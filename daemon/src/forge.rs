@@ -33,12 +33,15 @@
 //!
 //! TODO: Replace with real user-service authentication once RAL-245 is complete.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::config::ForgeConfig;
 
 /// Which forge a repository is hosted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForgeKind {
     GitHub,
     GitLab,
@@ -183,6 +186,18 @@ pub struct ForgeClient {
     /// for GitLab (its REST API addresses projects by encoded path or numeric id).
     repo_path: String,
     token: Option<String>,
+    /// The host [`resolve_cli_token_cached`] would have used to cache
+    /// `token`, if it came from that path -- set by
+    /// [`Self::with_cli_token_host`], never by [`Self::new`] directly (test
+    /// callers construct a client with no cache to evict).
+    ///
+    /// A 401/403 response on this client evicts `CLI_TOKEN_CACHE`'s entry for
+    /// `(kind, host)` (see [`Self::describe_evicting`]) so the next resolve
+    /// re-checks the CLI immediately instead of serving the same bad token
+    /// for up to [`CLI_TOKEN_TTL`]. Harmless to set even when `token` came
+    /// from an env var instead: evicting an absent/irrelevant cache entry is
+    /// a no-op.
+    cli_token_host: Option<String>,
 }
 
 impl ForgeClient {
@@ -200,7 +215,17 @@ impl ForgeClient {
             api_base,
             repo_path,
             token,
+            cli_token_host: None,
         }
+    }
+
+    /// Tags this client with the host its `token` was resolved against, so a
+    /// 401/403 it receives can evict the matching [`CLI_TOKEN_CACHE`] entry.
+    /// See the field doc on [`Self::cli_token_host`].
+    #[must_use]
+    fn with_cli_token_host(mut self, host: impl Into<String>) -> Self {
+        self.cli_token_host = Some(host.into());
+        self
     }
 
     /// Which forge this client talks to.
@@ -309,7 +334,7 @@ impl ForgeClient {
                     "head": head,
                     "base": base,
                 });
-                let resp = send(
+                let resp = self.send(
                     ureq::post(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
@@ -335,7 +360,7 @@ impl ForgeClient {
                 if let Some(id) = target_project_id {
                     payload["target_project_id"] = serde_json::json!(id);
                 }
-                let resp = send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                let resp = self.send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 let number = resp["iid"]
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitLab MR response shape: {resp}"))?;
@@ -361,7 +386,7 @@ impl ForgeClient {
         }
         let token = self.require_token()?;
         let url = format!("{}/projects/{}", self.api_base, self.repo_path);
-        let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+        let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
         resp["id"]
             .as_i64()
             .ok_or_else(|| format!("unexpected GitLab project response shape: {resp}"))
@@ -409,9 +434,11 @@ impl ForgeClient {
         match self.kind {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = get(ureq::get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json"))?;
+                let resp = self.get(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
                 if resp["merged"].as_bool().unwrap_or(false) {
                     return Ok("merged".to_string());
                 }
@@ -422,7 +449,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
                 Ok(match resp["state"].as_str().unwrap_or("opened") {
                     "opened" => "open".to_string(),
                     other => other.to_string(),
@@ -486,9 +513,11 @@ impl ForgeClient {
         let (base, updated_at) = match self.kind {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = get(ureq::get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json"))?;
+                let resp = self.get(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
                 let base = resp["base"]["ref"]
                     .as_str()
                     .map(str::to_string)
@@ -504,7 +533,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
                 let base = resp["target_branch"]
                     .as_str()
                     .map(str::to_string)
@@ -577,9 +606,11 @@ impl ForgeClient {
     fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
         let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        let pr = get(ureq::get(&pr_url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Accept", "application/vnd.github+json"))?;
+        let pr = self.get(
+            ureq::get(&pr_url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        )?;
         if pr["mergeable_state"].as_str() == Some("dirty") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the base branch".to_string(),
@@ -595,9 +626,11 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/check-runs",
             self.api_base, self.repo_path
         );
-        let checks = get(ureq::get(&checks_url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Accept", "application/vnd.github+json"))?;
+        let checks = self.get(
+            ureq::get(&checks_url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        )?;
         let runs = checks["check_runs"].as_array().cloned().unwrap_or_default();
         for run in &runs {
             let conclusion = run["conclusion"].as_str().unwrap_or_default();
@@ -632,9 +665,11 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/status",
             self.api_base, self.repo_path
         );
-        let status = get(ureq::get(&status_url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Accept", "application/vnd.github+json"))?;
+        let status = self.get(
+            ureq::get(&status_url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        )?;
         if matches!(status["state"].as_str(), Some("failure") | Some("error")) {
             let failing_context = status["statuses"].as_array().and_then(|s| {
                 s.iter()
@@ -674,7 +709,7 @@ impl ForgeClient {
             "{}/projects/{}/merge_requests/{number}",
             self.api_base, self.repo_path
         );
-        let mr = get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+        let mr = self.get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the target branch".to_string(),
@@ -701,7 +736,8 @@ impl ForgeClient {
                     "{}/projects/{}/pipelines/{pipeline_id}/jobs?scope[]=failed",
                     self.api_base, self.repo_path
                 );
-                let jobs = get(ureq::get(&jobs_url).set("PRIVATE-TOKEN", token))
+                let jobs = self
+                    .get(ureq::get(&jobs_url).set("PRIVATE-TOKEN", token))
                     .ok()
                     .and_then(|v| v.as_array().cloned())
                     .unwrap_or_default();
@@ -743,7 +779,7 @@ impl ForgeClient {
         ureq::get(&url)
             .set("PRIVATE-TOKEN", token)
             .call()
-            .map_err(describe_error)?
+            .map_err(|e| self.describe_evicting(e))?
             .into_string()
             .map_err(|e| format!("forge API read: {e}"))
     }
@@ -788,7 +824,7 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let payload = serde_json::json!({ "base": new_base });
-                send(
+                self.send(
                     ureq::patch(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
@@ -802,7 +838,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "target_branch": new_base });
-                send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -847,7 +883,7 @@ impl ForgeClient {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
                 let payload = serde_json::json!({ "state": "closed" });
-                send(
+                self.send(
                     ureq::patch(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
@@ -861,7 +897,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "state_event": "close" });
-                send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -908,7 +944,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "body": body });
-                send(
+                self.send(
                     ureq::post(&url)
                         .set("Authorization", &format!("Bearer {token}"))
                         .set("Accept", "application/vnd.github+json"),
@@ -922,7 +958,7 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "body": body });
-                send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                self.send(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
         }
@@ -975,7 +1011,7 @@ impl ForgeClient {
         let token = self.require_token()?;
         let url = format!("{}/repos/{}/stacks", self.api_base, self.repo_path);
         let payload = serde_json::json!({ "pull_requests": pr_numbers });
-        let resp = send(
+        let resp = self.send(
             ureq::post(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1032,7 +1068,7 @@ impl ForgeClient {
             self.api_base, self.repo_path
         );
         let payload = serde_json::json!({ "pull_requests": pr_numbers });
-        send(
+        self.send(
             ureq::post(&url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1069,7 +1105,7 @@ impl ForgeClient {
         {
             Ok(_) => Ok(true),
             Err(ureq::Error::Status(404, _)) => Ok(false),
-            Err(e) => Err(describe_error(e)),
+            Err(e) => Err(self.describe_evicting(e)),
         };
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
@@ -1133,7 +1169,7 @@ impl ForgeClient {
                 Ok(Some(members))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(describe_error(e)),
+            Err(e) => Err(self.describe_evicting(e)),
         };
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
@@ -1215,7 +1251,7 @@ impl ForgeClient {
             .set("Accept", "application/vnd.github+json")
             .set("Content-Type", "application/json")
             .send_string("{}")
-            .map_err(describe_error)?;
+            .map_err(|e| self.describe_evicting(e))?;
         Ok(())
     }
 
@@ -1261,9 +1297,11 @@ impl ForgeClient {
                     "{}/repos/{}/issues/{number}/comments",
                     self.api_base, self.repo_path
                 );
-                let resp = get(ureq::get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json"))?;
+                let resp = self.get(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
                 let items = resp
                     .as_array()
                     .ok_or_else(|| format!("unexpected GitHub comments response shape: {resp}"))?;
@@ -1282,7 +1320,7 @@ impl ForgeClient {
                     "{}/projects/{}/merge_requests/{number}/notes",
                     self.api_base, self.repo_path
                 );
-                let resp = get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
+                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
                 let items = resp
                     .as_array()
                     .ok_or_else(|| format!("unexpected GitLab notes response shape: {resp}"))?;
@@ -1366,7 +1404,7 @@ impl ForgeClient {
         if let Some(t) = token {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
-        let resp = get(req).ok()?;
+        let resp = self.get(req).ok()?;
         let b64 = resp["content"].as_str()?;
         decode_base64_maybe_wrapped(b64)
     }
@@ -1377,7 +1415,7 @@ impl ForgeClient {
         if let Some(t) = token {
             req = req.set("PRIVATE-TOKEN", t);
         }
-        let resp = get(req).ok()?;
+        let resp = self.get(req).ok()?;
         resp["default_branch"].as_str().map(str::to_string)
     }
 
@@ -1406,17 +1444,46 @@ fn decode_base64_maybe_wrapped(s: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn send(req: ureq::Request, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let resp = req
-        .set("Content-Type", "application/json")
-        .send_string(&payload.to_string())
-        .map_err(describe_error)?;
-    parse_body(resp)
-}
+impl ForgeClient {
+    /// `POST`/`PUT`/`PATCH` a JSON payload, parsing the JSON response body.
+    /// Every mutating forge call in this file routes through this (see the
+    /// module-level `impl ForgeClient` blocks above) rather than calling
+    /// `ureq` directly, so a 401/403 anywhere always reaches
+    /// [`Self::describe_evicting`].
+    fn send(
+        &self,
+        req: ureq::Request,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let resp = req
+            .set("Content-Type", "application/json")
+            .send_string(&payload.to_string())
+            .map_err(|e| self.describe_evicting(e))?;
+        parse_body(resp)
+    }
 
-fn get(req: ureq::Request) -> Result<serde_json::Value, String> {
-    let resp = req.call().map_err(describe_error)?;
-    parse_body(resp)
+    /// `GET`, parsing the JSON response body. See [`Self::send`]'s doc for
+    /// why every read call in this file routes through this.
+    fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        parse_body(resp)
+    }
+
+    /// [`describe_error`], plus (RAL-<new>) evicting this client's
+    /// [`CLI_TOKEN_CACHE`] entry on a 401/403 -- the daemon's one signal that
+    /// a token might genuinely be bad (revoked, expired), as opposed to the
+    /// cache's blind TTL. Without this, a token revoked mid-TTL keeps getting
+    /// served from cache to every request that hits it until the TTL expires
+    /// on its own; with it, the very next resolve re-checks the CLI live
+    /// instead of waiting.
+    fn describe_evicting(&self, e: ureq::Error) -> String {
+        if let ureq::Error::Status(401 | 403, _) = &e {
+            if let Some(host) = &self.cli_token_host {
+                evict_cli_token(self.kind, host);
+            }
+        }
+        describe_error(e)
+    }
 }
 
 fn describe_error(e: ureq::Error) -> String {
@@ -1553,6 +1620,71 @@ fn resolve_cli_token(kind: ForgeKind, host: &str) -> Result<String, String> {
                     text.trim()
                 )
             })
+        }
+    }
+}
+
+/// TTL for the [`CLI_TOKEN_CACHE`] entries [`resolve_cli_token_cached`] fills.
+///
+/// `resolve_remote_for_inner` runs on every `ForgeClient` build, which
+/// happens on every PR-sync-status check and every PR list refresh — with no
+/// cache, an unset token env var meant the daemon shelled out to `gh`/`glab`
+/// on nearly every board poll. Long enough to make that cost negligible;
+/// short enough that a token rotated by re-running `gh auth login` /
+/// `glab auth login` on this machine is picked up again within a few
+/// minutes rather than requiring a daemon restart.
+const CLI_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// `(kind, host) -> (token, fetched_at)` map backing [`CLI_TOKEN_CACHE`].
+type CliTokenCache = HashMap<(ForgeKind, String), (String, Instant)>;
+
+/// Cache of [`resolve_cli_token`] results, keyed by `(kind, host)`. Only
+/// successes are cached — a failure (CLI missing, not logged in) is cheap to
+/// retry and re-checking it live means a login performed after the daemon
+/// started is picked up on the very next call instead of waiting out a TTL.
+static CLI_TOKEN_CACHE: Mutex<Option<CliTokenCache>> = Mutex::new(None);
+
+/// [`resolve_cli_token`], cached for [`CLI_TOKEN_TTL`] per `(kind, host)`.
+fn resolve_cli_token_cached(kind: ForgeKind, host: &str) -> Result<String, String> {
+    let key = (kind, host.to_string());
+    {
+        let cache = CLI_TOKEN_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((token, fetched_at)) = cache.as_ref().and_then(|m| m.get(&key)) {
+            if fetched_at.elapsed() < CLI_TOKEN_TTL {
+                return Ok(token.clone());
+            }
+        }
+    }
+    let token = resolve_cli_token(kind, host)?;
+    let mut cache = CLI_TOKEN_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (token.clone(), Instant::now()));
+    Ok(token)
+}
+
+/// Drops the cached CLI-fallback token for `(kind, host)`, if any, so the
+/// next [`resolve_cli_token_cached`] call re-checks the CLI live instead of
+/// serving a possibly-revoked token for the rest of [`CLI_TOKEN_TTL`].
+/// Called by [`ForgeClient::describe_evicting`] on a 401/403. A no-op when
+/// nothing is cached for that key (e.g. the token came from an env var).
+fn evict_cli_token(kind: ForgeKind, host: &str) {
+    let mut cache = CLI_TOKEN_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(map) = cache.as_mut() {
+        if map.remove(&(kind, host.to_string())).is_some() {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [forge] evicted cached {} token for host={host} after a 401/403 -- \
+                 will re-check the CLI on the next request",
+                kind.as_str()
+            );
         }
     }
 }
@@ -1794,10 +1926,11 @@ impl ForgeClient {
             return NetworkLookup::NotVisible;
         };
         let url = format!("{}/repos/{}", self.api_base, self.repo_path);
-        let Ok(resp) = get(ureq::get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Accept", "application/vnd.github+json"))
-        else {
+        let Ok(resp) = self.get(
+            ureq::get(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        ) else {
             return NetworkLookup::NotVisible;
         };
         let Some(label) = resp["full_name"].as_str() else {
@@ -1861,7 +1994,7 @@ impl ForgeClient {
 
     fn get_gitlab_project(&self, token: &str, path_or_id: &str) -> Option<serde_json::Value> {
         let url = format!("{}/projects/{path_or_id}", self.api_base);
-        get(ureq::get(&url).set("PRIVATE-TOKEN", token)).ok()
+        self.get(ureq::get(&url).set("PRIVATE-TOKEN", token)).ok()
     }
 }
 
@@ -1996,7 +2129,7 @@ fn resolve_remote_for_inner(
     // TODO: Replace with real user-service authentication once RAL-245 is complete.
     let token = match std::env::var(&token_env) {
         Ok(t) => Some(t),
-        Err(_) => match resolve_cli_token(kind, &host) {
+        Err(_) => match resolve_cli_token_cached(kind, &host) {
             Ok(t) => {
                 // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
                 crate::rlog!(
@@ -2025,12 +2158,71 @@ fn resolve_remote_for_inner(
         ForgeKind::GitLab => path.replace('/', "%2F"),
     };
 
-    Ok(ForgeClient::new(kind, api_base, repo_path, token))
+    Ok(ForgeClient::new(kind, api_base, repo_path, token).with_cli_token_host(host))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_pr_template_reads_the_github_default_template() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/contents/.github/PULL_REQUEST_TEMPLATE.md"
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"content":"IyMgU3VtbWFyeQo="}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(client.fetch_pr_template().as_deref(), Some("## Summary\n"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_pr_template_reads_the_gitlab_default_template() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"default_branch":"main"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/acme%2Fwidget/repository/files/.gitlab%2Fmerge_request_templates%2FDefault.md/raw?ref=main"
+            );
+            req.respond(tiny_http::Response::from_string("## Summary\n").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(client.fetch_pr_template().as_deref(), Some("## Summary\n"));
+        handle.join().unwrap();
+    }
 
     #[test]
     fn parses_ssh_shorthand_remote() {
@@ -2664,6 +2856,78 @@ mod tests {
         );
         assert!(client.stack_exists(42).unwrap());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_401_evicts_the_cached_cli_fallback_token_but_a_404_does_not() {
+        let host = "ral-401-evict-test.example.com";
+        let key = (ForgeKind::GitHub, host.to_string());
+        let seed_cache = |token: &str| {
+            CLI_TOKEN_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(HashMap::new)
+                .insert(key.clone(), (token.to_string(), Instant::now()));
+        };
+        let cached_token = || {
+            CLI_TOKEN_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .map(|(t, _)| t.clone())
+        };
+
+        // A 404 (e.g. `stack_exists`'s not-found case above) must NOT evict --
+        // it's a normal negative result, not evidence the token itself is bad.
+        seed_cache("still-good");
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("not found").with_status_code(404))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("still-good".to_string()),
+        )
+        .with_cli_token_host(host);
+        assert!(!client.stack_exists(42).unwrap());
+        handle.join().unwrap();
+        assert_eq!(
+            cached_token().as_deref(),
+            Some("still-good"),
+            "a 404 is a normal negative result, not proof the token is bad"
+        );
+
+        // A 401 IS evidence the token is bad -- evict so the next resolve
+        // re-checks the CLI live instead of serving this token for the rest
+        // of CLI_TOKEN_TTL.
+        seed_cache("now-revoked");
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("bad credentials").with_status_code(401))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("now-revoked".to_string()),
+        )
+        .with_cli_token_host(host);
+        let _ = client.get_pull_request_state(1);
+        handle.join().unwrap();
+        assert_eq!(
+            cached_token(),
+            None,
+            "a 401 must evict the cached CLI-fallback token"
+        );
     }
 
     #[test]

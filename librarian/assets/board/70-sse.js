@@ -421,11 +421,16 @@
       /**
        * Fetches and caches the live drift check for one open PR (RAL-190).
        * Silent on failure -- a transient error leaves the previous cached
-       * value in place until the next poll.
+       * value in place until the next poll. Skips (rather than piling up a
+       * second concurrent request) a PR whose previous fetch hasn't resolved
+       * yet -- the daemon's per-PR `git fetch` can take several seconds, well
+       * past this poll's own interval.
        * @param {string} prId
        * @returns {Promise<void>}
        */
       async function fetchPrSyncStatus(prId) {
+        if (prSyncStatusInFlight.has(prId)) return;
+        prSyncStatusInFlight.add(prId);
         try {
           const res = await fetch(`/api/pull-requests/${prId}/sync-status`);
           if (!res.ok) return;
@@ -433,6 +438,7 @@
           const data = await res.json();
           prSyncStatus[prId] = data;
         } catch (e) { /* transient -- the next poll retries */ }
+        finally { prSyncStatusInFlight.delete(prId); }
       }
       /**
        * Fetches the PRs submitted for a review and caches them, along with a
@@ -503,6 +509,18 @@
           // already has everything `renderReviewDetail` needs, and the next
           // poll picks up the summary once that worker finishes it.
           if (selectedGuardian) fetch(`/api/guardians/${selectedGuardian}`).catch(() => {});
+          // Render now, with whatever's already loaded (the guardian list
+          // itself, plus any branch/PR/conflict data cached from a previous
+          // poll) -- don't make the whole tab wait on the four
+          // per-selected-guardian refreshes below. `pollPullRequests` hits
+          // `GET /api/pull-requests/{id}/sync-status`, which does a real
+          // `git fetch` and can take many seconds per open PR (serialized
+          // per repo on the daemon side) -- the list/sidebar has no reason to
+          // sit blank that whole time when its own data already arrived.
+          const renderIfNotSelecting = () => {
+            if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
+          };
+          renderIfNotSelecting();
           // Keep every expanded branch's feedback thread fresh (RAL-272) so a
           // guardian's async acknowledgment appears without a manual refresh.
           // These four fetches are independent of each other (each caches
@@ -520,8 +538,9 @@
             // The awaited refreshes may have been overtaken by a newer poll
             // (or re-selection) — a stale render now would show old data.
             if (seq !== reviewPollSeq) { console.debug("pollReviews: superseded, abandoning"); return; }
+            // Re-render now that the slower per-branch/PR data has landed.
+            renderIfNotSelecting();
           }
-          if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
         } catch (e) { byId("conn").className = "dot off"; }
       }
       // RALPHUS-REVIEW-POLL:END

@@ -3474,7 +3474,8 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        self.hydrate_guardian(row)
+        let ctx = self.build_hydration_ctx(std::iter::once(row.git_root.as_str()));
+        self.hydrate_guardian(row, &ctx)
     }
 
     /// List all guardians, newest first.
@@ -3486,7 +3487,45 @@ impl Store {
         let rows = stmt
             .query_map([], Self::map_guardian_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter().map(|r| self.hydrate_guardian(r)).collect()
+        // GUARDIAN_PERF.local.md: build the shared hydration context once for
+        // every distinct git_root in this call, instead of `hydrate_guardian`
+        // separately re-querying `projects` (4x) and re-walking the
+        // filesystem for `.ralphus.toml` (up to 2x) on every single row --
+        // mirrors how `build_squad_view` batches its own per-squad queries
+        // (see the RAL-121-style comment there) rather than forking the
+        // response into a separate lean/full shape.
+        let ctx = self.build_hydration_ctx(rows.iter().map(|r| r.git_root.as_str()));
+        rows.into_iter()
+            .map(|r| self.hydrate_guardian(r, &ctx))
+            .collect()
+    }
+
+    /// Builds the [`GuardianHydrationCtx`] shared by every guardian hydrated
+    /// in one `get_guardian`/`list_guardians` call -- see
+    /// `GUARDIAN_PERF.local.md`. Loads the full `projects` stamp table and
+    /// the global config exactly once, and memoizes the per-`git_root`
+    /// filesystem config resolution so guardians sharing a repo (the common
+    /// case) only pay that walk once for the whole call.
+    fn build_hydration_ctx<'a>(
+        &self,
+        git_roots: impl Iterator<Item = &'a str>,
+    ) -> GuardianHydrationCtx {
+        let mut config_by_git_root = std::collections::HashMap::new();
+        for root in git_roots {
+            config_by_git_root
+                .entry(root.to_string())
+                .or_insert_with(|| {
+                    (
+                        crate::config::resolve(Path::new(root)),
+                        crate::config::project_review_config(Path::new(root)),
+                    )
+                });
+        }
+        GuardianHydrationCtx {
+            project_stamps: self.load_all_project_stamps(),
+            live_global: crate::config::global_review_config(),
+            config_by_git_root,
+        }
     }
 
     fn map_guardian_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GuardianRow> {
@@ -3546,7 +3585,11 @@ impl Store {
         })
     }
 
-    fn hydrate_guardian(&self, row: GuardianRow) -> Result<GuardianView> {
+    fn hydrate_guardian(
+        &self,
+        row: GuardianRow,
+        ctx: &GuardianHydrationCtx,
+    ) -> Result<GuardianView> {
         // RAL-121: one correlated subquery per branch (finding that branch's
         // most-recent cell by rowid) instead of the previous four -- each of
         // state/squad_id/task_idx/idx was a separate subquery re-scanning
@@ -3778,7 +3821,14 @@ impl Store {
         // initial selection (interview Q7) without a second round-trip, and
         // the merge engine (`guardian_merge.rs`) has a single, always-populated
         // field to gate on.
-        let project_review_config = crate::config::resolve(Path::new(&row.git_root));
+        // GUARDIAN_PERF.local.md: both configs below come from `ctx`, resolved
+        // once per distinct `git_root` for the whole call rather than via a
+        // fresh filesystem walk on every guardian.
+        let (project_review_config, explicit_project) = ctx
+            .config_by_git_root
+            .get(&row.git_root)
+            .cloned()
+            .unwrap_or_default();
         // RAL-285: `skip_worktree_checks` was retired in favor of `proof_scope`
         // alone, but a row persisted before this change may still have the old
         // flag set with no explicit `proof_scope` override -- read-time
@@ -3805,13 +3855,19 @@ impl Store {
         // is read separately from `project_review_config` (which already
         // merges global in) so an explicit project override can be told apart
         // from the stamp and the live global.
-        let explicit_project = crate::config::project_review_config(Path::new(&row.git_root));
-        let stamp = self.project_skip_base_updates_stamp(&row.git_root);
-        let live_global = crate::config::global_review_config();
+        //
+        // GUARDIAN_PERF.local.md: `stamps` is one prefix-match against
+        // `ctx.project_stamps` (loaded once for the whole call) instead of
+        // four separate full-table-scan queries per guardian -- the match is
+        // a pure function of `git_root`, independent of which of the four
+        // columns is read, so one match serves all four `effective_*` fields
+        // below. `live_global` likewise comes from `ctx`, read once per call.
+        let stamps = crate::store::Store::match_project_stamps(&row.git_root, &ctx.project_stamps);
+        let live_global = &ctx.live_global;
         let effective_skip_base_updates = row
             .skip_base_updates
             .or(explicit_project.skip_base_updates)
-            .or(stamp)
+            .or(stamps.and_then(|s| s.skip_base_updates))
             .or(live_global.skip_base_updates)
             .unwrap_or(false);
 
@@ -3819,33 +3875,30 @@ impl Store {
         // whether a newly submitted PR's branch defaults to the exact
         // worktree/feature branch name instead of the convention-derived
         // alias.
-        let match_pr_branch_name_stamp = self.project_match_pr_branch_name_stamp(&row.git_root);
         let effective_match_pr_branch_name = row
             .match_pr_branch_name
             .or(explicit_project.match_pr_branch_name)
-            .or(match_pr_branch_name_stamp)
+            .or(stamps.and_then(|s| s.match_pr_branch_name))
             .or(live_global.match_pr_branch_name)
             .unwrap_or(false);
 
         // RAL-317: same layering as `effective_match_pr_branch_name` above,
         // for whether the PR stack is auto-submitted/grown as each branch
         // reaches a terminal merge state.
-        let auto_submit_pr_stack_stamp = self.project_auto_submit_pr_stack_stamp(&row.git_root);
         let effective_auto_submit_pr_stack = row
             .auto_submit_pr_stack
             .or(explicit_project.auto_submit_pr_stack)
-            .or(auto_submit_pr_stack_stamp)
+            .or(stamps.and_then(|s| s.auto_submit_pr_stack))
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
 
         // RAL-378: same layering as `effective_match_pr_branch_name` above,
         // for whether the PR gets a branch of its own or is opened straight
         // from the review branch.
-        let separate_pr_branch_stamp = self.project_separate_pr_branch_stamp(&row.git_root);
         let effective_separate_pr_branch = row
             .separate_pr_branch
             .or(explicit_project.separate_pr_branch)
-            .or(separate_pr_branch_stamp)
+            .or(stamps.and_then(|s| s.separate_pr_branch))
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
 
@@ -4192,6 +4245,28 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)
     }
+}
+
+/// Precomputed, call-scoped context shared across every guardian hydrated in
+/// one `list_guardians()`/`get_guardian()` call (GUARDIAN_PERF.local.md).
+/// Building this once per call, rather than once per guardian as before,
+/// turns 4 full-table-scans of `projects` and up to 2 filesystem
+/// `.ralphus.toml` walks *per guardian* into 1 table read and at most 1
+/// filesystem walk *per distinct git_root* for the whole call.
+struct GuardianHydrationCtx {
+    /// Every registered project's path + its four stamped booleans, read
+    /// once via `Store::load_all_project_stamps`.
+    project_stamps: Vec<(String, crate::store::ProjectStamps)>,
+    /// The global config -- identical for every guardian regardless of
+    /// `git_root`, so it is read once instead of once per guardian.
+    live_global: crate::config::ReviewConfig,
+    /// Per-`git_root`: `(the layered global+project config, the
+    /// project-only config)` -- memoized so guardians sharing a repo (the
+    /// common case) only pay the filesystem walk once for the whole call.
+    config_by_git_root: std::collections::HashMap<
+        String,
+        (crate::config::ReviewConfig, crate::config::ReviewConfig),
+    >,
 }
 
 struct GuardianRow {

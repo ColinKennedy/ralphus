@@ -918,10 +918,14 @@ fn guard_against_clobber(
     ))
 }
 
-/// Commit subject lines a PR for `position` should be described by: the
-/// branch's own commits, from its immediate predecessor's tip (or `base_sha`
-/// for the lowest enabled position).
-fn commit_log_for(root: &Path, base_sha: &str, guardian: &GuardianView, position: i64) -> String {
+/// Git range a PR for `position` should be described by: the branch's own
+/// commits, from its immediate predecessor's tip (or `base_sha` for the lowest
+/// enabled position) through this branch's review ref.
+fn commit_range_for(
+    base_sha: &str,
+    guardian: &GuardianView,
+    position: i64,
+) -> Option<(String, String)> {
     let prev = guardian
         .branches
         .iter()
@@ -929,15 +933,68 @@ fn commit_log_for(root: &Path, base_sha: &str, guardian: &GuardianView, position
         .max_by_key(|b| b.position)
         .and_then(|b| b.review_branch.clone())
         .unwrap_or_else(|| base_sha.to_string());
-    let Some(tip) = guardian
+    let tip = guardian
         .branches
         .iter()
         .find(|b| b.position == position)
-        .and_then(|b| b.review_branch.clone())
-    else {
-        return String::new();
-    };
-    git(root, &["log", "--format=%s", &format!("{prev}..{tip}")]).unwrap_or_default()
+        .and_then(|b| b.review_branch.clone())?;
+    Some((prev, tip))
+}
+
+const MAX_PR_PATCH_CHARS: usize = 120_000;
+
+fn truncate_pr_patch(patch: String) -> String {
+    if patch.chars().count() <= MAX_PR_PATCH_CHARS {
+        return patch;
+    }
+    let mut truncated: String = patch.chars().take(MAX_PR_PATCH_CHARS).collect();
+    truncated.push_str("\n\n[diff truncated by ralphus]\n");
+    truncated
+}
+
+/// Branch-local evidence supplied to the PR writer. The range is deliberately
+/// identical to the range the forge will display for this stacked PR, so no
+/// predecessor or downstream sibling can enter the generated description.
+fn branch_change_context(
+    root: &Path,
+    base_sha: &str,
+    guardian: &GuardianView,
+    position: i64,
+) -> Option<(String, String, String)> {
+    let (prev, tip) = commit_range_for(base_sha, guardian, position)?;
+    let range = format!("{prev}..{tip}");
+    let commits = git(
+        root,
+        &[
+            "log",
+            "--reverse",
+            "--format=commit %H%nsubject: %s%n%n%b%n---",
+            &range,
+        ],
+    )
+    .unwrap_or_default();
+    if commits.trim().is_empty() {
+        return None;
+    }
+    let diff_stat = git(root, &["diff", "--no-ext-diff", "--stat", &range]).unwrap_or_default();
+    let patch = git(root, &["diff", "--no-ext-diff", "--unified=3", &range])
+        .map(truncate_pr_patch)
+        .unwrap_or_default();
+    Some((commits, diff_stat, patch))
+}
+
+fn fallback_pr_description(commits: &str, template: Option<&str>) -> String {
+    let subjects = commits
+        .lines()
+        .filter_map(|line| line.strip_prefix("subject: "))
+        .map(|subject| format!("- {subject}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match (template, subjects.is_empty()) {
+        (Some(template), false) => format!("{template}\n\n## Branch changes\n\n{subjects}"),
+        (Some(template), true) => template.to_string(),
+        (None, _) => subjects,
+    }
 }
 
 #[derive(Deserialize)]
@@ -963,14 +1020,14 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String)> {
         .map(|s| (s.title, s.description))
 }
 
-/// Synthesize a suggested PR title + description from a branch's (or the
-/// whole stack's) commit subject lines, using the same `Runner`/`RunnerSpec`
-/// mechanism `guardian_merge::generate_final_summary` uses for the change
-/// summary.
+/// Synthesize a suggested PR title + description from one branch's unique
+/// commit range, using the same `Runner`/`RunnerSpec` mechanism
+/// `guardian_merge::generate_final_summary` uses for the change summary.
 /// `template`, if given (see `ForgeClient::fetch_pr_template`), is folded into
 /// the prompt so the repo's PR template is honoured. Falls back to a plain
-/// branch-name title and the guardian's existing change summary when the log
-/// is empty or the agent call fails — never returns an error. `trace_context`
+/// branch-name title and a deterministic list of this branch's commit subjects
+/// when the agent call fails. The review-wide change summary is never used for
+/// an individual PR. `trace_context`
 /// (the owning `pr.submit_pull_requests`/`pr.action_feedback` span, if any) is
 /// forwarded onto the `RunnerSpec` so `runner.subprocess`'s span (RAL-96)
 /// becomes a child of it instead of starting a disconnected trace.
@@ -988,21 +1045,21 @@ fn synthesize_pr_text(
         .find(|b| b.position == position)
         .map(|b| b.branch.clone())
         .unwrap_or_else(|| guardian.name.clone());
-    let fallback_description = guardian.change_summary.clone().unwrap_or_default();
-
     let base_sha = match git(&root, &["rev-parse", &guardian.base_branch]) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return (fallback_title, fallback_description),
+        Err(_) => return (fallback_title, template.unwrap_or_default().to_string()),
     };
-    let log = commit_log_for(&root, &base_sha, guardian, position);
-    if log.trim().is_empty() {
+    let Some((commits, diff_stat, patch)) =
+        branch_change_context(&root, &base_sha, guardian, position)
+    else {
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [pr] synthesize pr text position={position:?} skipped: empty commit log"
         );
-        return (fallback_title, fallback_description);
-    }
+        return (fallback_title, template.unwrap_or_default().to_string());
+    };
+    let fallback_description = fallback_pr_description(&commits, template);
 
     let agent = guardian_merge::resolver_agent(guardian.resolver_agent.as_deref(), &root);
     let model = guardian_merge::resolver_model(guardian.resolver_model.as_deref(), &agent, &root);
@@ -1013,8 +1070,13 @@ fn synthesize_pr_text(
         )
     });
     let prompt = format!(
-        "Suggest a pull request title and description for a code change. Here \
-         are the commit subject lines (one per commit, oldest first):\n\n{log}\n\n\
+        "Suggest a pull request title and description for one branch in a \
+         stacked review. Use ONLY the commits and diff in the unique range \
+         below. Do not describe predecessor branches, downstream branches, \
+         the wider review, or unrelated files visible in the workspace.\n\n\
+         UNIQUE COMMITS (oldest first):\n\n{commits}\n\n\
+         UNIQUE DIFF STAT:\n\n{diff_stat}\n\n\
+         UNIQUE DIFF:\n\n{patch}\n\n\
          Respond with ONLY a JSON object of the form \
          {{\"title\": \"...\", \"description\": \"...\"}}. The title must be a \
          single concise line under 72 characters. The description should be a \
@@ -1025,7 +1087,12 @@ fn synthesize_pr_text(
         squad_id: "guardian".to_string(),
         task: "pr-description".to_string(),
         cell_id: "pr-writer".to_string(),
-        cwd: guardian.git_root.clone(),
+        cwd: guardian
+            .branches
+            .iter()
+            .find(|b| b.position == position)
+            .and_then(|b| b.worktree.clone())
+            .unwrap_or_else(|| guardian.git_root.clone()),
         prompt: Some(prompt),
         command: None,
         agent,
@@ -1238,6 +1305,25 @@ impl PrRepoRouting {
             None => &self.parent_remote_name,
         }
     }
+}
+
+/// The remote name to strip/qualify a guardian's `base_branch` against when
+/// comparing or writing it relative to a forge PR's bare base ref -- the
+/// same fork-excluded [`PrRepoRouting::parent_remote_name`]
+/// [`detect_forge_reorder`] itself compares against, kept as a named entry
+/// point so [`check_and_apply_forge_reorder`]'s apply step can't drift back
+/// to a plain, non-excluding resolution (RAL-273/RAL-338: that mismatch let a
+/// project whose registered fork shares `base_branch`'s own remote name loop
+/// `merging`<->`in_review` forever, since the "fix" kept re-qualifying with
+/// the excluded remote and writing back the exact value the next detection
+/// pass would flag as drifted again).
+fn forge_parent_remote_name(
+    store: &Arc<Mutex<Store>>,
+    root: &Path,
+    base_branch: &str,
+    forge_cfg: &crate::config::ForgeConfig,
+) -> String {
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg).parent_remote_name
 }
 
 /// Resolve [`PrRepoRouting`] for `guardian`'s project (by `guardian.git_root`
@@ -2641,9 +2727,8 @@ pub fn check_and_apply_forge_reorder(
         drift.base_changed,
         drift.order_changed
     );
-    {
-        let mut guard = store.lock().expect("poisoned");
-        let guardian = match guard.get_guardian(id) {
+    let (root, base_branch, forge_cfg) = {
+        let guardian = match store.lock().expect("poisoned").get_guardian(id) {
             Ok(g) => g,
             Err(e) => {
                 crate::rlog!(
@@ -2655,9 +2740,12 @@ pub fn check_and_apply_forge_reorder(
         };
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        let remote_name =
-            crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
-        let local_base = qualify_forge_base(&guardian.base_branch, &remote_name, &drift.base);
+        (root, guardian.base_branch, forge_cfg)
+    };
+    let remote_name = forge_parent_remote_name(store, &root, &base_branch, &forge_cfg);
+    let local_base = qualify_forge_base(&base_branch, &remote_name, &drift.base);
+    {
+        let mut guard = store.lock().expect("poisoned");
         let base_applied = if drift.base_changed {
             match guard.set_guardian_base_branch_if_newer(id, &local_base, drift.base_changed_at_ms)
             {
@@ -3437,8 +3525,26 @@ fn submit_stacked_branch_pr(
         "ralphus [pr] review {id} pushing branch id={branch_id} alias={alias} remote={remote_name}"
     );
     // Nothing has been pushed to a brand-new alias yet, so there is no
-    // recorded tip to recognize the remote by.
-    guard_against_clobber(root, remote_name, &alias, &review_ref, None)?;
+    // recorded tip to recognize the remote by. If the remote alias already
+    // carries commits this worktree doesn't have -- a reviewer pushed
+    // directly to it, or the branch previously had its PR unlinked and
+    // drifted -- reconcile through the same rebase/conflict-resolution path
+    // a tracked-PR sync (`pull_pr_commits`) already uses, rather than
+    // refusing outright. This is the one push site every PR-creation path
+    // (whole-stack submit, explicit per-branch submit, resubmission after an
+    // unlink) funnels through, so every caller gets the reconciliation.
+    if let Err(clobber_err) = guard_against_clobber(root, remote_name, &alias, &review_ref, None) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} branch {branch_id} alias {alias} diverged from \
+             {remote_name} ({clobber_err}); reconciling before push"
+        );
+        guardian_merge::pull_pr_commits(store, runner, id, branch_id, remote_name, &alias, None)
+            .map_err(|e| {
+                format!("could not reconcile remote branch '{alias}' before pushing: {e}")
+            })?;
+        guard_against_clobber(root, remote_name, &alias, &review_ref, None)?;
+    }
     push_ref(root, remote_name, &review_ref, &alias)?;
     let pushed_sha = git(root, &["rev-parse", &review_ref])
         .map(|s| s.trim().to_string())
@@ -3786,6 +3892,14 @@ fn reconcile_native_pr_stack(
         crate::rlog!(WARNING, "ralphus [pr] review {id} stack resync failed: {e}");
         0
     });
+    // A branch reconciled (and restacked downstream) during this same
+    // submission -- see `submit_stacked_branch_pr`'s clobber-guard handling
+    // -- can leave an earlier, already-open PR's pushed content stale even
+    // though its `base` field above is still correct. `sync_open_pr_branches`
+    // is the same settle-time repair the periodic maintenance sweep already
+    // relies on for this; running it here too closes that gap for both
+    // submission paths that funnel through this function.
+    sync_open_pr_branches(store, id);
     {
         let guard = store.lock().expect("poisoned");
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -4288,30 +4402,64 @@ fn submit_pull_requests_inner(
 // Bidirectional sync (RAL-190)
 // ---------------------------------------------------------------------------
 
-/// One lock per repository root, serializing the `git fetch` +
-/// `rev-parse FETCH_HEAD` pair in [`compute_sync_status`].
+/// One lock per `(repository root, PR)`, serializing repeat/concurrent
+/// `git fetch` + `rev-parse` pairs in [`compute_sync_status`] for the *same*
+/// PR.
 ///
-/// `FETCH_HEAD` is a single file shared by the whole repository, so two
-/// fetches running in it at once can have either one's `rev-parse` read the
-/// other's result -- reporting a PR as ahead/behind against a sibling PR's
-/// tip. That pairing is reachable: the board fetches every open PR's
-/// sync-status for a review concurrently (`pollPullRequests` in board.html),
-/// and the daemon answers read-only requests on a pool of threads
-/// (`server::ReadPool`), so a stacked review's PRs land here at the same time
-/// in the same repository.
-static SYNC_FETCH_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+/// Originally this was one lock per repository root: `git fetch` with no
+/// explicit destination writes `FETCH_HEAD`, a single file shared by the
+/// whole repository, so two fetches racing in it could have either one's
+/// `rev-parse FETCH_HEAD` read the other's result -- reporting a PR as
+/// ahead/behind against a sibling PR's tip. That made every open PR on a
+/// stacked review serialize behind one lock, even though they have nothing
+/// to do with each other -- the board fetches every open PR's sync-status
+/// for a review concurrently (`pollPullRequests` in `70-sse.js`), and the
+/// daemon answers read-only requests on a pool of threads
+/// (`server::ReadPool`), so a stacked review's PRs land here at the same
+/// time in the same repository.
+///
+/// [`compute_sync_status`] now fetches into a PR-scoped ref
+/// (`refs/ralphus/sync/<pr_id>`) instead of relying on `FETCH_HEAD`, so two
+/// different PRs' fetches no longer share any mutable state and don't need
+/// to serialize at all. The lock is kept, scoped down to `(root, pr_id)`,
+/// only to protect a PR's *own* ref against a genuinely concurrent re-check
+/// of that same PR (e.g. two board tabs polling at once).
+type SyncFetchLocks = HashMap<(PathBuf, String), Arc<Mutex<()>>>;
+static SYNC_FETCH_LOCKS: Mutex<Option<SyncFetchLocks>> = Mutex::new(None);
 
-/// The [`SYNC_FETCH_LOCKS`] entry for `root`, creating it on first use.
-fn sync_fetch_lock(root: &Path) -> Arc<Mutex<()>> {
+/// The [`SYNC_FETCH_LOCKS`] entry for `(root, pr_id)`, creating it on first use.
+fn sync_fetch_lock(root: &Path, pr_id: &str) -> Arc<Mutex<()>> {
     let mut locks = SYNC_FETCH_LOCKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         locks
             .get_or_insert_with(HashMap::new)
-            .entry(root.to_path_buf())
+            .entry((root.to_path_buf(), pr_id.to_string()))
             .or_default(),
     )
+}
+
+/// The local ref [`compute_sync_status`] fetches a PR's remote branch tip
+/// into, scoped per-PR so concurrent fetches for different PRs never
+/// contend for the same ref (or, pre-this-fix, the same `FETCH_HEAD`).
+///
+/// `pr_id`s are daemon-generated (`Store::next_id`, always `[a-z0-9-]+`), so
+/// this sanitization is defense-in-depth rather than a load-bearing check --
+/// a git ref component may not contain whitespace, `~^:?*[`, `..`, or a
+/// leading/trailing `/`.
+fn sync_fetch_ref(pr_id: &str) -> String {
+    let cleaned: String = pr_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("refs/ralphus/sync/{cleaned}")
 }
 
 /// Drift between a PR's remote branch and its owning review worktree
@@ -4376,16 +4524,23 @@ pub fn compute_sync_status(
         .as_deref()
         .and_then(|r| git(&root, &["rev-parse", r]).ok())
         .map(|s| s.trim().to_string());
-    // Held across both commands: the `rev-parse` has to read back the
-    // `FETCH_HEAD` this very fetch wrote. See `SYNC_FETCH_LOCKS`.
+    // Held across both commands so a concurrent re-check of this same PR
+    // can't read back a fetch this one hasn't written yet. See
+    // `SYNC_FETCH_LOCKS`.
     let remote_sha = {
-        let fetch_lock = sync_fetch_lock(&root);
+        let fetch_lock = sync_fetch_lock(&root, pr_id);
         let _fetching = fetch_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git(&root, &["fetch", &remote_name, &pr.branch_alias])
+        let dest_ref = sync_fetch_ref(pr_id);
+        // `+` forces the update: a reviewer force-pushing the PR branch
+        // (an amend, a rebase onto a new base) makes its new tip a
+        // non-fast-forward from whatever this ref last pointed at, which a
+        // plain refspec would otherwise refuse to write.
+        let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
+        git(&root, &["fetch", &remote_name, &refspec])
             .ok()
-            .and_then(|_| git(&root, &["rev-parse", "FETCH_HEAD"]).ok())
+            .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
             .map(|s| s.trim().to_string())
     };
 
@@ -6881,6 +7036,195 @@ mod tests {
         assert_eq!(detect_forge_reorder(&store, &gid).unwrap(), None);
     }
 
+    /// Regression test for a real-world infinite loop: when a project's
+    /// registered fork happens to use the same remote name that `base_branch`
+    /// itself is qualified with (e.g. `base_branch = "alt/main"` and the
+    /// fork's `remote_name` is also `"alt"`), [`resolve_pr_repo_routing`]
+    /// excludes that remote from step 1 of
+    /// [`crate::forge::resolve_remote_name_excluding`] while computing the
+    /// *parent's* remote, so it falls through to the `origin`/`[forge].remote`
+    /// default instead of `"alt"` -- by design
+    /// (`resolve_remote_name_excluding_skips_a_registered_fork_remote` in
+    /// `forge.rs` pins exactly this fallback). A first [`detect_forge_reorder`]
+    /// call is therefore *correctly* going to report `base_changed` here: the
+    /// fork-excluded parent remote ("origin") can't strip `"alt/"` off
+    /// `base_branch`, so it reads as `"alt/main"` against the forge's bare
+    /// `"main"`.
+    ///
+    /// The bug was that applying that drift never converged: the apply block
+    /// in [`check_and_apply_forge_reorder`] re-qualified the new base with a
+    /// *plain, non-excluding* [`crate::forge::resolve_remote_name`] call,
+    /// which resolves `"alt"` from `base_branch` just fine (no exclusion) and
+    /// re-wrote `base_branch` right back to `"alt/main"` -- the exact value
+    /// the next detection pass would flag as drifted again. In production
+    /// this drove a guardian to cycle `in_review` -> `merging` -> `in_review`
+    /// every ~5 minutes, indefinitely, each cycle triggering a full stack
+    /// rebuild for nothing. The fix makes the apply block resolve the remote
+    /// the same fork-excluded way the detector did, so it writes back a value
+    /// the *next* detection pass agrees is already correct.
+    #[test]
+    fn detect_forge_reorder_converges_after_one_apply_when_the_registered_fork_remote_matches_base_branchs_own_remote()
+     {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Two full rounds: one for the initial (correctly reported)
+            // detection, one for the re-check after applying the fix, which
+            // must come back clean. `detect_forge_reorder` fetches each
+            // branch's PR base state out of a HashMap, so within a round the
+            // two GET requests can arrive in either order -- key the response
+            // on the PR number in the URL rather than assuming request order.
+            for _round in 0..2 {
+                for _ in 0..2 {
+                    let req = server.recv().unwrap();
+                    let forge_base = if req.url() == "/repos/acme/widget/pulls/1" {
+                        "main"
+                    } else if req.url() == "/repos/acme/widget/pulls/2" {
+                        "a-alias"
+                    } else {
+                        panic!("unexpected request: {}", req.url());
+                    };
+                    let state = serde_json::json!({
+                        "base": {"ref": forge_base},
+                        // Far enough in the future to always beat a freshly
+                        // created guardian's own `base_changed_at_ms` (set to
+                        // wall-clock `now_ms()` at creation), so the
+                        // newer-than check in `set_guardian_base_branch_if_newer`
+                        // accepts the apply regardless of when this test runs.
+                        "updated_at": "2099-01-01T00:00:00Z",
+                    });
+                    req.respond(
+                        tiny_http::Response::from_string(state.to_string()).with_status_code(200),
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let root_dir = tmp_dir("fork-remote-collision");
+        g(&root_dir, &["init"]);
+        // The only remote this repo has is named "alt" -- both `base_branch`
+        // (in `<remote>/<branch>` form) and the registered fork use it,
+        // exactly like a repo whose only push-able remote for the project's
+        // real GitHub repo happens to also be the one a fork row names.
+        g(
+            &root_dir,
+            &["remote", "add", "alt", "https://github.com/acme/widget.git"],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(Mutex::new(store()));
+        store
+            .lock()
+            .unwrap()
+            .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .upsert_project_fork(
+                "demo",
+                "",
+                "https://github.com/acme/widget.git",
+                "alt",
+                "acme",
+            )
+            .unwrap();
+
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "alt/main", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store
+                .lock()
+                .unwrap()
+                .add_guardian_branch(&gid, branch)
+                .unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .unwrap()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some(&ids[0]),
+                "github",
+                "acme/widget",
+                "a-alias",
+                "main",
+                "Add a",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .create_pull_request(
+                &gid,
+                Some(&ids[1]),
+                "github",
+                "acme/widget",
+                "b-alias",
+                "a-alias",
+                "Add b",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+
+        // Round 1: the fork-excluded parent remote can't strip "alt/" off
+        // base_branch, so this correctly reports a base mismatch.
+        let drift = detect_forge_reorder(&store, &gid)
+            .unwrap()
+            .expect("base_branch's own remote is fork-excluded, so a mismatch is expected here");
+        assert!(drift.base_changed, "expected the base to look drifted");
+
+        // Apply it through the exact same helper `check_and_apply_forge_reorder`'s
+        // apply block calls, so this test breaks if that call site ever
+        // drifts back to a plain, non-excluding remote resolution.
+        let forge_cfg = crate::config::resolve_forge(&root_dir);
+        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg);
+        let local_base = qualify_forge_base("alt/main", &remote_name, &drift.base);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .set_guardian_base_branch_if_newer(&gid, &local_base, drift.base_changed_at_ms)
+                .unwrap(),
+            "the newer-than check must accept this apply"
+        );
+
+        // Round 2: re-checking against the value just written must come back
+        // clean -- this is the property that was broken before the fix.
+        assert_eq!(
+            detect_forge_reorder(&store, &gid).unwrap(),
+            None,
+            "applying the reported drift once must make the next detection pass agree \
+             nothing is left to fix, instead of looping forever"
+        );
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
     #[test]
     fn poll_pr_base_drift_is_a_noop_for_a_review_with_no_submitted_prs() {
         let store = Arc::new(Mutex::new(store()));
@@ -8584,6 +8928,155 @@ mod tests {
     }
 
     #[test]
+    fn submit_stacked_branch_pr_reconciles_a_diverged_remote_alias_instead_of_failing() {
+        // A branch whose PR was previously dropped/unlinked (or whose remote
+        // alias a reviewer pushed straight to) can have a remote branch that
+        // already carries a commit this review worktree doesn't. Before this
+        // fix, `guard_against_clobber` would refuse the push outright and
+        // the whole PR creation would fail. Now `submit_stacked_branch_pr`
+        // must reconcile (pull the remote's extra commit into the worktree)
+        // and complete the submission instead.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/w/pulls");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number":42,"html_url":"http://x/42"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+
+        let root = tmp_dir("reconcile-push-root");
+        let remote_dir = tmp_dir("reconcile-push-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
+
+        // Simulate the real-world case: someone (a reviewer, or a prior
+        // submission attempt before its PR row got unlinked) pushed a commit
+        // straight to the remote alias that this worktree never received.
+        let clone_dir = tmp_dir("reconcile-push-clone");
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        g(
+            clone_dir.parent().unwrap(),
+            &[
+                "clone",
+                remote_dir.to_str().unwrap(),
+                clone_dir.file_name().unwrap().to_str().unwrap(),
+            ],
+        );
+        g(&clone_dir, &["checkout", "pr-y"]);
+        gwrite(&clone_dir, "reviewer.txt", "preserve this remote commit\n");
+        g(&clone_dir, &["add", "."]);
+        g(&clone_dir, &["commit", "--message", "reviewer fix"]);
+        g(&clone_dir, &["push", "origin", "pr-y"]);
+        let reviewer_sha = g(&clone_dir, &["rev-parse", "pr-y"]).trim().to_string();
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: Some("Title".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+        )
+        .expect("submission must reconcile the diverged remote alias instead of erroring");
+
+        assert_eq!(pr.pr_number, Some(42));
+        assert_eq!(pr.branch_alias, "pr-y");
+
+        // The reviewer's commit made it into the local review branch...
+        g(
+            &root,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &reviewer_sha,
+                "review-branch",
+            ],
+        );
+        // ...and the remote alias now matches what was actually pushed back.
+        assert_eq!(
+            g(&remote_dir, &["rev-parse", "pr-y"]).trim(),
+            g(&root, &["rev-parse", "review-branch"]).trim()
+        );
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
     fn list_pull_requests_for_guardian_is_ordered() {
         let s = store();
         let gid = s.create_guardian("demo", "main", "/repo").unwrap();
@@ -8911,6 +9404,105 @@ mod tests {
     #[test]
     fn parse_suggested_pr_rejects_garbage() {
         assert!(parse_suggested_pr("no json here").is_none());
+    }
+
+    struct CapturingFailureRunner(Mutex<Option<RunnerSpec>>);
+
+    impl Runner for CapturingFailureRunner {
+        fn run(&self, spec: &RunnerSpec) -> crate::runner::RunnerResult {
+            *self.0.lock().unwrap() = Some(spec.clone());
+            crate::runner::RunnerResult::failure("writer unavailable")
+        }
+    }
+
+    #[test]
+    fn pr_text_uses_only_the_branchs_unique_range_and_never_the_review_summary() {
+        let root = tmp_dir("pr-text-unique-range");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+
+        for (branch, file, subject) in [
+            ("review/a", "a.txt", "add predecessor behavior"),
+            ("review/b", "b.txt", "add this branch behavior"),
+            ("review/c", "c.txt", "add downstream behavior"),
+        ] {
+            g(&root, &["checkout", "-b", branch]);
+            gwrite(&root, file, &format!("{subject}\n"));
+            g(&root, &["add", "."]);
+            g(&root, &["commit", "--message", subject]);
+        }
+        g(&root, &["checkout", "main"]);
+
+        let store = store();
+        let gid = store
+            .create_guardian("whole-review", "main", root.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b", "c"] {
+            store.add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids = store
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|branch| branch.id.clone())
+            .collect::<Vec<_>>();
+        for ((id, review_branch), worktree) in ids
+            .iter()
+            .zip(["review/a", "review/b", "review/c"])
+            .zip(["worktree-a", "worktree-b", "worktree-c"])
+        {
+            store
+                .set_branch_review(&gid, id, review_branch, worktree)
+                .unwrap();
+        }
+        store
+            .set_guardian_summary(
+                &gid,
+                "predecessor and downstream contaminated review summary",
+                Some("claude-code"),
+                None,
+            )
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let runner = CapturingFailureRunner(Mutex::new(None));
+
+        let (title, description) = synthesize_pr_text(
+            &runner,
+            &guardian,
+            1,
+            Some("## Summary\n\n<!-- fill this in -->"),
+            None,
+        );
+
+        assert_eq!(title, "b");
+        assert!(description.starts_with("## Summary"), "{description}");
+        assert!(
+            description.contains("add this branch behavior"),
+            "{description}"
+        );
+        assert!(!description.contains("predecessor"), "{description}");
+        assert!(!description.contains("downstream"), "{description}");
+        assert_eq!(
+            fallback_pr_description(
+                "commit abc\nsubject: add this branch behavior\n\nbody\n---\n",
+                None,
+            ),
+            "- add this branch behavior"
+        );
+
+        let spec = runner.0.lock().unwrap().clone().unwrap();
+        assert_eq!(spec.cwd, "worktree-b");
+        let prompt = spec.prompt.unwrap();
+        assert!(prompt.contains("add this branch behavior"), "{prompt}");
+        assert!(prompt.contains("b.txt"), "{prompt}");
+        assert!(!prompt.contains("add predecessor behavior"), "{prompt}");
+        assert!(!prompt.contains("add downstream behavior"), "{prompt}");
+        assert!(prompt.contains("<!-- fill this in -->"), "{prompt}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ── RAL-317: maybe_auto_submit_branch (per-branch auto-submit trigger) ──
