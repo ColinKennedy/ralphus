@@ -596,37 +596,39 @@
         for (const item of ttDisplayItems) if (item.type === "task") taskTabExpanded.delete(/** @type {TtRow} */ (item.row).key);
         renderTasksTab();
       }
+      // RALPHUS-TT-FILTER-SELECTION-SCROLL:BEGIN
       /**
-       * Updates the name filter (RAL-362 §2). Mirrors `onFilter`'s squads-tab pattern -- mutate + re-render the list, without rebuilding the toolbar itself (which would fight the user's typing).
+       * Updates the name filter (RAL-362 §2). Mirrors `onFilter`'s squads-tab pattern -- mutate + re-render the list, without rebuilding the toolbar itself (which would fight the user's typing). Re-centers the retained selection (RAL-383) now that filtering may have changed its position or visibility.
        * @param {string} v
        * @returns {void}
        */
-      function ttSetNameFilter(v) { taskTabFilters.q = v.toLowerCase(); renderTasksTab(); syncHash(); }
+      function ttSetNameFilter(v) { taskTabFilters.q = v.toLowerCase(); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
       /**
-       * Toggles the "show hidden" (include tasks of hidden squads) filter.
+       * Toggles the "show hidden" (include tasks of hidden squads) filter. Re-centers the retained selection (RAL-383).
        * @param {boolean} on
        * @returns {void}
        */
-      function ttToggleShowHidden(on) { taskTabFilters.showHidden = on; renderTasksTab(); syncHash(); }
+      function ttToggleShowHidden(on) { taskTabFilters.showHidden = on; renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
       /**
-       * Toggles the "needs me" filter.
+       * Toggles the "needs me" filter. Re-centers the retained selection (RAL-383).
        * @param {boolean} on
        * @returns {void}
        */
-      function ttToggleNeedsMe(on) { taskTabFilters.needsMe = on; renderTasksTab(); syncHash(); }
+      function ttToggleNeedsMe(on) { taskTabFilters.needsMe = on; renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
       /**
-       * Shows or hides one status in the toolbar's status filter.
+       * Shows or hides one status in the toolbar's status filter. Re-centers the retained selection (RAL-383).
        * @param {string} s
        * @param {boolean} on
        * @returns {void}
        */
-      function ttToggleStatus(s, on) { if (on) taskTabFilters.status.add(s); else taskTabFilters.status.delete(s); renderTasksTab(); syncHash(); }
+      function ttToggleStatus(s, on) { if (on) taskTabFilters.status.add(s); else taskTabFilters.status.delete(s); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
       /**
-       * Shows or hides every status at once (the toolbar's all/none shortcuts) -- rebuilds the checkbox list since every box's checked state changes at once.
+       * Shows or hides every status at once (the toolbar's all/none shortcuts) -- rebuilds the checkbox list since every box's checked state changes at once. Re-centers the retained selection (RAL-383).
        * @param {boolean} on
        * @returns {void}
        */
-      function ttAllStatus(on) { taskTabFilters.status = on ? new Set(STATES) : new Set(); renderTtStatusFilters(); renderTasksTab(); syncHash(); }
+      function ttAllStatus(on) { taskTabFilters.status = on ? new Set(STATES) : new Set(); renderTtStatusFilters(); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
+      // RALPHUS-TT-FILTER-SELECTION-SCROLL:END
       /**
        * Renders the toolbar's per-state checkboxes and syncs the filter input/checkboxes to `taskTabFilters` -- called on load and whenever filters are reset wholesale, never on every poll (which would fight the user's typing/checking).
        * @returns {void}
@@ -779,8 +781,9 @@
         if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
         renderTasksTab();
       }
+      // RALPHUS-TT-SCROLL-SELECTION:BEGIN
       /**
-       * Scrolls the currently-selected row into view by its computed offset in `ttDisplayItems` (RAL-362 §7) -- under virtualization the selected row may not be mounted, so this computes its position rather than querying the DOM for it.
+       * Scrolls the currently-selected row into view by its computed offset in `ttDisplayItems` (RAL-362 §7, RAL-383) -- under virtualization the selected row may not be mounted, so this computes its position rather than querying the DOM for it. A no-op when the selection isn't (or is no longer, post-filter) present in `ttDisplayItems`.
        * @returns {void}
        */
       function ttScrollSelectionIntoView() {
@@ -797,6 +800,7 @@
         wrap.scrollTop = Math.max(0, targetTop - wrap.clientHeight / 2 + TT_ROW_H / 2);
         ttRenderVisibleRows();
       }
+      // RALPHUS-TT-SCROLL-SELECTION:END
       /**
        * Renders the read-only task details pane (RAL-362 §6): header/needs-you/kv/reviews/cells/task-scope-proof, plus an on-demand PR check. The watch star in its header is the only interactive control -- no action buttons live here.
        * @returns {void}
