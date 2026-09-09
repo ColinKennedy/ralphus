@@ -1957,10 +1957,7 @@ fn signature(n: &HelpNode) -> String {
 
 fn display_chip(chip: &str) -> String {
     let name = chip.split_whitespace().next().unwrap_or(chip);
-    if matches!(
-        name,
-        "selector" | "squad_id" | "entity_uri" | "pr_id" | "--entity" | "--for"
-    ) {
+    if matches!(name, "selector" | "entity_uri" | "--entity" | "--for") {
         chip.replacen("[str", "[uri", 1)
     } else {
         chip.to_string()
@@ -2060,7 +2057,7 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// The `selector [str]` chip's grammar, spelled out with concrete examples
+/// The `selector [uri]` chip's grammar, spelled out with concrete examples
 /// (RAL-376) -- both the legacy path form (`cli/src/selector.rs`'s
 /// `parse_squad_selector`) and the RAL-188 URI form
 /// (`core/src/uri.rs`) resolve to the same squad/task/cell/proof
@@ -2069,7 +2066,7 @@ const SELECTOR_GRAMMAR: &str = "e.g. squad-000000000001/build/0 (squad/task/cell
 squad-000000000001/build/proof/0 (proof path); also accepts the RAL-188 URI form, e.g. \
 ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001";
 
-/// The `entity_uri [str]` chip's grammar, mirrored from
+/// The `entity_uri [uri]` chip's grammar, mirrored from
 /// `daemon/src/entity_uri.rs`/`cli/src/entity_uri.rs`'s `EntityUri` (RAL-155)
 /// -- kept in sync with that grammar by hand since it has no shared constant
 /// of its own to import here.
@@ -2455,7 +2452,17 @@ mod tests {
         assert!(map.contains("- cell"));
         assert!(map.contains("        - edit selector [uri]"));
         assert!(map.contains("--entity [uri] --for [uri]"));
-        assert!(!map.contains("        - edit selector [str]"));
+        for raw_uri_chip in [
+            "selector [str]",
+            "entity_uri [str]",
+            "--entity [str]",
+            "--for [str]",
+        ] {
+            assert!(
+                !map.contains(raw_uri_chip),
+                "URI argument still rendered as a string: {raw_uri_chip}"
+            );
+        }
 
         let full = full_output();
         for example in [
