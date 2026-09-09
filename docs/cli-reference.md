@@ -644,7 +644,7 @@ use; see `READ_ONLY_NOTE`.
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [str] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
-        - feedback selector [str] text [str]  {Post feedback on one branch, triggering a resolver re-attempt.}
+        - feedback selector [str] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - force-start selector [str]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
         - (read-only-safe) logs selector [str]  {Show a review's state-transition audit log.}
