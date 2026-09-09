@@ -2693,6 +2693,16 @@ pub fn check_and_apply_forge_reorder(
                 WARNING,
                 "ralphus [pr] review {id} forge reorder check failed: {e}"
             );
+            let guard = store.lock().expect("poisoned");
+            crate::cartographer::Note::new("pr")
+                .guardian(id)
+                .scope("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    "forge reorder check failed",
+                    serde_json::json!({"error": e.to_string()}),
+                );
             return false;
         }
     };

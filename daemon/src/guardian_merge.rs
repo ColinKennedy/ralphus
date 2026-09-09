@@ -7998,6 +7998,19 @@ pub fn poll_base_branch_freshness_once(store: &Arc<Mutex<Store>>) {
                     target.base_branch,
                     target.root.display()
                 );
+                let guard = store.lock().expect("poisoned");
+                crate::cartographer::Note::new("guardian")
+                    .scope("guardian")
+                    .level(crate::logging::LogLevel::DEBUG)
+                    .emit(
+                        &guard,
+                        "base-branch freshness fetch skipped",
+                        serde_json::json!({
+                            "base_branch": target.base_branch,
+                            "git_root": target.root,
+                            "error": e.to_string(),
+                        }),
+                    );
             }
         });
     }
