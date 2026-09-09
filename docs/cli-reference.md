@@ -236,7 +236,7 @@ aborts the remaining batch).
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
 | `review approve <selector>` | Approve an in_review review |
-| `review feedback <selector#branch> <text> [--author name]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted |
+| `review feedback <selector#branch> <text> [--author name] [--replace] [--cancel-and-replace]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted. By default, successive feedback for one branch queues in submission order without discarding anything. `--replace` supersedes only feedback still queued (not yet started); `--cancel-and-replace` also stops an actively-running resolver attempt (RAL-387); the two are mutually exclusive |
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
 | `review upstream list <selector>` | Candidate upstream branches |
@@ -644,7 +644,7 @@ use; see `READ_ONLY_NOTE`.
         - delete selector [str] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [str]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [str] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
-        - feedback selector [str] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
+        - feedback selector [str] text [str] --author [name] --replace --cancel-and-replace  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted. By default, successive feedback for one branch queues in submission order without discarding anything. --replace supersedes only feedback still queued (not yet started); --cancel-and-replace also stops an actively-running resolver attempt (RAL-387); the two are mutually exclusive.}
         - force-start selector [str]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
         - (read-only-safe) logs selector [str]  {Show a review's state-transition audit log.}

@@ -254,6 +254,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             selector,
             text,
             author,
+            replace,
+            cancel_and_replace,
         } => {
             let resolved = resolve_branch(client, &selector)?;
             Ok(client.guardian_feedback(
@@ -261,6 +263,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 resolved.branch_id.as_deref().unwrap_or_default(),
                 &text,
                 author.as_deref(),
+                replace,
+                cancel_and_replace,
             )?)
         }
         ReviewCommand::DismissReenable { selector } => {

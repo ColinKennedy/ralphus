@@ -161,6 +161,14 @@ pub enum ReviewCommand {
         /// to. Defaults server-side to the authenticated/default submitter
         /// when absent.
         author: Option<String>,
+        /// RAL-387: supersede every request still queued (not yet started)
+        /// for this branch. An actively-running request is left to finish --
+        /// use `cancel_and_replace` to also interrupt that.
+        replace: bool,
+        /// RAL-387: like `replace`, and additionally cancel a request that
+        /// is actively running for this branch (stops the resolver agent
+        /// rather than letting it finish).
+        cancel_and_replace: bool,
     },
     DismissReenable {
         selector: String,
@@ -472,12 +480,21 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("approve") => with_selector(scanner, |selector| ReviewCommand::Approve { selector }),
         Some("feedback") => {
             let author = scanner.take_value("--author").ok().flatten();
+            let replace = scanner.take_bool("--replace");
+            let cancel_and_replace = scanner.take_bool("--cancel-and-replace");
+            if replace && cancel_and_replace {
+                return ReviewCommand::UsageError(
+                    "--replace and --cancel-and-replace are mutually exclusive".to_string(),
+                );
+            }
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
                 (Some(selector), Some(text)) => ReviewCommand::Feedback {
                     selector: selector.clone(),
                     text: text.clone(),
                     author,
+                    replace,
+                    cancel_and_replace,
                 },
                 _ => ReviewCommand::UsageError("feedback requires <selector> <text>".to_string()),
             }
@@ -1418,6 +1435,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             selector,
             text,
             author,
+            replace,
+            cancel_and_replace,
         } => {
             let resolved = match resolve_branch(opts, &client, &selector) {
                 Ok(r) => r,
@@ -1428,6 +1447,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 resolved.branch_id.as_deref().unwrap_or_default(),
                 &text,
                 author.as_deref(),
+                replace,
+                cancel_and_replace,
             ) {
                 Ok(result) => {
                     emit(opts, &result, |_| println!("feedback posted on {selector}"));
@@ -2930,11 +2951,68 @@ mod tests {
                 selector,
                 text,
                 author,
+                replace,
+                cancel_and_replace,
             } => {
                 assert_eq!(selector, "g1~0");
                 assert_eq!(text, "please fix");
                 assert_eq!(author, None);
+                assert!(!replace);
+                assert!(!cancel_and_replace);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_feedback_replace_flag() {
+        match parse(&v(&["feedback", "--replace", "g1~0", "please fix"])) {
+            ReviewCommand::Feedback {
+                selector,
+                text,
+                replace,
+                cancel_and_replace,
+                ..
+            } => {
+                assert_eq!(selector, "g1~0");
+                assert_eq!(text, "please fix");
+                assert!(replace);
+                assert!(!cancel_and_replace);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_feedback_cancel_and_replace_flag() {
+        match parse(&v(&[
+            "feedback",
+            "--cancel-and-replace",
+            "g1~0",
+            "please fix",
+        ])) {
+            ReviewCommand::Feedback {
+                replace,
+                cancel_and_replace,
+                ..
+            } => {
+                assert!(!replace);
+                assert!(cancel_and_replace);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feedback_replace_and_cancel_and_replace_are_mutually_exclusive() {
+        match parse(&v(&[
+            "feedback",
+            "--replace",
+            "--cancel-and-replace",
+            "g1~0",
+            "please fix",
+        ])) {
+            ReviewCommand::UsageError(_) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -2948,6 +3026,7 @@ mod tests {
                 selector,
                 text,
                 author,
+                ..
             } => {
                 assert_eq!(selector, "g1~0");
                 assert_eq!(text, "please fix");

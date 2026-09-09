@@ -1596,6 +1596,16 @@ message, action? } }` — `base_change` (same shape `POST .../base` returns)
 is present only when this request's side effect actually changed the
 merge's in-flight state.
 
+RAL-387: this restart (and every other merge/rebase trigger) holds the
+review's worktree-ownership lock for write for the whole rebuild, which a
+feedback pass (any branch, any project of this review) holds for read — so
+a merge/rebase started here always waits for every in-flight feedback pass
+across the whole review to finish first, and no feedback can start applying
+until this rebuild (even one still only queued behind the global concurrency
+cap, not yet doing real work) releases it. This is a real lock, not a
+best-effort signal: at most one of "a merge/rebase" or "feedback for project
+P" ever mutates a given project's worktrees at a time.
+
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered
 list of branch names:
@@ -1808,18 +1818,50 @@ never shown in the UI, and still just caller-claimed via `X-Ralphus-User`
 until RAL-252 makes authentication authoritative.
 
 Populated by `POST .../branches/{branch_id}/feedback`, body
-`{ "feedback": "...", "author"?: "alice" }`. `feedback` must be non-empty
-(`400` otherwise). `author` is optional and, if given, must already be a
-registered user (`400 unknown_user` otherwise) — it defaults to the resolved
-submitter when omitted. There is deliberately no `submitted_by` request
-field: the submitter always comes from the authenticated request context
-(`X-Ralphus-User` / `[daemon].default_user`) and can never be set by request
-data. The reviewer's feedback text is persisted immediately (`role:
-"reviewer"`), and a short conversational acknowledgment from the guardian
-follows in the background (`role: "guardian"`), generated via
-`chat_client::call_direct`. The board shows this thread only once a branch's
-detail view is expanded and it has at least one message — otherwise it shows
-a "No feedback yet" placeholder pointing at the `feedback` command above.
+`{ "feedback": "...", "author"?: "alice", "mode"?: "queue" }`. `feedback`
+must be non-empty (`400` otherwise). `author` is optional and, if given,
+must already be a registered user (`400 unknown_user` otherwise) — it
+defaults to the resolved submitter when omitted. There is deliberately no
+`submitted_by` request field: the submitter always comes from the
+authenticated request context (`X-Ralphus-User` / `[daemon].default_user`)
+and can never be set by request data. The reviewer's feedback text is
+persisted immediately (`role: "reviewer"`), and a short conversational
+acknowledgment from the guardian follows in the background (`role:
+"guardian"`), generated via `chat_client::call_direct`. The board shows this
+thread only once a branch's detail view is expanded and it has at least one
+message — otherwise it shows a "No feedback yet" placeholder pointing at the
+`feedback` command above.
+
+`mode` (RAL-387) controls how this request interacts with feedback already
+queued or actively running for this branch — applied in the background by a
+single per-project worker that drains every branch's queued "reviewer"
+messages oldest-first, one at a time, so two feedback passes for branches in
+the same project (and a feedback pass and a live merge/rebase for the same
+guardian) never race the same worktree:
+- `"queue"` (the default, also used when `mode` is omitted): append behind
+  whatever is already queued or running for this branch. Discards nothing.
+- `"replace"`: supersede every request still queued (not yet started) for
+  this branch. A request that is actively running is left to finish
+  untouched — it still lands, just under a `superseded` `action_status` on
+  its own message once a newer request has queued behind it.
+- `"cancel_and_replace"`: like `"replace"`, and additionally cancel a
+  request that is actively running for this branch (stops the resolver
+  agent rather than letting it finish). An unrecognized `mode` value is
+  `400 bad_request`.
+
+Each "reviewer" message's `action_status` (RAL-380, omitted from the JSON
+example above for brevity) reflects this lifecycle: `received` while queued
+or actively running, then `done`/`failed` once its own resolver pass
+finishes, or `superseded` if a `replace`/`cancel_and_replace` request
+overtook it first.
+
+A `received` message also carries `active` (RAL-387, `true`/`false`, omitted
+for every other `action_status`): `true` for the one message a resolver
+agent is actually acting on right now, `false` for a message still queued
+behind another request in the same project. This is resolved from the live
+cancellation registry on every read, not stored on the row, so it reflects
+the current moment rather than whatever was true when the message was
+inserted.
 
 ### `POST /api/guardians/{id}/pull-requests`
 Submit one or more PRs/MRs for a review (RAL-117). Body:
@@ -2131,6 +2173,14 @@ doesn't exist. Refuses (`4xx`, via the same guard `pull-from-pr` exists to
 resolve — see below) rather than force-pushing over a PR branch that has
 commits the review worktree doesn't, e.g. a reviewer pushed a fix directly to
 the open PR branch instead of leaving a comment (RAL-190).
+
+RAL-387: holds the same worktree-ownership locks as
+`POST .../branches/{branch_id}/feedback` (the review-wide read guard, plus
+the addressed branch's project write guard) — a live merge/rebase, or
+another feedback pass in the same project, delays this rather than racing
+it. Unlike that endpoint, this always synthesizes its feedback from forge
+comments (there is no single stored "reviewer" message to mark), so
+`--replace`/`--cancel-and-replace` semantics do not apply here.
 
 ### `GET /api/pull-requests/{pr_id}/sync-status`
 Live drift check between the PR's remote `branch_alias` branch and its owning

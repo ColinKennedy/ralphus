@@ -470,8 +470,8 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     node(
         "feedback",
         &["selector [str]", "text [str]"],
-        &["--author [name]"],
-        "Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.",
+        &["--author [name]", "--replace", "--cancel-and-replace"],
+        "Post feedback on one branch, triggering a resolver re-attempt. By default, successive feedback for one branch queues behind whatever is already there -- nothing is discarded. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted. --replace supersedes only feedback still queued (not yet started) for this branch, leaving an actively-running resolver attempt to finish undisturbed. --cancel-and-replace does the same but additionally stops an actively-running resolver attempt rather than letting it finish (RAL-387); --replace and --cancel-and-replace are mutually exclusive.",
         false,
         false,
         &[],

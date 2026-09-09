@@ -1344,15 +1344,26 @@ impl DaemonClient {
         )
     }
 
+    /// `replace`/`cancel_and_replace` are mutually exclusive (checked by the
+    /// CLI parser before this is ever called); at most one may be `true`.
+    /// See `ReviewCommand::Feedback`'s field docs for the exact scope of
+    /// each (RAL-387).
     pub fn guardian_feedback(
         &self,
         guardian_id: &str,
         branch_id: &str,
         feedback: &str,
         author: Option<&str>,
+        replace: bool,
+        cancel_and_replace: bool,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({"feedback": feedback});
         set_if_some(&mut body, "author", author.map(str::to_string));
+        if cancel_and_replace {
+            body["mode"] = json!("cancel_and_replace");
+        } else if replace {
+            body["mode"] = json!("replace");
+        }
         self.post(
             &format!("/api/guardians/{guardian_id}/branches/{branch_id}/feedback"),
             Some(body),

@@ -16,11 +16,13 @@ use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
 use ralphus_daemon::guardian::{GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus};
 use ralphus_daemon::guardian_merge::{
-    pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
+    FeedbackMode, pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
     rebuild_on_base_shift, reopen_cancelled_guardian_merge, reopen_straggler,
-    restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
-    stop_guardian_merge, stop_merge_worker_for_cancel,
+    restart_guardian_merge, run_feedback, run_merge, run_merge_staged,
+    spawn_feedback_project_worker, start_feedback, start_merge, stop_guardian_merge,
+    stop_merge_worker_for_cancel,
 };
+use ralphus_daemon::named_lock::NamedLocks;
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
@@ -434,6 +436,7 @@ fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 202, "body={}", reply.body);
     assert!(
@@ -473,6 +476,7 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 202, "body={}", reply.body);
     assert!(
@@ -521,6 +525,7 @@ fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 500, "body={}", reply.body);
 
@@ -1136,8 +1141,14 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
         "the crash-simulated pending feedback must be durably findable"
     );
 
-    // Simulate daemon restart recovery: reapply every branch's pending
-    // feedback exactly as `scheduler::recover_interrupted_reviews` does.
+    // Simulate daemon restart recovery by replaying `run_feedback` directly
+    // over `branches_with_pending_feedback`'s durable record -- this checks
+    // that record's own durability/clearing contract, not the real recovery
+    // entry point itself (which, since RAL-387, discovers work via
+    // `guardians_with_received_feedback`/`received_feedback_messages`
+    // instead, to cover a queue of several outstanding messages rather than
+    // just one; see `recovery_replays_every_queued_feedback_message_after_a_simulated_restart`
+    // below for a test through the real `scheduler::recover_interrupted_reviews`).
     let pending = store
         .lock()
         .unwrap()
@@ -1179,6 +1190,111 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
             .unwrap()
             .is_empty(),
         "resumed feedback must clear its own pending record on completion"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn recovery_discovers_every_guardian_with_a_queued_feedback_message() {
+    // RAL-387: crash recovery must discover a branch's *entire* queue of
+    // still-`received` messages (not just reattach to the single one the old
+    // `pending_feedback` column tracked) -- `scheduler::recover_interrupted_reviews`
+    // itself always builds a real `SubprocessRunner` internally (not
+    // injectable), so a hermetic test can't run it end-to-end without a real
+    // agent CLI; this instead proves its actual *discovery* query --
+    // `Store::guardians_with_received_feedback` /
+    // `Store::received_feedback_messages`, the new replacement for
+    // `branches_with_pending_feedback` -- finds every queued message across
+    // a restart, then replays them the same way `spawn_feedback_project_worker`
+    // does (oldest first) with a fake runner standing in for the real one.
+    let (root, store, id) = single_feature_repo();
+    let remote_dir = add_bare_remote(&root);
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // Simulate: two `POST .../feedback` requests were received and
+    // durably recorded (`add_guardian_message` always does this
+    // synchronously, before any worker thread even spawns) but the daemon
+    // was killed before either was ever actioned.
+    let seq_a = store
+        .lock()
+        .unwrap()
+        .add_guardian_message(
+            &id,
+            "reviewer",
+            "first change",
+            None,
+            Some(&bid0),
+            None,
+            None,
+        )
+        .unwrap();
+    let seq_b = store
+        .lock()
+        .unwrap()
+        .add_guardian_message(
+            &id,
+            "reviewer",
+            "second change",
+            None,
+            Some(&bid0),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let with_feedback = store
+        .lock()
+        .unwrap()
+        .guardians_with_received_feedback()
+        .unwrap();
+    assert_eq!(with_feedback, vec![id.clone()]);
+    let queued = store
+        .lock()
+        .unwrap()
+        .received_feedback_messages(&id)
+        .unwrap();
+    assert_eq!(
+        queued,
+        vec![
+            (bid0.clone(), seq_a, "first change".to_string()),
+            (bid0.clone(), seq_b, "second change".to_string()),
+        ],
+        "recovery's discovery query must find both queued messages, oldest first"
+    );
+
+    // Replay exactly like `resume_feedback` does for each discovered
+    // project (a fake runner standing in for its real `SubprocessRunner`).
+    spawn_feedback_project_worker(
+        store.clone(),
+        Arc::new(FeedbackRunner),
+        NamedLocks::new(),
+        Cancellations::new(),
+        Arc::new(Semaphore::new(4)),
+        &id,
+        root.to_str().unwrap(),
+    );
+
+    let status_a = poll_message_status(&store, &id, &bid0, seq_a);
+    let status_b = poll_message_status(&store, &id, &bid0, seq_b);
+    assert_eq!(
+        status_a.as_deref(),
+        Some("done"),
+        "the first queued message must be reapplied"
+    );
+    assert_eq!(
+        status_b.as_deref(),
+        Some("done"),
+        "the second queued message must also be reapplied, not dropped"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1392,11 +1508,15 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     let reply = start_feedback(
         store.clone(),
         Arc::new(FeedbackRunner),
+        NamedLocks::new(),
+        Cancellations::new(),
+        Arc::new(Semaphore::new(4)),
         &id,
         &bid0,
         "please add a note file".to_string(),
         Some("alice".to_string()),
         Some("bob".to_string()),
+        FeedbackMode::Queue,
     );
     assert_eq!(reply.status, 202);
 
@@ -1424,6 +1544,1192 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // Let the background apply + best-effort reply generation finish before
     // the repo is removed out from under it.
     std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Add a bare local "origin" remote to `root` -- without one, every feedback
+/// commit's push fails (there is nothing to push to), so its message ends up
+/// `failed` even though the edit itself landed. The concurrency tests below
+/// care about queueing/replacement, not push mechanics, so they need a real
+/// `done` outcome to assert against. Returns the remote's directory for the
+/// caller to clean up alongside `root`.
+fn add_bare_remote(root: &Path) -> PathBuf {
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    remote_dir
+}
+
+fn poll_message_status(
+    store: &Arc<Mutex<Store>>,
+    id: &str,
+    branch_id: &str,
+    seq: i64,
+) -> Option<String> {
+    // Generous (120s) budget, matching this file's other polls of real
+    // background git/agent work -- under full-suite parallel load many
+    // worktree-heavy tests contend for CPU/disk at once.
+    for _ in 0..24000 {
+        let msgs = store
+            .lock()
+            .unwrap()
+            .guardian_branch_messages(id, branch_id)
+            .unwrap();
+        if let Some(m) = msgs.iter().find(|m| m.seq == seq) {
+            if m.action_status.as_deref().is_some_and(|s| s != "received") {
+                return m.action_status.clone();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+#[test]
+fn successive_feedback_on_one_branch_queues_in_submission_order_by_default() {
+    // RAL-387: the default (no `--replace`/`--cancel-and-replace`) mode must
+    // apply successive feedback for one branch in submission order, without
+    // silently discarding either message.
+    let (root, store, id) = single_feature_repo();
+    let remote_dir = add_bare_remote(&root);
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    struct SequencingRunner {
+        order: Arc<Mutex<Vec<String>>>,
+    }
+    impl Runner for SequencingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            // Only the feedback edit call itself matters here -- a
+            // subsequent final-proof pass on the same branch reuses this
+            // runner too, but must not be recorded as a second feedback
+            // application.
+            if spec.task != "feedback" {
+                return RunnerResult {
+                    status: "done".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
+                    cost_usd: 0.0,
+                    cost_is_estimated: false,
+                    summary: "noop".into(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                };
+            }
+            // Small delay so an implementation that (incorrectly) let two
+            // submissions race would have a real chance to interleave.
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+            self.order
+                .lock()
+                .unwrap()
+                .push(spec.prompt.clone().unwrap_or_default());
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "edited".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let runner: Arc<dyn Runner> = Arc::new(SequencingRunner {
+        order: Arc::clone(&order),
+    });
+    let guardian_locks = NamedLocks::new();
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+
+    let reply_a = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "first change".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(reply_a.status, 202);
+    let reply_b = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "second change".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(reply_b.status, 202);
+
+    let (seq_a, seq_b) = {
+        let msgs = store
+            .lock()
+            .unwrap()
+            .guardian_branch_messages(&id, &bid0)
+            .unwrap();
+        (msgs[0].seq, msgs[1].seq)
+    };
+    // Wait for both to reach a terminal status -- that's the real signal
+    // both runner calls finished (including their own final-proof/push
+    // steps), not just that the edit call itself returned.
+    let status_a = poll_message_status(&store, &id, &bid0, seq_a);
+    let status_b = poll_message_status(&store, &id, &bid0, seq_b);
+
+    let applied = order.lock().unwrap().clone();
+    assert_eq!(
+        applied.len(),
+        2,
+        "both requests must be applied, none dropped"
+    );
+    assert!(
+        applied[0].contains("first change") && applied[1].contains("second change"),
+        "must apply in submission order, got: {applied:#?}"
+    );
+
+    assert_eq!(
+        status_a.as_deref(),
+        Some("done"),
+        "default mode must not discard/supersede either message"
+    );
+    assert_eq!(
+        status_b.as_deref(),
+        Some("done"),
+        "default mode must not discard/supersede either message"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn replace_supersedes_only_the_queued_request_not_the_active_one() {
+    // RAL-387 Q2/Q3: `--replace` supersedes a request still queued (not yet
+    // started) but must leave one that is actively running untouched.
+    let (root, store, id) = single_feature_repo();
+    let remote_dir = add_bare_remote(&root);
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    struct GateRunner {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+    impl Runner for GateRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            // A final-proof pass on the same branch reuses this runner too
+            // (after the feedback call below already made the branch dirty)
+            // -- only the feedback edit call itself should gate.
+            if spec.task != "feedback" {
+                return RunnerResult {
+                    status: "done".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
+                    cost_usd: 0.0,
+                    cost_is_estimated: false,
+                    summary: "noop".into(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                };
+            }
+            self.started.store(true, Ordering::SeqCst);
+            for _ in 0..4000 {
+                if cancel.is_cancelled() {
+                    return RunnerResult::failure("cancelled");
+                }
+                if self.release.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "edited".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let runner: Arc<dyn Runner> = Arc::new(GateRunner {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+    let guardian_locks = NamedLocks::new();
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+
+    // A: starts immediately and blocks in the gate.
+    let reply_a = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "A".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(reply_a.status, 202);
+    for _ in 0..2000 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(started.load(Ordering::SeqCst), "A never started");
+    let seq_a = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()[0]
+        .seq;
+
+    // B: queues behind A (never gets a runner call while A holds the gate).
+    let reply_b = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "B".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(reply_b.status, 202);
+    let seq_b = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()[1]
+        .seq;
+
+    // C replaces: must supersede B (still queued) but not touch A (active).
+    let reply_c = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "C".to_string(),
+        None,
+        None,
+        FeedbackMode::Replace,
+    );
+    assert_eq!(reply_c.status, 202);
+
+    // B is superseded right away -- no need to wait for A to release.
+    let msgs = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap();
+    assert_eq!(
+        msgs.iter()
+            .find(|m| m.seq == seq_b)
+            .unwrap()
+            .action_status
+            .as_deref(),
+        Some("superseded"),
+        "replace must supersede the queued request: {msgs:#?}"
+    );
+    assert_eq!(
+        msgs.iter()
+            .find(|m| m.seq == seq_a)
+            .unwrap()
+            .action_status
+            .as_deref(),
+        Some("received"),
+        "replace must not touch the actively-running request while it's still running: {msgs:#?}"
+    );
+
+    // Let A finish normally (not cancelled -- `Replace` never interrupts).
+    release.store(true, Ordering::SeqCst);
+
+    let a_status = poll_message_status(&store, &id, &bid0, seq_a);
+    assert_eq!(a_status.as_deref(), Some("done"), "A must finish normally");
+    let seq_c = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()[2]
+        .seq;
+    let c_status = poll_message_status(&store, &id, &bid0, seq_c);
+    assert_eq!(
+        c_status.as_deref(),
+        Some("done"),
+        "C must be applied after A"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn cancel_and_replace_stops_the_active_run_and_the_replacement_lands() {
+    // RAL-387 Q3: `--cancel-and-replace` additionally interrupts a request
+    // that is actively running (unlike plain `--replace`).
+    let (root, store, id) = single_feature_repo();
+    let remote_dir = add_bare_remote(&root);
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    // A single project has exactly one worker draining its queue at a time
+    // (see `spawn_feedback_project_worker`'s doc comment) -- whichever
+    // `start_feedback` call's spawned thread actually wins the project's
+    // lock keeps using the runner *it* was given for every message it goes
+    // on to drain, including one submitted by a differently-called
+    // `start_feedback` behind it. In production every call is given an
+    // equivalent real subprocess runner, so this never matters; here it
+    // means A and B must share one runner, which gates only its first
+    // "feedback"-task call (A) and answers every later one (B, and any
+    // final-proof pass) immediately.
+    struct GateRunner {
+        started: Arc<AtomicBool>,
+        feedback_calls: Arc<AtomicU32>,
+    }
+    impl Runner for GateRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            let done = RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "edited".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            };
+            if spec.task != "feedback" {
+                return done;
+            }
+            if self.feedback_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                // A later feedback-task call (B) -- answer immediately.
+                let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+                return done;
+            }
+            // The first feedback-task call (A) -- gate until cancelled.
+            self.started.store(true, Ordering::SeqCst);
+            for _ in 0..4000 {
+                if cancel.is_cancelled() {
+                    return RunnerResult::failure("cancelled");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+            RunnerResult::failure("gate never released")
+        }
+    }
+    let started = Arc::new(AtomicBool::new(false));
+    let feedback_calls = Arc::new(AtomicU32::new(0));
+    let runner: Arc<dyn Runner> = Arc::new(GateRunner {
+        started: Arc::clone(&started),
+        feedback_calls: Arc::clone(&feedback_calls),
+    });
+    let guardian_locks = NamedLocks::new();
+    let cancellations = Cancellations::new();
+    let sem = Arc::new(Semaphore::new(4));
+
+    let reply_a = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "A".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(reply_a.status, 202);
+    for _ in 0..2000 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(started.load(Ordering::SeqCst), "A never started");
+    let seq_a = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()[0]
+        .seq;
+
+    let reply_b = start_feedback(
+        store.clone(),
+        Arc::clone(&runner),
+        guardian_locks.clone(),
+        cancellations.clone(),
+        Arc::clone(&sem),
+        &id,
+        &bid0,
+        "B".to_string(),
+        None,
+        None,
+        FeedbackMode::CancelAndReplace,
+    );
+    assert_eq!(reply_b.status, 202);
+
+    // `a_status` flips to `superseded` synchronously, inside `start_feedback`
+    // itself, well before the background worker's blocked runner call has
+    // even noticed the cancellation -- it is not evidence B's own run has
+    // happened yet. Wait on B's status (the real completion signal) first.
+    let seq_b = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()[1]
+        .seq;
+    let b_status = poll_message_status(&store, &id, &bid0, seq_b);
+
+    let a_status = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.seq == seq_a)
+        .unwrap()
+        .action_status;
+    assert_eq!(
+        a_status.as_deref(),
+        Some("superseded"),
+        "an actively-running request cancel_and_replace interrupts must end up superseded, not failed"
+    );
+    assert!(
+        feedback_calls.load(Ordering::SeqCst) >= 2,
+        "both A's (cancelled) and B's (real) feedback-task calls must have happened"
+    );
+    assert_eq!(
+        b_status.as_deref(),
+        Some("done"),
+        "the replacement must still land"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+fn feedback_waits_for_an_in_flight_merge_to_release_the_guardian_lock() {
+    // RAL-387 Q4: feedback submitted while a merge/rebase is active waits
+    // for that operation to finish before it starts -- proven by holding the
+    // guardian's write guard ourselves (the same guard a merge worker holds
+    // for its whole run) and asserting a feedback pass never runs while it's
+    // held.
+    let (root, store, id) = single_feature_repo();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .unwrap();
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    let ran = Arc::new(AtomicBool::new(false));
+    struct MarkerRunner {
+        ran: Arc<AtomicBool>,
+    }
+    impl Runner for MarkerRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
+            self.ran.store(true, Ordering::SeqCst);
+            RunnerResult {
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "edited".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+    let runner: Arc<dyn Runner> = Arc::new(MarkerRunner {
+        ran: Arc::clone(&ran),
+    });
+
+    let guardian_locks = NamedLocks::new();
+    let acquired = Arc::new(AtomicBool::new(false));
+    let unblock = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|s| {
+        let acquired2 = Arc::clone(&acquired);
+        let unblock2 = Arc::clone(&unblock);
+        let gl = guardian_locks.clone();
+        let held_id = id.clone();
+        let holder = s.spawn(move || {
+            gl.with_write(&held_id, "test", || {
+                acquired2.store(true, Ordering::SeqCst);
+                while !unblock2.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        });
+
+        for _ in 0..2000 {
+            if acquired.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "test never acquired the guardian write guard"
+        );
+
+        let reply = start_feedback(
+            store.clone(),
+            Arc::clone(&runner),
+            guardian_locks.clone(),
+            Cancellations::new(),
+            Arc::new(Semaphore::new(4)),
+            &id,
+            &bid0,
+            "please add a note file".to_string(),
+            None,
+            None,
+            FeedbackMode::Queue,
+        );
+        assert_eq!(reply.status, 202);
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "feedback ran while a merge held the guardian write guard"
+        );
+
+        unblock.store(true, Ordering::SeqCst);
+        holder.join().unwrap();
+    });
+
+    for _ in 0..24000 {
+        if ran.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "feedback never ran after the guardian lock was released"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_waits_for_an_in_flight_feedback_pass_to_release_the_guardian_lock() {
+    // RAL-387 Q4: a merge/rebase requested while feedback is being applied
+    // waits for it to finish -- proven by holding the guardian's read guard
+    // ourselves (the same guard a feedback pass holds for its whole run) and
+    // asserting a merge's conflict resolver is never invoked while it's held.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("locked merge", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    let resolved = Arc::new(AtomicBool::new(false));
+    struct MarkingResolver {
+        resolved: Arc<AtomicBool>,
+    }
+    impl Runner for MarkingResolver {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            if spec.task == "resolve" {
+                self.resolved.store(true, Ordering::SeqCst);
+            }
+            MarkerStrippingRunner.run_cancellable(spec, cancel)
+        }
+    }
+    let runner: Arc<dyn Runner> = Arc::new(MarkingResolver {
+        resolved: Arc::clone(&resolved),
+    });
+
+    let guardian_locks = NamedLocks::new();
+    let acquired = Arc::new(AtomicBool::new(false));
+    let unblock = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|s| {
+        let acquired2 = Arc::clone(&acquired);
+        let unblock2 = Arc::clone(&unblock);
+        let gl = guardian_locks.clone();
+        let held_id = id.clone();
+        let holder = s.spawn(move || {
+            gl.with_read(&held_id, "test", || {
+                acquired2.store(true, Ordering::SeqCst);
+                while !unblock2.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        });
+
+        for _ in 0..2000 {
+            if acquired.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "test never acquired the guardian read guard"
+        );
+
+        let reply = start_merge(
+            Arc::clone(&store),
+            Arc::clone(&runner),
+            &id,
+            Arc::new(Semaphore::new(4)),
+            Cancellations::new(),
+            guardian_locks.clone(),
+        );
+        assert_eq!(reply.status, 202, "{}", reply.body);
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !resolved.load(Ordering::SeqCst),
+            "merge resolved a conflict while a feedback pass held the guardian read guard"
+        );
+
+        unblock.store(true, Ordering::SeqCst);
+        holder.join().unwrap();
+    });
+
+    for _ in 0..24000 {
+        if resolved.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        resolved.load(Ordering::SeqCst),
+        "merge never ran after the guardian lock was released"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restart_cannot_double_enter_the_merge_body_while_the_first_worker_is_queued_on_the_semaphore() {
+    // RAL-387: the exact race the ticket describes -- `kickoff_merge`'s
+    // spawned worker acquires the guardian's write guard, *then* waits on
+    // the global semaphore, *then* registers its cancel token. While a
+    // worker is stuck behind a saturated semaphore, `Cancellations::is_active`
+    // does not see it yet, so a concurrent `restart_guardian_merge`'s own
+    // cancel+bounded-wait cannot tell it's there and proceeds to reset and
+    // re-claim regardless. The write guard closes this anyway: the restart's
+    // own `kickoff_merge` call blocks on the *same* guard until the stuck
+    // worker actually finishes, so at most one worker is ever inside the
+    // merge body at a time, independent of what the DB claim / cancel
+    // registry say in between.
+    //
+    // `Semaphore::acquire` is crate-private, so this test can't hold the
+    // sole permit itself; instead a second, independent guardian's feedback
+    // pass (a real `start_feedback` call, sharing the same `sem`) blocks
+    // while holding it, exactly the way any other real caller would
+    // saturate the semaphore.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    git(&root, &["checkout", "-b", "feature/occupier"]);
+    write(&root, "occupier.txt", "occupier\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "occupier"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("racing restart", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+    let occ_id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("occupier", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/occupier").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &occ_id);
+    let occ_bid0 = store
+        .lock()
+        .unwrap()
+        .get_guardian(&occ_id)
+        .unwrap()
+        .branches[0]
+        .id
+        .clone();
+
+    // Tracks the *peak* number of concurrent resolver invocations, not just
+    // the total count -- worker B legitimately gets to run too, once worker
+    // A releases the guard, but the two must never overlap.
+    struct OverlapCountingResolver {
+        current: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+    }
+    impl Runner for OverlapCountingResolver {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            if spec.task == "resolve" {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(30));
+                self.current.fetch_sub(1, Ordering::SeqCst);
+            }
+            MarkerStrippingRunner.run_cancellable(spec, cancel)
+        }
+    }
+    let current = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let runner: Arc<dyn Runner> = Arc::new(OverlapCountingResolver {
+        current: Arc::clone(&current),
+        peak: Arc::clone(&peak),
+    });
+
+    // Blocks the whole feedback-task call (holding its semaphore permit)
+    // until told to stop, standing in for "something else is using the
+    // daemon's one concurrency slot right now".
+    struct OccupierRunner {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+    impl Runner for OccupierRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            if spec.task == "feedback" {
+                self.started.store(true, Ordering::SeqCst);
+                for _ in 0..4000 {
+                    if cancel.is_cancelled() || self.release.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            FeedbackRunner.run_cancellable(spec, cancel)
+        }
+    }
+    let occ_started = Arc::new(AtomicBool::new(false));
+    let occ_release = Arc::new(AtomicBool::new(false));
+    let occ_runner: Arc<dyn Runner> = Arc::new(OccupierRunner {
+        started: Arc::clone(&occ_started),
+        release: Arc::clone(&occ_release),
+    });
+
+    let sem = Arc::new(Semaphore::new(1));
+    let cancellations = Cancellations::new();
+    let guardian_locks = NamedLocks::new();
+
+    // Occupy the sole permit via a real feedback pass on the independent
+    // guardian.
+    let occ_reply = start_feedback(
+        store.clone(),
+        occ_runner,
+        NamedLocks::new(),
+        Cancellations::new(),
+        Arc::clone(&sem),
+        &occ_id,
+        &occ_bid0,
+        "occupy the semaphore".to_string(),
+        None,
+        None,
+        FeedbackMode::Queue,
+    );
+    assert_eq!(occ_reply.status, 202);
+    for _ in 0..2000 {
+        if occ_started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(occ_started.load(Ordering::SeqCst), "occupier never started");
+
+    let reply_a = start_merge(
+        Arc::clone(&store),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        cancellations.clone(),
+        guardian_locks.clone(),
+    );
+    assert_eq!(reply_a.status, 202, "{}", reply_a.body);
+
+    // Give worker A time to claim, spawn, and reach (and block on) the
+    // semaphore -- it must not have registered a cancel token yet, proving
+    // the pre-existing signal really is blind to it at this point.
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !cancellations.is_active(&format!("guardian:{id}")),
+        "precondition: worker A must not have registered yet (stuck before the semaphore)"
+    );
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "merging"
+    );
+    assert_eq!(
+        current.load(Ordering::SeqCst),
+        0,
+        "worker A must not have entered the merge body yet"
+    );
+
+    // A concurrent restart: its cancel+wait sees nothing active (as above)
+    // and resets + re-claims regardless of worker A still being alive.
+    let restart_reply = restart_guardian_merge(
+        Arc::clone(&store),
+        cancellations.clone(),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        guardian_locks.clone(),
+    );
+    assert_eq!(restart_reply.status, 202, "{}", restart_reply.body);
+
+    // Worker B's own kickoff must still be blocked on the guardian write
+    // guard -- neither worker has entered the merge body yet.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        current.load(Ordering::SeqCst),
+        0,
+        "no worker may enter the merge body before the semaphore frees up"
+    );
+
+    // Free the semaphore: worker A proceeds and finishes, releasing the
+    // write guard; only then can worker B's own kickoff acquire it.
+    occ_release.store(true, Ordering::SeqCst);
+
+    for _ in 0..24000 {
+        if store.lock().unwrap().get_guardian(&id).unwrap().status == "in_review" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        "in_review"
+    );
+    // Give worker B (if the DB claim let it start a second pass once A
+    // released the guard) a moment to also finish, then check the peak.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "no more than one worker may ever be inside the merge body at the same time"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn two_concurrent_restarts_never_let_more_than_one_worker_enter_the_merge_body() {
+    // RAL-387: the "Concurrent restart callers may present a similar
+    // scenario" case the ticket calls out directly, distinct from the
+    // queued-on-the-semaphore boundary tested above -- here the original
+    // worker is genuinely *inside* the merge body (registered, running)
+    // when two `restart_guardian_merge` calls fire at the same instant via
+    // a barrier. `restart_guardian_merge`'s own reset-then-claim sequence
+    // is not a single atomic transaction, so depending on scheduling either
+    // exactly one racer wins the claim (the other gets 409) or both windows
+    // interleave and both win (two workers spawn, one after the other) --
+    // this test deliberately does not assert which, since either is a
+    // legitimate outcome of a real OS-scheduled race. What must hold
+    // regardless: the guardian write guard still caps how many workers are
+    // ever *inside* the merge body at the same instant to one, the review
+    // still settles into one coherent terminal state, and no worker's
+    // cancellation token is left dangling once everything quiesces.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("racing restarts", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    // Tracks the *peak* number of concurrent resolver invocations, not just
+    // the total count -- a second worker legitimately gets to run too, if
+    // the reset/claim race let both restarts spawn one, but the two must
+    // never overlap.
+    struct GatedResolver {
+        current: Arc<AtomicU32>,
+        peak: Arc<AtomicU32>,
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+    impl Runner for GatedResolver {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.run_cancellable(spec, &CancelToken::never())
+        }
+        fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
+            if spec.task == "resolve" {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                self.started.store(true, Ordering::SeqCst);
+                for _ in 0..4000 {
+                    if cancel.is_cancelled() || self.release.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.current.fetch_sub(1, Ordering::SeqCst);
+            }
+            MarkerStrippingRunner.run_cancellable(spec, cancel)
+        }
+    }
+    let current = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let runner: Arc<dyn Runner> = Arc::new(GatedResolver {
+        current: Arc::clone(&current),
+        peak: Arc::clone(&peak),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+
+    let sem = Arc::new(Semaphore::new(4));
+    let cancellations = Cancellations::new();
+    let guardian_locks = NamedLocks::new();
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::clone(&runner),
+        &id,
+        Arc::clone(&sem),
+        cancellations.clone(),
+        guardian_locks.clone(),
+    );
+    assert_eq!(reply.status, 202, "{}", reply.body);
+
+    for _ in 0..2000 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        started.load(Ordering::SeqCst),
+        "initial worker never started resolving"
+    );
+
+    // Fire two restarts at the exact same instant, both racing the original
+    // worker (still gated, still active) and each other. Deliberately not
+    // asserting on each reply's individual status code: depending on
+    // scheduling, a racer can win its claim (202), lose to the other
+    // racer's claim (409), or -- if the other racer's *entire* restart
+    // cycle (reset, claim, run, land in a terminal status outside
+    // `('merging','in_review')` such as `merge_failed`) finishes before
+    // this racer's own reset call runs -- get a 500 from
+    // `reset_guardian_to_collecting` rejecting a state it no longer
+    // recognizes as restartable. All three are legitimate outcomes of a
+    // real race; what must hold regardless is asserted below.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let store = Arc::clone(&store);
+            let cancellations = cancellations.clone();
+            let runner = Arc::clone(&runner);
+            let sem = Arc::clone(&sem);
+            let guardian_locks = guardian_locks.clone();
+            let id = id.clone();
+            let release = Arc::clone(&release);
+            s.spawn(move || {
+                barrier.wait();
+                // Let the gated worker actually observe cancellation and
+                // exit once both restarts are in flight.
+                release.store(true, Ordering::SeqCst);
+                let _reply =
+                    restart_guardian_merge(store, cancellations, runner, &id, sem, guardian_locks);
+            });
+        }
+    });
+
+    for _ in 0..24000 {
+        let status = store.lock().unwrap().get_guardian(&id).unwrap().status;
+        if status == "in_review" || status == "merge_failed" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let final_status = store.lock().unwrap().get_guardian(&id).unwrap().status;
+    assert!(
+        final_status == "in_review" || final_status == "merge_failed",
+        "guardian must settle into one coherent terminal state, got {final_status}"
+    );
+
+    // Give a second worker (if the reset/claim race let both restarts spawn
+    // one) a moment to also finish, then check the peak.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "no more than one worker may ever be inside the merge body at the same time, \
+         even when two restarts race the exact same instant"
+    );
+    assert!(
+        !cancellations.is_active(&format!("guardian:{id}")),
+        "no worker's cancellation token may be left dangling once every racing restart settles"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1594,10 +2900,14 @@ fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
         &id,
         Arc::clone(&sem),
         cancellations.clone(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 202);
 
-    for _ in 0..2000 {
+    // Generous (120s) budget, matching this file's other polls of real
+    // background subprocess/git work -- under full-suite parallel load many
+    // worktree-heavy tests contend for CPU/disk at once.
+    for _ in 0..24000 {
         if started.exists() {
             break;
         }
@@ -2309,6 +3619,7 @@ fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
         &id,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 200, "body={}", reply.body);
     assert!(reply.body.contains("\"status\":\"approved\""));
@@ -5316,6 +6627,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         &id,
         Arc::clone(&sem),
         cancellations.clone(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 202);
 
@@ -5353,6 +6665,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         Arc::clone(&runner),
         &id,
         Arc::clone(&sem),
+        NamedLocks::new(),
     );
     assert_eq!(
         restart_reply.status, 202,
@@ -5740,6 +7053,7 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
         &id,
         Arc::clone(&sem),
         cancellations.clone(),
+        NamedLocks::new(),
     );
     assert_eq!(reply.status, 202);
 

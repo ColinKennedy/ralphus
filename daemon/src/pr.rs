@@ -4680,6 +4680,7 @@ pub fn start_pull_pr_commits(
 pub fn action_pr_feedback(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
+    guardian_locks: &crate::named_lock::NamedLocks,
     pr_id: &str,
 ) -> std::result::Result<usize, String> {
     let cx = crate::otel::context_from_traceparent(None);
@@ -4688,7 +4689,7 @@ pub fn action_pr_feedback(
 
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [pr] pr {pr_id} actioning feedback");
-    let result = action_pr_feedback_inner(store, runner, pr_id);
+    let result = action_pr_feedback_inner(store, runner, guardian_locks, pr_id);
     match &result {
         Ok(n) => {
             span.set_status(Status::Ok);
@@ -4707,6 +4708,7 @@ pub fn action_pr_feedback(
 fn action_pr_feedback_inner(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
+    guardian_locks: &crate::named_lock::NamedLocks,
     pr_id: &str,
 ) -> std::result::Result<usize, String> {
     let pr = store
@@ -4788,17 +4790,33 @@ fn action_pr_feedback_inner(
         fresh.len(),
         pr.guardian_id
     );
-    let outcome = guardian_merge::run_feedback(
-        store,
-        runner,
-        &pr.guardian_id,
-        &branch_id,
-        &feedback,
-        // RAL-380: this feedback is synthesized from several forge comments,
-        // not one stored "reviewer" message -- there is nothing to mark.
-        None,
-        &crate::cancel::CancelToken::never(),
-    );
+    // RAL-387: same guardian-wide read guard (excluded by a live merge/
+    // rebase) and per-project write guard (excluded by another feedback
+    // pass in this project, including one from the ordinary
+    // `POST .../feedback` path) every other route into `run_feedback` holds
+    // -- this synthesizes its feedback text from forge comments instead of
+    // one stored message, but it edits the exact same worktree.
+    let project = guardian_merge::effective_project(&guardian, &branch_id);
+    let outcome = guardian_locks.with_read(&pr.guardian_id, "pr-feedback", || {
+        guardian_locks.with_write(
+            &format!("{}:{project}", pr.guardian_id),
+            "pr-feedback",
+            || {
+                guardian_merge::run_feedback(
+                    store,
+                    runner,
+                    &pr.guardian_id,
+                    &branch_id,
+                    &feedback,
+                    // RAL-380: this feedback is synthesized from several forge
+                    // comments, not one stored "reviewer" message -- there is
+                    // nothing to mark.
+                    None,
+                    &crate::cancel::CancelToken::never(),
+                )
+            },
+        )
+    });
 
     for c in &fresh {
         let _ = store
@@ -4961,6 +4979,7 @@ pub fn start_submit_pull_requests(
 pub fn start_action_pr_feedback(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
+    guardian_locks: crate::named_lock::NamedLocks,
     pr_id: &str,
 ) -> Reply {
     let pr = {
@@ -4972,8 +4991,8 @@ pub fn start_action_pr_feedback(
         Err(e) => return error_reply(404, "not_found", &e.to_string()),
     };
     let pid = pr_id.to_string();
-    std::thread::spawn(
-        move || match action_pr_feedback(&store, runner.as_ref(), &pid) {
+    std::thread::spawn(move || {
+        match action_pr_feedback(&store, runner.as_ref(), &guardian_locks, &pid) {
             Ok(n) => {
                 let guard = store.lock().expect("poisoned");
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -5007,8 +5026,8 @@ pub fn start_action_pr_feedback(
                     admin_only: false,
                 });
             }
-        },
-    );
+        }
+    });
     reply(202, &serde_json::json!({"status": "actioning_feedback"}))
 }
 

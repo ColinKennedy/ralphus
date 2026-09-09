@@ -124,6 +124,20 @@ impl Cancellations {
         self.lock().contains_key(run_id)
     }
 
+    /// Every currently-registered key that starts with `prefix` (RAL-387).
+    /// Used to find the one specific run (if any) active under a narrower
+    /// scope than this registry's own keys individually encode -- e.g.
+    /// `feedback:{guardian}:{branch}:` to discover which message `seq` (if
+    /// any) is the one a branch's feedback worker is currently acting on.
+    #[must_use]
+    pub fn active_keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.lock()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ActiveCancellation>> {
         self.0.lock().expect("cancellation registry poisoned")
     }
@@ -219,5 +233,36 @@ mod tests {
     fn cancel_all_on_empty_registry_is_a_noop() {
         let reg = Cancellations::new();
         reg.cancel_all(); // must not panic
+    }
+
+    #[test]
+    fn cancelling_one_scoped_key_does_not_affect_a_different_scoped_key_for_the_same_branch() {
+        // RAL-387: `guardian_merge`'s `FeedbackMode::CancelAndReplace` targets
+        // `feedback:{guardian}:{branch}:{seq}` -- cancelling an older
+        // request's key must never trip a newer request's key for the same
+        // branch, even though both narrow the same branch.
+        let reg = Cancellations::new();
+        let old = reg.register("feedback:g1:b1:10");
+        let new = reg.register("feedback:g1:b1:11");
+        reg.cancel("feedback:g1:b1:10");
+        assert!(old.is_cancelled());
+        assert!(!new.is_cancelled());
+    }
+
+    #[test]
+    fn active_keys_with_prefix_finds_only_matching_keys() {
+        let reg = Cancellations::new();
+        let _ = reg.register("feedback:g1:b1:10");
+        let _ = reg.register("feedback:g1:b2:20");
+        let _ = reg.register("guardian:g1");
+        let mut found = reg.active_keys_with_prefix("feedback:g1:b1:");
+        found.sort();
+        assert_eq!(found, vec!["feedback:g1:b1:10".to_string()]);
+    }
+
+    #[test]
+    fn active_keys_with_prefix_on_empty_registry_is_empty() {
+        let reg = Cancellations::new();
+        assert!(reg.active_keys_with_prefix("feedback:g1:").is_empty());
     }
 }

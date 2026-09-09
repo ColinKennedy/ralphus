@@ -14,6 +14,7 @@ use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::guardian_merge::{run_merge, start_merge};
+use ralphus_daemon::named_lock::NamedLocks;
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use ralphus_daemon::scheduler::{Semaphore, execute_squad, execute_squad_with};
@@ -711,6 +712,7 @@ fn start_merge_resolves_conflicts_with_agent() {
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
 
     // Generous poll budget: under full-suite parallel load (many git worktree
@@ -833,6 +835,7 @@ fn force_push_then_merge_resolves_cleanly() {
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
 
     let mut status = String::new();
@@ -935,6 +938,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
         &gid,
         Arc::new(Semaphore::new(4)),
         Cancellations::new(),
+        NamedLocks::new(),
     );
     assert_eq!(
         reply.status, 202,

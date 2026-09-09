@@ -525,6 +525,17 @@ pub struct MessageView {
     /// field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_status: Option<String>,
+    /// RAL-387: `Some(true)` when this `received` message is the one a
+    /// resolver agent is actually acting on right now, `Some(false)` when it
+    /// is still queued behind another request for the same project (see
+    /// [`crate::guardian_merge::FeedbackMode`]). `None` for any message whose
+    /// `action_status` isn't `received` (nothing to distinguish once a
+    /// request has finished one way or another) -- resolved from the live
+    /// cancellation registry at read time by the `.../messages` endpoint
+    /// handler, not stored durably, since "active" is a function of runtime
+    /// state, not the database row itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
 }
 
 /// [`GuardianView::origin`] value for a review created from an authored
@@ -1840,6 +1851,7 @@ impl Store {
                     author: r.get(5)?,
                     submitted_by: r.get(6)?,
                     action_status: r.get(7)?,
+                    active: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1850,21 +1862,46 @@ impl Store {
     /// as `superseded` -- called right before a new feedback message is
     /// recorded, so an older bubble's checkmark can never be mistaken for
     /// progress on the newer request that is about to overtake it.
+    ///
+    /// RAL-387: `exclude_seq`, when given, leaves that one row untouched --
+    /// used by `guardian_merge::FeedbackMode::Replace` to supersede every
+    /// *queued* request without disturbing the one actively running (whose
+    /// `seq` the caller resolves via `Cancellations::active_keys_with_prefix`
+    /// before calling this). `FeedbackMode::CancelAndReplace` passes `None`
+    /// instead, since it wants the active row superseded too.
     pub fn supersede_pending_branch_feedback(
         &self,
         guardian_id: &str,
         branch_id: &str,
+        exclude_seq: Option<i64>,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE guardian_messages SET action_status=? \
-             WHERE guardian_id=? AND branch_id=? AND role='reviewer' AND action_status=?",
-            params![
-                FeedbackActionStatus::Superseded.as_str(),
-                guardian_id,
-                branch_id,
-                FeedbackActionStatus::Received.as_str()
-            ],
-        )?;
+        match exclude_seq {
+            Some(seq) => {
+                self.conn.execute(
+                    "UPDATE guardian_messages SET action_status=? \
+                     WHERE guardian_id=? AND branch_id=? AND role='reviewer' AND action_status=? AND seq != ?",
+                    params![
+                        FeedbackActionStatus::Superseded.as_str(),
+                        guardian_id,
+                        branch_id,
+                        FeedbackActionStatus::Received.as_str(),
+                        seq
+                    ],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "UPDATE guardian_messages SET action_status=? \
+                     WHERE guardian_id=? AND branch_id=? AND role='reviewer' AND action_status=?",
+                    params![
+                        FeedbackActionStatus::Superseded.as_str(),
+                        guardian_id,
+                        branch_id,
+                        FeedbackActionStatus::Received.as_str()
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1910,6 +1947,57 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// RAL-387: every still-`received` "reviewer" message across this
+    /// guardian's branches, oldest first -- the durable queue of record for
+    /// feedback awaiting application. `guardian_merge::spawn_feedback_project_worker`
+    /// filters this to one project (a branch's effective project is only
+    /// knowable from the caller's already-loaded `GuardianView`, not from this
+    /// table alone) and processes them oldest-first regardless of which
+    /// caller's thread happens to be the one draining the queue -- see that
+    /// function's doc comment.
+    pub fn received_feedback_messages(
+        &self,
+        guardian_id: &str,
+    ) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch_id, seq, text FROM guardian_messages \
+             WHERE guardian_id=? AND role='reviewer' AND action_status=? AND branch_id IS NOT NULL \
+             ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![guardian_id, FeedbackActionStatus::Received.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// RAL-387: every guardian id with at least one still-`received`
+    /// "reviewer" message -- the startup-recovery entry point
+    /// (`scheduler::recover_interrupted_reviews`) discovers *which* reviews
+    /// need a feedback-queue worker resumed from this, then resolves each
+    /// one's actual queued messages/projects via [`Self::received_feedback_messages`]
+    /// and its own already-loaded [`GuardianView`].
+    pub fn guardians_with_received_feedback(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT guardian_id FROM guardian_messages \
+             WHERE role='reviewer' AND action_status=?",
+        )?;
+        let rows = stmt
+            .query_map(params![FeedbackActionStatus::Received.as_str()], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Set a guardian's status (and optional detail).
@@ -5298,7 +5386,7 @@ mod tests {
         );
 
         store
-            .supersede_pending_branch_feedback(&id, "branch-a")
+            .supersede_pending_branch_feedback(&id, "branch-a", None)
             .unwrap();
         let seq_b = store
             .add_guardian_message(

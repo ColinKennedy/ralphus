@@ -32,6 +32,7 @@ pub mod machine_targets;
 pub mod machines;
 pub mod mailbox;
 pub mod monitor;
+pub mod named_lock;
 pub mod otel;
 pub mod plan;
 pub mod pr;

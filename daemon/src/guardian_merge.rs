@@ -34,6 +34,7 @@ use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{
     CheckInput, CheckInputType, FeedbackActionStatus, GuardianCheck, GuardianStatus, MergeStatus,
 };
+use crate::named_lock::NamedLocks;
 use crate::runner::{Runner, RunnerSpec};
 use crate::scheduler::Semaphore;
 use crate::server::Reply;
@@ -3145,8 +3146,9 @@ pub fn start_merge(
     id: &str,
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
+    guardian_locks: NamedLocks,
 ) -> Reply {
-    match kickoff_merge(store, runner, id, sem, cancellations) {
+    match kickoff_merge(store, runner, id, sem, cancellations, guardian_locks) {
         Ok(StartMergeOutcome::Merging) => reply(202, "{\"status\":\"merging\"}"),
         Ok(StartMergeOutcome::Deferred) => reply(
             202,
@@ -3225,6 +3227,7 @@ pub(crate) fn kickoff_merge(
     id: &str,
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
+    guardian_locks: NamedLocks,
 ) -> Result<StartMergeOutcome, StartMergeError> {
     let kickoff_started = std::time::Instant::now();
     // A nonexistent guardian must 404 before any preflight work runs.
@@ -3395,10 +3398,19 @@ pub(crate) fn kickoff_merge(
     );
     let sid = id.to_string();
     std::thread::spawn(move || {
-        let _permit = sem.acquire();
-        let token = cancellations.register(&format!("guardian:{sid}"));
-        run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
-        cancellations.remove(&format!("guardian:{sid}"));
+        // RAL-387: hold this guardian's worktree-ownership lock for write for
+        // the whole worker, including the semaphore wait -- a feedback
+        // worker for any of this guardian's projects holds it for read, so
+        // this blocks until every in-flight feedback pass has finished, and
+        // no feedback can start until this merge (claimed, even if still
+        // queued behind the semaphore) releases it. See `named_lock`'s
+        // module doc comment.
+        guardian_locks.with_write(&sid, "merge", || {
+            let _permit = sem.acquire();
+            let token = cancellations.register(&format!("guardian:{sid}"));
+            run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
+            cancellations.remove(&format!("guardian:{sid}"));
+        });
     });
     Ok(StartMergeOutcome::Merging)
 }
@@ -3491,6 +3503,7 @@ pub fn restart_guardian_merge(
     runner: Arc<dyn Runner>,
     id: &str,
     sem: Arc<Semaphore>,
+    guardian_locks: NamedLocks,
 ) -> Reply {
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
@@ -3503,7 +3516,7 @@ pub fn restart_guardian_merge(
     {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
-    start_merge(store, runner, id, sem, cancellations)
+    start_merge(store, runner, id, sem, cancellations, guardian_locks)
 }
 
 /// Reopen a `cancelled` review (status → `collecting`) and immediately try an
@@ -3532,6 +3545,7 @@ pub fn reopen_cancelled_guardian_merge(
     id: &str,
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
+    guardian_locks: NamedLocks,
 ) -> Reply {
     if let Err(e) = store
         .lock()
@@ -3552,10 +3566,13 @@ pub fn reopen_cancelled_guardian_merge(
     }
     let sid = id.to_string();
     std::thread::spawn(move || {
-        let _permit = sem.acquire();
-        let token = cancellations.register(&format!("guardian:{sid}"));
-        run_merge_staged(&store, runner.as_ref(), &sid, &token);
-        cancellations.remove(&format!("guardian:{sid}"));
+        // RAL-387: same guardian-wide write guard as `kickoff_merge`.
+        guardian_locks.with_write(&sid, "merge", || {
+            let _permit = sem.acquire();
+            let token = cancellations.register(&format!("guardian:{sid}"));
+            run_merge_staged(&store, runner.as_ref(), &sid, &token);
+            cancellations.remove(&format!("guardian:{sid}"));
+        });
     });
     reply(202, "{\"status\":\"merging\"}")
 }
@@ -3676,7 +3693,45 @@ pub fn start_resolve_input(
     reply(202, "{\"ok\":true}")
 }
 
-/// Validate that a branch position has a review worktree, then kick off a
+/// How a new feedback submission interacts with feedback already queued or
+/// actively running for the same branch (RAL-387). Successive feedback for
+/// one branch always queues in submission order by default -- nothing is
+/// silently discarded; `Replace`/`CancelAndReplace` are the caller's explicit
+/// opt-in to superseding what's already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackMode {
+    /// Append behind whatever is already queued or running for this branch.
+    /// Discards nothing -- the deterministic default.
+    Queue,
+    /// Supersede every request still queued (not yet picked up by the
+    /// project's worker) for this branch. Leaves a request that is actively
+    /// running to finish untouched -- it still lands, just under a
+    /// `superseded` message status once a newer request has queued behind
+    /// it.
+    Replace,
+    /// Like [`Self::Replace`], and additionally cancel a request that is
+    /// actively running for this branch -- the resolver agent is stopped
+    /// (via its registered [`CancelToken`]) rather than left to finish.
+    CancelAndReplace,
+}
+
+/// This branch's effective project: its own override, or the guardian's
+/// primary git root when unset (RAL-29). Feedback executions are serialized
+/// per project (not per branch) because a feedback pass restacks every
+/// downstream branch in the same project -- see [`spawn_feedback_project_worker`].
+pub(crate) fn effective_project(
+    guardian: &crate::guardian::GuardianView,
+    branch_id: &str,
+) -> String {
+    guardian
+        .branches
+        .iter()
+        .find(|b| b.id == branch_id)
+        .and_then(|b| b.project.clone())
+        .unwrap_or_else(|| guardian.git_root.clone())
+}
+
+/// Validate that a branch position has a review worktree, then queue a
 /// background feedback application. Returns immediately.
 ///
 /// RAL-272: also persists the feedback text into that branch's read-only
@@ -3688,14 +3743,26 @@ pub fn start_resolve_input(
 /// (the caller may name one; the HTTP layer defaults it to `submitted_by`
 /// when absent). `submitted_by` is the resolved authenticated/default
 /// requester and is never taken from request data.
+///
+/// RAL-387: `mode` controls how this request interacts with feedback already
+/// queued/running for this branch -- see [`FeedbackMode`]. The actual
+/// application always goes through [`spawn_feedback_project_worker`], which
+/// processes every project's queued "reviewer" messages one at a time, oldest
+/// first, so this never races a concurrent feedback request for the same
+/// project (or a live merge/rebase for this guardian).
+#[allow(clippy::too_many_arguments)]
 pub fn start_feedback(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
+    guardian_locks: NamedLocks,
+    cancellations: Cancellations,
+    sem: Arc<Semaphore>,
     id: &str,
     branch_id: &str,
     feedback: String,
     author: Option<String>,
     submitted_by: Option<String>,
+    mode: FeedbackMode,
 ) -> Reply {
     let guardian = {
         let guard = store.lock().expect("store mutex poisoned");
@@ -3715,16 +3782,38 @@ pub fn start_feedback(
         }
         None => return reply(404, &error_body("not_found", "no such branch")),
     };
-    // RAL-380: any earlier feedback message on this branch that's still
-    // `received` (i.e. its own `run_feedback` pass hasn't finished yet) is
-    // about to be overtaken by this one -- mark it `superseded` before
-    // inserting the new message so its bubble never reads as still in
-    // progress (or, worse, completed) once this newer request lands.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .supersede_pending_branch_feedback(id, branch_id);
-    let message_seq = match store.lock().expect("poisoned").add_guardian_message(
+    let project = effective_project(&guardian, branch_id);
+    match mode {
+        FeedbackMode::Queue => {}
+        FeedbackMode::Replace => {
+            // RAL-387: supersede every still-queued request for this branch,
+            // but not one that's actively running right now -- `Replace`
+            // deliberately leaves in-flight work alone (see `CancelAndReplace`
+            // for the mode that also interrupts it).
+            let active = active_feedback_seq(&cancellations, id, branch_id);
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .supersede_pending_branch_feedback(id, branch_id, active);
+        }
+        FeedbackMode::CancelAndReplace => {
+            // Trip the active run's cancel token (if any is currently
+            // registered for this exact branch) before superseding every
+            // Received row for it, including the one that run is acting on --
+            // the project's worker holds the project's `NamedLocks` write
+            // guard for the duration of one `run_feedback` call, so this
+            // request's own worker naturally queues behind it and only
+            // starts once that call actually returns.
+            if let Some(seq) = active_feedback_seq(&cancellations, id, branch_id) {
+                cancellations.cancel(&format!("feedback:{id}:{branch_id}:{seq}"));
+            }
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .supersede_pending_branch_feedback(id, branch_id, None);
+        }
+    }
+    if let Err(e) = store.lock().expect("poisoned").add_guardian_message(
         id,
         "reviewer",
         &feedback,
@@ -3733,30 +3822,123 @@ pub fn start_feedback(
         author.as_deref(),
         submitted_by.as_deref(),
     ) {
-        Ok(seq) => seq,
-        Err(e) => return reply(500, &error_body("internal", &e.to_string())),
-    };
+        return reply(500, &error_body("internal", &e.to_string()));
+    }
     let sid = id.to_string();
     let bid = branch_id.to_string();
+    {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
+        });
+    }
+    spawn_feedback_project_worker(
+        store,
+        runner,
+        guardian_locks,
+        cancellations,
+        sem,
+        id,
+        &project,
+    );
+    reply(202, "{\"status\":\"queued\"}")
+}
+
+/// The `seq` of the "reviewer" message currently being acted on for
+/// `branch_id`, if any -- derived from whichever `feedback:{guardian}:
+/// {branch}:{seq}` cancel-token key (if any) is currently registered. At most
+/// one such key can be registered at a time for a given branch (a feedback
+/// pass holds its project's [`NamedLocks`] write guard for the whole call),
+/// so this is unambiguous.
+///
+/// `pub(crate)` so the `.../messages` read endpoint can also use it (RAL-387)
+/// to mark which `received` message is actually active vs merely queued --
+/// see [`crate::guardian::MessageView::active`].
+pub(crate) fn active_feedback_seq(
+    cancellations: &Cancellations,
+    guardian_id: &str,
+    branch_id: &str,
+) -> Option<i64> {
+    let prefix = format!("feedback:{guardian_id}:{branch_id}:");
+    cancellations
+        .active_keys_with_prefix(&prefix)
+        .into_iter()
+        .find_map(|key| key[prefix.len()..].parse::<i64>().ok())
+}
+
+/// Apply every queued "reviewer" message for `project` (within guardian `id`),
+/// oldest first, then exit. Spawned by every route that can add a message to
+/// `project`'s queue (`start_feedback`, crash recovery); a burst of
+/// submissions each spawn one of these, but only one at a time ever does real
+/// work per project: they all funnel through the same `{id}:{project}`
+/// `NamedLocks` write guard, so whichever gets in first drains the queue
+/// (oldest-`seq`-first, regardless of which caller's own message that is) and
+/// every other caller's copy finds nothing left once its turn comes and
+/// returns immediately. This is what makes the default ordering deterministic
+/// -- it is derived from `seq` order in the database, never from which
+/// thread happened to win the lock.
+///
+/// The guardian-wide read guard held around the drain (see `named_lock`'s
+/// module doc comment) is what makes feedback wait for an in-flight merge/
+/// rebase to finish, and a merge/rebase (which holds the write side) wait for
+/// every in-flight feedback pass across every project to finish first.
+pub fn spawn_feedback_project_worker(
+    store: Arc<Mutex<Store>>,
+    runner: Arc<dyn Runner>,
+    guardian_locks: NamedLocks,
+    cancellations: Cancellations,
+    sem: Arc<Semaphore>,
+    id: &str,
+    project: &str,
+) {
+    let id = id.to_string();
+    let project = project.to_string();
     std::thread::spawn(move || {
-        record_feedback_reply(&store, &sid, &bid, &feature, &feedback);
-        let outcome = run_feedback(
-            &store,
-            runner.as_ref(),
-            &sid,
-            &bid,
-            &feedback,
-            Some(message_seq),
-            &CancelToken::never(),
-        );
-        crate::rlog!(
-            INFO,
-            "ralphus [guardian] review {sid} feedback outcome committed={} pushed={}",
-            outcome.committed,
-            outcome.pushed
-        );
+        guardian_locks.with_read(&id, "feedback", || {
+            guardian_locks.with_write(&format!("{id}:{project}"), "feedback", || {
+                loop {
+                    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(&id) else {
+                        break;
+                    };
+                    let received = store
+                        .lock()
+                        .expect("poisoned")
+                        .received_feedback_messages(&id)
+                        .unwrap_or_default();
+                    let Some((branch_id, seq, text)) =
+                        received.into_iter().find(|(branch_id, _, _)| {
+                            effective_project(&guardian, branch_id) == project
+                        })
+                    else {
+                        break;
+                    };
+                    // Acquired per-message (not once for the whole drain) so
+                    // a long queue doesn't hold a global concurrency slot it
+                    // isn't using between messages -- mirrors every
+                    // merge-family worker counting against the same cap.
+                    let _permit = sem.acquire();
+                    let cancel_key = format!("feedback:{id}:{branch_id}:{seq}");
+                    let token = cancellations.register(&cancel_key);
+                    let outcome = run_feedback(
+                        &store,
+                        runner.as_ref(),
+                        &id,
+                        &branch_id,
+                        &text,
+                        Some(seq),
+                        &token,
+                    );
+                    cancellations.remove(&cancel_key);
+                    crate::rlog!(
+                        INFO,
+                        "ralphus [guardian] review {id} feedback outcome committed={} pushed={}",
+                        outcome.committed,
+                        outcome.pushed
+                    );
+                }
+            });
+        });
     });
-    reply(202, "{\"status\":\"applying_feedback\"}")
 }
 
 /// Generate a short, conversational acknowledgment of branch feedback and
@@ -5426,6 +5608,33 @@ pub fn run_feedback(
     };
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    // RAL-387: `FeedbackMode::CancelAndReplace` already proactively marked
+    // this call's own "reviewer" message `Superseded` before tripping
+    // `cancel` (see `start_feedback`), so there is nothing left to reconcile
+    // on the message side -- bail out before committing/pushing/restacking
+    // downstream on a deliberately-interrupted pass; the replacement request
+    // queued right behind this one will redo all of that against the
+    // worktree's current (unmodified-by-this-call) state the moment this
+    // call returns and its worker picks it up.
+    if cancel.is_cancelled() {
+        if let Some(name) = &stash_name {
+            if let Err(e) = crate::stash::pop_named(|args| wt.git(args), name) {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} feedback: stash restore failed after cancellation: {e}"
+                );
+            }
+        }
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .clear_branch_pending_feedback(id, branch_id);
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {id} feedback cancelled position={position} (replaced by a newer request)"
+        );
+        return FeedbackOutcome::default();
+    }
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
     let committed = !dirty.trim().is_empty() && !no_commit;
     let mut proof_note: Option<String> = None;

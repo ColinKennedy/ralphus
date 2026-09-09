@@ -394,6 +394,7 @@ pub fn run_loop(
     cancellations: Cancellations,
     sem: Arc<Semaphore>,
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
+    guardian_locks: crate::named_lock::NamedLocks,
 ) {
     let mut last_maintenance = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
@@ -412,7 +413,7 @@ pub fn run_loop(
     crate::guardian_merge::retire_stale_worktrees(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
-    recover_interrupted_reviews(&store, &sem, &cancellations);
+    recover_interrupted_reviews(&store, &sem, &cancellations, &guardian_locks);
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
     // completed but before the guardian auto-started, and a full-merge crash (its
@@ -2727,20 +2728,63 @@ pub fn recover_interrupted_reviews(
     store: &Arc<Mutex<Store>>,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
+    guardian_locks: &crate::named_lock::NamedLocks,
 ) {
-    let (interrupted, pending_feedback) = {
+    let (interrupted, feedback_guardian_ids) = {
         let guard = store.lock().expect("store mutex poisoned");
         let interrupted = guard.interrupted_merges().unwrap_or_default();
         for gid in &interrupted {
             let _ = guard.reset_guardian_to_collecting(gid);
         }
-        let pending_feedback = guard.branches_with_pending_feedback().unwrap_or_default();
-        (interrupted, pending_feedback)
+        let feedback_guardian_ids = guard.guardians_with_received_feedback().unwrap_or_default();
+        (interrupted, feedback_guardian_ids)
     };
-    for (gid, branch_id, feedback) in pending_feedback {
+    for gid in feedback_guardian_ids {
+        resume_feedback(store, sem, cancellations, guardian_locks, gid);
+    }
+    start_reviews(store, interrupted, sem, cancellations);
+}
+
+/// RAL-375/RAL-387: resume every project's feedback queue for guardian `gid`
+/// left with at least one still-`received` "reviewer" message by an unclean
+/// shutdown -- one [`crate::guardian_merge::spawn_feedback_project_worker`]
+/// per distinct project, exactly the same entry point a fresh
+/// `POST .../feedback` request uses, so a queue with several outstanding
+/// messages (not just the single one an earlier daemon version could track)
+/// drains in full, oldest first, instead of only reapplying one.
+///
+/// Looked up just before spawning (not passed in from the caller) -- at
+/// startup, before any new feedback can have been submitted, this is exactly
+/// the queue state whatever crashed left behind.
+fn resume_feedback(
+    store: &Arc<Mutex<Store>>,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+    guardian_locks: &crate::named_lock::NamedLocks,
+    gid: String,
+) {
+    let guardian = {
+        let guard = store.lock().expect("store mutex poisoned");
+        match guard.get_guardian(&gid) {
+            Ok(g) => g,
+            Err(_) => return,
+        }
+    };
+    let received = store
+        .lock()
+        .expect("store mutex poisoned")
+        .received_feedback_messages(&gid)
+        .unwrap_or_default();
+    let mut projects: Vec<String> = received
+        .iter()
+        .map(|(branch_id, _, _)| crate::guardian_merge::effective_project(&guardian, branch_id))
+        .collect();
+    projects.sort();
+    projects.dedup();
+    for project in projects {
         crate::rlog!(
             WARNING,
-            "ralphus [recovery] review {gid} branch {branch_id}: reapplying feedback interrupted by daemon restart"
+            "ralphus [recovery] review {gid} project {project}: reapplying feedback interrupted by daemon restart"
         );
         let _ = store
             .lock()
@@ -2749,67 +2793,31 @@ pub fn recover_interrupted_reviews(
                 level: crate::logging::LogLevel::WARNING,
                 source: "recovery",
                 message: "reapplying feedback interrupted by daemon restart",
-                scope: Some("branch"),
+                scope: Some("guardian"),
                 squad_id: None,
                 guardian_id: Some(&gid),
                 cell_id: None,
                 task: None,
                 log_path: None,
-                payload: serde_json::json!({"branch_id": branch_id}),
+                payload: serde_json::json!({"project": project}),
                 admin_only: false,
             });
-        resume_feedback(store, sem, cancellations, gid, branch_id, feedback);
-    }
-    start_reviews(store, interrupted, sem, cancellations);
-}
-
-/// RAL-375: re-run [`crate::guardian_merge::run_feedback`] for a branch whose
-/// feedback application was interrupted by an unclean shutdown -- mirrors
-/// `guardian_merge::start_feedback`'s own thread-spawn shape (subprocess
-/// runner via `MachineRouter`, `guardian:{gid}`-keyed cancel token) since this
-/// is the same work, just re-entered from recovery instead of a fresh
-/// `POST .../feedback` request.
-///
-/// RAL-380: looked up just before spawning (not passed in from the caller) --
-/// at startup, before any new feedback can have been submitted, the still-
-/// `received` message on this branch (if any survived whatever crashed) is
-/// unambiguously the one this recovery run is resuming.
-fn resume_feedback(
-    store: &Arc<Mutex<Store>>,
-    sem: &Arc<Semaphore>,
-    cancellations: &Cancellations,
-    gid: String,
-    branch_id: String,
-    feedback: String,
-) {
-    let store = Arc::clone(store);
-    let sem = Arc::clone(sem);
-    let cancellations = cancellations.clone();
-    std::thread::spawn(move || {
-        let _permit = sem.acquire();
         let local: Arc<dyn Runner> =
-            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(&store)));
+            Arc::new(SubprocessRunner::from_env().with_cartographer(Arc::clone(store)));
         let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
             local,
-            Arc::clone(&store),
+            Arc::clone(store),
         ));
-        let token = cancellations.register(&format!("guardian:{gid}"));
-        let message_seq = store
-            .lock()
-            .expect("poisoned")
-            .latest_received_feedback_message_seq(&gid, &branch_id)
-            .unwrap_or_default();
-        crate::guardian_merge::run_feedback(
-            &store,
-            runner.as_ref(),
+        crate::guardian_merge::spawn_feedback_project_worker(
+            Arc::clone(store),
+            runner,
+            guardian_locks.clone(),
+            cancellations.clone(),
+            Arc::clone(sem),
             &gid,
-            &branch_id,
-            &feedback,
-            message_seq,
-            &token,
+            &project,
         );
-        cancellations.remove(&format!("guardian:{gid}"));
-    });
+    }
 }
 
 /// Spawn a background merge for each guardian that is still `collecting`.

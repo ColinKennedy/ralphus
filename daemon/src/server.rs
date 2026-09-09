@@ -108,6 +108,16 @@ pub struct Daemon {
     /// buttons -- see `crate::generation`'s module doc comment for why this
     /// is fire-and-forget-plus-poll rather than a blocking HTTP call.
     generation_jobs: crate::generation::GenerationJobs,
+    /// RAL-387: per-guardian and per-(guardian, project) read/write locks
+    /// giving worktree ownership a structural invariant -- a merge/rebase
+    /// worker holds its guardian's key for write (excluding every other
+    /// merge-family worker and every feedback worker), a feedback worker
+    /// holds it for read (concurrent with feedback in other projects,
+    /// excluded from a live merge) and additionally holds its own
+    /// `{guardian}:{project}` key for write (excluding other feedback within
+    /// the same project, since a feedback pass restacks every downstream
+    /// branch in its project). See `crate::named_lock`'s module doc comment.
+    guardian_locks: crate::named_lock::NamedLocks,
 }
 
 impl Daemon {
@@ -130,6 +140,7 @@ impl Daemon {
             active_terminal_sessions: Mutex::new(std::collections::HashSet::new()),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
             generation_jobs: crate::generation::GenerationJobs::new(),
+            guardian_locks: crate::named_lock::NamedLocks::new(),
         }
     }
 
@@ -266,6 +277,14 @@ impl Daemon {
     #[must_use]
     pub fn semaphore_handle(&self) -> Arc<Semaphore> {
         Arc::clone(&self.sem)
+    }
+
+    /// A cloned handle to the guardian worktree-ownership locks (RAL-387),
+    /// for the scheduler thread and every guardian-merge/feedback entry
+    /// point.
+    #[must_use]
+    pub fn guardian_locks_handle(&self) -> crate::named_lock::NamedLocks {
+        self.guardian_locks.clone()
     }
 
     /// A cloned handle to the guardian summary-recompute priority queue (for
@@ -9512,6 +9531,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             runner,
             id,
             daemon.semaphore_handle(),
+            daemon.guardian_locks_handle(),
         );
         if restarted.status >= 400 {
             // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
@@ -10093,7 +10113,12 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
 fn pr_action_feedback(daemon: &Daemon, pr_id: &str) -> Reply {
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::pr::start_action_pr_feedback(daemon.store_handle(), runner, pr_id)
+    crate::pr::start_action_pr_feedback(
+        daemon.store_handle(),
+        runner,
+        daemon.guardian_locks_handle(),
+        pr_id,
+    )
 }
 
 /// Live drift check between this PR's remote branch and its owning review
@@ -10328,6 +10353,7 @@ fn guardian_arrange(daemon: &Daemon, id: &str, body: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -10371,6 +10397,7 @@ fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -10830,6 +10857,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     );
     match outcome {
         Ok(crate::guardian_merge::StartMergeOutcome::Merging) => json(
@@ -10940,6 +10968,7 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -11026,6 +11055,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
             id,
             daemon.semaphore_handle(),
             daemon.cancellations_handle(),
+            daemon.guardian_locks_handle(),
         );
     }
     crate::guardian_merge::start_merge(
@@ -11034,6 +11064,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         &to_guardian_id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -11045,6 +11076,7 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
         id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -11077,6 +11109,7 @@ fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
         runner,
         id,
         daemon.semaphore_handle(),
+        daemon.guardian_locks_handle(),
     )
 }
 
@@ -11091,6 +11124,15 @@ struct FeedbackBody {
     /// request data.
     #[serde(default)]
     author: Option<String>,
+    /// RAL-387: how this request interacts with feedback already queued or
+    /// actively running for this branch. Absent/`"queue"` (the default)
+    /// appends behind whatever is already there, discarding nothing;
+    /// `"replace"` supersedes only requests still queued (not yet started
+    /// by the resolver agent), leaving an actively-running one to finish;
+    /// `"cancel_and_replace"` additionally stops a request that is actively
+    /// running. See [`crate::guardian_merge::FeedbackMode`].
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// RAL-379: resolves `req.author` against the user registry, falling back to
@@ -11129,6 +11171,21 @@ fn guardian_feedback(
     if req.feedback.trim().is_empty() {
         return error(400, "bad_request", "feedback must not be empty", vec![]);
     }
+    let mode = match req.mode.as_deref() {
+        None | Some("queue") => crate::guardian_merge::FeedbackMode::Queue,
+        Some("replace") => crate::guardian_merge::FeedbackMode::Replace,
+        Some("cancel_and_replace") => crate::guardian_merge::FeedbackMode::CancelAndReplace,
+        Some(other) => {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "unknown feedback mode {other:?} (expected queue, replace, or cancel_and_replace)"
+                ),
+                vec![],
+            );
+        }
+    };
     // Best-effort, like `guardian_create`'s `auto_watch_user`: an
     // unresolvable/unregistered ambient `[daemon].default_user` shouldn't
     // block posting feedback, it just means `submitted_by` stays `None`.
@@ -11142,11 +11199,15 @@ fn guardian_feedback(
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
         runner,
+        daemon.guardian_locks_handle(),
+        daemon.cancellations_handle(),
+        daemon.semaphore_handle(),
         id,
         branch_id,
         req.feedback,
         author,
         submitted_by,
+        mode,
     )
 }
 
@@ -11157,9 +11218,24 @@ struct MessagesResponse {
 
 /// One review branch's read-only feedback thread (RAL-272) -- populated by
 /// `POST .../branches/{branch_id}/feedback`.
+///
+/// RAL-387: marks each still-`received` message `active: true`/`false` --
+/// resolved from the live cancellation registry, not the stored row, since a
+/// message can move from queued to active (or from active to superseded, via
+/// `cancel_and_replace`) without a write to its own `action_status`.
 fn guardian_branch_messages(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     match daemon.lock().guardian_branch_messages(id, branch_id) {
-        Ok(messages) => json(200, &MessagesResponse { messages }),
+        Ok(mut messages) => {
+            let cancellations = daemon.cancellations_handle();
+            let active_seq =
+                crate::guardian_merge::active_feedback_seq(&cancellations, id, branch_id);
+            for m in &mut messages {
+                if m.action_status.as_deref() == Some("received") {
+                    m.active = Some(active_seq == Some(m.seq));
+                }
+            }
+            json(200, &MessagesResponse { messages })
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -11428,6 +11504,7 @@ pub fn serve<A: ToSocketAddrs>(
     // ralphus entirely -- still gets pulled back into this guardian's branch
     // order instead of silently drifting forever.
     crate::pr::spawn_pr_base_drift_poller(daemon.store_handle());
+    let guardian_locks = daemon.guardian_locks_handle();
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -11436,6 +11513,7 @@ pub fn serve<A: ToSocketAddrs>(
             cancellations,
             sem,
             summary_queue,
+            guardian_locks,
         );
     });
 
@@ -17476,6 +17554,62 @@ command = "true"
         assert!(r.body.contains("branch feedback"));
         assert!(r.body.contains("branch reply"));
         assert!(!r.body.contains("unscoped msg"));
+    }
+
+    #[test]
+    fn messages_endpoint_marks_the_active_received_message_not_the_queued_one() {
+        // RAL-387: two "received" messages on the same branch (as a real
+        // `Replace`-mode submission can leave behind: the active one plus a
+        // fresh queued one) must be told apart in the read endpoint's JSON,
+        // not just in the daemon's own bookkeeping -- resolved from the
+        // cancellation registry, not the stored row.
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        let active_seq = d
+            .lock()
+            .add_guardian_message(
+                gid,
+                "reviewer",
+                "in flight",
+                None,
+                Some(&branch_id),
+                None,
+                None,
+            )
+            .unwrap();
+        let queued_seq = d
+            .lock()
+            .add_guardian_message(
+                gid,
+                "reviewer",
+                "queued behind it",
+                None,
+                Some(&branch_id),
+                None,
+                None,
+            )
+            .unwrap();
+        let _token = d
+            .cancellations_handle()
+            .register(&format!("feedback:{gid}:{branch_id}:{active_seq}"));
+
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/messages"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let msgs = parsed["messages"].as_array().unwrap();
+        let by_seq = |seq: i64| msgs.iter().find(|m| m["seq"] == seq).unwrap();
+        assert_eq!(by_seq(active_seq)["active"], serde_json::json!(true));
+        assert_eq!(by_seq(queued_seq)["active"], serde_json::json!(false));
     }
 
     #[test]
