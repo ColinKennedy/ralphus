@@ -11,6 +11,28 @@ use crate::{backend::BackendError, shellcmd};
 /// directly: has a space, and isn't a single quoted/wrapped path token (a
 /// fully quoted value -- e.g. `"C:\path with space\claude.exe"` -- is a
 /// single program path despite containing spaces, so it stays a direct exec).
+/// The shell command line that runs `program` with `args`.
+///
+/// The two shell-routed cases need opposite treatment of `program`, and
+/// conflating them is a bug in both directions. A user-authored compound
+/// command (`cd /foo && claude`) is already a shell line: quoting it would
+/// turn the whole thing into one filename. A batch launcher is a *path*, and
+/// leaving it bare splits it at any space -- which is why an npm shim under
+/// `C:\Program Files\...` never launched (RAL-385).
+/// A launcher path is told apart from a shell line by whether it names a real
+/// file: [`is_compound_command`] only sees a space, and a path like
+/// `C:\Program Files\nodejs\pi.cmd` has one for an innocent reason. An
+/// already-quoted value is not a file by that test, so it keeps flowing
+/// through untouched rather than being quoted a second time.
+#[must_use]
+pub fn shell_command_line(shell: &str, program: &str, args: &[String]) -> String {
+    let trimmed = program.trim();
+    if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+        return shellcmd::build_program_command_line(shell, trimmed, args);
+    }
+    shellcmd::build_compound_command_line(shell, program, args)
+}
+
 #[must_use]
 pub fn is_compound_command(value: &str) -> bool {
     let trimmed = value.trim();

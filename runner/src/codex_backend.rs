@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::cli_agent_common::{live_session_path, write_live_session_id};
-use crate::shellcmd::{self, Env, SpawnArgs};
+use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "codex";
@@ -53,7 +53,10 @@ impl ModelBackend for CodexBackend {
         let mut args: Vec<String> = Vec::new();
         if let Some(sp) = options.append_system_prompt {
             args.push("-c".to_string());
-            args.push(format!("developer_instructions={sp}"));
+            args.push(format!(
+                "developer_instructions={}",
+                developer_instructions_value(sp, compound)
+            ));
         }
         args.extend(context_limit_args(options));
         args.push("exec".to_string());
@@ -126,6 +129,48 @@ impl ModelBackend for CodexBackend {
     }
 }
 
+/// The `-c developer_instructions=<value>` right-hand side.
+///
+/// Passed through untouched in every case that works today. A shell-routed
+/// launcher is the exception: a literal newline there truncates the cmd.exe
+/// command line, silently dropping the rest of the system prompt and every
+/// argument after it (RAL-385). Codex parses `-c key=value` as TOML, so a TOML
+/// basic string carries the same text with `\n` escapes instead of literal
+/// newlines -- one argv token, no newline, same value once parsed.
+///
+/// Deliberately scoped to the case that is already broken: when the launcher
+/// is direct, or the text is single-line, the value is emitted exactly as
+/// before, so no path that works today can regress.
+fn developer_instructions_value(system_prompt: &str, compound: bool) -> String {
+    if !compound || !(system_prompt.contains('\n') || system_prompt.contains('\r')) {
+        return system_prompt.to_string();
+    }
+    toml_basic_string(system_prompt)
+}
+
+/// `value` as a TOML basic string, escaping exactly what the TOML spec
+/// requires inside one.
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // TOML forbids raw control characters in a basic string.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// RAL-304/RAL-333: the `-c key=value` argument pairs that deliver
 /// `RunOptions::maximum_context`/`RunOptions::auto_compact_threshold`/
 /// `RunOptions::maximum_tool_output_tokens` to `codex` -- there is no dedicated
@@ -187,30 +232,15 @@ fn spawn(
     if compound {
         let shell = shellcmd::resolve_shell(None);
         let _ = shellcmd::detect_parent_shell(&Env::from_process());
-        let line = shellcmd::build_compound_command_line(&shell, program, args);
-        match shellcmd::shell_spawn_args(&shell, &line) {
-            SpawnArgs::RawShellLine(raw) => {
-                let mut cmd = Command::new("cmd");
-                cmd.arg("/C")
-                    .arg(raw)
-                    .current_dir(workspace.root())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_codex_home_env(&mut cmd, codex_home);
-                cmd.spawn()
-            }
-            SpawnArgs::Argv(argv) => {
-                let mut cmd = Command::new(&argv[0]);
-                cmd.args(&argv[1..]);
-                cmd.current_dir(workspace.root())
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                apply_codex_home_env(&mut cmd, codex_home);
-                cmd.spawn()
-            }
-        }
+        let line = crate::cli_agent_common::shell_command_line(&shell, program, args);
+        let mut cmd =
+            shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), args)?;
+        cmd.current_dir(workspace.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_codex_home_env(&mut cmd, codex_home);
+        cmd.spawn()
     } else {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -584,6 +614,39 @@ mod tests {
         assert_eq!(uncached, 100);
         assert_eq!(cached, 0);
         assert_eq!(output, 10);
+    }
+
+    /// RAL-385: the direct-launcher path is what works today, so it must keep
+    /// emitting the system prompt byte-for-byte -- escaping there would change
+    /// the instructions Codex actually receives.
+    #[test]
+    fn developer_instructions_are_untouched_for_a_direct_launcher() {
+        let sp = "line one\n\nline two";
+        assert_eq!(developer_instructions_value(sp, false), sp);
+    }
+
+    /// A single-line value needs no escaping even when shell-routed.
+    #[test]
+    fn developer_instructions_are_untouched_when_single_line() {
+        assert_eq!(developer_instructions_value("be terse", true), "be terse");
+    }
+
+    /// RAL-385: a literal newline truncates a cmd.exe command line, dropping
+    /// the rest of the system prompt and every later argument. A TOML basic
+    /// string carries the same text with no literal newline in it.
+    #[test]
+    fn developer_instructions_are_toml_escaped_when_shell_routed_and_multiline() {
+        let value = developer_instructions_value("line one\n\nline two", true);
+        assert_eq!(value, "\"line one\\n\\nline two\"");
+        assert!(!value.contains('\n'));
+    }
+
+    #[test]
+    fn toml_basic_string_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(toml_basic_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(toml_basic_string(r"a\b"), r#""a\\b""#);
+        assert_eq!(toml_basic_string("a\tb"), "\"a\\tb\"");
+        assert_eq!(toml_basic_string("a\u{7}b"), "\"a\\u0007b\"");
     }
 
     #[test]

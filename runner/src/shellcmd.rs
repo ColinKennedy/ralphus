@@ -335,6 +335,82 @@ pub fn shell_spawn_args(shell: &str, command_line: &str) -> SpawnArgs {
     SpawnArgs::Argv(argv)
 }
 
+/// A newline in a value bound for cmd.exe or a `.cmd`/`.bat` launcher cannot
+/// survive: cmd ends its command at the newline, and Rust's own batch-file
+/// argument escaping rejects one outright. Callers keep multiline values out
+/// of argv entirely (a file path or stdin instead); this is the backstop that
+/// names the offending argument rather than letting the tail be truncated
+/// silently.
+fn reject_newline_args(args: &[String]) -> std::io::Result<()> {
+    if let Some(bad) = args.iter().find(|a| a.contains('\n') || a.contains('\r')) {
+        let preview: String = bad.chars().take(60).collect();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "argument contains a newline, which cmd.exe cannot carry \
+                 (pass it via a file or stdin instead): {preview:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the [`Command`] for a shell-routed launch, `args` being the
+/// individual tokens that went into `command_line` (checked for newlines).
+///
+/// `cmd.exe` does not parse its command line by MSVCRT argv-quoting rules, so
+/// `Command::arg` is wrong for it: `arg` escapes the embedded quotes as `\"`,
+/// which cmd does not recognize as an escape, so every quoted token gets split
+/// at its spaces. `raw_arg` passes the line through byte-for-byte, and `/S`
+/// makes cmd strip exactly the outer quote pair instead of applying its
+/// context-dependent quote-stripping rules.
+///
+/// # Errors
+/// Returns an error if any argument contains a newline (see
+/// [`reject_newline_args`]).
+pub fn command_for_spawn_args(
+    spawn_args: SpawnArgs,
+    args: &[String],
+) -> std::io::Result<std::process::Command> {
+    match spawn_args {
+        SpawnArgs::RawShellLine(line) => {
+            reject_newline_args(args)?;
+            Ok(cmd_raw_shell_command(&line))
+        }
+        SpawnArgs::Argv(argv) => {
+            let mut cmd = std::process::Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            Ok(cmd)
+        }
+    }
+}
+
+/// `cmd.exe /S /C "<line>"`, built so cmd receives `line` byte-for-byte.
+///
+/// [`std::process::Command::arg`] is the wrong tool here: it applies MSVCRT
+/// argv quoting, escaping the quotes already inside `line` as `\"`, which cmd
+/// does not recognize as an escape -- so every quoted token gets split at its
+/// spaces. `raw_arg` bypasses that, and `/S` makes cmd strip exactly the outer
+/// quote pair rather than applying its context-dependent stripping rules.
+#[cfg(windows)]
+pub fn cmd_raw_shell_command(line: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.raw_arg("/S")
+        .raw_arg("/C")
+        .raw_arg(format!("\"{line}\""));
+    cmd
+}
+
+/// [`SpawnArgs::RawShellLine`] is only produced on Windows, so this exists to
+/// keep the module compiling elsewhere.
+#[cfg(not(windows))]
+pub fn cmd_raw_shell_command(line: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.arg("/C").arg(line);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +442,32 @@ mod tests {
     fn build_program_command_line_no_call_operator_for_bash() {
         let line = build_program_command_line("bash", "claude", &["--foo".to_string()]);
         assert!(!line.starts_with('&'));
+    }
+
+    /// RAL-385: cmd.exe cannot carry a newline, and silently truncating the
+    /// command line there is what made the original failure so hard to read.
+    #[test]
+    fn command_for_spawn_args_rejects_a_newline_argument_on_the_cmd_path() {
+        let args = vec!["--append-system-prompt".to_string(), "a\nb".to_string()];
+        let err = command_for_spawn_args(SpawnArgs::RawShellLine("x".to_string()), &args)
+            .expect_err("a newline cannot survive cmd.exe");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("newline"));
+    }
+
+    #[test]
+    fn command_for_spawn_args_accepts_newline_free_args_on_the_cmd_path() {
+        let args = vec!["-C".to_string(), "C:/Users/John Smith/repo".to_string()];
+        assert!(command_for_spawn_args(SpawnArgs::RawShellLine("x".to_string()), &args).is_ok());
+    }
+
+    /// A newline is only fatal on the cmd path -- PowerShell and the POSIX
+    /// shells pass argv through verbatim, so compound commands keep working.
+    #[test]
+    fn command_for_spawn_args_allows_a_newline_argument_on_the_argv_path() {
+        let args = vec!["a\nb".to_string()];
+        let spawn_args = SpawnArgs::Argv(vec!["bash".to_string(), "-c".to_string()]);
+        assert!(command_for_spawn_args(spawn_args, &args).is_ok());
     }
 
     #[test]

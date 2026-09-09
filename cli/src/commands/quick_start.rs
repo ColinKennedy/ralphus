@@ -790,7 +790,7 @@ fn run_quick_start_subprocess_with(
 /// hands this an empty `Argv`, so the `split_first` below is infallible.
 fn real_spawn(kind: SpawnKind) -> std::io::Result<i32> {
     let status = match kind {
-        SpawnKind::Raw(line) => Command::new("cmd").arg("/C").arg(line).status()?,
+        SpawnKind::Raw(line) => ralphus_runner::shellcmd::cmd_raw_shell_command(&line).status()?,
         SpawnKind::Argv(argv) => {
             let (program, args) = argv
                 .split_first()
