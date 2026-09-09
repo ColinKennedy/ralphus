@@ -525,7 +525,8 @@
        * @property {string} detail
        */
       /**
-       * One `GET /api/worktree-retirements` row (RAL-385): a review worktree
+       * One `GET /api/worktree-retirements` row (RAL-385, states widened by
+       * RAL-386 for machine-provider-backed worktrees): a review worktree
        * classified by retirement lifecycle state, or durable history for a
        * worktree already removed. See docs/glossary.md's "worktree retirement"
        * entry for the state vocabulary.
@@ -534,14 +535,15 @@
        * @property {string} guardian_name
        * @property {string} project_root
        * @property {string} path
-       * @property {string} state - "scheduled" | "eligible" | "claimed" | "failed" | "retired"
+       * @property {string} state - "scheduled" | "eligible" | "claimed" | "failed" | "deferred" | "opted_out" | "retired"
        * @property {number} eligible_at_ms - when the worktree became old enough to retire
        * @property {number|null} last_activity_ms - null for retired rows (path columns were cleared)
        * @property {string|null} claim_kind - "claimed" only: the non-terminal claim holding the worktree
        * @property {string|null} claim_owner - "claimed" only
        * @property {string|null} claim_state - "claimed" only
-       * @property {string|null} error - "failed" only: why git refused the last removal attempt
-       * @property {number|null} last_attempt_ms - "retired"/"failed" only: when the last attempt ran
+       * @property {string|null} error - "failed"/"deferred"/"opted_out" only: why the attempt was refused, deferred, or declined
+       * @property {number|null} last_attempt_ms - "retired"/"failed"/"deferred"/"opted_out" only: when the last attempt ran
+       * @property {number|null} retry_at_ms - "deferred" only (RAL-386): the provider's display-only retry hint
        */
       /**
        * `GET /api/whoami` response (RAL-332).

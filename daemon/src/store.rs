@@ -638,9 +638,12 @@ pub(crate) struct GuardianWorktreeRecord {
     pub last_activity_ms: i64,
 }
 
-/// One durable retirement attempt (RAL-385): a worktree whose removal git
-/// confirmed (`retired`) or refused (`failed`, with `error` carrying the
-/// git failure and the next daily sweep retrying).
+/// One durable retirement attempt (RAL-385, statuses widened by RAL-386): a
+/// worktree whose removal was confirmed (`retired`), refused (`failed`, with
+/// `error` carrying the failure), deferred by a machine provider's own policy
+/// (`deferred`, with `error` carrying its reason and `retry_at_ms` its hint),
+/// or declined outright (`opted_out`, with `error` carrying why). Every
+/// status but `retired` is retried on the next daily sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuardianWorktreeRetirementRecord {
     pub guardian_id: String,
@@ -649,6 +652,7 @@ pub(crate) struct GuardianWorktreeRetirementRecord {
     pub error: Option<String>,
     pub eligible_at_ms: i64,
     pub last_attempt_ms: i64,
+    pub retry_at_ms: Option<i64>,
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -1052,18 +1056,26 @@ impl Store {
             -- trace of the removal; this row is the audit trail. Retained for
             -- exactly as long as its review exists (the FK cascade plus the
             -- explicit sweep in `delete_guardian`), matching the review's own
-            -- retention lifecycle. `status` is `retired` (git removed the
-            -- worktree) or `failed` (git refused; `error` says why and the
-            -- next daily sweep retries). Worktrees that have never been
-            -- attempted need no row -- their scheduled/eligible/claimed
-            -- state is derived live in `guardian_merge::worktree_retirement_view`.
+            -- retention lifecycle. `status` is `retired` (removed), `failed`
+            -- (an attempt was made and refused; `error` says why and the next
+            -- daily sweep retries), `deferred` (RAL-386: a machine provider's
+            -- own policy asked to try again later; `error` carries its reason
+            -- and `retry_at_ms` its hint, though the sweep's own retry cadence
+            -- is still the daily interval), or `opted_out` (RAL-386: a machine
+            -- provider or an operator's static machine policy declined to ever
+            -- retire this worktree automatically; `error` carries why). Only
+            -- `failed`/`deferred`/`opted_out` are retried on the next sweep --
+            -- `retired` is terminal. Worktrees that have never been attempted
+            -- need no row -- their scheduled/eligible/claimed state is derived
+            -- live in `guardian_merge::worktree_retirement_view`.
             CREATE TABLE IF NOT EXISTS guardian_worktree_retirements (
                 guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
                 path            TEXT NOT NULL,
-                status          TEXT NOT NULL CHECK(status IN ('retired', 'failed')),
+                status          TEXT NOT NULL CHECK(status IN ('retired', 'failed', 'deferred', 'opted_out')),
                 error           TEXT,
                 eligible_at_ms  INTEGER NOT NULL,
                 last_attempt_ms INTEGER NOT NULL,
+                retry_at_ms     INTEGER,
                 PRIMARY KEY (guardian_id, path)
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -2303,6 +2315,46 @@ impl Store {
             let _ = self
                 .conn
                 .execute("ALTER TABLE tasks DROP COLUMN baseline_commit_sha", []);
+        }
+        // RAL-386: broaden `guardian_worktree_retirements.status`'s CHECK
+        // constraint to add `deferred`/`opted_out` and add `retry_at_ms`.
+        // SQLite cannot alter a CHECK constraint or add a column with a
+        // meaningful default retroactively in place, so a database created
+        // under the RAL-385 schema is migrated by rebuilding the table --
+        // detected by sniffing its own recorded DDL for the new status,
+        // rather than a version counter this codebase doesn't otherwise
+        // keep. Every existing row is `retired` or `failed` (the only
+        // statuses that ever existed before this migration), both still
+        // valid under the broadened constraint, so the copy is a plain
+        // `INSERT ... SELECT` with `retry_at_ms` defaulting to `NULL`.
+        let retirements_need_rebuild = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='guardian_worktree_retirements'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|sql| !sql.contains("opted_out"))
+            .unwrap_or(false);
+        if retirements_need_rebuild {
+            self.conn.execute_batch(
+                "ALTER TABLE guardian_worktree_retirements RENAME TO guardian_worktree_retirements_ral385;
+                 CREATE TABLE guardian_worktree_retirements (
+                     guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                     path            TEXT NOT NULL,
+                     status          TEXT NOT NULL CHECK(status IN ('retired', 'failed', 'deferred', 'opted_out')),
+                     error           TEXT,
+                     eligible_at_ms  INTEGER NOT NULL,
+                     last_attempt_ms INTEGER NOT NULL,
+                     retry_at_ms     INTEGER,
+                     PRIMARY KEY (guardian_id, path)
+                 );
+                 INSERT INTO guardian_worktree_retirements
+                     (guardian_id, path, status, error, eligible_at_ms, last_attempt_ms, retry_at_ms)
+                 SELECT guardian_id, path, status, error, eligible_at_ms, last_attempt_ms, NULL
+                 FROM guardian_worktree_retirements_ral385;
+                 DROP TABLE guardian_worktree_retirements_ral385;",
+            )?;
         }
         Ok(())
     }
@@ -4187,10 +4239,13 @@ impl Store {
         Ok(())
     }
 
-    /// Record (or overwrite) a worktree retirement attempt (RAL-385). A later
-    /// attempt for the same `(guardian, path)` replaces the earlier one, so a
-    /// worktree that failed once and was removed on a later daily sweep reads
-    /// as `retired`, while a repeated failure keeps only the latest error.
+    /// Record (or overwrite) a worktree retirement attempt (RAL-385; `status`
+    /// widened by RAL-386 to include `deferred`/`opted_out`, see
+    /// [`GuardianWorktreeRetirementRecord`]). A later attempt for the same
+    /// `(guardian, path)` replaces the earlier one, so a worktree that failed
+    /// once and was removed on a later daily sweep reads as `retired`, while a
+    /// repeated failure keeps only the latest error.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_guardian_worktree_retirement(
         &self,
         guardian_id: &str,
@@ -4199,23 +4254,26 @@ impl Store {
         error: Option<&str>,
         eligible_at_ms: i64,
         last_attempt_ms: i64,
+        retry_at_ms: Option<i64>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO guardian_worktree_retirements
-                 (guardian_id, path, status, error, eligible_at_ms, last_attempt_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (guardian_id, path, status, error, eligible_at_ms, last_attempt_ms, retry_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(guardian_id, path) DO UPDATE SET
                  status=excluded.status,
                  error=excluded.error,
                  eligible_at_ms=excluded.eligible_at_ms,
-                 last_attempt_ms=excluded.last_attempt_ms",
+                 last_attempt_ms=excluded.last_attempt_ms,
+                 retry_at_ms=excluded.retry_at_ms",
             params![
                 guardian_id,
                 path,
                 status,
                 error,
                 eligible_at_ms,
-                last_attempt_ms
+                last_attempt_ms,
+                retry_at_ms,
             ],
         )?;
         Ok(())
@@ -4226,7 +4284,7 @@ impl Store {
         &self,
     ) -> Result<Vec<GuardianWorktreeRetirementRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT guardian_id, path, status, error, eligible_at_ms, last_attempt_ms
+            "SELECT guardian_id, path, status, error, eligible_at_ms, last_attempt_ms, retry_at_ms
              FROM guardian_worktree_retirements ORDER BY last_attempt_ms, guardian_id, path",
         )?;
         Ok(stmt
@@ -4238,6 +4296,7 @@ impl Store {
                     error: r.get(3)?,
                     eligible_at_ms: r.get(4)?,
                     last_attempt_ms: r.get(5)?,
+                    retry_at_ms: r.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
