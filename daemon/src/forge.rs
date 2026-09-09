@@ -168,6 +168,23 @@ pub struct CreatedPr {
     pub url: String,
 }
 
+/// An already-open PR/MR discovered via [`ForgeClient::find_open_pull_request`]
+/// (RAL-<new>) — distinct from [`CreatedPr`] because it also carries the
+/// PR/MR's current base/title/body, so a caller adopting it can record what
+/// the forge actually has rather than what ralphus intended to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingPr {
+    pub number: i64,
+    pub url: String,
+    /// The base ref (GitHub) / target branch (GitLab) currently recorded on
+    /// the forge — may differ from what a caller was about to request; the
+    /// normal base-resync path reconciles that afterward.
+    pub base: String,
+    pub title: String,
+    /// Empty when the PR/MR has no description, not absent.
+    pub description: String,
+}
+
 /// A registered GitHub-native PR stack (`GET/POST .../stacks`) — GitHub only,
 /// see [`ForgeClient::create_stack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +385,135 @@ impl ForgeClient {
                 Ok(CreatedPr { number, url })
             }
         }
+    }
+
+    /// Look up whether an open PR/MR already exists for `head` against this
+    /// repo, via the forge's own documented head/source-branch filter query
+    /// (RAL-<new>) -- GitHub's `GET .../pulls?head=&state=open`, GitLab's
+    /// `GET .../merge_requests?source_branch=&state=opened`. Deliberately
+    /// never inspects a creation attempt's error text: GitHub's "a pull
+    /// request already exists" validation failure carries no stable
+    /// machine-readable code of its own (`code: "custom"`, like every other
+    /// free-text validation message), so a caller wanting to detect it durably
+    /// must ask the API directly instead of pattern-matching that wording.
+    /// `Ok(None)` when no open PR/MR has this head.
+    ///
+    /// # Errors
+    /// Missing token or any forge API/parse failure.
+    pub fn find_open_pull_request(&self, head: &str) -> Result<Option<ExistingPr>, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] find open pr start kind={} repo={} head={head}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.find_open_pull_request_inner(head);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(Some(found)) => crate::rlog!(
+                INFO,
+                "ralphus [forge] find open pr found kind={} repo={} head={head} number={} \
+                 base={}",
+                self.kind.as_str(),
+                self.repo_path,
+                found.number,
+                found.base
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(None) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] find open pr none kind={} repo={} head={head}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] find open pr failed kind={} repo={} head={head}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn find_open_pull_request_inner(&self, head: &str) -> Result<Option<ExistingPr>, String> {
+        let token = self.require_token()?;
+        let found = match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls", self.api_base, self.repo_path);
+                let resp = self.get(
+                    ureq::get(&url)
+                        .query("head", head)
+                        .query("state", "open")
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                let arr = resp
+                    .as_array()
+                    .ok_or_else(|| format!("unexpected GitHub PR list response shape: {resp}"))?;
+                let Some(found) = arr.first() else {
+                    return Ok(None);
+                };
+                let number = found["number"]
+                    .as_i64()
+                    .ok_or_else(|| format!("unexpected GitHub PR response shape: {found}"))?;
+                let url = found["html_url"].as_str().unwrap_or_default().to_string();
+                let base = found["base"]["ref"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing base.ref".to_string())?;
+                let title = found["title"].as_str().unwrap_or_default().to_string();
+                let description = found["body"].as_str().unwrap_or_default().to_string();
+                ExistingPr {
+                    number,
+                    url,
+                    base,
+                    title,
+                    description,
+                }
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests",
+                    self.api_base, self.repo_path
+                );
+                let resp = self.get(
+                    ureq::get(&url)
+                        .query("source_branch", head)
+                        .query("state", "opened")
+                        .set("PRIVATE-TOKEN", token),
+                )?;
+                let arr = resp
+                    .as_array()
+                    .ok_or_else(|| format!("unexpected GitLab MR list response shape: {resp}"))?;
+                let Some(found) = arr.first() else {
+                    return Ok(None);
+                };
+                let number = found["iid"]
+                    .as_i64()
+                    .ok_or_else(|| format!("unexpected GitLab MR response shape: {found}"))?;
+                let url = found["web_url"].as_str().unwrap_or_default().to_string();
+                let base = found["target_branch"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "forge response missing target_branch".to_string())?;
+                let title = found["title"].as_str().unwrap_or_default().to_string();
+                let description = found["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                ExistingPr {
+                    number,
+                    url,
+                    base,
+                    title,
+                    description,
+                }
+            }
+        };
+        Ok(Some(found))
     }
 
     /// Resolve this GitLab project's numeric id via `GET /projects/{path}`
@@ -1789,6 +1935,18 @@ impl PrRoute {
             self.target_project_id,
         )
     }
+
+    /// Look up whether this route's exact head already has an open PR/MR --
+    /// see [`ForgeClient::find_open_pull_request`] for why this is a
+    /// structured query rather than a creation-error-text check. Call this
+    /// before [`Self::create_pull_request`] and adopt what it finds instead
+    /// of creating a duplicate.
+    ///
+    /// # Errors
+    /// Propagates the underlying forge API failure.
+    pub fn find_existing_pull_request(&self) -> Result<Option<ExistingPr>, String> {
+        self.client.find_open_pull_request(&self.head)
+    }
 }
 
 /// Pick whichever candidate client's repo label matches `repo` (RAL-338) --
@@ -2427,6 +2585,104 @@ mod tests {
         client
             .create_pull_request("t", "b", "alias", "main")
             .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn find_open_pull_request_queries_githubs_documented_head_filter() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/repos/acme/widget/pulls");
+            assert!(
+                query.contains("head=acme%3Aalias") || query.contains("head=acme:alias"),
+                "{query}"
+            );
+            assert!(query.contains("state=open"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"number":7,"html_url":"http://x/7","base":{"ref":"main"},"title":"T","body":"D"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let found = client
+            .find_open_pull_request("acme:alias")
+            .unwrap()
+            .expect("must find the open PR the mock server reports");
+        assert_eq!(found.number, 7);
+        assert_eq!(found.url, "http://x/7");
+        assert_eq!(found.base, "main");
+        assert_eq!(found.title, "T");
+        assert_eq!(found.description, "D");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn find_open_pull_request_is_none_when_githubs_list_is_empty() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(
+            client
+                .find_open_pull_request("acme:alias")
+                .unwrap()
+                .is_none()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn find_open_pull_request_queries_gitlabs_documented_source_branch_filter() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/projects/alice%2Fwidget/merge_requests");
+            assert!(query.contains("source_branch=alias"), "{query}");
+            assert!(query.contains("state=opened"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"iid":9,"web_url":"http://x/9","target_branch":"main","title":"T","description":"D"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let found = client
+            .find_open_pull_request("alias")
+            .unwrap()
+            .expect("must find the open MR the mock server reports");
+        assert_eq!(found.number, 9);
+        assert_eq!(found.base, "main");
         handle.join().unwrap();
     }
 

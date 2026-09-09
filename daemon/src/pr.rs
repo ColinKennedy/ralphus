@@ -3565,15 +3565,47 @@ fn submit_stacked_branch_pr(
             repo: client.repo_label().to_string(),
         },
     };
-    let (title, description) = resolve_title_description(
-        runner,
-        guardian,
-        req,
-        position,
-        &route.client,
-        trace_context,
-    );
-    let created_pr = route.create_pull_request(&title, &description)?;
+    // RAL-<new>: a branch can reach here with no local PR row (a prior one
+    // was unlinked, or a resubmit races an earlier attempt) while the forge
+    // still has an open PR/MR for this exact head -- creating would just
+    // 422. Ask the forge directly via its documented head/source-branch
+    // filter (see `find_open_pull_request`'s doc for why this is a
+    // structured query, never a parse of the creation error's free-text
+    // message) and adopt what's already there instead of failing.
+    let (created_pr, base, title, description, adopted) =
+        match route.find_existing_pull_request()? {
+            Some(existing) => {
+                crate::rlog!(
+                    INFO,
+                    "ralphus [pr] review {id} branch {branch_id} alias {alias} adopting \
+                     pre-existing open PR/MR #{} (base={}) instead of creating a duplicate",
+                    existing.number,
+                    existing.base
+                );
+                (
+                    crate::forge::CreatedPr {
+                        number: existing.number,
+                        url: existing.url,
+                    },
+                    existing.base,
+                    existing.title,
+                    existing.description,
+                    true,
+                )
+            }
+            None => {
+                let (title, description) = resolve_title_description(
+                    runner,
+                    guardian,
+                    req,
+                    position,
+                    &route.client,
+                    trace_context,
+                );
+                let created = route.create_pull_request(&title, &description)?;
+                (created, base, title, description, false)
+            }
+        };
     let row_id = store
         .lock()
         .expect("poisoned")
@@ -3608,7 +3640,11 @@ fn submit_stacked_branch_pr(
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "pr",
-            message: "pull request created",
+            message: if adopted {
+                "pull request adopted"
+            } else {
+                "pull request created"
+            },
             scope: Some("branch"),
             squad_id: None,
             guardian_id: Some(id),
@@ -3621,6 +3657,7 @@ fn submit_stacked_branch_pr(
                 "alias": alias,
                 "pr_number": created_pr.number,
                 "pr_url": created_pr.url,
+                "adopted": adopted,
             }),
             admin_only: false,
         });
@@ -3631,6 +3668,18 @@ fn submit_stacked_branch_pr(
     // map is seeded from *all* already-open PRs up front, not just the ones
     // submitted in this call.
     alias_by_branch.insert(branch_id.to_string(), alias);
+    // RAL-<new>: a stale `auto_submit_error` badge (RAL-317) is only ever
+    // cleared by `maybe_auto_submit_branch`'s own success path, scoped to the
+    // single branch whose terminal transition triggered that call -- so a
+    // sibling branch swept into the same auto-submit batch, or a PR fixed
+    // through any other path entirely (a manual "submit PR stack", the
+    // periodic reconcile sweep), never had its own error cleared even after
+    // succeeding here. This is the one site every PR creation/adoption
+    // funnels through, so clearing it here covers all of them uniformly.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .set_branch_auto_submit_error(id, branch_id, None);
     store
         .lock()
         .expect("poisoned")
@@ -8529,49 +8578,51 @@ mod tests {
 
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
+        // Every `submit_stacked_branch_pr` call now checks "does an open
+        // PR/MR already exist for this head?" via a GET before it POSTs a
+        // new one (RAL-<new>) -- expect and answer "no" for each branch.
+        let expect_none_then_create =
+            |server: &tiny_http::Server, repo: &str, number: i64, url: &str| {
+                let req = server.recv().unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                assert!(
+                    req.url().starts_with(&format!("/repos/{repo}/pulls?")),
+                    "{}",
+                    req.url()
+                );
+                req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                    .unwrap();
+
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.url(), format!("/repos/{repo}/pulls"));
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"number":{number},"html_url":"{url}"}}"#
+                    ))
+                    .with_status_code(201),
+                )
+                .unwrap();
+                payload
+            };
         let handle = std::thread::spawn(move || {
             // Root branch: cross-repository PR filed at the parent, head is
             // `<fork_owner>:<alias>`.
-            let mut req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls");
-            let mut body = String::new();
-            req.as_reader().read_to_string(&mut body).unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
-            req.respond(
-                tiny_http::Response::from_string(r#"{"number":1,"html_url":"http://x/1"}"#)
-                    .with_status_code(201),
-            )
-            .unwrap();
 
             // Branch b: fork-internal PR based on a's own alias.
-            let mut req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/alice/widget/pulls");
-            let mut body = String::new();
-            req.as_reader().read_to_string(&mut body).unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
-            req.respond(
-                tiny_http::Response::from_string(r#"{"number":2,"html_url":"http://x/2"}"#)
-                    .with_status_code(201),
-            )
-            .unwrap();
 
             // Branch c: fork-internal PR based on b's own alias.
-            let mut req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/alice/widget/pulls");
-            let mut body = String::new();
-            req.as_reader().read_to_string(&mut body).unwrap();
-            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
             assert_eq!(payload["head"], serde_json::json!("c-alias"));
             assert_eq!(payload["base"], serde_json::json!("b-alias"));
-            req.respond(
-                tiny_http::Response::from_string(r#"{"number":3,"html_url":"http://x/3"}"#)
-                    .with_status_code(201),
-            )
-            .unwrap();
         });
 
         let root_dir = tmp_dir("fork-it-work");
@@ -8761,14 +8812,21 @@ mod tests {
             // Requests arrive in a mix of fixed (PR creation, stack
             // registration) and non-deterministic (per-PR live-state checks,
             // iterated from a `HashMap`) order, so this dispatches by
-            // method+url rather than asserting a strict sequence.
+            // method+url rather than asserting a strict sequence. Each
+            // branch's `submit_stacked_branch_pr` call also now opens with a
+            // "does a PR already exist for this head?" GET (RAL-<new>) --
+            // two more requests than before this fix.
             let mut next_pr_number = 10_i64;
             let mut stack_payload = serde_json::Value::Null;
-            for _ in 0..6 {
+            for _ in 0..8 {
                 let mut req = server.recv().unwrap();
                 let method = req.method().clone();
                 let url = req.url().to_string();
-                if method == tiny_http::Method::Post && url == "/repos/acme/widget/pulls" {
+                if method == tiny_http::Method::Get && url.starts_with("/repos/acme/widget/pulls?")
+                {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Post && url == "/repos/acme/widget/pulls" {
                     let number = next_pr_number;
                     next_pr_number += 1;
                     req.respond(
@@ -8939,6 +8997,18 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            // `submit_stacked_branch_pr` checks "does an open PR already
+            // exist for this head?" before creating (RAL-<new>) -- answer no.
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url().starts_with("/repos/acme/w/pulls?"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Post);
             assert_eq!(req.url(), "/repos/acme/w/pulls");
@@ -9074,6 +9144,253 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_adopts_a_pre_existing_open_pull_request_instead_of_creating_a_duplicate()
+     {
+        // A branch's PR row was dropped/unlinked locally (or a resubmit
+        // races a prior attempt) while the forge still has an open PR for
+        // that exact head -- creating a new one would 422 ("A pull request
+        // already exists for ..."). `submit_stacked_branch_pr` must discover
+        // it via the documented head-filter query and adopt it, never by
+        // parsing that creation error's free-text message.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url().starts_with("/repos/acme/w/pulls?"),
+                "{}",
+                req.url()
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"predecessor-review"},"title":"Existing title","body":"Existing body"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            // No creation POST must follow -- adoption skips it entirely.
+        });
+
+        let root = tmp_dir("adopt-existing-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        let remote_dir = tmp_dir("adopt-existing-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        // The remote alias already matches local exactly, so the push is a
+        // safe no-op superset -- only the create-vs-adopt decision that
+        // follows it is under test here.
+        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        // No title/description: if adoption were skipped, this would fall
+        // through to `resolve_title_description`'s template-fetch/agent-
+        // synthesis path and then a real creation POST -- both hit a mock
+        // server that has already exited, failing loudly rather than
+        // silently passing.
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: None,
+            description: None,
+            use_worktree_branch_name: None,
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+        )
+        .expect("submission must adopt the pre-existing open PR instead of erroring");
+
+        assert_eq!(pr.pr_number, Some(21));
+        assert_eq!(pr.base_ref, "predecessor-review");
+        assert_eq!(pr.title, "Existing title");
+        assert_eq!(pr.description, "Existing body");
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_clears_a_stale_auto_submit_error_on_success() {
+        // RAL-317's `auto_submit_error` badge is only ever cleared by
+        // `maybe_auto_submit_branch`'s own success path, scoped to the one
+        // branch whose terminal transition triggered that specific call --
+        // so a PR that succeeds through any other route (this function, the
+        // single site every creation/adoption path funnels through) must
+        // clear the branch's own stale marker itself, or the board keeps
+        // showing "auto-submit failed" forever after the real problem is
+        // already fixed.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number":5,"html_url":"http://x/5"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+
+        let root = tmp_dir("clear-auto-submit-error-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        let remote_dir = tmp_dir("clear-auto-submit-error-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .unwrap()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+        // Simulate an earlier failed auto-submit attempt that left its
+        // marker set, e.g. from before this branch's underlying problem was
+        // fixed by hand.
+        store
+            .lock()
+            .unwrap()
+            .set_branch_auto_submit_error(&gid, &branch_id, Some("earlier failure"))
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: None,
+            title: Some("Title".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+        };
+
+        submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+        )
+        .unwrap();
+
+        let after = store.lock().unwrap().get_guardian(&gid).unwrap();
+        assert_eq!(
+            after.branches[0].auto_submit_error, None,
+            "a successful submission must clear the stale auto-submit-error marker, \
+             not just leave a real failure's badge stuck forever"
+        );
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]
