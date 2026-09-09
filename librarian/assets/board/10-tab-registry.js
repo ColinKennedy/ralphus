@@ -209,7 +209,7 @@
       // must not misfire just because the very first fetch hasn't landed.
       let whoAmIResolved = false;
       /** Tab names only ever shown to an admin (client-side hide -- the daemon enforces this server-side too). */
-      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets"];
+      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets", "worktree-retirement"];
       // RAL-332 "Edit Profile": the target user name an admin is viewing
       // RAL-329's Preferences page as, or null for "viewing your own". Set by
       // `editUserProfile`, cleared the moment the admin navigates off the
