@@ -146,6 +146,7 @@
        * @property {{[key: string]: string}} [resolved_env] - RAL-191: the effective environment this branch's review worktree actually runs under — `inherited_env` with `env_overrides` applied.
        * @property {number|null} [started_at_ms] - RAL-259: epoch-ms when this branch's conflict-resolver agent (fix pass or final-proof call) most recently began running, or null if none has started. Persists after the resolver finishes.
        * @property {string|null} [auto_submit_error] - RAL-317: error from this branch's most recent auto-submit-PR-stack attempt, or null/absent if none failed (or none has run). Cleared server-side once the branch's state is covered by an open PR again.
+       * @property {boolean} [pr_submission_pending] - RAL-389: true while an auto-submit-PR-stack request for this branch is durably queued or actively running on its own async worker thread, decoupled from the merge worker. Survives a daemon restart; cleared once that attempt completes (success or failure).
        */
       /**
        * A named, defaulted value referenced by a GuardianCheck's

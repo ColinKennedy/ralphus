@@ -28,25 +28,6 @@ fn stop_timeout_from(value: Option<&str>) -> Duration {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stop_timeout_defaults_to_the_cli_deadline() {
-        assert_eq!(stop_timeout_from(None), Duration::from_secs(60));
-        assert_eq!(
-            stop_timeout_from(Some("not-a-number")),
-            Duration::from_secs(60)
-        );
-    }
-
-    #[test]
-    fn stop_timeout_honors_the_daemon_timeout_override() {
-        assert_eq!(stop_timeout_from(Some("75")), Duration::from_secs(75));
-    }
-}
-
 fn main() -> ExitCode {
     // Touches the obfuscated embedded LICENSE (RAL-236) so thin-LTO release
     // builds don't strip it as dead code ahead of the `ralphus license`
@@ -211,5 +192,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_timeout_defaults_to_the_cli_deadline() {
+        assert_eq!(stop_timeout_from(None), Duration::from_secs(60));
+        assert_eq!(
+            stop_timeout_from(Some("not-a-number")),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn stop_timeout_honors_the_daemon_timeout_override() {
+        assert_eq!(stop_timeout_from(Some("75")), Duration::from_secs(75));
     }
 }

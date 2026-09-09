@@ -1,7 +1,7 @@
-"""Lint: every board.html tab has a documented, embedded "main" screenshot.
+"""Lint: every board tab has a documented, embedded "main" screenshot.
 
-Reads the GUI's own list of tabs — the ``TABS`` JS array in
-``librarian/assets/board.html`` — and, for each one, requires:
+Reads the GUI's own list of tabs — the ``TABS`` JS array from the board's
+loaded JavaScript chunks — and, for each one, requires:
 
 1. A mandatory "main" screenshot at
    ``docs/site/pages/screenshots/<tab>-overview.png``.
@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
+    "BOARD_ASSETS_DIR",
     "BOARD_HTML",
     "MAIN_SUFFIX",
     "PAGES_DIR",
@@ -44,6 +45,7 @@ __all__ = [
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BOARD_HTML = REPO_ROOT / "librarian" / "assets" / "board.html"
+BOARD_ASSETS_DIR = BOARD_HTML.parent
 PAGES_DIR = REPO_ROOT / "docs" / "site" / "pages"
 SCREENSHOTS_DIR = PAGES_DIR / "screenshots"
 VIEWS_DIR = PAGES_DIR / "views"
@@ -54,18 +56,31 @@ MAIN_SUFFIX = "overview"
 
 _TABS_RE = re.compile(r"const TABS\s*=\s*\[([^\]]*)\]")
 _TAB_NAME_RE = re.compile(r'"([^"]+)"')
+_BOARD_CHUNK_RE = re.compile(r'<script\s+src="/board/([^"]+\.js)"></script>')
 
 
 def _log(message: str) -> None:
     print(f"ralphus [docsgen] {message}", file=sys.stderr)
 
 
-def board_tabs() -> list[str]:
-    """The GUI's own list of tabs, parsed from board.html's `TABS` array."""
+def board_source() -> str:
+    """Return the board chunks in the same order the page loads them."""
     html = BOARD_HTML.read_text(encoding="utf-8")
-    match = _TABS_RE.search(html)
+    chunks = _BOARD_CHUNK_RE.findall(html)
+    if not chunks:
+        raise RuntimeError(f"could not find board JavaScript chunks in {BOARD_HTML}")
+    return "\n".join(
+        (BOARD_ASSETS_DIR / "board" / chunk).read_text(encoding="utf-8") for chunk in chunks
+    )
+
+
+def board_tabs() -> list[str]:
+    """The GUI's own list of tabs, parsed from its loaded `TABS` array."""
+    match = _TABS_RE.search(board_source())
     if not match:
-        raise RuntimeError(f"could not find `const TABS = [...]` in {BOARD_HTML}")
+        raise RuntimeError(
+            f"could not find `const TABS = [...]` in board chunks loaded by {BOARD_HTML}"
+        )
     return _TAB_NAME_RE.findall(match.group(1))
 
 
