@@ -138,9 +138,10 @@ fn build_tool(path: &[&'static str], node: &'static help_map::HelpNode) -> Tool 
 
     let mut properties = Map::new();
     let mut required = Vec::new();
-    for chip in positionals.iter().chain(options.iter()) {
+    let raw_chips = node.positionals.iter().chain(node.options.iter());
+    for (chip, raw) in positionals.iter().chain(options.iter()).zip(raw_chips) {
         let prop_name = chip.property_name();
-        properties.insert(prop_name.clone(), chip_schema(chip));
+        properties.insert(prop_name.clone(), chip_schema(chip, raw));
         if chip.required && !chip.is_option() {
             required.push(Value::String(prop_name));
         }
@@ -161,17 +162,28 @@ fn build_tool(path: &[&'static str], node: &'static help_map::HelpNode) -> Tool 
     }
 }
 
-fn chip_schema(chip: &Chip) -> Value {
+/// Mirrors `help_map::chip_description`'s grammar/example text (RAL-376)
+/// into the property's JSON-Schema `description` -- the same text
+/// `ralphus <cmd> --help` shows for this chip, so an MCP caller with only
+/// the tool schema on hand still learns what a valid value looks like.
+/// `raw` is the original `help_map.rs` chip text (e.g. `"--cell [str]"`),
+/// passed alongside the already-parsed `chip` because `chip_description`
+/// tells a value-taking option apart from a bare boolean one by the
+/// presence of `[...]`, which [`Chip`] itself no longer retains once parsed.
+fn chip_schema(chip: &Chip, raw: &str) -> Value {
     if !chip.takes_value {
         return json!({"type": "boolean", "description": "boolean flag"});
     }
-    let base = chip.choices.as_ref().map_or_else(
+    let description = help_map::chip_description(raw, chip.is_option());
+    let item = chip.choices.as_ref().map_or_else(
         || json!({"type": "string"}),
         |choices| json!({"type": "string", "enum": choices}),
     );
     if chip.repeatable {
-        json!({"type": "array", "items": base})
+        json!({"type": "array", "items": item, "description": description})
     } else {
+        let mut base = item;
+        base["description"] = json!(description);
         base
     }
 }
