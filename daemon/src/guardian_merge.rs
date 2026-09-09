@@ -11507,6 +11507,9 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         g(&repo, &["init", "--initial-branch", "main"]);
+        // Keep the exact bytes written by this content-preservation test even
+        // when the host has core.autocrlf enabled.
+        g(&repo, &["config", "core.autocrlf", "false"]);
         // `drive_rebase` below shells out through `GitVcs::exec_raw`, which
         // (correctly, for real repos) never injects an identity -- so this
         // throwaway repo needs one in its own local config, not just on the
