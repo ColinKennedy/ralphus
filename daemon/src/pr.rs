@@ -3695,6 +3695,48 @@ fn submit_stack_for_guardian(
         created.push(pr);
     }
 
+    // RAL-395: native-stack reconciliation is a shared self-heal, not
+    // whole-stack-only -- see `reconcile_native_pr_stack` for why it also
+    // runs from the explicit per-branch/positional submission path in
+    // `submit_pull_requests_inner`.
+    reconcile_native_pr_stack(
+        store,
+        client,
+        id,
+        ordered_enabled,
+        fork_routing,
+        created.len(),
+    )?;
+
+    Ok(created)
+}
+
+/// Reconcile this guardian's native GitHub PR-stack grouping after a
+/// submission that touched its PR rows (RAL-395). Shared by
+/// [`submit_stack_for_guardian`] (the "submit the whole stack" path) and the
+/// explicit per-branch/positional request path in
+/// [`submit_pull_requests_inner`] -- every PR submission method funnels
+/// through this one function, so a stack assembled one branch at a time
+/// (e.g. `ralphus review pr submit <id> --position N` called once per
+/// branch) still ends up registered as a native stack on the forge, not
+/// just chained by base ref. Re-reads the guardian's PR rows fresh from the
+/// store rather than trusting a caller-held list, since branch creation may
+/// have just written new rows this same call.
+fn reconcile_native_pr_stack(
+    store: &Arc<Mutex<Store>>,
+    client: &crate::forge::ForgeClient,
+    id: &str,
+    ordered_enabled: &[&BranchView],
+    fork_routing: Option<&ForkRouting>,
+    created_count: usize,
+) -> std::result::Result<(), String> {
+    let existing_prs = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(id)
+        .map_err(|e| e.to_string())?;
+    let already_open = refresh_open_prs(store, client, open_prs_by_branch(&existing_prs));
+
     // Re-target any PR that already existed for this guardian but whose base
     // no longer matches the current stack order/chain (RAL-190) -- without
     // this, a PR left over from before this bug fix (or from a manual
@@ -3721,13 +3763,13 @@ fn submit_stack_for_guardian(
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({"created": created.len(), "resynced": resynced}),
+            payload: serde_json::json!({"created": created_count, "resynced": resynced}),
             admin_only: false,
         });
     }
 
     if client.kind() != crate::forge::ForgeKind::GitHub {
-        return Ok(created);
+        return Ok(());
     }
 
     // RAL-338: GitHub's native stack API is repository-scoped, so a
@@ -3740,12 +3782,7 @@ fn submit_stack_for_guardian(
     let all_with_prs: Vec<(String, i64, i64)> = ordered_enabled
         .iter()
         .filter_map(|branch| {
-            let pr_view: &PullRequestView =
-                already_open.get(branch.id.as_str()).copied().or_else(|| {
-                    created
-                        .iter()
-                        .find(|p| p.branch_id.as_deref() == Some(branch.id.as_str()))
-                })?;
+            let pr_view = already_open.get(branch.id.as_str()).copied()?;
             if let Some(routing) = fork_routing {
                 if pr_view.repo != routing.fork_client.repo_label() {
                     return None;
@@ -3781,7 +3818,7 @@ fn submit_stack_for_guardian(
                     WARNING,
                     "ralphus [pr] review {id} could not inspect github pr stack {stack_number}; leaving it unchanged: {e}"
                 );
-                return Ok(created);
+                return Ok(());
             }
         },
         None => None,
@@ -3893,7 +3930,7 @@ fn submit_stack_for_guardian(
         }
     }
 
-    Ok(created)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4190,6 +4227,23 @@ fn submit_pull_requests_inner(
             fork_routing.as_ref(),
         )?;
         created.extend(stack_prs);
+    } else if !created.is_empty() {
+        // RAL-395: an explicit per-branch/positional request (no `branch_id:
+        // null` in this call) skips `submit_stack_for_guardian` entirely, so
+        // without this it never reconciled the native GitHub PR-stack
+        // grouping -- a review submitted one branch at a time (e.g. the CLI's
+        // `ralphus review pr submit <id> --position N`, called once per
+        // branch) ended up with correctly chained base refs but no forge-side
+        // stack object linking them. Every submission path now funnels
+        // through the same reconciler.
+        reconcile_native_pr_stack(
+            store,
+            &client,
+            id,
+            &ordered_enabled,
+            fork_routing.as_ref(),
+            created.len(),
+        )?;
     }
 
     Ok(created)
@@ -8138,6 +8192,189 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
         let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-395 regression: a stack submitted one branch at a time via
+    /// explicit `branch_id: Some` requests -- what the CLI's `ralphus review
+    /// pr submit <id> --position N` sends, called once per branch -- must
+    /// still end up registered as a native GitHub PR stack, not just
+    /// chained by base ref. Reproduces `submit_pull_requests_inner`'s
+    /// per-branch (non-whole-stack) dispatch exactly: each call creates its
+    /// own PR via `submit_stacked_branch_pr`, then reconciles the native
+    /// stack via `reconcile_native_pr_stack`, mirroring two independent CLI
+    /// invocations rather than one "submit the whole stack" request.
+    #[test]
+    fn per_branch_submission_still_registers_the_native_github_stack() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Requests arrive in a mix of fixed (PR creation, stack
+            // registration) and non-deterministic (per-PR live-state checks,
+            // iterated from a `HashMap`) order, so this dispatches by
+            // method+url rather than asserting a strict sequence.
+            let mut next_pr_number = 10_i64;
+            let mut stack_payload = serde_json::Value::Null;
+            for _ in 0..6 {
+                let mut req = server.recv().unwrap();
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Post && url == "/repos/acme/widget/pulls" {
+                    let number = next_pr_number;
+                    next_pr_number += 1;
+                    req.respond(
+                        tiny_http::Response::from_string(format!(
+                            r#"{{"number":{number},"html_url":"http://x/{number}"}}"#
+                        ))
+                        .with_status_code(201),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/widget/pulls/")
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"state":"open"}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Post && url == "/repos/acme/widget/stacks" {
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    stack_payload = serde_json::from_str(&body).unwrap();
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"number": 77}"#).with_status_code(201),
+                    )
+                    .unwrap();
+                    // The second call's reconciliation registering the
+                    // native stack is the behavior under test -- this
+                    // request never happened before RAL-395.
+                    break;
+                } else {
+                    panic!("unexpected request: {method:?} {url}");
+                }
+            }
+            stack_payload
+        });
+
+        let origin_bare = tmp_dir("per-branch-stack-origin-bare");
+        g(&origin_bare, &["init", "--bare"]);
+
+        let root_dir = tmp_dir("per-branch-stack-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        for (branch, file) in [("review/a", "a.txt"), ("review/b", "b.txt")] {
+            g(&root_dir, &["checkout", "-b", branch]);
+            gwrite(&root_dir, file, "content\n");
+            g(&root_dir, &["add", "."]);
+            g(&root_dir, &["commit", "--message", &format!("add {file}")]);
+        }
+        g(&root_dir, &["checkout", "release"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
+
+        let store = Arc::new(Mutex::new(store()));
+        let gid = store
+            .lock()
+            .unwrap()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store
+                .lock()
+                .unwrap()
+                .add_guardian_branch(&gid, branch)
+                .unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .unwrap()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        for (branch_id, review_branch) in ids.iter().zip(["review/a", "review/b"]) {
+            store
+                .lock()
+                .unwrap()
+                .set_branch_review(&gid, branch_id, review_branch, "wt")
+                .unwrap();
+        }
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+
+        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let mut ordered_enabled: Vec<&BranchView> =
+            guardian.branches.iter().filter(|b| b.enabled).collect();
+        ordered_enabled.sort_by_key(|b| b.position);
+
+        // Two independent calls -- exactly what `ralphus review pr submit
+        // <id> --position 0` then `--position 1` produces, each going
+        // through the exact dispatch `submit_pull_requests_inner` uses for
+        // an explicit `branch_id: Some` request: create the PR, then
+        // reconcile the native stack.
+        for branch in &ordered_enabled {
+            let existing_prs = store
+                .lock()
+                .unwrap()
+                .list_pull_requests_for_guardian(&gid)
+                .unwrap();
+            let mut alias_by_branch = open_alias_by_branch(&existing_prs);
+            let req = PrRequest {
+                branch_id: Some(branch.id.clone()),
+                branch_alias: None,
+                title: Some("Title".to_string()),
+                description: Some("Description".to_string()),
+                use_worktree_branch_name: None,
+            };
+            submit_stacked_branch_pr(
+                &store,
+                &runner,
+                &client,
+                &gid,
+                &root_dir,
+                "origin",
+                &guardian,
+                &ordered_enabled,
+                &mut alias_by_branch,
+                "release",
+                branch,
+                &req,
+                "{name}-alias",
+                None,
+                "stack-1",
+                None,
+            )
+            .unwrap();
+
+            reconcile_native_pr_stack(&store, &client, &gid, &ordered_enabled, None, 1).unwrap();
+        }
+
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_guardian_forge_stack_number(&gid)
+                .unwrap(),
+            Some(77),
+            "the second per-branch submission must have registered the native stack"
+        );
+
+        let stack_payload = handle.join().unwrap();
+        assert_eq!(stack_payload["pull_requests"], serde_json::json!([10, 11]));
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&origin_bare);
     }
 
     #[test]
