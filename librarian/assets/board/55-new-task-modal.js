@@ -18,12 +18,15 @@
       let ntPasteToml = "";   // paste tab: preserved across tab switches
       let ntLabel = "";       // paste tab: optional squad label
       /**
-       * Resets and opens the New Task modal.
+       * Opens the New Task modal. The Simple tab's form state persists
+       * in-memory across opens (e.g. after Cancel) so re-opening doesn't
+       * lose the agent/model/project selection; it's only reset after a
+       * successful submit (see `submitTaskSimple`).
        * @returns {void}
        */
       function openNewTask() {
         ntTab = ntConfigDefaultTab; ntFiles = []; ntPasteToml = ""; ntLabel = "";
-        ntSimpleReset();
+        if (!ntSimple) ntSimpleReset();
         renderNewTaskModal();
         loadNtSimpleConfig();
       }
@@ -147,7 +150,7 @@
         return {
           templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
           prompt: "", fieldValues: {}, agent: ntAgentCatalogDefault, model: "",
-          project: "", upstreamBranch: "", proofs: true, addReview: false, generateManualChecks: false,
+          project: "", upstreamBranch: "", proofs: true, addReview: true, generateManualChecks: true,
           proofItems: [], checkItems: [], generating: false, confirmStep: false,
         };
       }
@@ -199,7 +202,7 @@
 
       /** @type {NtTemplate} */
       const NT_FALLBACK_TEMPLATE = {
-        name: "hello-world", label: "Hello World",
+        name: "hello-world", label: "Hello World (Built-in)",
         description: "Minimal one-shot task: run a prompt as-is, no extra context.",
         fields: [], prompt_template: "{prompt}",
       };
@@ -642,14 +645,15 @@
             <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.fieldValues[f.name] || "")}" oninput="ntSimple.fieldValues[${JSON.stringify(f.name)}]=this.value">
           </label>`).join("");
         const catalog = ntAgentCatalog.length ? ntAgentCatalog : NT_FALLBACK_AGENTS;
-        const agentOptions = catalog.map((a) => `<option value="${esc(a.id)}" ${a.id === ntSimple.agent ? "selected" : ""}>${esc(a.id)}${a.id === ntAgentCatalogDefault ? " (default)" : ""}</option>`).join("");
+        const sortedCatalog = [...catalog].sort((a, b) => a.id.localeCompare(b.id));
+        const agentOptions = sortedCatalog.map((a) => `<option value="${esc(a.id)}" ${a.id === ntSimple.agent ? "selected" : ""}>${esc(a.id)}${a.id === ntAgentCatalogDefault ? " (default)" : ""}</option>`).join("");
         const selectedAgent = catalog.find((a) => a.id === ntSimple.agent);
         const modelDatalist = ((selectedAgent && selectedAgent.models) || []).map((m) => `<option value="${esc(m)}">`).join("");
         const projectOptions = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === ntSimple.project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
         const selectedProject = projects.find((p) => p.name === ntSimple.project);
         const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
         return `
-          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in \\&quot;Hello World\\&quot; template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
+          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in \\&quot;Hello World (Built-in)\\&quot; template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
             Template
             <select style="${NT_INPUT_STYLE}" ${ntTemplatesFallback ? "disabled" : ""} onchange="ntSimple.templateName=this.value;ntSimple.fieldValues={};renderNewTaskModal()">${templateOptions}</select>
           </label>
@@ -740,6 +744,7 @@
         }
         const resp = await fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label: ntSimple.prompt.slice(0, 60) || null }) });
         if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        ntSimpleReset();
         closeModal(); tick();
       }
 
