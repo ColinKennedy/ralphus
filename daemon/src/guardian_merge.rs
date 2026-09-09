@@ -7845,6 +7845,164 @@ pub fn list_base_branches(git_root: &str, base_branch: &str) -> Vec<String> {
     }
 }
 
+/// Minimal per-guardian fields [`poll_base_branch_freshness_once`] needs to
+/// collect fetch targets, kept separate from [`crate::guardian::GuardianView`]
+/// so [`collect_base_fetch_targets`] stays unit-testable without hydrating a
+/// full view.
+#[derive(Debug, Clone)]
+pub(crate) struct GuardianBaseFetchInfo {
+    pub status: String,
+    pub base_branch: String,
+    pub projects: Vec<String>,
+    pub git_root: String,
+    pub machine: Option<String>,
+}
+
+/// One distinct (project root, machine, base branch) combination whose local
+/// ref may need refreshing from the remote. The dedup key is all three: the
+/// same base branch on the same project root but a different machine
+/// (RAL-185) is a distinct checkout that needs its own fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BaseFetchTarget {
+    pub root: PathBuf,
+    pub machine: Option<String>,
+    pub base_branch: String,
+}
+
+/// Collect the deduped set of base-branch fetch targets across every
+/// guardian in a maintained status. Pure, no I/O — reuses the exact same
+/// candidate-status set [`review_maintenance`] computes, so this refreshes
+/// precisely the base branches [`rebuild_on_base_shift`]'s per-project loop
+/// (over `guardian.projects`) later reads via [`resolve_base`]. When multiple
+/// guardians (or multiple projects of one guardian) share a target, it is
+/// collected once.
+pub(crate) fn collect_base_fetch_targets(
+    guardians: &[GuardianBaseFetchInfo],
+) -> Vec<BaseFetchTarget> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for g in guardians {
+        if !matches!(
+            g.status.as_str(),
+            "in_review" | "merge_failed" | "merging" | "merge_stopped"
+        ) {
+            continue;
+        }
+        let projects: &[String] = if g.projects.is_empty() {
+            std::slice::from_ref(&g.git_root)
+        } else {
+            &g.projects
+        };
+        for proj in projects {
+            let target = BaseFetchTarget {
+                root: PathBuf::from(proj),
+                machine: g.machine.clone(),
+                base_branch: g.base_branch.clone(),
+            };
+            if seen.insert(target.clone()) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+/// Best-effort: refresh the local ref for one base-branch fetch target, or
+/// determine there is nothing to fetch and no-op successfully.
+///
+/// A `base_branch` is only fetched when it names a genuine remote-tracking
+/// relationship — never guessed from its spelling alone:
+/// - `"<remote>/<branch>"` where `<remote>` is an *actually configured* git
+///   remote (`git remote get-url <remote>` succeeds) fetches into the
+///   remote-tracking ref `refs/remotes/<remote>/<branch>`.
+/// - A bare name (e.g. `"main"`) with a real `@{upstream}` configured
+///   fetches that upstream's branch, overwriting the local
+///   `refs/heads/<base_branch>` directly — the same shape (and the same
+///   already-accepted "refuses if that branch is checked out" risk) as
+///   [`crate::vcs::GitVcs::fetch_branch`].
+/// - Anything else is a purely local branch with no remote to fetch from,
+///   and is left untouched.
+fn fetch_base_branch(
+    store: &Arc<Mutex<Store>>,
+    target: &BaseFetchTarget,
+) -> std::result::Result<(), String> {
+    let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
+    let base = &target.base_branch;
+
+    if let Some((remote, branch)) = base.split_once('/') {
+        if ws.git(&["remote", "get-url", remote]).is_ok() {
+            let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+            return ws.git(&["fetch", remote, &refspec]).map(|_| ());
+        }
+    }
+    if let Ok(upstream) = ws.git(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")]) {
+        let upstream = upstream.trim();
+        if let Some((remote, branch)) = upstream.split_once('/') {
+            let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
+            return ws.git(&["fetch", remote, &refspec]).map(|_| ());
+        }
+    }
+    Ok(())
+}
+
+/// Base-branch fetch targets ([`poll_base_branch_freshness_once`]) currently
+/// being refreshed, keyed by `"{root}|{machine}|{base_branch}"`. Mirrors
+/// [`MAINTAINING`]'s role: a slow or unreachable remote must not pile up a
+/// new thread for the same target every poll cycle.
+static BASE_FETCH_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Refresh the local ref for every distinct base branch a maintained review
+/// targets (RAL-<pending>). Called once at daemon startup and periodically
+/// from `scheduler::run_loop` (`BASE_BRANCH_FRESHNESS_POLL_INTERVAL`).
+///
+/// This never triggers a rebuild itself — it only updates local refs so the
+/// very next [`review_maintenance`] pass observes a shift the normal way,
+/// through [`rebuild_on_base_shift`]'s own unchanged logic. Listing+dedup is
+/// one cheap store read; each fetch is spawned onto its own thread (mirroring
+/// `pr::poll_forge_reorders`) so one slow/unreachable remote never blocks
+/// this call or, transitively, the scheduler's own hot loop.
+pub fn poll_base_branch_freshness_once(store: &Arc<Mutex<Store>>) {
+    let inputs: Vec<GuardianBaseFetchInfo> = {
+        let guard = store.lock().expect("poisoned");
+        guard
+            .list_guardians()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| GuardianBaseFetchInfo {
+                status: g.status,
+                base_branch: g.base_branch,
+                projects: g.projects,
+                git_root: g.git_root,
+                machine: g.machine,
+            })
+            .collect()
+    };
+    for target in collect_base_fetch_targets(&inputs) {
+        let key = format!(
+            "{}|{}|{}",
+            target.root.display(),
+            target.machine.as_deref().unwrap_or(""),
+            target.base_branch
+        );
+        let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
+            continue;
+        };
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            let _claim = claim;
+            if let Err(e) = fetch_base_branch(&store, &target) {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [guardian] base-branch freshness fetch skipped for {} ({}): {e}",
+                    target.base_branch,
+                    target.root.display()
+                );
+            }
+        });
+    }
+}
+
 /// Resolve `base_branch` (a branch name — mutable, may be local or a remote
 /// tracking ref) to the immutable commit it currently points at, so a single
 /// build snapshots one base and a later shift is detectable. Returns the short-ish
@@ -9251,6 +9409,80 @@ mod tests {
             !IDLE_MAINT_LAST.lock().expect("poisoned").contains_key(&id),
             "IDLE_MAINT_LAST must not grow unbounded for guardians no longer maintained"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Base-branch freshness poller: target collection/dedup (pure, no git)
+    // -----------------------------------------------------------------------
+
+    fn fetch_info(
+        status: &str,
+        base_branch: &str,
+        projects: &[&str],
+        machine: Option<&str>,
+    ) -> GuardianBaseFetchInfo {
+        GuardianBaseFetchInfo {
+            status: status.to_string(),
+            base_branch: base_branch.to_string(),
+            projects: projects.iter().map(|s| s.to_string()).collect(),
+            git_root: projects.first().unwrap_or(&"/repo").to_string(),
+            machine: machine.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn collect_base_fetch_targets_dedupes_a_shared_upstream_across_guardians() {
+        let guardians = vec![
+            fetch_info("in_review", "origin/main", &["/repo/a"], None),
+            fetch_info("merge_failed", "origin/main", &["/repo/a"], None), // same target
+            fetch_info("in_review", "origin/develop", &["/repo/a"], None), // distinct base_branch
+            fetch_info(
+                "in_review",
+                "origin/main",
+                &["/repo/a"],
+                Some("build-farm-1"),
+            ), // distinct machine
+            fetch_info("collecting", "origin/main", &["/repo/a"], None),   // status not maintained
+        ];
+        let targets = collect_base_fetch_targets(&guardians);
+        assert_eq!(targets.len(), 3, "got: {targets:?}");
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.base_branch == "origin/main" && t.machine.is_none())
+        );
+        assert!(targets.iter().any(|t| t.base_branch == "origin/develop"));
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.machine.as_deref() == Some("build-farm-1"))
+        );
+    }
+
+    #[test]
+    fn collect_base_fetch_targets_expands_multi_project_guardians() {
+        let guardians = vec![fetch_info(
+            "in_review",
+            "origin/main",
+            &["/repo/a", "/repo/b"],
+            None,
+        )];
+        let targets = collect_base_fetch_targets(&guardians);
+        assert_eq!(
+            targets.len(),
+            2,
+            "one target per project root, same base_branch: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn collect_base_fetch_targets_excludes_every_non_maintained_status() {
+        let guardians = vec![
+            fetch_info("collecting", "origin/main", &["/repo/a"], None),
+            fetch_info("approved", "origin/main", &["/repo/a"], None),
+            fetch_info("deployed", "origin/main", &["/repo/a"], None),
+        ];
+        assert!(collect_base_fetch_targets(&guardians).is_empty());
     }
 
     // -----------------------------------------------------------------------

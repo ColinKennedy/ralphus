@@ -75,6 +75,19 @@ pub const TRIAGE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 /// bounds accumulation to a day's worth of already-stale worktrees.
 pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How often to refresh the local ref for every maintained review's base
+/// branch (see `crate::guardian_merge::poll_base_branch_freshness_once`).
+/// This is pure ref freshness with no rebuild logic of its own — a base
+/// branch that only moves via a direct forge-side merge, bypassing every
+/// ralphus-tracked PR, is otherwise never re-fetched by anything in the
+/// daemon. [`REVIEW_MAINT_INTERVAL`]'s own `rebuild_on_base_shift` check
+/// picks up the refreshed ref on its very next tick, unchanged. A minute is
+/// deliberately coarser than `REVIEW_MAINT_INTERVAL`: a base-branch merge is
+/// a human-timescale event, not something that needs sub-minute latency, and
+/// every guardian sharing the same (root, machine, base_branch) is deduped
+/// into a single fetch per cycle regardless of how many reviews target it.
+pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 fn resolve_agent_selection(
     agent: &str,
     cwd: &str,
@@ -412,6 +425,11 @@ pub fn run_loop(
     crate::guardian_merge::retire_stale_worktrees(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
+    // Run once at startup too, so a freshly (re)started daemon doesn't wait a
+    // full BASE_BRANCH_FRESHNESS_POLL_INTERVAL before its first base-branch
+    // refresh -- same rationale as the ark call just above.
+    crate::guardian_merge::poll_base_branch_freshness_once(&store);
+    let mut last_base_branch_freshness_poll = std::time::Instant::now();
     recover_interrupted_reviews(&store, &sem, &cancellations);
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
@@ -445,6 +463,10 @@ pub fn run_loop(
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
             last_maintenance = std::time::Instant::now();
+        }
+        if last_base_branch_freshness_poll.elapsed() >= BASE_BRANCH_FRESHNESS_POLL_INTERVAL {
+            crate::guardian_merge::poll_base_branch_freshness_once(&store);
+            last_base_branch_freshness_poll = std::time::Instant::now();
         }
         if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);

@@ -133,6 +133,9 @@ tree -- it's a global flag, not a per-command one. Unlike other global flags, it
 before and after the subcommand: `ralphus --json status` and `ralphus status --json` are \
 equivalent.";
 
+/// Syntax and examples for arguments displayed as `[uri]`.
+pub const URI_ARGUMENT_NOTE: &str = "`[uri]` arguments use the EntityUri grammar: `squad:<squad_id>` (e.g. `squad:squad-1`); `task:<squad_id>:<task_idx>` (e.g. `task:squad-1:2`); `cell:<squad_id>:<task_idx>:<cell_idx>` (e.g. `cell:squad-1:2:0`); `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>` (e.g. `proof:squad-1:2:cell:0:1`; use `task` and `-1` for a task-scoped proof); and `guardian:<guardian_id>` (e.g. `guardian:g-1`) for a review. `selector` also accepts its documented name and index forms in addition to these URIs.";
+
 // ---- review subgroups (defined separately to keep REVIEW_CHILDREN readable) --
 
 const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
@@ -1839,7 +1842,15 @@ fn render(n: &HelpNode, depth: usize, root_name: Option<&str>, out: &mut String)
     let head = if chips.is_empty() {
         display_name.to_string()
     } else {
-        format!("{} {}", display_name, chips.join(" "))
+        format!(
+            "{} {}",
+            display_name,
+            chips
+                .iter()
+                .map(|chip| display_chip(chip))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     };
     let marker = if n.subagent { " (subagent)" } else { "" };
     let prefix = if n.read_only_safe {
@@ -1886,7 +1897,15 @@ fn render_read_only_safe(n: &HelpNode, depth: usize, root_name: Option<&str>, ou
     let head = if chips.is_empty() {
         display_name.to_string()
     } else {
-        format!("{} {}", display_name, chips.join(" "))
+        format!(
+            "{} {}",
+            display_name,
+            chips
+                .iter()
+                .map(|chip| display_chip(chip))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     };
     let marker = if n.subagent { " (subagent)" } else { "" };
     let prefix = if n.read_only_safe {
@@ -1935,8 +1954,31 @@ fn signature(n: &HelpNode) -> String {
     if chips.is_empty() {
         n.name.to_string()
     } else {
-        format!("{} {}", n.name, chips.join(" "))
+        format!(
+            "{} {}",
+            n.name,
+            chips
+                .iter()
+                .map(|chip| display_chip(chip))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     }
+}
+
+fn display_chip(chip: &str) -> String {
+    let name = chip.split_whitespace().next().unwrap_or(chip);
+    if matches!(name, "selector" | "entity_uri" | "--entity" | "--for") {
+        chip.replacen("[str", "[uri", 1)
+    } else {
+        chip.to_string()
+    }
+}
+
+fn has_uri_chip(chips: impl IntoIterator<Item = &'static str>) -> bool {
+    chips
+        .into_iter()
+        .any(|chip| display_chip(chip).contains("[uri"))
 }
 
 fn command_path(path: &[&str]) -> String {
@@ -1958,7 +2000,14 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     out.push_str(&full);
     if !node.positionals.is_empty() {
         out.push(' ');
-        out.push_str(&node.positionals.join(" "));
+        out.push_str(
+            &node
+                .positionals
+                .iter()
+                .map(|chip| display_chip(chip))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     if !node.options.is_empty() {
         out.push_str(" [OPTIONS]");
@@ -1970,9 +2019,10 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     if !node.positionals.is_empty() {
         out.push_str("\nARGUMENTS:\n");
         for positional in node.positionals {
+            let displayed = display_chip(positional);
             out.push_str(&format!(
                 "    {:<32} {}\n",
-                positional,
+                displayed,
                 chip_description(positional, false)
             ));
         }
@@ -1982,9 +2032,23 @@ pub fn command_help(path: &[&str]) -> Option<String> {
         opts.sort_unstable();
         out.push_str("\nOPTIONS:\n");
         for opt in opts {
-            out.push_str(&format!("    {opt:<32} {}\n", chip_description(opt, true)));
+            let displayed = display_chip(opt);
+            out.push_str(&format!(
+                "    {displayed:<32} {}\n",
+                chip_description(opt, true)
+            ));
         }
         out.push_str("    -h, --help                       Print help and exit\n");
+    }
+    if has_uri_chip(
+        node.positionals
+            .iter()
+            .copied()
+            .chain(node.options.iter().copied()),
+    ) {
+        out.push_str("\nURI ARGUMENTS:\n    ");
+        out.push_str(URI_ARGUMENT_NOTE);
+        out.push('\n');
     }
     if !node.children.is_empty() || path.is_empty() {
         let mut children: Vec<&HelpNode> = node.children.iter().collect();
@@ -2004,7 +2068,7 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// The `selector [str]` chip's grammar, spelled out with concrete examples
+/// The `selector [uri]` chip's grammar, spelled out with concrete examples
 /// (RAL-376) -- both the legacy path form (`cli/src/selector.rs`'s
 /// `parse_squad_selector`) and the RAL-188 URI form
 /// (`core/src/uri.rs`) resolve to the same squad/task/cell/proof
@@ -2013,7 +2077,7 @@ const SELECTOR_GRAMMAR: &str = "e.g. squad-000000000001/build/0 (squad/task/cell
 squad-000000000001/build/proof/0 (proof path); also accepts the RAL-188 URI form, e.g. \
 ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001";
 
-/// The `entity_uri [str]` chip's grammar, mirrored from
+/// The `entity_uri [uri]` chip's grammar, mirrored from
 /// `daemon/src/entity_uri.rs`/`cli/src/entity_uri.rs`'s `EntityUri` (RAL-155)
 /// -- kept in sync with that grammar by hand since it has no shared constant
 /// of its own to import here.
@@ -2246,7 +2310,7 @@ pub fn generate_read_only_safe() -> String {
     out
 }
 
-/// The seven guidance notes, blank-line separated, followed by [`generate()`]'s
+/// The eight guidance notes, blank-line separated, followed by [`generate()`]'s
 /// tree -- ports `helpmap.py::main()`'s exact print sequence (plus
 /// [`SUBMIT_RETRY_NOTE`], added after the Python port). This is what
 /// `ralphus show help-map` prints.
@@ -2254,7 +2318,7 @@ pub fn generate_read_only_safe() -> String {
 pub fn full_output() -> String {
     crate::program_name::substitute_backticked_invocations(&format!(
         "{SUBAGENT_NOTE}\n\n{READ_ONLY_NOTE}\n\n{PROJECT_LOOKUP_NOTE}\n\n{SUBMIT_VALIDATE_NOTE}\n\n\
-{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{}",
+{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{URI_ARGUMENT_NOTE}\n\n{}",
         generate()
     ))
 }
@@ -2371,7 +2435,7 @@ mod tests {
     }
 
     #[test]
-    fn full_output_prints_all_seven_notes_before_the_tree() {
+    fn full_output_prints_all_eight_notes_before_the_tree() {
         let text = full_output();
         assert!(text.starts_with(SUBAGENT_NOTE));
         for note in [
@@ -2382,6 +2446,7 @@ mod tests {
             SUBMIT_REVIEW_NOTE,
             SUBMIT_RETRY_NOTE,
             JSON_NOTE,
+            URI_ARGUMENT_NOTE,
         ] {
             assert!(
                 text.contains(&crate::program_name::substitute_backticked_invocations(
@@ -2390,6 +2455,40 @@ mod tests {
             );
         }
         assert!(text.contains("- ralphus"));
+    }
+
+    #[test]
+    fn rendered_uri_arguments_use_uri_chips_and_document_every_entity_kind() {
+        let map = generate();
+        assert!(map.contains("- cell"));
+        assert!(map.contains("        - edit selector [uri]"));
+        assert!(map.contains("--entity [uri] --for [uri]"));
+        for raw_uri_chip in [
+            "selector [str]",
+            "entity_uri [str]",
+            "--entity [str]",
+            "--for [str]",
+        ] {
+            assert!(
+                !map.contains(raw_uri_chip),
+                "URI argument still rendered as a string: {raw_uri_chip}"
+            );
+        }
+
+        let full = full_output();
+        for example in [
+            "squad:squad-1",
+            "task:squad-1:2",
+            "cell:squad-1:2:0",
+            "proof:squad-1:2:cell:0:1",
+            "guardian:g-1",
+        ] {
+            assert!(full.contains(example), "missing URI example: {example}");
+        }
+
+        let command = command_help(&["task", "show"]).expect("task show help");
+        assert!(command.contains("selector [uri]"));
+        assert!(command.contains("URI ARGUMENTS:"));
     }
 
     #[test]
