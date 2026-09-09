@@ -921,8 +921,9 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
     node(
         "check",
         &[],
-        &["--priority [urgent|high|normal]"],
-        "Drain unread escalation mailbox messages and print them (RAL-241).",
+        &["--priority [urgent|high|normal]", "--category [name]"],
+        "Drain unread escalation mailbox messages and print them (RAL-241). \
+         --category restricts to one message category, e.g. \"review\" (RAL-375).",
         false,
         false, // drains (marks read) as a side effect -- not read-only
         &[],

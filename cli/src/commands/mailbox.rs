@@ -14,6 +14,11 @@ use crate::flags::Scanner;
 pub enum MailboxCommand {
     Check {
         priority: Option<String>,
+        /// RAL-375: restrict to one category (e.g. `"review"`). `None`
+        /// drains everything, regardless of category -- QuickStart Watcher's
+        /// default. QuickStart Reviewer's system prompt instead runs `check
+        /// --category review`.
+        category: Option<String>,
     },
     Personal {
         unread_only: bool,
@@ -53,7 +58,8 @@ pub fn parse(args: &[String]) -> MailboxCommand {
     match args.first().map(String::as_str) {
         None | Some("check") => {
             let priority = scanner.take_value("--priority").ok().flatten();
-            MailboxCommand::Check { priority }
+            let category = scanner.take_value("--category").ok().flatten();
+            MailboxCommand::Check { priority, category }
         }
         Some("personal") => {
             let unread_only = scanner.take_bool("--unread");
@@ -175,9 +181,14 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             println!("usage error: {m}");
             2
         }
-        MailboxCommand::Check { priority } => run_and_report(opts, None, || {
+        MailboxCommand::Check { priority, category } => run_and_report(opts, None, || {
             let client_id = ensure_client_id(&client)?;
-            let messages = client.mailbox_messages(&client_id, true, priority.as_deref())?;
+            let messages = client.mailbox_messages_filtered(
+                &client_id,
+                true,
+                priority.as_deref(),
+                category.as_deref(),
+            )?;
             let ids = message_ids(&messages);
             let drained = if ids.is_empty() {
                 0
@@ -363,14 +374,32 @@ mod tests {
 
     #[test]
     fn bare_mailbox_behaves_like_check() {
-        matches!(parse(&[]), MailboxCommand::Check { priority: None });
+        matches!(
+            parse(&[]),
+            MailboxCommand::Check {
+                priority: None,
+                category: None
+            }
+        );
     }
 
     #[test]
     fn parses_check_with_priority_filter() {
         match parse(&v(&["check", "--priority", "urgent"])) {
-            MailboxCommand::Check { priority } => {
+            MailboxCommand::Check { priority, category } => {
                 assert_eq!(priority.as_deref(), Some("urgent"));
+                assert_eq!(category, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_with_category_filter() {
+        match parse(&v(&["check", "--category", "review"])) {
+            MailboxCommand::Check { priority, category } => {
+                assert_eq!(priority, None);
+                assert_eq!(category.as_deref(), Some("review"));
             }
             other => panic!("unexpected: {other:?}"),
         }
