@@ -1469,6 +1469,19 @@ impl Runner for MachineRouter {
             None => self.local.preflight_agent(agent, executable, Some(machine)),
         }
     }
+
+    fn preflight_runner_executable(&self, machine: Option<&str>) -> Result<(), String> {
+        let Some(machine) = machine.map(str::trim).filter(|machine| !machine.is_empty()) else {
+            return self.local.preflight_runner_executable(None);
+        };
+        match self.provider_for(machine)? {
+            // A provider executes on a different host, so its PATH cannot be
+            // inspected from this daemon -- same rationale as
+            // `preflight_agent` above.
+            Some(_) => Ok(()),
+            None => self.local.preflight_runner_executable(Some(machine)),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -879,6 +879,33 @@ pub trait Runner: Send + Sync {
         Ok(())
     }
 
+    /// Check that the runner executable itself (`ralphus-runner`, resolved
+    /// via `RALPHUS_RUNNER_CMD`) exists and is runnable, before the scheduler
+    /// marks a cell in-progress (RAL-377). `machine` mirrors
+    /// [`Runner::preflight_agent`]'s parameter of the same name: `None` (or
+    /// a machine that resolves local) checks this daemon's own
+    /// `RALPHUS_RUNNER_CMD`; a machine that routes to a remote provider is
+    /// not checked at all, since this daemon has no visibility into a
+    /// remote host's `PATH`.
+    ///
+    /// Deliberately distinct from [`Runner::preflight_agent`], which checks
+    /// the *backend* CLI (`claude`, `codex`, ...) a spawned `ralphus-runner`
+    /// process would in turn invoke -- and does so by actually spawning
+    /// `ralphus-runner` itself, so it can never distinguish "the backend CLI
+    /// is missing" from "`ralphus-runner` itself is missing" (the latter
+    /// currently isn't even called for a normal cell, only for a guardian
+    /// resolver dispatch). This check exists to catch exactly that second,
+    /// narrower case up front, without expanding scope to every executable
+    /// the daemon might shell out to.
+    ///
+    /// Test runners deliberately accept unconditionally, mirroring
+    /// `preflight_agent`'s rationale: they never spawn `ralphus-runner` at
+    /// all, so requiring a real one on `PATH` would make in-process
+    /// scheduler tests depend on local build artifacts.
+    fn preflight_runner_executable(&self, _machine: Option<&str>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Like [`run`](Runner::run), but aborts — killing any spawned
     /// subprocess — as soon as `cancel` trips. The default ignores
     /// cancellation and just calls [`run`](Runner::run); the real
@@ -1087,6 +1114,18 @@ impl Runner for SubprocessRunner {
         } else {
             detail
         })
+    }
+
+    fn preflight_runner_executable(&self, _machine: Option<&str>) -> Result<(), String> {
+        crate::agent_profiles::resolve_executable(&self.program)
+            .map(|_resolved| ())
+            .map_err(|reason| {
+                format!(
+                    "runner executable \"{}\" (resolved from RALPHUS_RUNNER_CMD, default \
+                     \"ralphus-runner\") is missing or not runnable: {reason}",
+                    self.program
+                )
+            })
     }
 }
 
@@ -4389,5 +4428,35 @@ prompt = "make it build"
             "reattach should complete, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// RAL-377: a missing/misconfigured `RALPHUS_RUNNER_CMD` must fail loudly
+    /// up front rather than only surfacing once `run_via_tmux` tries and
+    /// fails to spawn it -- see `SubprocessRunner::preflight_runner_executable`.
+    #[test]
+    fn preflight_runner_executable_fails_for_a_missing_program() {
+        let runner = SubprocessRunner::new("ralphus-runner-does-not-exist-ral-377");
+        let err = runner
+            .preflight_runner_executable(None)
+            .expect_err("a nonexistent program must fail preflight");
+        assert!(
+            err.contains("ralphus-runner-does-not-exist-ral-377"),
+            "error should name the executable it looked for: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_runner_executable_succeeds_for_a_real_absolute_path() {
+        let exe = std::env::current_exe().expect("current test binary has a path");
+        let runner = SubprocessRunner {
+            program: exe.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            registry: None,
+            cartographer: None,
+            detachments: None,
+        };
+        runner
+            .preflight_runner_executable(None)
+            .expect("the running test binary is itself a real, executable file");
     }
 }

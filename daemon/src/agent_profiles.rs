@@ -517,7 +517,12 @@ fn is_executable(_path: &Path) -> bool {
 /// `PATH`/`PATHEXT` -- deliberately separate from `cli_rs::health`'s
 /// identically-shaped helper, since that one runs in the CLI process and
 /// would check the wrong environment for this purpose.
-fn resolve_executable(program: &str) -> Result<String, String> {
+///
+/// `pub(crate)`: also used by [`crate::runner::SubprocessRunner`]'s
+/// `preflight_runner_executable` (RAL-377), which needs the exact same
+/// PATH/PATHEXT-aware resolution to check the `ralphus-runner` executable
+/// itself before the scheduler marks a cell in-progress.
+pub(crate) fn resolve_executable(program: &str) -> Result<String, String> {
     let path = Path::new(program);
     if path.components().count() > 1 {
         if !path.is_file() {
