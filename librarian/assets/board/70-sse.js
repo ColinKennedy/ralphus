@@ -73,18 +73,65 @@
       // counter and the `squads` cache (used by the running dropdown) without triggering
       // task-view rendering. Called by tick() on non-task tabs so the counter stays
       // accurate regardless of which tab is active.
+      // RALPHUS-TASKS-POLL-SEQ:BEGIN
+      /**
+       * Monotonic sequence shared by `updateCounter`/`pollTasks` (RAL-390) --
+       * each call captures its number at start; only the call still holding
+       * the latest ticket when its data lands is allowed to write
+       * `squads`/the daemon-status counter or render, regardless of which
+       * fetch resolves first. Same latest-wins pattern `reviewPollSeq`
+       * already proved out for `pollReviews` (RAL-382).
+       */
+      let tasksPollSeq = 0;
+      /**
+       * The in-flight `/api/tasks` request `updateCounter`/`pollTasks`
+       * currently share (RAL-390 follow-up) -- an overlapping caller
+       * piggybacks on this instead of firing its own duplicate fetch.
+       * `/api/tasks` can take multiple seconds against a large squad
+       * history, and squad-state SSE events fire faster than that; without
+       * sharing the request, every poll queued behind the flood and the
+       * ticket guard alone made every response land stale, so nothing ever
+       * rendered.
+       * @type {Promise<any>|null}
+       */
+      let tasksFetchInFlight = null;
+      /**
+       * Fetches and parses `/api/tasks`, reusing the current in-flight
+       * request if one is already running instead of starting a duplicate.
+       * @returns {Promise<any>}
+       */
+      function fetchTasksShared() {
+        if (!tasksFetchInFlight) {
+          tasksFetchInFlight = (async () => {
+            try {
+              return await (await fetch("/api/tasks")).json();
+            } finally {
+              tasksFetchInFlight = null;
+            }
+          })();
+        }
+        return tasksFetchInFlight;
+      }
+      // RALPHUS-TASKS-POLL-SEQ:END
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
        * Fetches /api/tasks for the daemon status counter and `squads` cache, without triggering task-view rendering.
+       * RAL-390: shares one in-flight request and a monotonic ticket with `pollTasks` -- see the `tasksPollSeq` declaration above.
        * @returns {Promise<void>}
        */
       async function updateCounter() {
+        const seq = ++tasksPollSeq;
         try {
-          const d = await (await fetch("/api/tasks")).json();
+          const d = await fetchTasksShared();
+          if (seq !== tasksPollSeq) return; // superseded -- a newer poll's data wins
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           squads = d.squads || [];
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
-        } catch (_) { markUnreachable(); }
+        } catch (_) {
+          if (seq !== tasksPollSeq) return;
+          byId("conn").className = "dot off";
+          byId("updated").textContent = "daemon unreachable";
+        }
       }
       // RALPHUS-UPDATE-COUNTER:END
       /**
@@ -297,17 +344,23 @@
           hiddenGuardianIds = new Set(d.hidden.filter((h) => h.kind === "review" && h.guardian_id).map((h) => /** @type {string} */ (h.guardian_id)));
         } catch (e) { /* transient -- the next tick retries */ }
       }
+      // RALPHUS-POLL-TASKS:BEGIN
       /**
        * Polls `/api/tasks` and re-renders the Squads tab, applying any pending hash-derived selection.
+       * RAL-390: shares one in-flight request and a monotonic ticket with `updateCounter` -- see the
+       * `tasksPollSeq` declaration above. A call superseded by a newer one before its data lands
+       * abandons itself instead of writing stale `squads`/rendering a stale selection.
        * @returns {Promise<void>}
        */
       async function pollTasks() {
+        const seq = ++tasksPollSeq;
         try {
-          const d = await (await fetch("/api/tasks")).json();
+          const d = await fetchTasksShared();
+          if (seq !== tasksPollSeq) return; // superseded -- a newer poll owns the render
           byId("conn").className = "dot on";
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
-          markUpdated();
+          byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
           squads = d.squads || [];
           const wantSquad = pendingHash ? squadForPendingHash(pendingHash) : undefined;
           if (pendingHash && wantSquad) {
@@ -321,8 +374,13 @@
           else if (userIsSelecting()) { /* keep the user's text selection intact */ }
           else if (!editing) renderAll();
           else renderSquads();
-        } catch (e) { markUnreachable(); }
+        } catch (e) {
+          if (seq !== tasksPollSeq) return;
+          byId("conn").className = "dot off";
+          byId("updated").textContent = "daemon unreachable";
+        }
       }
+      // RALPHUS-POLL-TASKS:END
       /**
        * Fetches the live conflicting-files list for one review branch (RAL-148)
        * and caches it for `branchConflictFiles` to render. Silent on failure --
