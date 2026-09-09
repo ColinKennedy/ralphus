@@ -7573,6 +7573,10 @@ fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
 /// Called only from the scheduler's daily interval. Git and filesystem work
 /// happen without holding the store mutex; each short snapshot/update does.
 pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
+    // RAL-386: loaded once per sweep, not per worktree -- an operator's
+    // static opt-out is a config file read, not a store round trip, and the
+    // set of configured machines cannot change mid-sweep.
+    let machine_targets = crate::machine_targets::load_machine_targets().unwrap_or_default();
     let (records, claims) = {
         let guard = store.lock().expect("poisoned");
         let records = match guard.guardian_worktree_records() {
@@ -7678,8 +7682,44 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         let eligible_at_ms = record
             .last_activity_ms
             .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
-        match root.git(&["worktree", "remove", "--force", "--force", &record.path]) {
-            Ok(_) => {
+
+        // RAL-386: a machine's own static policy is checked before its
+        // provider is ever asked -- an operator who knows a machine's
+        // worktrees must never be auto-deleted (e.g. a shared build farm
+        // another team also inspects) does not need the provider program to
+        // know anything about retirement at all.
+        if let Some(machine_uri) = root.machine() {
+            if crate::machine_targets::find_by_machine(&machine_targets, machine_uri)
+                .is_some_and(|t| t.retirement_opt_out)
+            {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.record_guardian_worktree_retirement(
+                    &record.guardian_id,
+                    &record.path,
+                    "opted_out",
+                    Some("machine target's [retirement] policy sets opt_out = true"),
+                    eligible_at_ms,
+                    crate::store::now_ms(),
+                    None,
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "worktree retirement skipped: machine target opted out",
+                        serde_json::json!({"worktree": record.path, "machine": machine_uri}),
+                    );
+                continue;
+            }
+        }
+
+        // RAL-386: local retirement still runs the exact `git worktree
+        // remove` above; a remote worktree instead goes through its
+        // machine's provider via the `retire` verb -- see
+        // `Workspace::retire_worktree`.
+        match root.retire_worktree(&record.path) {
+            crate::remote_runner::RetirementOutcome::Removed => {
                 let guard = store.lock().expect("poisoned");
                 let _ = guard.clear_guardian_worktree_path(&record.path);
                 // RAL-385: the path columns above are now NULL, so the durable
@@ -7692,6 +7732,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     None,
                     eligible_at_ms,
                     crate::store::now_ms(),
+                    None,
                 );
                 crate::cartographer::Note::new("guardian")
                     .guardian(&record.guardian_id)
@@ -7702,7 +7743,50 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                         serde_json::json!({"worktree": record.path, "age_threshold_days": 30}),
                     );
             }
-            Err(error) => {
+            crate::remote_runner::RetirementOutcome::Deferred {
+                retry_at_ms,
+                reason,
+            } => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.record_guardian_worktree_retirement(
+                    &record.guardian_id,
+                    &record.path,
+                    "deferred",
+                    reason.as_deref(),
+                    eligible_at_ms,
+                    crate::store::now_ms(),
+                    retry_at_ms,
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "worktree retirement deferred by machine provider",
+                        serde_json::json!({"worktree": record.path, "reason": reason, "retry_at_ms": retry_at_ms}),
+                    );
+            }
+            crate::remote_runner::RetirementOutcome::OptedOut { reason } => {
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.record_guardian_worktree_retirement(
+                    &record.guardian_id,
+                    &record.path,
+                    "opted_out",
+                    reason.as_deref(),
+                    eligible_at_ms,
+                    crate::store::now_ms(),
+                    None,
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "worktree retirement declined by machine provider",
+                        serde_json::json!({"worktree": record.path, "reason": reason}),
+                    );
+            }
+            crate::remote_runner::RetirementOutcome::Failed { error } => {
                 // RAL-385: record the failure durably (the next daily sweep
                 // retries) and emit it as a Cartographer row, not just stderr
                 // -- a worktree whose cleanup is failing must stay visible
@@ -7717,9 +7801,10 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     &record.guardian_id,
                     &record.path,
                     "failed",
-                    Some(&error.to_string()),
+                    Some(&error),
                     eligible_at_ms,
                     crate::store::now_ms(),
+                    None,
                 );
                 crate::cartographer::Note::new("guardian")
                     .guardian(&record.guardian_id)
@@ -7727,16 +7812,17 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     .emit(
                         &guard,
                         "could not retire old guardian worktree",
-                        serde_json::json!({"worktree": record.path, "error": error.to_string()}),
+                        serde_json::json!({"worktree": record.path, "error": error}),
                     );
             }
         }
     }
 }
 
-/// The operator-facing worktree-retirement view (RAL-385): every persisted
-/// review worktree path classified by where it sits in the retirement
-/// lifecycle, plus durable history for paths already removed.
+/// The operator-facing worktree-retirement view (RAL-385, states widened by
+/// RAL-386): every persisted review worktree path classified by where it
+/// sits in the retirement lifecycle, plus durable history for paths already
+/// removed.
 ///
 /// States, in the labels the board and CLI present:
 /// - `scheduled` -- exists, younger than [`WORKTREE_RETIREMENT_AGE_MS`];
@@ -7745,8 +7831,17 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
 ///   next daily `retire_stale_worktrees` pass to remove it.
 /// - `claimed` -- past `eligible_at_ms` but held by a non-terminal cell,
 ///   proof, or review claim, so it is kept and a mailbox escalation fires.
-/// - `failed` -- an attempt was made and git refused it; `error` carries the
-///   failure and the sweep retries on its next pass.
+/// - `failed` -- an attempt was made and it was refused (git, or a machine
+///   provider's own error); `error` carries the failure and the sweep
+///   retries on its next pass.
+/// - `deferred` (RAL-386) -- a machine provider's own policy asked to try
+///   again later; `error` carries its reason, `retry_at_ms` its hint. The
+///   sweep still retries on its normal daily cadence regardless.
+/// - `opted_out` (RAL-386) -- a machine provider, or an operator's static
+///   `[machine.targets.*.retirement]` policy, declined to ever retire this
+///   worktree automatically; `error` carries why. Not a failure -- an
+///   operator should be able to tell "nobody is trying" from "something is
+///   broken" at a glance.
 /// - `retired` -- an attempt succeeded and the worktree no longer exists;
 ///   visible here for as long as its review row exists.
 #[derive(serde::Serialize)]
@@ -7764,10 +7859,15 @@ pub(crate) struct WorktreeRetirementEntry {
     pub claim_kind: Option<String>,
     pub claim_owner: Option<String>,
     pub claim_state: Option<String>,
-    /// `failed` only: why git refused the last removal attempt.
+    /// `failed`/`deferred`/`opted_out` only: why the attempt was refused,
+    /// deferred, or declined.
     pub error: Option<String>,
-    /// `retired`/`failed` only: when the last attempt ran.
+    /// `retired`/`failed`/`deferred`/`opted_out` only: when the last attempt
+    /// ran.
     pub last_attempt_ms: Option<i64>,
+    /// `deferred` only (RAL-386): the provider's hint of when to try again.
+    /// Display-only -- the sweep's own retry cadence is still daily.
+    pub retry_at_ms: Option<i64>,
 }
 
 /// The whole `GET /api/worktree-retirements` response body (RAL-385).
@@ -7813,33 +7913,35 @@ pub(crate) fn worktree_retirement_view(
         let eligible_at_ms = record
             .last_activity_ms
             .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
-        // A durable `failed` row for this exact (guardian, path) pair wins
-        // over the derived live states -- the failure is the newest fact the
-        // sweep recorded, and it stays until an attempt succeeds.
-        let failed = retirements.iter().find(|r| {
+        // A durable non-terminal row (`failed`/`deferred`/`opted_out`) for
+        // this exact (guardian, path) pair wins over the derived live states
+        // -- it is the newest fact the sweep recorded, and it stays until an
+        // attempt succeeds (RAL-386 widened this beyond just `failed`).
+        let pending = retirements.iter().find(|r| {
             r.guardian_id == record.guardian_id
-                && r.status == "failed"
+                && r.status != "retired"
                 && normalized_worktree_path(Path::new(&r.path)) == key
         });
         let active_claim = claims.iter().find(|claim| {
             normalized_worktree_path(Path::new(&claim.path)) == key
                 && !terminal_worktree_claim(&claim.kind, &claim.state)
         });
-        let (state, claim_kind, claim_owner, claim_state, error, last_attempt_ms) =
-            if let Some(f) = failed {
+        let (state, claim_kind, claim_owner, claim_state, error, last_attempt_ms, retry_at_ms) =
+            if let Some(p) = pending {
                 (
-                    "failed",
+                    p.status.as_str(),
                     None,
                     None,
                     None,
-                    f.error.clone(),
-                    Some(f.last_attempt_ms),
+                    p.error.clone(),
+                    Some(p.last_attempt_ms),
+                    p.retry_at_ms,
                 )
             } else if eligible_at_ms > now {
                 // `eligible_at_ms` is `last_activity + AGE`, so comparing it
                 // straight against now is the single-count form of the
                 // sweep's `last_activity_ms > cutoff` test.
-                ("scheduled", None, None, None, None, None)
+                ("scheduled", None, None, None, None, None, None)
             } else if let Some(claim) = active_claim {
                 (
                     "claimed",
@@ -7848,9 +7950,10 @@ pub(crate) fn worktree_retirement_view(
                     Some(claim.state.clone()),
                     None,
                     None,
+                    None,
                 )
             } else {
-                ("eligible", None, None, None, None, None)
+                ("eligible", None, None, None, None, None, None)
             };
         entries.push(WorktreeRetirementEntry {
             guardian_id: record.guardian_id.clone(),
@@ -7865,11 +7968,12 @@ pub(crate) fn worktree_retirement_view(
             claim_state,
             error,
             last_attempt_ms,
+            retry_at_ms,
         });
     }
     // Retired history: durable rows whose path no longer has a live record.
-    // (A failed row's path always still has one, so only successful
-    // retirements fall through here.)
+    // (A failed/deferred/opted_out row's path always still has one, so only
+    // successful retirements fall through here.)
     for r in retirements {
         if r.status != "retired" {
             continue;
@@ -7901,6 +8005,7 @@ pub(crate) fn worktree_retirement_view(
             claim_state: None,
             error: r.error,
             last_attempt_ms: Some(r.last_attempt_ms),
+            retry_at_ms: None,
         });
     }
     entries.sort_by(|a, b| {
@@ -11170,6 +11275,7 @@ mod tests {
                 Some("directory not empty"),
                 old + WORKTREE_RETIREMENT_AGE_MS,
                 crate::store::now_ms(),
+                None,
             )
             .unwrap();
         let view2 = worktree_retirement_view(&store.lock().unwrap()).unwrap();
@@ -11195,6 +11301,7 @@ mod tests {
                     None,
                     old + WORKTREE_RETIREMENT_AGE_MS,
                     crate::store::now_ms(),
+                    None,
                 )
                 .unwrap();
         }

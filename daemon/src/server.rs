@@ -3365,7 +3365,9 @@ fn list_all_project_forks(daemon: &Daemon) -> Reply {
 
 /// `GET /api/worktree-retirements` (RAL-385): every review worktree
 /// classified by retirement state (`scheduled`/`eligible`/`claimed`/
-/// `failed`/`retired`), plus durable history for already-removed worktrees.
+/// `failed`/`deferred`/`opted_out`/`retired`, see
+/// [`crate::guardian_merge::WorktreeRetirementEntry`]), plus durable history
+/// for already-removed worktrees.
 fn worktree_retirements(daemon: &Daemon) -> Reply {
     match crate::guardian_merge::worktree_retirement_view(&daemon.lock()) {
         Ok(view) => json(200, &view),
@@ -12833,6 +12835,7 @@ mod tests {
                 Some("git refused"),
                 crate::store::now_ms(),
                 crate::store::now_ms(),
+                None,
             )
             .unwrap();
         let r2 = route(&d, "GET", "/api/worktree-retirements", "");
@@ -12855,6 +12858,7 @@ mod tests {
                 None,
                 crate::store::now_ms(),
                 crate::store::now_ms(),
+                None,
             )
             .unwrap();
         let r3 = route(&d, "GET", "/api/worktree-retirements", "");

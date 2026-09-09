@@ -67,6 +67,15 @@ pub struct MachineTarget {
     /// `ProviderRunner::resolve_remote_executable`, the dispatch-time
     /// consumer.
     pub agent_executables: BTreeMap<String, String>,
+    /// This machine's static worktree-retirement policy (RAL-386). Checked
+    /// by the daily retirement sweep (`guardian_merge::retire_stale_worktrees`)
+    /// *before* it ever asks the provider: an operator who knows a given
+    /// machine should never have its worktrees auto-deleted (e.g. a shared
+    /// build farm another team also inspects) can say so here without the
+    /// provider program needing to know anything about retirement at all.
+    /// Independent of, and checked before, whatever the provider itself
+    /// decides per worktree via the `retire` verb.
+    pub retirement_opt_out: bool,
 }
 
 /// How a target's runner gets onto the remote machine (RAL-355 Phase 5).
@@ -114,6 +123,19 @@ struct RawMachineTarget {
     /// override.
     #[serde(default)]
     agents: BTreeMap<String, String>,
+    #[serde(default)]
+    retirement: RawRetirement,
+}
+
+/// `[machine.targets.<name>.retirement]` (RAL-386).
+#[derive(Debug, Default, Deserialize)]
+struct RawRetirement {
+    /// When `true`, the daily worktree-retirement sweep never touches this
+    /// machine's worktrees -- not even to ask the provider. The safe choice
+    /// for a machine an operator does not want ralphus reclaiming
+    /// automatically, regardless of what the provider itself might decide.
+    #[serde(default)]
+    opt_out: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -250,6 +272,7 @@ fn parse_targets_file(path: &Path) -> Result<BTreeMap<String, MachineTarget>, St
                 runner_command,
                 runner_artifacts: raw.runner.artifacts,
                 agent_executables: raw.agents,
+                retirement_opt_out: raw.retirement.opt_out,
             },
         );
     }
@@ -386,6 +409,45 @@ codex = "/opt/tools/codex-wrapper"
             devbox.agent_executables.get("codex").map(String::as_str),
             Some("/opt/tools/codex-wrapper")
         );
+    }
+
+    #[test]
+    fn retirement_opt_out_defaults_false() {
+        let dir = tempdir("retirement-default");
+        let file = dir.join(".ralphus.toml");
+        fs::write(
+            &file,
+            r#"
+[machine.targets.devbox]
+machine = "ssh:devbox"
+remote_root = "/home/me/.ralphus/remote-work"
+"#,
+        )
+        .expect("write config");
+
+        let targets = parse_targets_file(&file).expect("parse");
+        assert!(!targets["devbox"].retirement_opt_out);
+    }
+
+    #[test]
+    fn retirement_opt_out_is_parsed() {
+        let dir = tempdir("retirement-opt-out");
+        let file = dir.join(".ralphus.toml");
+        fs::write(
+            &file,
+            r#"
+[machine.targets.devbox]
+machine = "ssh:devbox"
+remote_root = "/home/me/.ralphus/remote-work"
+
+[machine.targets.devbox.retirement]
+opt_out = true
+"#,
+        )
+        .expect("write config");
+
+        let targets = parse_targets_file(&file).expect("parse");
+        assert!(targets["devbox"].retirement_opt_out);
     }
 
     #[test]
@@ -768,6 +830,7 @@ remote_root = "/srv/second"
                 runner_command: DEFAULT_RUNNER_COMMAND.to_string(),
                 runner_artifacts: BTreeMap::new(),
                 agent_executables: BTreeMap::new(),
+                retirement_opt_out: false,
             },
         );
         let found = find_by_machine(&targets, "ssh:devbox").expect("should find devbox");

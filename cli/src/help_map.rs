@@ -653,10 +653,10 @@ the review worktree.",
     node(
         "worktree-retirements",
         &[],
-        &["--state [scheduled|eligible|claimed|failed|retired]"],
+        &["--state [scheduled|eligible|claimed|failed|deferred|opted_out|retired]"],
         "List review worktrees across every review by retirement state -- scheduled, \
-         eligible, claimed, failed, retired -- with failure context and the eligible-at timestamp. \
-         Repeat --state to filter (no --state lists everything).",
+         eligible, claimed, failed, deferred, opted_out, retired -- with failure context and \
+         the eligible-at timestamp. Repeat --state to filter (no --state lists everything).",
         false,
         true, // ("review", "worktree-retirements")
         &[],
