@@ -4311,6 +4311,20 @@ pub(crate) fn schedule_auto_submit_branch(store: &Arc<Mutex<Store>>, id: &str, b
             WARNING,
             "ralphus [pr] review {id} branch {branch_id} failed to queue auto-submit request: {e}"
         );
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "pr",
+            message: "auto-submit request queue failed",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"branch_id": branch_id, "error": e.to_string()}),
+            admin_only: false,
+        });
     }
 }
 
@@ -4379,6 +4393,19 @@ pub fn recover_pending_auto_submits_on_startup(store: &Arc<Mutex<Store>>) {
                 ERROR,
                 "ralphus [pr] auto-submit startup recovery: listing guardians failed: {e}"
             );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::ERROR,
+                source: "pr",
+                message: "auto-submit startup recovery failed",
+                scope: None,
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"error": e.to_string()}),
+                admin_only: false,
+            });
             return;
         }
     };
