@@ -208,6 +208,7 @@
        * @property {GuardianBranch[]} branches
        * @property {string} [squad_id]
        * @property {string} [git_root]
+       * @property {string|null} [project] - registered-project creation identity, or null for a raw-directory review
        * @property {string} [review_type]
        * @property {string} [review_branch]
        * @property {string} [combined_worktree]
@@ -586,4 +587,3 @@
       /**
        * @typedef {StatusPickerItem & { key: string, kind: "task"|"cell"|"proof" }} GraphNodeSelectionItem
        */
-

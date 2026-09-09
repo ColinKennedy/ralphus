@@ -551,8 +551,12 @@ pub struct GuardianView {
     /// The base-branch commit the stack was last built against. Used to detect a
     /// base-branch shift and auto-rebuild the review. `None` until first built.
     pub base_commit: Option<String>,
-    /// Absolute path to the git repository.
+    /// Concrete path used for git operations. For project-backed reviews this
+    /// may be machine-specific and is not the review's user-facing identity.
     pub git_root: String,
+    /// Registered project used to create this review, or `None` when the
+    /// review was created directly from a raw directory path.
+    pub project: Option<String>,
     /// The resulting review branch, once built.
     pub review_branch: Option<String>,
     /// Status string.
@@ -981,7 +985,27 @@ impl Store {
         git_root: &str,
         squad_id: Option<&str>,
     ) -> Result<String> {
-        self.create_guardian_keyed(name, base_branch, git_root, squad_id, None)
+        self.create_guardian_keyed(name, base_branch, git_root, squad_id, None, None)
+    }
+
+    /// Create a review through the registered-project route.
+    pub fn create_guardian_for_project(
+        &self,
+        name: &str,
+        base_branch: &str,
+        project_name: &str,
+    ) -> Result<String> {
+        let project = self
+            .get_project(project_name)?
+            .ok_or(StoreError::NotFound)?;
+        self.create_guardian_keyed(
+            name,
+            base_branch,
+            &project.path,
+            None,
+            None,
+            Some(&project.name),
+        )
     }
 
     /// Like [`Store::create_guardian_for_squad`] but also stores a stable
@@ -994,6 +1018,7 @@ impl Store {
         git_root: &str,
         squad_id: Option<&str>,
         review_key: Option<&str>,
+        project: Option<&str>,
     ) -> Result<String> {
         let id = self.next_id("guardian_seq", "guardian")?;
         let now = crate::store::now_ms();
@@ -1032,11 +1057,21 @@ impl Store {
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch)
-             VALUES(?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1)",
-            params![id, name, base_branch, git_root, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch)],
+            "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch)
+             VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1)",
+            params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch)],
         )?;
         Ok(id)
+    }
+
+    /// Record a registered-project creation identity on a legacy review only
+    /// when it has not already been set. Returns whether the row changed.
+    pub(crate) fn set_guardian_project_if_unset(&self, id: &str, project: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE guardians SET project=?, updated_at_ms=? WHERE id=? AND project IS NULL",
+            params![project, crate::store::now_ms(), id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// The id of the guardian that owns `review_key`, if one exists. Used to link
@@ -3495,7 +3530,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3509,7 +3544,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3610,6 +3645,7 @@ impl Store {
             separate_pr_branch: r.get::<_, Option<i64>>(49)?.map(|v| v != 0),
             readable_review_branch: r.get::<_, i64>(50)? != 0,
             review_branch_name: r.get(51)?,
+            project: r.get(52)?,
         })
     }
 
@@ -3948,6 +3984,7 @@ impl Store {
             base_branch: row.base_branch,
             base_commit: row.base_commit,
             git_root: row.git_root,
+            project: row.project,
             review_branch: row.review_branch,
             status: row.status,
             detail: row.detail,
@@ -4302,6 +4339,7 @@ struct GuardianRow {
     name: String,
     base_branch: String,
     git_root: String,
+    project: Option<String>,
     review_branch: Option<String>,
     base_commit: Option<String>,
     /// JSON map of {project_root: sha} for multi-project base-shift detection.

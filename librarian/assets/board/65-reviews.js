@@ -912,7 +912,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${proofScopeRow}
           ${isMultiProject
             ? `<div class="kv-row"><span class="k">projects</span><span class="v" style="display:flex;flex-direction:column;gap:2px">${(g.projects||[]).map((p) => `<span class="mono" style="font-size:11px">${esc(p)}</span>`).join("")}</span></div>`
-            : `<div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>`}
+            : g.project
+              ? `<div class="kv-row"><span class="k">project</span><span class="v" data-tip="This review was created through the registered-project route. Its concrete git path may be machine-specific, so the project name is the stable identity shown here.">${esc(g.project)}</span></div>`
+              : `<div class="kv-row"><span class="k">git root</span><span class="mono">${esc(g.git_root)}</span></div>`}
           <div class="kv-row"><span class="k">review branch</span><span class="mono">${esc(g.review_branch||"—")}</span></div>
           ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono" style="font-size:11px">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
@@ -1547,6 +1549,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function openCreateReview() {
+        if (!projects.length) {
+          pollProjects().then(() => {
+            if (document.getElementById("cr-project")) renderCreateReviewProjectOptions();
+          });
+        }
+        const projectOptions = `<option value="">(select a project)</option>` + projects.map((project) => `<option value="${esc(project.name)}">${esc(project.name)}</option>`).join("");
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
             <h2>Create Review</h2>
@@ -1555,7 +1563,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <label data-tip="Review type. 'git' stacks branches via rebase with AI conflict resolution. Other types are placeholders.">type<select id="cr-type" onchange="onReviewTypeChange()"><option value="git">git</option><option value="document">document (placeholder)</option></select></label>
               <div id="cr-git-fields">
                 <label data-tip="The branch that every submitted branch is ultimately rebased onto. Usually 'main' or 'master'.">upstream branch<input id="cr-base" value="main"></label>
-                <label data-tip="Absolute path to the git repository root on this machine. The daemon checks out worktrees here.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
+                <label data-tip="Choose whether this review is identified by a registered project or directly by a raw repository path.">target<select id="cr-target-kind" onchange="onReviewTargetKindChange()"><option value="project">registered project</option><option value="path">directory path</option></select></label>
+                <div id="cr-project-field">
+                  <label data-tip="The stable registered project identity for this review. Its concrete path may differ by machine.">project<select id="cr-project">${projectOptions}</select></label>
+                </div>
+                <div id="cr-path-field" class="hidden">
+                  <label data-tip="Absolute path to an unregistered git repository. Use this only when the review is not based on a registered project.">git root (absolute path)<input id="cr-root" placeholder="C:/path/to/repo"></label>
+                </div>
                 <label data-tip="Shell commands to run as check gates after each merge commit (comma-separated). Leave blank to skip gates. Example: cargo test, npm test">checks (comma-separated shell commands, optional)<input id="cr-checks" placeholder="cargo test"></label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:10px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nGates are still stored — you can re-enable this later."><input type="checkbox" id="cr-skip-auto-build" style="width:auto;margin:0">skip auto-build</label>
                 <label style="display:flex;align-items:center;gap:6px;margin-top:6px" data-tip="Use one shared worktree for the entire stack instead of per-branch worktrees. Faster for large repos."><input type="checkbox" id="cr-skip-worktrees" style="width:auto;margin:0">skip per-branch worktrees (large repos)</label>
@@ -1565,6 +1579,26 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             <div id="cr-err" class="verr"></div>
             <div class="btn-row"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="createReview()">Create</button></div>
           </div></div>`;
+      }
+      /**
+       * Refreshes the registered-project choices after a background project poll.
+       * @returns {void}
+       */
+      function renderCreateReviewProjectOptions() {
+        const select = /** @type {HTMLSelectElement|null} */ (document.getElementById("cr-project"));
+        if (!select) return;
+        const current = select.value;
+        select.innerHTML = `<option value="">(select a project)</option>` + projects.map((project) => `<option value="${esc(project.name)}">${esc(project.name)}</option>`).join("");
+        select.value = current;
+      }
+      /**
+       * Toggles between registered-project and raw-directory review creation.
+       * @returns {void}
+       */
+      function onReviewTargetKindChange() {
+        const isProject = /** @type {HTMLSelectElement} */ (document.getElementById("cr-target-kind")).value === "project";
+        byId("cr-project-field").classList.toggle("hidden", !isProject);
+        byId("cr-path-field").classList.toggle("hidden", isProject);
       }
       // CCTL-112: reviews are schema-based; the type dropdown toggles which
       // fields are shown (git-specific fields for `git`, a generic state else).
@@ -1595,8 +1629,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const checks = v("cr-checks") ? v("cr-checks").split(",").map((s) => s.trim()).filter(Boolean) : [];
         const skip_auto_build = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-auto-build")).checked;
         const skip_worktrees = /** @type {HTMLInputElement} */ (document.getElementById("cr-skip-worktrees")).checked;
-        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), git_root: v("cr-root"), checks, skip_auto_build, skip_worktrees };
-        if (!body.git_root) { byId("cr-err").textContent = "git root is required"; return; }
+        /** @type {Record<string, unknown>} */
+        const body = { name: v("cr-name"), review_type, base_branch: v("cr-base"), checks, skip_auto_build, skip_worktrees };
+        const targetKind = /** @type {HTMLSelectElement} */ (document.getElementById("cr-target-kind")).value;
+        if (targetKind === "project") {
+          const project = /** @type {HTMLSelectElement} */ (document.getElementById("cr-project")).value;
+          if (!project) { byId("cr-err").textContent = "select a project"; return; }
+          body.project = project;
+        } else {
+          const gitRoot = v("cr-root");
+          if (!gitRoot) { byId("cr-err").textContent = "git root is required"; return; }
+          body.git_root = gitRoot;
+        }
         const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
         if (!resp.ok) { byId("cr-err").textContent = "create failed"; return; }
         const g = await resp.json(); selectedGuardian = g.id; closeModal(); tick();

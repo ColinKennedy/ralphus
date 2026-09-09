@@ -217,6 +217,7 @@ fn single_project_makes_one_review() {
     assert_eq!(ids.len(), 1);
     let g = store.get_guardian(&ids[0]).unwrap();
     assert_eq!(g.name, "backend");
+    assert_eq!(g.project, None, "a cwd-only task uses the directory route");
     assert_eq!(g.base_branch, "main");
     assert_eq!(g.squad_id.as_deref(), Some(run_id.as_str()));
     // The review's declared conflict-resolver backend/model is persisted.
@@ -232,6 +233,30 @@ fn single_project_makes_one_review() {
     assert_eq!(g.branches[0].branch, "feature/a");
     assert_eq!(store.guardians_for_squad(&run_id).unwrap(), ids);
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn registered_project_task_records_project_identity_on_its_review() {
+    let base = temp_base("registered-project");
+    let cwd = repo_with_worktree(&base, "feature/project");
+    let sentinel = cell_review_sentinel("project-review");
+    let toml = format!(
+        "[[task]]\nname=\"t\"\nproject=\"ralphus\"\n\
+         [[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
+         [[review]]\nid=\"project-review\"\nskip_auto_build=true\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .register_project("ralphus", "", &base.join("repo").to_string_lossy(), "git")
+        .unwrap();
+    let squad_id = store.insert_squad(&file, None, false).unwrap();
+
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.get_guardian(&guardian_id).unwrap();
+
+    assert_eq!(guardian.project.as_deref(), Some("ralphus"));
     let _ = std::fs::remove_dir_all(&base);
 }
 

@@ -9157,7 +9157,12 @@ fn clear_all(daemon: &Daemon, body: &str) -> Reply {
 struct CreateGuardianBody {
     name: String,
     base_branch: String,
-    git_root: String,
+    /// Raw-directory creation route. Mutually exclusive with `project`.
+    #[serde(default)]
+    git_root: Option<String>,
+    /// Registered-project creation route. Mutually exclusive with `git_root`.
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     checks: Vec<String>,
     #[serde(default)]
@@ -9322,13 +9327,51 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
         return error(
             400,
             "bad_request",
-            "body must be {name, base_branch, git_root}",
+            "body must be {name, base_branch, git_root} or {name, base_branch, project}",
             vec![],
         );
     };
+    let git_root = req
+        .git_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let project = req
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let auto_watch_user = current_user(daemon, user_header).ok().flatten();
     let store = daemon.lock();
-    match store.create_guardian(&req.name, &req.base_branch, &req.git_root) {
+    let created = match (git_root, project) {
+        (Some(git_root), None) => store.create_guardian(&req.name, &req.base_branch, git_root),
+        (None, Some(project)) => {
+            store.create_guardian_for_project(&req.name, &req.base_branch, project)
+        }
+        (Some(_), Some(_)) => {
+            return error(
+                400,
+                "bad_request",
+                "specify exactly one of git_root or project, not both",
+                vec![],
+            );
+        }
+        (None, None) => {
+            return error(
+                400,
+                "bad_request",
+                "body must include exactly one of git_root or project",
+                vec![],
+            );
+        }
+    };
+    match created {
+        Err(StoreError::NotFound) if project.is_some() => error(
+            404,
+            "not_found",
+            &format!("project {:?} is not registered", project.unwrap()),
+            vec![],
+        ),
         Ok(id) => {
             if !req.checks.is_empty() {
                 let _ = store.set_guardian_checks(&id, &req.checks);
@@ -11277,6 +11320,7 @@ pub fn serve<A: ToSocketAddrs>(
     // Resolve project-name keys accidentally persisted as filesystem roots on
     // Arbiter reviews before review recovery starts scheduling work.
     crate::reviews::repair_arbiter_review_project_roots(&store);
+    crate::reviews::repair_review_project_identities(&store);
     // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
     // keyed by its pre-fix raw worktree path instead of the resolved
     // project name, and fire any pool that's now correctly counted and
@@ -17729,6 +17773,62 @@ command = "true"
         );
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"skip_auto_build\":false"));
+    }
+
+    #[test]
+    fn guardian_create_with_project_records_project_identity() {
+        let d = daemon();
+        d.lock()
+            .register_project("ralphus", "", "/repo", "git")
+            .unwrap();
+        let body = serde_json::json!({
+            "name": "r",
+            "base_branch": "main",
+            "project": "ralphus"
+        })
+        .to_string();
+
+        let created = route(&d, "POST", "/api/guardians", &body);
+        assert_eq!(created.status, 201, "{}", created.body);
+        let review = route(&d, "GET", "/api/guardians/guardian-000000000001", "");
+        assert!(review.body.contains("\"project\":\"ralphus\""));
+        assert!(review.body.contains("\"git_root\":\"/repo\""));
+    }
+
+    #[test]
+    fn guardian_create_with_directory_keeps_project_identity_unset() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+
+        let created = route(&d, "POST", "/api/guardians", &body);
+        assert_eq!(created.status, 201, "{}", created.body);
+        let review = route(&d, "GET", "/api/guardians/guardian-000000000001", "");
+        assert!(review.body.contains("\"project\":null"));
+    }
+
+    #[test]
+    fn guardian_create_requires_exactly_one_target_route() {
+        let d = daemon();
+        let both = serde_json::json!({
+            "name":"r",
+            "base_branch":"main",
+            "git_root":"/repo",
+            "project":"ralphus"
+        })
+        .to_string();
+        assert_eq!(route(&d, "POST", "/api/guardians", &both).status, 400);
+
+        let neither = serde_json::json!({"name":"r","base_branch":"main"}).to_string();
+        assert_eq!(route(&d, "POST", "/api/guardians", &neither).status, 400);
+    }
+
+    #[test]
+    fn guardian_create_rejects_an_unknown_project() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","project":"missing"}).to_string();
+        assert_eq!(route(&d, "POST", "/api/guardians", &body).status, 404);
     }
 
     #[test]

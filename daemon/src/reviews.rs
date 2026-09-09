@@ -319,6 +319,9 @@ struct Membership {
     task_idx: i64,
     idx: i64,
     project: PathBuf,
+    /// Registered project declared by the owning task. `None` means this
+    /// membership reached review creation through a raw-directory route.
+    registered_project: Option<String>,
     branch: String,
     upstream: String,
     name: String,
@@ -640,6 +643,13 @@ pub fn derive_reviews(
         // Record this cell's review branch so the board can link the cell
         // back to its review(s) (RAL-17).
         let crow = &cells[pos];
+        let registered_project = tasks_by_idx
+            .get(&crow.task_idx)
+            .copied()
+            .flatten()
+            .and_then(|task| task.project.as_deref())
+            .and_then(|name| store.resolve_project(name).ok().flatten())
+            .map(|registered| registered.name);
         store
             .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -659,6 +669,7 @@ pub fn derive_reviews(
             task_idx: crow.task_idx,
             idx: crow.idx,
             project: project.clone(),
+            registered_project,
             branch: branch.clone(),
             upstream,
             name: rv
@@ -787,8 +798,16 @@ pub fn derive_reviews(
             suggested
         };
         require_auto_build_declaration(&members, std::slice::from_ref(project), &name)?;
+        let registered_project = single_registered_project(&members);
         let gid = store
-            .create_guardian_for_squad(&name, &upstream, project, Some(squad_id))
+            .create_guardian_keyed(
+                &name,
+                &upstream,
+                project,
+                Some(squad_id),
+                None,
+                registered_project,
+            )
             .map_err(|e| ReviewError::new(e.to_string()))?;
         apply_resolver(store, &gid, &members)?;
         apply_project_review_defaults(store, &gid, project)?;
@@ -837,8 +856,16 @@ pub fn derive_reviews(
         };
         let review_ref = format!("{}{key}", ralphus_core::schema::REVIEW_LINK_PREFIX);
         require_auto_build_declaration(&members, &distinct_projects, &review_ref)?;
+        let registered_project = single_registered_project(&members);
         let gid = store
-            .create_guardian_keyed(&name, &upstream, &project, Some(squad_id), Some(key))
+            .create_guardian_keyed(
+                &name,
+                &upstream,
+                &project,
+                Some(squad_id),
+                Some(key),
+                registered_project,
+            )
             .map_err(|e| ReviewError::new(e.to_string()))?;
         // Apply skip_worktrees for every distinct project in the group.
         for proj in &distinct_projects {
@@ -855,6 +882,16 @@ pub fn derive_reviews(
     }
 
     Ok(created)
+}
+
+/// Return the one registered project shared by every member. Mixed-project
+/// and raw-directory groups intentionally have no singular project identity.
+fn single_registered_project<'a>(members: &[&'a Membership]) -> Option<&'a str> {
+    let first = members.first()?.registered_project.as_deref()?;
+    members
+        .iter()
+        .all(|member| member.registered_project.as_deref() == Some(first))
+        .then_some(first)
 }
 
 /// Stamp `gid` as the guardian a group's cells resolved to (RAL-314), both
@@ -1398,13 +1435,24 @@ pub(crate) fn create_review_from_triage_pool(
         .first()
         .map(|c| c.upstream.clone())
         .unwrap_or_else(|| "main".to_string());
-    let project_root = store
+    let registered_project = store
         .get_project(project)
-        .map_err(|e| ReviewError::new(e.to_string()))?
-        .map_or_else(|| project.to_string(), |registered| registered.path);
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    let project_root = registered_project
+        .as_ref()
+        .map_or_else(|| project.to_string(), |registered| registered.path.clone());
     let name = format!("triage-{triage_type}");
     let gid = store
-        .create_guardian_for_squad(&name, &upstream, &project_root, None)
+        .create_guardian_keyed(
+            &name,
+            &upstream,
+            &project_root,
+            None,
+            None,
+            registered_project
+                .as_ref()
+                .map(|registered| registered.name.as_str()),
+        )
         .map_err(|e| ReviewError::new(e.to_string()))?;
     store
         .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
@@ -1496,6 +1544,16 @@ pub fn repair_arbiter_review_project_roots(store: &Store) {
         if !repaired {
             continue;
         }
+        if let Err(e) = store.set_guardian_project_if_unset(&guardian.id, &registered.name) {
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::ERROR)
+                .guardian(&guardian.id)
+                .emit(
+                    store,
+                    format!("could not record project identity after project-root repair: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+        }
         if let Err(e) = apply_project_review_defaults(store, &guardian.id, &registered.path) {
             crate::cartographer::Note::new("recovery")
                 .level(crate::logging::LogLevel::ERROR)
@@ -1523,6 +1581,84 @@ pub fn repair_arbiter_review_project_roots(store: &Store) {
                     "status": if guardian.status == "merge_failed" { "collecting" } else { guardian.status.as_str() },
                 }),
             );
+    }
+}
+
+/// Backfill the registered-project identity for reviews whose source tasks
+/// unambiguously used one registered project. This uses submission provenance,
+/// never path matching, so directory-backed reviews remain directory-backed.
+pub fn repair_review_project_identities(store: &Store) {
+    let guardians = match store.list_guardians() {
+        Ok(guardians) => guardians,
+        Err(e) => {
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::ERROR)
+                .emit(
+                    store,
+                    format!("review project-identity repair failed to list reviews: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            return;
+        }
+    };
+    for guardian in guardians {
+        if guardian.project.is_some() || guardian.branches.is_empty() {
+            continue;
+        }
+        let mut project_name: Option<String> = None;
+        let mut unambiguous = true;
+        for branch in &guardian.branches {
+            let Some(squad_id) = branch.source_squad_id.as_deref() else {
+                unambiguous = false;
+                break;
+            };
+            let Some(task_idx) = branch.source_task_idx else {
+                unambiguous = false;
+                break;
+            };
+            let registered = store
+                .task_project_at(squad_id, task_idx)
+                .ok()
+                .flatten()
+                .and_then(|name| store.resolve_project(&name).ok().flatten());
+            let Some(registered) = registered else {
+                unambiguous = false;
+                break;
+            };
+            match project_name.as_deref() {
+                None => project_name = Some(registered.name),
+                Some(existing) if existing == registered.name => {}
+                Some(_) => {
+                    unambiguous = false;
+                    break;
+                }
+            }
+        }
+        let Some(project_name) = project_name.filter(|_| unambiguous) else {
+            continue;
+        };
+        match store.set_guardian_project_if_unset(&guardian.id, &project_name) {
+            Ok(true) => crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::WARNING)
+                .guardian(&guardian.id)
+                .emit(
+                    store,
+                    format!(
+                        "review {} recovered registered project identity '{}' from its source tasks",
+                        guardian.id, project_name
+                    ),
+                    serde_json::json!({"project": project_name}),
+                ),
+            Ok(false) => {}
+            Err(e) => crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::ERROR)
+                .guardian(&guardian.id)
+                .emit(
+                    store,
+                    format!("review project-identity repair failed: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                ),
+        }
     }
 }
 
@@ -1729,7 +1865,7 @@ mod tests {
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
         derive_triage_pools, rebase_onto, repair_arbiter_review_project_roots,
-        repair_triage_pool_keys, require_auto_build_declaration,
+        repair_review_project_identities, repair_triage_pool_keys, require_auto_build_declaration,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
@@ -2006,6 +2142,7 @@ mod tests {
             task_idx: 0,
             idx: 0,
             project: PathBuf::from("/repo"),
+            registered_project: None,
             branch: "feat".to_string(),
             upstream: "main".to_string(),
             name: "r".to_string(),
@@ -2532,6 +2669,7 @@ print(json.dumps(result))
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
         assert_eq!(g.git_root, "proj");
+        assert_eq!(g.project, None);
         assert_eq!(g.branches.len(), 2);
         assert_eq!(store.triage_pool_count("proj", "security").unwrap(), 0);
 
@@ -2658,6 +2796,7 @@ print(json.dumps(result))
 
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.git_root, root.to_string_lossy());
+        assert_eq!(g.project.as_deref(), Some("proj"));
         assert_eq!(
             g.machine.as_deref(),
             Some("ib:A"),
@@ -2693,8 +2832,36 @@ print(json.dumps(result))
 
         let guardian = store.get_guardian(&gid).unwrap();
         assert_eq!(guardian.git_root, root.to_string_lossy());
+        assert_eq!(guardian.project.as_deref(), Some("proj"));
         assert_eq!(guardian.status, "collecting");
         assert!(guardian.detail.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_review_project_identities_uses_source_task_provenance() {
+        let root = temp_repo();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"do it\"\n",
+        )
+        .unwrap();
+        let squad = store.insert_squad(&file, None, false).unwrap();
+        let gid = store.create_guardian("r", "main", "/remote/repo").unwrap();
+        store.add_guardian_branch(&gid, "feature").unwrap();
+        store
+            .set_cell_review_branch(&squad, 0, 0, "feature")
+            .unwrap();
+
+        repair_review_project_identities(&store);
+
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().project.as_deref(),
+            Some("proj")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
