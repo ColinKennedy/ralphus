@@ -159,8 +159,8 @@
       CLICK_HANDLERS.cancelReview = (e, ds) => cancelReview(ds.guardianId || "");
       CLICK_HANDLERS.reopenReview = (e, ds) => reopenReview(ds.guardianId || "");
       CLICK_HANDLERS.deleteReview = (e, ds) => deleteReview(ds.guardianId || "");
-      CLICK_HANDLERS.hideSquadMenuItem = (e, ds) => setSquadHidden(ds.squadId || "", true);
-      CLICK_HANDLERS.unhideSquadMenuItem = (e, ds) => setSquadHidden(ds.squadId || "", false);
+      CLICK_HANDLERS.hideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", true);
+      CLICK_HANDLERS.unhideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", false);
       CLICK_HANDLERS.hideReviewMenuItem = (e, ds) => setReviewHidden(ds.guardianId || "", true);
       CLICK_HANDLERS.unhideReviewMenuItem = (e, ds) => setReviewHidden(ds.guardianId || "", false);
       CLICK_HANDLERS.toggleAgentInspect = (e, ds) => toggleAgentInspect(e, ds.tid || "");

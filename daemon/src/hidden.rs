@@ -7,7 +7,7 @@
 use rusqlite::params;
 use serde::Serialize;
 
-use crate::store::{Result as StoreResult, Store, now_ms};
+use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 
 /// One per-user hidden item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,6 +65,31 @@ impl Store {
             params![user_name, guardian_id],
         )?;
         Ok(())
+    }
+
+    /// Batch form of [`Self::hide_squad`]/[`Self::unhide_squad`] -- applies to
+    /// every id under the one `Store` lock the caller already holds, instead
+    /// of one HTTP round trip per id (the board's multi-select Hide/Unhide
+    /// menu). Best-effort per id: a failure (e.g. the squad was deleted
+    /// concurrently) is reported back rather than aborting the rest of the
+    /// batch.
+    pub fn set_squads_hidden(
+        &self,
+        user_name: &str,
+        squad_ids: &[String],
+        hidden: bool,
+    ) -> Vec<(String, StoreError)> {
+        squad_ids
+            .iter()
+            .filter_map(|squad_id| {
+                let result = if hidden {
+                    self.hide_squad(user_name, squad_id)
+                } else {
+                    self.unhide_squad(user_name, squad_id)
+                };
+                result.err().map(|e| (squad_id.clone(), e))
+            })
+            .collect()
     }
 
     /// List all items hidden by one user, newest first.
@@ -154,5 +179,35 @@ mod tests {
             store.hide_review("alice", "guardian-missing"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn set_squads_hidden_applies_the_whole_batch_and_reports_partial_failure() {
+        let (mut store, squad_id, _) = fixture();
+        let file: TaskFile =
+            toml::from_str("[[task]]\nname='build'\n[[task.cell]]\ncwd='/repo'\nprompt='go'\n")
+                .unwrap();
+        let squad_id_2 = store.insert_squad(&file, None, false).unwrap();
+
+        let ids = vec![
+            squad_id.clone(),
+            squad_id_2.clone(),
+            "squad-missing".to_string(),
+        ];
+        let failed = store.set_squads_hidden("alice", &ids, true);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "squad-missing");
+        assert!(matches!(failed[0].1, StoreError::NotFound));
+
+        let alice = store.list_hidden("alice").unwrap();
+        assert_eq!(alice.len(), 2);
+        assert!(alice.iter().all(|item| item.kind == "squad"));
+
+        // unhide_squad has no existence check (it's a plain idempotent
+        // delete), so unhiding an unknown id is not a failure the way
+        // hiding one is.
+        let failed = store.set_squads_hidden("alice", &ids, false);
+        assert!(failed.is_empty());
+        assert!(store.list_hidden("alice").unwrap().is_empty());
     }
 }

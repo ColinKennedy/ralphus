@@ -43,6 +43,7 @@ where one exists.
 | GET | `/api/hidden` | [List the current user's hidden squads and reviews](#hidden-items-ral-328) |
 | POST | `/api/hidden/squads/{id}` | [Hide a squad for the current user](#hidden-items-ral-328) |
 | DELETE | `/api/hidden/squads/{id}` | [Re-enable a squad for the current user](#hidden-items-ral-328) |
+| POST | `/api/hidden/squads/batch` | [Hide/unhide many squads for the current user in one request](#hidden-items-ral-328) |
 | POST | `/api/hidden/reviews/{id}` | [Hide a review for the current user](#hidden-items-ral-328) |
 | DELETE | `/api/hidden/reviews/{id}` | [Re-enable a review for the current user](#hidden-items-ral-328) |
 
@@ -772,6 +773,24 @@ Deleting a squad or review also deletes every user's preference for it.
 These endpoints return `400 current_user_required` when neither identity
 source is set, `400 unknown_user` for an unregistered identity, and `404` when
 a hide request names an entity that does not exist.
+
+`POST /api/hidden/squads/batch` hides or unhides many squads in one request
+(RAL-331) -- the board's multi-select Hide/Unhide menu items send every
+selected squad id here instead of one request per squad:
+
+```json
+{ "ids": ["squad-000000000001", "squad-000000000002"], "hidden": true }
+```
+
+Every id is applied under a single held lock; an id that fails (e.g. it was
+deleted concurrently) is reported back instead of aborting the rest of the
+batch, and the response is still `200`:
+
+```json
+{ "hidden": true, "failed": [ { "id": "squad-000000000003", "error": "not found" } ] }
+```
+
+`400 bad_request` if `ids` is empty or the body doesn't parse.
 
 ### `GET /api/secret-env-names`
 List the user-configurable set of env-var **names** treated as secret

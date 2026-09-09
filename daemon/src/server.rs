@@ -455,6 +455,27 @@ struct HiddenStateResponse {
     hidden: bool,
 }
 
+/// `POST /api/hidden/squads/batch` body -- the board's multi-select
+/// Hide/Unhide menu items send every selected squad id in one request
+/// instead of one HTTP round trip per id.
+#[derive(Deserialize)]
+struct HiddenSquadsBatchBody {
+    ids: Vec<String>,
+    hidden: bool,
+}
+
+#[derive(Serialize)]
+struct HiddenBatchFailure {
+    id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct HiddenBatchResponse {
+    hidden: bool,
+    failed: Vec<HiddenBatchFailure>,
+}
+
 /// `POST /api/users` body -- see `crate::users`'s module doc comment for why
 /// this is a placeholder identity registry, not authentication.
 #[derive(Deserialize)]
@@ -797,6 +818,9 @@ fn route_for_user(
             visit_user_profile(daemon, user_header, &url_decode(name))
         }
         ("GET", ["api", "hidden"]) => list_hidden(daemon, user_header),
+        ("POST", ["api", "hidden", "squads", "batch"]) => {
+            set_squads_hidden_batch(daemon, user_header, body)
+        }
         ("POST", ["api", "hidden", "squads", id]) => {
             set_squad_hidden(daemon, user_header, id, true)
         }
@@ -2817,6 +2841,62 @@ fn set_squad_hidden(
             serde_json::json!({ "user_name": user_name }),
         );
     json(200, &HiddenStateResponse { hidden })
+}
+
+/// Batch form of [`set_squad_hidden`] -- one request for the board's
+/// multi-select Hide/Unhide menu items, applying every id under a single
+/// held `Store` lock instead of one HTTP round trip per squad. Best-effort:
+/// an id that fails (e.g. already deleted) is reported in `failed` rather
+/// than aborting the rest of the batch, and the response is still `200`.
+fn set_squads_hidden_batch(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Reply {
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let Ok(req) = serde_json::from_str::<HiddenSquadsBatchBody>(body) else {
+        return error(400, "bad_request", "invalid body", vec![]);
+    };
+    if req.ids.is_empty() {
+        return error(400, "bad_request", "ids must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    let failed = store.set_squads_hidden(&user_name, &req.ids, req.hidden);
+    let failed_ids: std::collections::HashSet<&str> =
+        failed.iter().map(|(id, _)| id.as_str()).collect();
+    // RAL-332: admin-only Cartographer visibility -- see `set_squad_hidden`'s
+    // matching comment. One note per squad that actually changed, mirroring
+    // the granularity of the single-item endpoint.
+    for id in &req.ids {
+        if failed_ids.contains(id.as_str()) {
+            continue;
+        }
+        crate::cartographer::Note::new("hidden")
+            .squad(id)
+            .scope("squad")
+            .admin_only()
+            .emit(
+                &store,
+                if req.hidden {
+                    "squad hidden"
+                } else {
+                    "squad unhidden"
+                },
+                serde_json::json!({ "user_name": user_name }),
+            );
+    }
+    json(
+        200,
+        &HiddenBatchResponse {
+            hidden: req.hidden,
+            failed: failed
+                .into_iter()
+                .map(|(id, e)| HiddenBatchFailure {
+                    id,
+                    error: e.to_string(),
+                })
+                .collect(),
+        },
+    )
 }
 
 fn set_review_hidden(
