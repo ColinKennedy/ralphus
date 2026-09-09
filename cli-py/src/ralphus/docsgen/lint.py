@@ -1,7 +1,8 @@
 """Lint: every board tab has a documented, embedded "main" screenshot.
 
-Reads the GUI's own list of tabs — the ``TABS`` JS array from the board's
-loaded JavaScript chunks — and, for each one, requires:
+Reads the GUI's own list of tabs — the ``TABS`` JS array in
+``librarian/assets/board.html`` or, since RAL-362, one of the
+``librarian/assets/board/*.js`` chunks — and, for each one, requires:
 
 1. A mandatory "main" screenshot at
    ``docs/site/pages/screenshots/<tab>-overview.png``.
@@ -45,10 +46,8 @@ __all__ = [
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BOARD_HTML = REPO_ROOT / "librarian" / "assets" / "board.html"
-# The board's JS is split into numbered chunk files served individually
-# (board.html loads each via its own <script src="/board/NN-…">), and the
-# `const TABS = [...]` array lives in one of those chunks rather than in
-# board.html itself — tab extraction scans both locations.
+# The board's JS lives in global-scope chunks under `board/` — RAL-362 moved
+# the tab bar (and its `TABS` array) out of board.html into one of them.
 BOARD_CHUNKS_DIR = REPO_ROOT / "librarian" / "assets" / "board"
 PAGES_DIR = REPO_ROOT / "docs" / "site" / "pages"
 SCREENSHOTS_DIR = PAGES_DIR / "screenshots"
@@ -69,8 +68,8 @@ def _log(message: str) -> None:
 def board_tabs() -> list[str]:
     """The GUI's own list of tabs, parsed from the board's `TABS` array.
 
-    Searched in board.html first, then every `board/*.js` chunk file — the
-    array lives in a chunk, not in board.html itself.
+    The array used to live in board.html; since RAL-362 it lives in a
+    board chunk, so both locations are searched.
     """
     sources = [BOARD_HTML, *sorted(BOARD_CHUNKS_DIR.glob("*.js"))]
     for source in sources:

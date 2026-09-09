@@ -56,6 +56,13 @@ pub enum ReviewCommand {
     Worktrees {
         selector: String,
     },
+    /// RAL-385: the cross-review worktree-retirement view — every review
+    /// worktree classified by retirement state, plus durable history for
+    /// worktrees already retired or whose cleanup failed.
+    WorktreeRetirements {
+        /// Repeatable `--state` filter; empty means every state.
+        states: Vec<String>,
+    },
     Create {
         name: String,
         base_branch: String,
@@ -302,6 +309,17 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("status") => with_selector(scanner, |selector| ReviewCommand::Status { selector }),
         Some("worktrees") => {
             with_selector(scanner, |selector| ReviewCommand::Worktrees { selector })
+        }
+        Some("worktree-retirements") => {
+            let states = scanner.take_repeated("--state").unwrap_or_default();
+            if let Some(bad) = states.iter().find(|s| !STATES.contains(&s.as_str())) {
+                ReviewCommand::UsageError(format!(
+                    "unknown --state {bad:?} (expected one of: {})",
+                    STATES.join(", ")
+                ))
+            } else {
+                ReviewCommand::WorktreeRetirements { states }
+            }
         }
         Some("create") => {
             let checks = scanner.take_value("--checks").ok().flatten();
@@ -1177,6 +1195,11 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let guardian = client.guardian_get(&resolved.guardian_id)?;
             emit(opts, &guardian, render_review_worktrees);
+            Ok(())
+        }),
+        ReviewCommand::WorktreeRetirements { states } => run_and_report(opts, None, || {
+            let view = client.worktree_retirements()?;
+            emit(opts, &view, |v| render_worktree_retirements(v, &states));
             Ok(())
         }),
         ReviewCommand::Create {
@@ -2464,6 +2487,59 @@ fn render_review_worktrees(g: &Value) {
         })
         .collect();
     crate::output::print_table(&["POS", "BRANCH", "WORKTREE", "SOURCE"], &rows);
+}
+
+/// RAL-385: every retirement state the view can report, in lifecycle order.
+const STATES: [&str; 5] = ["scheduled", "eligible", "claimed", "failed", "retired"];
+
+/// RAL-385: the cross-review retirement view. `states` is the caller's
+/// repeatable `--state` filter (empty = every state).
+fn render_worktree_retirements(view: &Value, states: &[String]) {
+    let entries: Vec<&Value> = view["entries"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| {
+                    states.is_empty()
+                        || states
+                            .iter()
+                            .any(|s| Some(s.as_str()) == e["state"].as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        if states.is_empty() {
+            println!("no review worktrees");
+        } else {
+            println!("no review worktrees match the state filter");
+        }
+        return;
+    }
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| {
+            let claim = match e["claim_kind"].as_str() {
+                Some(kind) => format!("{kind} ({})", e["claim_owner"].as_str().unwrap_or("?")),
+                None => "-".to_string(),
+            };
+            let note = match e["error"].as_str() {
+                Some(err) => err.to_string(),
+                None => e["eligible_at_ms"]
+                    .as_i64()
+                    .map(|ms| format!("eligible at {ms}"))
+                    .unwrap_or_default(),
+            };
+            vec![
+                e["guardian_name"].as_str().unwrap_or_default().to_string(),
+                e["state"].as_str().unwrap_or_default().to_string(),
+                e["path"].as_str().unwrap_or_default().to_string(),
+                claim,
+                note,
+            ]
+        })
+        .collect();
+    crate::output::print_table(&["REVIEW", "STATE", "PATH", "CLAIM", "DETAIL"], &rows);
 }
 
 fn render_events(events: &Value) {

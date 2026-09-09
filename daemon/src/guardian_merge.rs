@@ -7501,10 +7501,24 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
             continue;
         }
         let _ = root.git(&["worktree", "unlock", &record.path]);
+        let eligible_at_ms = record
+            .last_activity_ms
+            .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
         match root.git(&["worktree", "remove", "--force", "--force", &record.path]) {
             Ok(_) => {
                 let guard = store.lock().expect("poisoned");
                 let _ = guard.clear_guardian_worktree_path(&record.path);
+                // RAL-385: the path columns above are now NULL, so the durable
+                // retirement record is the only trace that this worktree ever
+                // existed. It dies with the review (delete_guardian).
+                let _ = guard.record_guardian_worktree_retirement(
+                    &record.guardian_id,
+                    &record.path,
+                    "retired",
+                    None,
+                    eligible_at_ms,
+                    crate::store::now_ms(),
+                );
                 crate::cartographer::Note::new("guardian")
                     .guardian(&record.guardian_id)
                     .scope("guardian")
@@ -7514,13 +7528,217 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                         serde_json::json!({"worktree": record.path, "age_threshold_days": 30}),
                     );
             }
-            Err(error) => crate::rlog!(
-                WARNING,
-                "ralphus [guardian] could not retire worktree {}: {error}",
-                record.path
-            ),
+            Err(error) => {
+                // RAL-385: record the failure durably (the next daily sweep
+                // retries) and emit it as a Cartographer row, not just stderr
+                // -- a worktree whose cleanup is failing must stay visible
+                // (`worktree_retirement_view`) until an attempt succeeds.
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] could not retire worktree {}: {error}",
+                    record.path
+                );
+                let guard = store.lock().expect("poisoned");
+                let _ = guard.record_guardian_worktree_retirement(
+                    &record.guardian_id,
+                    &record.path,
+                    "failed",
+                    Some(&error.to_string()),
+                    eligible_at_ms,
+                    crate::store::now_ms(),
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "could not retire old guardian worktree",
+                        serde_json::json!({"worktree": record.path, "error": error.to_string()}),
+                    );
+            }
         }
     }
+}
+
+/// The operator-facing worktree-retirement view (RAL-385): every persisted
+/// review worktree path classified by where it sits in the retirement
+/// lifecycle, plus durable history for paths already removed.
+///
+/// States, in the labels the board and CLI present:
+/// - `scheduled` -- exists, younger than [`WORKTREE_RETIREMENT_AGE_MS`];
+///   `eligible_at_ms` says when the daily sweep will first consider it.
+/// - `eligible` -- past `eligible_at_ms`, no blocking claim, waiting for the
+///   next daily `retire_stale_worktrees` pass to remove it.
+/// - `claimed` -- past `eligible_at_ms` but held by a non-terminal cell,
+///   proof, or review claim, so it is kept and a mailbox escalation fires.
+/// - `failed` -- an attempt was made and git refused it; `error` carries the
+///   failure and the sweep retries on its next pass.
+/// - `retired` -- an attempt succeeded and the worktree no longer exists;
+///   visible here for as long as its review row exists.
+#[derive(serde::Serialize)]
+pub(crate) struct WorktreeRetirementEntry {
+    pub guardian_id: String,
+    pub guardian_name: String,
+    pub project_root: String,
+    pub path: String,
+    pub state: String,
+    /// When the worktree became (or becomes) old enough to retire: owner
+    /// last-activity + [`WORKTREE_RETIREMENT_AGE_MS`].
+    pub eligible_at_ms: i64,
+    pub last_activity_ms: Option<i64>,
+    /// `claimed` only: the non-terminal claim holding the worktree.
+    pub claim_kind: Option<String>,
+    pub claim_owner: Option<String>,
+    pub claim_state: Option<String>,
+    /// `failed` only: why git refused the last removal attempt.
+    pub error: Option<String>,
+    /// `retired`/`failed` only: when the last attempt ran.
+    pub last_attempt_ms: Option<i64>,
+}
+
+/// The whole `GET /api/worktree-retirements` response body (RAL-385).
+#[derive(serde::Serialize)]
+pub(crate) struct WorktreeRetirementView {
+    pub age_threshold_days: u32,
+    pub entries: Vec<WorktreeRetirementEntry>,
+}
+
+/// Builds the retirement view from one short store snapshot. Pure
+/// derivation -- no git or filesystem access -- so it is safe to call from
+/// request handling.
+pub(crate) fn worktree_retirement_view(
+    store: &crate::store::Store,
+) -> crate::store::Result<WorktreeRetirementView> {
+    let guard = store;
+    let records = guard.guardian_worktree_records()?;
+    let claims = guard.worktree_claims()?;
+    let retirements = guard.guardian_worktree_retirements()?;
+    let now = crate::store::now_ms();
+
+    // Same dedup as `retire_stale_worktrees`: a combined worktree is also
+    // the last branch's worktree, so one path commonly has two rows; the
+    // newest activity wins. Keyed on the normalized path, matching how
+    // retirement dedups and how claims are matched.
+    let mut records_by_path: HashMap<String, crate::store::GuardianWorktreeRecord> = HashMap::new();
+    for record in records {
+        let key = normalized_worktree_path(Path::new(&record.path));
+        let replace =
+            records_by_path
+                .get(&key)
+                .is_none_or(|old: &crate::store::GuardianWorktreeRecord| {
+                    record.last_activity_ms > old.last_activity_ms
+                });
+        if replace {
+            records_by_path.insert(key, record);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(records_by_path.len());
+    for record in records_by_path.values() {
+        let key = normalized_worktree_path(Path::new(&record.path));
+        let eligible_at_ms = record
+            .last_activity_ms
+            .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
+        // A durable `failed` row for this exact (guardian, path) pair wins
+        // over the derived live states -- the failure is the newest fact the
+        // sweep recorded, and it stays until an attempt succeeds.
+        let failed = retirements.iter().find(|r| {
+            r.guardian_id == record.guardian_id
+                && r.status == "failed"
+                && normalized_worktree_path(Path::new(&r.path)) == key
+        });
+        let active_claim = claims.iter().find(|claim| {
+            normalized_worktree_path(Path::new(&claim.path)) == key
+                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        });
+        let (state, claim_kind, claim_owner, claim_state, error, last_attempt_ms) =
+            if let Some(f) = failed {
+                (
+                    "failed",
+                    None,
+                    None,
+                    None,
+                    f.error.clone(),
+                    Some(f.last_attempt_ms),
+                )
+            } else if eligible_at_ms > now {
+                // `eligible_at_ms` is `last_activity + AGE`, so comparing it
+                // straight against now is the single-count form of the
+                // sweep's `last_activity_ms > cutoff` test.
+                ("scheduled", None, None, None, None, None)
+            } else if let Some(claim) = active_claim {
+                (
+                    "claimed",
+                    Some(claim.kind.clone()),
+                    Some(claim.owner.clone()),
+                    Some(claim.state.clone()),
+                    None,
+                    None,
+                )
+            } else {
+                ("eligible", None, None, None, None, None)
+            };
+        entries.push(WorktreeRetirementEntry {
+            guardian_id: record.guardian_id.clone(),
+            guardian_name: record.guardian_name.clone(),
+            project_root: record.project_root.clone(),
+            path: record.path.clone(),
+            state: state.to_string(),
+            eligible_at_ms,
+            last_activity_ms: Some(record.last_activity_ms),
+            claim_kind,
+            claim_owner,
+            claim_state,
+            error,
+            last_attempt_ms,
+        });
+    }
+    // Retired history: durable rows whose path no longer has a live record.
+    // (A failed row's path always still has one, so only successful
+    // retirements fall through here.)
+    for r in retirements {
+        if r.status != "retired" {
+            continue;
+        }
+        let key = normalized_worktree_path(Path::new(&r.path));
+        if records_by_path
+            .values()
+            .any(|record| normalized_worktree_path(Path::new(&record.path)) == key)
+        {
+            continue;
+        }
+        // The review row still exists (the retirement record cascades away
+        // with it), so the name is resolvable; if the review was deleted in
+        // between, its retirement record was cascaded away with it and the
+        // row simply drops out of the view.
+        let Some(guardian_name) = guard.guardian_display_name(&r.guardian_id)? else {
+            continue;
+        };
+        entries.push(WorktreeRetirementEntry {
+            guardian_id: r.guardian_id,
+            guardian_name,
+            project_root: String::new(),
+            path: r.path,
+            state: "retired".to_string(),
+            eligible_at_ms: r.eligible_at_ms,
+            last_activity_ms: None,
+            claim_kind: None,
+            claim_owner: None,
+            claim_state: None,
+            error: r.error,
+            last_attempt_ms: Some(r.last_attempt_ms),
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.eligible_at_ms
+            .cmp(&b.eligible_at_ms)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(WorktreeRetirementView {
+        age_threshold_days: u32::try_from(WORKTREE_RETIREMENT_AGE_MS / (24 * 60 * 60 * 1_000))
+            .unwrap_or(0),
+        entries,
+    })
 }
 
 /// RAL-317: record a branch's terminal (`Done`/`ConflictResolved`) merge
@@ -10354,6 +10572,30 @@ mod tests {
                 .len(),
             1
         );
+
+        // RAL-385: the sweep's outcome is also visible in the retirement
+        // view — the removed safe worktree reads as retired history (its
+        // live path row was cleared, so only the durable record remains),
+        // while the retained unsafe one reads as claimed by the review that
+        // still owns it.
+        {
+            let view = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+            let safe = view
+                .entries
+                .iter()
+                .find(|e| e.guardian_id == _safe_id)
+                .expect("retired safe worktree must stay visible");
+            assert_eq!(safe.state, "retired");
+            assert!(safe.error.is_none());
+            let held = view
+                .entries
+                .iter()
+                .find(|e| e.guardian_id == unsafe_id)
+                .expect("retained worktree must stay visible");
+            assert_eq!(held.state, "claimed");
+            assert_eq!(held.claim_kind.as_deref(), Some("review"));
+            assert_eq!(held.claim_owner.as_deref(), Some(unsafe_id.as_str()));
+        }
         g(
             &repo,
             &[
@@ -10364,6 +10606,114 @@ mod tests {
             ],
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_retirement_view_classifies_every_lifecycle_state() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
+        let recent = crate::store::now_ms() - 1000;
+
+        // Scheduled: recent activity, no retirement record.
+        let scheduled_id = store
+            .lock()
+            .unwrap()
+            .create_guardian("scheduled", "main", "/r")
+            .unwrap();
+        // Eligible: old and terminal, so its review claim is not blocking.
+        let eligible_id = store
+            .lock()
+            .unwrap()
+            .create_guardian("eligible", "main", "/r")
+            .unwrap();
+        for (id, status, updated) in [
+            (&scheduled_id, "deployed", recent),
+            (&eligible_id, "deployed", old),
+        ] {
+            let guard = store.lock().unwrap();
+            guard.add_guardian_branch(id, "b").unwrap();
+            let branch_id = guard.get_guardian(id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_review(id, &branch_id, "gb", &format!("C:/r/{id}/wt"))
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                    rusqlite::params![status, updated, id],
+                )
+                .unwrap();
+        }
+
+        let view = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        assert_eq!(view.age_threshold_days, 30);
+        let state_of = |id: &str, v: &WorktreeRetirementView| {
+            v.entries
+                .iter()
+                .find(|e| e.guardian_id == id)
+                .map(|e| e.state.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(state_of(&scheduled_id, &view), "scheduled");
+        assert_eq!(state_of(&eligible_id, &view), "eligible");
+        let eligible_entry = view
+            .entries
+            .iter()
+            .find(|e| e.guardian_id == eligible_id)
+            .unwrap();
+        assert_eq!(
+            eligible_entry.eligible_at_ms,
+            old + WORKTREE_RETIREMENT_AGE_MS
+        );
+
+        // Failed: a recorded refusal wins over the derived live state.
+        store
+            .lock()
+            .unwrap()
+            .record_guardian_worktree_retirement(
+                &eligible_id,
+                &format!("C:/r/{eligible_id}/wt"),
+                "failed",
+                Some("directory not empty"),
+                old + WORKTREE_RETIREMENT_AGE_MS,
+                crate::store::now_ms(),
+            )
+            .unwrap();
+        let view2 = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        let failed_entry = view2
+            .entries
+            .iter()
+            .find(|e| e.guardian_id == eligible_id)
+            .unwrap();
+        assert_eq!(failed_entry.state, "failed");
+        assert_eq!(failed_entry.error.as_deref(), Some("directory not empty"));
+
+        // Retired: after the path row is cleared, the durable record keeps
+        // the entry visible as history (with the review's display name).
+        {
+            let guard = store.lock().unwrap();
+            let path = format!("C:/r/{eligible_id}/wt");
+            guard.clear_guardian_worktree_path(&path).unwrap();
+            guard
+                .record_guardian_worktree_retirement(
+                    &eligible_id,
+                    &path,
+                    "retired",
+                    None,
+                    old + WORKTREE_RETIREMENT_AGE_MS,
+                    crate::store::now_ms(),
+                )
+                .unwrap();
+        }
+        let view3 = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        let retired_entry = view3
+            .entries
+            .iter()
+            .find(|e| e.guardian_id == eligible_id)
+            .unwrap();
+        assert_eq!(retired_entry.state, "retired");
+        assert_eq!(retired_entry.guardian_name, "eligible");
+        assert_eq!(retired_entry.last_activity_ms, None);
     }
 
     #[test]

@@ -99,7 +99,10 @@
         <div class="side-head">
           <div class="row" style="justify-content:space-between">
             <b>Reviews</b>
-            <button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack to rebase, validate with check gates, and approve for deployment.">＋ Create</button>
+            <span class="row" style="gap:4px">
+              <button class="btn" onclick="openWorktreeRetirementModal()" data-tip="Worktree retirement — every review worktree by retirement state: scheduled (too young), eligible (awaiting the daily cleanup sweep), claimed (kept because a live task/proof/review still needs it), failed (a cleanup attempt failed — hover the detail column for why), retired (removed). Retired rows are kept as history for as long as the review exists.">⏳ Retirement</button>
+              <button class="newtask" onclick="openCreateReview()" data-tip="Create a new Guardian review — set up a branch stack to rebase, validate with check gates, and approve for deployment.">＋ Create</button>
+            </span>
           </div>
           <input type="text" id="review-filter" placeholder="filter by review id / name…" oninput="onReviewFilter(this.value)" data-tip="Filter reviews by review ID or name. Only matching reviews appear in the list." />
           <div class="status-filters row" id="review-status-filters"></div>
