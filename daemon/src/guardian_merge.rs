@@ -11610,6 +11610,10 @@ mod tests {
             guard
                 .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), base_sha)
                 .unwrap();
+            // Final-summary generation only runs on an InReview guardian;
+            // the merge pass that would normally reach it is the part these
+            // tests stub out, so land the state the same way the merge pass
+            // ends.
             guard
                 .set_guardian_status(&id, GuardianStatus::InReview, None)
                 .unwrap();

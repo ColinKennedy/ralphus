@@ -12,10 +12,17 @@ use crate::pi_backend::PiBackend;
 use crate::spec::{CellResult, CellSpec};
 use crate::tools::Workspace;
 
-// These four constants must stay byte-identical to
-// `daemon/src/runner.rs`'s `PROOF_SYSTEM_PROMPT`/`GHOST_SYSTEM_PROMPT`/
-// `ASYNC_SYSTEM_PROMPT`/`NON_INTERACTIVE_SYSTEM_PROMPT` -- that file's own
+// These five constants must stay byte-identical to `daemon/src/runner.rs`'s
+// `PROOF_SYSTEM_PROMPT`/`GHOST_SYSTEM_PROMPT`/`ASYNC_SYSTEM_PROMPT`/
+// `TOOLS_SYSTEM_PROMPT`/`NON_INTERACTIVE_SYSTEM_PROMPT` -- that file's own
 // comment says the same about staying in sync with this one.
+//
+// The assembled prompt (caller-authored fragment first, then these in the
+// order `combine_system_prompts` lists them) is organized as
+// `## Background` -> `## Regarding Tools` -> `## Conclusion`: the
+// non-interactive and tools fragments open their own sections, and the
+// async fragment opens `## Conclusion`, so the proof/ghost fragment that
+// follows it lands inside that section.
 const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate whether the \
      task holds, attempting to fix any problems you find so the check passes \
      if you can reasonably do so. When you are done, your FINAL line of \
@@ -31,24 +38,30 @@ const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to ch
      the diff: places you struggled, workarounds you used, issues you noticed \
      but did not fix, and open questions. This is not a changelog. If there \
      is truly nothing worth flagging, write 'RALPHUS_GHOST: (nothing to report)'.";
-const ASYNC_SYSTEM_PROMPT: &str = "This is a single, non-interactive invocation with no later turn — \
-     nothing will check back on you. Never use an asynchronous/background/\
-     'notify me later' tool for anything this session depends on, and never \
-     launch the thing you are checking as a background/detached process and \
-     end your turn while it is still running; those require a persistent \
-     session this invocation does not have. If a check genuinely takes a long \
-     time, block and wait for it synchronously in the foreground within this \
-     same turn — it is fine for that to take a long time. If, despite that, \
-     you truly cannot reach a definitive result before you must stop, end \
-     your reply with 'RALPHUS_STILL_WORKING: <one-line reason>' as the last \
-     line instead of trailing off — you will be re-invoked shortly to \
-     continue synchronously from where you left off, though only a bounded \
-     number of times, so prefer just finishing the check yourself.";
-const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non-interactive cell — no human is \
-     available to answer questions or approve a plan. Never ask a clarifying \
-     question, never stop to present a plan for confirmation, and never pause \
-     waiting for input. Make the most reasonable judgment call yourself and \
-     continue until the task is complete.";
+const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interactive invocation — no \
+     human will check back on you or answer follow-up questions, though \
+     Ralphus may re-invoke you synchronously to continue. Never use an \
+     asynchronous/background/'notify me later' tool for anything this session \
+     depends on, and never launch the thing you are checking as a \
+     background/detached process and end your turn while it is still running; \
+     those require a persistent session this invocation does not have. If a \
+     check genuinely takes a long time, block and wait for it synchronously \
+     in the foreground within this same turn — it is fine for that to take a \
+     long time. If, despite that, you truly cannot reach a definitive result \
+     before you must stop, end your reply with 'RALPHUS_STILL_WORKING: \
+     <one-line reason>' as the last line instead of trailing off — you will \
+     be re-invoked shortly to continue synchronously from where you left \
+     off, though only a bounded number of times, so prefer just finishing \
+     the check yourself.";
+const TOOLS_SYSTEM_PROMPT: &str = "## Regarding Tools\nPrefer `rg` for shell searches; \
+     use `grep` only when `rg` is unavailable or you need grep-specific \
+     behavior. In shell examples, use `rg \"pattern\" .`.";
+const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unattended in a non-interactive \
+     cell — no human is available to answer questions or approve a plan. \
+     Never ask a clarifying question, never stop to present a plan for \
+     confirmation, and never pause waiting for input. Make the most \
+     reasonable judgment call yourself and continue until the task is \
+     complete.";
 
 const MAX_ASYNC_ATTEMPTS: u32 = 3;
 /// RAL-292: how many times a turn that ended with an unresolved backgrounded
@@ -291,6 +304,7 @@ fn run_with_backend(
     let system_prompt = combine_system_prompts(&[
         spec.system_prompt.as_deref(),
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+        Some(TOOLS_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
         Some(if spec.proof {
             PROOF_SYSTEM_PROMPT
@@ -933,6 +947,112 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Asserts the structure of the fully assembled unattended-cell system
+    /// prompt (caller-authored fragment + ralphus fragments joined with blank
+    /// lines), the form the backend actually receives -- not just the
+    /// individual constants.
+    fn assert_assembled_prompt_sections(sp: &str, caller_first_line: &str) {
+        assert!(
+            sp.starts_with(caller_first_line),
+            "caller-authored fragment must come first: {sp}"
+        );
+        let background = sp.find("## Background\n").expect("Background section");
+        let tools = sp
+            .find("## Regarding Tools\n")
+            .expect("Regarding Tools section");
+        let conclusion = sp.find("## Conclusion\n").expect("Conclusion section");
+        assert!(background < tools && tools < conclusion);
+        // Tool guidance: prefer rg, allow grep as fallback, example form.
+        assert!(sp.contains("Prefer `rg` for shell searches"), "{sp}");
+        assert!(
+            sp.contains("use `grep` only when `rg` is unavailable"),
+            "{sp}"
+        );
+        assert!(sp.contains("use `rg \"pattern\" .`"), "{sp}");
+        // Synchronous-execution constraints with the exact escape marker.
+        assert!(
+            sp.contains("never launch the thing you are checking as a background"),
+            "{sp}"
+        );
+        assert!(
+            sp.contains("'RALPHUS_STILL_WORKING: <one-line reason>'"),
+            "{sp}"
+        );
+    }
+
+    #[test]
+    fn assembled_unattended_cell_prompt_is_sectioned_and_gated_on_markers() {
+        let mut spec = test_spec(false);
+        spec.system_prompt = Some("Do NOT commit and do NOT push under any circumstances.".into());
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(BackendOutcome {
+                summary: "all done".to_string(),
+                ..Default::default()
+            })],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert!(result.ok());
+        let sp = backend
+            .last_system_prompt
+            .borrow()
+            .clone()
+            .expect("run() should have received the assembled system prompt");
+        assert_assembled_prompt_sections(
+            &sp,
+            "Do NOT commit and do NOT push under any circumstances.",
+        );
+        // Ghost handoff contract (this is a non-proof cell) with the exact
+        // marker and the 5-bullet cap, and no proof marker text.
+        assert!(
+            sp.contains("exact marker 'RALPHUS_GHOST:', followed by up to 5 short"),
+            "{sp}"
+        );
+        assert!(sp.contains("'RALPHUS_GHOST: (nothing to report)'"), "{sp}");
+        assert!(!sp.contains("RALPHUS_PROOF:"), "{sp}");
+        // No human follow-up, but Ralphus itself may re-invoke synchronously.
+        assert!(sp.contains("no human will check back on you"), "{sp}");
+        assert!(
+            sp.contains("Ralphus may re-invoke you synchronously"),
+            "{sp}"
+        );
+    }
+
+    #[test]
+    fn assembled_proof_prompt_is_sectioned_and_gated_on_verdict_markers() {
+        let mut spec = test_spec(true);
+        spec.system_prompt = Some("Do NOT commit and do NOT push under any circumstances.".into());
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(BackendOutcome {
+                summary: "checked\nRALPHUS_PROOF: PASS".to_string(),
+                ..Default::default()
+            })],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert!(result.ok());
+        assert_eq!(result.proofed, Some(true));
+        let sp = backend
+            .last_system_prompt
+            .borrow()
+            .clone()
+            .expect("run() should have received the assembled system prompt");
+        assert_assembled_prompt_sections(
+            &sp,
+            "Do NOT commit and do NOT push under any circumstances.",
+        );
+        // Proof steps get the verdict contract, not the ghost handoff.
+        assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
+        assert!(sp.contains("RALPHUS_PROOF: FAIL"), "{sp}");
+        assert!(!sp.contains("RALPHUS_GHOST:"), "{sp}");
+    }
+
     /// A [`ModelBackend`] stub whose `run`/`nudge` outcomes are scripted in
     /// advance, so the RAL-292 background-job nudge loop in
     /// [`run_with_backend`] can be exercised without a real CLI subprocess.
@@ -943,6 +1063,7 @@ mod tests {
             std::collections::VecDeque<Result<Option<BackendOutcome>, BackendError>>,
         >,
         nudge_calls: std::cell::Cell<u32>,
+        last_system_prompt: std::cell::RefCell<Option<String>>,
     }
 
     impl ScriptedBackend {
@@ -954,6 +1075,7 @@ mod tests {
                 run_outcomes: std::cell::RefCell::new(run_outcomes.into()),
                 nudge_outcomes: std::cell::RefCell::new(nudge_outcomes.into()),
                 nudge_calls: std::cell::Cell::new(0),
+                last_system_prompt: std::cell::RefCell::new(None),
             }
         }
     }
@@ -963,8 +1085,10 @@ mod tests {
             &self,
             _prompt: &str,
             _workspace: &Workspace,
-            _options: &RunOptions<'_>,
+            options: &RunOptions<'_>,
         ) -> Result<BackendOutcome, BackendError> {
+            *self.last_system_prompt.borrow_mut() =
+                options.append_system_prompt.map(str::to_string);
             self.run_outcomes
                 .borrow_mut()
                 .pop_front()
