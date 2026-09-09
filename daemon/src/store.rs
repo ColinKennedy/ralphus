@@ -2152,6 +2152,8 @@ impl Store {
             // treated as "not this category" by a category filter (see
             // `crate::mailbox::mailbox_messages_for_client_filtered`).
             "ALTER TABLE mailbox_messages ADD COLUMN category TEXT",
+        ] {
+            let _ = self.conn.execute(stmt, []);
         }
         // RAL-155: task-scoped Cartographer filtering (`?task=`, and the
         // `entity=task:...` addressing scheme) needs this to not degrade into
