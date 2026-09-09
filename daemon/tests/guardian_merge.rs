@@ -16,10 +16,10 @@ use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
 use ralphus_daemon::guardian::{GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus};
 use ralphus_daemon::guardian_merge::{
-    pull_pr_commits, purge_worktrees, rebase_command_progress, rebase_on_manual_push,
-    rebuild_on_base_shift, reopen_cancelled_guardian_merge, reopen_straggler,
-    restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
-    stop_guardian_merge, stop_merge_worker_for_cancel,
+    poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees, rebase_command_progress,
+    rebase_on_manual_push, rebuild_on_base_shift, reopen_cancelled_guardian_merge,
+    reopen_straggler, restart_guardian_merge, run_feedback, run_merge, run_merge_staged,
+    start_feedback, start_merge, stop_guardian_merge, stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -2183,6 +2183,124 @@ fn base_branch_shift_triggers_rebuild() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-<pending>: proves the base-branch freshness poller's fetch actually
+// feeds the existing, unchanged `rebuild_on_base_shift` path. Unlike
+// `base_branch_shift_triggers_rebuild` above (which advances `main` directly
+// in the same local checkout), this simulates a merge landing on the forge
+// side -- a commit pushed straight to a bare "remote" from an unrelated
+// clone, never touching the guardian's own working copy. Before any fetch,
+// the guardian's local `origin/main` ref is stale and `rebuild_on_base_shift`
+// must see nothing; only after `poll_base_branch_freshness_once` runs does
+// the existing rebuild logic pick it up, on the very next call, unmodified.
+#[test]
+fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+
+    let root = temp_repo();
+    init_repo(&root);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["push", "-u", "origin", "main"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        // Remote-tracking form is the whole point of this test -- a bare
+        // "main" never goes through the fetch path at all.
+        let id = g
+            .create_guardian("r", "origin/main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(before.status, "in_review");
+    let base_before = before.base_commit.clone().expect("base recorded");
+
+    // Simulate a merge landing on the forge side: an unrelated clone pushes
+    // straight to the bare remote, never touching `root`.
+    let other_clone = temp_repo();
+    git(&other_clone, &["clone", remote_dir.to_str().unwrap(), "."]);
+    // The bare remote's own HEAD symref still points at whatever
+    // `init --bare` defaulted to (commonly `master`), which was never
+    // pushed -- force the clone onto `main`, tracking `origin/main`.
+    git(&other_clone, &["checkout", "-B", "main", "origin/main"]);
+    write(&other_clone, "c.txt", "merged on github directly\n");
+    git(&other_clone, &["add", "."]);
+    git(&other_clone, &["commit", "-m", "merged on github directly"]);
+    git(&other_clone, &["push", "origin", "main"]);
+
+    let sem = Semaphore::new(4);
+    assert!(
+        !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
+        "the local origin/main ref is stale until something fetches it -- this is the gap the poller closes"
+    );
+
+    // The poller under test: refreshes local refs only, triggers nothing.
+    poll_base_branch_freshness_once(&store);
+
+    // The fetch is spawned onto a background thread; wait for the local ref
+    // to actually move before checking whether the rebuild fired.
+    let remote_head = git(&other_clone, &["rev-parse", "HEAD"]).trim().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let local = git(&root, &["rev-parse", "origin/main"]).trim().to_string();
+        if local == remote_head {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "poll_base_branch_freshness_once did not refresh origin/main in time"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
+    assert!(
+        rebuilt,
+        "the freshly fetched ref should trigger the existing rebuild-on-shift path"
+    );
+
+    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
+    assert_ne!(
+        after.base_commit.as_deref(),
+        Some(base_before.as_str()),
+        "base_commit advanced"
+    );
+    let combined = after.combined_worktree.as_deref().expect("combined");
+    assert!(Path::new(combined).join("a.txt").exists(), "feature kept");
+    assert!(
+        Path::new(combined).join("c.txt").exists(),
+        "the out-of-band merge's content was picked up"
+    );
+
+    let events = store.lock().unwrap().events_for_guardian(&id, 500).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("base branch changed; rebuilding")),
+        "no base-shift transition recorded: {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    let _ = std::fs::remove_dir_all(&other_clone);
 }
 
 // Shared-worktree reviews cannot preserve a per-branch staged prefix. A base
