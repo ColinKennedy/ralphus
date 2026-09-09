@@ -986,6 +986,11 @@ impl Store {
                 base_branch       TEXT NOT NULL,
                 base_commit       TEXT,
                 git_root          TEXT NOT NULL,
+                -- The registered project (`projects.name`) used to create
+                -- this review. NULL means the review was created from a raw
+                -- directory path instead. `git_root` remains the concrete
+                -- path used by git, but is not the review's identity.
+                project           TEXT,
                 review_branch     TEXT,
                 status            TEXT NOT NULL,
                 detail            TEXT,
@@ -2123,6 +2128,9 @@ impl Store {
             // column meaningfully set) simply gets no auto_build tier at
             // finalize time (see `guardian_merge::final_checks`).
             "ALTER TABLE guardians ADD COLUMN auto_build_json TEXT",
+            // Registered-project creation identity. NULL preserves the
+            // distinct raw-directory creation route for existing rows.
+            "ALTER TABLE guardians ADD COLUMN project TEXT",
             // RAL-338: set on a fork-internal PR row once reconcile-first
             // promotion closes it and files a fresh cross-repository PR
             // against the parent in its place (its own branch became the
