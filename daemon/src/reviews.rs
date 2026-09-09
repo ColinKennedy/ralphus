@@ -1398,14 +1398,18 @@ pub(crate) fn create_review_from_triage_pool(
         .first()
         .map(|c| c.upstream.clone())
         .unwrap_or_else(|| "main".to_string());
+    let project_root = store
+        .get_project(project)
+        .map_err(|e| ReviewError::new(e.to_string()))?
+        .map_or_else(|| project.to_string(), |registered| registered.path);
     let name = format!("triage-{triage_type}");
     let gid = store
-        .create_guardian_for_squad(&name, &upstream, project, None)
+        .create_guardian_for_squad(&name, &upstream, &project_root, None)
         .map_err(|e| ReviewError::new(e.to_string()))?;
     store
         .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
         .map_err(|e| ReviewError::new(e.to_string()))?;
-    apply_project_review_defaults(store, &gid, project)?;
+    apply_project_review_defaults(store, &gid, &project_root)?;
     let mut seen: HashSet<String> = HashSet::new();
     for cell in &drained {
         if seen.insert(cell.branch.clone()) {
@@ -1432,6 +1436,94 @@ pub(crate) fn create_review_from_triage_pool(
             }),
         );
     Ok(Some(gid))
+}
+
+/// Repair Arbiter reviews created with a registered project name in the
+/// filesystem-facing `git_root` field. Triage pools use stable project names
+/// as keys, while review worktrees and project config require the registered
+/// absolute path.
+pub fn repair_arbiter_review_project_roots(store: &Store) {
+    let guardians = match store.list_guardians() {
+        Ok(guardians) => guardians,
+        Err(e) => {
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::ERROR)
+                .emit(
+                    store,
+                    format!("Arbiter review project-root repair failed to list reviews: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            return;
+        }
+    };
+    for guardian in guardians {
+        if guardian.origin != crate::guardian::GUARDIAN_ORIGIN_ARBITER {
+            continue;
+        }
+        let registered = match store.get_project(&guardian.git_root) {
+            Ok(Some(project)) => project,
+            Ok(None) => continue,
+            Err(e) => {
+                crate::cartographer::Note::new("recovery")
+                    .level(crate::logging::LogLevel::ERROR)
+                    .guardian(&guardian.id)
+                    .emit(
+                        store,
+                        format!("review project-root lookup failed: {e}"),
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                continue;
+            }
+        };
+        let repaired = match store.repair_arbiter_guardian_project_root(
+            &guardian.id,
+            &guardian.git_root,
+            &registered.path,
+        ) {
+            Ok(repaired) => repaired,
+            Err(e) => {
+                crate::cartographer::Note::new("recovery")
+                    .level(crate::logging::LogLevel::ERROR)
+                    .guardian(&guardian.id)
+                    .emit(
+                        store,
+                        format!("review project-root repair failed: {e}"),
+                        serde_json::json!({"error": e.to_string()}),
+                    );
+                continue;
+            }
+        };
+        if !repaired {
+            continue;
+        }
+        if let Err(e) = apply_project_review_defaults(store, &guardian.id, &registered.path) {
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::ERROR)
+                .guardian(&guardian.id)
+                .emit(
+                    store,
+                    format!("could not apply project defaults after project-root repair: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+        }
+        crate::cartographer::Note::new("recovery")
+            .level(crate::logging::LogLevel::WARNING)
+            .guardian(&guardian.id)
+            .emit(
+                store,
+                format!(
+                    "review {} repaired Arbiter project root '{}' -> '{}'",
+                    guardian.id, guardian.git_root, registered.path
+                ),
+                serde_json::json!({
+                    "project": registered.name.as_str(),
+                    "old_git_root": guardian.git_root.as_str(),
+                    "git_root": registered.path.as_str(),
+                    "old_status": guardian.status.as_str(),
+                    "status": if guardian.status == "merge_failed" { "collecting" } else { guardian.status.as_str() },
+                }),
+            );
+    }
 }
 
 /// Startup repair (RAL-318 bug 3) for Triage pool/threshold/schedule keys
@@ -1636,7 +1728,8 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, rebase_onto, repair_triage_pool_keys, require_auto_build_declaration,
+        derive_triage_pools, rebase_onto, repair_arbiter_review_project_roots,
+        repair_triage_pool_keys, require_auto_build_declaration,
         workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::Store;
@@ -2551,17 +2644,20 @@ print(json.dumps(result))
             "[review]\ndefault_machine = \"ib:A\"\ndefault_maximum_budget_usd = 2.5\n",
         )
         .unwrap();
-        let project = root.to_string_lossy().into_owned();
         let store = Store::open_in_memory().unwrap();
         store
-            .record_triage_pool_cell(&project, "security", "squad-1", 0, 0, "b1", "main")
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
             .unwrap();
 
-        let gid = create_review_from_triage_pool(&store, &project, "security")
+        let gid = create_review_from_triage_pool(&store, "proj", "security")
             .unwrap()
             .expect("pool was non-empty, must create a review");
 
         let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.git_root, root.to_string_lossy());
         assert_eq!(
             g.machine.as_deref(),
             Some("ib:A"),
@@ -2569,6 +2665,36 @@ print(json.dumps(result))
              the project's default_machine"
         );
         assert_eq!(g.maximum_budget_usd, Some(2.5));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_arbiter_review_project_roots_repairs_and_reopens_a_failed_review() {
+        let root = temp_repo();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let gid = store
+            .create_guardian_for_squad("triage-bug", "main", "proj", None)
+            .unwrap();
+        store
+            .set_guardian_origin(&gid, crate::guardian::GUARDIAN_ORIGIN_ARBITER)
+            .unwrap();
+        store
+            .set_guardian_status(
+                &gid,
+                crate::guardian::GuardianStatus::MergeFailed,
+                Some("invalid directory"),
+            )
+            .unwrap();
+
+        repair_arbiter_review_project_roots(&store);
+
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(guardian.git_root, root.to_string_lossy());
+        assert_eq!(guardian.status, "collecting");
+        assert!(guardian.detail.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

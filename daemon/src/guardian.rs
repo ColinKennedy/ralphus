@@ -2068,6 +2068,34 @@ impl Store {
         }
     }
 
+    /// Replace an Arbiter review's mistaken project-name `git_root` with the
+    /// registered project path before it has produced a review worktree.
+    /// Failed reviews return to `collecting` so startup recovery retries them.
+    pub(crate) fn repair_arbiter_guardian_project_root(
+        &self,
+        id: &str,
+        expected_root: &str,
+        project_root: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE guardians
+             SET git_root=?,
+                 status=CASE WHEN status='merge_failed' THEN 'collecting' ELSE status END,
+                 detail=CASE WHEN status='merge_failed' THEN NULL ELSE detail END,
+                 updated_at_ms=?
+             WHERE id=? AND git_root=? AND origin=? AND combined_worktree IS NULL
+               AND status IN ('collecting','merging','merge_failed','merge_stopped')",
+            params![
+                project_root,
+                crate::store::now_ms(),
+                id,
+                expected_root,
+                GUARDIAN_ORIGIN_ARBITER
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Set this review's own USD spend cap (RAL-193), from the top-level
     /// `[[review]]` block's `maximum_budget_usd`. Enforced by the guardian
     /// merge machinery against the cumulative sum of [`Self::guardian_cost_total`]

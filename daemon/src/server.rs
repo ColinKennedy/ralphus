@@ -11274,6 +11274,9 @@ pub fn serve<A: ToSocketAddrs>(
             "ralphus [recovery] input resolution recovery failed: {e}"
         ),
     }
+    // Resolve project-name keys accidentally persisted as filesystem roots on
+    // Arbiter reviews before review recovery starts scheduling work.
+    crate::reviews::repair_arbiter_review_project_roots(&store);
     // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
     // keyed by its pre-fix raw worktree path instead of the resolved
     // project name, and fire any pool that's now correctly counted and
