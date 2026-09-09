@@ -3052,6 +3052,7 @@ fn claim_branch_review_ref(
         None,
         Some(guardian_id),
         "guardian",
+        None,
         "review branch named",
     );
     Ok(name)
@@ -3093,6 +3094,7 @@ fn claim_combined_review_ref(
         None,
         Some(&guardian.id),
         "guardian",
+        None,
         "combined review branch named",
     );
     Ok(name)
