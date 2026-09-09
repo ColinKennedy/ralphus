@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::forge::{PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
+use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;
 use crate::pr::PullRequestView;
 use crate::store::{Store, now_ms};
@@ -133,6 +134,28 @@ fn capture_and_trim_log(job_ref: &str, log_text: &str) -> String {
 static WATCHING: LazyLock<Mutex<HashSet<(String, String)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Record a CI-watch event in both the plain-text log and Cartographer, so
+/// the poll loop's progress is queryable per-branch instead of only tailable
+/// (RAL-98 pairing).
+fn log_ci_watch(
+    store: &Arc<Mutex<Store>>,
+    guardian_id: &str,
+    branch_id: &str,
+    level: LogLevel,
+    message: impl AsRef<str>,
+    payload: serde_json::Value,
+) {
+    crate::cartographer::Note::new("ci-watch")
+        .level(level)
+        .scope("branch")
+        .guardian(guardian_id)
+        .emit(
+            &store.lock().expect("poisoned"),
+            message,
+            serde_json::json!({"branch_id": branch_id, "detail": payload}),
+        );
+}
+
 /// Start watching `branch_id`'s open PR after a review-feedback push
 /// (RAL-375). No-op if the branch has no open, forge-numbered PR, its forge
 /// client can't be resolved, or a watch for this exact branch is already
@@ -144,9 +167,15 @@ pub fn watch_after_feedback_push(store: &Arc<Mutex<Store>>, guardian_id: &str, b
     {
         let mut watching = WATCHING.lock().expect("poisoned");
         if !watching.insert(key.clone()) {
-            crate::rlog!(
-                DEBUG,
-                "ralphus [ci-watch] review {guardian_id} branch {branch_id} watch skipped: already in flight"
+            log_ci_watch(
+                store,
+                guardian_id,
+                branch_id,
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} watch skipped: already in flight"
+                ),
+                serde_json::json!({"outcome": "skipped", "reason": "already_in_flight"}),
             );
             return;
         }
@@ -187,62 +216,102 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
     let client = match crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) {
         Ok(c) => c,
         Err(e) => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [ci-watch] review {guardian_id} branch {branch_id} could not resolve forge client: {e}"
+            log_ci_watch(
+                store,
+                guardian_id,
+                branch_id,
+                LogLevel::WARNING,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} could not resolve forge client: {e}"
+                ),
+                serde_json::json!({"outcome": "unavailable", "error": e}),
             );
             return;
         }
     };
 
-    crate::rlog!(
-        INFO,
-        "ralphus [ci-watch] review {guardian_id} branch {branch_id} watching pr #{number}"
+    log_ci_watch(
+        store,
+        guardian_id,
+        branch_id,
+        LogLevel::INFO,
+        format!("ralphus [ci-watch] review {guardian_id} branch {branch_id} watching pr #{number}"),
+        serde_json::json!({"pr_number": number, "outcome": "watching"}),
     );
     let start = Instant::now();
     loop {
         let elapsed = start.elapsed();
         if elapsed > MAX_WATCH_DURATION {
-            crate::rlog!(
-                WARNING,
-                "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
-                 gave up after {MAX_WATCH_DURATION:?} with no terminal status"
+            log_ci_watch(
+                store,
+                guardian_id,
+                branch_id,
+                LogLevel::WARNING,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
+                     gave up after {MAX_WATCH_DURATION:?} with no terminal status"
+                ),
+                serde_json::json!({"pr_number": number, "outcome": "timed_out"}),
             );
             return;
         }
         match client.check_pr_ci_status(number) {
             Ok(PrCiState::Passing) => {
                 if elapsed < SUCCESS_SETTLE_DURATION {
-                    crate::rlog!(
-                        DEBUG,
-                        "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
-                         appears passing but is still in the post-push settle window"
+                    log_ci_watch(
+                        store,
+                        guardian_id,
+                        branch_id,
+                        LogLevel::DEBUG,
+                        format!(
+                            "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
+                             appears passing but is still in the post-push settle window"
+                        ),
+                        serde_json::json!({"pr_number": number, "outcome": "settling"}),
                     );
                     std::thread::sleep(next_poll_delay(elapsed));
                     continue;
                 }
-                crate::rlog!(
-                    INFO,
-                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} passing"
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    branch_id,
+                    LogLevel::INFO,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} passing"
+                    ),
+                    serde_json::json!({"pr_number": number, "outcome": "passing"}),
                 );
                 return;
             }
             Ok(PrCiState::Failing(failure)) => {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
-                     failing: {}",
-                    failure.reason
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    branch_id,
+                    LogLevel::WARNING,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
+                         failing: {}",
+                        failure.reason
+                    ),
+                    serde_json::json!({"pr_number": number, "outcome": "failing", "reason": failure.reason}),
                 );
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
             Ok(PrCiState::Pending) => {}
             Err(e) => {
-                crate::rlog!(
-                    DEBUG,
-                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
-                     poll error (will retry): {e}"
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    branch_id,
+                    LogLevel::DEBUG,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
+                         poll error (will retry): {e}"
+                    ),
+                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
                 );
             }
         }
@@ -287,22 +356,29 @@ fn enqueue_ci_failure_notice(
     text.push_str("\nDo you want to fix these immediately in a subagent?");
 
     let entity_uri = format!("guardian:{}", guardian.id);
-    let guard = store.lock().expect("poisoned");
-    let enqueued = guard.enqueue_mailbox_message_ex(
-        MailboxPriority::High,
-        &text,
-        None,
-        None,
-        None,
-        Some(&entity_uri),
-        Some("review"),
-    );
+    let enqueued = {
+        let guard = store.lock().expect("poisoned");
+        guard.enqueue_mailbox_message_ex(
+            MailboxPriority::High,
+            &text,
+            None,
+            None,
+            None,
+            Some(&entity_uri),
+            Some("review"),
+        )
+    };
     if let Err(e) = enqueued {
-        crate::rlog!(
-            ERROR,
-            "ralphus [ci-watch] review {} branch {} could not enqueue ci-failure mailbox notice: {e}",
-            guardian.id,
-            branch.id
+        log_ci_watch(
+            store,
+            &guardian.id,
+            &branch.id,
+            LogLevel::ERROR,
+            format!(
+                "ralphus [ci-watch] review {} branch {} could not enqueue ci-failure mailbox notice: {e}",
+                guardian.id, branch.id
+            ),
+            serde_json::json!({"outcome": "mailbox_enqueue_failed", "error": e.to_string()}),
         );
     }
 }
