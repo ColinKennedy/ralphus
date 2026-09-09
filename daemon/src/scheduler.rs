@@ -3599,6 +3599,29 @@ mod tests {
         )
     }
 
+    /// Waits until exactly `expected` ranked semaphore callers have registered.
+    /// This synchronizes fairness tests with the state they intend to exercise
+    /// instead of assuming a sleeping test thread gave workers enough CPU time.
+    fn wait_for_ranked_waiters(sem: &Semaphore, expected: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let actual = sem
+                .state
+                .lock()
+                .expect("semaphore mutex poisoned")
+                .waiting
+                .len();
+            if actual == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {expected} ranked semaphore waiters, found {actual}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// Simulates the `"exit N"` shell-command convention this test module's
     /// TOML fixtures use for a `command`-kind proof step. Since RAL-151
     /// routes `command`-kind proof steps through the same `Runner` cells
@@ -4429,13 +4452,12 @@ mod tests {
                     let _p = sem_ref.acquire_ranked(f64::INFINITY);
                     order_ref.lock().unwrap().push("low_pref");
                 });
-                // Give the low-preference waiter time to register itself first.
-                std::thread::sleep(Duration::from_millis(30));
+                wait_for_ranked_waiters(sem_ref, 1);
                 let high_pref = s.spawn(move || {
                     let _p = sem_ref.acquire_ranked(-5.0);
                     order_ref.lock().unwrap().push("high_pref");
                 });
-                std::thread::sleep(Duration::from_millis(30));
+                wait_for_ranked_waiters(sem_ref, 2);
                 drop(held);
                 high_pref.join().unwrap();
                 low_pref.join().unwrap();
