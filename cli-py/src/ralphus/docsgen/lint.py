@@ -30,11 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
-<<<<<<< HEAD
-    "BOARD_ASSETS_DIR",
-=======
     "BOARD_CHUNKS_DIR",
->>>>>>> 446a4499 (docs(RAL-384): tabulate ralphus special syntax and reply markers)
     "BOARD_HTML",
     "MAIN_SUFFIX",
     "PAGES_DIR",
@@ -49,15 +45,11 @@ __all__ = [
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BOARD_HTML = REPO_ROOT / "librarian" / "assets" / "board.html"
-<<<<<<< HEAD
-BOARD_ASSETS_DIR = BOARD_HTML.parent
-=======
 # The board's JS is split into numbered chunk files served individually
 # (board.html loads each via its own <script src="/board/NN-…">), and the
 # `const TABS = [...]` array lives in one of those chunks rather than in
 # board.html itself — tab extraction scans both locations.
 BOARD_CHUNKS_DIR = REPO_ROOT / "librarian" / "assets" / "board"
->>>>>>> 446a4499 (docs(RAL-384): tabulate ralphus special syntax and reply markers)
 PAGES_DIR = REPO_ROOT / "docs" / "site" / "pages"
 SCREENSHOTS_DIR = PAGES_DIR / "screenshots"
 VIEWS_DIR = PAGES_DIR / "views"
@@ -68,34 +60,12 @@ MAIN_SUFFIX = "overview"
 
 _TABS_RE = re.compile(r"const TABS\s*=\s*\[([^\]]*)\]")
 _TAB_NAME_RE = re.compile(r'"([^"]+)"')
-_BOARD_CHUNK_RE = re.compile(r'<script\s+src="/board/([^"]+\.js)"></script>')
 
 
 def _log(message: str) -> None:
     print(f"ralphus [docsgen] {message}", file=sys.stderr)
 
 
-<<<<<<< HEAD
-def _board_source() -> str:
-    """Return the board chunks in the same order the page loads them."""
-    html = BOARD_HTML.read_text(encoding="utf-8")
-    chunks = _BOARD_CHUNK_RE.findall(html)
-    if not chunks:
-        raise RuntimeError(f"could not find board JavaScript chunks in {BOARD_HTML}")
-    return "\n".join(
-        (BOARD_ASSETS_DIR / "board" / chunk).read_text(encoding="utf-8") for chunk in chunks
-    )
-
-
-def board_tabs() -> list[str]:
-    """The GUI's own list of tabs, parsed from its loaded `TABS` array."""
-    match = _TABS_RE.search(_board_source())
-    if not match:
-        raise RuntimeError(
-            f"could not find `const TABS = [...]` in board chunks loaded by {BOARD_HTML}"
-        )
-    return _TAB_NAME_RE.findall(match.group(1))
-=======
 def board_tabs() -> list[str]:
     """The GUI's own list of tabs, parsed from the board's `TABS` array.
 
@@ -108,7 +78,6 @@ def board_tabs() -> list[str]:
         if match:
             return _TAB_NAME_RE.findall(match.group(1))
     raise RuntimeError(f"could not find `const TABS = [...]` in {[str(s) for s in sources]}")
->>>>>>> 446a4499 (docs(RAL-384): tabulate ralphus special syntax and reply markers)
 
 
 @dataclass
