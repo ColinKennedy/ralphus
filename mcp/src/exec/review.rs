@@ -227,12 +227,17 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_approve(&resolved.guardian_id)?)
         }
-        ReviewCommand::Feedback { selector, text } => {
+        ReviewCommand::Feedback {
+            selector,
+            text,
+            author,
+        } => {
             let resolved = resolve_branch(client, &selector)?;
             Ok(client.guardian_feedback(
                 &resolved.guardian_id,
                 resolved.branch_id.as_deref().unwrap_or_default(),
                 &text,
+                author.as_deref(),
             )?)
         }
         ReviewCommand::DismissReenable { selector } => {

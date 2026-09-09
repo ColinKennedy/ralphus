@@ -1247,6 +1247,8 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
         &id,
         &bid0,
         "please add a note file".to_string(),
+        Some("alice".to_string()),
+        Some("bob".to_string()),
     );
     assert_eq!(reply.status, 202);
 
@@ -1258,6 +1260,10 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].role, "reviewer");
     assert_eq!(msgs[0].text, "please add a note file");
+    // RAL-379: the attributed author and the authenticated submitter persist
+    // as separate identities, even when they differ.
+    assert_eq!(msgs[0].author.as_deref(), Some("alice"));
+    assert_eq!(msgs[0].submitted_by.as_deref(), Some("bob"));
     assert!(
         store
             .lock()

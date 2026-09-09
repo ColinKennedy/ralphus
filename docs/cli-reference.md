@@ -236,7 +236,7 @@ aborts the remaining batch).
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
 | `review approve <selector>` | Approve an in_review review |
-| `review feedback <selector#branch> <text>` | Post feedback on a branch |
+| `review feedback <selector#branch> <text> [--author name]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted |
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
 | `review upstream list <selector>` | Candidate upstream branches |

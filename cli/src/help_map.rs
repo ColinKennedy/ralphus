@@ -470,8 +470,8 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
     node(
         "feedback",
         &["selector [str]", "text [str]"],
-        &[],
-        "Post feedback on one branch, triggering a resolver re-attempt.",
+        &["--author [name]"],
+        "Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.",
         false,
         false,
         &[],

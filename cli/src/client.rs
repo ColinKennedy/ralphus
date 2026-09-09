@@ -1328,10 +1328,13 @@ impl DaemonClient {
         guardian_id: &str,
         branch_id: &str,
         feedback: &str,
+        author: Option<&str>,
     ) -> Result<Value, DaemonError> {
+        let mut body = json!({"feedback": feedback});
+        set_if_some(&mut body, "author", author.map(str::to_string));
         self.post(
             &format!("/api/guardians/{guardian_id}/branches/{branch_id}/feedback"),
-            Some(json!({"feedback": feedback})),
+            Some(body),
         )
     }
 

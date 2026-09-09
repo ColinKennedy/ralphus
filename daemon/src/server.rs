@@ -1092,7 +1092,7 @@ fn route_for_user(
         }
         ("POST", ["api", "guardians", id, "sync-pr"]) => guardian_sync_pr(daemon, id),
         ("POST", ["api", "guardians", id, "branches", branch_id, "feedback"]) => {
-            guardian_feedback(daemon, id, branch_id, body)
+            guardian_feedback(daemon, user_header, id, branch_id, body)
         }
         ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
             guardian_branch_messages(daemon, id, branch_id)
@@ -11063,15 +11063,60 @@ fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
 struct FeedbackBody {
     #[serde(default)]
     feedback: String,
+    /// RAL-379: the registered user this feedback should be attributed to.
+    /// Defaults to the resolved submitter when absent. Note there is
+    /// deliberately no `submitted_by` field here -- the submitter always
+    /// comes from the authenticated request context and can never be set by
+    /// request data.
+    #[serde(default)]
+    author: Option<String>,
 }
 
-fn guardian_feedback(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> Reply {
+/// RAL-379: resolves `req.author` against the user registry, falling back to
+/// `submitted_by` when the caller doesn't name one. Returns `Err(Reply)` if
+/// an explicitly named author isn't a registered user.
+fn resolve_feedback_author(
+    daemon: &Daemon,
+    author: Option<&str>,
+    submitted_by: Option<&str>,
+) -> Result<Option<String>, Reply> {
+    let Some(name) = author.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(submitted_by.map(str::to_string));
+    };
+    match daemon.lock().get_user(name) {
+        Ok(Some(_)) => Ok(Some(name.to_string())),
+        Ok(None) => Err(error(
+            400,
+            "unknown_user",
+            &format!("user {name:?} is not registered"),
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+fn guardian_feedback(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    id: &str,
+    branch_id: &str,
+    body: &str,
+) -> Reply {
     let Ok(req) = serde_json::from_str::<FeedbackBody>(body) else {
         return error(400, "bad_request", "body must be {feedback}", vec![]);
     };
     if req.feedback.trim().is_empty() {
         return error(400, "bad_request", "feedback must not be empty", vec![]);
     }
+    // Best-effort, like `guardian_create`'s `auto_watch_user`: an
+    // unresolvable/unregistered ambient `[daemon].default_user` shouldn't
+    // block posting feedback, it just means `submitted_by` stays `None`.
+    let submitted_by = current_user(daemon, user_header).ok().flatten();
+    let author =
+        match resolve_feedback_author(daemon, req.author.as_deref(), submitted_by.as_deref()) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
@@ -11079,6 +11124,8 @@ fn guardian_feedback(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> 
         id,
         branch_id,
         req.feedback,
+        author,
+        submitted_by,
     )
 }
 
@@ -17283,13 +17330,29 @@ command = "true"
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
         let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
         d.lock()
-            .add_guardian_message(gid, "reviewer", "unscoped msg", None, None)
+            .add_guardian_message(gid, "reviewer", "unscoped msg", None, None, None, None)
             .unwrap();
         d.lock()
-            .add_guardian_message(gid, "reviewer", "branch feedback", None, Some(&branch_id))
+            .add_guardian_message(
+                gid,
+                "reviewer",
+                "branch feedback",
+                None,
+                Some(&branch_id),
+                None,
+                None,
+            )
             .unwrap();
         d.lock()
-            .add_guardian_message(gid, "guardian", "branch reply", None, Some(&branch_id))
+            .add_guardian_message(
+                gid,
+                "guardian",
+                "branch reply",
+                None,
+                Some(&branch_id),
+                None,
+                None,
+            )
             .unwrap();
 
         let r = route(
@@ -17315,6 +17378,87 @@ command = "true"
             "POST",
             "/api/guardians/guardian-000000000001/branches/0/feedback",
             "{\"feedback\":\"  \"}",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn feedback_author_defaults_to_submitter_when_absent() {
+        // RAL-379 Q2: with no `author` in the request body, the attributed
+        // author defaults to the resolved authenticated submitter.
+        let d = daemon();
+        d.lock().create_user("bob").unwrap();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        // `start_feedback` requires the branch to already have a review
+        // worktree; stub one in directly rather than running a real merge.
+        d.lock()
+            .set_branch_review(gid, &branch_id, "feature/a", "/tmp/wt")
+            .unwrap();
+        let r = route_for_user(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/feedback"),
+            "{\"feedback\":\"please fix\"}",
+            Some("bob"),
+        );
+        assert_eq!(r.status, 202);
+        let msgs = d.lock().guardian_branch_messages(gid, &branch_id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].author.as_deref(), Some("bob"));
+        assert_eq!(msgs[0].submitted_by.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn feedback_author_can_differ_from_submitter_and_submitted_by_cannot_be_overridden() {
+        // RAL-379 Q2/Q3: a caller can attribute feedback to a different
+        // registered user than the one submitting it, but the submitter is
+        // always the authenticated/default requester -- a `submitted_by` in
+        // the request body is silently ignored, never trusted.
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        d.lock()
+            .set_branch_review(gid, &branch_id, "feature/a", "/tmp/wt")
+            .unwrap();
+        let r = route_for_user(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/feedback"),
+            "{\"feedback\":\"please fix\",\"author\":\"alice\",\"submitted_by\":\"eve\"}",
+            Some("bob"),
+        );
+        assert_eq!(r.status, 202);
+        let msgs = d.lock().guardian_branch_messages(gid, &branch_id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].author.as_deref(), Some("alice"));
+        assert_eq!(msgs[0].submitted_by.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn feedback_rejects_an_unregistered_author() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/feedback"),
+            "{\"feedback\":\"please fix\",\"author\":\"nobody\"}",
         );
         assert_eq!(r.status, 400);
     }

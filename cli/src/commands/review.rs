@@ -150,6 +150,10 @@ pub enum ReviewCommand {
     Feedback {
         selector: String,
         text: String,
+        /// RAL-379: the registered user this feedback should be attributed
+        /// to. Defaults server-side to the authenticated/default submitter
+        /// when absent.
+        author: Option<String>,
     },
     DismissReenable {
         selector: String,
@@ -449,11 +453,13 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         }
         Some("approve") => with_selector(scanner, |selector| ReviewCommand::Approve { selector }),
         Some("feedback") => {
+            let author = scanner.take_value("--author").ok().flatten();
             let rest = scanner.remaining();
             match (rest.first(), rest.get(1)) {
                 (Some(selector), Some(text)) => ReviewCommand::Feedback {
                     selector: selector.clone(),
                     text: text.clone(),
+                    author,
                 },
                 _ => ReviewCommand::UsageError("feedback requires <selector> <text>".to_string()),
             }
@@ -1385,7 +1391,11 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             emit(opts, &result, |r| println!("{selector} -> {}", r["state"]));
             Ok(())
         }),
-        ReviewCommand::Feedback { selector, text } => {
+        ReviewCommand::Feedback {
+            selector,
+            text,
+            author,
+        } => {
             let resolved = match resolve_branch(opts, &client, &selector) {
                 Ok(r) => r,
                 Err(code) => return code,
@@ -1394,6 +1404,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 &resolved.guardian_id,
                 resolved.branch_id.as_deref().unwrap_or_default(),
                 &text,
+                author.as_deref(),
             ) {
                 Ok(result) => {
                     emit(opts, &result, |_| println!("feedback posted on {selector}"));
@@ -2839,9 +2850,32 @@ mod tests {
     #[test]
     fn parses_feedback_positional_pair() {
         match parse(&v(&["feedback", "g1~0", "please fix"])) {
-            ReviewCommand::Feedback { selector, text } => {
+            ReviewCommand::Feedback {
+                selector,
+                text,
+                author,
+            } => {
                 assert_eq!(selector, "g1~0");
                 assert_eq!(text, "please fix");
+                assert_eq!(author, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_feedback_author_flag() {
+        // RAL-379: an optional --author flag lets the caller attribute
+        // feedback to a different registered user than the one submitting it.
+        match parse(&v(&["feedback", "--author", "alice", "g1~0", "please fix"])) {
+            ReviewCommand::Feedback {
+                selector,
+                text,
+                author,
+            } => {
+                assert_eq!(selector, "g1~0");
+                assert_eq!(text, "please fix");
+                assert_eq!(author.as_deref(), Some("alice"));
             }
             other => panic!("unexpected: {other:?}"),
         }

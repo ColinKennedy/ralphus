@@ -1795,17 +1795,31 @@ per-review opt-out toggles). Returns `200` with the updated guardian view, whose
 ### `GET /api/guardians/{id}/branches/{branch_id}/messages`
 One review branch's read-only feedback thread (RAL-272), oldest first:
 ```json
-{ "messages": [ { "seq": 1, "role": "reviewer", "text": "fix the naming", "at_ms": 1783120106867 } ] }
+{ "messages": [ { "seq": 1, "role": "reviewer", "text": "fix the naming", "at_ms": 1783120106867, "author": "alice", "submitted_by": "bob" } ] }
 ```
 `role` is `reviewer` (human) or `guardian` (triage agent). `at_ms` is when the
 message was posted (Unix epoch ms); the board renders it beside each message.
-Populated by `POST .../branches/{branch_id}/feedback`: the reviewer's
-feedback text is persisted immediately (`role: "reviewer"`), and a short
-conversational acknowledgment from the guardian follows in the background
-(`role: "guardian"`), generated via `chat_client::call_direct`. The board
-shows this thread only once a branch's detail view is expanded and it has at
-least one message — otherwise it shows a "No feedback yet" placeholder
-pointing at the `feedback` command above.
+`author` and `submitted_by` (RAL-379) are omitted from the JSON when unset
+(every "guardian"-role message, and any row predating this field). `author`
+is the registered user this feedback is attributed to — the only identity
+the board shows. `submitted_by` is the resolved authenticated/default
+requester who actually made the request; kept for audit/provenance only and
+never shown in the UI, and still just caller-claimed via `X-Ralphus-User`
+until RAL-252 makes authentication authoritative.
+
+Populated by `POST .../branches/{branch_id}/feedback`, body
+`{ "feedback": "...", "author"?: "alice" }`. `feedback` must be non-empty
+(`400` otherwise). `author` is optional and, if given, must already be a
+registered user (`400 unknown_user` otherwise) — it defaults to the resolved
+submitter when omitted. There is deliberately no `submitted_by` request
+field: the submitter always comes from the authenticated request context
+(`X-Ralphus-User` / `[daemon].default_user`) and can never be set by request
+data. The reviewer's feedback text is persisted immediately (`role:
+"reviewer"`), and a short conversational acknowledgment from the guardian
+follows in the background (`role: "guardian"`), generated via
+`chat_client::call_direct`. The board shows this thread only once a branch's
+detail view is expanded and it has at least one message — otherwise it shows
+a "No feedback yet" placeholder pointing at the `feedback` command above.
 
 ### `POST /api/guardians/{id}/pull-requests`
 Submit one or more PRs/MRs for a review (RAL-117). Body:

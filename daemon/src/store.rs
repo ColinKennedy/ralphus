@@ -2089,6 +2089,17 @@ impl Store {
             // closed PR's discussion stays visible in `PrStackView`
             // history, per this ticket's Q3.3.
             "ALTER TABLE guardian_pull_requests ADD COLUMN superseded_by TEXT",
+            // RAL-379: dual identity on a feedback-thread message. `author` is
+            // the registered user the feedback is attributed to (client-set,
+            // defaulting to the submitter) -- this is who the UI shows.
+            // `submitted_by` is the requester resolved from `X-Ralphus-User` /
+            // `[daemon].default_user` at the time the request was made and can
+            // never be set by request data -- kept for audit/provenance only,
+            // never shown in the UI. NULL on both for every pre-existing row
+            // and for a "guardian"-role message, which has no human author.
+            // Caller-claimed until RAL-252 makes authentication authoritative.
+            "ALTER TABLE guardian_messages ADD COLUMN author TEXT",
+            "ALTER TABLE guardian_messages ADD COLUMN submitted_by TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

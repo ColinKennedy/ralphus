@@ -351,6 +351,8 @@
        * @property {string} role
        * @property {string} text
        * @property {number} at_ms
+       * @property {string} [author] RAL-379: registered user this feedback is attributed to -- the only identity the board shows. Absent for a "guardian"-role message and for any row predating this field.
+       * @property {string} [submitted_by] RAL-379: the resolved authenticated/default requester who actually submitted this message. Audit/provenance only -- never rendered.
        */
       /**
        * @typedef {object} ResourceEntry

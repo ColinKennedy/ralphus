@@ -470,6 +470,19 @@ pub struct MessageView {
     /// for text-only messages; omitted from JSON when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// RAL-379: the registered user this feedback is attributed to -- the
+    /// only identity the UI shows. Defaults to `submitted_by` when a caller
+    /// doesn't name one explicitly. `None` for a "guardian"-role message and
+    /// for any row predating this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// RAL-379: the authenticated/default requester who actually submitted
+    /// this message, resolved server-side and never overridable by request
+    /// data. Kept for audit/provenance only -- never shown in the UI. Still
+    /// caller-claimed (via `X-Ralphus-User`) until RAL-252 makes
+    /// authentication authoritative. `None` for any row predating this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
 }
 
 /// [`GuardianView::origin`] value for a review created from an authored
@@ -1717,6 +1730,10 @@ impl Store {
     /// `"reviewer"` (the human) or `"guardian"` (the triage agent). `image` is
     /// an optional base64 data-URI attached to the message (RAL-59).
     /// `branch_id` scopes the message to one review branch (RAL-272).
+    /// `author` is the registered user this feedback is attributed to (shown
+    /// in the UI); `submitted_by` is the resolved authenticated/default
+    /// requester (audit-only, never shown) (RAL-379).
+    #[allow(clippy::too_many_arguments)]
     pub fn add_guardian_message(
         &self,
         guardian_id: &str,
@@ -1724,10 +1741,21 @@ impl Store {
         text: &str,
         image: Option<&str>,
         branch_id: Option<&str>,
+        author: Option<&str>,
+        submitted_by: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image, branch_id) VALUES(?,?,?,?,?,?)",
-            params![guardian_id, role, text, crate::store::now_ms(), image, branch_id],
+            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image, branch_id, author, submitted_by) VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                guardian_id,
+                role,
+                text,
+                crate::store::now_ms(),
+                image,
+                branch_id,
+                author,
+                submitted_by
+            ],
         )?;
         Ok(())
     }
@@ -1741,7 +1769,7 @@ impl Store {
         branch_id: &str,
     ) -> Result<Vec<MessageView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, text, at_ms, image FROM guardian_messages \
+            "SELECT seq, role, text, at_ms, image, author, submitted_by FROM guardian_messages \
              WHERE guardian_id=? AND branch_id=? ORDER BY seq",
         )?;
         let rows = stmt
@@ -1752,6 +1780,8 @@ impl Store {
                     text: r.get(2)?,
                     at_ms: r.get(3)?,
                     image: r.get(4)?,
+                    author: r.get(5)?,
+                    submitted_by: r.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5015,7 +5045,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "hi", None, Some("branch-a"))
+            .add_guardian_message(&id, "reviewer", "hi", None, Some("branch-a"), None, None)
             .unwrap();
         store.delete_guardian(&id).unwrap();
         assert!(
@@ -5034,16 +5064,40 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "unscoped", None, None)
+            .add_guardian_message(&id, "reviewer", "unscoped", None, None, None, None)
             .unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "feedback on a", None, Some("branch-a"))
+            .add_guardian_message(
+                &id,
+                "reviewer",
+                "feedback on a",
+                None,
+                Some("branch-a"),
+                None,
+                None,
+            )
             .unwrap();
         store
-            .add_guardian_message(&id, "guardian", "reply on a", None, Some("branch-a"))
+            .add_guardian_message(
+                &id,
+                "guardian",
+                "reply on a",
+                None,
+                Some("branch-a"),
+                None,
+                None,
+            )
             .unwrap();
         store
-            .add_guardian_message(&id, "reviewer", "feedback on b", None, Some("branch-b"))
+            .add_guardian_message(
+                &id,
+                "reviewer",
+                "feedback on b",
+                None,
+                Some("branch-b"),
+                None,
+                None,
+            )
             .unwrap();
 
         let a = store.guardian_branch_messages(&id, "branch-a").unwrap();
@@ -5061,6 +5115,30 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn guardian_message_records_author_and_submitted_by_separately() {
+        // RAL-379: the attributed author and the authenticated submitter are
+        // independent identities -- a message can carry both, even when they
+        // differ (e.g. Bob submitting feedback attributed to Alice).
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_guardian_message(
+                &id,
+                "reviewer",
+                "please fix",
+                None,
+                Some("branch-a"),
+                Some("alice"),
+                Some("bob"),
+            )
+            .unwrap();
+        let msgs = store.guardian_branch_messages(&id, "branch-a").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].author.as_deref(), Some("alice"));
+        assert_eq!(msgs[0].submitted_by.as_deref(), Some("bob"));
     }
 
     #[test]

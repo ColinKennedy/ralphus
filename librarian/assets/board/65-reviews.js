@@ -1422,8 +1422,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           const expandBtn = text.includes("\n")
             ? `<button class="chat-expand-btn" data-click="toggleChatBubble" data-key="${esc(bubbleKey)}" data-tip="${expanded ? "Collapse this message back to its first line." : "Expand to show the full message."}">${expanded ? "−" : "+"}</button>`
             : "";
+          // RAL-379: only the attributed author is ever shown here -- the
+          // authenticated submitter (who may differ, e.g. an assistant
+          // posting on someone else's behalf) is audit-only and never
+          // rendered in the UI.
+          const label = isUser ? (m.author || "you") : "guardian";
           return `<div class="chat-msg chat-bubble-wrap ${isUser ? "user" : "guardian"}"><div>
-              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${isUser ? "you" : "guardian"}${ts}</div>
+              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${esc(label)}${ts}</div>
               <div class="chat-bubble">${esc(shown)}${expandBtn}</div>
             </div></div>`;
         }).join("");
@@ -1463,8 +1468,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (menu) menu.remove();
         const msgs = branchMessages[`${gid}:${bid}`] || [];
         const text = format === "markdown"
-          ? msgs.map((m) => `**${m.role === "reviewer" ? "You" : "Guardian"}:** ${m.text}`).join("\n\n")
-          : JSON.stringify(msgs.map((m) => ({ role: m.role, text: m.text })), null, 2);
+          ? msgs.map((m) => `**${m.role === "reviewer" ? (m.author || "You") : "Guardian"}:** ${m.text}`).join("\n\n")
+          : JSON.stringify(msgs.map((m) => ({ role: m.role, text: m.text, author: m.author })), null, 2);
         await navigator.clipboard.writeText(text);
       }
       // RAL-24: base-branch change dropdown — fetch branches on demand and post the change.

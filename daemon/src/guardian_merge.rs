@@ -3661,12 +3661,19 @@ pub fn start_resolve_input(
 /// feedback thread (`guardian_messages`, scoped by `branch_id`) and, in the
 /// background, generates a short triage-style acknowledgment reply the same
 /// way the old global chat did -- see [`record_feedback_reply`].
+///
+/// RAL-379: `author` is the registered user this feedback is attributed to
+/// (the caller may name one; the HTTP layer defaults it to `submitted_by`
+/// when absent). `submitted_by` is the resolved authenticated/default
+/// requester and is never taken from request data.
 pub fn start_feedback(
     store: Arc<Mutex<Store>>,
     runner: Arc<dyn Runner>,
     id: &str,
     branch_id: &str,
     feedback: String,
+    author: Option<String>,
+    submitted_by: Option<String>,
 ) -> Reply {
     let guardian = {
         let guard = store.lock().expect("store mutex poisoned");
@@ -3692,6 +3699,8 @@ pub fn start_feedback(
         &feedback,
         None,
         Some(branch_id),
+        author.as_deref(),
+        submitted_by.as_deref(),
     ) {
         return reply(500, &error_body("internal", &e.to_string()));
     }
@@ -3786,7 +3795,15 @@ fn record_feedback_reply(
         }
     };
     let guard = store.lock().expect("poisoned");
-    let _ = guard.add_guardian_message(id, "guardian", &reply_text, None, Some(branch_id));
+    let _ = guard.add_guardian_message(
+        id,
+        "guardian",
+        &reply_text,
+        None,
+        Some(branch_id),
+        None,
+        None,
+    );
 }
 
 /// [`run_merge`] with no way to stop early -- for tests and any caller with no
