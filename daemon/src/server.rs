@@ -3032,7 +3032,7 @@ fn watchers_endpoint(daemon: &Daemon, entity_uri: &str) -> Reply {
         return error(
             400,
             "invalid_entity_uri",
-            "only whole squads and reviews can be watched",
+            "only squads, tasks, cells, and reviews can be watched",
             vec![],
         );
     }
@@ -3067,7 +3067,7 @@ fn create_watch_endpoint(
         return error(
             400,
             "bad_request",
-            "only whole squads and reviews can be watched",
+            "only squads, tasks, cells, and reviews can be watched",
             vec![],
         );
     }
@@ -3096,6 +3096,8 @@ fn is_watchable_entity(entity_uri: &str) -> bool {
         crate::entity_uri::parse(entity_uri),
         Some(
             crate::entity_uri::EntityUri::Squad { .. }
+                | crate::entity_uri::EntityUri::Task { .. }
+                | crate::entity_uri::EntityUri::Cell { .. }
                 | crate::entity_uri::EntityUri::Guardian { .. }
         )
     )
@@ -20044,15 +20046,36 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn watches_reject_child_entity_uris() {
+    fn watches_accept_task_and_cell_entity_uris() {
+        let d = daemon();
+        for entity_uri in ["task:squad-1:0", "cell:squad-1:0:1"] {
+            let body =
+                serde_json::to_string(&serde_json::json!({ "entity_uri": entity_uri })).unwrap();
+            let r = route(&d, "POST", "/api/watches?user=colin", &body);
+            assert_eq!(r.status, 201, "{}", r.body);
+        }
+        let list = route(&d, "GET", "/api/watches?user=colin", "");
+        let parsed: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        let uris: Vec<&str> = parsed["watches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["entity_uri"].as_str().unwrap())
+            .collect();
+        assert!(uris.contains(&"task:squad-1:0"), "{uris:?}");
+        assert!(uris.contains(&"cell:squad-1:0:1"), "{uris:?}");
+    }
+
+    #[test]
+    fn watches_reject_a_proof_entity_uri() {
         let d = daemon();
         let body = serde_json::to_string(&serde_json::json!({
-            "entity_uri": "task:squad-1:0"
+            "entity_uri": "proof:squad-1:0:task:-1:0"
         }))
         .unwrap();
         let r = route(&d, "POST", "/api/watches?user=colin", &body);
         assert_eq!(r.status, 400, "{}", r.body);
-        assert!(r.body.contains("only whole squads and reviews"));
+        assert!(r.body.contains("only squads, tasks, cells, and reviews"));
     }
 
     #[test]
@@ -20184,6 +20207,86 @@ command=\"cargo test\"
         let messages: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
         assert_eq!(messages.len(), 1, "{}", r.body);
         assert_eq!(messages[0]["entity_uri"], cell_uri);
+    }
+
+    #[test]
+    fn personal_mailbox_task_watch_cascades_to_its_cells_but_not_sibling_tasks() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": format!("task:{squad_id}:0"),
+        }))
+        .unwrap();
+        assert_eq!(
+            route(&d, "POST", "/api/watches?user=colin", &body).status,
+            201
+        );
+
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                "task 0 cell 0 failed",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(format!("cell:{squad_id}:0:0").as_str()),
+            )
+            .unwrap();
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                "task 1 cell 0 failed",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(format!("cell:{squad_id}:1:0").as_str()),
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", "/api/mailbox/personal/messages?user=colin", "");
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(messages.len(), 1, "{}", r.body);
+        assert_eq!(messages[0]["message"], "task 0 cell 0 failed");
+    }
+
+    #[test]
+    fn personal_mailbox_cell_watch_does_not_cascade_to_sibling_cells() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let body = serde_json::to_string(&serde_json::json!({
+            "entity_uri": format!("cell:{squad_id}:0:0"),
+        }))
+        .unwrap();
+        assert_eq!(
+            route(&d, "POST", "/api/watches?user=colin", &body).status,
+            201
+        );
+
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                "cell 0/0 failed",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(format!("cell:{squad_id}:0:0").as_str()),
+            )
+            .unwrap();
+        d.lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                "cell 0/1 failed",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(format!("cell:{squad_id}:0:1").as_str()),
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", "/api/mailbox/personal/messages?user=colin", "");
+        let messages: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(messages.len(), 1, "{}", r.body);
+        assert_eq!(messages[0]["message"], "cell 0/0 failed");
     }
 
     #[test]
