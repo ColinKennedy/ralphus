@@ -829,12 +829,15 @@
         el.innerHTML = html;
       }
       /**
-       * Repaints every visible live-ticking Time-column cell in place (RAL-362 §3/acceptance: never a full re-render) once a second while the Tasks tab is open in duration mode.
+       * Repaints every visible live-ticking duration element in place (RAL-362 §3,
+       * extended by RAL-381 to squad sidebar and details pane). Never a full re-render.
+       * Runs once a second for any element with `data-running="1"`.
        * @returns {void}
        */
       function ttTickRunningTimes() {
-        if (tab !== "tasks" || taskTabTimeMode !== "duration") return;
-        document.querySelectorAll('.tt-time[data-running="1"]').forEach((el) => {
+        document.querySelectorAll('[data-running="1"]').forEach((el) => {
+          // Tasks-tab Time column only ticks in duration mode; start mode shows static "ago" text.
+          if (el.classList.contains("tt-time") && tab === "tasks" && taskTabTimeMode !== "duration") return;
           const started = Number(/** @type {HTMLElement} */ (el).dataset.started);
           if (started) el.textContent = fmtDuration(Date.now() - started);
         });

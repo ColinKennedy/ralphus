@@ -239,8 +239,10 @@
             <div class="kv-row"><span class="k">time running</span><span class="v" data-tip="${runningTip}">—</span></div>`;
         }
         const elapsed = (finishedAtMs || Date.now()) - startedAtMs;
+        const running = !finishedAtMs;
+        const runningAttrs = running ? ` data-running="1" data-started="${startedAtMs}"` : "";
         return `<div class="kv-row"><span class="k">started at</span><span class="v mono" data-tip="${startedTip}">${fmtUtc(startedAtMs)}</span></div>
-          <div class="kv-row"><span class="k">time running</span><span class="v" data-tip="${runningTip}">${fmtDuration(elapsed)}</span></div>`;
+          <div class="kv-row"><span class="k">time running</span><span class="v"${runningAttrs} data-tip="${runningTip}">${fmtDuration(elapsed)}</span></div>`;
       }
       /**
        * Renders the squad-level details pane.
