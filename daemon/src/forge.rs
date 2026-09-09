@@ -1233,14 +1233,18 @@ pub(crate) fn derive_owner_from_url(url: &str) -> Option<String> {
 /// `RALPHUS_GITHUB_TOKEN`/`RALPHUS_GITLAB_TOKEN`) isn't set in the daemon's
 /// own environment: ask the forge's own CLI for a token it already has
 /// cached from a prior interactive `gh auth login` / `glab auth login` on
-/// this machine. Best-effort only — returns `None` on any failure (CLI not
-/// installed, not logged in, unexpected output shape) and callers should
-/// treat that exactly like "no token configured" rather than surfacing a
-/// separate error. Only usable when the daemon process runs on the same
-/// machine as that CLI login; a remote/CI daemon still needs the env var.
+/// this machine. Best-effort only — the caller (`resolve_remote_for_inner`)
+/// treats an `Err` here exactly like "no token configured" and proceeds
+/// unauthenticated, but logs the `Err` reason as a warning first, since a
+/// spawn failure (e.g. the CLI missing from the daemon's own PATH, which can
+/// differ from an interactive shell's) would otherwise look identical to "no
+/// CLI installed, working as intended" right up until an unauthenticated
+/// request 404s against a private repo with no clue why. Only usable when
+/// the daemon process runs on the same machine as that CLI login; a
+/// remote/CI daemon still needs the env var.
 ///
 /// TODO: Replace with real user-service authentication once RAL-245 is complete.
-fn resolve_cli_token(kind: ForgeKind, host: &str) -> Option<String> {
+fn resolve_cli_token(kind: ForgeKind, host: &str) -> Result<String, String> {
     match kind {
         ForgeKind::GitHub => {
             let mut cmd = std::process::Command::new("gh");
@@ -1248,16 +1252,24 @@ fn resolve_cli_token(kind: ForgeKind, host: &str) -> Option<String> {
             if !host.eq_ignore_ascii_case("github.com") {
                 cmd.arg("--hostname").arg(host);
             }
-            let output = cmd.output().ok()?;
+            let output = cmd.output().map_err(|e| {
+                format!("could not run `gh auth token` (is `gh` on the daemon's PATH?): {e}")
+            })?;
             if !output.status.success() {
-                return None;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "`gh auth token` exited with {}: {}",
+                    output.status,
+                    stderr.trim()
+                ));
             }
-            let token = String::from_utf8(output.stdout).ok()?;
+            let token = String::from_utf8(output.stdout)
+                .map_err(|e| format!("`gh auth token` printed non-UTF-8 output: {e}"))?;
             let token = token.trim();
             if token.is_empty() {
-                None
+                Err("`gh auth token` printed an empty token".to_string())
             } else {
-                Some(token.to_string())
+                Ok(token.to_string())
             }
         }
         ForgeKind::GitLab => {
@@ -1271,10 +1283,20 @@ fn resolve_cli_token(kind: ForgeKind, host: &str) -> Option<String> {
                 .arg(host)
                 .arg("--show-token")
                 .output()
-                .ok()?;
+                .map_err(|e| {
+                    format!(
+                        "could not run `glab auth status` (is `glab` on the daemon's PATH?): {e}"
+                    )
+                })?;
             let combined = [output.stdout, output.stderr].concat();
-            let text = String::from_utf8(combined).ok()?;
-            extract_glab_token(&text)
+            let text = String::from_utf8(combined)
+                .map_err(|e| format!("`glab auth status` printed non-UTF-8 output: {e}"))?;
+            extract_glab_token(&text).ok_or_else(|| {
+                format!(
+                    "could not find a token in `glab auth status --show-token` output: {}",
+                    text.trim()
+                )
+            })
         }
     }
 }
@@ -1711,18 +1733,36 @@ fn resolve_remote_for_inner(
         .unwrap_or_else(|| kind.default_token_env().to_string());
     // Env var wins when set; otherwise fall back to the forge CLI's own
     // cached login (see `resolve_cli_token`'s doc comment for scope/limits).
+    // A failed fallback is logged loudly rather than folded silently into
+    // "no token" -- a client built with no token still makes unauthenticated
+    // requests (see the module doc's "Auth" section), which only 404 much
+    // later against a private repo with zero clue as to why.
     // TODO: Replace with real user-service authentication once RAL-245 is complete.
-    let token = std::env::var(&token_env)
-        .ok()
-        .or_else(|| resolve_cli_token(kind, &host));
-    if token.is_some() && std::env::var(&token_env).is_err() {
-        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-        crate::rlog!(
-            DEBUG,
-            "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
-            kind.as_str()
-        );
-    }
+    let token = match std::env::var(&token_env) {
+        Ok(t) => Some(t),
+        Err(_) => match resolve_cli_token(kind, &host) {
+            Ok(t) => {
+                // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
+                    kind.as_str()
+                );
+                Some(t)
+            }
+            Err(reason) => {
+                // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [forge] no {} token available -- env {token_env} is unset and the CLI \
+                     fallback failed: {reason}. Requests will go out unauthenticated and may fail \
+                     (e.g. 404) against a private repo.",
+                    kind.as_str()
+                );
+                None
+            }
+        },
+    };
 
     let repo_path = match kind {
         ForgeKind::GitHub => path,

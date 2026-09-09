@@ -11,6 +11,11 @@ primary owner of are documented at [[../.agent/logging-policy|logging-policy.md]
 rather than here, since they're shared with `runner/` and `cli/`.
 Daemon-specific runtime gotchas (port clash, live-Ollama test gating,
 `Pending` vs `Queued` on submit) are in [[../.agent/gotchas|gotchas.md]].
+Anything touching `forge.rs`/`pr.rs` (GitHub/GitLab calls, PR/MR submission,
+base resync, stacking) must follow
+[[../.agent/forge-design-principles|forge-design-principles.md]] — forge
+parity + REST-over-CLI, and always folding a PR/MR into the review's
+existing stack, with regression tests to match.
 
 ## Tmux cell process-tree confinement (RAL-321)
 

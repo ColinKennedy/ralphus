@@ -69,6 +69,15 @@ alternatives to reach for are in
   librarian exe is locked from underneath it, so `--all-targets` doesn't just
   fail, it often hangs. Use `cargo nextest run -p ralphus-daemon --lib` (and
   the same for `ralphus-librarian`) instead. See `.agent/gotchas.md`.
+- **GitHub and GitLab must stay at feature parity, and forge calls go
+  through each provider's REST API directly, never the `gh`/`glab` CLIs**
+  (the one sanctioned exception is `resolve_cli_token`'s best-effort token
+  fallback). **Any PR/MR submission must always fold into the review's
+  existing PR stack** — that's the entire reason a review's branches are a
+  linear rebase stack — and any change touching PR/MR submission, base
+  resync, reordering, or promotion needs a regression test proving the
+  stack stays intact. See
+  [`.agent/forge-design-principles.md`](.agent/forge-design-principles.md).
 
 ## Architecture
 
@@ -242,6 +251,7 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 `.agent/` files for content that doesn't belong to one component:
 
 - [`.agent/agent-conduct.md`](.agent/agent-conduct.md) — hard rules for agents working here (daemon, stash, comments, commits)
+- [`.agent/forge-design-principles.md`](.agent/forge-design-principles.md) — GitHub/GitLab parity + REST-over-CLI, and always folding PR/MR submissions into the review's PR stack
 - [`.agent/logging-policy.md`](.agent/logging-policy.md) — stderr+Cartographer logging rules, log-type table
 - [`.agent/otel-tracing.md`](.agent/otel-tracing.md) — opt-in end-to-end OpenTelemetry tracing design
 - [`.agent/gotchas.md`](.agent/gotchas.md) — cross-component pitfalls learned the hard way
