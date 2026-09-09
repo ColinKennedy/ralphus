@@ -703,7 +703,7 @@
           <div class="squad-item ${(r.id === selectedSquadId || multiSel.has(r.id)) ? "selected" : ""}" data-click="onSquadClick" data-ctx="openSquadMenu" data-squad-id="${esc(r.id)}">
             <div class="squad-row">
               <span class="rid" data-tip="Full squad name: ${esc(r.label || r.id)}\nShown here in case the name above is truncated to make room for the status.">${hiddenSquadIds.has(r.id) ? `<span data-tip="You've hidden this squad from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(r.label || r.id)}</span>
-              <span class="meta"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${sdot(squadDisplayState(r))}<span>${squadDisplayState(r)}</span></span>
+              <span class="meta"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${sdot(squadDisplayState(r))}<span>${squadDisplayState(r)}</span>${r.state === "running" && r.started_at_ms ? `<span class="squad-dur" data-running="1" data-started="${r.started_at_ms}">${fmtDuration(Date.now() - r.started_at_ms)}</span>` : ""}</span>
               <span class="squad-actions">
                 ${r.state === "queued" ? `<button class="btn squadbtn" data-click="activateSquad" data-squad-id="${esc(r.id)}" data-tip="Activate this queued squad — it was staged with hold=true and is waiting to be scheduled.">▶ Run</button>` : ""}
                 <button class="btn squadbtn" data-click="openSquadMenu" data-squad-id="${esc(r.id)}" data-tip="Squad actions — rename, hide, retry, restart, cancel, delete, or view logs for this squad.">⋯</button>
