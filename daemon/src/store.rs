@@ -638,6 +638,19 @@ pub(crate) struct GuardianWorktreeRecord {
     pub last_activity_ms: i64,
 }
 
+/// One durable retirement attempt (RAL-385): a worktree whose removal git
+/// confirmed (`retired`) or refused (`failed`, with `error` carrying the
+/// git failure and the next daily sweep retrying).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuardianWorktreeRetirementRecord {
+    pub guardian_id: String,
+    pub path: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub eligible_at_ms: i64,
+    pub last_attempt_ms: i64,
+}
+
 // ── Store ────────────────────────────────────────────────────────────────────
 
 /// The task store.
@@ -1033,6 +1046,26 @@ impl Store {
                 created_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_guardian_costs_guardian ON guardian_costs(guardian_id);
+            -- RAL-385: durable record of guardian worktree retirement attempts.
+            -- A successful retirement clears `guardian_branches.worktree`/
+            -- `guardians.combined_worktree`, which would otherwise erase all
+            -- trace of the removal; this row is the audit trail. Retained for
+            -- exactly as long as its review exists (the FK cascade plus the
+            -- explicit sweep in `delete_guardian`), matching the review's own
+            -- retention lifecycle. `status` is `retired` (git removed the
+            -- worktree) or `failed` (git refused; `error` says why and the
+            -- next daily sweep retries). Worktrees that have never been
+            -- attempted need no row -- their scheduled/eligible/claimed
+            -- state is derived live in `guardian_merge::worktree_retirement_view`.
+            CREATE TABLE IF NOT EXISTS guardian_worktree_retirements (
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                path            TEXT NOT NULL,
+                status          TEXT NOT NULL CHECK(status IN ('retired', 'failed')),
+                error           TEXT,
+                eligible_at_ms  INTEGER NOT NULL,
+                last_attempt_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, path)
+            );
             CREATE TABLE IF NOT EXISTS events (
                 seq         INTEGER PRIMARY KEY AUTOINCREMENT,
                 squad_id      TEXT,
@@ -4152,6 +4185,72 @@ impl Store {
             params![path],
         )?;
         Ok(())
+    }
+
+    /// Record (or overwrite) a worktree retirement attempt (RAL-385). A later
+    /// attempt for the same `(guardian, path)` replaces the earlier one, so a
+    /// worktree that failed once and was removed on a later daily sweep reads
+    /// as `retired`, while a repeated failure keeps only the latest error.
+    pub(crate) fn record_guardian_worktree_retirement(
+        &self,
+        guardian_id: &str,
+        path: &str,
+        status: &str,
+        error: Option<&str>,
+        eligible_at_ms: i64,
+        last_attempt_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_worktree_retirements
+                 (guardian_id, path, status, error, eligible_at_ms, last_attempt_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(guardian_id, path) DO UPDATE SET
+                 status=excluded.status,
+                 error=excluded.error,
+                 eligible_at_ms=excluded.eligible_at_ms,
+                 last_attempt_ms=excluded.last_attempt_ms",
+            params![
+                guardian_id,
+                path,
+                status,
+                error,
+                eligible_at_ms,
+                last_attempt_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every durable retirement attempt, oldest first.
+    pub(crate) fn guardian_worktree_retirements(
+        &self,
+    ) -> Result<Vec<GuardianWorktreeRetirementRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT guardian_id, path, status, error, eligible_at_ms, last_attempt_ms
+             FROM guardian_worktree_retirements ORDER BY last_attempt_ms, guardian_id, path",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(GuardianWorktreeRetirementRecord {
+                    guardian_id: r.get(0)?,
+                    path: r.get(1)?,
+                    status: r.get(2)?,
+                    error: r.get(3)?,
+                    eligible_at_ms: r.get(4)?,
+                    last_attempt_ms: r.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// A retired worktree row outlives its path columns, so the retirement
+    /// view resolves its review's display name by id (RAL-385).
+    pub(crate) fn guardian_display_name(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT name FROM guardians WHERE id=?1")?
+            .query_row([id], |r| r.get(0))
+            .optional()?)
     }
 
     /// Persist the effective read-only system prompt shown for a cell in

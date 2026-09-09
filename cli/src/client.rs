@@ -612,6 +612,12 @@ impl DaemonClient {
         self.get(&format!("/api/squads/{squad_id}/worktrees"))
     }
 
+    /// RAL-385: every review worktree classified by retirement state, plus
+    /// durable history for worktrees already retired or whose cleanup failed.
+    pub fn worktree_retirements(&self) -> Result<Value, DaemonError> {
+        self.get("/api/worktree-retirements")
+    }
+
     pub fn squad_logs(&self, squad_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/squads/{squad_id}/logs"))
     }

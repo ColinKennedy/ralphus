@@ -647,6 +647,17 @@ the review worktree.",
         true, // ("review", "worktrees")
         &[],
     ),
+    node(
+        "worktree-retirements",
+        &[],
+        &["--state [scheduled|eligible|claimed|failed|retired]"],
+        "List review worktrees across every review by retirement state -- scheduled, \
+         eligible, claimed, failed, retired -- with failure context and the eligible-at timestamp. \
+         Repeat --state to filter (no --state lists everything).",
+        false,
+        true, // ("review", "worktree-retirements")
+        &[],
+    ),
 ];
 
 // ---- other top-level groups' children -------------------------------------

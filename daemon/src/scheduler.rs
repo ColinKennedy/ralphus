@@ -68,6 +68,13 @@ pub const FORGE_REORDER_POLL_INTERVAL: Duration = Duration::from_secs(300);
 /// bounds how stale the board's "current pool state" view can be.
 pub const TRIAGE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often the scheduler sweeps stale review worktrees for retirement
+/// (RAL-385, `guardian_merge::retire_stale_worktrees`). A day matches the
+/// 30-day age threshold's granularity -- a worktree that became stale
+/// yesterday can't have crossed the threshold since the last pass -- and
+/// bounds accumulation to a day's worth of already-stale worktrees.
+pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 fn resolve_agent_selection(
     agent: &str,
     cwd: &str,
@@ -397,6 +404,13 @@ pub fn run_loop(
     // Ark persists its per-project due times, so calling once at startup is
     // cheap for projects whose configured interval has not elapsed.
     crate::ark::periodic_sweep(&store, &cancellations, &sem);
+    // RAL-385: same startup reasoning as the ark sweep -- only worktrees
+    // already past the 30-day threshold are touched, so running the daily
+    // retirement pass once at startup (then every
+    // [`WORKTREE_RETIREMENT_INTERVAL`]) retires backlog promptly instead of
+    // waiting a day for the first interval to elapse.
+    crate::guardian_merge::retire_stale_worktrees(&store);
+    let mut last_worktree_retirement = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
     recover_interrupted_reviews(&store, &sem, &cancellations);
     // Recovery: start collecting guardians whose contributing cells are all
@@ -439,6 +453,10 @@ pub fn run_loop(
         if last_ark_check.elapsed() >= Duration::from_secs(3600) {
             crate::ark::periodic_sweep(&store, &cancellations, &sem);
             last_ark_check = std::time::Instant::now();
+        }
+        if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
+            crate::guardian_merge::retire_stale_worktrees(&store);
+            last_worktree_retirement = std::time::Instant::now();
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();

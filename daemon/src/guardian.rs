@@ -1752,6 +1752,14 @@ impl Store {
             "DELETE FROM guardian_input_resolutions WHERE guardian_id=?",
             params![id],
         )?;
+        // RAL-385: retired-worktree history lives exactly as long as its
+        // review does, so delete it with the review. (The FK also cascades;
+        // this explicit sweep matches `delete_guardian`'s other child tables,
+        // which must not rely on cascade enforcement.)
+        self.conn.execute(
+            "DELETE FROM guardian_worktree_retirements WHERE guardian_id=?",
+            params![id],
+        )?;
         // RAL-320: watches are keyed by `EntityUri` string, not a `guardian_id`
         // FK column, so a deleted review's watches need an explicit sweep.
         self.conn.execute(

@@ -69,6 +69,29 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_get(&resolved.guardian_id)?)
         }
+        ReviewCommand::WorktreeRetirements { states } => {
+            let view = client.worktree_retirements()?;
+            if states.is_empty() {
+                Ok(view)
+            } else {
+                let filtered: Vec<&serde_json::Value> = view["entries"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|e| {
+                                states
+                                    .iter()
+                                    .any(|s| Some(s.as_str()) == e["state"].as_str())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(serde_json::json!({
+                    "age_threshold_days": view["age_threshold_days"],
+                    "entries": filtered,
+                }))
+            }
+        }
         ReviewCommand::Create {
             name,
             base_branch,

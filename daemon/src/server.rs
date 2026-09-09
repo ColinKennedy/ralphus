@@ -691,6 +691,11 @@ fn route_for_user(
         // slash, so the no-segment form is this router's way of addressing
         // the default row.
         ("GET", ["api", "project-forks"]) => list_all_project_forks(daemon),
+        // RAL-385: read-only worktree-retirement view -- every review
+        // worktree classified by retirement state plus the durable history
+        // of successful/failed retirement attempts. Open to every caller
+        // (read-only, like the fork reads above).
+        ("GET", ["api", "worktree-retirements"]) => worktree_retirements(daemon),
         ("GET", ["api", "projects", name, "forks"]) => {
             list_project_forks(daemon, &url_decode(name))
         }
@@ -3354,6 +3359,16 @@ fn get_project(daemon: &Daemon, name: &str) -> Reply {
 fn list_all_project_forks(daemon: &Daemon) -> Reply {
     match daemon.lock().list_project_forks() {
         Ok(forks) => json(200, &ProjectForksResponse { forks }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/worktree-retirements` (RAL-385): every review worktree
+/// classified by retirement state (`scheduled`/`eligible`/`claimed`/
+/// `failed`/`retired`), plus durable history for already-removed worktrees.
+fn worktree_retirements(daemon: &Daemon) -> Reply {
+    match crate::guardian_merge::worktree_retirement_view(&daemon.lock()) {
+        Ok(view) => json(200, &view),
         Err(e) => store_error(&e),
     }
 }
@@ -12727,6 +12742,86 @@ mod tests {
         let health = route(&d, "GET", "/api/health/project-forks", "");
         assert_eq!(health.status, 200, "{}", health.body);
         assert!(health.body.contains("\"checks\":[]"));
+    }
+
+    #[test]
+    fn worktree_retirements_route_reports_states_and_durable_history() {
+        let d = daemon();
+        // A review whose worktree last moved 10 days before the 30-day
+        // threshold — still scheduled, not yet eligible.
+        let id = d.lock().create_guardian("young", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "b").unwrap();
+        let branch_id = d.lock().get_guardian(&id).unwrap().branches[0].id.clone();
+        let recent = crate::store::now_ms() - crate::guardian_merge::WORKTREE_RETIREMENT_AGE_MS
+            + 10 * 24 * 60 * 60 * 1_000;
+        d.lock()
+            .set_branch_review(&id, &branch_id, "gb", "C:/repo/wt-young")
+            .unwrap();
+        d.lock()
+            .conn
+            .execute(
+                "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                rusqlite::params!["deployed", recent, id],
+            )
+            .unwrap();
+
+        let r = route(&d, "GET", "/api/worktree-retirements", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["age_threshold_days"], 30);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{}", r.body);
+        assert_eq!(entries[0]["state"], "scheduled");
+        assert_eq!(entries[0]["guardian_name"], "young");
+        assert_eq!(entries[0]["path"], "C:/repo/wt-young");
+        assert!(entries[0]["eligible_at_ms"].as_i64().unwrap() > recent);
+
+        // A failed retirement attempt shows up durably with its error, even
+        // though the live path row is also present.
+        d.lock()
+            .record_guardian_worktree_retirement(
+                &id,
+                "C:/repo/wt-young",
+                "failed",
+                Some("git refused"),
+                crate::store::now_ms(),
+                crate::store::now_ms(),
+            )
+            .unwrap();
+        let r2 = route(&d, "GET", "/api/worktree-retirements", "");
+        let body2: serde_json::Value = serde_json::from_str(&r2.body).unwrap();
+        let entries2 = body2["entries"].as_array().unwrap();
+        assert_eq!(entries2.len(), 1);
+        assert_eq!(entries2[0]["state"], "failed");
+        assert_eq!(entries2[0]["error"], "git refused");
+
+        // Recording the retry's success (which clears the live path) turns
+        // the row into retired history without losing the entry.
+        d.lock()
+            .clear_guardian_worktree_path("C:/repo/wt-young")
+            .unwrap();
+        d.lock()
+            .record_guardian_worktree_retirement(
+                &id,
+                "C:/repo/wt-young",
+                "retired",
+                None,
+                crate::store::now_ms(),
+                crate::store::now_ms(),
+            )
+            .unwrap();
+        let r3 = route(&d, "GET", "/api/worktree-retirements", "");
+        let body3: serde_json::Value = serde_json::from_str(&r3.body).unwrap();
+        let entries3 = body3["entries"].as_array().unwrap();
+        assert_eq!(entries3.len(), 1, "{}", r3.body);
+        assert_eq!(entries3[0]["state"], "retired");
+        assert_eq!(entries3[0]["guardian_name"], "young");
+
+        // And deleting the review takes the retired history with it — the
+        // history lives exactly as long as the review does.
+        d.lock().delete_guardian(&id).unwrap();
+        let r4 = route(&d, "GET", "/api/worktree-retirements", "");
+        assert!(r4.body.contains("\"entries\":[]"), "{}", r4.body);
     }
 
     #[test]
