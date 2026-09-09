@@ -1701,6 +1701,56 @@ fn run_cell_worker(
     if cancel.is_cancelled() {
         return;
     }
+    // RAL-377: verify the runner executable itself can actually be spawned
+    // *before* this cell is marked Running, not after -- previously a
+    // missing/misconfigured `RALPHUS_RUNNER_CMD` only surfaced once
+    // `runner.run_cancellable` tried and failed to launch its tmux-wrapped
+    // subprocess, by which point the cell already looked in-progress with no
+    // further signal (the shell inside the tmux pane prints its own
+    // "not recognized"/"command not found" and exits, but nothing here was
+    // watching for that -- the cell just sat Running until its timeout, if
+    // it had one at all).
+    if let Err(message) = runner.preflight_runner_executable(row.machine.as_deref()) {
+        crate::rlog!(
+            ERROR,
+            "ralphus [scheduler] cell {squad_id}/{} runner executable unavailable: {message}",
+            row.cell_id,
+        );
+        let outcome = crate::store::CellOutcome {
+            state: crate::store::NodeState::Failed,
+            usage: crate::store::RecordedUsage::default(),
+            error: Some(message.clone()),
+            agent_session_id: None,
+        };
+        {
+            let guard = store.lock().expect("store mutex poisoned");
+            let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::ERROR,
+                source: "scheduler",
+                message: "cell failed: runner executable unavailable",
+                scope: Some("cell"),
+                squad_id: Some(squad_id),
+                guardian_id: None,
+                cell_id: Some(&row.cell_id),
+                task: Some(&row.task_name),
+                log_path: None,
+                payload: serde_json::json!({"error": message}),
+                admin_only: false,
+            });
+            enqueue_cell_failure_mailbox(
+                &guard,
+                squad_id,
+                &row.cell_id,
+                &row.task_name,
+                Some(&message),
+            );
+        }
+        let mut prog = progress.lock().expect("progress mutex poisoned");
+        prog.status[i] = CellState::Failed;
+        prog.failed.insert(row.task_idx);
+        return;
+    }
     {
         let guard = store.lock().expect("store mutex poisoned");
         let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Running);
@@ -4139,6 +4189,42 @@ mod tests {
         let guard = store.lock().unwrap();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
+    }
+
+    /// A runner whose `preflight_runner_executable` always fails, simulating
+    /// a missing/misconfigured `RALPHUS_RUNNER_CMD` (RAL-377). `run`/
+    /// `run_cancellable` panic if ever reached -- the whole point of the
+    /// preflight check is that the scheduler never gets that far.
+    struct PreflightFailingRunner;
+
+    impl Runner for PreflightFailingRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            panic!("runner must not be invoked once preflight_runner_executable has failed");
+        }
+
+        fn preflight_runner_executable(&self, _machine: Option<&str>) -> Result<(), String> {
+            Err("ralphus-runner executable not found (simulated)".to_string())
+        }
+    }
+
+    #[test]
+    fn missing_runner_executable_fails_the_cell_immediately_instead_of_hanging() {
+        let (store, id) = store_with(ONE_CELL);
+        execute_squad(&store, &PreflightFailingRunner, &id);
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "failed");
+        assert!(
+            squad.tasks[0].cells[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("simulated"),
+            "{:?}",
+            squad.tasks[0].cells[0].error
+        );
     }
 
     // RAL-157: soloing task 0 ("a") must keep task 1 ("b")'s cell Pending
