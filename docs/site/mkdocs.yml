@@ -19,6 +19,7 @@ nav:
       - Triage: views/triage.md
       - Users: views/users.md
       - Secrets: views/secrets.md
+      - Worktree retirement: views/worktree-retirement.md
       - Preferences: views/prefs.md
   - Reference:
       - Special syntax & markers: special-syntax.md

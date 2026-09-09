@@ -50,6 +50,8 @@ __all__ = [
     "TRIAGE_TYPES",
     "USERS_ROUTES",
     "USERS_ROWS",
+    "WORKTREE_RETIREMENT_ROUTES",
+    "WORKTREE_RETIREMENT_ROWS",
     "Json",
     "Routes",
     "branch",
@@ -70,6 +72,7 @@ __all__ = [
     "triage_schedule_entry",
     "triage_type_entry",
     "user_entry",
+    "worktree_retirement_entry",
 ]
 
 Json = dict[str, Any]
@@ -472,6 +475,39 @@ def triage_schedule_entry(
         "every_n": every_n,
         "occurrence_count": occurrence_count,
         "last_checked_ms": last_checked_ms,
+    }
+
+
+def worktree_retirement_entry(
+    guardian_id: str,
+    guardian_name: str,
+    *,
+    project_root: str,
+    path: str,
+    state: str,
+    eligible_at_ms: int,
+    last_activity_ms: int | None = None,
+    claim_kind: str | None = None,
+    claim_owner: str | None = None,
+    claim_state: str | None = None,
+    error: str | None = None,
+    last_attempt_ms: int | None = None,
+    retry_at_ms: int | None = None,
+) -> Json:
+    return {
+        "guardian_id": guardian_id,
+        "guardian_name": guardian_name,
+        "project_root": project_root,
+        "path": path,
+        "state": state,
+        "eligible_at_ms": eligible_at_ms,
+        "last_activity_ms": last_activity_ms,
+        "claim_kind": claim_kind,
+        "claim_owner": claim_owner,
+        "claim_state": claim_state,
+        "error": error,
+        "last_attempt_ms": last_attempt_ms,
+        "retry_at_ms": retry_at_ms,
     }
 
 
@@ -1150,6 +1186,89 @@ TRIAGE_ROUTES: Routes = {
     "/api/triage/types": {"types": list(TRIAGE_TYPES)},
     "/api/triage/pools": {"pools": list(TRIAGE_POOLS)},
     "/api/triage/schedules": {"schedules": list(TRIAGE_SCHEDULES)},
+}
+
+# ---------------------------------------------------------------------------
+# Worktree retirement scenario (RAL-385/386) — one row per lifecycle state,
+# admin-only tab.
+# ---------------------------------------------------------------------------
+
+WORKTREE_RETIREMENT_ROWS: tuple[Json, ...] = (
+    worktree_retirement_entry(
+        "guardian-000000000001",
+        "add-rate-limiter",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/add-rate-limiter-review",
+        state="scheduled",
+        eligible_at_ms=1_783_600_000_000,
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000002",
+        "fix-flaky-scheduler-test",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/fix-flaky-scheduler-test-review",
+        state="eligible",
+        eligible_at_ms=1_783_140_000_000,
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000003",
+        "rework-guardian-merge",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/rework-guardian-merge-review",
+        state="claimed",
+        eligible_at_ms=1_783_100_000_000,
+        claim_kind="merge",
+        claim_owner="colin",
+        claim_state="running",
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000004",
+        "migrate-secret-store",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/migrate-secret-store-review",
+        state="failed",
+        eligible_at_ms=1_783_080_000_000,
+        error="permission denied removing .git/worktrees/migrate-secret-store-review",
+        last_attempt_ms=1_783_142_000_000,
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000005",
+        "provision-lab-gpu-01",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/provision-lab-gpu-01-review",
+        state="deferred",
+        eligible_at_ms=1_783_070_000_000,
+        error="machine provider is mid-snapshot, try again later",
+        last_attempt_ms=1_783_141_000_000,
+        retry_at_ms=1_783_400_000_000,
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000006",
+        "pin-incredibuild-agent",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/pin-incredibuild-agent-review",
+        state="opted_out",
+        eligible_at_ms=1_783_060_000_000,
+        error="static machine retirement policy excludes this provider",
+        last_attempt_ms=1_783_140_000_000,
+    ),
+    worktree_retirement_entry(
+        "guardian-000000000007",
+        "retire-old-runner-shim",
+        project_root=_REPO,
+        path=f"{_REPO}-worktrees/retire-old-runner-shim-review",
+        state="retired",
+        eligible_at_ms=1_782_900_000_000,
+        last_attempt_ms=1_782_950_000_000,
+    ),
+)
+
+WORKTREE_RETIREMENT_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/worktree-retirements": {"entries": list(WORKTREE_RETIREMENT_ROWS)},
 }
 
 # ---------------------------------------------------------------------------

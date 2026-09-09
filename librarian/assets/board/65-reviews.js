@@ -74,7 +74,6 @@
           </div>
         </div>`;
       }
-
       // Render the inline cell-link button for a review branch row.
       // Prefers direct squad/task/cell indices from the API; falls back to cwd path matching.
       /**
@@ -2137,4 +2136,3 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (tab !== "reviews") { try { guardians = await (await fetch("/api/guardians")).json(); } catch (_) {} }
         if (!userIsSelecting()) renderReadyBanner();
       }
-
