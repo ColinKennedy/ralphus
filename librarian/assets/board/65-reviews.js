@@ -231,7 +231,7 @@
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
         const canCancel = G_CANCELLABLE.includes(g.status);
-        const items = [`<div data-click="renameReview" data-guardian-id="${esc(id)}" data-tip="Rename this review — changes the display name only.">✎ Rename</div>`];
+        const items = [`<div data-click="openEditReviewDetailsFromMenu" data-guardian-id="${esc(id)}" data-tip="Edit this review's name and other settings.">✎ Edit Details</div>`];
         const reviewUri = `guardian:${id}`;
         items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(reviewUri)}" data-tip="${isWatching(reviewUri) ? "Stop receiving watcher notifications for this review." : "Watch this whole review and choose which mailbox priority tiers should notify you."}">${isWatching(reviewUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
         items.push(hiddenGuardianIds.has(id)
@@ -244,18 +244,6 @@
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
-      }
-      /**
-       * Prompts for and applies a new name for a review.
-       * @param {string} id
-       * @returns {void}
-       */
-      function renameReview(id) {
-        closeSquadMenu();
-        const g = guardians.find((x) => x.id === id); if (!g) return;
-        const name = prompt("Rename review:", g.name);
-        if (name === null || !name.trim()) return;
-        post(`/api/guardians/${id}/rename`, { name: name.trim() }).then(() => tick());
       }
       /**
        * Deletes a review and its worktrees after confirmation.
@@ -465,6 +453,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // otherwise-healthy "done"/"conflict_resolved" branch. Clears itself
         // (server-side) the next time the branch's state is covered by an
         // open PR again, whether via a fresh auto-submit or a manual one.
+        // RAL-389: an auto-submit-PR-stack request for this branch is
+        // durably queued or actively running on its own worker thread,
+        // decoupled from the merge worker. Checked before `auto_submit_error`
+        // -- a fresh attempt in flight is more relevant than a stale failure
+        // from a previous one, which the in-flight attempt is about to
+        // either clear or replace.
+        if (b.pr_submission_pending) return `<span class="badge live" data-tip="Auto-submitting this branch's pull request is in progress on its own background worker.\nWho/when: you enabled auto-submit for this review's PR stack and this branch just reached a terminal state.\nClears automatically once the attempt completes (success clears it silently; failure leaves the ⚠ auto-submit failed badge instead).">⏳ submitting PR</span>`;
         if (b.auto_submit_error) return `<span class="badge bad" data-tip="Auto-submitting this branch's pull request failed: ${esc(b.auto_submit_error)}\nWho/when: you enabled auto-submit for this review's PR stack and this branch's PR wasn't opened/updated as a result.\nCheck forge credentials/connectivity, then resubmit manually (review pr submit) or wait for the next auto-submit attempt.">⚠ auto-submit failed</span>`;
         if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
         if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
@@ -677,18 +672,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function combinedPrSection(g) {
         if (!g.branches.some((b) => b.enabled && b.worktree)) return "";
+        // RAL-410: separate-PR-branch/match-worktree-branch-name/auto-submit
+        // are edited via the Edit Details modal (openEditReviewDetails) --
+        // shown here as a read-only summary alongside the submit action.
         return `<h3 class="section" data-tip="Pull/merge requests submitted for this review on GitHub/GitLab (RAL-117/RAL-190).">pull requests</h3>
             <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
               <button class="btn primary" style="padding:3px 10px;font-size:11px" data-click="submitPrStack" data-guardian-id="${esc(g.id)}" data-tip="Push every enabled branch in this review as its own PR, each based on the branch below it -- never one squashed PR containing everything.\nOn GitHub, also registers/grows a native PR stack so GitHub's own UI shows them as a linked stack.\nWho/when: once the stack looks good, open real PRs for the whole thing without leaving the board.\nSafe to press again after adding a new branch on top -- only the new branch gets its own PR.\nRuns in the background -- each branch's PR card above updates once its forge call completes.">submit PR stack</button>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Push this review's PRs to a branch of their own, derived from the task branch, instead of opening them straight from the review branch.\nOff (the default): the review branch -- named '&lt;task branch&gt;-review' -- IS the PR branch, so there is one branch and nothing to reconcile between them.\nWho/when: turn this on only if your workflow needs the PR to live on a differently-named remote branch. The 'match worktree branch name' setting beside this one applies only in that case.\nStarts from this project's default ('[review] separate_pr_branch' in .ralphus.toml) and can be flipped per-review here.">
-                <input type="checkbox" ${g.effective_separate_pr_branch ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSeparatePrBranch(this.dataset.guardianId,this.checked)">separate PR branch
-              </label>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)${g.effective_separate_pr_branch ? "" : ";opacity:0.5"}" data-tip="Only applies when 'separate PR branch' is on -- with one branch serving both roles there is no second name to pick.\nUse the exact worktree/feature branch name as the PR branch, instead of the convention-derived alias (e.g. '{name}-review').\nWho/when: makes it easy to trace a submitted PR back to the review/worktree that produced it.\nStarts from this project's default (set via 'ralphus project git --match-pr-branch-name') and can be flipped per-review here; a --use-worktree-branch-name flag on 'ralphus review pr submit' can still override it for one submission.">
-                <input type="checkbox" ${g.effective_match_pr_branch_name ? "checked" : ""} ${g.effective_separate_pr_branch ? "" : "disabled"} data-guardian-id="${esc(g.id)}" onchange="setMatchPrBranchName(this.dataset.guardianId,this.checked)">match worktree branch name
-              </label>
-              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing, instead of requiring the manual 'submit PR stack' button above.\nWho/when: turn this on for a review you want opened on the forge incrementally, branch by branch, with no extra clicks.\nA per-branch failure is shown as a badge next to that branch (⚠ auto-submit failed) rather than blocking the merge -- resubmit manually or wait for the next attempt.">
-                <input type="checkbox" ${g.effective_auto_submit_pr_stack ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setAutoSubmitPrStack(this.dataset.guardianId,this.checked)">auto-submit PR stack
-              </label>
+              <span class="k" style="text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)" data-tip="separate PR branch: ${g.effective_separate_pr_branch ? "yes" : "no"}\nmatch worktree branch name: ${g.effective_match_pr_branch_name ? "yes" : "no"}\nauto-submit PR stack: ${g.effective_auto_submit_pr_stack ? "yes" : "no"}\nEdited via Edit Details.">${g.effective_separate_pr_branch ? "separate branch" : "same branch"}${g.effective_auto_submit_pr_stack ? " · auto-submit" : ""}</span>
             </div>`;
       }
       // RALPHUS-MERGE-BUTTON:BEGIN
@@ -813,7 +803,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
               ${resolverPeekBox(g, b)}
-              ${renderBranchEnvOverrides(g, b)}
               ${branchPrSection(g, b)}
               ${open ? branchFeedbackSection(g, b) : ""}
             </div>` : "";
@@ -877,58 +866,32 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : g.skip_auto_build
               ? "—"
               : `<div class="row"><span class="vchip" style="border-color:var(--unverified);color:var(--unverified)" data-tip="No check gates are configured for this review, the project has no auto_build default in .ralphus.toml, and either the resolver agent found no build step to infer or skip auto-build is on.\nWho/when: relevant to anyone relying on 'in review' meaning 'built and tested' — right now this review reached that status with zero build or test verification.\nAdd checks above, or set [review] auto_build in the project's .ralphus.toml, to close this gap.">⚠ no build verification configured</span></div>`;
-        const skipToggles = `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Skip the finalize-time build/check step entirely: explicit check gates, the project's .ralphus.toml auto_build default, and the AI-inferred build command are all skipped.\nUseful while iterating on check gates, or to avoid an unwanted inferred build.\nManual checks are still generated — only the automatic build/check step is skipped.">
-            <input type="checkbox" ${g.skip_auto_build ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSkipAutoBuild(this.dataset.guardianId,this.checked)">skip auto-build${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees.\nFaster for large repos but gives less isolation between branches.">
-            <input type="checkbox" ${g.skip_worktrees ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="setSkipWorktrees(this.dataset.guardianId,this.checked)">skip per-branch worktrees (build the stack in one shared worktree)</label>`;
-        // RAL-91: per-(git-project) squash toggle. Scope is each git project in the
-        // review, NOT the whole review — a review spanning N projects honours each
-        // project's setting independently. Projects are indexed into g.projects so
-        // the raw (possibly backslashed) path never lands in an inline handler.
+        // RAL-410: skip-auto-build/skip-per-branch-worktrees, squash,
+        // resolver agent/model, and proof scope are all now edited via the
+        // "Edit Details" modal (openEditReviewDetails) -- these are
+        // read-only summaries here.
+        const skipInfo = `<div class="kv-row"><span class="k">skip auto-build</span><span class="v">${g.skip_auto_build ? "yes" : "no"}${g.skip_auto_build && gChecks.length ? ' — <span style="color:var(--queued)">gates will be skipped</span>' : ""}</span></div>
+          <div class="kv-row"><span class="k">skip per-branch worktrees</span><span class="v">${g.skip_worktrees ? "yes" : "no"}</span></div>`;
+        // RAL-91: per-(git-project) squash. Scope is each git project in the
+        // review, NOT the whole review — a review spanning N projects honours
+        // each project's setting independently.
         const squashOn = g.squash_projects || [];
         const squashProjects = (g.projects && g.projects.length) ? g.projects : [g.git_root || ""];
-        const squashSection = squashProjects.map((p, pi) => {
+        const squashSummary = squashProjects.map((p) => {
           const on = squashOn.includes(p);
           const label = (p || "").split(/[\\/]/).filter(Boolean).pop() || p;
-          return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Collapse this git project's task branches to a single squashed commit each in the review worktree.\nWhy: a task that produced several small commits then reads as one clean commit per branch — the original task commits are left untouched.\nWho/when: reviewers who want a tidy, one-commit-per-branch review history to read or stack.\nScope: THIS git project only — other projects in the review keep their own setting.\nTakes effect on the next Merge / rebase.">
-            <input type="checkbox" ${on ? "checked" : ""} data-guardian-id="${esc(g.id)}" data-pi="${pi}" onchange="setSquash(this.dataset.guardianId,Number(this.dataset.pi),this.checked)">squash each task branch to a single commit${isMultiProject ? ` — <span class="mono" style="font-size:11px">${esc(label)}</span>` : ""}</label>`;
+          return `<div class="kv-row"><span class="k">squash${isMultiProject ? ` — <span class="mono" style="font-size:11px">${esc(label)}</span>` : ""}</span><span class="v">${on ? "yes" : "no"}</span></div>`;
         }).join("");
         // Conflict-resolver backend for this review.
-        const resolverFrozen = ["approved", "deployed"].includes(g.status);
-        const rp = (pendingResolver && pendingResolver.gid === g.id) ? pendingResolver : null;
-        const storedResolverAgent = g.resolver_agent || "";
-        const storedResolverModel = g.resolver_model || "";
-        const rSelVal = rp ? rp.agent : storedResolverAgent;
-        const rModelVal = rp ? rp.model : storedResolverModel;
-        const rAgentPending = !!rp && rp.agent !== storedResolverAgent;
-        const rModelPending = !!rp && rp.model.trim() !== storedResolverModel;
-        const resolverCwd = g.git_root || (g.projects && g.projects[0]) || "";
-        const resolverOptions = resolverOptionHtml(resolverCwd, rSelVal);
-        const resolverRow = resolverFrozen
-          ? `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverOf(g))}</span></div>
-             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(storedResolverModel || "agent default")}</span></div>`
-          : `<div class="kv-row"><span class="k">resolver agent</span><div style="display:flex;flex-direction:column;gap:4px"><select id="resolver-select" data-guardian-id="${esc(g.id)}" onchange="onResolverChange(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts.\nIncludes this project's built-in backends plus any custom agent profiles configured in its .ralphus.toml.\nPress Save to apply — if a rebase is already in progress it restarts immediately with the new backend.">${resolverOptions}</select><div id="resolver-pending" style="display:${rAgentPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveResolver" data-guardian-id="${esc(g.id)}" data-tip="Save the staged resolver agent and model together.\nIf a rebase is already in progress, it restarts immediately with the new resolver configuration.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelResolver" data-guardian-id="${esc(g.id)}" data-tip="Discard all staged resolver changes and restore the last saved agent and model.">Cancel</button></div></div></div>
-             <div class="kv-row"><span class="k">resolver model</span><div style="display:flex;flex-direction:column;gap:4px"><input type="text" id="resolver-model-input" class="mono" value="${esc(rModelVal)}" placeholder="agent default" data-guardian-id="${esc(g.id)}" oninput="onResolverModelInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="Exact model passed to the selected resolver agent, such as gpt-5.6-luna.\nWho/when: set this when the agent's default model is not the one you want for conflict resolution and review work.\nAny model name is accepted; an unavailable, misspelled, or agent-incompatible value can make the resolver fail. Clear the field to use the agent's default."><div id="resolver-model-pending" style="display:${rModelPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveResolver" data-guardian-id="${esc(g.id)}" data-tip="Save the staged resolver model and agent together.\nLeading and trailing whitespace is removed; an empty field clears the model override. If a rebase is already in progress, it restarts immediately with the new resolver configuration.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelResolver" data-guardian-id="${esc(g.id)}" data-tip="Discard all staged resolver changes and restore the last saved agent and model.">Cancel</button></div></div></div>`;
+        const resolverRow = `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverOf(g))}</span></div>
+             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(g.resolver_model || "agent default")}</span></div>`;
         // RAL-168: "Proof" scope -- how often the dedicated LLM-based
-        // final-proof pass runs. Save/Cancel like the resolver dropdown
-        // above (interview Q6: confirm via Save/Cancel, but no rebase
-        // re-trigger needed once saved).
-        const vp = (pendingProofScope && pendingProofScope.gid === g.id) ? pendingProofScope : null;
-        const vPending = !!vp;
-        const vScopeVal = vp ? vp.scope : (g.effective_proof_scope || "each_branch");
-        const vSkipAutoClean = vp ? vp.skipAutoClean : !!g.effective_proof_skip_auto_clean;
-        const proofScopeRow = `<div class="kv-row"><span class="k">proof scope</span><div style="display:flex;flex-direction:column;gap:4px">
-          <select id="proof-scope-select" data-guardian-id="${esc(g.id)}" onchange="onProofScopeChange(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="How often the dedicated final-proof agent call runs after a branch's rebase.\nEach branch (default): proof every branch that changed, whether its rebase hit a conflict or applied cleanly.\nThe final branch: proof once, on the last branch in the stack.\nNothing: skip the final-proof call entirely for this review.\nThe fix pass itself never runs formatters/linters/tests either way -- only this dedicated call does.\nShows the project's .ralphus.toml default until you pick something else.">
-            <option value="each_branch" ${vScopeVal==="each_branch"?"selected":""}>each branch${!vp && !g.proof_scope ? " (project default)" : ""}</option>
-            <option value="final_branch" ${vScopeVal==="final_branch"?"selected":""}>the final branch</option>
-            <option value="nothing" ${vScopeVal==="nothing"?"selected":""}>nothing</option>
-          </select>
-          ${vScopeVal === "each_branch" ? `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Within \"each branch\" scope, additionally skip verification on branches whose rebase applied cleanly with no conflict at all.\nWho/when: reviewers who want the lighter-weight behavior of only proofing branches that actually hit a conflict.\nA true no-op rebase (zero diff) always skips proof regardless of this setting.">
-            <input type="checkbox" ${vSkipAutoClean ? "checked" : ""} data-guardian-id="${esc(g.id)}" onchange="onProofScopeSkipAutoCleanChange(this.dataset.guardianId,this.checked)">skip auto-clean branches</label>` : ""}
-          <div id="proof-scope-pending" style="display:${vPending?"flex":"none"};flex-direction:row;gap:4px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveProofScope" data-guardian-id="${esc(g.id)}" data-tip="Save the Proof scope for this review.\nApplies immediately -- no rebase is triggered.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelProofScope" data-guardian-id="${esc(g.id)}" data-tip="Discard — revert to the last saved value.">Cancel</button></div>
-        </div></div>`;
+        // final-proof pass runs.
+        const effectiveProofScope = g.effective_proof_scope || "each_branch";
+        const proofScopeRow = `<div class="kv-row"><span class="k">proof scope</span><span class="v">${esc(effectiveProofScope.replace(/_/g, " "))}${!g.proof_scope ? " (project default)" : ""}</span></div>
+          ${effectiveProofScope === "each_branch" ? `<div class="kv-row"><span class="k">skip auto-clean branches</span><span class="v">${g.effective_proof_skip_auto_clean ? "yes" : "no"}</span></div>` : ""}`;
         el.innerHTML = `<div class="squad-banner">${gdot(g.status)}<span class="rid">${esc(g.name)}</span> ${pill(g.status)} ${arbiterBadge(g)}
-            <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
+            <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Edit Details</button><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
           ${reviewCostSummary(g)}
@@ -936,7 +899,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
           ${g.status === "collecting" && g.squad_id ? `<div class="kv-row"><span class="k" style="text-transform:none;letter-spacing:0">gate</span><span class="v">${g.branches.some((b) => b.merge_status === "ready") ? "tasks complete — rebase will start automatically" : "starts automatically when its squad finishes — or start it now below"}</span></div>` : ""}
           <div class="kv-row"><span class="k">type</span><span class="v">${esc(g.review_type || "git")}</span></div>
-          <div class="kv-row"><span class="k">upstream</span>${["approved","deployed"].includes(g.status) ? `<span class="mono">${esc(g.base_branch)}</span>` : `<div style="display:flex;flex-direction:column;gap:4px"><div style="display:flex;align-items:center;gap:4px"><input type="text" id="base-input" class="mono" list="base-datalist" value="${esc(g.base_branch)}" data-guardian-id="${esc(g.id)}" onfocus="loadBaseBranches(this.dataset.guardianId)" oninput="onBaseBranchInput(this.dataset.guardianId,this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px;width:200px" data-tip="The branch every submitted branch is rebased onto.\nUsually 'main' or 'master'.\nType or use ▾ to pick from remote."><datalist id="base-datalist">${(baseBranchCache[g.id]||[]).map(b=>`<option value="${esc(b)}"></option>`).join('')}</datalist><button class="btn" style="padding:2px 6px;font-size:13px;line-height:1" data-click="loadBaseBranchesShowPicker" data-guardian-id="${esc(g.id)}" data-tip="Load all branches from the remote and show them as a pick list.\nClick a branch name to fill in the upstream field.">▾</button></div><div id="base-error" style="display:none;color:var(--failed);font-size:11px;margin-top:2px"></div><div id="base-pending" class="row" style="display:none;gap:4px;margin-top:2px"><button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="saveBase" data-guardian-id="${esc(g.id)}" data-tip="Save the new upstream branch and trigger a full rebase of the review stack.\nReruns even if the branch name is unchanged — useful when the upstream has new commits.\nThis cannot be undone.">Save</button><button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelBase" data-guardian-id="${esc(g.id)}" data-tip="Cancel — revert the upstream branch input to its last saved value.">Cancel</button></div></div>`}</div>
+          <div class="kv-row"><span class="k">upstream</span><span class="mono">${esc(g.base_branch)}</span></div>
           ${resolverRow}
           ${proofScopeRow}
           ${isMultiProject
@@ -946,10 +909,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           ${g.combined_worktree ? `<div class="kv-row"><span class="k">combined worktree</span><span class="v mono" style="font-size:11px">${esc(g.combined_worktree)}</span></div>` : ""}
           ${renderChangeSummary(g)}
           ${combinedPrSection(g)}
-          <h3 class="section">check gates</h3>${checks}${skipToggles}
+          <h3 class="section">check gates</h3>${checks}${skipInfo}
           <div class="kv-row">${envViewerBtn(`/api/guardians/${g.id}/tests-env`, "this review's check gates (tests)")}</div>
-          ${renderGuardianBuildEnvOverrides(g)}
-          <h3 class="section" data-tip="Squash controls how each task branch's commits appear in the review worktree.\nScope is per git project — set it independently for each project in the review.">squash</h3>${squashSection}
+          <h3 class="section" data-tip="Squash controls how each task branch's commits appear in the review worktree.\nScope is per git project — set it independently for each project in the review.">squash</h3>${squashSummary}
           ${g.detail && !autoBuiltCmd ? `<div class="warn">${esc(g.detail)}</div>` : ""}
           <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
@@ -966,12 +928,14 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             <span class="k" style="text-transform:none;letter-spacing:0;color:var(--muted)">Save persists the order and enabled states, then rebases</span>
           </div>` : ""}
           ${(() => {
-            // RAL-69: show Force-Start when collecting and some enabled branches are not yet done.
+            // RAL-69: warn upfront when some enabled branches aren't ready yet --
+            // Merge / rebase still works, but will offer to continue with just
+            // the ready ones (see mergeReview's confirmMergeSubset prompt).
             const hasNotReady = g.status === "collecting" && (g.branches || []).some(
               (b) => b.enabled !== false && b.source_cell_state !== "done"
             );
             return hasNotReady
-              ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). <b>Force-Start</b> will disable the unready branches and start immediately.</div>`
+              ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
           <div class="btn-row">
@@ -995,33 +959,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               return `<button class="btn" data-click="stopMerge" data-guardian-id="${esc(g.id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop</button>`;
             })()}
             ${(() => {
-              const hasNotReady = g.status === "collecting" && (g.branches || []).some(
-                (b) => b.enabled !== false && b.source_cell_state !== "done"
-              );
-              return hasNotReady
-                ? `<button class="btn" data-click="forceStartReview" data-guardian-id="${esc(g.id)}" data-tip="Start the review now using only branches whose source cells are already done.\nBranches that are still running or were never submitted will be disabled — you can re-enable them later once their source tasks finish.\nThis cannot be undone.">Force-Start</button>`
-                : "";
-            })()}
-            ${(() => {
-              const canApprove = g.status === "in_review";
               const isPending = pendingGuardianActions.has(g.id);
-              /** @type {Record<string, string>} */
-              const approveDisabledReason = {
-                collecting: "Still collecting branches — approve is only available once every branch has merged and the review reaches in_review.",
-                merging: "A rebase is currently in progress — approve becomes available once it finishes and the review reaches in_review.",
-                merge_failed: "The last rebase failed — resolve the failure (see the review's detail/logs, or click Merge / rebase to retry) before you can approve.",
-                merge_stopped: "This review is stopped mid-rebase — resume it (Resume rebase) and let it finish before you can approve.",
-                approved: "This review has already been approved.",
-                cancelled: "This review was cancelled — approve is not available for a cancelled review.",
-                deployed: "This review has already been deployed (and was approved to get there).",
-              };
               const approveTip = isPending
                 ? "Approval is in flight — waiting for the daemon to confirm."
-                : canApprove
-                  ? "Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nOnly available when the review is in_review."
-                  : (approveDisabledReason[g.status] || `Not available — this review's status is currently "${esc(g.status)}".\nApprove is only available once the review reaches in_review.`);
-              const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${(canApprove && !isPending) ? "" : "disabled"} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
-              return (canApprove && !isPending) ? approveBtn : `<span data-tip="${approveTip}">${approveBtn}</span>`;
+                : "Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
+              const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${isPending ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
+              return isPending ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
+            })()}
+            ${(() => {
+              const canCancel = G_CANCELLABLE.includes(g.status);
+              if (!canCancel) return "";
+              return `<button class="btn danger" data-click="cancelReview" data-guardian-id="${esc(g.id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</button>`;
             })()}
             ${(() => {
               // RAL-273: only meaningful once a stack is actually built and
@@ -1086,8 +1034,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
                 ${menuOpen ? `<div style="position:absolute;top:100%;left:0;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;min-width:200px;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.4);padding:4px 0;margin-top:2px">${menuItems}</div>` : ""}` : ""}
               </div>
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${manualChecksTerminalBtns(g)}</div>
-              ${manualChecksPeekBox(g)}
-              ${renderGuardianManualChecksEnvOverrides(g)}`;
+              ${manualChecksPeekBox(g)}`;
           })()}`;
         attachPeekResizeHandlers();
       }
@@ -1127,41 +1074,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       /** @type {PendingReorder|null} */
       let pendingReorder = null;
-      /**
-       * @typedef {object} PendingResolver
-       * @property {string} gid
-       * @property {string} agent
-       * @property {string} model
-       */
-       /** @type {PendingResolver|null} */
-       let pendingResolver = null;
-      // RALPHUS-RESOLVER-SETTINGS:BEGIN
-      /**
-       * Returns the current resolver draft, starting from the stored pair when
-       * this review has no pending edit. Agent and model always travel together
-       * so saving one control cannot erase the other.
-       * @param {string} gid
-       * @param {string} storedAgent
-       * @param {string} storedModel
-       * @param {PendingResolver|null} pending
-       * @returns {PendingResolver}
-       */
-      function resolverDraftFor(gid, storedAgent, storedModel, pending) {
-        return pending && pending.gid === gid
-          ? { ...pending }
-          : { gid, agent: storedAgent, model: storedModel };
-      }
-      /**
-       * Produces the settings request for a staged resolver pair.
-       * @param {PendingResolver} draft
-       * @returns {{resolver_agent: string, resolver_model: string}}
-       */
-      function resolverSettingsBody(draft) {
-        return { resolver_agent: draft.agent, resolver_model: draft.model.trim() };
-      }
-      // RALPHUS-RESOLVER-SETTINGS:END
-       /** @type {{gid: string, scope: string, skipAutoClean: boolean}|null} RAL-168: staged Proof-scope choice, not yet saved. */
-       let pendingProofScope = null;
       /**
        * Drag-start handler for a branch row: records the dragged branch name.
        * @param {DragEvent} e
@@ -1563,77 +1475,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (dl) dl.innerHTML = baseBranchCache[gid].map(b => `<option value="${esc(b)}"></option>`).join('');
       }
       /**
-       * Validates the base-branch input against the cached candidate list as the user types.
-       * @param {string} gid
-       * @param {string} val
-       * @returns {void}
-       */
-      function onBaseBranchInput(gid, val) {
-        val = val.trim();
-        const cache = baseBranchCache[gid];
-        const isInvalid = cache && cache.length > 0 && val && !cache.includes(val);
-        const inp = /** @type {HTMLInputElement|null} */ (document.getElementById("base-input"));
-        if (inp) { inp.style.borderColor = isInvalid ? "var(--failed)" : ""; inp.style.color = isInvalid ? "var(--failed)" : ""; }
-        const errEl = document.getElementById("base-error");
-        if (errEl) { errEl.textContent = isInvalid ? "Branch not found in remote — check the name." : ""; errEl.style.display = isInvalid ? "" : "none"; }
-        const pendingDiv = document.getElementById("base-pending");
-        if (pendingDiv) pendingDiv.style.display = val ? "flex" : "none";
-      }
-      /**
-       * Saves a review's new base branch and triggers a full rebase.
-       * @param {string} gid
-       * @param {string} val
-       * @returns {Promise<void>}
-       */
-      async function saveBase(gid, val) {
-        val = val.trim();
-        if (!val) return;
-        const cache = baseBranchCache[gid];
-        if (cache && cache.length > 0 && !cache.includes(val)) {
-          const errEl = document.getElementById("base-error");
-          if (errEl) { errEl.textContent = "Branch not found in remote — cannot save."; errEl.style.display = ""; }
-          return;
-        }
-        delete baseBranchCache[gid];
-        const resp = await guardianAction(`/api/guardians/${gid}/base`, { branch: val });
-        if (resp && resp.ok) {
-          const data = await resp.json().catch(() => null);
-          const change = data && data.base_change;
-          if (change && change.status === "deferred") {
-            showInfoToast(change.message || `We will use '${val}' once the branches are ready to merge.`);
-          } else if (change && change.status === "rebase_in_progress") {
-            const action = change.action && change.action.url
-              ? {
-                  label: change.action.label || "Stop and restart now",
-                  run: async () => {
-                    await guardianAction(change.action.url);
-                    tick();
-                  },
-                }
-              : undefined;
-            showWarningToast(
-              change.message || "You changed the base but there's a rebase in progress. We'll trigger a new rebase once this one completes.",
-              action,
-            );
-          }
-        }
-        tick();
-      }
-      /**
-       * Reverts the base-branch input to the last saved value, discarding the draft.
-       * @param {string} gid
-       * @returns {void}
-       */
-      function cancelBase(gid) {
-        const g = guardians.find(x => x.id === gid);
-        const inp = /** @type {HTMLInputElement|null} */ (document.getElementById("base-input"));
-        if (inp && g) { inp.value = g.base_branch ?? ""; inp.style.borderColor = ""; inp.style.color = ""; }
-        const errEl = document.getElementById("base-error");
-        if (errEl) { errEl.textContent = ""; errEl.style.display = "none"; }
-        const pendingDiv = document.getElementById("base-pending");
-        if (pendingDiv) pendingDiv.style.display = "none";
-      }
-      /**
        * Builds the resolver `<select>`'s `<option>`s for `cwd`: every real
        * agent (built-ins plus configured custom profiles) cached from
        * `GET /api/agents`, sorted alphabetically, falling back to a hardcoded
@@ -1686,115 +1527,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           agentOptionsByCwd.delete(cwd); // transient failure — allow a later render to retry
           return;
         }
-        renderReviewDetail();
-      }
-      /**
-       * Stages a new resolver-agent choice (not yet saved).
-       * @param {string} gid
-       * @param {string} agent
-       * @returns {void}
-       */
-      function onResolverChange(gid, agent) {
-        const g = guardians.find((x) => x.id === gid);
-        if (!g) return;
-        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
-        draft.agent = agent;
-        pendingResolver = draft;
-        renderReviewDetail();
-      }
-      /**
-       * Stages a raw resolver-model value while leaving focus in the text
-       * field. The value is trimmed only when saved.
-       * @param {string} gid
-       * @param {string} model
-       * @returns {void}
-       */
-      function onResolverModelInput(gid, model) {
-        const g = guardians.find((x) => x.id === gid);
-        if (!g) return;
-        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
-        draft.model = model;
-        pendingResolver = draft;
-        const controls = document.getElementById("resolver-model-pending");
-        if (controls) controls.style.display = model.trim() !== (g.resolver_model || "") ? "flex" : "none";
-      }
-      /**
-       * Saves the staged resolver-agent/model pair. The daemon itself restarts an
-       * already-`merging` review's in-flight rebase so the new resolver takes
-       * effect immediately (RAL-213) -- this no longer needs to do that here.
-       * @param {string} gid
-       * @returns {Promise<void>}
-       */
-      async function saveResolver(gid) {
-        const g = guardians.find((x) => x.id === gid);
-        if (!g) return;
-        const draft = resolverDraftFor(gid, g.resolver_agent || "", g.resolver_model || "", pendingResolver);
-        const resp = await guardianAction(`/api/guardians/${gid}/settings`, resolverSettingsBody(draft));
-        if (resp && resp.ok) pendingResolver = null;
-        tick();
-      }
-      /**
-       * Discards the staged resolver-agent choice.
-       * @param {string} gid
-       * @returns {void}
-       */
-      function cancelResolver(gid) {
-        if (pendingResolver && pendingResolver.gid === gid) pendingResolver = null;
-        renderReviewDetail();
-      }
-      /**
-       * Stages a new Proof-scope choice (RAL-168, not yet saved), preserving
-       * whatever auto-clean-skip value is already staged/saved for this review.
-       * @param {string} gid
-       * @param {string} scope
-       * @returns {void}
-       */
-      function onProofScopeChange(gid, scope) {
-        const g = guardians.find((x) => x.id === gid);
-        const skipAutoClean = pendingProofScope && pendingProofScope.gid === gid
-          ? pendingProofScope.skipAutoClean
-          : !!(g && g.effective_proof_skip_auto_clean);
-        pendingProofScope = { gid, scope, skipAutoClean };
-        renderReviewDetail();
-      }
-      /**
-       * Stages a new auto-clean-skip choice (RAL-168, not yet saved), preserving
-       * whatever scope is already staged/saved for this review.
-       * @param {string} gid
-       * @param {boolean} skip
-       * @returns {void}
-       */
-      function onProofScopeSkipAutoCleanChange(gid, skip) {
-        const g = guardians.find((x) => x.id === gid);
-        const scope = pendingProofScope && pendingProofScope.gid === gid
-          ? pendingProofScope.scope
-          : (g && g.effective_proof_scope) || "each_branch";
-        pendingProofScope = { gid, scope, skipAutoClean: skip };
-        renderReviewDetail();
-      }
-      /**
-       * Saves the staged Proof-scope choice (RAL-168). Applies immediately --
-       * unlike the resolver-backend dropdown, this never triggers a fresh rebase.
-       * @param {string} gid
-       * @returns {Promise<void>}
-       */
-      async function saveProofScope(gid) {
-        if (!pendingProofScope || pendingProofScope.gid !== gid) return;
-        const { scope, skipAutoClean } = pendingProofScope;
-        pendingProofScope = null;
-        await guardianAction(`/api/guardians/${gid}/settings`, {
-          proof_scope: scope,
-          proof_skip_auto_clean: skipAutoClean,
-        });
-        tick();
-      }
-      /**
-       * Discards the staged Proof-scope choice (RAL-168).
-       * @param {string} gid
-       * @returns {void}
-       */
-      function cancelProofScope(gid) {
-        pendingProofScope = null;
         renderReviewDetail();
       }
       /**
@@ -1855,79 +1587,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
         if (!resp.ok) { byId("cr-err").textContent = "create failed"; return; }
         const g = await resp.json(); selectedGuardian = g.id; closeModal(); tick();
-      }
-      /**
-       * Toggles a review's skip-auto-build setting.
-       * @param {string} id
-       * @param {boolean} skip
-       * @returns {Promise<void>}
-       */
-      async function setSkipAutoBuild(id, skip) {
-        await guardianAction(`/api/guardians/${id}/settings`, { skip_auto_build: skip });
-        tick();
-      }
-      /**
-       * Toggles a review's separate-PR-branch setting (RAL-378): whether the
-       * pull request is pushed to a branch of its own rather than opened
-       * straight from the review branch.
-       * @param {string} id
-       * @param {boolean} enabled
-       * @returns {Promise<void>}
-       */
-      async function setSeparatePrBranch(id, enabled) {
-        await guardianAction(`/api/guardians/${id}/settings`, { separate_pr_branch: enabled });
-        tick();
-      }
-      /**
-       * Toggles a review's match-pr-branch-name setting (RAL-307): whether a
-       * newly submitted PR's branch defaults to the worktree/feature branch
-       * name instead of the convention-derived alias.
-       * @param {string} id
-       * @param {boolean} enabled
-       * @returns {Promise<void>}
-       */
-      async function setMatchPrBranchName(id, enabled) {
-        await guardianAction(`/api/guardians/${id}/settings`, { match_pr_branch_name: enabled });
-        tick();
-      }
-      /**
-       * Toggles a review's auto-submit-PR-stack setting (RAL-317): whether
-       * the PR stack is auto-submitted/grown as each branch reaches a
-       * terminal merge state, instead of requiring the manual "submit PR
-       * stack" button.
-       * @param {string} id
-       * @param {boolean} enabled
-       * @returns {Promise<void>}
-       */
-      async function setAutoSubmitPrStack(id, enabled) {
-        await guardianAction(`/api/guardians/${id}/settings`, { auto_submit_pr_stack: enabled });
-        tick();
-      }
-      /**
-       * Toggles a review's skip-per-branch-worktrees setting.
-       * @param {string} id
-       * @param {boolean} skip
-       * @returns {Promise<void>}
-       */
-      async function setSkipWorktrees(id, skip) {
-        await guardianAction(`/api/guardians/${id}/settings`, { skip_worktrees: skip });
-        tick();
-      }
-      // RAL-91: toggle per-project squash. projIdx indexes g.projects so the raw
-      // project path (which may contain backslashes) never enters an inline handler.
-      /**
-       * Toggles per-git-project commit squashing for a review.
-       * @param {string} id
-       * @param {number} projIdx
-       * @param {boolean} enabled
-       * @returns {Promise<void>}
-       */
-      async function setSquash(id, projIdx, enabled) {
-        const g = guardians.find((x) => x.id === id); if (!g) return;
-        const project = ((g.projects && g.projects.length) ? g.projects : [g.git_root])[projIdx];
-        if (!project) return;
-        await guardianAction(`/api/guardians/${id}/squash`, { project, enabled });
-        tick();
       }
 
       // ---- Review-action error surfacing (RAL-108) ----
@@ -2109,6 +1768,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // handler is reachable regardless of what the pane currently shows.
         if (pendingMergeActions.has(id)) return;
         if (status === "merging" && !confirm("There is a rebase currently in progress. Do you want to cancel it and start another?")) return;
+        // RAL-69: merged into this button (there is no separate Force-Start
+        // button anymore) -- while still collecting, some enabled branches
+        // may not be ready yet. Ask before disabling them and starting with
+        // only whichever branches are actually rebaseable right now.
+        if (status === "collecting") {
+          const g = (guardians || []).find((x) => x.id === id);
+          const hasNotReady = !!g && (g.branches || []).some((b) => b.enabled !== false && b.source_cell_state !== "done");
+          if (hasNotReady) { confirmMergeSubset(id); return; }
+        }
         pendingMergeActions.add(id);
         if (!userIsSelecting()) renderReviewDetail();
         showInfoToast(mergeRequestedToast(status));
@@ -2177,41 +1845,53 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         tick();
       }
 
-      // ---------- force-start review (RAL-69) ----------
-      // Shows a confirmation modal listing not-ready branches, then calls
-      // POST /api/guardians/{id}/force_start which disables them and kicks off the merge.
+      // ---------- merge / rebase with a not-ready subset of branches (RAL-69) ----------
+      // Clicking Merge / rebase while some enabled branches aren't ready yet
+      // (still running, or never submitted) shows this confirmation instead of
+      // silently doing nothing or silently disabling branches. Continuing
+      // calls POST /api/guardians/{id}/force_start, which disables the
+      // not-ready branches and kicks off the rebase with the rest.
       /**
-       * Shows the Force-Start confirmation modal listing not-yet-ready branches.
+       * Shows a confirmation modal naming which branches can actually be
+       * rebased right now (the ones closest to upstream that are ready),
+       * before disabling the rest and starting the rebase.
        * @param {string} id
        * @returns {void}
        */
-      function forceStartReview(id) {
+      function confirmMergeSubset(id) {
         const g = (guardians || []).find((x) => x.id === id);
         if (!g) return;
-        const notReady = (g.branches || []).filter(
-          (b) => b.enabled !== false && b.source_cell_state !== "done"
-        );
-        const rows = notReady.map((b) => {
-          const st = b.source_cell_state || "not submitted";
+        const enabledBranches = (g.branches || []).filter((b) => b.enabled !== false);
+        const rebaseable = enabledBranches.filter((b) => b.source_cell_state === "done");
+        const notReady = enabledBranches.filter((b) => b.source_cell_state !== "done");
+        const names = rebaseable.map((b) => b.branch);
+        const namesList = names.length === 0
+          ? "no"
+          : names.length === 1
+            ? names[0]
+            : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+        const rows = enabledBranches.map((b) => {
+          const ready = b.source_cell_state === "done";
+          const st = ready ? "ready" : (b.source_cell_state || "not submitted");
           return `<div style="display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)">
-            <span class="mono" style="flex:1;font-size:12px">${esc(b.branch)}</span>
-            <span class="badge" style="color:var(--queued);border-color:var(--queued);font-size:11px">${esc(st)}</span>
+            <span class="mono" style="flex:1;font-size:12px${ready ? "" : ";color:var(--muted)"}">${esc(b.branch)}</span>
+            <span class="badge" style="color:${ready ? "var(--done)" : "var(--queued)"};border-color:${ready ? "var(--done)" : "var(--queued)"};font-size:11px">${esc(st)}</span>
           </div>`;
         }).join("");
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal">
-            <h2>Force-Start Review?</h2>
-            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">The following ${notReady.length === 1 ? "branch is" : "branches are"} not yet ready and will be <b>disabled</b> in the review stack. You can re-enable them later once their source cells finish.</p>
+            <h2>Merge / rebase with fewer branches?</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">We can only rebase ${esc(namesList)} ${names.length === 1 ? "branch" : "branches"} right now. ${notReady.length === 1 ? "The other branch is" : "The other branches are"} not yet ready (still running or never submitted) and will be <b>disabled</b> in the review stack. You can re-enable ${notReady.length === 1 ? "it" : "them"} later once ${notReady.length === 1 ? "its" : "their"} source cell${notReady.length === 1 ? "" : "s"} finish.</p>
             <div style="border-top:1px solid var(--border);margin-bottom:10px">${rows}</div>
             <p style="font-size:12px;color:var(--failed);margin:0 0 2px">This cannot be undone.</p>
             <div class="btn-row">
               <button class="btn" onclick="closeModal()" data-tip="Cancel — leave the review in its current collecting state.">Cancel</button>
-              <button class="btn primary" data-click="doForceStart" data-guardian-id="${esc(id)}" data-tip="Disable the listed branches and start the review immediately with whatever branches remain enabled.">Continue anyway</button>
+              <button class="btn primary" data-click="doForceStart" data-guardian-id="${esc(id)}" data-tip="Disable the not-ready branches and start the rebase immediately with whatever branches remain enabled.">Continue anyway</button>
             </div>
           </div></div>`;
       }
       /**
-       * Confirms and executes a force-start of a review.
+       * Confirms and executes a rebase with the not-ready branches disabled.
        * @param {string} id
        * @returns {Promise<void>}
        */

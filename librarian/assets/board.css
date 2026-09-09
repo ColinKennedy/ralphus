@@ -418,6 +418,12 @@
       .q-modal input[type=number] { width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; }
       .q-modal .row { display: flex; gap: 14px; margin: 12px 0; flex-wrap: wrap; }
       .goto-search-modal { width: 760px; max-width: 94vw; }
+      .review-edit-modal { width: 900px; max-width: 94vw; max-height: 88vh; overflow-y: auto; }
+      .review-edit-modal h3.section { margin-top: 14px; }
+      .review-edit-env-row { display: flex; align-items: center; gap: 6px; margin: 0; }
+      .review-edit-env-row input[type=text] { width: auto; margin-top: 0; }
+      .review-edit-env-row input[type=text].review-edit-env-key { flex: 1; }
+      .review-edit-env-row input[type=text].review-edit-env-value { flex: 2; }
       .goto-search-input { width: 100%; box-sizing: border-box; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 11px; font: inherit; }
       .goto-search-summary { color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
       .goto-search-list { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }

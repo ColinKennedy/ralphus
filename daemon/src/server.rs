@@ -1056,6 +1056,7 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
         ("POST", ["api", "guardians", id, "rename"]) => guardian_rename(daemon, id, body),
         ("POST", ["api", "guardians", id, "settings"]) => guardian_settings(daemon, id, body),
+        ("POST", ["api", "guardians", id, "details"]) => guardian_details(daemon, id, body),
         ("POST", ["api", "guardians", id, "squash"]) => guardian_squash(daemon, id, body),
         ("DELETE", ["api", "guardians", id]) => guardian_delete(daemon, id),
         ("POST", ["api", "guardians", id, "branches"]) => guardian_add_branch(daemon, id, body),
@@ -9119,6 +9120,56 @@ struct GuardianSettingsBody {
     separate_pr_branch: Option<bool>,
 }
 
+/// Body for `POST /api/guardians/{id}/details` -- the board's single
+/// "Edit Details" modal (RAL-410). A strict superset of
+/// [`GuardianSettingsBody`] plus the fields that otherwise require
+/// `/rename`, `/base`, `/squash`, `/build-env`, `/manual-checks-env`, and
+/// `/branches/{id}/env` as separate calls. Every field is `Option<T>`; only
+/// `Some(..)` fields are applied. This endpoint is purely additive -- all of
+/// those individual endpoints remain unchanged and in place for the
+/// CLI/MCP, which call them directly.
+#[derive(Deserialize)]
+struct GuardianDetailsBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    base_branch: Option<String>,
+    #[serde(default)]
+    resolver_agent: Option<String>,
+    #[serde(default)]
+    resolver_model: Option<String>,
+    #[serde(default)]
+    proof_scope: Option<String>,
+    #[serde(default)]
+    proof_skip_auto_clean: Option<bool>,
+    #[serde(default)]
+    skip_auto_build: Option<bool>,
+    #[serde(default)]
+    skip_worktrees: Option<bool>,
+    #[serde(default)]
+    separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    match_pr_branch_name: Option<bool>,
+    #[serde(default)]
+    auto_submit_pr_stack: Option<bool>,
+    /// Full desired squash membership: every project in this list gets
+    /// squash turned ON, every other project in the review's
+    /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
+    /// `None` leaves every project's squash setting untouched.
+    #[serde(default)]
+    squash_projects: Option<Vec<String>>,
+    /// Reuses [`InheritedEnvOverridesBody`]'s `set`/`unset`/`clear` shape so
+    /// the inherited-vs-tombstoned-vs-reverted distinction the per-scope
+    /// endpoints already support isn't lost in this batched path.
+    #[serde(default)]
+    build_env: Option<InheritedEnvOverridesBody>,
+    #[serde(default)]
+    manual_checks_env: Option<InheritedEnvOverridesBody>,
+    /// Keyed by branch id, matching `/branches/{branch_id}/env`'s addressing.
+    #[serde(default)]
+    branch_env: Option<std::collections::BTreeMap<String, InheritedEnvOverridesBody>>,
+}
+
 #[derive(Deserialize)]
 struct AddBranchBody {
     branch: String,
@@ -9373,6 +9424,356 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Shared env-key/value validation for one `GuardianDetailsBody` env-override
+/// section, matching `set_guardian_branch_env`/`set_guardian_scoped_env`'s
+/// inline checks so the batched path enforces the identical rules.
+fn validate_env_overrides_body(req: &InheritedEnvOverridesBody) -> Option<Reply> {
+    for key in req
+        .set
+        .keys()
+        .chain(req.unset.iter())
+        .chain(req.clear.iter())
+    {
+        if !crate::config::is_valid_env_key(key) {
+            return Some(error(
+                400,
+                "bad_request",
+                &format!("invalid environment variable name: {key:?}"),
+                vec![],
+            ));
+        }
+    }
+    for (key, value) in &req.set {
+        if !crate::config::is_valid_env_value(value) {
+            return Some(error(
+                400,
+                "bad_request",
+                &format!(
+                    "invalid environment variable value for {key:?}: contains control characters"
+                ),
+                vec![],
+            ));
+        }
+    }
+    None
+}
+
+/// Cartographer entry for one env-override section changed by
+/// [`guardian_details`], matching [`set_guardian_scoped_env`]'s
+/// allowlist-redacted logging shape.
+fn cartographer_log_guardian_env(
+    store: &Store,
+    id: &str,
+    scope: &str,
+    task: Option<&str>,
+    req: &InheritedEnvOverridesBody,
+) {
+    let allow = crate::config::load_env_overrides_config();
+    let redacted_set: serde_json::Map<String, serde_json::Value> = req
+        .set
+        .iter()
+        .map(|(k, v)| {
+            let shown = if allow.is_allowed(k) {
+                v.clone()
+            } else {
+                "<redacted>".to_string()
+            };
+            (k.clone(), serde_json::Value::String(shown))
+        })
+        .collect();
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "server",
+        message: "review env overrides changed",
+        scope: Some(scope),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task,
+        log_path: None,
+        payload: serde_json::json!({
+            "set": redacted_set,
+            "unset": req.unset,
+            "clear": req.clear,
+        }),
+        admin_only: false,
+    });
+}
+
+#[derive(Serialize)]
+struct GuardianDetailsReply {
+    guardian: crate::guardian::GuardianView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_change: Option<ChangeBaseStatus>,
+}
+
+/// Batched update for the board's "Edit Details" modal (RAL-410). A single
+/// request that supersets `guardian_rename`/[`guardian_settings`]/
+/// `guardian_change_base`/`guardian_squash`/`set_guardian_build_env`/
+/// `set_guardian_manual_checks_env`/`set_guardian_branch_env` -- every
+/// present field is applied under one held `Store` lock, then **at most
+/// one** rebase-relevant side effect (PR base resync, then a merge
+/// restart/kickoff) runs at the end, instead of each field independently
+/// deciding to trigger one the way the individual endpoints above do. This
+/// is purely additive: every one of those endpoints remains in place
+/// unchanged for the CLI/MCP, which call them directly.
+///
+/// Deliberate refinement over [`guardian_settings`]'s policy: that handler
+/// restarts an in-flight merge on *any* field write, even a purely cosmetic
+/// one. This handler only restarts when something in the batch was actually
+/// rebase-relevant, so a rename bundled with cosmetic-only fields never
+/// forces a restart.
+fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<GuardianDetailsBody>(body) else {
+        return error(400, "bad_request", "invalid body", vec![]);
+    };
+
+    let store = daemon.lock();
+    let guardian = match store.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+
+    // Guard: base/resolver are frozen once approved/deployed, same as
+    // guardian_change_base's existing check.
+    let frozen = matches!(guardian.status.as_str(), "approved" | "deployed");
+    if frozen
+        && (req
+            .base_branch
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || req.resolver_agent.is_some()
+            || req.resolver_model.is_some())
+    {
+        return error(
+            409,
+            "invalid_transition",
+            "cannot change base branch or resolver on an approved or deployed review",
+            vec![],
+        );
+    }
+
+    // Validate every env-override section up front so a mid-way failure
+    // never leaves some fields applied and others rejected.
+    if let Some(patch) = &req.build_env {
+        if let Some(e) = validate_env_overrides_body(patch) {
+            return e;
+        }
+    }
+    if let Some(patch) = &req.manual_checks_env {
+        if let Some(e) = validate_env_overrides_body(patch) {
+            return e;
+        }
+    }
+    if let Some(branches) = &req.branch_env {
+        for patch in branches.values() {
+            if let Some(e) = validate_env_overrides_body(patch) {
+                return e;
+            }
+        }
+    }
+
+    if let Some(name) = req.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Err(e) = store.rename_guardian(id, name) {
+            return store_error(&e);
+        }
+    }
+    let base_changed = req
+        .base_branch
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if base_changed {
+        if let Err(e) =
+            store.set_guardian_base_branch(id, req.base_branch.as_deref().unwrap().trim())
+        {
+            return store_error(&e);
+        }
+    }
+    if req.resolver_agent.is_some() || req.resolver_model.is_some() {
+        let agent = req.resolver_agent.as_deref().filter(|s| !s.is_empty());
+        let model = req.resolver_model.as_deref().filter(|s| !s.is_empty());
+        if let Err(e) = store.set_guardian_resolver(id, agent, model) {
+            return store_error(&e);
+        }
+    }
+    if let Some(scope) = req.proof_scope.as_deref() {
+        let scope = if scope.is_empty() { None } else { Some(scope) };
+        if let Err(e) = store.set_guardian_proof_scope(id, scope) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.proof_skip_auto_clean {
+        if let Err(e) = store.set_guardian_proof_skip_auto_clean(id, Some(skip)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.skip_auto_build {
+        if let Err(e) = store.set_guardian_skip_auto_build(id, skip) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.skip_worktrees {
+        if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.separate_pr_branch {
+        if let Err(e) = store.set_guardian_separate_pr_branch(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.match_pr_branch_name {
+        if let Err(e) = store.set_guardian_match_pr_branch_name(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.auto_submit_pr_stack {
+        if let Err(e) = store.set_guardian_auto_submit_pr_stack(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(desired) = &req.squash_projects {
+        for project in &guardian.projects {
+            let want_on = desired.contains(project);
+            if let Err(e) = store.set_guardian_project_squash(id, project, want_on) {
+                return store_error(&e);
+            }
+        }
+    }
+    if let Some(patch) = &req.build_env {
+        if let Err(e) =
+            store.set_guardian_build_env_overrides(id, &patch.set, &patch.unset, &patch.clear)
+        {
+            return store_error(&e);
+        }
+        cartographer_log_guardian_env(
+            &store,
+            id,
+            GuardianEnvSection::Build.cartographer_scope(),
+            Some(GuardianEnvSection::Build.label()),
+            patch,
+        );
+    }
+    if let Some(patch) = &req.manual_checks_env {
+        if let Err(e) = store.set_guardian_manual_checks_env_overrides(
+            id,
+            &patch.set,
+            &patch.unset,
+            &patch.clear,
+        ) {
+            return store_error(&e);
+        }
+        cartographer_log_guardian_env(
+            &store,
+            id,
+            GuardianEnvSection::ManualChecks.cartographer_scope(),
+            Some(GuardianEnvSection::ManualChecks.label()),
+            patch,
+        );
+    }
+    if let Some(branches) = &req.branch_env {
+        for (branch_id, patch) in branches {
+            if let Err(e) = store.set_guardian_branch_env_overrides(
+                id,
+                branch_id,
+                &patch.set,
+                &patch.unset,
+                &patch.clear,
+            ) {
+                return store_error(&e);
+            }
+            cartographer_log_guardian_env(&store, id, "guardian-branch", Some(branch_id), patch);
+        }
+    }
+
+    // -- single side-effect decision point --
+    let rebase_relevant = base_changed
+        || req.resolver_agent.is_some()
+        || req.resolver_model.is_some()
+        || req.skip_auto_build.is_some()
+        || req.skip_worktrees.is_some()
+        || req.squash_projects.is_some()
+        || req.build_env.is_some()
+        || req.manual_checks_env.is_some()
+        || req.branch_env.is_some();
+    let status = guardian.status.clone();
+    let has_branches = !guardian.branches.is_empty();
+    drop(store);
+
+    if base_changed {
+        if let Err(e) = crate::pr::resync_pr_bases_synchronously(&daemon.store_handle(), id) {
+            return error(
+                502,
+                "forge_error",
+                &format!("details saved locally but PR/MR base sync failed: {e}"),
+                vec![],
+            );
+        }
+    }
+
+    let mut base_change: Option<ChangeBaseStatus> = None;
+    if status == "merging" {
+        if rebase_relevant {
+            let runner = guardian_agent_runner(daemon);
+            let restarted = crate::guardian_merge::restart_guardian_merge(
+                daemon.store_handle(),
+                daemon.cancellations_handle(),
+                runner,
+                id,
+                daemon.semaphore_handle(),
+            );
+            if restarted.status >= 400 {
+                // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [guardian] review {id} details-triggered merge restart failed: {}",
+                    restarted.body
+                );
+            } else {
+                base_change = Some(ChangeBaseStatus {
+                    status: "merging".to_string(),
+                    message: "Details saved and the rebase restarted.".to_string(),
+                    action: None,
+                });
+            }
+        } else if base_changed {
+            base_change = Some(ChangeBaseStatus {
+                status: "rebase_in_progress".to_string(),
+                message: "Details saved; a rebase is already in progress.".to_string(),
+                action: None,
+            });
+        }
+    } else if rebase_relevant && has_branches && status != "approved" && status != "deployed" {
+        let runner = guardian_agent_runner(daemon);
+        if let Ok(crate::guardian_merge::StartMergeOutcome::Merging) =
+            crate::guardian_merge::kickoff_merge(
+                daemon.store_handle(),
+                runner,
+                id,
+                daemon.semaphore_handle(),
+                daemon.cancellations_handle(),
+            )
+        {
+            base_change = Some(ChangeBaseStatus {
+                status: "merging".to_string(),
+                message: "Details saved and the rebase started.".to_string(),
+                action: None,
+            });
+        }
+    }
+
+    match daemon.lock().get_guardian(id) {
+        Ok(g) => json(
+            200,
+            &GuardianDetailsReply {
+                guardian: g,
+                base_change,
+            },
+        ),
         Err(e) => store_error(&e),
     }
 }
@@ -18781,6 +19182,239 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"auto_submit_pr_stack\":false"));
         assert!(r.body.contains("\"effective_auto_submit_pr_stack\":false"));
+    }
+
+    // ── RAL-410: batched `/details` endpoint (board "Edit Details" modal) ───
+
+    #[test]
+    fn guardian_details_batches_multiple_fields_in_one_request() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let body = serde_json::json!({
+            "skip_auto_build": true,
+            "proof_scope": "final_branch",
+            "match_pr_branch_name": true,
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"skip_auto_build\":true"));
+        assert!(r.body.contains("\"proof_scope\":\"final_branch\""));
+        assert!(r.body.contains("\"match_pr_branch_name\":true"));
+    }
+
+    #[test]
+    fn guardian_details_renames_and_changes_base_together() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let body = serde_json::json!({
+            "name": "renamed via details",
+            "base_branch": "develop",
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"name\":\"renamed via details\""));
+        assert!(r.body.contains("\"base_branch\":\"develop\""));
+    }
+
+    #[test]
+    fn guardian_details_frozen_fields_rejected_when_approved_but_others_still_apply() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        d.lock()
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Approved, None)
+            .unwrap();
+
+        let frozen = serde_json::json!({"base_branch": "develop"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &frozen,
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+
+        let frozen = serde_json::json!({"resolver_agent": "codex"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &frozen,
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+
+        // A non-frozen field on the same (approved) guardian still applies.
+        let allowed = serde_json::json!({"name": "still renamable"}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &allowed,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"name\":\"still renamable\""));
+    }
+
+    #[test]
+    fn guardian_details_squash_is_a_full_membership_diff() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let project = "/repo".to_string();
+
+        let on = serde_json::json!({"squash_projects": [project.clone()]}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &on);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["squash_projects"],
+            serde_json::json!([project])
+        );
+
+        let off = serde_json::json!({"squash_projects": []}).to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &off);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["squash_projects"],
+            serde_json::json!([]),
+            "an empty desired list turns every project's squash back off"
+        );
+    }
+
+    #[test]
+    fn guardian_details_env_overrides_set_unset_and_clear_in_one_request() {
+        let d = daemon();
+        let gid = {
+            let store = d.lock();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store.add_guardian_branch(&id, "feat").unwrap();
+            id
+        };
+        let bid = d.lock().get_guardian(&gid).unwrap().branches[0].id.clone();
+
+        let body = serde_json::json!({
+            "build_env": {"set": {"A": "1"}},
+            "manual_checks_env": {"set": {"B": "2"}},
+            "branch_env": {bid.clone(): {"set": {"C": "3"}}},
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["guardian"]["build_env_overrides"]["A"], "1");
+        assert_eq!(v["guardian"]["manual_checks_env_overrides"]["B"], "2");
+        assert_eq!(v["guardian"]["branches"][0]["env_overrides"]["C"], "3");
+
+        // unset tombstones a key, clear reverts a key back to inherited --
+        // exercise both in the same follow-up batch.
+        let body = serde_json::json!({
+            "build_env": {"unset": ["A"]},
+            "manual_checks_env": {"clear": ["B"]},
+        })
+        .to_string();
+        let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["build_env_overrides"]["A"],
+            serde_json::Value::Null
+        );
+        assert!(
+            !v["guardian"]["manual_checks_env_overrides"]
+                .as_object()
+                .unwrap()
+                .contains_key("B")
+        );
+    }
+
+    #[test]
+    fn guardian_details_validates_env_keys_and_values() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+
+        let bad_key = serde_json::json!({"build_env": {"set": {"NOT VALID": "1"}}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &bad_key,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        let bad_value =
+            serde_json::json!({"build_env": {"set": {"A": "first\necho INJECTED"}}}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &bad_value,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        // The rejected batch must not have partially applied.
+        let g = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        assert!(!g.body.contains("\"A\":\"first"));
+    }
+
+    /// RAL-410 core regression: the whole point of one batched endpoint with
+    /// one decision point is that a save touching only cosmetic fields must
+    /// never restart an in-flight merge, while a save touching a
+    /// rebase-relevant field must restart it exactly once -- not once per
+    /// field the way the pre-RAL-410 per-field endpoints could. Uses a
+    /// branchless guardian so the restart path's eventual `kickoff_merge`
+    /// call resolves synchronously (`NoBranches`) instead of racing a spawned
+    /// background merge thread -- this test asserts the *decision*, not
+    /// whether a real rebase later succeeds (that's `guardian_merge.rs`'s
+    /// job, see `settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect`).
+    #[test]
+    fn guardian_details_restarts_merge_only_when_something_rebase_relevant_changed() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        d.lock()
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merging, None)
+            .unwrap();
+
+        // Cosmetic-only batch: must NOT touch merge state at all.
+        let cosmetic = serde_json::json!({
+            "name": "cosmetic rename",
+            "separate_pr_branch": true,
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &cosmetic,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["status"], "merging",
+            "a cosmetic-only batch must never restart an in-flight merge: {}",
+            r.body
+        );
+        assert!(v.get("base_change").is_none());
+
+        // Rebase-relevant field in the same request: must restart exactly
+        // once. `restart_guardian_merge` resets to `collecting` before
+        // re-attempting; with no branches the re-attempt fails fast
+        // (`NoBranches`) and never re-claims `merging`, so landing on
+        // `collecting` here is proof the restart ran exactly once.
+        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &rebase_relevant,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["status"], "collecting",
+            "a rebase-relevant field must trigger the restart path exactly once: {}",
+            r.body
+        );
     }
 
     // -----------------------------------------------------------------------

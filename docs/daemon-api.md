@@ -103,6 +103,7 @@ where one exists.
 | GET | `/api/guardians/{id}/logs` | State-transition audit log (bare array) |
 | POST | `/api/guardians/{id}/rename` | Rename |
 | POST | `/api/guardians/{id}/settings` | Update opt-out settings (only present fields change) |
+| POST | `/api/guardians/{id}/details` | [Batched board-only update](#post-apiguardiansiddetails) — supersets rename/settings/base/squash/env endpoints, at most one rebase side effect |
 | POST | `/api/guardians/{id}/squash` | [Per-project commit squashing](#post-apiguardiansidsquash) |
 | DELETE | `/api/guardians/{id}` | Delete + purge worktrees/branches |
 | POST | `/api/guardians/{id}/branches` | Add a branch |
@@ -1510,6 +1511,17 @@ failure never blocks this review's merge -- it's recorded as a one-shot
 branch's state is found already covered by an open PR (whether via a fresh
 auto-submit or a manual `review pr submit`).
 
+RAL-389: auto-submit runs on its own async worker thread per guardian,
+independent of the merge worker that rebases the review's worktrees -- a slow
+or hanging forge call never delays remediation of the review's other
+branches. `BranchView.pr_submission_pending` is `true` while a branch's
+request is durably queued or actively running; it survives a daemon restart
+(an interrupted request is resumed at startup) and is cleared the moment that
+attempt completes, success or failure. Overlapping requests for the same
+guardian never race a duplicate PR into existence -- forge/network work for
+one guardian is serialized onto a single worker at a time, coalescing any
+request that arrives while it's already running rather than dropping it.
+
 RAL-213: if the review is currently `merging`, the settings write also stops
 the in-flight merge and starts a fresh one (the same safe cancel → wait →
 reset → restart sequence `cancel_and_merge` uses), so the new setting takes
@@ -1517,6 +1529,53 @@ effect on this build rather than only the next one. This is best-effort — a
 restart hiccup is logged, not surfaced as an error, since the settings write
 itself has already succeeded by that point. The returned `GuardianView`
 reflects the fresh `merging` status when this fires.
+
+### `POST /api/guardians/{id}/details`
+RAL-410: board-only convenience endpoint backing the librarian's "Edit
+Details" modal. A single request that supersets `POST .../rename`,
+`POST .../settings`, `POST .../base`, `POST .../squash`,
+`POST .../build-env`, `POST .../manual-checks-env`, and
+`POST .../branches/{branch_id}/env` — every one of those individual
+endpoints remains in place unchanged, since the CLI and MCP call them
+directly; this endpoint exists purely so the board can batch several edits
+into one transaction instead of firing one request per field. See
+`GuardianDetailsBody` in `daemon/src/server.rs` for the exhaustive field
+list; every field is optional and only present fields are changed.
+
+Field-by-field, this replaces:
+
+| `/details` field | Replaces |
+|---|---|
+| `name` | `POST .../rename` |
+| `base_branch` | `POST .../base` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_auto_build`, `skip_worktrees`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
+| `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
+
+Like `POST .../base`, changing `base_branch` or `resolver_agent`/
+`resolver_model` on an `approved`/`deployed` review is rejected with `409`;
+every other field on the same request still applies even when those two are
+blocked.
+
+Unlike `POST .../settings` — which restarts an in-flight (`merging`) review
+on *any* field write, even a purely cosmetic one like a rename — this
+endpoint computes a single `rebase_relevant` decision across the whole
+batch (true if `base_branch`, `resolver_agent`/`resolver_model`,
+`skip_auto_build`, `skip_worktrees`, `squash_projects`, or any env-override
+field was present) and takes **at most one** action at the end: restart the
+merge once if the review is already `merging` and something rebase-relevant
+changed, or kick off one merge if it wasn't merging and something
+rebase-relevant changed (mirroring `POST .../base`'s not-already-merging
+kickoff). A batch containing only cosmetic fields (a rename, a PR-branch
+naming toggle, etc.) never touches merge state, even bundled into the same
+request as other changes. This is the fix for the pre-RAL-410 board UI,
+where several independently-saved fields could each decide to restart the
+merge, queuing overlapping rebase attempts.
+
+Returns `200` with `{ "guardian": GuardianView, "base_change"?: { status,
+message, action? } }` — `base_change` (same shape `POST .../base` returns)
+is present only when this request's side effect actually changed the
+merge's in-flight state.
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered

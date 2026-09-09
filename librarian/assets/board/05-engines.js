@@ -116,9 +116,6 @@
       CLICK_HANDLERS.removeEnvOverrideAt = (e, ds) => removeEnvOverrideAt(ds.apiPath || "", ds.key || "");
       CLICK_HANDLERS.addEnvOverrideAt = (e, ds) => addEnvOverrideAt(ds.apiPath || "");
       CLICK_HANDLERS.editEnvOverrideAt = (e, ds) => editEnvOverrideAt(ds.apiPath || "", ds.key || "", ds.value || "");
-      CLICK_HANDLERS.clearScopedEnvOverride = (e, ds) => clearScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
-      CLICK_HANDLERS.unsetScopedEnvOverride = (e, ds) => unsetScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
-      CLICK_HANDLERS.setScopedEnvOverride = (e, ds) => setScopedEnvOverride(ds.apiPath || "", ds.key || "", ds.scopeLabel || "");
       CLICK_HANDLERS.loadCumulativeCost = (e, ds) => loadCumulativeCost(ds.cartoKey || "", ds.squadId || "", ds.elId || "", ds.cartoKind || "cell");
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
@@ -151,7 +148,7 @@
       CLICK_HANDLERS.onReviewClick = (e, ds) => onReviewClick(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
       CTX_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
-      CLICK_HANDLERS.renameReview = (e, ds) => renameReview(ds.guardianId || "");
+      CLICK_HANDLERS.openEditReviewDetailsFromMenu = (e, ds) => { closeSquadMenu(); openEditReviewDetails(ds.guardianId || ""); };
       CLICK_HANDLERS.cancelReview = (e, ds) => cancelReview(ds.guardianId || "");
       CLICK_HANDLERS.reopenReview = (e, ds) => reopenReview(ds.guardianId || "");
       CLICK_HANDLERS.deleteReview = (e, ds) => deleteReview(ds.guardianId || "");
@@ -167,30 +164,14 @@
       CLICK_HANDLERS.dismissReenable = (e, ds) => { e.stopPropagation(); dismissReenable(ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.openMoveBranchMenu = (e, ds) => { e.stopPropagation(); openMoveBranchMenu(e, ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "");
-      CLICK_HANDLERS.saveResolver = (e, ds) => saveResolver(ds.guardianId || "");
-      CLICK_HANDLERS.cancelResolver = (e, ds) => cancelResolver(ds.guardianId || "");
-      CLICK_HANDLERS.saveProofScope = (e, ds) => saveProofScope(ds.guardianId || "");
-      CLICK_HANDLERS.cancelProofScope = (e, ds) => cancelProofScope(ds.guardianId || "");
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };
-      CLICK_HANDLERS.loadBaseBranchesShowPicker = (e, ds) => {
-        loadBaseBranches(ds.guardianId || "").then(() => {
-          const i = /** @type {HTMLInputElement|null} */ (document.getElementById("base-input"));
-          if (i && i.showPicker) i.showPicker();
-        });
-      };
-      CLICK_HANDLERS.saveBase = (e, ds) => {
-        const i = /** @type {HTMLInputElement|null} */ (document.getElementById("base-input"));
-        saveBase(ds.guardianId || "", i ? i.value : "");
-      };
-      CLICK_HANDLERS.cancelBase = (e, ds) => cancelBase(ds.guardianId || "");
       CLICK_HANDLERS.selectProjectTab = (e, ds) => selectProjectTab(ds.guardianId || "", ds.project || "");
       CLICK_HANDLERS.saveReorder = (e, ds) => saveReorder(ds.guardianId || "");
       CLICK_HANDLERS.discardReorder = (e, ds) => discardReorder(ds.guardianId || "");
       CLICK_HANDLERS.mergeReview = (e, ds) => mergeReview(ds.guardianId || "", ds.status || "");
       CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
-      CLICK_HANDLERS.forceStartReview = (e, ds) => forceStartReview(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.syncPrReview = (e, ds) => syncPrReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");
@@ -232,6 +213,10 @@
       CLICK_HANDLERS.openReviewTitleMenu = (e, ds) => openReviewTitleMenu(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewPrStacks = (e, ds) => openReviewPrStacks(ds.guardianId || "");
       CLICK_HANDLERS.openEnvViewer = (e, ds) => { e.stopPropagation(); openEnvViewer(ds.apiPath || ""); };
+      CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "");
+      CLICK_HANDLERS.addEnvOverrideRow = (e, ds) => addEnvOverrideRow(ds.scope || "", ds.branchId || "");
+      CLICK_HANDLERS.removeEnvOverrideRow = (e, ds) => removeEnvOverrideRow(ds.scope || "", ds.branchId || "", Number(ds.i));
+      CLICK_HANDLERS.overrideInheritedKey = (e, ds) => overrideInheritedKey(ds.scope || "", ds.branchId || "", ds.key || "", ds.value || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;
