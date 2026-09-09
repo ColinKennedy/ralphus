@@ -16383,12 +16383,22 @@ command = "true"
         let tmux = crate::tmux::Tmux::resolve().unwrap();
         let _ = tmux.kill_session(name);
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        // A bare `echo` prints and exits almost immediately, which races the
+        // test's own HTTP-triggered capture: real tmux repaints a dead pane
+        // with a "Pane is dead (status N, <date>)" banner shortly after its
+        // command exits, and on a loaded CI runner that repaint can beat the
+        // capture to the punch and erase the marker before anyone reads it.
+        // Every caller of this helper is specifically testing "while the
+        // agent is still running" behavior, so the marker process must
+        // actually still be alive for the whole test, not just have
+        // recently printed something -- sleeping well past any test's own
+        // runtime removes the race outright instead of narrowing it.
         tmux.new_detached_session_with_command(
             name,
             &cwd,
             &std::collections::BTreeMap::new(),
-            "echo",
-            &[marker.to_string()],
+            "sh",
+            &["-c".to_string(), format!("echo {marker}; sleep 60")],
         )
         .unwrap();
         for _ in 0..50 {
