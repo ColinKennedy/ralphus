@@ -18,7 +18,7 @@ provider's business.
 > **Status:** implemented — registry, `machine` syntax, validation, remote
 > cell/proof execution, and every documented verb (`provision`, `exec`,
 > `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
-> `remove-path`, `ping`, `capabilities`, `channel`, `cleanup`), each
+> `remove-path`, `ping`, `capabilities`, `channel`, `cleanup`, `retire`), each
 > dispatched genericly through the same registry with no daemon-side
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
@@ -158,6 +158,7 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `capabilities` | `--uri` | none | **Optional.** Report what this provider/machine pairing supports. Reply `{"capabilities": {...}}` — see [`Capabilities`](../daemon/src/remote_runner.rs) (`os?`, `arch?`, `supported_ops: [String]`, `async_exec: bool`, `terminal: bool`, `runner_version?`). Every field is best-effort (`None`/omitted means "unknown", never "no"). A provider that does not implement this verb is not a failure — the daemon reads that the same way as "no capability information available", not an error. Must never have side effects (no runner upload, no workspace mutation) even when answering `runner_version` or `async_exec` would otherwise tempt one. |
 | `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
 | `cleanup` | `--uri` | [`CleanupRequest`](../daemon/src/remote_runner.rs) (`project: String`, `clone_url: String`, `branch?: String`, `remote_root?: String`) | Tear one workspace down — one worktree when `branch` is given, the whole project directory (repository plus every worktree) when it is omitted. Reply `{"removed": "<abs path on this machine>"}`. See "The `cleanup` verb and its retention policy" below. |
+| `retire` | `--uri` | [`RetireRequest`](../daemon/src/remote_runner.rs) (`path: String` — the worktree's absolute path on this machine) | **Optional**, and unlike `cleanup`, called automatically once a day per stale review worktree. Decide (and possibly carry out) one worktree-retirement attempt. Reply `{"outcome": "removed"}`, `{"outcome": "deferred", "reason?": "...", "retry_at_ms?": N}`, or `{"outcome": "opted_out", "reason?": "..."}`. See "The `retire` verb and worktree-retirement policy" below. |
 | `terminal` | `--uri --command --cols --lines` | none (raw byte stream, not JSON) | **The one verb that is not JSON request/response.** Runs `--command` on the target under an allocated pty (e.g. `ssh -tt`), with `--cols`/`--lines` setting the pty's *initial* size only (no live resize forwarding — see below). From the moment the pty connects, this process's own stdin/stdout **are** the terminal byte stream: read stdin, write it to the pty; read the pty, write it to stdout; until either side closes. Success/failure is this process's own exit code, not a trailing JSON line — see "The `terminal` verb" below. |
 
 The cell spec arrives on stdin for `exec`; the provision request arrives on
@@ -205,6 +206,73 @@ open, a dead machine), leave the workspace exactly as it was and reply
 the caller rather than swallowing it, so a human can retry or investigate. On
 success, reply `{"removed": "<abs path>"}` so the operator sees exactly what
 was torn down.
+
+### The `retire` verb and worktree-retirement policy
+
+`retire` (RAL-386) is the one verb the daemon calls **automatically** —
+once a day, per stale review worktree, from the retirement sweep
+(`guardian_merge::retire_stale_worktrees`). A worktree is stale once its
+review has been inactive for the same age threshold used for local
+worktrees (30 days); the sweep asks the owning machine's provider to decide
+what happens to it instead of running `git worktree remove` against a path
+it cannot reach directly.
+
+**Optional, and safe by default.** A provider that does not implement
+`retire` is not a failure — the daemon reads that the same way it reads an
+unanswered `capabilities` call, and treats it as `opted_out`. An existing
+provider written before RAL-386 therefore never has a remote worktree
+deleted out from under it just because the daemon learned a new verb; it
+must opt in by implementing `retire` before automatic remote retirement
+does anything.
+
+Reply with exactly one of three outcomes:
+
+- `{"outcome": "removed"}` — the worktree is gone.
+- `{"outcome": "deferred", "reason": "...", "retry_at_ms": 1699999999000}` —
+  not removed, but not a failure either (e.g. the workspace looks like it's
+  still in active use by something outside the daemon's view). `reason` and
+  `retry_at_ms` are both optional and display-only: the sweep retries on its
+  own daily cadence regardless of what `retry_at_ms` says.
+- `{"outcome": "opted_out", "reason": "..."}` — this provider (or this
+  particular worktree) is never retired automatically. `reason` is optional
+  and shown to operators so a deliberate opt-out doesn't read as a silent
+  cleanup failure.
+
+Anything else — a malformed `outcome`, or the standard `{"ok": false,
+"error": "..."}` failure envelope — is treated as a genuine failure, the
+same as a local `git worktree remove` refusal: recorded with the failure
+reason and retried on the next daily sweep.
+
+**Static opt-out, checked before the provider is ever asked.** An operator
+who already knows a machine's worktrees must never be auto-deleted (a
+shared build farm another team also inspects, say) does not need the
+provider program itself to know anything about retirement:
+
+```toml
+[machine.targets.devbox]
+machine     = "ssh:devbox"
+remote_root = "/home/me/.ralphus/remote-work"
+
+[machine.targets.devbox.retirement]
+opt_out = true
+```
+
+When set, the sweep records `opted_out` for that machine's worktrees without
+ever invoking `retire` — the provider does not need to handle this itself,
+though it is free to also return `opted_out` per worktree for its own
+reasons (e.g. a worktree with uncommitted changes it wants a human to
+inspect first).
+
+**Local retirement uses the same abstraction.** The daemon's own host is the
+built-in provider equivalent: `Workspace::retire_worktree` runs exactly the
+`git worktree remove --force --force` it always did when there is no
+machine attached, so local behavior is unaffected by, and unaware of,
+anything RAL-386 added.
+
+Every outcome — `retired`, `failed`, `deferred`, `opted_out` — is queryable
+through `GET /api/worktree-retirements`, alongside the existing
+`scheduled`/`eligible`/`claimed` states derived live from worktree age and
+claims.
 
 ### The `terminal` verb
 
