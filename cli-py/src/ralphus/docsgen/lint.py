@@ -71,12 +71,16 @@ def board_tabs() -> list[str]:
     The array used to live in board.html; since RAL-362 it lives in a
     board chunk, so both locations are searched.
     """
-    sources = [BOARD_HTML, *sorted(BOARD_CHUNKS_DIR.glob("*.js"))]
-    for source in sources:
-        match = _TABS_RE.search(source.read_text(encoding="utf-8"))
+    match = _TABS_RE.search(BOARD_HTML.read_text(encoding="utf-8"))
+    if match:
+        return _TAB_NAME_RE.findall(match.group(1))
+    for chunk in sorted(BOARD_CHUNKS_DIR.glob("*.js")):
+        match = _TABS_RE.search(chunk.read_text(encoding="utf-8"))
         if match:
             return _TAB_NAME_RE.findall(match.group(1))
-    raise RuntimeError(f"could not find `const TABS = [...]` in {[str(s) for s in sources]}")
+    raise RuntimeError(
+        f"could not find `const TABS = [...]` in {BOARD_HTML} or {BOARD_CHUNKS_DIR}/*.js"
+    )
 
 
 @dataclass
