@@ -11596,6 +11596,9 @@ mod tests {
             guard
                 .set_guardian_project_base_commit(&id, repo.to_str().unwrap(), base_sha)
                 .unwrap();
+            guard
+                .set_guardian_status(&id, GuardianStatus::InReview, None)
+                .unwrap();
             id
         };
         g(
