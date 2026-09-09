@@ -841,6 +841,7 @@ impl ForgeClient {
         if self.kind != ForgeKind::GitHub {
             return Ok(None);
         }
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
             "ralphus [forge] get stack members start kind={} repo={} stack={stack_number}",
