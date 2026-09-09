@@ -288,6 +288,13 @@ pub(crate) fn generate_agent_session_id() -> String {
 // appends them right before invoking the backend. The board shows the effective
 // read-only system prompt the agent actually received, not just the user-authored
 // cell config fragment.
+//
+// The assembled prompt (caller-authored fragment first, then these in the
+// order the `combine_system_prompts` calls below list them) is organized as
+// `## Background` -> `## Regarding Tools` -> `## Conclusion`: the
+// non-interactive and tools fragments open their own sections, and the
+// async fragment opens `## Conclusion`, so the proof/ghost fragment that
+// follows it lands inside that section.
 const PROOF_SYSTEM_PROMPT: &str = "This is a PROOF step, not a normal task. Investigate whether the \
      task holds, attempting to fix any problems you find so the check passes \
      if you can reasonably do so. When you are done, your FINAL line of \
@@ -302,26 +309,32 @@ const GHOST_SYSTEM_PROMPT: &str = "Operational logging note, not a request to ch
      things a future agent could NOT already learn by reading `git log` or \
      the diff: places you struggled, workarounds you used, issues you noticed \
      but did not fix, and open questions. This is not a changelog. If there \
-     is nothing worth handing off, write 'RALPHUS_GHOST: (nothing to report)'. \
-     Keep it brief.";
-const ASYNC_SYSTEM_PROMPT: &str = "This is a single, non-interactive invocation with no later turn — \
-     nothing will check back on you. Never use an asynchronous/background/\
-     'notify me later' tool for anything this session depends on, and never \
-     launch the thing you are checking as a background/detached process and \
-     end your turn while it is still running; those require a persistent \
-     session this invocation does not have. If a check genuinely takes a long \
-     time, block and wait for it synchronously in the foreground within this \
-     same turn — it is fine for that to take a long time. If, despite that, \
-     you truly cannot reach a definitive result before you must stop, end \
-     your reply with 'RALPHUS_STILL_WORKING: <one-line reason>' as the last \
-     line instead of trailing off — you will be re-invoked shortly to \
-     continue synchronously from where you left off, though only a bounded \
-     number of times, so prefer just finishing the check yourself.";
-const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "You are running unattended in a non-interactive cell — no human is \
-     available to answer questions or approve a plan. Never ask a clarifying \
-     question, never stop to present a plan for confirmation, and never pause \
-     waiting for input. Make the most reasonable judgment call yourself and \
-     continue until the task is complete.";
+     is truly nothing worth flagging, write 'RALPHUS_GHOST: (nothing to \
+     report)'.";
+const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interactive invocation — no \
+     human will check back on you or answer follow-up questions, though \
+     Ralphus may re-invoke you synchronously to continue. Never use an \
+     asynchronous/background/'notify me later' tool for anything this session \
+     depends on, and never launch the thing you are checking as a \
+     background/detached process and end your turn while it is still running; \
+     those require a persistent session this invocation does not have. If a \
+     check genuinely takes a long time, block and wait for it synchronously \
+     in the foreground within this same turn — it is fine for that to take a \
+     long time. If, despite that, you truly cannot reach a definitive result \
+     before you must stop, end your reply with 'RALPHUS_STILL_WORKING: \
+     <one-line reason>' as the last line instead of trailing off — you will \
+     be re-invoked shortly to continue synchronously from where you left \
+     off, though only a bounded number of times, so prefer just finishing \
+     the check yourself.";
+const TOOLS_SYSTEM_PROMPT: &str = "## Regarding Tools\nPrefer `rg` for shell searches; \
+     use `grep` only when `rg` is unavailable or you need grep-specific \
+     behavior. In shell examples, use `rg \"pattern\" .`.";
+const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unattended in a non-interactive \
+     cell — no human is available to answer questions or approve a plan. \
+     Never ask a clarifying question, never stop to present a plan for \
+     confirmation, and never pause waiting for input. Make the most \
+     reasonable judgment call yourself and continue until the task is \
+     complete.";
 
 fn combine_system_prompts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     let combined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n");
@@ -366,6 +379,7 @@ pub(crate) fn effective_cell_system_prompt(
     combine_system_prompts([
         base.as_deref(),
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+        Some(TOOLS_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
         Some(GHOST_SYSTEM_PROMPT),
     ])
@@ -376,6 +390,7 @@ pub(crate) fn effective_proof_system_prompt(spec_system_prompt: Option<&str>) ->
     combine_system_prompts([
         spec_system_prompt,
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+        Some(TOOLS_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
         Some(PROOF_SYSTEM_PROMPT),
     ])
@@ -581,6 +596,7 @@ impl RunnerSpec {
             combine_system_prompts([
                 self.system_prompt.as_deref(),
                 Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+                Some(TOOLS_SYSTEM_PROMPT),
                 Some(ASYNC_SYSTEM_PROMPT),
                 Some(GHOST_SYSTEM_PROMPT),
             ])
@@ -2172,6 +2188,79 @@ mod tests {
         ));
         // No sentinel at all.
         assert!(!pane_shows_done_sentinel("still working on it...\n"));
+    }
+
+    /// Asserts the structure of the fully assembled unattended-cell system
+    /// prompt (caller-authored fragment + ralphus fragments joined with blank
+    /// lines), the form the board shows and the backend receives -- not just
+    /// the individual constants.
+    fn assert_assembled_prompt_sections(sp: &str, caller_first_line: &str) {
+        assert!(
+            sp.starts_with(caller_first_line),
+            "caller-authored fragment must come first: {sp}"
+        );
+        let background = sp.find("## Background\n").expect("Background section");
+        let tools = sp
+            .find("## Regarding Tools\n")
+            .expect("Regarding Tools section");
+        let conclusion = sp.find("## Conclusion\n").expect("Conclusion section");
+        assert!(background < tools && tools < conclusion);
+        // Tool guidance: prefer rg, allow grep as fallback, example form.
+        assert!(sp.contains("Prefer `rg` for shell searches"), "{sp}");
+        assert!(
+            sp.contains("use `grep` only when `rg` is unavailable"),
+            "{sp}"
+        );
+        assert!(sp.contains("use `rg \"pattern\" .`"), "{sp}");
+        // Synchronous-execution constraints with the exact escape marker.
+        assert!(
+            sp.contains("never launch the thing you are checking as a background"),
+            "{sp}"
+        );
+        assert!(
+            sp.contains("'RALPHUS_STILL_WORKING: <one-line reason>'"),
+            "{sp}"
+        );
+    }
+
+    #[test]
+    fn assembled_unattended_cell_system_prompt_is_sectioned() {
+        let sp = effective_cell_system_prompt(
+            Some("Do NOT commit and do NOT push under any circumstances."),
+            &[],
+        );
+        assert_assembled_prompt_sections(
+            &sp,
+            "Do NOT commit and do NOT push under any circumstances.",
+        );
+        // Ghost handoff contract with the exact marker and 5-bullet cap.
+        assert!(
+            sp.contains("exact marker 'RALPHUS_GHOST:', followed by up to 5 short"),
+            "{sp}"
+        );
+        assert!(sp.contains("'RALPHUS_GHOST: (nothing to report)'"), "{sp}");
+        assert!(!sp.contains("RALPHUS_PROOF:"), "{sp}");
+        // No human follow-up, but Ralphus itself may re-invoke synchronously.
+        assert!(sp.contains("no human will check back on you"), "{sp}");
+        assert!(
+            sp.contains("Ralphus may re-invoke you synchronously"),
+            "{sp}"
+        );
+    }
+
+    #[test]
+    fn assembled_proof_system_prompt_is_sectioned() {
+        let sp = effective_proof_system_prompt(Some(
+            "Do NOT commit and do NOT push under any circumstances.",
+        ));
+        assert_assembled_prompt_sections(
+            &sp,
+            "Do NOT commit and do NOT push under any circumstances.",
+        );
+        // Proof steps get the verdict contract, not the ghost handoff.
+        assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
+        assert!(sp.contains("RALPHUS_PROOF: FAIL"), "{sp}");
+        assert!(!sp.contains("RALPHUS_GHOST:"), "{sp}");
     }
 
     #[test]
