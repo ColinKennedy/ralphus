@@ -2346,7 +2346,7 @@ fn resolve_conflicts_with_agent(
 /// Sets the branch's merge status to [`MergeStatus::ProofPending`] for the
 /// call's duration -- the caller clears it (to `conflict_resolved`) once this
 /// returns. Reuses the `proof: true` `RunnerSpec` contract (same
-/// `RALPHUS_VERIFY: PASS/FAIL` marker-parsing, fail-closed on no verdict) that
+/// `RALPHUS_PROOF: PASS/FAIL` marker-parsing, fail-closed on no verdict) that
 /// `agent`-kind task proof steps already use.
 ///
 /// Never fails the branch: like the quality-bar instructions it carries, this
