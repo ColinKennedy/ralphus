@@ -63,7 +63,7 @@ def _log(message: str) -> None:
     print(f"ralphus [docsgen] {message}", file=sys.stderr)
 
 
-def board_source() -> str:
+def _board_source() -> str:
     """Return the board chunks in the same order the page loads them."""
     html = BOARD_HTML.read_text(encoding="utf-8")
     chunks = _BOARD_CHUNK_RE.findall(html)
@@ -76,7 +76,7 @@ def board_source() -> str:
 
 def board_tabs() -> list[str]:
     """The GUI's own list of tabs, parsed from its loaded `TABS` array."""
-    match = _TABS_RE.search(board_source())
+    match = _TABS_RE.search(_board_source())
     if not match:
         raise RuntimeError(
             f"could not find `const TABS = [...]` in board chunks loaded by {BOARD_HTML}"

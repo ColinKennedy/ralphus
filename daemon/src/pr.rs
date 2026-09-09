@@ -3797,6 +3797,7 @@ fn submit_stack_for_guardian(
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                     crate::rlog!(WARNING, "ralphus [pr] review {id} create stack failed: {e}");
                 }
             }
@@ -3813,6 +3814,7 @@ fn submit_stack_for_guardian(
                         .expect("poisoned")
                         .clear_guardian_forge_stack_number(id);
                     if let Err(clear_error) = clear_result {
+                        // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                         crate::rlog!(
                             WARNING,
                             "ralphus [pr] review {id} could not clear missing github pr stack {stack_number}: {clear_error}"
@@ -3827,13 +3829,17 @@ fn submit_stack_for_guardian(
                                 );
                             }
                             Ok(None) => {}
-                            Err(create_error) => crate::rlog!(
-                                WARNING,
-                                "ralphus [pr] review {id} could not replace missing github pr stack {stack_number}: {create_error}"
-                            ),
+                            Err(create_error) => {
+                                // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+                                crate::rlog!(
+                                    WARNING,
+                                    "ralphus [pr] review {id} could not replace missing github pr stack {stack_number}: {create_error}"
+                                );
+                            }
                         }
                     }
                 } else {
+                    // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                     crate::rlog!(
                         WARNING,
                         "ralphus [pr] review {id} add to stack {stack_number} failed: {e}"
@@ -3857,18 +3863,25 @@ fn submit_stack_for_guardian(
                         "ralphus [pr] review {id} rebuilt github pr stack {stack_number} as {new_stack_number}"
                     ),
                     Ok(None) => {}
-                    Err(e) => crate::rlog!(
-                        WARNING,
-                        "ralphus [pr] review {id} could not rebuild github pr stack {stack_number}: {e}"
-                    ),
+                    Err(e) => {
+                        // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} could not rebuild github pr stack {stack_number}: {e}"
+                        );
+                    }
                 }
             }
-            Err(e) => crate::rlog!(
-                WARNING,
-                "ralphus [pr] review {id} could not dissolve mismatched github pr stack {stack_number}: {e}"
-            ),
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not dissolve mismatched github pr stack {stack_number}: {e}"
+                );
+            }
         },
         StackAction::Skip { reason } => {
+            // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
             crate::rlog!(
                 DEBUG,
                 "ralphus [pr] review {id} skipping stack registration: {reason}"
