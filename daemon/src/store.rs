@@ -675,6 +675,26 @@ pub struct Store {
     /// than strictly necessary, not a correctness issue. See
     /// `guardian_merge::queue_final_summary_regen`/`sweep_pending_summaries`.
     guardian_summary_debounce: HashMap<String, GuardianSummaryDebounce>,
+    /// Exclusive ownership of one review branch's mutable worktree, keyed by
+    /// `(guardian_id, branch_id)` and valued by an owner tag (e.g.
+    /// `feedback:{branch_id}`) — see the `worktree lease` glossary entry.
+    /// `run_feedback` holds one for the duration of its resolver call so a
+    /// concurrent restack can never rebase a branch out from under a
+    /// still-running feedback pass. In-memory only: a daemon restart mid-lease
+    /// simply drops it, which is safe since the worktree itself is re-checked
+    /// for dirt on the next pass through `drive_rebase`.
+    guardian_worktree_leases: HashMap<(String, String), String>,
+    /// A pending restack request per guardian, coalesced to the lowest
+    /// requested `from_position` — a later request for a *later* position
+    /// while an earlier one is still queued would otherwise lose ground
+    /// already claimed. Cleared by [`Store::try_claim_guardian_restack`].
+    guardian_restack_requests: HashMap<String, i64>,
+    /// Guardians with a restack currently claimed (running). A restack may
+    /// only be claimed when no branch of the guardian holds a worktree lease,
+    /// and no new worktree lease may be acquired while the guardian's id is
+    /// in this set — see [`Store::try_claim_guardian_restack`] and
+    /// [`Store::try_acquire_guardian_worktree_lease`].
+    guardian_restack_running: std::collections::HashSet<String>,
     /// RAL-241: which `crate::tmux::session_name` keys have already had a
     /// stall escalation enqueued for their *current* stall onset, and when
     /// that onset's last-known-good activity timestamp was — so a still-
@@ -765,6 +785,99 @@ fn tighten_unix_db_permissions(db_path: &Path) {
 }
 
 impl Store {
+    /// Claim exclusive ownership of `branch_id`'s worktree for `owner`
+    /// (typically `feedback:{branch_id}`). Fails while a restack is running
+    /// for this guardian (a restack always wants every branch lease free
+    /// before it starts, so a new lease must not appear mid-restack) or
+    /// while another owner already holds this branch's lease. See the
+    /// `worktree lease` glossary entry.
+    pub(crate) fn try_acquire_guardian_worktree_lease(
+        &mut self,
+        guardian_id: &str,
+        branch_id: &str,
+        owner: &str,
+    ) -> bool {
+        if self.guardian_restack_running.contains(guardian_id) {
+            return false;
+        }
+        let key = (guardian_id.to_string(), branch_id.to_string());
+        if self.guardian_worktree_leases.contains_key(&key) {
+            return false;
+        }
+        self.guardian_worktree_leases.insert(key, owner.to_string());
+        true
+    }
+
+    /// Release `branch_id`'s worktree lease, but only if `owner` is the
+    /// current holder — a stale caller (e.g. a retried request) can never
+    /// release a lease it no longer owns. Returns whether it actually
+    /// released one.
+    pub(crate) fn release_guardian_worktree_lease(
+        &mut self,
+        guardian_id: &str,
+        branch_id: &str,
+        owner: &str,
+    ) -> bool {
+        let key = (guardian_id.to_string(), branch_id.to_string());
+        if self.guardian_worktree_leases.get(&key).map(String::as_str) != Some(owner) {
+            return false;
+        }
+        self.guardian_worktree_leases.remove(&key);
+        true
+    }
+
+    /// The current lease owner for `branch_id`'s worktree, if any — used by
+    /// `drive_rebase` to wait out a concurrent feedback pass before touching
+    /// the worktree.
+    pub(crate) fn guardian_worktree_lease_owner(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Option<String> {
+        self.guardian_worktree_leases
+            .get(&(guardian_id.to_string(), branch_id.to_string()))
+            .cloned()
+    }
+
+    /// Queue a restack starting at `from_position` for `guardian_id`,
+    /// coalescing with any already-queued request by keeping the lower
+    /// position — a restack from a later position can never safely replace
+    /// one already promised to reach further back into the stack.
+    pub(crate) fn request_guardian_restack(&mut self, guardian_id: &str, from_position: i64) {
+        self.guardian_restack_requests
+            .entry(guardian_id.to_string())
+            .and_modify(|p| *p = (*p).min(from_position))
+            .or_insert(from_position);
+    }
+
+    /// Claim the queued restack request for `guardian_id`, if one exists and
+    /// no branch of the guardian currently holds a worktree lease (a restack
+    /// must see every branch's worktree quiescent before it starts rebasing
+    /// them) and no restack is already running for it. On success, the
+    /// guardian is marked running until [`Store::finish_guardian_restack`]
+    /// is called, and the coalesced position is returned and removed from
+    /// the queue.
+    pub(crate) fn try_claim_guardian_restack(&mut self, guardian_id: &str) -> Option<i64> {
+        if self.guardian_restack_running.contains(guardian_id)
+            || self
+                .guardian_worktree_leases
+                .keys()
+                .any(|(gid, _)| gid == guardian_id)
+        {
+            return None;
+        }
+        let position = self.guardian_restack_requests.remove(guardian_id)?;
+        self.guardian_restack_running
+            .insert(guardian_id.to_string());
+        Some(position)
+    }
+
+    /// Mark `guardian_id`'s claimed restack finished, allowing a new restack
+    /// claim or worktree lease acquisition.
+    pub(crate) fn finish_guardian_restack(&mut self, guardian_id: &str) {
+        self.guardian_restack_running.remove(guardian_id);
+    }
+
     /// Open (creating if needed) a store at `path`, in WAL mode.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -775,6 +888,9 @@ impl Store {
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -792,6 +908,9 @@ impl Store {
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -8538,6 +8657,9 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -8654,6 +8776,9 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -8743,6 +8868,9 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -8784,6 +8912,9 @@ command = "cargo test"
             event_bus: crate::events::EventBus::new(),
             live_activity: HashMap::new(),
             guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
         };
@@ -12534,6 +12665,33 @@ command = "check-c"
                 .take_due_final_summary_requests(10_000, 5_000)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn guardian_restack_waits_for_all_parallel_branch_leases_and_coalesces() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
+        assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
+        store.request_guardian_restack("g", 4);
+        store.request_guardian_restack("g", 2);
+        store.request_guardian_restack("g", 3);
+        assert_eq!(store.try_claim_guardian_restack("g"), None);
+        assert!(store.release_guardian_worktree_lease("g", "a", "feedback:a"));
+        assert_eq!(store.try_claim_guardian_restack("g"), None);
+        assert!(store.release_guardian_worktree_lease("g", "b", "feedback:b"));
+        assert_eq!(store.try_claim_guardian_restack("g"), Some(2));
+        assert_eq!(store.try_claim_guardian_restack("g"), None);
+        assert!(!store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
+        store.finish_guardian_restack("g");
+        assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
+    }
+
+    #[test]
+    fn guardian_distinct_branch_feedback_leases_are_concurrent() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
+        assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
+        assert!(!store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a2"));
     }
 
     /// RAL-230: the DB file (and its WAL/SHM siblings, when SQLite has
