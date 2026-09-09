@@ -26,6 +26,7 @@ uv run pytest                       # run one: uv run pytest -k name
 | File | Covers |
 |---|---|
 | `test_docsgen_helpmap.py` | `helpmap_docs.py`'s marker splice + drift-check logic, and a real (non-mocked) call into the compiled `ralphus show help-map` |
+| `test_docsgen_lint.py` | `lint.py`'s `board_tabs()` scan: the `TABS` array found in a `board/*.js` chunk, in board.html itself, or nowhere (error) |
 | `test_bench_storage.py` | Bench record read/write, filename hashing |
 | `test_bench_graphs.py` | SVG/HTML rendering from stored records |
 | `test_bench_gitinfo.py` | Git commit/dirty-state detection |

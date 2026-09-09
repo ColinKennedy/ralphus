@@ -20,6 +20,8 @@ nav:
       - Users: views/users.md
       - Secrets: views/secrets.md
       - Preferences: views/prefs.md
+  - Reference:
+      - Special syntax & markers: special-syntax.md
 
 theme:
   name: material

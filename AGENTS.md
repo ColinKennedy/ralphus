@@ -191,6 +191,13 @@ meanings harder to read, and a collision is painful to undo once it has reached
 the schema, the store, and the board. That document also lists the words already
 carrying too much weight to take, with the alternative to use instead.
 
+**Words that trigger behavior are tabulated in
+[`docs/special-syntax.md`](docs/special-syntax.md)** — the `<<…>>` sentinels,
+entity URIs/selectors, the unattended-reply markers (`RALPHUS_PROOF:`,
+`RALPHUS_STILL_WORKING:`, `RALPHUS_GHOST:`), and the reviewer-mode `feedback`
+convention that routes change requests into a review's worktrees, with what is
+machine-parsed kept separate from what is only a prompt convention.
+
 **When you take a new word, add it to the glossary.**
 
 ## Design / UI colors

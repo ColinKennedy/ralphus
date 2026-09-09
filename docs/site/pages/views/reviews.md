@@ -46,3 +46,7 @@ branch's review worktree, amends the affected commit, and pushes the update,
 posting a short acknowledgment back to the thread. The branch's merge status
 and the change summary refresh automatically once that lands, so you see the
 result of your feedback without triggering anything yourself.
+
+That feedback routing (what the word does in reviewer mode — and what it
+doesn't — plus the per-branch selector and restack effects) is documented in
+the repo's [special syntax & markers](../special-syntax.md) guide.
