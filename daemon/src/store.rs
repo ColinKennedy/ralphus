@@ -2100,6 +2100,16 @@ impl Store {
             // Caller-claimed until RAL-252 makes authentication authoritative.
             "ALTER TABLE guardian_messages ADD COLUMN author TEXT",
             "ALTER TABLE guardian_messages ADD COLUMN submitted_by TEXT",
+            // RAL-380: durable, read-only completion status for a "reviewer"-role
+            // message -- `received` (Ralphus accepted the feedback and started
+            // applying it), `done` (the resolver agent's pass finished
+            // successfully), `failed` (it errored), or `superseded` (a newer
+            // feedback message was submitted on the same branch before this one
+            // finished, so its outcome is no longer trustworthy). Set at insert
+            // time by `Store::add_guardian_message` for every "reviewer"-role row
+            // and NULL for a "guardian"-role row, which isn't actionable. NULL
+            // for every pre-existing row.
+            "ALTER TABLE guardian_messages ADD COLUMN action_status TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

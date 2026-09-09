@@ -17446,6 +17446,40 @@ command = "true"
     }
 
     #[test]
+    fn feedback_message_is_received_immediately_and_exposed_via_the_messages_api() {
+        // RAL-380: the board reads completion state from this same endpoint --
+        // the reviewer message must carry `action_status` the moment the
+        // `202` response comes back, before the background resolver-agent
+        // pass even starts.
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        d.lock().add_guardian_branch(gid, "feature/a").unwrap();
+        let branch_id = d.lock().get_guardian(gid).unwrap().branches[0].id.clone();
+        d.lock()
+            .set_branch_review(gid, &branch_id, "feature/a", "/tmp/wt")
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/feedback"),
+            "{\"feedback\":\"please fix\"}",
+        );
+        assert_eq!(r.status, 202);
+
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/messages"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"action_status\":\"received\""));
+    }
+
+    #[test]
     fn feedback_rejects_an_unregistered_author() {
         let d = daemon();
         let body =

@@ -2694,6 +2694,11 @@ pub fn recover_interrupted_reviews(
 /// runner via `MachineRouter`, `guardian:{gid}`-keyed cancel token) since this
 /// is the same work, just re-entered from recovery instead of a fresh
 /// `POST .../feedback` request.
+///
+/// RAL-380: looked up just before spawning (not passed in from the caller) --
+/// at startup, before any new feedback can have been submitted, the still-
+/// `received` message on this branch (if any survived whatever crashed) is
+/// unambiguously the one this recovery run is resuming.
 fn resume_feedback(
     store: &Arc<Mutex<Store>>,
     sem: &Arc<Semaphore>,
@@ -2714,12 +2719,18 @@ fn resume_feedback(
             Arc::clone(&store),
         ));
         let token = cancellations.register(&format!("guardian:{gid}"));
+        let message_seq = store
+            .lock()
+            .expect("poisoned")
+            .latest_received_feedback_message_seq(&gid, &branch_id)
+            .unwrap_or_default();
         crate::guardian_merge::run_feedback(
             &store,
             runner.as_ref(),
             &gid,
             &branch_id,
             &feedback,
+            message_seq,
             &token,
         );
         cancellations.remove(&format!("guardian:{gid}"));

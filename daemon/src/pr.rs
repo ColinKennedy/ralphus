@@ -4699,6 +4699,9 @@ fn action_pr_feedback_inner(
         &pr.guardian_id,
         &branch_id,
         &feedback,
+        // RAL-380: this feedback is synthesized from several forge comments,
+        // not one stored "reviewer" message -- there is nothing to mark.
+        None,
         &crate::cancel::CancelToken::never(),
     );
 

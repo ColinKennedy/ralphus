@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::{CancelToken, Cancellations};
-use crate::guardian::{CheckInput, CheckInputType, GuardianCheck, GuardianStatus, MergeStatus};
+use crate::guardian::{
+    CheckInput, CheckInputType, FeedbackActionStatus, GuardianCheck, GuardianStatus, MergeStatus,
+};
 use crate::runner::{Runner, RunnerSpec};
 use crate::scheduler::Semaphore;
 use crate::server::Reply;
@@ -3693,7 +3695,16 @@ pub fn start_feedback(
         }
         None => return reply(404, &error_body("not_found", "no such branch")),
     };
-    if let Err(e) = store.lock().expect("poisoned").add_guardian_message(
+    // RAL-380: any earlier feedback message on this branch that's still
+    // `received` (i.e. its own `run_feedback` pass hasn't finished yet) is
+    // about to be overtaken by this one -- mark it `superseded` before
+    // inserting the new message so its bubble never reads as still in
+    // progress (or, worse, completed) once this newer request lands.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .supersede_pending_branch_feedback(id, branch_id);
+    let message_seq = match store.lock().expect("poisoned").add_guardian_message(
         id,
         "reviewer",
         &feedback,
@@ -3702,8 +3713,9 @@ pub fn start_feedback(
         author.as_deref(),
         submitted_by.as_deref(),
     ) {
-        return reply(500, &error_body("internal", &e.to_string()));
-    }
+        Ok(seq) => seq,
+        Err(e) => return reply(500, &error_body("internal", &e.to_string())),
+    };
     let sid = id.to_string();
     let bid = branch_id.to_string();
     std::thread::spawn(move || {
@@ -3714,6 +3726,7 @@ pub fn start_feedback(
             &sid,
             &bid,
             &feedback,
+            Some(message_seq),
             &CancelToken::never(),
         );
         crate::rlog!(
@@ -5171,20 +5184,43 @@ pub struct FeedbackOutcome {
 /// rebuild the combined worktree. The task worktrees are never touched.
 /// Deliberately not PR-system-aware -- see [`push_feedback_branch`]'s doc
 /// comment. Runs synchronously (spawned by [`start_feedback`]).
+///
+/// `message_seq` (RAL-380) is the `seq` of the "reviewer" message this call is
+/// acting on, when there is one to report back to -- `None` for the
+/// PR-comment-aggregation caller (`pr::action_pr_feedback_inner`), which
+/// synthesizes its feedback text from several forge comments rather than one
+/// stored message.
 pub fn run_feedback(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
     id: &str,
     branch_id: &str,
     feedback: &str,
+    message_seq: Option<i64>,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
+    // RAL-380: mark the reviewer message this call was invoked for as
+    // `Failed` -- used on every early-exit path below that bails out before
+    // the resolver agent (and therefore the main completion block further
+    // down) ever runs.
+    let fail_message = || {
+        if let Some(seq) = message_seq {
+            let _ = store
+                .lock()
+                .expect("poisoned")
+                .set_message_action_status(seq, FeedbackActionStatus::Failed);
+        }
+    };
     let guardian = match store.lock().expect("poisoned").get_guardian(id) {
         Ok(g) => g,
-        Err(_) => return FeedbackOutcome::default(),
+        Err(_) => {
+            fail_message();
+            return FeedbackOutcome::default();
+        }
     };
     let base = guardian.base_branch.clone();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+        fail_message();
         return FeedbackOutcome::default();
     };
     // RAL-375: persist the feedback text durably before any work begins, so
@@ -5246,6 +5282,7 @@ pub fn run_feedback(
             GuardianStatus::MergeFailed,
             Some("no review worktree yet; run the merge first"),
         );
+        fail_message();
         return FeedbackOutcome::default();
     };
     let feature = branch.branch.clone();
@@ -5291,6 +5328,7 @@ pub fn run_feedback(
                 GuardianStatus::MergeFailed,
                 Some(&format!("unresolvable resolver agent: {message}")),
             );
+            fail_message();
             return FeedbackOutcome::default();
         }
     };
@@ -5496,6 +5534,21 @@ pub fn run_feedback(
         branch_status,
         Some(&detail),
     );
+    // RAL-380: resolve the reviewer message this run was acting on to a
+    // terminal status matching the branch outcome above -- two checkmarks on
+    // `Done`, the failed indicator on `Failed`. `set_message_action_status`
+    // no-ops if the message was already `Superseded` in the meantime.
+    if let Some(seq) = message_seq {
+        let message_status = if branch_status == MergeStatus::Failed {
+            FeedbackActionStatus::Failed
+        } else {
+            FeedbackActionStatus::Done
+        };
+        let _ = store
+            .lock()
+            .expect("poisoned")
+            .set_message_action_status(seq, message_status);
+    }
     // RAL-375: this is a real completion (success or a legitimate failure),
     // not a crash -- clear the durable pending-feedback record set at the
     // top of this function so startup recovery doesn't try to reapply

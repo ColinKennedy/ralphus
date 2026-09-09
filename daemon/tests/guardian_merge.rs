@@ -885,6 +885,7 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
         &id,
         &bid0,
         "add a note file",
+        None,
         &CancelToken::never(),
     );
 
@@ -918,6 +919,150 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-380: once `run_feedback` finishes a successful pass, the reviewer
+/// message it was invoked for (identified by its `seq`) gets marked `done` --
+/// the source of the board's two-checkmark indicator on that message's bubble.
+#[test]
+fn run_feedback_marks_its_reviewer_message_done_on_success() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    let seq = store
+        .lock()
+        .unwrap()
+        .add_guardian_message(
+            &id,
+            "reviewer",
+            "add a note file",
+            None,
+            Some(&bid0),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .guardian_branch_messages(&id, &bid0)
+            .unwrap()[0]
+            .action_status
+            .as_deref(),
+        Some("received")
+    );
+
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        Some(seq),
+        &CancelToken::never(),
+    );
+
+    let msgs = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap();
+    assert_eq!(msgs[0].action_status.as_deref(), Some("done"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-380: an agent-runner error is a distinct terminal message status from
+/// a successful pass, so a failed request is never shown with the same
+/// checkmark as one that actually completed.
+#[test]
+fn run_feedback_marks_its_reviewer_message_failed_on_agent_error() {
+    struct FailingRunner;
+    impl Runner for FailingRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult::failure("boom")
+        }
+    }
+
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+
+    let seq = store
+        .lock()
+        .unwrap()
+        .add_guardian_message(&id, "reviewer", "please fix", None, Some(&bid0), None, None)
+        .unwrap();
+
+    run_feedback(
+        &store,
+        &FailingRunner,
+        &id,
+        &bid0,
+        "please fix",
+        Some(seq),
+        &CancelToken::never(),
+    );
+
+    let msgs = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap();
+    assert_eq!(msgs[0].action_status.as_deref(), Some("failed"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// RAL-375: feedback interrupted by an unclean daemon shutdown must be
@@ -1005,6 +1150,7 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
             &gid,
             &branch_id,
             &feedback,
+            None,
             &CancelToken::never(),
         );
     }
@@ -1109,6 +1255,7 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         &id,
         &bid0,
         "add a note file",
+        None,
         &CancelToken::never(),
     );
 
@@ -1193,6 +1340,7 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
         &id,
         &bid0,
         "add a note file",
+        None,
         &CancelToken::never(),
     );
 
@@ -1326,6 +1474,7 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
         &id,
         &bid0,
         "tighten up the error messages",
+        None,
         &CancelToken::never(),
     );
 
@@ -3268,6 +3417,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
         &id,
         &bid0,
         "add a note file, don't commit",
+        None,
         &CancelToken::never(),
     );
 
@@ -3323,6 +3473,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &id,
         &bid0,
         "add note1, don't commit",
+        None,
         &CancelToken::never(),
     );
     assert!(
@@ -3337,6 +3488,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &id,
         &bid0,
         "add note2",
+        None,
         &CancelToken::never(),
     );
 

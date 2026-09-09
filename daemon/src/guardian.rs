@@ -258,6 +258,42 @@ impl MergeStatus {
     }
 }
 
+/// RAL-380: durable, read-only completion status for one "reviewer"-role
+/// feedback message -- rendered by the board as a checkmark on that message's
+/// chat bubble. Distinct from [`MergeStatus::Actioning`]/[`MergeStatus::Done`],
+/// which describe the *branch's* current rebase/feedback state as a whole;
+/// this tracks a single message's own outcome so an older bubble's checkmark
+/// can't be mistaken for a newer request's progress. `None` (no column value)
+/// on a "guardian"-role message, which isn't actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackActionStatus {
+    /// Ralphus accepted the feedback and started applying it (one checkmark).
+    Received,
+    /// The resolver agent's pass for this feedback finished successfully
+    /// (two checkmarks).
+    Done,
+    /// The resolver agent's pass (or a preceding validation step) failed.
+    Failed,
+    /// A newer feedback message was submitted on the same branch before this
+    /// one's action finished -- its eventual outcome, if any, is stale and
+    /// must not be shown as completed.
+    Superseded,
+}
+
+impl FeedbackActionStatus {
+    /// The stored lowercase string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
 /// Parse a review branch's stored env-override map (RAL-191). Unlike every
 /// other env layer this one is `{key: value|null}`, where `null` is a
 /// tombstone meaning "remove this inherited key". Malformed JSON degrades to
@@ -483,6 +519,12 @@ pub struct MessageView {
     /// authentication authoritative. `None` for any row predating this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted_by: Option<String>,
+    /// RAL-380: this message's completion status (see
+    /// [`FeedbackActionStatus`]), the source of its bubble's checkmark.
+    /// `None` for a "guardian"-role message and for any row predating this
+    /// field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_status: Option<String>,
 }
 
 /// [`GuardianView::origin`] value for a review created from an authored
@@ -1732,7 +1774,12 @@ impl Store {
     /// `branch_id` scopes the message to one review branch (RAL-272).
     /// `author` is the registered user this feedback is attributed to (shown
     /// in the UI); `submitted_by` is the resolved authenticated/default
-    /// requester (audit-only, never shown) (RAL-379).
+    /// requester (audit-only, never shown) (RAL-379). Returns the new
+    /// message's `seq`. RAL-380: a `"reviewer"`-role message starts life with
+    /// `action_status = Received` -- every message that role can ever get is
+    /// posted through `guardian_merge::start_feedback`, which always kicks
+    /// off a resolver-agent pass for it, so there is no "non-actionable
+    /// reviewer message" to special-case here.
     #[allow(clippy::too_many_arguments)]
     pub fn add_guardian_message(
         &self,
@@ -1743,9 +1790,10 @@ impl Store {
         branch_id: Option<&str>,
         author: Option<&str>,
         submitted_by: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<i64> {
+        let action_status = (role == "reviewer").then_some(FeedbackActionStatus::Received.as_str());
         self.conn.execute(
-            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image, branch_id, author, submitted_by) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO guardian_messages(guardian_id, role, text, at_ms, image, branch_id, author, submitted_by, action_status) VALUES(?,?,?,?,?,?,?,?,?)",
             params![
                 guardian_id,
                 role,
@@ -1754,10 +1802,11 @@ impl Store {
                 image,
                 branch_id,
                 author,
-                submitted_by
+                submitted_by,
+                action_status,
             ],
         )?;
-        Ok(())
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// One review branch's feedback thread, oldest first (RAL-272). Only
@@ -1769,8 +1818,8 @@ impl Store {
         branch_id: &str,
     ) -> Result<Vec<MessageView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, text, at_ms, image, author, submitted_by FROM guardian_messages \
-             WHERE guardian_id=? AND branch_id=? ORDER BY seq",
+            "SELECT seq, role, text, at_ms, image, author, submitted_by, action_status \
+             FROM guardian_messages WHERE guardian_id=? AND branch_id=? ORDER BY seq",
         )?;
         let rows = stmt
             .query_map(params![guardian_id, branch_id], |r| {
@@ -1782,10 +1831,77 @@ impl Store {
                     image: r.get(4)?,
                     author: r.get(5)?,
                     submitted_by: r.get(6)?,
+                    action_status: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// RAL-380: mark every still-`received` "reviewer" message on this branch
+    /// as `superseded` -- called right before a new feedback message is
+    /// recorded, so an older bubble's checkmark can never be mistaken for
+    /// progress on the newer request that is about to overtake it.
+    pub fn supersede_pending_branch_feedback(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_messages SET action_status=? \
+             WHERE guardian_id=? AND branch_id=? AND role='reviewer' AND action_status=?",
+            params![
+                FeedbackActionStatus::Superseded.as_str(),
+                guardian_id,
+                branch_id,
+                FeedbackActionStatus::Received.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-380: resolve one feedback message (by `seq`) to a terminal
+    /// [`FeedbackActionStatus`] once `guardian_merge::run_feedback` finishes
+    /// acting on it. Guarded on the row still being `Received` so a stale
+    /// completion (e.g. a crash-recovered re-run finishing after a newer
+    /// feedback message already superseded this one) can never clobber a
+    /// `Superseded` row back to `Done`/`Failed`.
+    pub fn set_message_action_status(&self, seq: i64, status: FeedbackActionStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_messages SET action_status=? WHERE seq=? AND action_status=?",
+            params![
+                status.as_str(),
+                seq,
+                FeedbackActionStatus::Received.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-380: the most recent still-`received` "reviewer" message's `seq`
+    /// on this branch, if any -- used only by startup recovery
+    /// (`scheduler::recover_interrupted_reviews`) to reattach a re-run
+    /// `run_feedback` call to the message it's resuming, since at that point
+    /// no other feedback round can be concurrently in flight for the branch.
+    pub fn latest_received_feedback_message_seq(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seq FROM guardian_messages \
+                 WHERE guardian_id=? AND branch_id=? AND role='reviewer' AND action_status=? \
+                 ORDER BY seq DESC LIMIT 1",
+                params![
+                    guardian_id,
+                    branch_id,
+                    FeedbackActionStatus::Received.as_str()
+                ],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Set a guardian's status (and optional detail).
@@ -5139,6 +5255,118 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].author.as_deref(), Some("alice"));
         assert_eq!(msgs[0].submitted_by.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn guardian_role_message_has_no_action_status() {
+        // RAL-380: only a "reviewer" message is actionable -- a "guardian"
+        // acknowledgment never gets a completion checkmark on the board.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_guardian_message(&id, "guardian", "ack", None, Some("branch-a"), None, None)
+            .unwrap();
+        let msgs = store.guardian_branch_messages(&id, "branch-a").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].action_status, None);
+    }
+
+    #[test]
+    fn reviewer_message_action_status_lifecycle() {
+        // RAL-380: a reviewer message starts `received`; a newer feedback
+        // message on the same branch supersedes it; and a stale completion
+        // for the superseded message must never clobber that terminal state
+        // back to `done`/`failed`.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let seq_a = store
+            .add_guardian_message(&id, "reviewer", "first", None, Some("branch-a"), None, None)
+            .unwrap();
+        assert_eq!(
+            store.guardian_branch_messages(&id, "branch-a").unwrap()[0]
+                .action_status
+                .as_deref(),
+            Some("received")
+        );
+
+        store
+            .supersede_pending_branch_feedback(&id, "branch-a")
+            .unwrap();
+        let seq_b = store
+            .add_guardian_message(
+                &id,
+                "reviewer",
+                "second",
+                None,
+                Some("branch-a"),
+                None,
+                None,
+            )
+            .unwrap();
+        let msgs = store.guardian_branch_messages(&id, "branch-a").unwrap();
+        assert_eq!(msgs[0].action_status.as_deref(), Some("superseded"));
+        assert_eq!(msgs[1].action_status.as_deref(), Some("received"));
+
+        // The first (now-stale) run finishing late must not clobber `superseded`.
+        store
+            .set_message_action_status(seq_a, FeedbackActionStatus::Done)
+            .unwrap();
+        assert_eq!(
+            store.guardian_branch_messages(&id, "branch-a").unwrap()[0]
+                .action_status
+                .as_deref(),
+            Some("superseded")
+        );
+
+        store
+            .set_message_action_status(seq_b, FeedbackActionStatus::Failed)
+            .unwrap();
+        assert_eq!(
+            store.guardian_branch_messages(&id, "branch-a").unwrap()[1]
+                .action_status
+                .as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn latest_received_feedback_message_seq_finds_the_newest_pending_one() {
+        // RAL-380: used only by startup recovery to reattach a re-run
+        // `run_feedback` call to the message it's resuming.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert_eq!(
+            store
+                .latest_received_feedback_message_seq(&id, "branch-a")
+                .unwrap(),
+            None
+        );
+        let seq = store
+            .add_guardian_message(
+                &id,
+                "reviewer",
+                "fix it",
+                None,
+                Some("branch-a"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_received_feedback_message_seq(&id, "branch-a")
+                .unwrap(),
+            Some(seq)
+        );
+        store
+            .set_message_action_status(seq, FeedbackActionStatus::Done)
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_received_feedback_message_seq(&id, "branch-a")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
