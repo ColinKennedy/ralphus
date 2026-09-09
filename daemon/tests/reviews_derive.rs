@@ -652,18 +652,15 @@ fn reviews_auto_start_when_the_run_succeeds() {
         std::thread::sleep(Duration::from_millis(25));
     }
     // What is under test is that the merge started *by itself* when the run
-    // finished -- not its verdict. The lone branch is empty, so RAL-190 fails
-    // it; reaching `merge_failed` (rather than sitting in `collecting`
-    // forever) is proof the auto-start fired.
+    // finished -- not its verdict. Depending on whether a resolver is
+    // available, this hermetic fixture fails either during resolver preflight
+    // or when RAL-190 observes the deliberately empty branch. Reaching
+    // `merge_failed` (rather than sitting in `collecting` forever) is proof
+    // the auto-start fired.
     assert_eq!(
         status, "merge_failed",
         "review should auto-start when the run succeeds; its lone branch is \
-         empty, so the merge it starts then fails on RAL-190"
-    );
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
-    assert!(
-        view.branches[0].is_empty,
-        "the merge must have run far enough to evaluate the branch"
+         empty and the merge it starts should reach a terminal failure"
     );
 
     let _ = std::fs::remove_dir_all(&base);
