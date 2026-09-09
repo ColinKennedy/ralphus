@@ -430,6 +430,9 @@ pub fn run_loop(
     // refresh -- same rationale as the ark call just above.
     crate::guardian_merge::poll_base_branch_freshness_once(&store);
     let mut last_base_branch_freshness_poll = std::time::Instant::now();
+    // RAL-389: self-heal a request lost to a crash between a branch's
+    // terminal-status write and its durable queue write.
+    crate::pr::recover_pending_auto_submits_on_startup(&store);
     recover_interrupted_reviews(&store, &sem, &cancellations);
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
@@ -470,6 +473,9 @@ pub fn run_loop(
         }
         if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);
+            // RAL-389 uses the same cheap debounce-sweep cadence while doing
+            // the actual push and forge work on background threads.
+            crate::pr::sweep_pending_pr_auto_submits_once(&store);
             last_summary_sweep = std::time::Instant::now();
         }
         if last_ark_check.elapsed() >= Duration::from_secs(3600) {

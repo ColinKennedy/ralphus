@@ -1411,6 +1411,13 @@ impl Store {
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, input_name)
             );
+            -- RAL-389: durable trailing-debounce requests for asynchronous
+            -- PR-stack submission. A later branch completion moves the same
+            -- guardian-level request forward instead of adding another job.
+            CREATE TABLE IF NOT EXISTS guardian_auto_submit_requests (
+                guardian_id     TEXT PRIMARY KEY REFERENCES guardians(id) ON DELETE CASCADE,
+                requested_at_ms INTEGER NOT NULL
+            );
             -- RAL-136: ephemeral, queryable handoff notes ('ghosts') a task
             -- cell or review worktree publishes for downstream work.  One
             -- row per owner (`owner_uri`) -- a rewrite merges onto the
@@ -7708,6 +7715,41 @@ impl Store {
         due
     }
 
+    /// Queue a guardian's PR stack for asynchronous submission, restarting
+    /// its trailing-debounce clock. The database row makes the request
+    /// durable across daemon restarts.
+    pub fn request_auto_submit_branch(&self, id: &str, now_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_auto_submit_requests (guardian_id, requested_at_ms) \
+             VALUES (?1, ?2) \
+             ON CONFLICT(guardian_id) DO UPDATE SET requested_at_ms = ?2",
+            params![id, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically claim every guardian whose auto-submit request has been
+    /// quiet for at least `debounce_ms`.
+    pub fn take_due_auto_submits(&self, now_ms: i64, debounce_ms: i64) -> Result<Vec<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let due: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT guardian_id FROM guardian_auto_submit_requests \
+                 WHERE ?1 - requested_at_ms >= ?2",
+            )?;
+            let rows = stmt.query_map(params![now_ms, debounce_ms], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        for id in &due {
+            tx.execute(
+                "DELETE FROM guardian_auto_submit_requests WHERE guardian_id=?",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(due)
+    }
+
     /// RAL-208: record that guardian `id`'s change summary now reflects
     /// `signature`, so a later request for the same signature is recognized
     /// as already-satisfied (see [`Self::request_final_summary`]).
@@ -12869,6 +12911,62 @@ command = "check-c"
                 .take_due_final_summary_requests(10_000, 5_000)
                 .is_empty()
         );
+    }
+
+    fn any_guardian(store: &Store) -> String {
+        store.create_guardian("r", "main", "/repo").unwrap()
+    }
+
+    #[test]
+    fn take_due_auto_submits_respects_debounce_window() {
+        let store = Store::open_in_memory().unwrap();
+        let id = any_guardian(&store);
+        store.request_auto_submit_branch(&id, 1_000).unwrap();
+        assert!(store.take_due_auto_submits(1_200, 400).unwrap().is_empty());
+        assert_eq!(store.take_due_auto_submits(1_400, 400).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn a_second_auto_submit_request_restarts_the_debounce_clock() {
+        let store = Store::open_in_memory().unwrap();
+        let id = any_guardian(&store);
+        store.request_auto_submit_branch(&id, 1_000).unwrap();
+        store.request_auto_submit_branch(&id, 1_200).unwrap();
+        assert!(store.take_due_auto_submits(1_400, 400).unwrap().is_empty());
+        assert_eq!(store.take_due_auto_submits(1_600, 400).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn due_auto_submit_is_claimed_once() {
+        let store = Store::open_in_memory().unwrap();
+        let id = any_guardian(&store);
+        store.request_auto_submit_branch(&id, 0).unwrap();
+        assert_eq!(store.take_due_auto_submits(400, 400).unwrap(), vec![id]);
+        assert!(store.take_due_auto_submits(400, 400).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_submit_requests_survive_store_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-auto-submit-durability-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("tasks.db");
+        let id = {
+            let store = Store::open(&db_path).unwrap();
+            let id = any_guardian(&store);
+            store.request_auto_submit_branch(&id, 1_000).unwrap();
+            id
+        };
+        let reopened = Store::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.take_due_auto_submits(1_400, 400).unwrap(),
+            vec![id]
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
