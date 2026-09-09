@@ -459,12 +459,27 @@
         if (!res.ok) { alert("Failed to remove the environment override."); return; }
         tick();
       }
+      // RALPHUS-GOTO-REVIEW:BEGIN
       /**
        * Navigates to the Reviews tab for a given guardian id.
+       * RAL-382: renders the destination synchronously — `showTab`'s tick and
+       * `pollReviews` only re-render after several awaited fetches, so without
+       * this the pane keeps showing the *previously* selected review's details
+       * while those requests are in flight. When the target isn't in the loaded
+       * `guardians` set yet, `reviewDetailLoading` makes the detail pane show a
+       * "Loading review…" placeholder until a poll delivers its data.
        * @param {string} id
        * @returns {void}
        */
-      function gotoReview(id) { selectedGuardian = id; revealedGuardianId = id; showTab("reviews", true); }
+      function gotoReview(id) {
+        selectedGuardian = id;
+        revealedGuardianId = id;
+        showTab("reviews", true);
+        renderReviews();
+        if (!findGuardian(id)) reviewDetailLoading = id;
+        renderReviewDetail();
+      }
+      // RALPHUS-GOTO-REVIEW:END
       /**
        * Navigates to a specific branch within a review, expanding its detail block.
        * @param {string} gid
@@ -482,6 +497,13 @@
           if (b != null) expandedBranches.add(`${gid}:${b.id}`);
         }
         showTab("reviews", true);
+        // RAL-382: same no-lingering rule as gotoReview — render synchronously
+        // instead of leaving the previous selection on screen during the poll;
+        // set the loading placeholder if the target isn't loaded yet (its caller
+        // normally has it, but hash/menu navigation need not).
+        if (!findGuardian(gid)) reviewDetailLoading = gid;
+        renderReviews();
+        renderReviewDetail();
       }
       /**
        * Toggles a branch row's selection within a review's branch list.
