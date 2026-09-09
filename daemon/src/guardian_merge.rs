@@ -7394,7 +7394,11 @@ fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
 
 /// Retire old guardian worktrees whose every persisted Cell, Proof, and Review
 /// claim is terminal. Old worktrees with a non-terminal claim are retained and
-/// raise one durable, per-path mailbox escalation instead.
+/// raise one durable, per-path mailbox escalation instead. An unclaimed
+/// worktree gets one sweep's advance mailbox notice before it is actually
+/// removed (RAL-386): the first sweep that finds a path eligible and
+/// unclaimed only notifies whoever is watching the review, the next sweep
+/// that still finds it eligible and unclaimed removes it.
 ///
 /// Called only from the scheduler's daily interval. Git and filesystem work
 /// happen without holding the store mutex; each short snapshot/update does.
@@ -7540,6 +7544,44 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
             }
         }
 
+        // RAL-386: give whoever is watching this review one sweep's advance
+        // notice before an unclaimed worktree is actually removed, the same
+        // durable-dedup mechanism the claimed-and-retained branch above uses
+        // (a distinct `entity_kind` so the two never collide) -- the first
+        // sweep that finds a path eligible and unclaimed only notifies and
+        // defers; the removal itself happens on the next sweep that still
+        // finds it eligible and unclaimed.
+        {
+            let guard = store.lock().expect("poisoned");
+            if guard
+                .claim_ark_notification("guardian-worktree-eligible", &key)
+                .unwrap_or(false)
+            {
+                let message = format!(
+                    "Guardian worktree {} for review {} ({}) is over 30 days old and unclaimed. It will be retired on the daemon's next worktree-retirement sweep.",
+                    record.path, record.guardian_id, record.guardian_name
+                );
+                let entity_uri = format!("guardian:{}", record.guardian_id);
+                let _ = guard.enqueue_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &message,
+                    None,
+                    None,
+                    None,
+                    Some(&entity_uri),
+                );
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&record.guardian_id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "worktree retirement scheduled -- notified watchers ahead of removal",
+                        serde_json::json!({"worktree": record.path}),
+                    );
+                continue;
+            }
+        }
+
         // RAL-386: local retirement still runs the exact `git worktree
         // remove` above; a remote worktree instead goes through its
         // machine's provider via the `retire` verb -- see
@@ -7653,8 +7695,10 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
 /// States, in the labels the board and CLI present:
 /// - `scheduled` -- exists, younger than [`WORKTREE_RETIREMENT_AGE_MS`];
 ///   `eligible_at_ms` says when the daily sweep will first consider it.
-/// - `eligible` -- past `eligible_at_ms`, no blocking claim, waiting for the
-///   next daily `retire_stale_worktrees` pass to remove it.
+/// - `eligible` -- past `eligible_at_ms`, no blocking claim. The sweep that
+///   discovers this sends one mailbox notice to whoever is watching the
+///   review; the *next* daily `retire_stale_worktrees` pass that still finds
+///   it eligible and unclaimed removes it.
 /// - `claimed` -- past `eligible_at_ms` but held by a non-terminal cell,
 ///   proof, or review claim, so it is kept and a mailbox escalation fires.
 /// - `failed` -- an attempt was made and it was refused (git, or a machine
@@ -10643,13 +10687,19 @@ mod tests {
             (id, wt)
         };
 
-        let (_safe_id, safe_wt) = make_review("safe", "safe", "deployed");
+        let (safe_id, safe_wt) = make_review("safe", "safe", "deployed");
         let (unsafe_id, unsafe_wt) = make_review("unsafe", "unsafe", "in_review");
         let client = store.lock().unwrap().register_mailbox_client().unwrap();
 
         retire_stale_worktrees(&store);
 
-        assert!(!safe_wt.exists(), "terminal review worktree should retire");
+        // RAL-386: the sweep that first finds an unclaimed worktree eligible
+        // only sends a heads-up to whoever is watching the review -- it
+        // isn't removed until a *later* sweep still finds it eligible.
+        assert!(
+            safe_wt.exists(),
+            "eligible-but-unclaimed worktree is only notified on its first sweep, not removed yet"
+        );
         assert!(
             unsafe_wt.exists(),
             "active review worktree must be retained"
@@ -10658,16 +10708,36 @@ mod tests {
         let messages = guard
             .mailbox_messages_for_client(&client, true, None)
             .unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].message.contains("please cancel it"));
         assert_eq!(
-            messages[0].entity_uri.as_deref(),
+            messages.len(),
+            2,
+            "one claimed-retention notice plus one eligible-for-retirement heads-up"
+        );
+        let unsafe_message = messages
+            .iter()
+            .find(|m| m.message.contains("please cancel it"))
+            .expect("claimed-retention notice for the still-active review");
+        assert_eq!(
+            unsafe_message.entity_uri.as_deref(),
             Some(format!("guardian:{unsafe_id}").as_str())
+        );
+        let safe_message = messages
+            .iter()
+            .find(|m| m.message.contains("will be retired"))
+            .expect("advance notice for the unclaimed, about-to-retire review");
+        assert_eq!(
+            safe_message.entity_uri.as_deref(),
+            Some(format!("guardian:{safe_id}").as_str())
         );
         drop(guard);
 
-        // The durable per-path claim prevents a daily sweep from spamming.
+        // The second sweep actually retires the now-notified worktree, and
+        // the durable per-path claims prevent either notice from repeating.
         retire_stale_worktrees(&store);
+        assert!(
+            !safe_wt.exists(),
+            "worktree removed on the sweep after its notice went out"
+        );
         assert_eq!(
             store
                 .lock()
@@ -10675,7 +10745,8 @@ mod tests {
                 .mailbox_messages_for_client(&client, true, None)
                 .unwrap()
                 .len(),
-            1
+            2,
+            "neither notice repeats on a later sweep"
         );
 
         // RAL-385: the sweep's outcome is also visible in the retirement
@@ -10688,7 +10759,7 @@ mod tests {
             let safe = view
                 .entries
                 .iter()
-                .find(|e| e.guardian_id == _safe_id)
+                .find(|e| e.guardian_id == safe_id)
                 .expect("retired safe worktree must stay visible");
             assert_eq!(safe.state, "retired");
             assert!(safe.error.is_none());
@@ -10710,6 +10781,84 @@ mod tests {
                 &unsafe_wt.to_string_lossy(),
             ],
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn eligible_worktree_retirement_notice_reaches_a_watcher_via_the_mailbox() {
+        // RAL-386: the advance notice sent before an eligible-but-unclaimed
+        // worktree is actually removed must be visible through the ordinary
+        // personal-mailbox/watch path (RAL-320/343), not just the broadcast
+        // mailbox client -- that is the whole point of tagging it with the
+        // review's entity_uri rather than just logging it.
+        let (base, repo, _feature_worktree) = make_repo("retire-watch");
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
+
+        let guard = store.lock().unwrap();
+        let id = guard
+            .create_guardian("watched", "main", &repo.to_string_lossy())
+            .unwrap();
+        guard.add_guardian_branch(&id, "watched").unwrap();
+        let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+        let wt = worktree_dir(&repo.to_string_lossy(), &id).join("wt-test");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("guardian/{id}/wt-watched"),
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        guard
+            .set_branch_review(
+                &id,
+                &branch_id,
+                &format!("guardian/{id}/wt-watched"),
+                &wt.to_string_lossy(),
+            )
+            .unwrap();
+        guard
+            .conn
+            .execute(
+                "UPDATE guardians SET status=?1, updated_at_ms=?2 WHERE id=?3",
+                rusqlite::params!["deployed", old, id],
+            )
+            .unwrap();
+        guard
+            .create_watch(
+                "colin",
+                &format!("guardian:{id}"),
+                &[crate::mailbox::MailboxPriority::High],
+            )
+            .unwrap();
+        drop(guard);
+
+        retire_stale_worktrees(&store);
+
+        let guard = store.lock().unwrap();
+        let watcher_messages = guard
+            .personal_mailbox_messages_for_user("colin", true, None)
+            .unwrap();
+        assert_eq!(
+            watcher_messages.len(),
+            1,
+            "the watcher must see the advance notice"
+        );
+        assert!(watcher_messages[0].message.contains("will be retired"));
+        let unwatched_messages = guard
+            .personal_mailbox_messages_for_user("alex", true, None)
+            .unwrap();
+        assert!(
+            unwatched_messages.is_empty(),
+            "a user not watching this review sees nothing"
+        );
+        drop(guard);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
