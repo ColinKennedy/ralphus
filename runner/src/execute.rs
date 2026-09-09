@@ -607,6 +607,24 @@ fn run_with_backend(
             };
         }
 
+        let ghost = match parse_ghost(&outcome.summary) {
+            GhostParse::Published(text) => Some(text),
+            GhostParse::NoMarker | GhostParse::NothingReported => None,
+            GhostParse::Malformed => {
+                crate::cartographer::emit(
+                    "runner",
+                    "ghost rejected: malformed",
+                    "warning",
+                    event_context(spec),
+                    serde_json::json!({
+                        "reason": "RALPHUS_GHOST: marker found but the text after it \
+                                    didn't parse as a short bullet list",
+                    }),
+                );
+                None
+            }
+        };
+
         return CellResult {
             status: "done".to_string(),
             tokens_in: total_tokens_in,
@@ -621,7 +639,7 @@ fn run_with_backend(
             error: None,
             proofed: None,
             agent_session_id,
-            ghost: parse_ghost(&outcome.summary),
+            ghost,
         };
     }
 
@@ -731,16 +749,58 @@ fn parse_still_working(text: &str) -> Option<String> {
     Some(line.to_string())
 }
 
-/// Finds the last `RALPHUS_GHOST:` marker and returns everything after it
-/// (to end of text), capped at [`GHOST_MAX_CHARS`]. `None` if empty or the
-/// agent explicitly reported nothing to hand off.
-fn parse_ghost(text: &str) -> Option<String> {
-    let idx = text.rfind("RALPHUS_GHOST:")?;
-    let rest = text[idx + "RALPHUS_GHOST:".len()..].trim();
+/// Outcome of scanning an agent's final reply for a `RALPHUS_GHOST:` marker.
+#[derive(Debug, PartialEq, Eq)]
+enum GhostParse {
+    /// No marker anywhere in the reply -- the agent didn't attempt to report.
+    NoMarker,
+    /// The agent explicitly reported nothing to hand off.
+    NothingReported,
+    /// A marker was found, but what followed it didn't parse as the short
+    /// bullet list `GHOST_SYSTEM_PROMPT` asks for -- rejected rather than
+    /// carried forward as a partial, unverified fragment.
+    Malformed,
+    /// Marker found, followed by well-formed bullet lines.
+    Published(String),
+}
+
+/// Finds the last `RALPHUS_GHOST:` marker and validates that what follows is
+/// a short bullet list -- the shape `GHOST_SYSTEM_PROMPT` asks for -- rather
+/// than trusting arbitrary trailing text. A model that goes off the rails
+/// right after writing the marker (drifting into an unrelated tangent
+/// instead of stopping) must not have that tangent carried into the next
+/// attempt's prompt: parsing stops at the first line that isn't a bullet,
+/// rather than consuming to the end of the reply or [`GHOST_MAX_CHARS`]. An
+/// attempt whose marker is followed by no valid bullets at all contributes
+/// nothing ([`GhostParse::Malformed`]) -- the same as if it had never
+/// published a ghost, since a partial, unverified fragment is not safer than
+/// carrying forward nothing.
+fn parse_ghost(text: &str) -> GhostParse {
+    const MAX_GHOST_BULLETS: usize = 5;
+    let Some(idx) = text.rfind("RALPHUS_GHOST:") else {
+        return GhostParse::NoMarker;
+    };
+    let rest = text[idx + "RALPHUS_GHOST:".len()..].trim_start();
     if rest.is_empty() || rest.to_lowercase().starts_with("(nothing to report)") {
-        return None;
+        return GhostParse::NothingReported;
     }
-    Some(rest.chars().take(GHOST_MAX_CHARS).collect())
+    let mut bullets: Vec<&str> = Vec::new();
+    for line in rest.lines() {
+        let line = line.trim();
+        let is_bullet = line.starts_with('-') || line.starts_with('*') || line.starts_with('•');
+        if line.is_empty() || !is_bullet {
+            break;
+        }
+        bullets.push(line);
+        if bullets.len() >= MAX_GHOST_BULLETS {
+            break;
+        }
+    }
+    if bullets.is_empty() {
+        return GhostParse::Malformed;
+    }
+    let joined: String = bullets.join("\n");
+    GhostParse::Published(joined.chars().take(GHOST_MAX_CHARS).collect())
 }
 
 fn tail(text: &str, limit: usize) -> String {
@@ -789,16 +849,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_ghost_extracts_and_caps() {
+    fn parse_ghost_extracts_single_bullet() {
         assert_eq!(
             parse_ghost("done.\nRALPHUS_GHOST: - noted a workaround"),
-            Some("- noted a workaround".to_string())
+            GhostParse::Published("- noted a workaround".to_string())
         );
+    }
+
+    #[test]
+    fn parse_ghost_extracts_multiple_bullets_and_caps_at_five() {
+        let reply = "done.\nRALPHUS_GHOST:\n- one\n- two\n- three\n- four\n- five\n- six (dropped)";
+        assert_eq!(
+            parse_ghost(reply),
+            GhostParse::Published("- one\n- two\n- three\n- four\n- five".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ghost_nothing_reported_is_not_malformed() {
         assert_eq!(
             parse_ghost("done.\nRALPHUS_GHOST: (nothing to report)"),
-            None
+            GhostParse::NothingReported
         );
-        assert_eq!(parse_ghost("no marker"), None);
+    }
+
+    #[test]
+    fn parse_ghost_no_marker_is_no_marker() {
+        assert_eq!(parse_ghost("no marker"), GhostParse::NoMarker);
+    }
+
+    /// Reproduces the real failure this validation exists for: the agent
+    /// wrote one legitimate bullet, then drifted into an unrelated tangent
+    /// instead of stopping. The tangent must not survive, but the bullet
+    /// that came before it is genuine and worth keeping -- parsing stops the
+    /// instant the shape breaks, publishing only the clean prefix rather
+    /// than either the whole (partly-garbage) blob or nothing at all.
+    #[test]
+    fn parse_ghost_truncates_at_the_tangent_that_follows_a_real_bullet() {
+        let reply = "RALPHUS_GHOST: - noted retire_stale_worktrees has no scheduler caller\n\
+                      Wait, I think the user typed \"yourself\" -- let me reconsider...";
+        assert_eq!(
+            parse_ghost(reply),
+            GhostParse::Published(
+                "- noted retire_stale_worktrees has no scheduler caller".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_ghost_rejects_free_prose_with_no_bullets() {
+        assert_eq!(
+            parse_ghost("RALPHUS_GHOST: nothing much happened, all good"),
+            GhostParse::Malformed
+        );
     }
 
     #[test]
