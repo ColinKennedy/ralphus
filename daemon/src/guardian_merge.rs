@@ -3048,6 +3048,12 @@ fn claim_branch_review_ref(
         INFO,
         "ralphus [guardian] review {guardian_id} branch {branch_id} review branch named {name}"
     );
+    let _ = store.lock().expect("poisoned").log_event(
+        None,
+        Some(guardian_id),
+        "guardian",
+        "review branch named",
+    );
     Ok(name)
 }
 
@@ -3082,6 +3088,12 @@ fn claim_combined_review_ref(
         INFO,
         "ralphus [guardian] review {} combined review branch named {name}",
         guardian.id
+    );
+    let _ = store.lock().expect("poisoned").log_event(
+        None,
+        Some(&guardian.id),
+        "guardian",
+        "combined review branch named",
     );
     Ok(name)
 }

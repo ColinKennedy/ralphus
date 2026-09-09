@@ -816,12 +816,14 @@ impl ForgeClient {
             Err(e) => Err(describe_error(e)),
         };
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(exists) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get stack done kind={} repo={} stack={stack_number} exists={exists}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 WARNING,
                 "ralphus [forge] get stack failed kind={} repo={} stack={stack_number}: {e}",
@@ -877,18 +879,21 @@ impl ForgeClient {
             Err(e) => Err(describe_error(e)),
         };
         match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(Some(members)) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get stack members done kind={} repo={} stack={stack_number} pull_requests={members:?}",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(None) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] get stack members done kind={} repo={} stack={stack_number} missing",
                 self.kind.as_str(),
                 self.repo_path
             ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
                 WARNING,
                 "ralphus [forge] get stack members failed kind={} repo={} stack={stack_number}: {e}",
