@@ -473,6 +473,40 @@ pub fn build_command_line(program: &str, args: &[String]) -> String {
     }
 }
 
+/// Build a `pipe-pane` target argument from a program and its arguments —
+/// **not** the same shape as [`build_command_line`], which is deliberately
+/// PowerShell-pane-typed syntax (single-quoted, `&`-prefixed on Windows,
+/// meant to be `send-keys`'d into an interactive pane prompt). A `pipe-pane`
+/// target is instead a single argv-level string passed to psmux/tmux's own
+/// CLI, which re-flattens and re-quotes it internally before handing it to
+/// whatever actually spawns the process (confirmed by tracing psmux's
+/// `pipe-pane` argument handling during the RAL-397 Phase 0 spike — see
+/// `PSMUX_MEMORY_FIX.local.md`). Using [`build_command_line`]'s
+/// single-quote-and-`&`-prefix syntax here does not survive that re-quoting.
+///
+/// Quoting scope is intentionally narrow: an argument is wrapped in plain
+/// double quotes only if it contains whitespace, with no embedded-quote or
+/// trailing-backslash escaping — sufficient for this function's only two
+/// callers ([`Tmux::new_detached_session_with_command`]'s pipe-pane wiring),
+/// whose arguments are always a resolved runner executable path and a
+/// transcript file path, neither of which contains a literal `"` character.
+/// Not a general-purpose shell-quoting function; do not reuse it for
+/// attacker-influenced or arbitrarily-shaped arguments.
+#[must_use]
+pub fn build_pipe_target(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(|arg| {
+            if arg.contains(' ') {
+                format!("\"{arg}\"")
+            } else {
+                arg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Like [`build_command_line`], additionally prefixing `env`'s assignments so
 /// they're set in the pane's shell before the command runs (RAL-150). The
 /// tmux-wrapped runner path has no `std::process::Command::envs`-style hook —
@@ -938,6 +972,64 @@ impl Tmux {
     pub fn capture_pane(&self, name: &str, lines: u32) -> Result<String, TmuxError> {
         self.run(&["capture-pane", "-p", "-t", name, "-S", &format!("-{lines}")])
             .map(|raw| trim_trailing_blank_pane_lines(&raw))
+    }
+
+    /// Start teeing `name`'s raw pane output (output-only, `-o`: does not
+    /// also pipe input typed into the pane) to `target` — a full,
+    /// psmux/tmux-runnable command line, not a program name alone (RAL-397
+    /// Phase 2). This is the mechanism that lets a pane's durable transcript
+    /// live on disk instead of in the multiplexer's own scrollback memory —
+    /// see `PSMUX_MEMORY_FIX.local.md` Phase 2 and the linked upstream
+    /// analysis (`PSMUX_SCROLLBACK_OOM.local.md`) for why scrollback memory
+    /// scales with `history-limit × pane width` regardless of real content.
+    ///
+    /// Confirmed empirically against this project's psmux build (RAL-397
+    /// Phase 0 spike): `pipe-pane -o` does continuously forward raw pane
+    /// bytes (ANSI codes included) to `target`'s stdin for the pane's whole
+    /// lifetime — but only once `target` has actually started and reached a
+    /// blocking read of its stdin. There is a real startup race: pane output
+    /// produced before that point is lost, never buffered and replayed. This
+    /// method does not itself wait out that race — see
+    /// [`Self::new_detached_session_with_command`]'s pipe-pane wiring (2C)
+    /// for the settle step required before the pane's actual payload command
+    /// is sent.
+    ///
+    /// Use [`build_pipe_target`] to construct `target` from a program and
+    /// argument list — psmux's own CLI re-flattens and re-quotes `target`
+    /// before handing it to whatever spawns the process (confirmed in the
+    /// Phase 0 spike by tracing `pipe-pane`'s argument handling), so a target
+    /// built for [`build_command_line`] (PowerShell-pane-typed syntax, single
+    /// quoted, `&`-prefixed) is the wrong shape here and will not survive
+    /// that re-quoting.
+    ///
+    /// # Errors
+    /// Returns an error if the session does not exist or tmux fails.
+    pub fn pipe_pane(&self, name: &str, target: &str) -> Result<(), TmuxError> {
+        self.run(&["pipe-pane", "-o", "-t", name, target])
+            .map(|_| ())
+    }
+
+    /// Stop any pipe-pane tee previously started on `name` (a bare `pipe-pane`
+    /// with no command argument toggles it off, mirroring real tmux). Called
+    /// symmetrically with [`Self::pipe_pane`] at session teardown so a lagging
+    /// sink process is told to stop rather than left to notice EOF on its own
+    /// whenever the pane's shell process happens to exit. Best-effort: a
+    /// session that's already gone (or a build with no active pipe) is not an
+    /// error, since every caller uses this for best-effort cleanup symmetry.
+    pub fn stop_pipe_pane(&self, name: &str) {
+        let _ = self.run(&["pipe-pane", "-t", name]);
+    }
+
+    /// Clear `name`'s in-memory scrollback buffer, freeing whatever RAM the
+    /// multiplexer was holding for it without ending the session or its
+    /// running command. Best-effort safety valve only — see
+    /// `PSMUX_MEMORY_FIX.local.md` Phase 1/2 for why this is not the primary
+    /// mechanism (a bare `clear-history` with no prior durable capture can
+    /// discard lines no consumer ever read); production call sites must only
+    /// invoke this once the content being cleared is already known-persisted
+    /// elsewhere (the pipe-pane transcript, per Phase 2).
+    pub fn clear_history(&self, name: &str) {
+        let _ = self.run(&["clear-history", "-t", name]);
     }
 
     /// Kill `name` if it exists. Idempotent: a session that's already gone is
@@ -1681,6 +1773,43 @@ mod tests {
         assert_eq!(line, build_command_line("prog", &[]));
     }
 
+    #[test]
+    fn build_pipe_target_leaves_simple_tokens_bare() {
+        assert_eq!(
+            build_pipe_target("ralphus-runner", &["pipe-sink".to_string()]),
+            "ralphus-runner pipe-sink"
+        );
+    }
+
+    #[test]
+    fn build_pipe_target_quotes_only_args_containing_whitespace() {
+        assert_eq!(
+            build_pipe_target(
+                "C:\\Program Files\\ralphus\\ralphus-runner.exe",
+                &[
+                    "pipe-sink".to_string(),
+                    "--out".to_string(),
+                    "C:\\Users\\me\\transcript.raw".to_string(),
+                ]
+            ),
+            "\"C:\\Program Files\\ralphus\\ralphus-runner.exe\" pipe-sink --out C:\\Users\\me\\transcript.raw"
+        );
+    }
+
+    #[test]
+    fn build_pipe_target_differs_from_build_command_line_shape() {
+        // The whole reason `build_pipe_target` exists separately: it must
+        // NOT be PowerShell-pane-typed syntax (single-quoted, `&`-prefixed),
+        // since psmux re-flattens/re-quotes a pipe-pane target itself before
+        // spawning it -- see `build_pipe_target`'s doc comment.
+        let program = "ralphus-runner";
+        let args = vec!["pipe-sink".to_string()];
+        assert_ne!(
+            build_pipe_target(program, &args),
+            build_command_line(program, &args)
+        );
+    }
+
     fn tmux_on_path() -> bool {
         find_on_path("tmux").is_some()
     }
@@ -1789,6 +1918,106 @@ mod tests {
         );
 
         tmux.kill_session(&name).unwrap();
+    }
+
+    /// RAL-397 Phase 0/2A: the decisive proof that `pipe_pane` actually tees
+    /// live pane output to an external file, driven through the real Rust
+    /// `Tmux::run()` (argv-based `Command::new().args()`, no shell
+    /// requoting) rather than an ad-hoc shell script — the Phase 0 spike hit
+    /// a real, confirmed startup race doing this via PowerShell string
+    /// quoting (see `PSMUX_MEMORY_FIX.local.md`), so this test is what
+    /// actually gates the mechanism this crate ships.
+    ///
+    /// The sink is a small standalone PowerShell script (not yet the real
+    /// `ralphus-runner pipe-sink` from Phase 2B, which doesn't exist until
+    /// that phase lands) that blocks on `[Console]::In.ReadLine()` and
+    /// appends every line to a file — mirrors the sink shape the Phase 0
+    /// spike proved works. The explicit settle sleep after `pipe_pane`
+    /// documents the confirmed race rather than hiding it; Phase 2C's
+    /// production wiring must have its own settle step for the same reason.
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
+    #[test]
+    fn live_tmux_pipe_pane_tees_raw_output_to_a_file() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        if !cfg!(target_os = "windows") {
+            println!("SKIP: this test's sink script is Windows/PowerShell-specific");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "pipe-pane");
+        let _ = tmux.kill_session(&name);
+
+        let tmp = std::env::temp_dir();
+        let tag = unique_test_tag("pipe-pane-sink");
+        let sink_script = tmp.join(format!("{tag}.ps1"));
+        let transcript = tmp.join(format!("{tag}.raw"));
+        let transcript_str = transcript.to_string_lossy().into_owned();
+        std::fs::write(
+            &sink_script,
+            format!(
+                "$fs = [System.IO.File]::Open('{transcript_str}', [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)\n\
+                 $sw = [System.IO.StreamWriter]::new($fs)\n\
+                 try {{ while (($line = [Console]::In.ReadLine()) -ne $null) {{ $sw.WriteLine($line); $sw.Flush() }} }} finally {{ $sw.Close() }}\n"
+            ),
+        )
+        .unwrap();
+
+        let cwd = tmp.to_string_lossy().into_owned();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd,
+            &BTreeMap::new(),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Milliseconds 200".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let target = build_pipe_target(
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                sink_script.to_string_lossy().into_owned(),
+            ],
+        );
+        tmux.pipe_pane(&name, &target).unwrap();
+
+        // Confirmed race (see doc comment): give the sink process time to
+        // reach its blocking stdin read before sending the real payload.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let marker = "ralphus-pipe-pane-marker-397";
+        tmux.send_keys_literal(&name, &format!("echo {marker}"))
+            .unwrap();
+
+        let mut seen = String::new();
+        for _ in 0..75 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen = std::fs::read_to_string(&transcript).unwrap_or_default();
+            if seen.contains(marker) {
+                break;
+            }
+        }
+        assert!(
+            seen.contains(marker),
+            "expected the pipe-pane transcript file to contain the echoed marker, got: {seen:?}"
+        );
+
+        tmux.stop_pipe_pane(&name);
+        tmux.kill_session(&name).unwrap();
+        let _ = std::fs::remove_file(&sink_script);
+        let _ = std::fs::remove_file(&transcript);
     }
 
     #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
