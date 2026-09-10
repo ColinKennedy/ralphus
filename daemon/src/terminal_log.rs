@@ -146,6 +146,137 @@ pub fn write_attempt(session_name: &str, attempt: u32, content: &str, max_lines:
     );
 }
 
+/// Bound on how many bytes are read from the *tail* of a `.raw` transcript
+/// (RAL-397 Phase 2E) when deriving the durable, human-readable attempt log —
+/// a disk file can grow up to `ralphus-runner pipe-sink`'s own 256 MiB cap,
+/// and reading the whole thing into memory before the existing line-based
+/// `max_lines` truncation would spike RAM for no benefit, since only the tail
+/// ever survives that truncation anyway. 8 MiB is generous relative to
+/// `max_lines` (4000 lines of plain text is rarely more than a few hundred
+/// KB), so a head/tail-of-*this window* line boundary landing mid-line in
+/// practice is very unlikely.
+const RAW_TRANSCRIPT_TAIL_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Derive `session_name`'s attempt `attempt` durable, human-readable log from
+/// its `.raw` pipe-pane transcript (RAL-397 Phase 2E) instead of a single
+/// point-in-time `capture-pane` snapshot — the transcript is unbounded-depth
+/// (bounded only by `pipe-sink`'s own byte cap, not by pane scrollback), so
+/// this delivers "saved lines accessible as contiguous text" without the
+/// scrollback-depth ceiling the old capture-based path had.
+///
+/// Reads at most the last [`RAW_TRANSCRIPT_TAIL_READ_BYTES`] of the file (a
+/// bounded-memory tail read, not the whole file), strips ANSI escape
+/// sequences (the raw transcript is a verbatim byte tee — see
+/// [`Tmux::pipe_pane`](crate::tmux::Tmux::pipe_pane) — so it carries color/
+/// cursor codes a `capture-pane` snapshot never did), then reuses
+/// [`write_attempt`]'s existing redaction/line-truncation/header pipeline
+/// unchanged. A missing `.raw` file (no cell has run yet, or Phase 2C's
+/// wiring didn't apply — e.g. an interactive terminal session) is not an
+/// error: callers fall back to their own pre-transcript content in that case.
+///
+/// # Errors
+/// Returns an error only if the `.raw` file cannot be opened/read at all;
+/// never for the content it contains (best-effort, matching `write_attempt`).
+pub fn write_attempt_from_raw_transcript(
+    session_name: &str,
+    attempt: u32,
+    max_lines: usize,
+) -> std::io::Result<()> {
+    write_attempt_from_raw_transcript_in(&terminal_log_root(), session_name, attempt, max_lines)
+}
+
+fn write_attempt_from_raw_transcript_in(
+    root: &std::path::Path,
+    session_name: &str,
+    attempt: u32,
+    max_lines: usize,
+) -> std::io::Result<()> {
+    let raw_path = raw_transcript_path_in(root, session_name, attempt);
+    let tail_bytes = read_tail_bytes(&raw_path, RAW_TRANSCRIPT_TAIL_READ_BYTES)?;
+    // `read_tail_bytes` can start mid-multibyte-sequence when the file is
+    // larger than the tail window; lossy conversion replaces any truncated
+    // leading sequence with U+FFFD rather than failing the whole read.
+    let text = String::from_utf8_lossy(&tail_bytes);
+    let stripped = strip_ansi_escapes(&text);
+    write_attempt_in(root, session_name, attempt, &stripped, max_lines);
+    Ok(())
+}
+
+/// Read at most the last `max_bytes` of the file at `path`, via `seek`
+/// rather than reading the whole file first — see
+/// [`RAW_TRANSCRIPT_TAIL_READ_BYTES`]'s doc comment for why bounding peak
+/// memory matters here.
+fn read_tail_bytes(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Strip ANSI/VT100 escape sequences from `s`, leaving plain text — a small
+/// hand-rolled state machine rather than pulling in a `regex`/ANSI-parsing
+/// dependency the workspace doesn't otherwise carry (RAL-397 Phase 2E; see
+/// [`write_attempt_from_raw_transcript`]). Recognizes:
+/// - CSI sequences (`ESC [` ... a final byte in `@`-`~`) — cursor movement,
+///   color/style (SGR), and the vast majority of what a real pane emits;
+/// - OSC sequences (`ESC ]` ... terminated by BEL or `ESC \`) — window title/
+///   hyperlink escapes;
+/// - bare two-byte escapes (`ESC` + one other char) as a catch-all for
+///   anything not shaped like the two above.
+///
+/// Not a complete ECMA-48 parser (no support for nested/malformed sequences
+/// beyond what real pane output actually produces), but sufficient for its
+/// only consumer: turning a real captured pane transcript back into the same
+/// kind of plain text `capture-pane -p` already produced before this file
+/// existed.
+#[must_use]
+fn strip_ansi_escapes(s: &str) -> String {
+    const ESC: char = '\u{1b}';
+    const BEL: char = '\u{07}';
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next(); // consume '['
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next(); // consume ']'
+                loop {
+                    match chars.next() {
+                        None | Some(BEL) => break,
+                        Some(ESC) if chars.peek() == Some(&'\\') => {
+                            chars.next(); // consume '\\' (ST)
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next(); // consume the single char after ESC
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 fn write_attempt_in(
     root: &std::path::Path,
     session_name: &str,
@@ -632,5 +763,111 @@ mod tests {
             .open(path)
             .and_then(|f| f.set_modified(time))
             .is_ok()
+    }
+
+    #[test]
+    fn strip_ansi_escapes_removes_csi_sequences() {
+        // A real sample shape from a captured pipe-pane transcript (RAL-397
+        // Phase 0 spike): cursor hide/show + SGR color codes around plain text.
+        let raw = "\u{1b}[?25l\u{1b}[93mecho \u{1b}[37mpane-line-1\u{1b}[?25h\u{1b}[m";
+        assert_eq!(strip_ansi_escapes(raw), "echo pane-line-1");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_removes_osc_sequences_terminated_by_bel() {
+        let raw = "before\u{1b}]0;window title\u{07}after";
+        assert_eq!(strip_ansi_escapes(raw), "beforeafter");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_removes_osc_sequences_terminated_by_st() {
+        let raw = "before\u{1b}]8;;https://example.com\u{1b}\\linked text\u{1b}]8;;\u{1b}\\after";
+        assert_eq!(strip_ansi_escapes(raw), "beforelinked textafter");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_leaves_plain_text_and_newlines_untouched() {
+        let raw = "line one\nline two\r\nline three";
+        assert_eq!(strip_ansi_escapes(raw), raw);
+    }
+
+    #[test]
+    fn strip_ansi_escapes_handles_a_bare_trailing_escape_without_panicking() {
+        assert_eq!(strip_ansi_escapes("text\u{1b}"), "text");
+    }
+
+    #[test]
+    fn read_tail_bytes_reads_the_whole_file_when_under_the_cap() {
+        let root = TempRoot::new("tail-under-cap");
+        let path = root.0.join("small.raw");
+        std::fs::write(&path, b"hello world").unwrap();
+        let tail = read_tail_bytes(&path, 1024).unwrap();
+        assert_eq!(tail, b"hello world");
+    }
+
+    #[test]
+    fn read_tail_bytes_keeps_only_the_last_n_bytes_when_over_the_cap() {
+        let root = TempRoot::new("tail-over-cap");
+        let path = root.0.join("big.raw");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let tail = read_tail_bytes(&path, 4).unwrap();
+        assert_eq!(tail, b"6789");
+    }
+
+    #[test]
+    fn write_attempt_from_raw_transcript_strips_ansi_and_redacts() {
+        crate::redact::with_registry_lock(|| {
+            crate::redact::clear_for_tests();
+            crate::redact::register("sk-or-v1-terminal-log-ansi-test");
+
+            let root = TempRoot::new("from-raw-transcript");
+            let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+            std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &raw_path,
+                "\u{1b}[93mworking\u{1b}[m...\n$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-terminal-log-ansi-test'\ndone\n",
+            )
+            .unwrap();
+
+            write_attempt_from_raw_transcript_in(&root.0, "sess-a", 0, 100).unwrap();
+
+            let content = read_attempt_in(&root.0, "sess-a", 0).expect("attempt written");
+            assert!(
+                !content.contains('\u{1b}'),
+                "ANSI escape leaked into the derived log: {content:?}"
+            );
+            assert!(content.contains("working..."));
+            assert!(content.contains("done"));
+            assert!(
+                !content.contains("sk-or-v1-terminal-log-ansi-test"),
+                "secret leaked into the derived log: {content}"
+            );
+            assert!(content.contains(crate::redact::REDACTED));
+        });
+    }
+
+    #[test]
+    fn write_attempt_from_raw_transcript_errors_when_no_raw_file_exists() {
+        let root = TempRoot::new("from-raw-transcript-missing");
+        assert!(write_attempt_from_raw_transcript_in(&root.0, "sess-a", 0, 100).is_err());
+    }
+
+    #[test]
+    fn write_attempt_from_raw_transcript_only_reads_the_tail_on_a_huge_file() {
+        // Confirms the bounded-memory read path is actually exercised end to
+        // end, not just `read_tail_bytes` in isolation: write a file larger
+        // than a small tail cap and assert only the tail's content survives.
+        let root = TempRoot::new("from-raw-transcript-huge");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        let filler = "x".repeat(1000);
+        std::fs::write(&raw_path, format!("{filler}\nreal-tail-content\n")).unwrap();
+
+        // 20 bytes is comfortably smaller than the 1000-byte filler, so only
+        // content at/after that point should ever reach the derived log.
+        let tail = read_tail_bytes(&raw_path, 20).unwrap();
+        let text = String::from_utf8_lossy(&tail);
+        assert!(text.contains("real-tail-content"));
+        assert!(!text.contains(&filler));
     }
 }
