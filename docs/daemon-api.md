@@ -3059,11 +3059,18 @@ reader, disconnected from the live tail). That UI/API design decision was
 deliberately left open rather than guessed at — see `PSMUX_MEMORY_FIX.local.md`
 Phase 2G for the full writeup of what was tried and why it was reverted.
 
-Currently wired for the squad-cell context only
-(`/api/squads/{id}/cells/{ti}/{si}/pane-transcript`); the proof-step and
-Guardian (branch/manual-checks) contexts `capture_pane_reply`'s other three
-call sites serve would need the identical pattern (one new route + a
-one-line handler each) — a mechanical follow-up, not done yet.
+Wired for all four contexts `capture_pane_reply` serves, each with the
+identical `attempt`/`offset`/`limit` params, `{ content, start, total }`
+response, 404 semantics, and RAL-247 redaction as the squad-cell form above:
+
+- squad cell: `GET /api/squads/{id}/cells/{ti}/{si}/pane-transcript`
+- proof step: `GET /api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane-transcript`
+- Guardian branch resolver: `GET /api/guardians/{id}/branches/{branch_id}/pane-transcript`
+- Guardian manual-checks: `GET /api/guardians/{id}/manual-checks/pane-transcript`
+
+Each resolves the same tmux session its sibling `.../pane` route does and
+delegates to the one shared range helper, so the four stay byte-identical in
+behavior.
 
 ### Live View debug-line filtering (RAL-232)
 
