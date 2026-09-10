@@ -979,6 +979,9 @@ fn route_for_user(
         ("GET", ["api", "squads", id, "cells", ti, si, "pane"]) => {
             cell_pane(daemon, id, ti, si, query)
         }
+        ("GET", ["api", "squads", id, "cells", ti, si, "pane-transcript"]) => {
+            cell_pane_transcript(daemon, id, ti, si, query)
+        }
         ("GET", ["api", "squads", id, "cells", ti, si, "debug-events"]) => {
             cell_debug_events(daemon, id, ti, si)
         }
@@ -6528,6 +6531,72 @@ fn capture_pane_reply(
     }
 }
 
+/// A default byte-range request size for [`pane_transcript_range_reply`] —
+/// generous enough that a normal-speed scroll rarely needs a second request,
+/// small enough that the daemon never has to read more than this much into
+/// memory to answer one HTTP request.
+const DEFAULT_TRANSCRIPT_RANGE_LIMIT: u64 = 64 * 1024;
+
+/// Composed depth for the board's Live View (RAL-397 Phase 2F): a byte range
+/// of a cell's raw pipe-pane transcript, sourced from disk rather than pane
+/// scrollback — so scrolling back further than the pane's own in-memory
+/// `history-limit` (`daemon/src/tmux.rs::TMUX_HISTORY_LIMIT`) is possible
+/// without raising that limit (and its RAM cost) at all. Because the
+/// transcript file is written continuously for the cell's whole lifetime
+/// (`Tmux::pipe_pane` via Phase 2C), a request against a still-running cell
+/// simply reads whatever has been captured so far — there is no separate
+/// "live tail" source to compose with; the file already *is* live.
+///
+/// `attempt` (query param) selects which attempt to read; omitted, it
+/// defaults to [`crate::terminal_log::latest_attempt`] — the attempt a human
+/// watching a live cell means by "now". `offset`/`limit` (query params, both
+/// in bytes) page through the file; the response's `total` field tells the
+/// client how far back it can still scroll.
+///
+/// `404` when the cell has no transcript at all (never ran through Phase
+/// 2C's wiring, or has been pruned) — distinct from the `active`/`inactive`
+/// pane-snapshot fallback [`capture_pane_reply`] uses, since a transcript
+/// range has no equivalent "last known snapshot" to fall back to.
+fn pane_transcript_range_reply(squad_id: &str, task: &str, cell_id: &str, query: &str) -> Reply {
+    let name = crate::tmux::session_name(squad_id, task, cell_id);
+    let attempt = match query_param(query, "attempt").and_then(|s| s.parse::<u32>().ok()) {
+        Some(a) => a,
+        None => match crate::terminal_log::latest_attempt(&name) {
+            Some(a) => a,
+            None => {
+                return error(
+                    404,
+                    "not_found",
+                    "no transcript recorded for this cell",
+                    vec![],
+                );
+            }
+        },
+    };
+    let offset: u64 = query_param(query, "offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let limit: u64 = query_param(query, "limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TRANSCRIPT_RANGE_LIMIT);
+    match crate::terminal_log::read_raw_transcript_range(&name, attempt, offset, limit) {
+        Some(mut range) => {
+            // RAL-247: same credential scrubbing `capture_pane_reply` applies
+            // to live pane content -- a transcript range is served before
+            // it's ever redacted at attempt-end (`write_attempt_from_raw_transcript`),
+            // so this is the one read path write-time redaction can't cover.
+            range.content = ralphus_core::redact::redact_secrets(&range.content).into_owned();
+            json(200, &range)
+        }
+        None => error(
+            404,
+            "not_found",
+            "no transcript recorded for that attempt",
+            vec![],
+        ),
+    }
+}
+
 /// List of persisted terminal-log attempts for a tmux session, for the
 /// board's "historical attempts" picker (RAL-154).
 #[derive(Serialize)]
@@ -7012,6 +7081,29 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
         Err(e) => return store_error(&e),
     };
     capture_pane_reply(daemon, id, &task, &cell_id, query)
+}
+
+/// A requested byte range of a task cell's raw transcript, for Live View
+/// scrollback beyond the pane's own in-memory `history-limit` (RAL-397
+/// Phase 2F) -- see [`pane_transcript_range_reply`].
+fn cell_pane_transcript(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let task = match daemon.lock().get_task_name(id, task_idx) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    pane_transcript_range_reply(id, &task, &cell_id, query)
 }
 
 /// This entity's own chronologically-merged, current-attempt-only debug
@@ -15547,6 +15639,94 @@ command=\"check\"
             "",
         );
         assert_eq!(attempt_missing.status, 404);
+
+        crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn cell_pane_transcript_route_pages_through_a_raw_transcript() {
+        let d = daemon();
+        let _troot = isolated_terminal_root();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let squad_id = "squad-000000000001";
+
+        // No transcript at all yet -- 404, not an empty/inactive response
+        // (there's no "last known snapshot" fallback for a byte range).
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
+
+        let task = d.lock().get_task_name(squad_id, 0).unwrap();
+        let cell_id = d.lock().get_cell_id(squad_id, 0, 0).unwrap();
+        let name = crate::tmux::session_name(squad_id, &task, &cell_id);
+        let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, "0123456789").unwrap();
+
+        // No attempt/offset/limit specified: defaults to the latest attempt,
+        // offset 0, and a generous limit -- the whole (short) file comes back.
+        let whole = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript"),
+            "",
+        );
+        assert_eq!(whole.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&whole.body).unwrap();
+        assert_eq!(v["content"], "0123456789");
+        assert_eq!(v["start"], 0);
+        assert_eq!(v["total"], 10);
+
+        // Explicit offset/limit pages through it.
+        let slice = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript?offset=3&limit=4"),
+            "",
+        );
+        assert_eq!(slice.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&slice.body).unwrap();
+        assert_eq!(v["content"], "3456");
+        assert_eq!(v["start"], 3);
+
+        // A live attempt (a .raw file with no .log sibling yet) is what an
+        // omitted `attempt` query param resolves to -- not the earlier,
+        // already-finished attempt 0.
+        let live_raw = crate::terminal_log::raw_transcript_path(&name, 1);
+        std::fs::write(&live_raw, "live-attempt-content").unwrap();
+        let latest = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript"),
+            "",
+        );
+        assert_eq!(latest.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&latest.body).unwrap();
+        assert_eq!(v["content"], "live-attempt-content");
+
+        // An explicit attempt query param overrides the latest-attempt default.
+        let explicit = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript?attempt=0"),
+            "",
+        );
+        assert_eq!(explicit.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&explicit.body).unwrap();
+        assert_eq!(v["content"], "0123456789");
+
+        // A named attempt with no transcript at all is 404.
+        let bad_attempt = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/cells/0/0/pane-transcript?attempt=9"),
+            "",
+        );
+        assert_eq!(bad_attempt.status, 404);
 
         crate::terminal_log::delete_for_session(&name);
     }

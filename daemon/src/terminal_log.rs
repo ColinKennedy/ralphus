@@ -202,6 +202,97 @@ fn write_attempt_from_raw_transcript_in(
     Ok(())
 }
 
+/// One requested slice of a `.raw` transcript (RAL-397 Phase 2F), for the
+/// board's Live View to page through depth beyond a pane's own in-memory
+/// scrollback window without the daemon ever holding the whole transcript in
+/// RAM. `content` is the raw byte range re-encoded as UTF-8 (lossy — an
+/// arbitrary byte offset can land mid escape-sequence or mid multi-byte
+/// character at either edge of the slice); consumers that need exact
+/// rendering should request ANSI-sequence-aligned ranges where practical, but
+/// a lossy edge on an occasional request is a rendering nicety, not a
+/// correctness requirement, for a live-updating view.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RawTranscriptRange {
+    pub content: String,
+    /// Byte offset in the file the returned `content` actually starts at
+    /// (may differ from the requested `offset` if it was past the end).
+    pub start: u64,
+    /// Total size of the transcript file at read time, so the client knows
+    /// whether it has reached the beginning (`start == 0`) or the current
+    /// live end (`start + content.len() as u64 == total`).
+    pub total: u64,
+}
+
+/// Read up to `limit` bytes starting at `offset` from `session_name`'s
+/// attempt `attempt` raw transcript (RAL-397 Phase 2F) — the file
+/// `Tmux::pipe_pane` (via Phase 2C's wiring) continuously appends to for the
+/// attempt's whole lifetime, so a request against a still-running cell reads
+/// whatever has been captured so far, live. `None` when no `.raw` file
+/// exists for that attempt (the cell never ran under the Phase 2C-wired
+/// path, or the file has since been pruned).
+#[must_use]
+pub fn read_raw_transcript_range(
+    session_name: &str,
+    attempt: u32,
+    offset: u64,
+    limit: u64,
+) -> Option<RawTranscriptRange> {
+    read_raw_transcript_range_in(&terminal_log_root(), session_name, attempt, offset, limit)
+}
+
+fn read_raw_transcript_range_in(
+    root: &std::path::Path,
+    session_name: &str,
+    attempt: u32,
+    offset: u64,
+    limit: u64,
+) -> Option<RawTranscriptRange> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let path = raw_transcript_path_in(root, session_name, attempt);
+    let mut file = std::fs::File::open(path).ok()?;
+    let total = file.metadata().ok()?.len();
+    let start = offset.min(total);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = vec![0u8; usize::try_from(limit).unwrap_or(usize::MAX)];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(RawTranscriptRange {
+        content: String::from_utf8_lossy(&buf).into_owned(),
+        start,
+        total,
+    })
+}
+
+/// The most recent (highest-numbered) attempt with a `.raw` transcript for
+/// `session_name`, or `None` if none exist yet — the attempt a "live" Live
+/// View request (RAL-397 Phase 2F) means when it doesn't name one explicitly.
+///
+/// Deliberately scans `.raw` files, **not** [`list_attempts`]'s `.log`-only
+/// view: a still-running attempt's `.raw` file exists from the moment its
+/// session starts (Phase 2C wires `pipe_pane` in at session creation), while
+/// its `.log` sibling is only written once the attempt *ends*
+/// ([`write_attempt`]) — so for a live cell, `list_attempts`'s latest entry
+/// is always one attempt *behind* the one actually worth viewing live.
+#[must_use]
+pub fn latest_attempt(session_name: &str) -> Option<u32> {
+    latest_attempt_in(&terminal_log_root(), session_name)
+}
+
+fn latest_attempt_in(root: &std::path::Path, session_name: &str) -> Option<u32> {
+    let dir = session_dir_in(root, session_name);
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("raw") {
+                return None;
+            }
+            path.file_stem()?.to_str()?.parse::<u32>().ok()
+        })
+        .max()
+}
+
 /// Read at most the last `max_bytes` of the file at `path`, via `seek`
 /// rather than reading the whole file first — see
 /// [`RAW_TRANSCRIPT_TAIL_READ_BYTES`]'s doc comment for why bounding peak
@@ -894,5 +985,74 @@ mod tests {
         let text = String::from_utf8_lossy(&tail);
         assert!(text.contains("real-tail-content"));
         assert!(!text.contains(&filler));
+    }
+
+    #[test]
+    fn read_raw_transcript_range_returns_the_requested_slice() {
+        let root = TempRoot::new("range-slice");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, b"0123456789").unwrap();
+
+        let range = read_raw_transcript_range_in(&root.0, "sess-a", 0, 2, 4).unwrap();
+        assert_eq!(range.content, "2345");
+        assert_eq!(range.start, 2);
+        assert_eq!(range.total, 10);
+    }
+
+    #[test]
+    fn read_raw_transcript_range_clamps_an_offset_past_the_end() {
+        let root = TempRoot::new("range-clamp");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, b"short").unwrap();
+
+        let range = read_raw_transcript_range_in(&root.0, "sess-a", 0, 1000, 100).unwrap();
+        assert_eq!(range.content, "");
+        assert_eq!(range.start, 5);
+        assert_eq!(range.total, 5);
+    }
+
+    #[test]
+    fn read_raw_transcript_range_is_none_for_a_missing_file() {
+        let root = TempRoot::new("range-missing");
+        assert!(read_raw_transcript_range_in(&root.0, "sess-a", 0, 0, 10).is_none());
+    }
+
+    #[test]
+    fn latest_attempt_finds_the_highest_numbered_raw_file() {
+        let root = TempRoot::new("latest-attempt");
+        for attempt in [0, 1, 2] {
+            let raw_path = raw_transcript_path_in(&root.0, "sess-a", attempt);
+            std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+            std::fs::write(&raw_path, b"x").unwrap();
+        }
+        assert_eq!(latest_attempt_in(&root.0, "sess-a"), Some(2));
+    }
+
+    #[test]
+    fn latest_attempt_sees_a_live_attempt_with_no_log_file_yet() {
+        // The whole reason this scans .raw, not .log: a still-running
+        // attempt's .raw file exists before its .log sibling is ever
+        // written (only written at attempt end).
+        let root = TempRoot::new("latest-attempt-live");
+        write_attempt_in(&root.0, "sess-a", 0, "finished attempt", 100);
+        let live_raw = raw_transcript_path_in(&root.0, "sess-a", 1);
+        std::fs::create_dir_all(live_raw.parent().unwrap()).unwrap();
+        std::fs::write(&live_raw, b"still running").unwrap();
+
+        assert_eq!(latest_attempt_in(&root.0, "sess-a"), Some(1));
+        // Confirms the premise: list_attempts (the .log view) is one behind.
+        let logged_attempts: Vec<u32> = list_attempts_in(&root.0, "sess-a")
+            .into_iter()
+            .map(|a| a.attempt)
+            .collect();
+        assert_eq!(logged_attempts, vec![0]);
+    }
+
+    #[test]
+    fn latest_attempt_none_for_unknown_session() {
+        let root = TempRoot::new("latest-attempt-none");
+        assert_eq!(latest_attempt_in(&root.0, "never-existed"), None);
     }
 }
