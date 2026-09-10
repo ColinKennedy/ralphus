@@ -969,8 +969,12 @@
       let worktreeMenuOpen = {};
       /** @type {{[key: string]: boolean}} peek key -> bool, live tmux pane "Read-only terminal" boxes currently expanded (RAL-102) */
       let peekOpen = {};
-      /** @type {{[key: string]: string}} peek key -> last-fetched pane text, so a full pane re-render redisplays the last content instead of flashing back to "Loading…" (RAL-102 follow-up) */
+      /** @type {{[key: string]: string}} peek key -> last-rendered Live View text (the transcript tape run through the ANSI-strip/classify pipeline, RAL-397 Phase 2G-A), so a full pane re-render redisplays the last content instead of flashing back to "Loading…" (RAL-102 follow-up) */
       let peekContent = {};
+      /** @type {{[key: string]: TapeWindow}} peek key -> loaded transcript-tape byte window (RAL-397 Phase 2G-A); the Live View's single content source, paged from `.../pane-transcript`. */
+      let peekTape = {};
+      /** @type {Set<string>} peek keys with a load-older transcript fetch in flight, so scroll events near the top don't stack duplicate prepends (RAL-397 Phase 2G-A). */
+      const peekLoadingOlder = new Set();
       /** @type {{[key: string]: boolean}} peek key -> whether the last-fetched poll reported the cell as truly, confirmedly ended (past PEEK_MISSING_STRIKE_LIMIT) -- distinct from a single transient miss, which is not treated as ended (RAL-102 follow-up) */
       let peekEnded = {};
       /** @type {{[key: string]: number}} peek key -> consecutive inactive-poll count, reset to 0 on any active response */

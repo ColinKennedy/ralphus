@@ -125,15 +125,15 @@
         const startedHtml = startedAtMs
           ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently started running.\nUpdates to a new time if it is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
           : "";
-        // RAL-288 Stage 5: the pane itself is always pure agent output now
-        // (the daemon strips ralphus's own marker lines before ever serving
-        // it) -- "Show Debug Messages" prepends that entity's own merged,
-        // current-attempt-only debug stream (RAL-296: lifecycle events plus
-        // any inlined terminal-log excerpt, chronologically ahead of the live
-        // tail) instead of revealing anything already inline.
+        // RAL-397 Phase 2G-A: the Live View renders the transcript tape run
+        // through the ANSI-strip/classify pipeline; `peekContent[key]` already
+        // holds that rendered text, so it's shown verbatim here. "Show Debug
+        // Messages" flips whether the tape's own inline RALPHUS_EVENT telemetry
+        // lines are rendered in place or dropped -- no separate stream, no
+        // prepended block (that richer Cartographer stream returns in 2G-B).
         const showDebug = peekShowsDebug(key);
-        const shown = cached !== undefined ? currentPeekDisplayText(key) : undefined;
-        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost, RALPHUS_EVENT markers) chronologically ahead of the agent's actual output, fetched from Cartographer.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep both."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const shown = cached;
+        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
         return `<div class="peek-box" data-tip="${headTip}">
             <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
@@ -198,41 +198,73 @@
         // leave peekOpen alone so the toggle is remembered per-cell
         // (RAL-162) and skip fetching until it's rendered again.
         if (!document.getElementById(preId)) return;
-        const url = peekUrlFor(key);
-        if (!url) { delete peekOpen[key]; delete peekContent[key]; return; }
+        const tapeUrl = peekTranscriptUrlFor(key);
+        if (!tapeUrl) { delete peekOpen[key]; delete peekContent[key]; delete peekTape[key]; return; }
         try {
-          const resp = await fetch(url);
-          if (!resp.ok) { setPeekPreText(preId, "Could not load terminal output."); return; }
-          /** @type {PeekPaneResponse} */
-          const data = await resp.json();
-          if (data.content !== undefined) data.content = scrubSecrets(data.content);
           const before = document.getElementById(preId);
           if (!before) return;
           const atBottom = forceBottom || before.scrollTop + before.clientHeight >= before.scrollHeight - 4;
+
+          // Liveness: poll `/pane` purely for its authoritative `active` flag
+          // (RAL-397 Phase 2G-A — its pane content is ignored; the tape below
+          // is the content source). A failed probe leaves `live` null so the
+          // tape-growth fallback decides.
+          /** @type {boolean|null} */
+          let live = null;
+          const liveUrl = peekUrlFor(key);
+          if (liveUrl) {
+            try {
+              const lr = await fetch(liveUrl);
+              if (lr.ok) { /** @type {PeekPaneResponse} */ const ld = await lr.json(); live = ld.active ?? null; }
+            } catch (_) { /* leave live=null; tape-growth fallback decides */ }
+          }
+
+          // Content: page the transcript tape. Seed the tail on first open
+          // (probe total, then fetch the last chunk); afterwards follow the
+          // tail by fetching only bytes appended past `loadedEnd`.
+          const prevTape = peekTape[key];
+          const prevTotal = prevTape ? prevTape.total : 0;
+          let win = prevTape;
+          if (!win) {
+            const probe = await fetchTapeRange(tapeUrl, TAPE_PROBE_OFFSET, 1);
+            if (probe === null) { setPeekPreText(preId, "Waiting for output…"); return; }
+            const seedStart = Math.max(0, probe.total - TAPE_CHUNK_BYTES);
+            const seed = await fetchTapeRange(tapeUrl, seedStart, TAPE_CHUNK_BYTES);
+            if (seed === null) { setPeekPreText(preId, "Waiting for output…"); return; }
+            win = tapeAppend(emptyTapeWindow(), { start: seed.start, content: seed.content, total: seed.total, requested: TAPE_CHUNK_BYTES });
+          } else {
+            const chunk = await fetchTapeRange(tapeUrl, win.loadedEnd, TAPE_CHUNK_BYTES);
+            if (chunk !== null) {
+              win = tapeAppend(win, { start: chunk.start, content: chunk.content, total: chunk.total, requested: TAPE_CHUNK_BYTES });
+              // Don't drop the front while the user is actively paging older
+              // history in (that fetch is mid-flight and about to prepend).
+              if (atBottom && !peekLoadingOlder.has(key)) win = tapeTrimFront(win, TAPE_MAX_WINDOW_CHARS);
+            }
+          }
+          peekTape[key] = win;
+          const grew = win.total > prevTotal;
+
           /** @type {PeekPaneState} */
           const prev = {
             ended: !!peekEnded[key],
             missingStrikes: peekMissingStrikes[key] || 0,
             lastActivityMs: peekLastActivity[key] ?? null,
-            text: peekContent[key] || "",
           };
-          const next = nextPeekPaneState(prev, data, PEEK_MISSING_STRIKE_LIMIT);
+          const next = nextPeekPaneState(prev, { live, grew, nowMs: Date.now() }, PEEK_MISSING_STRIKE_LIMIT);
           peekEnded[key] = next.state.ended;
           peekMissingStrikes[key] = next.state.missingStrikes;
           peekLastActivity[key] = next.state.lastActivityMs;
-          peekContent[key] = next.state.text;
+
+          // Render the tape window through the ANSI-strip/classify pipeline
+          // and patch it into the DOM (re-resolves the `<pre>` by id, per the
+          // RAL-186 rule above).
+          renderPeekTape(key);
           if (next.headerChanged) {
             if (sel.kind) renderDetails();
             if (selectedGuardian) renderReviewDetail();
           }
-          // RAL-288 Stage 5: refreshed on the same poll cycle as the pane
-          // itself, so an open "Show Debug Messages" block keeps catching up
-          // with new events for as long as the box stays open -- re-resolve
-          // `pre` after, per this function's own RAL-186 rule above.
-          await maybeRefreshDebugEvents(key);
           const pre = document.getElementById(preId);
           if (!pre) return;
-          pre.textContent = currentPeekDisplayText(key);
           // A just-revived (or just-ended) box gets pinned to the bottom
           // regardless of where it was scrolled: its content is a different
           // log now, so the old offset means nothing.
@@ -241,6 +273,78 @@
           updatePeekActivityLabel(key);
         } catch (_) {
           setPeekPreText(preId, "Could not load terminal output (network error).");
+        }
+      }
+      /**
+       * Fetches one byte range of a peek key's transcript tape. Returns null on
+       * a 404 (no transcript yet — a fresh attempt's `.raw` file appears a
+       * moment after the session starts) or any non-OK response, so callers can
+       * treat "not ready" distinctly from a thrown network error.
+       * @param {string} baseUrl - the `.../pane-transcript` URL from {@link peekTranscriptUrlFor}.
+       * @param {number} offset - byte offset to read from (clamped to the file size server-side).
+       * @param {number} limit - maximum bytes to read.
+       * @returns {Promise<RawTranscriptRange|null>}
+       */
+      async function fetchTapeRange(baseUrl, offset, limit) {
+        const resp = await fetch(`${baseUrl}?offset=${offset}&limit=${limit}`);
+        if (!resp.ok) return null;
+        return /** @type {RawTranscriptRange} */ (await resp.json());
+      }
+      /**
+       * Renders peek key `key`'s loaded tape window through the pure line
+       * pipeline (ANSI-strip + classify, honoring the per-box Debug toggle),
+       * scrubs secrets defensively, applies the ended/empty affordances, caches
+       * the result in `peekContent[key]`, and patches it into the `<pre>`.
+       * @param {string} key
+       * @returns {void}
+       */
+      function renderPeekTape(key) {
+        const w = peekTape[key];
+        const ended = !!peekEnded[key];
+        let text = w ? renderTapeLines(tapeCompleteLines(w, ended), peekShowsDebug(key)) : "";
+        text = scrubSecrets(text);
+        if (ended) {
+          text = text.trim()
+            ? `${text}\n\n[Read-only historical record — this terminal session has ended.]`
+            : "Terminal cell has ended. No output was recorded before it ended.";
+        } else if (text === "") {
+          text = "(no output yet)";
+        }
+        peekContent[key] = text;
+        setPeekPreText(`peek-pre-${peekCssKey(key)}`, text);
+      }
+      /**
+       * Pages an older chunk of the transcript tape in when the user scrolls
+       * near the top (RAL-397 Phase 2G-A), prepending it and preserving the
+       * viewport so the content under the user's eyes doesn't jump. Guarded by
+       * `peekLoadingOlder` so overlapping scroll events don't stack duplicate
+       * fetches.
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function loadOlderPeekTape(key) {
+        const w = peekTape[key];
+        const tapeUrl = peekTranscriptUrlFor(key);
+        if (!w || !tapeUrl || w.loadedStart <= 0 || peekLoadingOlder.has(key)) return;
+        peekLoadingOlder.add(key);
+        try {
+          const start = Math.max(0, w.loadedStart - TAPE_CHUNK_BYTES);
+          const chunk = await fetchTapeRange(tapeUrl, start, w.loadedStart - start);
+          if (chunk === null) return;
+          const cssKey = peekCssKey(key);
+          const preBefore = document.getElementById(`peek-pre-${cssKey}`);
+          const prevHeight = preBefore ? preBefore.scrollHeight : 0;
+          const prevTop = preBefore ? preBefore.scrollTop : 0;
+          // Re-read the window: a follow-tail poll may have advanced it while
+          // this fetch was in flight (its `loadedStart` is unchanged either way).
+          const cur = peekTape[key];
+          if (!cur) return;
+          peekTape[key] = tapePrepend(cur, { start: chunk.start, content: chunk.content, total: cur.total });
+          renderPeekTape(key);
+          const preAfter = document.getElementById(`peek-pre-${cssKey}`);
+          if (preAfter) preAfter.scrollTop = prevTop + (preAfter.scrollHeight - prevHeight);
+        } finally {
+          peekLoadingOlder.delete(key);
         }
       }
       /**
@@ -261,11 +365,23 @@
         btn.style.display = distance > threshold ? "" : "none";
       }
       /**
-       * Handles a scroll event inside a peek box's terminal pane.
+       * Handles a scroll event inside a peek box's terminal pane: updates the
+       * jump-to-latest button, and — when scrolled near the top with older
+       * transcript still on disk (RAL-397 Phase 2G-A) — pages the previous
+       * chunk in seamlessly. Scrolling up crosses no "live vs. saved" boundary:
+       * it's all one byte-addressed tape.
        * @param {string} key
        * @returns {void}
        */
-      function onPeekScroll(key) { updatePeekJumpVisibility(key); }
+      function onPeekScroll(key) {
+        updatePeekJumpVisibility(key);
+        const pre = document.getElementById(`peek-pre-${peekCssKey(key)}`);
+        const w = peekTape[key];
+        if (!pre || !w) return;
+        if (pre.scrollTop <= TAPE_TOP_TRIGGER_PX && w.loadedStart > 0 && !peekLoadingOlder.has(key)) {
+          void loadOlderPeekTape(key);
+        }
+      }
       /**
        * Scrolls a peek box's terminal pane to the latest (bottom-most) output.
        * @param {string} key

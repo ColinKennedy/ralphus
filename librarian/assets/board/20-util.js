@@ -716,9 +716,10 @@
        * at render time), this reads peekContent[key] live at click time, since
        * pollOpenPeeks() patches the pane text on its own timer (RAL-167)
        * without re-rendering the header this button lives in — a baked-in
-       * payload would go stale. Respects this pane's "Show Debug Messages"
-       * checkbox (RAL-232): copies whatever text is currently rendered, not
-       * always the raw unfiltered content.
+       * payload would go stale. `peekContent[key]` already holds the tape run
+       * through the ANSI-strip/classify pipeline honoring this pane's "Show
+       * Debug Messages" checkbox (RAL-232/RAL-397 Phase 2G-A), so copying it
+       * copies exactly what's visible.
        * @param {MouseEvent} e
        * @param {string} key
        * @returns {Promise<void>}
@@ -726,8 +727,8 @@
       async function copyPeekText(e, key) {
         e.stopPropagation();
         const btn = /** @type {HTMLElement} */ (e.currentTarget);
-        // RAL-232/RAL-288: copy whatever is currently visible, same as this box's own text.
-        const text = currentPeekDisplayText(key);
+        // RAL-232/RAL-397: copy whatever is currently visible, same as this box's own text.
+        const text = peekContent[key] || "";
         try {
           if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
           else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }

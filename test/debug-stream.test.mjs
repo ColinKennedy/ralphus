@@ -154,8 +154,8 @@ test("viewHistoryAttempt picks the debug-events URL only for the most recent att
   assert.ok(fallbackAt > -1, "an older attempt must still fall back to its own raw terminal-log content");
 });
 
-test("currentPeekDisplayText places debug events chronologically ahead of the live pane, not appended after it", () => {
-  const body = boardSource.slice(boardSource.indexOf("function currentPeekDisplayText(key)"));
-  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
-  assert.match(fn, /`\$\{events\.map\(formatDebugEvent\)\.join\("\\n"\)\}\\n\\n\$\{base\}`/);
-});
+// (The former `currentPeekDisplayText` prepend test was removed with that
+// function in RAL-397 Phase 2G-A: the live box now renders debug inline from
+// the transcript tape — see tape-lines.test.mjs — rather than prepending a
+// separately-fetched `/debug-events` block. The history box's use of the
+// debug-events helpers is still covered by the tests above.)
