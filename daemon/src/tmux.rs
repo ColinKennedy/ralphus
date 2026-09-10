@@ -2150,6 +2150,29 @@ mod tests {
         let _ = std::fs::remove_file(&transcript);
     }
 
+    /// The `live_tmux_flood_keeps_server_rss_bounded_and_transcript_complete`
+    /// test's RSS probe, split out so it can be compiled away entirely on
+    /// non-Windows (where `sysinfo` isn't even a dependency -- see
+    /// `[target."cfg(windows)".dependencies]` in `Cargo.toml`), matching
+    /// `find_server_pid_windows`'s same split just above in this file.
+    #[cfg(target_os = "windows")]
+    fn flood_test_rss_bytes(pid: u32) -> u64 {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        sys.process(Pid::from_u32(pid))
+            .map_or(0, sysinfo::Process::memory)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn flood_test_rss_bytes(_pid: u32) -> u64 {
+        0
+    }
+
     /// RAL-397 Phase 2I: the permanent regression test for the whole reason
     /// this phase exists — ports the manual PowerShell OOM-repro spike
     /// (`PSMUX_MEMORY_FIX.local.md` Phase 0;
@@ -2276,16 +2299,7 @@ mod tests {
         for _ in 0..600 {
             std::thread::sleep(Duration::from_millis(300));
             if let Some(pid) = server_pid {
-                use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-                let mut sys = System::new();
-                sys.refresh_processes_specifics(
-                    ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-                    true,
-                    ProcessRefreshKind::nothing().with_memory(),
-                );
-                if let Some(proc) = sys.process(Pid::from_u32(pid)) {
-                    peak_rss_bytes = peak_rss_bytes.max(proc.memory());
-                }
+                peak_rss_bytes = peak_rss_bytes.max(flood_test_rss_bytes(pid));
             }
             if std::fs::read_to_string(&transcript)
                 .is_ok_and(|c| c.contains("FLOOD_REGRESSION_DONE"))
