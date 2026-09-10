@@ -341,6 +341,13 @@ fn list_attempts_in(root: &std::path::Path, session_name: &str) -> Vec<AttemptMe
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
+            // RAL-397 Phase 2C added a same-stemmed `.raw` sibling next to
+            // each attempt's `.log` file (see `raw_transcript_path`) -- an
+            // internal transcript source, not a user-facing "attempt" in its
+            // own right, so it must not surface here as a duplicate entry.
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("log") {
+                return None;
+            }
             let attempt: u32 = path.file_stem()?.to_str()?.parse().ok()?;
             let meta = entry.metadata().ok()?;
             let modified_ms = meta
@@ -687,6 +694,24 @@ mod tests {
     fn list_attempts_empty_for_unknown_session() {
         let root = TempRoot::new("list-empty");
         assert!(list_attempts_in(&root.0, "never-existed").is_empty());
+    }
+
+    #[test]
+    fn list_attempts_ignores_the_sibling_raw_transcript_file() {
+        // RAL-397 regression: a `.raw` file sharing an attempt's `0000` stem
+        // must not surface as a second, duplicate "attempt" in the listing.
+        let root = TempRoot::new("list-ignores-raw");
+        write_attempt_in(&root.0, "sess-a", 0, "log content", 100);
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::write(&raw_path, "raw content").unwrap();
+
+        let attempts = list_attempts_in(&root.0, "sess-a");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "expected exactly one attempt, got: {attempts:?}"
+        );
+        assert_eq!(attempts[0].attempt, 0);
     }
 
     #[test]
