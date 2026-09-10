@@ -1049,6 +1049,20 @@ fn route_for_user(
                 scope,
                 cell_idx,
                 proof_idx,
+                "pane-transcript",
+            ],
+        ) => proof_pane_transcript(daemon, id, task_idx, scope, cell_idx, proof_idx, query),
+        (
+            "GET",
+            [
+                "api",
+                "squads",
+                id,
+                "proofs",
+                task_idx,
+                scope,
+                cell_idx,
+                proof_idx,
                 "debug-events",
             ],
         ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
@@ -1158,6 +1172,17 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "pane"]) => {
             guardian_branch_pane(daemon, id, branch_id, query)
         }
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "pane-transcript",
+            ],
+        ) => guardian_branch_pane_transcript(daemon, id, branch_id, query),
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
         }
@@ -1200,6 +1225,9 @@ fn route_for_user(
         }
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
             guardian_manual_checks_pane(daemon, id, query)
+        }
+        ("GET", ["api", "guardians", id, "manual-checks", "pane-transcript"]) => {
+            guardian_manual_checks_pane_transcript(daemon, id, query)
         }
         ("GET", ["api", "guardians", id, "manual-checks", "debug-events"]) => {
             guardian_manual_checks_debug_events(daemon, id)
@@ -7305,6 +7333,42 @@ fn proof_pane(
     capture_pane_reply(daemon, &squad_id, &task, &cell_id, query)
 }
 
+/// A requested byte range of a `prompt`-kind proof step's raw transcript, for
+/// Live View scrollback beyond the pane's own in-memory `history-limit`
+/// (RAL-397 Phase 2F) -- see [`pane_transcript_range_reply`].
+#[allow(clippy::too_many_arguments)]
+fn proof_pane_transcript(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    cell_idx: &str,
+    proof_idx: &str,
+    query: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
+        task_idx.parse::<i64>(),
+        cell_idx.parse::<i64>(),
+        proof_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell/proof index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon.lock().proof_specs(id, task_idx_n, scope, cell_idx_n) {
+        return store_error(&e);
+    }
+    let task = match daemon.lock().get_task_name(id, task_idx_n) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    pane_transcript_range_reply(&squad_id, &task, &cell_id, query)
+}
+
 /// List a `prompt`-kind proof step's persisted historical terminal-log
 /// attempts (RAL-154).
 fn proof_terminal_log_attempts(
@@ -7931,6 +7995,23 @@ fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str)
     capture_pane_reply(daemon, &format!("guardian-{id}"), task, &cell_id, query)
 }
 
+/// A requested byte range of a review branch's conflict-resolver raw
+/// transcript, for Live View scrollback beyond the pane's own in-memory
+/// `history-limit` (RAL-397 Phase 2F) -- see [`pane_transcript_range_reply`].
+/// Resolves the same branch-keyed session as [`guardian_branch_pane`].
+fn guardian_branch_pane_transcript(
+    daemon: &Daemon,
+    id: &str,
+    branch_id: &str,
+    query: &str,
+) -> Reply {
+    let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    pane_transcript_range_reply(&format!("guardian-{id}"), task, &cell_id, query)
+}
+
 /// Live list of files with unresolved merge conflicts (`git diff
 /// --diff-filter=U`) in a review branch's worktree, for the auto-refreshing
 /// conflicting-files panel in the Reviews UI (RAL-148).
@@ -8086,6 +8167,22 @@ fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply 
     }
     capture_pane_reply(
         daemon,
+        &format!("guardian-{id}"),
+        crate::guardian_merge::MANUAL_COMMANDS_TASK,
+        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
+        query,
+    )
+}
+
+/// A requested byte range of a review's manual-checks generation raw
+/// transcript, for Live View scrollback beyond the pane's own in-memory
+/// `history-limit` (RAL-397 Phase 2F) -- see [`pane_transcript_range_reply`].
+/// Resolves the same generation-pass session as [`guardian_manual_checks_pane`].
+fn guardian_manual_checks_pane_transcript(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    if daemon.lock().get_guardian(id).is_err() {
+        return error(404, "not_found", "no such guardian", vec![]);
+    }
+    pane_transcript_range_reply(
         &format!("guardian-{id}"),
         crate::guardian_merge::MANUAL_COMMANDS_TASK,
         crate::guardian_merge::MANUAL_COMMANDS_SESSION,
@@ -15727,6 +15824,165 @@ command=\"check\"
             "",
         );
         assert_eq!(bad_attempt.status, 404);
+
+        crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn proof_pane_transcript_route_pages_through_a_raw_transcript() {
+        let d = daemon();
+        let _troot = isolated_terminal_root();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell.proof]]\ncommand=\"c\"\n";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let squad_id = "squad-000000000001";
+
+        // No transcript at all yet -- 404, not an empty/inactive response.
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/proofs/0/cell/0/0/pane-transcript"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
+
+        // The proof step's tmux session is keyed the same way `proof_tmux_keys`
+        // builds it: `(squad_id, "proof-{scope}-{proof_idx}")` with the task name.
+        let task = d.lock().get_task_name(squad_id, 0).unwrap();
+        let name = crate::tmux::session_name(squad_id, &task, "proof-cell-0");
+        let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, "0123456789").unwrap();
+
+        // Whole (short) file with defaults.
+        let whole = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/proofs/0/cell/0/0/pane-transcript"),
+            "",
+        );
+        assert_eq!(whole.status, 200, "{}", whole.body);
+        let v: serde_json::Value = serde_json::from_str(&whole.body).unwrap();
+        assert_eq!(v["content"], "0123456789");
+        assert_eq!(v["start"], 0);
+        assert_eq!(v["total"], 10);
+
+        // Explicit offset/limit pages through it.
+        let slice = route(
+            &d,
+            "GET",
+            &format!("/api/squads/{squad_id}/proofs/0/cell/0/0/pane-transcript?offset=3&limit=4"),
+            "",
+        );
+        assert_eq!(slice.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&slice.body).unwrap();
+        assert_eq!(v["content"], "3456");
+        assert_eq!(v["start"], 3);
+
+        crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn guardian_branch_pane_transcript_route_pages_through_a_raw_transcript() {
+        let d = daemon();
+        let _troot = isolated_terminal_root();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+
+        // No transcript at all yet -- 404.
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_id}/pane-transcript"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
+
+        // A freshly-added branch resolves to the merge/rebase resolver session
+        // (`resolver_task_and_cell_id` -> `freshest_resolver_or_feedback`).
+        let name = crate::tmux::session_name(
+            &format!("guardian-{id}"),
+            crate::guardian_merge::RESOLVER_TASK,
+            &format!("resolver-{branch_id}"),
+        );
+        let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, "0123456789").unwrap();
+
+        let whole = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_id}/pane-transcript"),
+            "",
+        );
+        assert_eq!(whole.status, 200, "{}", whole.body);
+        let v: serde_json::Value = serde_json::from_str(&whole.body).unwrap();
+        assert_eq!(v["content"], "0123456789");
+        assert_eq!(v["start"], 0);
+        assert_eq!(v["total"], 10);
+
+        let slice = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_id}/pane-transcript?offset=3&limit=4"),
+            "",
+        );
+        assert_eq!(slice.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&slice.body).unwrap();
+        assert_eq!(v["content"], "3456");
+        assert_eq!(v["start"], 3);
+
+        crate::terminal_log::delete_for_session(&name);
+    }
+
+    #[test]
+    fn guardian_manual_checks_pane_transcript_route_pages_through_a_raw_transcript() {
+        let d = daemon();
+        let _troot = isolated_terminal_root();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+
+        // No transcript at all yet -- 404.
+        let missing = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/manual-checks/pane-transcript"),
+            "",
+        );
+        assert_eq!(missing.status, 404);
+
+        let name = crate::tmux::session_name(
+            &format!("guardian-{id}"),
+            crate::guardian_merge::MANUAL_COMMANDS_TASK,
+            crate::guardian_merge::MANUAL_COMMANDS_SESSION,
+        );
+        let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, "0123456789").unwrap();
+
+        let whole = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/manual-checks/pane-transcript"),
+            "",
+        );
+        assert_eq!(whole.status, 200, "{}", whole.body);
+        let v: serde_json::Value = serde_json::from_str(&whole.body).unwrap();
+        assert_eq!(v["content"], "0123456789");
+        assert_eq!(v["start"], 0);
+        assert_eq!(v["total"], 10);
+
+        let slice = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/manual-checks/pane-transcript?offset=3&limit=4"),
+            "",
+        );
+        assert_eq!(slice.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&slice.body).unwrap();
+        assert_eq!(v["content"], "3456");
+        assert_eq!(v["start"], 3);
 
         crate::terminal_log::delete_for_session(&name);
     }
