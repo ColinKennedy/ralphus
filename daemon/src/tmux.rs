@@ -952,12 +952,24 @@ impl Tmux {
             TMUX_HISTORY_LIMIT,
         ]);
         if let Some(path) = transcript_path {
+            // RAL-397 Phase 2H: the configured per-attempt transcript byte
+            // cap, threaded through as `--max-bytes` so it's not silently
+            // stuck at `pipe-sink`'s own built-in default regardless of what
+            // an operator sets in `.ralphus.toml`. Read directly from
+            // `crate::config` here (this file already does so elsewhere --
+            // `build_command_line_with_env`/`env_override_flags` both call
+            // `crate::config::is_valid_env_key`) rather than adding yet
+            // another parameter to an already-long signature.
+            let max_bytes =
+                crate::config::load_terminal_log_config().max_transcript_bytes_per_attempt();
             let target = build_pipe_target(
                 program,
                 &[
                     "pipe-sink".to_string(),
                     "--out".to_string(),
                     path.to_string_lossy().into_owned(),
+                    "--max-bytes".to_string(),
+                    max_bytes.to_string(),
                 ],
             );
             // Best-effort: a transcript is a durable-capture nicety, not
