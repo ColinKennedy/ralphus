@@ -44,39 +44,41 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// `history-limit` set on every cell pane (RAL-397 stopgap). This is a
+/// Default `history-limit` set on every cell pane (RAL-397). This is a
 /// per-pane scrollback ceiling, and each scrollback line at the pane's `-x
 /// 500` width costs a fixed amount regardless of content on the Windows
 /// tmux-alternative build this project targets (psmux stores every
-/// scrollback row as a dense 500-cell vector) — so the previous value of
-/// `200000` set a ~4.4 GB *per pane* memory ceiling, and an output-heavy
-/// `command`/`prompt` proof (e.g. a `cargo` build/test) could drive a real
-/// pane there and get OOM-killed mid-run (see `PSMUX_SCROLLBACK_OOM.local.md`
-/// and the linked upstream repro for the full analysis).
+/// scrollback row as a dense 500-cell vector) — so per-pane resident memory
+/// is essentially `history-limit × pane width`. That formula is the whole
+/// reason this value is kept small: the original `200000` set a ~4.4 GB *per
+/// pane* ceiling, and an output-heavy `command`/`prompt` proof (e.g. a
+/// `cargo` build/test) could drive a real pane there and get OOM-killed
+/// mid-run (see `PSMUX_MEMORY_FIX.local.md` /
+/// `PSMUX_SCROLLBACK_OOM.local.md` and the linked upstream repro).
 ///
-/// `15000` is chosen to sit safely above every consumer that currently reads
-/// pane scrollback depth, so lowering it costs no functional coverage:
-/// - `runner.rs`'s poll loop and reattach capture read `capture_pane(...,
-///   10_000)` — the deepest window anything reads. This is the hard floor:
-///   do not lower `TMUX_HISTORY_LIMIT` below it without first lowering that
-///   capture window to match, or the done-sentinel/event scan can miss
-///   output that scrolled past between polls.
-/// - the durable terminal log keeps `max_lines_per_attempt()` (default 4000)
-///   and the pane snapshot keeps `PANE_SNAPSHOT_MAX_LINES` (4000) — both well
-///   under this value.
-/// - the board's live-view/history HTTP endpoint defaults to 2000 lines
-///   (user-overridable).
+/// `2000` is the live-window value — a couple of screenfuls, all a human
+/// needs when opening Live View. Deep scrollback no longer lives in pane
+/// memory at all: the durable `.raw` pipe-pane transcript
+/// (`crate::terminal_log`) and the `pane-transcript` HTTP endpoint
+/// (`crate::server`) serve it from disk. At `-x 500` this drops the per-pane
+/// ceiling from ~330 MB (Phase 1's `15000`) to roughly ~45 MB, matching the
+/// Phase 0 spike's measured ~49 MB peak at exactly this geometry.
 ///
-/// At `-x 500`, this drops the per-pane ceiling from ~4.4 GB to ~330 MB — the
-/// same order of magnitude already used successfully by every other
-/// consumer in this list. This is a stopgap, not the permanent fix: per-pane
-/// limits do not bound *aggregate* memory under concurrency (a pane's
-/// ceiling times `DEFAULT_MAX_CONCURRENT` panes can still be large). The
-/// permanent fix moves the durable transcript off pane scrollback entirely
-/// (`pipe-pane` to a file — see `PSMUX_MEMORY_FIX.local.md` Phase 2), at
-/// which point this constant can drop further, to just the live scrollback
-/// window a human wants when opening Live View.
-const TMUX_HISTORY_LIMIT: &str = "15000";
+/// Floor: this must stay `>= crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES`
+/// (500), the only remaining per-poll `capture_pane` window. RAL-397 Phase 2D
+/// moved `RALPHUS_EVENT:` marker and `RALPHUS_TMUX_DONE:` sentinel reading off
+/// pane scrollback onto the `.raw` transcript tail
+/// (`crate::runner::TranscriptTailer`), so — unlike before 2D — event and
+/// completion detection no longer depend on scrollback depth at all; only
+/// that shallow live-snapshot capture still reads the pane, and it never asks
+/// for more than `LIVE_SNAPSHOT_CAPTURE_LINES` lines. (This replaces the
+/// now-obsolete pre-2D "must stay >= the runner's 10k capture window" floor.)
+///
+/// Operators can override this per-project via `[terminal_logs]
+/// pane_history_limit` in `.ralphus.toml` (see
+/// [`crate::config::TerminalLogConfig::pane_history_limit`]); this const is
+/// the default source of truth used whenever that knob is unset.
+const TMUX_HISTORY_LIMIT: &str = "2000";
 
 /// How long [`Tmux::new_detached_session_with_command`] waits after starting
 /// a `pipe_pane` tee before sending the pane's actual payload command (RAL-397
@@ -937,31 +939,39 @@ impl Tmux {
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
         let _ = self.run(&["set-option", "-t", name, "remain-on-exit", "on"]);
-        // Best-effort: raise the scrollback limit past tmux's default (2000
-        // lines) so `ralphus history --live` (RAL-140), which polls
-        // `capture-pane` with a larger `lines` window than the board's
-        // live-view default, doesn't silently lose older output to tmux's
-        // own buffer trimming while a long-running session is still live.
-        // See `TMUX_HISTORY_LIMIT`'s doc comment for why this value is
-        // capped well below tmux's own maximum.
+        // RAL-397 Phase 2H: the pane's scrollback ceiling sets its resident-
+        // memory ceiling (`history-limit × pane width`; see
+        // `TMUX_HISTORY_LIMIT`'s doc comment), so it is kept at the small
+        // live-window default -- deep scrollback is served from the durable
+        // `.raw` transcript, not pane memory. An operator can override the
+        // live window per-project via `[terminal_logs] pane_history_limit` in
+        // `.ralphus.toml`; the `TMUX_HISTORY_LIMIT` const is the default when
+        // that knob is unset. Loaded once here (this file already reaches into
+        // `crate::config` elsewhere --
+        // `build_command_line_with_env`/`env_override_flags` both call
+        // `crate::config::is_valid_env_key`) and reused for the pipe-sink
+        // `--max-bytes` cap below, so a session start reads project config a
+        // single time. Best-effort: a `set-option` failure here is not
+        // load-bearing for the cell's own result.
+        let terminal_log_config = crate::config::load_terminal_log_config();
+        let history_limit = terminal_log_config
+            .pane_history_limit()
+            .map_or_else(|| TMUX_HISTORY_LIMIT.to_string(), |n| n.to_string());
         let _ = self.run(&[
             "set-option",
             "-t",
             name,
             "history-limit",
-            TMUX_HISTORY_LIMIT,
+            history_limit.as_str(),
         ]);
         if let Some(path) = transcript_path {
             // RAL-397 Phase 2H: the configured per-attempt transcript byte
             // cap, threaded through as `--max-bytes` so it's not silently
             // stuck at `pipe-sink`'s own built-in default regardless of what
-            // an operator sets in `.ralphus.toml`. Read directly from
-            // `crate::config` here (this file already does so elsewhere --
-            // `build_command_line_with_env`/`env_override_flags` both call
-            // `crate::config::is_valid_env_key`) rather than adding yet
-            // another parameter to an already-long signature.
-            let max_bytes =
-                crate::config::load_terminal_log_config().max_transcript_bytes_per_attempt();
+            // an operator sets in `.ralphus.toml`. Reuses the
+            // `TerminalLogConfig` already loaded just above for the pane
+            // history-limit rather than reloading it.
+            let max_bytes = terminal_log_config.max_transcript_bytes_per_attempt();
             let target = build_pipe_target(
                 program,
                 &[
@@ -1520,23 +1530,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tmux_history_limit_stays_above_the_runners_10k_capture_window() {
-        // See `TMUX_HISTORY_LIMIT`'s doc comment: `runner.rs`'s poll loop and
-        // reattach path read `capture_pane(..., 10_000)`, the deepest window
-        // any consumer reads. Lowering the history-limit below that floor
-        // without also lowering the capture window risks losing scrolled-past
-        // events/done-sentinels. This is a change-detector by design: it
-        // should force a deliberate look at `runner.rs`'s capture windows
-        // whenever `TMUX_HISTORY_LIMIT` moves.
-        const RUNNER_CAPTURE_WINDOW: u32 = 10_000;
+    fn tmux_history_limit_stays_at_or_above_the_live_snapshot_capture_window() {
+        // RAL-397 Phase 2D moved `RALPHUS_EVENT:` marker and
+        // `RALPHUS_TMUX_DONE:` sentinel reading off pane scrollback onto the
+        // `.raw` transcript tail (`crate::runner::TranscriptTailer`), so the
+        // old "history-limit must stay >= the runner's 10k capture window"
+        // floor is obsolete -- event/completion detection no longer depends on
+        // scrollback depth at all. The only capture window left is the shallow
+        // per-poll live-snapshot read
+        // (`crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES`), so that is the real
+        // floor now. This stays a change-detector by design: it forces a
+        // deliberate look whenever `TMUX_HISTORY_LIMIT` moves toward or below
+        // that live-snapshot window.
         let limit: u32 = TMUX_HISTORY_LIMIT
             .parse()
             .expect("TMUX_HISTORY_LIMIT must be a valid tmux history-limit integer");
         assert!(
-            limit >= RUNNER_CAPTURE_WINDOW,
-            "TMUX_HISTORY_LIMIT ({limit}) must stay >= the runner's capture window \
-             ({RUNNER_CAPTURE_WINDOW}) or the poll loop can miss scrolled-past \
-             events/done-sentinels"
+            limit >= crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES,
+            "TMUX_HISTORY_LIMIT ({limit}) must stay >= the live-snapshot capture \
+             window ({}) -- the only pane read left after Phase 2D moved \
+             events/sentinel onto the .raw transcript",
+            crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES
         );
     }
 
@@ -2086,6 +2100,146 @@ mod tests {
         tmux.kill_session(&name).unwrap();
         let _ = std::fs::remove_file(&sink_script);
         let _ = std::fs::remove_file(&transcript);
+    }
+
+    /// RAL-397 Phase 2H item #2: the end-to-end proof the unit tests can't
+    /// give — that `crate::runner::TranscriptTailer` drains a
+    /// `RALPHUS_EVENT:` marker and detects the `RALPHUS_TMUX_DONE:` sentinel
+    /// from a **real, psmux-teed** `.raw` transcript (including whatever ANSI
+    /// the live shell adds), not a hand-written fixture file. The 2D unit
+    /// tests exhaustively cover the tailer's offset/carry/ANSI-strip logic
+    /// against synthetic files; this closes the "does it actually work on the
+    /// bytes psmux really writes through `pipe_pane`" gap.
+    ///
+    /// Drives `pipe_pane` directly with a PowerShell-script sink (the proven
+    /// shape from `live_tmux_pipe_pane_tees_raw_output_to_a_file`), then reads
+    /// the resulting file through the real `TranscriptTailer`. It deliberately
+    /// does **not** exercise `run_via_tmux_attempt`'s full poll loop: that
+    /// needs the real `ralphus-runner` binary as the pipe-sink target
+    /// (`<program> pipe-sink --out <path>`, reusing the payload's own
+    /// `program`), and `CARGO_BIN_EXE_ralphus-runner` is unavailable from a
+    /// `daemon`-crate test (no crate dependency), while a `.cmd` dispatcher
+    /// stand-in was confirmed not to work as a pipe-pane target at all (psmux
+    /// does not resolve `.bat`/`.cmd` as an executable image the way `cmd.exe`
+    /// does — see 2I's "Design note" in `PSMUX_MEMORY_FIX.local.md`). A live
+    /// multi-attempt reattach test is likewise skipped for the same
+    /// full-poll-loop/runner-binary reason; the tailer's per-attempt
+    /// construction and file-shrink self-heal are already unit-covered in 2D.
+    ///
+    /// Windows-only (PowerShell sink), matching this file's other live tests.
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
+    #[test]
+    fn live_tmux_transcript_tailer_reads_events_and_sentinel_from_real_teed_output() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        if !cfg!(target_os = "windows") {
+            println!("SKIP: this test's sink script is Windows/PowerShell-specific");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "tailer-e2e");
+        let _ = tmux.kill_session(&name);
+        let _cleanup = KillSessionOnDrop(name.clone());
+
+        let tmp = std::env::temp_dir();
+        let tag = unique_test_tag("tailer-e2e");
+        let sink_script = tmp.join(format!("{tag}.ps1"));
+        let transcript = tmp.join(format!("{tag}.raw"));
+        let transcript_str = transcript.to_string_lossy().into_owned();
+        std::fs::write(
+            &sink_script,
+            format!(
+                "$fs = [System.IO.File]::Open('{transcript_str}', [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)\n\
+                 $sw = [System.IO.StreamWriter]::new($fs)\n\
+                 try {{ while (($line = [Console]::In.ReadLine()) -ne $null) {{ $sw.WriteLine($line); $sw.Flush() }} }} finally {{ $sw.Close() }}\n"
+            ),
+        )
+        .unwrap();
+
+        // Placeholder payload keeps the pane alive while pipe_pane attaches and
+        // settles (the confirmed startup race), before the real marker lines
+        // are sent — the same ordering `new_detached_session_with_command`
+        // uses internally for the production wiring.
+        let cwd = tmp.to_string_lossy().into_owned();
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd,
+            &BTreeMap::new(),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Milliseconds 200".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let target = build_pipe_target(
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                sink_script.to_string_lossy().into_owned(),
+            ],
+        );
+        tmux.pipe_pane(&name, &target).unwrap();
+        // Confirmed race: give the sink time to reach its blocking stdin read
+        // before producing output.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // A few plain lines, then a real RALPHUS_EVENT: marker line, then the
+        // RALPHUS_TMUX_DONE: completion sentinel as the final printed line —
+        // exactly the shape `ralphus-runner` emits into a live pane. Each is
+        // its own flush-left `Write-Output` line, so the tailer sees them as
+        // standalone lines (the echoed command line itself is prefixed by the
+        // shell prompt, so it never false-matches the line-start predicates).
+        let event_line = r#"RALPHUS_EVENT: {"type":"live_usage","cost_usd":0.5}"#;
+        let payload = format!(
+            "Write-Output 'tailer plain line one'; Write-Output 'tailer plain line two'; \
+             Write-Output '{event_line}'; Write-Output 'RALPHUS_TMUX_DONE: ok'"
+        );
+        tmux.send_keys_literal(&name, &payload).unwrap();
+
+        // Read the REAL teed transcript through the production tailer, polling
+        // to EOF each tick the same way `run_via_tmux_attempt` does.
+        let mut tailer = crate::runner::TranscriptTailer::at_path(transcript.clone());
+        let mut lines: Vec<String> = Vec::new();
+        let mut saw_event = false;
+        let mut saw_done = false;
+        for _ in 0..75 {
+            std::thread::sleep(Duration::from_millis(200));
+            lines.extend(tailer.drain().lines);
+            saw_event = lines.iter().any(|l| l.starts_with("RALPHUS_EVENT: {"));
+            saw_done = lines
+                .iter()
+                .any(|l| crate::runner::line_is_done_sentinel(l));
+            if saw_event && saw_done {
+                break;
+            }
+        }
+
+        tmux.stop_pipe_pane(&name);
+        tmux.kill_session(&name).unwrap();
+        let _ = std::fs::remove_file(&sink_script);
+        let _ = std::fs::remove_file(&transcript);
+
+        assert!(
+            saw_event,
+            "TranscriptTailer did not drain the RALPHUS_EVENT: marker from the \
+             real teed transcript; drained lines: {lines:?}"
+        );
+        assert!(
+            saw_done,
+            "TranscriptTailer did not surface the RALPHUS_TMUX_DONE: sentinel \
+             from the real teed transcript; drained lines: {lines:?}"
+        );
     }
 
     /// RAL-397 Phase 2C regression: does wiring `pipe_pane` into
