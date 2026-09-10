@@ -89,6 +89,28 @@ pub fn attempt_path(session_name: &str, attempt: u32) -> PathBuf {
     attempt_path_in(&terminal_log_root(), session_name, attempt)
 }
 
+/// Path a given attempt's *raw* transcript lives (or would live) at — the
+/// continuous, verbatim byte stream `Tmux::pipe_pane` tees a pane's output
+/// to for the attempt's whole lifetime (RAL-397 Phase 2C), as opposed to
+/// [`attempt_path`]'s `.log` file, which is a single point-in-time
+/// `capture-pane` snapshot written once the attempt ends. Deliberately the
+/// same `<session_name>/<NNNN>` naming, just a `.raw` extension, so it lives
+/// in the same per-session directory as its `.log` sibling: both
+/// [`prune`] and [`delete_with_prefix`] already enumerate every file in that
+/// directory regardless of extension, so this needs no separate retention
+/// wiring — it inherits the existing `retention_days`/`max_files` policy for
+/// free. (A consequence worth knowing: since an attempt now has two files
+/// instead of one, the same `max_files` cap now holds roughly half as many
+/// attempts' worth of history as before — an accepted tradeoff, not a bug.)
+#[must_use]
+pub fn raw_transcript_path(session_name: &str, attempt: u32) -> PathBuf {
+    raw_transcript_path_in(&terminal_log_root(), session_name, attempt)
+}
+
+fn raw_transcript_path_in(root: &std::path::Path, session_name: &str, attempt: u32) -> PathBuf {
+    session_dir_in(root, session_name).join(format!("{attempt:04}.raw"))
+}
+
 /// One persisted attempt's metadata, as returned to API/UI consumers (RAL-154
 /// AC: the board must be able to list historical attempts, not just open the
 /// live one).
@@ -378,6 +400,17 @@ mod tests {
         assert!(
             a.to_string_lossy().ends_with("sess-a\\0000.log")
                 || a.to_string_lossy().ends_with("sess-a/0000.log")
+        );
+    }
+
+    #[test]
+    fn raw_transcript_path_lives_alongside_the_log_in_the_same_session_dir() {
+        let raw = raw_transcript_path("sess-a", 0);
+        let log = attempt_path("sess-a", 0);
+        assert_eq!(raw.parent(), log.parent());
+        assert!(
+            raw.to_string_lossy().ends_with("sess-a\\0000.raw")
+                || raw.to_string_lossy().ends_with("sess-a/0000.raw")
         );
     }
 

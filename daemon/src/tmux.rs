@@ -78,6 +78,19 @@ use std::time::{Duration, Instant};
 /// window a human wants when opening Live View.
 const TMUX_HISTORY_LIMIT: &str = "15000";
 
+/// How long [`Tmux::new_detached_session_with_command`] waits after starting
+/// a `pipe_pane` tee before sending the pane's actual payload command (RAL-397
+/// Phase 2C). Confirmed empirically (Phase 0 spike) that psmux does not
+/// forward pane output to a `pipe-pane` target until that target process has
+/// actually started and reached a blocking read of its own stdin — sending
+/// output before that point is silently lost, never buffered and replayed.
+/// 150ms is a defensive margin sized for a compiled binary's startup
+/// (`ralphus-runner`), not a measured minimum; the spike's own slow
+/// PowerShell-script sink needed ~1.5s, so this is not "the same race,
+/// scaled down" so much as "a different, much smaller version of the same
+/// race, plus headroom."
+const PIPE_SINK_SETTLE_DELAY: Duration = Duration::from_millis(150);
+
 /// Overrides tmux resolution entirely — set to the full path (or bare name,
 /// if it's on `PATH` under a different name) of the tmux-compatible binary to
 /// use, skipping both the `PATH` lookup and the embedded fallback.
@@ -864,6 +877,19 @@ impl Tmux {
     /// env-inlined command for `respawn-pane` (POSIX) itself, so the two can
     /// never drift.
     ///
+    /// `transcript_path`, when `Some` (RAL-397 Phase 2C), starts a
+    /// `pipe_pane` tee of this pane's raw output to
+    /// `<program> pipe-sink --out <transcript_path>` (see
+    /// `runner/src/main.rs`'s `pipe_sink`) *before* the payload command is
+    /// sent — so the transcript captures from the payload's very first
+    /// byte, and the confirmed pipe-pane startup race (Phase 0 spike; see
+    /// `PSMUX_MEMORY_FIX.local.md`) settles before there's anything to lose.
+    /// Reuses the same `program` executable passed in for the payload — the
+    /// sink is `ralphus-runner` running a different subcommand, not a
+    /// separately resolved binary. `None` (every non-cell caller: the
+    /// interactive "open terminal" attach path, test helpers) skips this
+    /// entirely, matching today's behavior.
+    ///
     /// # Errors
     /// Returns an error if any of the underlying tmux calls fail; the
     /// partially-created session is killed before returning so a failed
@@ -875,6 +901,7 @@ impl Tmux {
         env: &BTreeMap<String, String>,
         program: &str,
         args: &[String],
+        transcript_path: Option<&std::path::Path>,
     ) -> Result<(), TmuxError> {
         let base = build_command_line(program, args);
         let full = build_command_line_with_env(program, args, env);
@@ -924,6 +951,32 @@ impl Tmux {
             "history-limit",
             TMUX_HISTORY_LIMIT,
         ]);
+        if let Some(path) = transcript_path {
+            let target = build_pipe_target(
+                program,
+                &[
+                    "pipe-sink".to_string(),
+                    "--out".to_string(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            );
+            // Best-effort: a transcript is a durable-capture nicety, not
+            // load-bearing for the cell's own correctness while Phase 2D is
+            // still pending (the poll loop still reads events/the done
+            // sentinel from scrollback, not this file) -- so a pipe-pane
+            // failure here must never fail session creation.
+            let _ = self.pipe_pane(name, &target);
+            // Confirmed race (RAL-397 Phase 0 spike): the sink process needs
+            // a moment to reach its blocking stdin read before pipe-pane
+            // actually forwards to it. This settles before the payload
+            // command below produces its first byte, so nothing the payload
+            // prints is lost to a not-yet-ready sink. `ralphus-runner` is a
+            // compiled binary (not an interpreter), so this window is far
+            // smaller in practice than the PowerShell-script sink the spike
+            // measured against -- the constant is a documented safety
+            // margin, not a measured minimum.
+            std::thread::sleep(PIPE_SINK_SETTLE_DELAY);
+        }
         let started = if cfg!(target_os = "windows") {
             self.run(&["send-keys", "-t", name, base.as_str(), "Enter"])
         } else {
@@ -1836,6 +1889,7 @@ mod tests {
             &BTreeMap::new(),
             "echo",
             &["tmux-roundtrip-ok".to_string()],
+            None,
         )
         .unwrap();
 
@@ -1891,6 +1945,7 @@ mod tests {
             &BTreeMap::new(),
             "echo",
             &["ral237-marker".to_string()],
+            None,
         )
         .unwrap();
 
@@ -1980,6 +2035,7 @@ mod tests {
                 "-Command".to_string(),
                 "Start-Sleep -Milliseconds 200".to_string(),
             ],
+            None,
         )
         .unwrap();
 
@@ -2017,6 +2073,68 @@ mod tests {
         tmux.stop_pipe_pane(&name);
         tmux.kill_session(&name).unwrap();
         let _ = std::fs::remove_file(&sink_script);
+        let _ = std::fs::remove_file(&transcript);
+    }
+
+    /// RAL-397 Phase 2C regression: does wiring `pipe_pane` into
+    /// `new_detached_session_with_command`'s new `transcript_path` parameter
+    /// interfere with, delay, or break normal payload delivery? This is the
+    /// main risk of that change (an extra tmux round-trip plus a settle sleep
+    /// now sit between session creation and `send-keys`). Uses a trivial
+    /// `program` ("echo") rather than a `ralphus-runner`-shaped dual-mode
+    /// executable — `CARGO_BIN_EXE_ralphus-runner` is unavailable here (no
+    /// crate dependency on `ralphus-runner`), and this test's job is
+    /// specifically the wiring's effect on payload delivery, not re-proving
+    /// `pipe_pane`/`pipe_sink` themselves (covered by
+    /// `live_tmux_pipe_pane_tees_raw_output_to_a_file` and
+    /// `runner/tests/pipe_sink.rs` respectively). Full wired-together
+    /// end-to-end coverage (transcript actually populated by a real
+    /// `ralphus-runner` payload) is planned for Phase 2I once more of the
+    /// system consumes the transcript.
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
+    #[test]
+    fn live_tmux_transcript_path_wiring_does_not_break_payload_delivery() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "transcript-wiring");
+        let _ = tmux.kill_session(&name);
+
+        let cwd = std::env::temp_dir();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let transcript = cwd.join(format!("{}.raw", unique_test_tag("transcript-wiring")));
+
+        let marker = "ralphus-transcript-wiring-marker-397";
+        tmux.new_detached_session_with_command(
+            &name,
+            &cwd_str,
+            &BTreeMap::new(),
+            "echo",
+            &[marker.to_string()],
+            Some(&transcript),
+        )
+        .unwrap();
+
+        let mut seen = String::new();
+        for _ in 0..75 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen = tmux.capture_pane(&name, 50).unwrap_or_default();
+            if seen.contains(marker) {
+                break;
+            }
+        }
+        assert!(
+            seen.contains(marker),
+            "expected the payload to still run with transcript_path wired in, pane: {seen:?}"
+        );
+
+        tmux.kill_session(&name).unwrap();
         let _ = std::fs::remove_file(&transcript);
     }
 
@@ -2069,6 +2187,7 @@ mod tests {
             &env,
             "echo",
             &["intended-marker".to_string()],
+            None,
         )
         .unwrap();
 
@@ -2162,6 +2281,7 @@ mod tests {
             &env,
             "echo",
             &["intended-marker".to_string()],
+            None,
         )
         .unwrap();
 
