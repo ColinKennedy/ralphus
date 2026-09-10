@@ -3000,6 +3000,71 @@ interval that drives event forwarding), the next step would be debouncing
 the insert further (e.g. only update if the value has advanced by more than
 some threshold), not switching to persistent storage.
 
+### Live View deep scrollback via the raw transcript (RAL-397 Phase 2F)
+
+`GET /api/squads/{id}/cells/{ti}/{si}/pane-transcript?attempt=&offset=&limit=`
+reads a byte range directly from a task cell's `.raw` pipe-pane transcript —
+the continuous, on-disk tee of the pane's raw output `Tmux::pipe_pane`
+(`daemon/src/tmux.rs`) starts for the cell's whole lifetime, independent of
+the pane's own in-memory scrollback. It exists so the board can page through
+depth beyond a pane's `history-limit` (`TMUX_HISTORY_LIMIT`,
+`daemon/src/tmux.rs`) without raising that limit's RAM cost at all — see
+[`PSMUX_MEMORY_FIX.local.md`](../PSMUX_MEMORY_FIX.local.md) for the full
+design (that file is git-ignored; ask whoever ran that phase for a copy if
+it's not on disk).
+
+```json
+{ "content": "...", "start": 12288, "total": 40012 }
+```
+
+- `attempt` (optional): which attempt's transcript to read. Omitted, it
+  resolves to the *latest* attempt with a `.raw` file — deliberately **not**
+  the same as the latest entry `GET .../terminal-log-attempts` would report,
+  because a still-running attempt's `.raw` file exists from the moment its
+  session starts, while its `.log` sibling (what `terminal-log-attempts`
+  lists) is only written once the attempt *ends*. For a live cell,
+  `terminal-log-attempts`'s latest entry is always one attempt behind the one
+  this endpoint means by "now".
+- `offset`/`limit` (bytes, both optional; default `offset=0`,
+  `limit=65536`): the requested slice. `start` in the response is the actual
+  byte offset the returned `content` begins at (clamped to the file's current
+  size — requesting past the end returns an empty `content` with `start` set
+  to `total`); `total` is the transcript's size at read time, so the client
+  can tell whether it has reached the beginning (`start == 0`) or the live end
+  (`start + content.length == total`).
+- `content` is the raw byte range, ANSI escape codes included (the Phase 0
+  "raw + xterm" design decision — this endpoint does not strip them; a
+  consumer intending to render faithfully should feed the bytes to a real
+  terminal emulator, e.g. the board's already-vendored `xterm.js`, rather
+  than displaying them as plain text). Re-encoded as UTF-8 lossily at either
+  edge, since an arbitrary byte offset can land mid multi-byte
+  character/escape sequence.
+- `404` (not the `active`/`inactive` fallback every other `.../pane` endpoint
+  uses) when no transcript exists at all for the cell, or for the specific
+  named `attempt` — a byte range has no equivalent "last known snapshot" to
+  degrade to.
+- Same RAL-247 credential scrubbing as every other `.../pane` endpoint,
+  applied to the returned range (a secret straddling a range boundary could
+  partially survive at the edge — an inherent limitation of range-based
+  redaction on top of substring-based scrubbing).
+
+**Not yet wired into the board UI.** The endpoint is fully implemented and
+tested, but surfacing it in the Live View peek box turned out to need either
+a genuine API extension (this endpoint's line-based sibling, `GET .../pane`,
+does not expose a byte offset the client could use to know "where in the
+transcript the currently-displayed scrollback starts", so there is no shared
+coordinate space to stitch the two views on) or a materially different,
+simpler affordance (e.g. a separate "view full transcript from the start"
+reader, disconnected from the live tail). That UI/API design decision was
+deliberately left open rather than guessed at — see `PSMUX_MEMORY_FIX.local.md`
+Phase 2G for the full writeup of what was tried and why it was reverted.
+
+Currently wired for the squad-cell context only
+(`/api/squads/{id}/cells/{ti}/{si}/pane-transcript`); the proof-step and
+Guardian (branch/manual-checks) contexts `capture_pane_reply`'s other three
+call sites serve would need the identical pattern (one new route + a
+one-line handler each) — a mechanical follow-up, not done yet.
+
 ### Live View debug-line filtering (RAL-232)
 
 Every tmux-wrapped cell/proof/resolver runs its `ralphus-runner` subprocess
