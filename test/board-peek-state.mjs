@@ -36,7 +36,7 @@ if (from === -1 || to === -1 || to < from) {
 }
 const source = html.slice(from + BEGIN.length, to);
 
-const exported = ["PEEK_MISSING_STRIKE_LIMIT", "peekCssKey", "peekUrlFor", "nextPeekPaneState"];
+const exported = ["PEEK_MISSING_STRIKE_LIMIT", "peekCssKey", "peekUrlFor", "peekTranscriptUrlFor", "nextPeekPaneState"];
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
 const factory = new Function(`${source}\nreturn { ${exported.join(", ")} };`);
 

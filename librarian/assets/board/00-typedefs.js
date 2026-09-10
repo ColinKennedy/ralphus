@@ -100,6 +100,14 @@
        * @property {number} modified_ms
        */
       /**
+       * @typedef {object} RawTranscriptRange - one byte range of a `.raw`
+       *   pipe-pane transcript returned by a `.../pane-transcript` endpoint
+       *   (RAL-397 Phase 2F); see docs/daemon-api.md.
+       * @property {string} content - The decoded byte range, raw (ANSI escapes included; re-encoded UTF-8 lossy at either edge).
+       * @property {number} start - Byte offset `content` actually begins at (clamped to the file's current size).
+       * @property {number} total - Transcript size in bytes at read time.
+       */
+      /**
        * @typedef {object} SquadView
        * @property {string} id
        * @property {string|null} label

@@ -158,19 +158,31 @@
       // ended/live transitions that RAL-186 was filed against — gets real
       // automated coverage instead of manual eyeballing. Keep it pure: anything
       // added here must stay callable with no browser present.
+      /**
+       * @typedef {object} PeekPaneResponse - the `/pane` reply, now consulted
+       *   only for its liveness `active` flag (RAL-397 Phase 2G-A moved Live
+       *   View content onto the transcript tape); its `content` is no longer
+       *   rendered.
+       * @property {boolean} [active] - Whether the daemon found a live tmux cell for this key (`has-session`).
+       * @property {string} [content] - Live pane snapshot (no longer rendered by the Live View).
+       * @property {number|null} [last_activity_ms] - Unix-epoch-ms of the last observed fresh output (RAL-170); unused now that liveness ms comes from tape growth.
+       */
       // RALPHUS-PEEK-STATE-MACHINE:BEGIN
       /**
-       * @typedef {object} PeekPaneResponse
-       * @property {boolean} [active] - Whether the daemon found a live tmux cell for this key.
-       * @property {string} [content] - Live pane content, or the persisted historical snapshot when inactive.
-       * @property {number|null} [last_activity_ms] - Unix-epoch-ms of the last observed fresh output (RAL-170).
+       * @typedef {object} PeekLiveSignal - what one poll observed about a peek
+       *   box's liveness (RAL-397 Phase 2G-A). The Live View's *content* now
+       *   comes from the transcript tape, not `/pane`; `/pane` is still polled
+       *   purely as an authoritative liveness probe (its `active` flag, based on
+       *   the daemon's `has-session` check — its pane content is ignored).
+       * @property {boolean|null} live - Liveness from the `/pane` probe's `active` flag, or null only when that probe itself failed/errored this poll — in which case the tape-growth fallback (`grew`) decides.
+       * @property {boolean} grew - Whether the transcript's `total` grew since the previous poll — the tape-growth liveness fallback when `live` is null, and what feeds `lastActivityMs`.
+       * @property {number} nowMs - Current wall-clock ms, passed in (never read here) so this stays pure and testable.
        */
       /**
        * @typedef {object} PeekPaneState
-       * @property {boolean} ended - Confirmed-ended (past PEEK_MISSING_STRIKE_LIMIT), not just one transient miss.
-       * @property {number} missingStrikes - Consecutive inactive polls; reset to 0 by any active response.
-       * @property {number|null} lastActivityMs - Last-fetched `last_activity_ms`, or null when there is none.
-       * @property {string} text - Text the box should display.
+       * @property {boolean} ended - Confirmed-ended, not just one transient quiet poll.
+       * @property {number} missingStrikes - Consecutive not-live polls under the tape-growth fallback; reset to 0 by any live signal.
+       * @property {number|null} lastActivityMs - Wall-clock ms the transcript last grew, or null when there is none / the cell has ended.
        */
       /**
        * @typedef {object} PeekPaneTransition
@@ -206,66 +218,315 @@
         return null;
       }
       /**
-       * Folds one `/pane` response into a peek box's next state.
+       * Resolves a peek key to the daemon API URL for its `.raw` transcript
+       * tape (RAL-397 Phase 2G-A) — the single content source the Live View
+       * now pages through, `offset`/`limit`/`attempt` appended by the caller.
+       * Sibling to {@link peekUrlFor} (still used by the linked-output reader),
+       * one per peek kind, all four wired in 2F.
+       * @param {string} key
+       * @returns {string|null}
+       */
+      function peekTranscriptUrlFor(key) {
+        const [kind, ...rest] = key.split("|");
+        if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/pane-transcript`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/pane-transcript`; }
+        if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/pane-transcript`; }
+        if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane-transcript`; }
+        return null;
+      }
+      /**
+       * Folds one poll's liveness observation into a peek box's next state
+       * (RAL-397 Phase 2G-A — the content itself comes from the transcript
+       * tape, no longer from `/pane`, so this decides only ended/liveness).
        *
-       * A single inactive poll is not immediately treated as "ended" —
-       * `missingStrikes` must reach `missingLimit` first (see
-       * PEEK_MISSING_STRIKE_LIMIT). Below the limit the box keeps showing
-       * whatever it last displayed rather than flashing to "ended" and back.
-       * Once confirmed ended, `content` (if any) is the daemon's persisted
-       * last-pane-content snapshot (RAL-102 follow-up) — a read-only historical
-       * record, not fresh output.
+       * When the board's own node state answers authoritatively (`live` is a
+       * boolean), it's trusted directly: `true` keeps the box live, `false`
+       * ends it at once — board state has none of `/pane`'s transient hiccups.
+       * When it can't (`live === null`, guardian boxes), the tape-growth
+       * fallback applies: a growing tape is live, and a non-growing one is only
+       * confirmed ended after `missingLimit` quiet polls, so a briefly-idle
+       * live resolver doesn't flash "ended" (mirrors the old missing-strike
+       * tolerance, PEEK_MISSING_STRIKE_LIMIT).
        *
-       * RAL-186: the reverse transition matters just as much. When a restarted
-       * cell or proof step brings a new tmux pane up under the same
-       * (deterministic, index-derived) name, the very next active response must
-       * clear `ended` *and* report `headerChanged`, because the "Historical
-       * record (read-only)" banner, its grey dot and its tooltip are only
-       * produced by a full `peekBox()` render. Reporting the flip in one
-       * direction but not the other is exactly what left a restarted step's
-       * Live View sitting on its stale historical log until the user navigated
-       * away and back.
+       * RAL-186: the flip must be reported in *both* directions. A restarted
+       * cell/proof brings a new tape up under the same (index-derived) key, and
+       * the "Historical record (read-only)" banner, grey dot and tooltip are
+       * only produced by a full `peekBox()` render — so reviving must report
+       * `headerChanged` just as ending does, or the box stays visually stuck
+       * on its stale historical banner until the user navigates away and back.
        * @param {PeekPaneState} prev
-       * @param {PeekPaneResponse} data
+       * @param {PeekLiveSignal} signal
        * @param {number} missingLimit
        * @returns {PeekPaneTransition}
        */
-      function nextPeekPaneState(prev, data, missingLimit) {
-        if (data.active) {
+      function nextPeekPaneState(prev, signal, missingLimit) {
+        if (signal.live === true || (signal.live === null && signal.grew)) {
           return {
             state: {
               ended: false,
               missingStrikes: 0,
-              // RAL-170: liveness signal, always fresh since it's re-fetched
-              // alongside the pane content itself -- never backfilled/stale.
-              lastActivityMs: data.last_activity_ms ?? null,
-              text: data.content || "(no output yet)",
+              // Fresh only when the tape actually grew this poll; a quiet-but-
+              // live cell keeps its prior timestamp so the RAL-170 staleness
+              // warning can still fire.
+              lastActivityMs: signal.grew ? signal.nowMs : prev.lastActivityMs,
             },
             headerChanged: prev.ended,
           };
         }
+        if (signal.live === false) {
+          // Authoritatively ended by the board's node state — no strike wait.
+          return {
+            state: { ended: true, missingStrikes: prev.missingStrikes, lastActivityMs: null },
+            headerChanged: !prev.ended,
+          };
+        }
+        // Liveness unknown and the tape didn't grow: tolerate a few quiet polls
+        // before declaring the box ended.
         const missingStrikes = prev.missingStrikes + 1;
         if (missingStrikes < missingLimit) {
-          // Not confirmed yet -- keep showing the last known content instead
-          // of flashing "ended" for what may be a transient miss.
           return {
-            state: { ended: prev.ended, missingStrikes, lastActivityMs: prev.lastActivityMs, text: prev.text || "Loading…" },
+            state: { ended: prev.ended, missingStrikes, lastActivityMs: prev.lastActivityMs },
             headerChanged: false,
           };
         }
         return {
-          state: {
-            ended: true,
-            missingStrikes,
-            lastActivityMs: null, // a finished cell's last output is history, not a liveness signal
-            text: (data.content && data.content.trim())
-              ? data.content + "\n\n[Read-only historical record — this terminal session has ended.]"
-              : "Terminal cell has ended. No output was recorded before it ended.",
-          },
+          state: { ended: true, missingStrikes, lastActivityMs: null },
           headerChanged: !prev.ended,
         };
       }
       // RALPHUS-PEEK-STATE-MACHINE:END
+
+      // ---- RAL-397 Phase 2G-A: single-tape seamless scroll ----
+      // The Live View is driven entirely from the one `.raw` transcript tape
+      // (`GET .../pane-transcript`, 2F): the bottom of the file IS the live
+      // output (pipe-pane appends continuously, the sink flushes after every
+      // read) and scrolling up just reads earlier bytes of the same file, so
+      // there is no "live vs. saved" boundary to stitch. Everything between the
+      // markers below is a pure, DOM/fetch/module-state-free reducer over a
+      // loaded byte window, sliced out and driven standalone by
+      // test/board-tape-scroll.mjs (the same pattern as the peek-state region).
+      /** Byte window the Live View pages the tape in (matches the server's DEFAULT_TRANSCRIPT_RANGE_LIMIT). */
+      const TAPE_CHUNK_BYTES = 64 * 1024;
+      /** A deliberately-past-the-end offset for probing the tape's current size on open — the server clamps `start` to `total` and returns empty content. */
+      const TAPE_PROBE_OFFSET = Number.MAX_SAFE_INTEGER;
+      /** Soft cap (chars) on the retained follow-tail window; older text is dropped off the top while following the tail, still re-loadable by scrolling up. */
+      const TAPE_MAX_WINDOW_CHARS = 1024 * 1024;
+      /** Scroll distance (px) from the top that triggers loading an older chunk. */
+      const TAPE_TOP_TRIGGER_PX = 120;
+      // RALPHUS-TAPE-SCROLL:BEGIN
+      /**
+       * @typedef {object} TapeWindow
+       * @property {number} loadedStart - Byte offset of the first loaded byte.
+       * @property {number} loadedEnd - Byte offset just past the last loaded byte.
+       * @property {number} total - Last known transcript size in bytes.
+       * @property {string} text - The decoded bytes for `[loadedStart, loadedEnd)`, verbatim (ANSI included).
+       */
+      /**
+       * @typedef {object} TapeChunk
+       * @property {number} start - Byte offset the server says `content` begins at.
+       * @property {string} content - Decoded content of the returned range.
+       * @property {number} total - Transcript size at read time.
+       * @property {number} [requested] - Byte limit the caller requested (append/seed only); `loadedEnd` advances by this, not by the returned string's byte length, so a server-side redaction that shortens `content` can't desync the offset.
+       */
+      /**
+       * A never-fetched, empty tape window.
+       * @returns {TapeWindow}
+       */
+      function emptyTapeWindow() { return { loadedStart: 0, loadedEnd: 0, total: 0, text: "" }; }
+      /**
+       * UTF-8 byte length of a JS string — the tape's coordinate space is
+       * bytes, but a JS string is UTF-16, so `.length` is not it.
+       * @param {string} s
+       * @returns {number}
+       */
+      function utf8ByteLength(s) { return new TextEncoder().encode(s).length; }
+      /**
+       * Folds a follow-tail (or initial-seed) chunk into the window: the chunk
+       * covers `[chunk.start, …)` at/after the current `loadedEnd`. An empty or
+       * non-contiguous window adopts the chunk wholesale (the initial tail seed
+       * goes through here too). `loadedEnd` advances by `min(requested, total −
+       * start)`, never by the returned string's byte length, so a redaction
+       * that shortens `content` can't desync the byte offset.
+       *
+       * NOTE — byte-cap freeze (RAL-397): once an attempt exceeds
+       * `max_transcript_bytes_per_attempt` (default 256 MiB) the pipe-sink
+       * stops appending and `total` freezes while the pane keeps producing, so
+       * the tail stops advancing here. Only bites pathologically huge attempts;
+       * called out so it isn't a silent surprise (see PSMUX_MEMORY_FIX.local.md
+       * 2G "Liveness caveats").
+       * @param {TapeWindow} w
+       * @param {TapeChunk} chunk
+       * @returns {TapeWindow}
+       */
+      function tapeAppend(w, chunk) {
+        const requested = chunk.requested ?? chunk.content.length;
+        const contiguous = w.text !== "" && chunk.start === w.loadedEnd;
+        if (!contiguous) {
+          return { loadedStart: chunk.start, loadedEnd: Math.min(chunk.start + requested, chunk.total), total: chunk.total, text: chunk.content };
+        }
+        return { loadedStart: w.loadedStart, loadedEnd: Math.min(w.loadedEnd + requested, chunk.total), total: chunk.total, text: w.text + chunk.content };
+      }
+      /**
+       * Folds a load-older chunk into the window: the caller requests exactly
+       * `[chunk.start, w.loadedStart)`, so `loadedStart` moves back to
+       * `chunk.start` with no byte-length math — redaction-proof by
+       * construction. Prepends the text.
+       * @param {TapeWindow} w
+       * @param {TapeChunk} chunk
+       * @returns {TapeWindow}
+       */
+      function tapePrepend(w, chunk) {
+        return { loadedStart: chunk.start, loadedEnd: w.loadedEnd, total: w.total, text: chunk.content + w.text };
+      }
+      /**
+       * Bounds the in-memory window while following the tail: once `text`
+       * exceeds `maxChars`, drop the front and advance `loadedStart` by the
+       * *true* UTF-8 byte length of what was dropped, so it stays a valid byte
+       * offset load-older can still page back from. Only ever applied on the
+       * follow-tail path; scrolling up (prepend) deliberately grows past the
+       * cap since the user asked to see that history.
+       * @param {TapeWindow} w
+       * @param {number} maxChars
+       * @returns {TapeWindow}
+       */
+      function tapeTrimFront(w, maxChars) {
+        if (w.text.length <= maxChars) return w;
+        const dropChars = w.text.length - maxChars;
+        const droppedBytes = utf8ByteLength(w.text.slice(0, dropChars));
+        return { loadedStart: w.loadedStart + droppedBytes, loadedEnd: w.loadedEnd, total: w.total, text: w.text.slice(dropChars) };
+      }
+      /**
+       * The complete lines currently renderable from the window. A partial
+       * leading line (present when `loadedStart > 0`, since a byte range can cut
+       * a line's start off) is dropped; a partial trailing line (text after the
+       * last newline) is held back unless the cell has ended AND the window
+       * reaches the file's true end — so a marker line split at either edge is
+       * never half-classified (same carry idea as the Rust `TranscriptTailer`).
+       * @param {TapeWindow} w
+       * @param {boolean} ended
+       * @returns {string[]}
+       */
+      function tapeCompleteLines(w, ended) {
+        let text = w.text;
+        if (w.loadedStart > 0) {
+          const nl = text.indexOf("\n");
+          text = nl === -1 ? "" : text.slice(nl + 1);
+        }
+        const atEnd = w.loadedEnd >= w.total;
+        const parts = text.split("\n");
+        const trailing = parts.pop();
+        if (trailing !== undefined && trailing !== "" && ended && atEnd) parts.push(trailing);
+        return parts;
+      }
+      // RALPHUS-TAPE-SCROLL:END
+
+      // RALPHUS-TAPE-LINES:BEGIN
+      // Pure line pipeline for the single-tape Live View (RAL-397 Phase 2G-A):
+      // ANSI-strip each complete line (a JS mirror of
+      // daemon/src/terminal_log.rs::strip_ansi_escapes), then classify it. The
+      // tape is served raw — `/pane-transcript` does NOT strip ralphus's own
+      // marker lines the way `/pane` does — so this is where they're handled.
+      // Sliced out and driven standalone by test/board-tape-lines.mjs.
+      /** Internal tmux-completion sentinel; always dropped, never shown in any debug state. Matches daemon/src/runner.rs::TMUX_DONE_MARKER. */
+      const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
+      /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
+      const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
+      /**
+       * Strip ANSI/VT100 escape sequences from `s` — a faithful JS port of
+       * daemon/src/terminal_log.rs::strip_ansi_escapes (RAL-397 Phase 2E):
+       * CSI (`ESC [` … final byte `@`–`~`), OSC (`ESC ]` … BEL or `ESC \`), and
+       * bare two-char escapes as a catch-all. Not a full ECMA-48 parser — the
+       * same scope as the Rust original, sufficient for real pane output.
+       * @param {string} s
+       * @returns {string}
+       */
+      function stripAnsiEscapes(s) {
+        const ESC = "\x1b", BEL = "\x07";
+        let out = "";
+        let i = 0;
+        while (i < s.length) {
+          const c = s[i];
+          if (c !== ESC) { out += c; i++; continue; }
+          const next = s[i + 1];
+          if (next === "[") {
+            i += 2;
+            while (i < s.length) { const ch = s[i]; i++; if (ch >= "@" && ch <= "~") break; }
+          } else if (next === "]") {
+            i += 2;
+            while (i < s.length) {
+              const ch = s[i];
+              if (ch === BEL) { i++; break; }
+              if (ch === ESC && s[i + 1] === "\\") { i += 2; break; }
+              i++;
+            }
+          } else if (next !== undefined) {
+            i += 2; // consume ESC + the single following char
+          } else {
+            i += 1; // bare trailing ESC
+          }
+        }
+        return out;
+      }
+      /**
+       * Render one `RALPHUS_EVENT` payload (the trailing JSON after the marker)
+       * as a concise inline one-liner — Debug-ON only. Mirrors
+       * `formatDebugEvent`'s `source: message` tone, with a compact
+       * usage/session-id detail when the payload carries one. Malformed JSON
+       * falls back to the raw payload rather than throwing.
+       * @param {string} payloadJson
+       * @returns {string}
+       */
+      function formatInlineTapeEvent(payloadJson) {
+        let ev;
+        try { ev = JSON.parse(payloadJson); } catch (_) { return `⟨debug⟩ ${payloadJson}`; }
+        const source = typeof ev.source === "string" ? ev.source : "event";
+        const message = typeof ev.message === "string" ? ev.message : "";
+        const p = (ev && typeof ev.payload === "object" && ev.payload) ? ev.payload : {};
+        let detail = "";
+        if (typeof p.cost_usd === "number") {
+          const tin = typeof p.tokens_in === "number" ? p.tokens_in : 0;
+          const tout = typeof p.tokens_out === "number" ? p.tokens_out : 0;
+          detail = ` — in ${tin} / out ${tout} tok · $${p.cost_usd.toFixed(4)}`;
+        } else if (typeof p.agent_session_id === "string") {
+          detail = ` — session ${p.agent_session_id}`;
+        }
+        return `⟨debug⟩ ${source}: ${message}${detail}`;
+      }
+      /**
+       * Classify + render one already-ANSI-stripped line, or return null to
+       * drop it: `RALPHUS_TMUX_DONE` lines are always dropped (internal
+       * sentinel); `RALPHUS_EVENT` lines are dropped when Debug is off and
+       * rendered inline when on; everything else is agent output, kept verbatim
+       * (a trailing `\r` from `\r\n` is trimmed for tidy display).
+       * @param {string} line
+       * @param {boolean} showDebug
+       * @returns {string|null}
+       */
+      function classifyTapeLine(line, showDebug) {
+        const clean = line.replace(/\r$/, "");
+        if (clean.startsWith(RALPHUS_TAPE_DONE_PREFIX)) return null;
+        if (clean.startsWith(RALPHUS_TAPE_EVENT_PREFIX)) {
+          if (!showDebug) return null;
+          return formatInlineTapeEvent(clean.slice(RALPHUS_TAPE_EVENT_PREFIX.length));
+        }
+        return clean;
+      }
+      /**
+       * Run the full pipeline over a tape's complete lines — ANSI-strip,
+       * classify, drop nulls, join — to the single text the Live View renders.
+       * @param {string[]} lines
+       * @param {boolean} showDebug
+       * @returns {string}
+       */
+      function renderTapeLines(lines, showDebug) {
+        const out = [];
+        for (const raw of lines) {
+          const rendered = classifyTapeLine(stripAnsiEscapes(raw), showDebug);
+          if (rendered !== null) out.push(rendered);
+        }
+        return out.join("\n");
+      }
+      // RALPHUS-TAPE-LINES:END
 
       // ---- RAL-288 Stage 5: Live View debug/agent split ----
       // The daemon now always strips ralphus's own `RALPHUS_EVENT:`/
@@ -297,16 +558,17 @@
       // timestamps to splice against (`daemon/src/timeline.rs`'s module doc
       // comment documents the same limitation for the whole-squad timeline
       // this reuses).
-      /** @type {{[key: string]: DebugEventEntry[]}} cached debug-event rows per peek key, fetched only while that pane's checkbox is checked. */
-      let peekDebugEvents = {};
       // RALPHUS-DEBUG-STREAM:BEGIN
       // Pure, DOM/fetch/module-state-free logic for the unified debug/
-      // terminal-log stream (RAL-296) -- kept free of `peekContent`/
-      // `peekDebugEvents`/other module-level state so it can be sliced out
-      // and evaluated standalone by test/board-debug-stream.mjs, the same
-      // pattern test/board-peek-state.mjs and test/board-merge-button.mjs use
-      // for their own regions. See librarian/AGENTS.md's "Testing --
-      // Frontend" section before moving these markers.
+      // terminal-log stream (RAL-296) -- kept free of `peekContent`/other
+      // module-level state so it can be sliced out and evaluated standalone by
+      // test/board-debug-stream.mjs, the same pattern test/board-peek-state.mjs
+      // and test/board-merge-button.mjs use for their own regions. See
+      // librarian/AGENTS.md's "Testing -- Frontend" section before moving these
+      // markers. Used by the terminal-log *history* box (`viewHistoryAttempt`)
+      // to render a past attempt's merged debug stream; the live Live View box
+      // renders debug inline from the tape instead (RAL-397 Phase 2G-A), so it
+      // no longer consumes these.
       /**
        * The `/debug-events` endpoint for peek key `key` (RAL-296: all four
        * kinds are wired -- cell, proof step, guardian branch resolver,
@@ -349,38 +611,6 @@
         return attempts.length > 0 && attempt === Math.max(...attempts.map((a) => a.attempt));
       }
       // RALPHUS-DEBUG-STREAM:END
-      /**
-       * Peek key `key`'s current display text: cached debug events (RAL-296:
-       * lifecycle events with their terminal-log excerpts already inlined),
-       * in chronological order, ahead of the live pane's own tail -- when
-       * "Show Debug Messages" is checked and any are cached for this key.
-       * Otherwise just the clean base pane content.
-       * @param {string} key
-       * @returns {string}
-       */
-      function currentPeekDisplayText(key) {
-        const base = peekContent[key] || "";
-        if (!peekShowsDebug(key)) return base;
-        const events = peekDebugEvents[key];
-        if (!events || !events.length) return base;
-        return `${events.map(formatDebugEvent).join("\n")}\n\n${base}`;
-      }
-      /**
-       * Fetches and caches peek key `key`'s debug events, if its checkbox is
-       * currently checked and this kind has an endpoint for it. Best-effort:
-       * a failed fetch just leaves whatever was cached before untouched.
-       * @param {string} key
-       * @returns {Promise<void>}
-       */
-      async function maybeRefreshDebugEvents(key) {
-        if (!peekShowsDebug(key)) return;
-        const url = debugEventsUrlFor(key);
-        if (!url) return;
-        try {
-          const resp = await fetch(url);
-          if (resp.ok) peekDebugEvents[key] = await resp.json();
-        } catch (_) { /* best-effort; keep the prior cache */ }
-      }
 
       // ---- RAL-247: credential env-var redaction (defense-in-depth) ----
       /**
@@ -433,6 +663,8 @@
         peekOpen[key] = !peekOpen[key];
         if (!peekOpen[key]) {
           delete peekContent[key]; // stale content shouldn't reappear next time this box is opened
+          delete peekTape[key]; // drop the loaded transcript-tape window too (RAL-397 Phase 2G-A)
+          peekLoadingOlder.delete(key);
           delete peekEnded[key];
           delete peekMissingStrikes[key];
           delete peekLastActivity[key];
@@ -460,22 +692,18 @@
       }
       /**
        * Toggles Live View pane `key`'s "Show Debug Messages" checkbox
-       * (RAL-232). Repaints immediately with whatever's cached (instant, no
-       * flash of "Loading…"), then — when just turned on — fetches that
-       * cell's debug events (RAL-288 Stage 5) and repaints again once they
-       * land, since the additive block can't be shown before it's fetched.
+       * (RAL-232, RAL-397 Phase 2G-A). Debug is now rendered *inline* from the
+       * already-loaded transcript-tape window (the `RALPHUS_EVENT` marker lines
+       * are shown in place when on, dropped when off), so this just flips the
+       * flag and re-renders that window immediately — no fetch, no flash.
        * @param {string} key
        * @param {boolean} checked
        * @returns {void}
        */
       function toggleShowDebugMessages(key, checked) {
         peekShowDebug[key] = checked;
-        const preId = `peek-pre-${peekCssKey(key)}`;
-        if (peekContent[key] === undefined) return;
-        setPeekPreText(preId, currentPeekDisplayText(key));
-        if (checked) {
-          maybeRefreshDebugEvents(key).then(() => setPeekPreText(preId, currentPeekDisplayText(key)));
-        }
+        if (peekTape[key] === undefined) return;
+        renderPeekTape(key);
       }
       /**
        * Fetches the operator-configured default for the "Show Debug
