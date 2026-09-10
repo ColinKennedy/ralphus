@@ -729,12 +729,14 @@ impl BudgetConfig {
 /// [`CartographerConfig`], which only governs the separate structured
 /// `cartographer_events` table.
 ///
-/// Three independently configurable knobs, all `None` meaning unset (so a
+/// Four independently configurable knobs, all `None` meaning unset (so a
 /// lower layer can supply it): [`max_lines_per_attempt`](Self::max_lines_per_attempt)
 /// bounds a single attempt's log file size; `retention_days` and `max_files`
 /// bound the total on-disk footprint over time, mirroring
 /// [`CartographerConfig`]'s two-cap retention model (either condition
-/// triggers pruning).
+/// triggers pruning); [`max_transcript_bytes_per_attempt`](Self::max_transcript_bytes_per_attempt)
+/// (RAL-397 Phase 2H) bounds the *raw* `.raw` pipe-pane transcript a single
+/// attempt writes, independent of the `.log` file's line-based cap.
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalLogConfig {
     /// Max lines kept per attempt's log file (the tail is kept, oldest lines
@@ -747,6 +749,13 @@ pub struct TerminalLogConfig {
     pub retention_days: Option<i64>,
     #[serde(default)]
     pub max_files: Option<i64>,
+    /// Max bytes a single attempt's `.raw` transcript may grow to (RAL-397
+    /// Phase 2C/2H) before `ralphus-runner pipe-sink` stops persisting
+    /// further output (still draining stdin so the pane never blocks — see
+    /// `runner/src/main.rs::pipe_sink`). Must be `>= 1` — same "unset on a
+    /// non-positive value" rule as `max_lines_per_attempt`.
+    #[serde(default)]
+    pub max_transcript_bytes_per_attempt: Option<i64>,
 }
 
 impl TerminalLogConfig {
@@ -775,6 +784,20 @@ impl TerminalLogConfig {
     #[must_use]
     pub fn max_files(&self) -> i64 {
         self.max_files.unwrap_or(2000)
+    }
+
+    /// Max bytes a single attempt's `.raw` transcript may grow to. Defaults
+    /// to 256 MiB (matching `ralphus-runner pipe-sink`'s own built-in
+    /// default, `DEFAULT_PIPE_SINK_MAX_BYTES` — kept as a duplicated literal
+    /// rather than a shared constant since `daemon` and `runner` are separate
+    /// crates with no existing shared home for a single-value default this
+    /// small). A configured value `< 1` is treated as unset.
+    #[must_use]
+    pub fn max_transcript_bytes_per_attempt(&self) -> u64 {
+        match self.max_transcript_bytes_per_attempt {
+            Some(n) if n >= 1 => n as u64,
+            _ => 256 * 1024 * 1024,
+        }
     }
 }
 
@@ -808,6 +831,9 @@ pub fn load_terminal_log_config() -> TerminalLogConfig {
         max_lines_per_attempt: local.max_lines_per_attempt.or(global.max_lines_per_attempt),
         retention_days: local.retention_days.or(global.retention_days),
         max_files: local.max_files.or(global.max_files),
+        max_transcript_bytes_per_attempt: local
+            .max_transcript_bytes_per_attempt
+            .or(global.max_transcript_bytes_per_attempt),
     }
 }
 
@@ -2520,16 +2546,18 @@ mod tests {
         assert_eq!(c.max_lines_per_attempt(), 4000);
         assert_eq!(c.retention_days(), 30);
         assert_eq!(c.max_files(), 2000);
+        assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
     }
 
     #[test]
     fn terminal_log_parses_explicit_values() {
         let c = terminal_log_from_toml_str(
-            "[terminal_logs]\nmax_lines_per_attempt = 500\nretention_days = 7\nmax_files = 100\n",
+            "[terminal_logs]\nmax_lines_per_attempt = 500\nretention_days = 7\nmax_files = 100\nmax_transcript_bytes_per_attempt = 1048576\n",
         );
         assert_eq!(c.max_lines_per_attempt(), 500);
         assert_eq!(c.retention_days(), 7);
         assert_eq!(c.max_files(), 100);
+        assert_eq!(c.max_transcript_bytes_per_attempt(), 1_048_576);
     }
 
     #[test]
@@ -2538,6 +2566,7 @@ mod tests {
         assert_eq!(c.max_lines_per_attempt(), 4000);
         assert_eq!(c.retention_days(), 7);
         assert_eq!(c.max_files(), 2000);
+        assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
     }
 
     #[test]
@@ -2546,6 +2575,27 @@ mod tests {
         assert_eq!(c.max_lines_per_attempt(), 4000);
         assert_eq!(c.retention_days(), 30);
         assert_eq!(c.max_files(), 2000);
+        assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn terminal_log_max_transcript_bytes_below_one_falls_back_to_default() {
+        let zero =
+            terminal_log_from_toml_str("[terminal_logs]\nmax_transcript_bytes_per_attempt = 0\n");
+        assert_eq!(zero.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
+        let negative =
+            terminal_log_from_toml_str("[terminal_logs]\nmax_transcript_bytes_per_attempt = -5\n");
+        assert_eq!(
+            negative.max_transcript_bytes_per_attempt(),
+            256 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn terminal_log_max_transcript_bytes_of_one_is_valid() {
+        let c =
+            terminal_log_from_toml_str("[terminal_logs]\nmax_transcript_bytes_per_attempt = 1\n");
+        assert_eq!(c.max_transcript_bytes_per_attempt(), 1);
     }
 
     #[test]
