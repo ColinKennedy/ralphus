@@ -44,6 +44,21 @@
       .running-menu div { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
+      /* Cosmetic header flex — idle pulse, hover intensifies, click jabs. No function beyond delight. */
+      .flex-btn { font-size: 14px; transform-origin: 70% 75%; animation: flex-idle 2.6s ease-in-out infinite; }
+      .flex-btn:hover { animation-play-state: paused; transform: scale(1.35) rotate(-8deg); filter: drop-shadow(0 0 5px var(--accent)) brightness(1.2); }
+      .flex-btn.jab { animation: flex-jab .45s cubic-bezier(.34,1.56,.64,1) 1; }
+      @keyframes flex-idle {
+        0%, 100% { transform: scale(1) rotate(0deg); }
+        50% { transform: scale(1.08) rotate(-4deg); }
+      }
+      @keyframes flex-jab {
+        0% { transform: scale(1) rotate(0deg); }
+        30% { transform: scale(1.15) translateX(-2px) rotate(-10deg); }
+        55% { transform: scale(0.92) translateX(9px) rotate(5deg); }
+        75% { transform: scale(1.05) translateX(-3px) rotate(-2deg); }
+        100% { transform: scale(1) rotate(0deg); }
+      }
       .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
       .copy-btn:hover { color: var(--text); }
       .copy-btn.copied { color: var(--done); border-color: var(--done); }

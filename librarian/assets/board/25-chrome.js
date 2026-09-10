@@ -27,6 +27,21 @@
       }
       applyTheme(localStorage.getItem("ralphus-theme") || "dark");
 
+      // ---------- flex button (cosmetic, no function) ----------
+      /**
+       * Replays the header flex button's jab keyframe, restarting it if a jab is already in flight.
+       * @param {HTMLElement} el
+       * @returns {void}
+       */
+      function flexJab(el) {
+        el.classList.remove("jab");
+        void el.offsetWidth; // force reflow so re-adding "jab" restarts the animation
+        el.classList.add("jab");
+      }
+      byId("flex-btn").addEventListener("animationend", (e) => {
+        if (e.animationName === "flex-jab") byId("flex-btn").classList.remove("jab");
+      });
+
       // ---------- resizable panes (RAL-12) ----------
       // The squads-page sidebar/details columns and the tasks-page details column
       // are var-driven grid tracks; a thin splitter beside each drags its width.
