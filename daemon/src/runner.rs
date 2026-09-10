@@ -1459,12 +1459,20 @@ impl SubprocessRunner {
             }
             let _ = tmux.kill_session(session_name);
         }
+        // RAL-397 Phase 2C: a durable, unbounded-depth transcript of this
+        // attempt's raw pane output, written continuously via `pipe_pane` --
+        // see `Tmux::new_detached_session_with_command`'s doc comment. Not
+        // yet consumed by anything in this pass (Phase 2D, which moves
+        // event/sentinel reading onto this file, is deliberately deferred);
+        // for now this only feeds Phase 2E's terminal-log derivation.
+        let transcript_path = crate::terminal_log::raw_transcript_path(session_name, attempt);
         if let Err(e) = tmux.new_detached_session_with_command(
             session_name,
             &attempt_spec.cwd,
             &attempt_spec.env_overrides,
             &self.program,
             &all_args,
+            Some(&transcript_path),
         ) {
             let _ = std::fs::remove_file(spec_path);
             return (
@@ -1662,6 +1670,14 @@ impl SubprocessRunner {
             std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
         };
 
+        // RAL-397 Phase 2C: best-effort clean stop before the forceful
+        // process-tree kill below -- not load-bearing (the job-object
+        // confinement `kill_session` relies on, RAL-321, already tears down
+        // any pipe-sink child spawned into this session's tree), but gives
+        // the sink a chance to notice EOF and exit tidily rather than being
+        // killed outright. A no-op when this attempt never started a pipe
+        // (transcript_path was `None`).
+        tmux.stop_pipe_pane(session_name);
         let _ = tmux.kill_session(session_name);
         let _ = std::fs::remove_file(spec_path);
         let _ = std::fs::remove_file(result_path);

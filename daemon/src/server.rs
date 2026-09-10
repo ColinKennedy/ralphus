@@ -7741,6 +7741,7 @@ fn open_agent_terminal_via_tmux(
             &std::collections::BTreeMap::new(),
             &shell_cmd,
             &shell_args,
+            None,
         ) {
             return error(500, "tmux_error", &e.to_string(), vec![]);
         }
@@ -16450,6 +16451,7 @@ command = "true"
             &std::collections::BTreeMap::new(),
             "sh",
             &["-c".to_string(), format!("echo {marker}; sleep 60")],
+            None,
         )
         .unwrap();
         for _ in 0..50 {
