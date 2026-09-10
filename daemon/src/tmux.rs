@@ -2150,6 +2150,188 @@ mod tests {
         let _ = std::fs::remove_file(&transcript);
     }
 
+    /// RAL-397 Phase 2I: the permanent regression test for the whole reason
+    /// this phase exists — ports the manual PowerShell OOM-repro spike
+    /// (`PSMUX_MEMORY_FIX.local.md` Phase 0;
+    /// `psmux-scrollback-oom-repro/RESULTS.md` in the sibling repro repo)
+    /// into real, automated, CI-covered coverage. Floods a real pane with
+    /// far more lines than `TMUX_HISTORY_LIMIT` (15000), then asserts both
+    /// halves of the Phase 1+2 thesis at once:
+    /// - the psmux server's RSS stays bounded (history-limit does its job;
+    ///   this would have caught the original ~4.4 GB-at-200000 ceiling), and
+    /// - the `.raw` transcript still contains every single line (Phase 2C's
+    ///   pipe-pane tee makes the low history-limit safe to have at all,
+    ///   since nothing is lost to it).
+    ///
+    /// Drives `pipe_pane` directly with a real PowerShell-script sink (the
+    /// same proven shape `live_tmux_pipe_pane_tees_raw_output_to_a_file`
+    /// uses), rather than through `new_detached_session_with_command`'s
+    /// `transcript_path` wiring: that wiring builds the pipe-sink target as
+    /// `<program> pipe-sink --out <path>`, reusing the *same* `program` the
+    /// payload uses -- correct in production (`program` is `ralphus-runner`,
+    /// one binary understanding both `send` and `pipe-sink`), but there is
+    /// no `CARGO_BIN_EXE_ralphus-runner` available from a `daemon`-crate test
+    /// (no dependency relationship) to stand in for it. A `.cmd` dispatcher
+    /// script was tried as a substitute and discovered *not* to work at all:
+    /// psmux's pipe-pane spawn does not go through a shell that resolves
+    /// `.bat`/`.cmd` files as executable images the way `cmd.exe` itself
+    /// does, so `pipe-pane -o -t <session> "dispatcher.cmd ..."` silently
+    /// no-ops (confirmed directly against a real psmux session, independent
+    /// of any Rust code, while authoring this test). This test therefore
+    /// verifies the RSS/capture thesis at scale using the primitives that
+    /// *are* provable from here; the wiring's dual-subcommand assumption is
+    /// covered separately by `live_tmux_transcript_path_wiring_does_not_break_payload_delivery`.
+    ///
+    /// Windows-only (RSS is read via `sysinfo`, and the flood/sink scripts
+    /// are PowerShell) — matches this test file's existing Windows-specific
+    /// live tests.
+    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
+    #[test]
+    fn live_tmux_flood_keeps_server_rss_bounded_and_transcript_complete() {
+        if !tmux_on_path() {
+            println!("SKIP: tmux not found on PATH");
+            return;
+        }
+        if !cfg!(target_os = "windows") {
+            println!(
+                "SKIP: this test's flood/sink scripts and RSS measurement are Windows-specific"
+            );
+            return;
+        }
+        let _guard = LIVE_TMUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmux = Tmux::resolve().unwrap();
+        let name = session_name(&unique_test_tag("test-run"), "build", "flood-regression");
+        let _ = tmux.kill_session(&name);
+
+        let tmp = std::env::temp_dir();
+        let tag = unique_test_tag("flood-regression");
+        let transcript = tmp.join(format!("{tag}.raw"));
+        let sink_script = tmp.join(format!("{tag}-sink.ps1"));
+        let flood_script = tmp.join(format!("{tag}-flood.ps1"));
+        // Comfortably more lines than TMUX_HISTORY_LIMIT (15000), matching
+        // the scale that produced a multi-GB ceiling before this phase
+        // (see RESULTS.md in the sibling repro repo).
+        const FLOOD_LINES: u32 = 40_000;
+
+        let transcript_str = transcript.to_string_lossy().into_owned();
+        std::fs::write(
+            &sink_script,
+            format!(
+                "$fs = [System.IO.File]::Open('{transcript_str}', [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)\n\
+                 $sw = [System.IO.StreamWriter]::new($fs)\n\
+                 try {{ while (($line = [Console]::In.ReadLine()) -ne $null) {{ $sw.WriteLine($line); $sw.Flush() }} }} finally {{ $sw.Close() }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &flood_script,
+            format!(
+                "for ($i=0; $i -lt {FLOOD_LINES}; $i++) {{ \"line $i \" + ('x' * 150) }}\n\"FLOOD_REGRESSION_DONE\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Create the session with a placeholder payload -- pipe_pane must be
+        // attached, and settled (the confirmed startup race), *before* the
+        // real flood is sent, exactly as `new_detached_session_with_command`
+        // orders it internally for the production wiring this stands in for.
+        tmux.new_detached_session_with_command(
+            &name,
+            &tmp.to_string_lossy(),
+            &BTreeMap::new(),
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Milliseconds 200".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        let target = build_pipe_target(
+            "powershell",
+            &[
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                sink_script.to_string_lossy().into_owned(),
+            ],
+        );
+        tmux.pipe_pane(&name, &target).unwrap();
+        std::thread::sleep(PIPE_SINK_SETTLE_DELAY.max(Duration::from_millis(500)));
+        tmux.send_keys_literal(
+            &name,
+            &format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                flood_script.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let server_pid = find_server_pid(&name);
+        let mut peak_rss_bytes: u64 = 0;
+        let mut done = false;
+        for _ in 0..600 {
+            std::thread::sleep(Duration::from_millis(300));
+            if let Some(pid) = server_pid {
+                use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+                let mut sys = System::new();
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+                    true,
+                    ProcessRefreshKind::nothing().with_memory(),
+                );
+                if let Some(proc) = sys.process(Pid::from_u32(pid)) {
+                    peak_rss_bytes = peak_rss_bytes.max(proc.memory());
+                }
+            }
+            if std::fs::read_to_string(&transcript)
+                .is_ok_and(|c| c.contains("FLOOD_REGRESSION_DONE"))
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "flood did not complete within the polling budget");
+
+        // The core Phase 1 thesis: bounded regardless of how many lines were
+        // emitted. 500 MB is a generous ceiling above the ~330 MB predicted
+        // at TMUX_HISTORY_LIMIT=15000/cols=500 (accounts for baseline psmux
+        // process overhead + measurement noise), while remaining far below
+        // the multi-GB the pre-Phase-1 200000 setting would have produced at
+        // this same flood size.
+        const MAX_ACCEPTABLE_RSS_BYTES: u64 = 500 * 1024 * 1024;
+        assert!(
+            peak_rss_bytes > 0,
+            "could not measure psmux server RSS at all -- test infrastructure problem, not a pass"
+        );
+        assert!(
+            peak_rss_bytes < MAX_ACCEPTABLE_RSS_BYTES,
+            "psmux server RSS grew to {} MB, expected < {} MB -- history-limit may have regressed",
+            peak_rss_bytes / 1024 / 1024,
+            MAX_ACCEPTABLE_RSS_BYTES / 1024 / 1024,
+        );
+
+        // The core Phase 2C/2E thesis: nothing is lost to the low
+        // history-limit, because the transcript captured it independently.
+        let transcript_content = std::fs::read_to_string(&transcript).unwrap();
+        for i in [0u32, FLOOD_LINES / 2, FLOOD_LINES - 1] {
+            let marker = format!("line {i} ");
+            assert!(
+                transcript_content.contains(&marker),
+                "expected the transcript to contain {marker:?} -- a line was lost despite the low history-limit"
+            );
+        }
+
+        tmux.stop_pipe_pane(&name);
+        tmux.kill_session(&name).unwrap();
+        let _ = std::fs::remove_file(&sink_script);
+        let _ = std::fs::remove_file(&flood_script);
+        let _ = std::fs::remove_file(&transcript);
+    }
+
     #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
     #[test]
     fn live_tmux_has_session_false_for_unknown_name() {
