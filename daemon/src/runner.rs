@@ -1448,7 +1448,7 @@ impl SubprocessRunner {
             // any salvage written to that same slot anyway.
             if attempt > 0 {
                 if let Ok(content) = tmux.capture_pane(session_name, 10_000) {
-                    crate::terminal_log::write_attempt(
+                    write_terminal_log_preferring_raw_transcript(
                         session_name,
                         attempt - 1,
                         &content,
@@ -1693,7 +1693,7 @@ impl SubprocessRunner {
         // overwritten record (unlike the single-slot snapshot above, which
         // the next attempt/reattach will replace) — so a restarted cell's
         // full multi-attempt history stays individually accessible.
-        crate::terminal_log::write_attempt(
+        write_terminal_log_preferring_raw_transcript(
             session_name,
             attempt,
             last_pane.as_deref().unwrap_or(""),
@@ -2187,6 +2187,26 @@ fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
 /// without spawning a real subprocess (RAL-15).
 fn timed_out(elapsed: Duration, deadline: Option<Duration>) -> bool {
     matches!(deadline, Some(d) if elapsed >= d)
+}
+
+/// Writes `session_name`'s durable attempt log for `attempt`, preferring the
+/// unbounded-depth `.raw` pipe-pane transcript (RAL-397 Phase 2E) over a
+/// single `capture-pane` scrollback snapshot. Falls back to
+/// `fallback_content` only if the transcript is unavailable (no cell run
+/// through Phase 2C's wiring yet, or some other read failure) — so terminal-
+/// log coverage never regresses for a session that, for whatever reason,
+/// never got a `.raw` file.
+fn write_terminal_log_preferring_raw_transcript(
+    session_name: &str,
+    attempt: u32,
+    fallback_content: &str,
+    max_lines: usize,
+) {
+    if crate::terminal_log::write_attempt_from_raw_transcript(session_name, attempt, max_lines)
+        .is_err()
+    {
+        crate::terminal_log::write_attempt(session_name, attempt, fallback_content, max_lines);
+    }
 }
 
 /// The last `n` non-empty lines of `text`, joined back with newlines — used
