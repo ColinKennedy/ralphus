@@ -1029,7 +1029,7 @@ const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// so this is a small visible-window read rather than the former 10_000-line
 /// scan, kept comfortably above both a terminal's visible height and
 /// [`SubprocessRunner::read_tmux_result`]'s 60-line failure-diagnostic tail.
-const LIVE_SNAPSHOT_CAPTURE_LINES: u32 = 500;
+pub(crate) const LIVE_SNAPSHOT_CAPTURE_LINES: u32 = 500;
 
 /// RAL-241: how long a tmux-wrapped session may show no pane growth before a
 /// `high`-priority mailbox stall escalation fires (see
@@ -1084,7 +1084,7 @@ fn pane_shows_done_sentinel(pane: &str) -> bool {
 /// so a sentinel read from the durable transcript and one read from a pane
 /// scrollback scan are accepted on byte-for-byte identical terms (line-start
 /// match only, defeating the mid-line false positives documented above).
-fn line_is_done_sentinel(line: &str) -> bool {
+pub(crate) fn line_is_done_sentinel(line: &str) -> bool {
     line.trim_start()
         .strip_prefix(TMUX_DONE_MARKER)
         .is_some_and(|rest| rest.starts_with(": "))
@@ -1111,8 +1111,8 @@ const MAX_TRANSCRIPT_CARRY_BYTES: usize = 1024 * 1024;
 /// even for output that hasn't yet produced a complete (newline-terminated)
 /// line.
 #[derive(Default)]
-struct DrainedLines {
-    lines: Vec<String>,
+pub(crate) struct DrainedLines {
+    pub(crate) lines: Vec<String>,
     saw_new_bytes: bool,
 }
 
@@ -1126,7 +1126,7 @@ struct DrainedLines {
 /// the 500 ms polls. Constructed fresh per attempt; a reattach is a new
 /// `run_via_tmux_attempt` call with the next `attempt` number, pointing a new
 /// tailer at that attempt's own `.raw` file.
-struct TranscriptTailer {
+pub(crate) struct TranscriptTailer {
     path: std::path::PathBuf,
     /// Byte offset into the file already consumed.
     offset: u64,
@@ -1145,7 +1145,7 @@ impl TranscriptTailer {
         ))
     }
 
-    fn at_path(path: std::path::PathBuf) -> Self {
+    pub(crate) fn at_path(path: std::path::PathBuf) -> Self {
         Self {
             path,
             offset: 0,
@@ -1168,7 +1168,7 @@ impl TranscriptTailer {
     /// that doesn't exist yet (session still settling) or a transient read
     /// error yields no lines and leaves the offset untouched, to be retried
     /// next poll.
-    fn drain(&mut self) -> DrainedLines {
+    pub(crate) fn drain(&mut self) -> DrainedLines {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let Ok(mut file) = std::fs::File::open(&self.path) else {
             return DrainedLines::default();
