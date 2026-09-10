@@ -44,6 +44,40 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// `history-limit` set on every cell pane (RAL-397 stopgap). This is a
+/// per-pane scrollback ceiling, and each scrollback line at the pane's `-x
+/// 500` width costs a fixed amount regardless of content on the Windows
+/// tmux-alternative build this project targets (psmux stores every
+/// scrollback row as a dense 500-cell vector) — so the previous value of
+/// `200000` set a ~4.4 GB *per pane* memory ceiling, and an output-heavy
+/// `command`/`prompt` proof (e.g. a `cargo` build/test) could drive a real
+/// pane there and get OOM-killed mid-run (see `PSMUX_SCROLLBACK_OOM.local.md`
+/// and the linked upstream repro for the full analysis).
+///
+/// `15000` is chosen to sit safely above every consumer that currently reads
+/// pane scrollback depth, so lowering it costs no functional coverage:
+/// - `runner.rs`'s poll loop and reattach capture read `capture_pane(...,
+///   10_000)` — the deepest window anything reads. This is the hard floor:
+///   do not lower `TMUX_HISTORY_LIMIT` below it without first lowering that
+///   capture window to match, or the done-sentinel/event scan can miss
+///   output that scrolled past between polls.
+/// - the durable terminal log keeps `max_lines_per_attempt()` (default 4000)
+///   and the pane snapshot keeps `PANE_SNAPSHOT_MAX_LINES` (4000) — both well
+///   under this value.
+/// - the board's live-view/history HTTP endpoint defaults to 2000 lines
+///   (user-overridable).
+///
+/// At `-x 500`, this drops the per-pane ceiling from ~4.4 GB to ~330 MB — the
+/// same order of magnitude already used successfully by every other
+/// consumer in this list. This is a stopgap, not the permanent fix: per-pane
+/// limits do not bound *aggregate* memory under concurrency (a pane's
+/// ceiling times `DEFAULT_MAX_CONCURRENT` panes can still be large). The
+/// permanent fix moves the durable transcript off pane scrollback entirely
+/// (`pipe-pane` to a file — see `PSMUX_MEMORY_FIX.local.md` Phase 2), at
+/// which point this constant can drop further, to just the live scrollback
+/// window a human wants when opening Live View.
+const TMUX_HISTORY_LIMIT: &str = "15000";
+
 /// Overrides tmux resolution entirely — set to the full path (or bare name,
 /// if it's on `PATH` under a different name) of the tmux-compatible binary to
 /// use, skipping both the `PATH` lookup and the embedded fallback.
@@ -842,12 +876,20 @@ impl Tmux {
         // immediately, which would race the daemon's own sentinel-based
         // completion detection.
         let _ = self.run(&["set-option", "-t", name, "remain-on-exit", "on"]);
-        // Best-effort: raise the scrollback limit well past tmux's default
-        // (2000 lines) so `ralphus history --live` (RAL-140), which polls
-        // `capture-pane` with a much larger `lines` window than the board's
+        // Best-effort: raise the scrollback limit past tmux's default (2000
+        // lines) so `ralphus history --live` (RAL-140), which polls
+        // `capture-pane` with a larger `lines` window than the board's
         // live-view default, doesn't silently lose older output to tmux's
         // own buffer trimming while a long-running session is still live.
-        let _ = self.run(&["set-option", "-t", name, "history-limit", "200000"]);
+        // See `TMUX_HISTORY_LIMIT`'s doc comment for why this value is
+        // capped well below tmux's own maximum.
+        let _ = self.run(&[
+            "set-option",
+            "-t",
+            name,
+            "history-limit",
+            TMUX_HISTORY_LIMIT,
+        ]);
         let started = if cfg!(target_os = "windows") {
             self.run(&["send-keys", "-t", name, base.as_str(), "Enter"])
         } else {
@@ -1319,6 +1361,27 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    #[test]
+    fn tmux_history_limit_stays_above_the_runners_10k_capture_window() {
+        // See `TMUX_HISTORY_LIMIT`'s doc comment: `runner.rs`'s poll loop and
+        // reattach path read `capture_pane(..., 10_000)`, the deepest window
+        // any consumer reads. Lowering the history-limit below that floor
+        // without also lowering the capture window risks losing scrolled-past
+        // events/done-sentinels. This is a change-detector by design: it
+        // should force a deliberate look at `runner.rs`'s capture windows
+        // whenever `TMUX_HISTORY_LIMIT` moves.
+        const RUNNER_CAPTURE_WINDOW: u32 = 10_000;
+        let limit: u32 = TMUX_HISTORY_LIMIT
+            .parse()
+            .expect("TMUX_HISTORY_LIMIT must be a valid tmux history-limit integer");
+        assert!(
+            limit >= RUNNER_CAPTURE_WINDOW,
+            "TMUX_HISTORY_LIMIT ({limit}) must stay >= the runner's capture window \
+             ({RUNNER_CAPTURE_WINDOW}) or the poll loop can miss scrolled-past \
+             events/done-sentinels"
+        );
+    }
 
     #[test]
     fn split_command_separates_program_from_leading_args() {
