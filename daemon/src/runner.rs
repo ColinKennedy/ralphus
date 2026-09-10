@@ -1021,6 +1021,16 @@ impl Drop for DetachGuard<'_> {
 /// subprocess spawn, not just a syscall.
 const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many lines the per-poll `capture_pane` pulls for the board's live and
+/// frozen "current screen" snapshot, since RAL-397 Phase 2D moved event and
+/// completion-sentinel detection off pane scrollback onto the `.raw`
+/// transcript tail ([`TranscriptTailer`]). The snapshot only needs the current
+/// screen now — deep scrollback is served from the transcript (Phase 2E/2F) —
+/// so this is a small visible-window read rather than the former 10_000-line
+/// scan, kept comfortably above both a terminal's visible height and
+/// [`SubprocessRunner::read_tmux_result`]'s 60-line failure-diagnostic tail.
+const LIVE_SNAPSHOT_CAPTURE_LINES: u32 = 500;
+
 /// RAL-241: how long a tmux-wrapped session may show no pane growth before a
 /// `high`-priority mailbox stall escalation fires (see
 /// `SubprocessRunner::check_stall_escalation`). Overridable via
@@ -1065,9 +1075,141 @@ const TMUX_DONE_MARKER: &str = "RALPHUS_TMUX_DONE";
 /// tool's numbered listing is prefixed with a line number, and quoting the
 /// marker in prose reads as ordinary text, not a line starting with it.
 fn pane_shows_done_sentinel(pane: &str) -> bool {
-    let prefix = format!("{TMUX_DONE_MARKER}: ");
-    pane.lines()
-        .any(|line| line.trim_start().starts_with(&prefix))
+    pane.lines().any(line_is_done_sentinel)
+}
+
+/// Whether a single line is the standalone `RALPHUS_TMUX_DONE: <status>`
+/// completion sentinel — the per-line predicate behind
+/// [`pane_shows_done_sentinel`], shared with the Phase 2D [`TranscriptTailer`]
+/// so a sentinel read from the durable transcript and one read from a pane
+/// scrollback scan are accepted on byte-for-byte identical terms (line-start
+/// match only, defeating the mid-line false positives documented above).
+fn line_is_done_sentinel(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(TMUX_DONE_MARKER)
+        .is_some_and(|rest| rest.starts_with(": "))
+}
+
+/// Max bytes [`TranscriptTailer::drain`] consumes from the `.raw` transcript in
+/// a single poll. Bounds the transient allocation when a cell floods output
+/// between polls; anything beyond it is drained on subsequent polls (the byte
+/// offset persists). Completion is never missed while catching up: the done
+/// sentinel is always the pane's final printed line, so the small
+/// `capture_pane` safety net in the poll loop still sees it even mid-catch-up.
+const MAX_TRANSCRIPT_DRAIN_BYTES_PER_POLL: u64 = 4 * 1024 * 1024;
+
+/// Cap on the partial-line carry buffer. Real pane output is newline-
+/// terminated long before this; the cap only exists so a pathological
+/// newline-free flood can never pin the buffer in memory (the whole point of
+/// this phase is bounded per-pane memory). A marker line is orders of
+/// magnitude shorter than this, so flushing an over-long carry as a synthetic
+/// line can never split a `RALPHUS_EVENT:`/sentinel line.
+const MAX_TRANSCRIPT_CARRY_BYTES: usize = 1024 * 1024;
+
+/// The complete, ANSI-stripped lines [`TranscriptTailer::drain`] read this
+/// poll, plus whether *any* new bytes were consumed at all — a liveness signal
+/// even for output that hasn't yet produced a complete (newline-terminated)
+/// line.
+#[derive(Default)]
+struct DrainedLines {
+    lines: Vec<String>,
+    saw_new_bytes: bool,
+}
+
+/// Chunked, offset-tracking reader over one attempt's `.raw` pipe-pane
+/// transcript (RAL-397 Phase 2D). Each [`Self::drain`] processes only the
+/// bytes appended since the previous call and buffers a trailing partial line
+/// across polls, so a `RALPHUS_EVENT:`/done-sentinel line split by a poll
+/// boundary still parses intact. This captures every marker the runner emits
+/// losslessly, unlike the `capture_pane` scrollback scan it replaces — which
+/// could drop a marker that scrolled past a shrinking `history-limit` between
+/// the 500 ms polls. Constructed fresh per attempt; a reattach is a new
+/// `run_via_tmux_attempt` call with the next `attempt` number, pointing a new
+/// tailer at that attempt's own `.raw` file.
+struct TranscriptTailer {
+    path: std::path::PathBuf,
+    /// Byte offset into the file already consumed.
+    offset: u64,
+    /// Bytes of an incomplete trailing line held back until its newline
+    /// arrives. Raw (pre-ANSI-strip) so a UTF-8 char or escape sequence split
+    /// across a read boundary reassembles correctly — a `\n` byte never
+    /// appears inside either.
+    carry: Vec<u8>,
+}
+
+impl TranscriptTailer {
+    fn new(session_name: &str, attempt: u32) -> Self {
+        Self::at_path(crate::terminal_log::raw_transcript_path(
+            session_name,
+            attempt,
+        ))
+    }
+
+    fn at_path(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            carry: Vec::new(),
+        }
+    }
+
+    /// ANSI-strip one raw line's bytes and drop its trailing line terminator,
+    /// so a yielded line matches the terminator-free form the replaced
+    /// `pane.lines()` scan produced (trailing spaces are left intact, as
+    /// `str::lines` does).
+    fn to_line(raw: &[u8]) -> String {
+        crate::terminal_log::strip_ansi_escapes(&String::from_utf8_lossy(raw))
+            .trim_end_matches(['\r', '\n'])
+            .to_string()
+    }
+
+    /// Read and process everything appended since the last call (up to
+    /// [`MAX_TRANSCRIPT_DRAIN_BYTES_PER_POLL`]). Best-effort: a `.raw` file
+    /// that doesn't exist yet (session still settling) or a transient read
+    /// error yields no lines and leaves the offset untouched, to be retried
+    /// next poll.
+    fn drain(&mut self) -> DrainedLines {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return DrainedLines::default();
+        };
+        let Ok(total) = file.metadata().map(|m| m.len()) else {
+            return DrainedLines::default();
+        };
+        // File shrank beneath us (pipe-sink hit its byte cap and truncated, or
+        // the path was reused) — restart from the top rather than seek past
+        // the new end.
+        if total < self.offset {
+            self.offset = 0;
+            self.carry.clear();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return DrainedLines::default();
+        }
+        let mut lines = Vec::new();
+        let mut consumed: u64 = 0;
+        let mut buf = [0u8; 64 * 1024];
+        while consumed < MAX_TRANSCRIPT_DRAIN_BYTES_PER_POLL {
+            let n = match file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            self.offset += n as u64;
+            consumed += n as u64;
+            self.carry.extend_from_slice(&buf[..n]);
+            while let Some(nl) = self.carry.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = self.carry.drain(..=nl).collect();
+                lines.push(Self::to_line(&raw));
+            }
+            if self.carry.len() > MAX_TRANSCRIPT_CARRY_BYTES {
+                lines.push(Self::to_line(&std::mem::take(&mut self.carry)));
+            }
+        }
+        DrainedLines {
+            lines,
+            saw_new_bytes: consumed > 0,
+        }
+    }
 }
 
 impl Runner for SubprocessRunner {
@@ -1461,10 +1603,10 @@ impl SubprocessRunner {
         }
         // RAL-397 Phase 2C: a durable, unbounded-depth transcript of this
         // attempt's raw pane output, written continuously via `pipe_pane` --
-        // see `Tmux::new_detached_session_with_command`'s doc comment. Not
-        // yet consumed by anything in this pass (Phase 2D, which moves
-        // event/sentinel reading onto this file, is deliberately deferred);
-        // for now this only feeds Phase 2E's terminal-log derivation.
+        // see `Tmux::new_detached_session_with_command`'s doc comment. Phase 2D
+        // reads event markers and the completion sentinel back from it (the
+        // `TranscriptTailer` in the poll loop below), and Phase 2E derives this
+        // attempt's durable terminal log from it.
         let transcript_path = crate::terminal_log::raw_transcript_path(session_name, attempt);
         if let Err(e) = tmux.new_detached_session_with_command(
             session_name,
@@ -1525,7 +1667,11 @@ impl SubprocessRunner {
         // is `None` until then).
         let attempt_started_ms = crate::store::now_ms();
         let stall_threshold = mailbox_stall_threshold();
-        let mut lines_seen: usize = 0;
+        // RAL-397 Phase 2D: the lossless event/sentinel source for this
+        // attempt, tailing the durable `.raw` transcript this attempt's
+        // `pipe_pane` wiring (Phase 2C) streams to. Fresh per attempt — see
+        // `TranscriptTailer`'s doc comment on how a reattach re-targets it.
+        let mut tailer = TranscriptTailer::new(session_name, attempt);
         let mut last_pane: Option<String> = None;
         let mut missing_session_strikes: u32 = 0;
         // A session that appears gone must be confirmed gone across a couple
@@ -1618,36 +1764,59 @@ impl SubprocessRunner {
                     attempt_started_ms,
                     stall_threshold,
                 );
-                match tmux.capture_pane(session_name, 10_000) {
+                // RAL-397 Phase 2D: read newly-appended `RALPHUS_EVENT:`
+                // markers and the completion sentinel from this attempt's
+                // durable `.raw` transcript, not from pane scrollback. The
+                // transcript is an append-only byte tee (`pipe_pane`, Phase 2C)
+                // the sink flushes continuously, so a marker can never scroll
+                // past a shrinking `history-limit` between polls the way the
+                // old `capture_pane(10_000)` scan risked — this is the change
+                // that lets `history-limit` drop to the live window (Phase 2H)
+                // without losing events. Runs independently of the
+                // `capture_pane` call below and of any transient capture error.
+                let drained = tailer.drain();
+                if drained.saw_new_bytes {
+                    self.note_live_activity(session_name);
+                }
+                let mut done = false;
+                for line in &drained.lines {
+                    if line_is_done_sentinel(line) {
+                        done = true;
+                    }
+                    if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
+                        let fwd = forward_runner_event(
+                            self.cartographer.as_ref(),
+                            &attempt_spec.squad_id,
+                            &attempt_spec.cell_id,
+                            &attempt_spec.task,
+                            json,
+                        );
+                        if let Some(sid) = fwd.agent_session_id {
+                            *resumable_agent_session_id = Some(sid);
+                        }
+                        if let Some(usage) = fwd.live_usage {
+                            current_usage = usage;
+                        }
+                    }
+                }
+
+                // A small `capture_pane` (visible window only, not the former
+                // deep 10_000-line scan events used to come from) still runs
+                // each poll for three jobs unrelated to event parsing: the
+                // single-slot "current screen" snapshot the board freezes once
+                // the session ends (deep scrollback is now served from the
+                // transcript — Phase 2E/2F), the `has-session` strike-based
+                // death detection, and a completion safety net. Because the
+                // sentinel is always the pane's final printed line, even this
+                // shallow window reliably shows it if the transcript tailer is
+                // still catching up or the `.raw` file never materialized (a
+                // best-effort `pipe_pane` that silently failed) — so completion
+                // detection never becomes dependent on the transcript alone.
+                match tmux.capture_pane(session_name, LIVE_SNAPSHOT_CAPTURE_LINES) {
                     Ok(pane) => {
                         missing_session_strikes = 0;
-                        let all_lines: Vec<&str> = pane.lines().collect();
-                        if all_lines.len() > lines_seen {
-                            self.note_live_activity(session_name);
-                            for line in &all_lines[lines_seen..] {
-                                if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
-                                    let fwd = forward_runner_event(
-                                        self.cartographer.as_ref(),
-                                        &attempt_spec.squad_id,
-                                        &attempt_spec.cell_id,
-                                        &attempt_spec.task,
-                                        json,
-                                    );
-                                    if let Some(sid) = fwd.agent_session_id {
-                                        *resumable_agent_session_id = Some(sid);
-                                    }
-                                    if let Some(usage) = fwd.live_usage {
-                                        current_usage = usage;
-                                    }
-                                }
-                            }
-                            lines_seen = all_lines.len();
-                        }
-                        let done = pane_shows_done_sentinel(&pane);
+                        done = done || pane_shows_done_sentinel(&pane);
                         last_pane = Some(pane);
-                        if done {
-                            break Self::read_tmux_result(result_path, last_pane.as_deref());
-                        }
                     }
                     Err(_) => {
                         // The session may have died before printing the sentinel
@@ -1665,6 +1834,9 @@ impl SubprocessRunner {
                             missing_session_strikes = 0;
                         }
                     }
+                }
+                if done {
+                    break Self::read_tmux_result(result_path, last_pane.as_deref());
                 }
             }
             std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
@@ -4494,5 +4666,152 @@ prompt = "make it build"
         runner
             .preflight_runner_executable(None)
             .expect("the running test binary is itself a real, executable file");
+    }
+
+    // --- RAL-397 Phase 2D: `.raw` transcript tailer -----------------------
+
+    /// A unique, empty temp `.raw` path for a tailer test — mirrors the
+    /// SystemTime-nanos naming the pane/result tests in this module already
+    /// use, so parallel test processes never collide on one file.
+    fn unique_raw_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ralphus-tailer-{tag}-{nanos}.raw"))
+    }
+
+    fn append(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open transcript for append");
+        f.write_all(bytes).expect("append to transcript");
+    }
+
+    #[test]
+    fn transcript_tailer_yields_complete_lines_and_advances_its_offset() {
+        let path = unique_raw_path("incremental");
+        let _ = std::fs::remove_file(&path);
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+
+        append(&path, b"line a\nline b\n");
+        let first = tailer.drain();
+        assert!(first.saw_new_bytes);
+        assert_eq!(
+            first.lines,
+            vec!["line a".to_string(), "line b".to_string()]
+        );
+
+        // A second drain with nothing appended sees no new bytes and no lines.
+        let idle = tailer.drain();
+        assert!(!idle.saw_new_bytes);
+        assert!(idle.lines.is_empty());
+
+        // Only the newly appended line comes back, not the whole file again.
+        append(&path, b"line c\n");
+        let second = tailer.drain();
+        assert!(second.saw_new_bytes);
+        assert_eq!(second.lines, vec!["line c".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_tailer_reassembles_a_marker_split_across_polls() {
+        let path = unique_raw_path("split");
+        let _ = std::fs::remove_file(&path);
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+
+        // Half of a RALPHUS_EVENT line lands in one poll (no newline yet) ...
+        append(&path, b"RALPHUS_EVENT: {\"kind\":\"live");
+        let partial = tailer.drain();
+        assert!(
+            partial.saw_new_bytes,
+            "the partial write is still activity even without a complete line"
+        );
+        assert!(
+            partial.lines.is_empty(),
+            "an unterminated line is held back, not emitted early"
+        );
+
+        // ... and its remainder + newline arrives in the next poll.
+        append(&path, b" usage\"}\n");
+        let complete = tailer.drain();
+        assert_eq!(
+            complete.lines,
+            vec!["RALPHUS_EVENT: {\"kind\":\"live usage\"}".to_string()],
+            "the two halves reassemble into one intact marker line"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_tailer_strips_ansi_and_line_terminators() {
+        let path = unique_raw_path("ansi");
+        let _ = std::fs::remove_file(&path);
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+
+        // Color codes around the text, and a CRLF terminator.
+        append(&path, b"\x1b[31mhello\x1b[0m\r\n");
+        let drained = tailer.drain();
+        assert_eq!(drained.lines, vec!["hello".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_tailer_missing_file_is_a_quiet_noop() {
+        let path = unique_raw_path("absent");
+        let _ = std::fs::remove_file(&path);
+        let mut tailer = TranscriptTailer::at_path(path);
+        let drained = tailer.drain();
+        assert!(!drained.saw_new_bytes);
+        assert!(drained.lines.is_empty());
+    }
+
+    #[test]
+    fn transcript_tailer_restarts_from_the_top_when_the_file_shrinks() {
+        let path = unique_raw_path("shrink");
+        let _ = std::fs::remove_file(&path);
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+
+        append(&path, b"first attempt aaaa\nfirst attempt bbbb\n");
+        let first = tailer.drain();
+        assert_eq!(first.lines.len(), 2);
+
+        // Simulate the pipe-sink byte-cap truncation (or a path reuse): the
+        // file is now shorter than the offset already consumed. The tailer
+        // must reset to byte 0 rather than seek past the new end and stall.
+        std::fs::write(&path, b"short\n").expect("truncate-rewrite");
+        let after = tailer.drain();
+        assert!(after.saw_new_bytes);
+        assert_eq!(after.lines, vec!["short".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn line_is_done_sentinel_matches_only_a_standalone_line_start_marker() {
+        assert!(line_is_done_sentinel("RALPHUS_TMUX_DONE: ok"));
+        assert!(
+            line_is_done_sentinel("   RALPHUS_TMUX_DONE: failed"),
+            "leading whitespace is tolerated (trim_start), matching the pane scan"
+        );
+        assert!(
+            !line_is_done_sentinel("some_file.rs:42:RALPHUS_TMUX_DONE: ok"),
+            "a grep-style file:line prefix must not read as completion"
+        );
+        assert!(
+            !line_is_done_sentinel("mentioning RALPHUS_TMUX_DONE in prose"),
+            "the marker embedded mid-line is not a sentinel"
+        );
+        assert!(
+            !line_is_done_sentinel("RALPHUS_TMUX_DONEno-colon"),
+            "the marker must be followed by the exact ': ' separator"
+        );
     }
 }

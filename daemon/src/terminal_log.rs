@@ -323,11 +323,12 @@ fn read_tail_bytes(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Ve
 ///
 /// Not a complete ECMA-48 parser (no support for nested/malformed sequences
 /// beyond what real pane output actually produces), but sufficient for its
-/// only consumer: turning a real captured pane transcript back into the same
-/// kind of plain text `capture-pane -p` already produced before this file
-/// existed.
+/// consumers: turning a real captured pane transcript back into the same kind
+/// of plain text `capture-pane -p` already produced before this file existed
+/// (here), and normalizing the raw transcript tail the runner's Phase 2D
+/// event/sentinel scan reads (`crate::runner`).
 #[must_use]
-fn strip_ansi_escapes(s: &str) -> String {
+pub(crate) fn strip_ansi_escapes(s: &str) -> String {
     const ESC: char = '\u{1b}';
     const BEL: char = '\u{07}';
     let mut out = String::with_capacity(s.len());
