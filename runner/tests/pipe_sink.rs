@@ -79,6 +79,27 @@ fn pipe_sink_stops_persisting_past_max_bytes_but_still_drains_stdin() {
 }
 
 #[test]
+fn pipe_sink_creates_the_out_parent_directory_when_missing() {
+    // RAL-397 regression: psmux spawns this sink before the daemon has created
+    // the `terminal_logs/<session>/` directory (it only does so later, when
+    // writing the attempt `.log`), and psmux nulls the sink's stderr — so a
+    // missing-parent open failure was silent, producing zero `.raw` files in
+    // production even though the pipe-sink subcommand worked standalone.
+    let base = scratch_dir("missing-parent");
+    // A parent that does NOT exist yet — the sink must create it, not fail.
+    let out = base.join("nested").join("session").join("0000.raw");
+    assert!(
+        !out.parent().unwrap().exists(),
+        "precondition: parent is absent"
+    );
+    run_pipe_sink(b"first\nsecond\n", &out, None);
+    let content =
+        std::fs::read_to_string(&out).expect("the sink created the dir and wrote the file");
+    assert_eq!(content, "first\nsecond\n");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn pipe_sink_without_out_flag_fails() {
     let exe = env!("CARGO_BIN_EXE_ralphus-runner");
     let status = Command::new(exe)

@@ -132,6 +132,18 @@ fn pipe_sink(out_path: Option<&str>, max_bytes: Option<u64>) -> std::process::Ex
         return std::process::ExitCode::FAILURE;
     };
     let cap = max_bytes.unwrap_or(DEFAULT_PIPE_SINK_MAX_BYTES);
+    // psmux spawns this sink (via `pipe-pane`) at session-creation time, before
+    // anything has created the transcript's parent directory, and it nulls our
+    // stderr -- so a missing-directory open failure would be silent, leaving no
+    // `.raw` at all (RAL-397: the daemon only `create_dir_all`s that directory
+    // later, when it writes the attempt `.log`). Create the parent up front so
+    // the append below always lands. Best-effort: if this fails, the `open`
+    // error still surfaces below.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
     let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
