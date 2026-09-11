@@ -204,8 +204,7 @@ fn write_attempt_from_raw_transcript_in(
     // larger than the tail window; lossy conversion replaces any truncated
     // leading sequence with U+FFFD rather than failing the whole read.
     let text = String::from_utf8_lossy(&tail_bytes);
-    let stripped = strip_ansi_escapes(&text);
-    let rendered = render_carriage_returns(&stripped);
+    let rendered = render_pane_text(&text);
     write_attempt_in(root, session_name, attempt, &rendered, max_lines);
     Ok(())
 }
@@ -216,54 +215,199 @@ fn write_attempt_from_raw_transcript_in(
 /// over the longest one a pane realistically emits.
 const MAX_CSI_SEQUENCE_LEN: usize = 32;
 
-/// Apply carriage-return overwrite semantics to each line of `s`, so the
-/// derived log shows what the pane was actually *displaying* rather than
-/// every intermediate pass that produced it.
+/// Widest column [`render_pane_line`] will honor. A cursor-move parameter is
+/// attacker-adjacent only in the sense that it comes from whatever the agent
+/// printed, and padding out to an arbitrary column would allocate that many
+/// cells; real panes are hundreds of columns wide, so this is generous
+/// headroom that still bounds the allocation.
+const MAX_RENDERED_LINE_COLS: usize = 10_000;
+
+/// Render `s` the way a terminal would display it, rather than stripping the
+/// escape sequences and concatenating whatever is left (RAL-397 Phase 2E
+/// follow-up).
 ///
-/// Before RAL-397 Phase 2E the durable log came from `capture-pane -p`, i.e.
-/// the screen psmux had already composited. Deriving it from the raw byte
-/// stream instead means every progress-bar frame a `cargo`/`npm`/`pip` build
-/// rewrites in place with a bare `\r` arrives as separate content — hundreds
-/// of near-identical passes over one line, which then push everything else
-/// out through `max_lines` truncation. Replaying the overwrites restores the
-/// single rendered line a human expects to read.
+/// # Why this exists
 ///
-/// This is per-line only: `\r` returns the cursor to column 0 and later
-/// characters overwrite earlier ones position by position (a shorter final
-/// pass therefore leaves the tail of a longer earlier one visible, exactly as
-/// a terminal would). Full-screen cursor-addressed redraws are *not* replayed
-/// — that would need a real terminal emulator — so a full-screen TUI agent's
-/// log is still more verbose than its rendered screen.
-fn render_carriage_returns(s: &str) -> String {
-    if !s.contains('\r') {
-        return s.to_string();
-    }
+/// Before Phase 2E the durable log came from `capture-pane -p` — the screen
+/// psmux had already composited. Deriving it from the raw byte stream instead
+/// means every frame of an in-place rewrite arrives as separate content, so a
+/// `cargo` build's progress bar contributes hundreds of near-identical passes
+/// over one line, which then push everything else out through `max_lines`
+/// truncation. Replaying the overwrites restores the single line a human
+/// expects to read.
+///
+/// Two distinct shapes produce that rewrite, and both must be handled:
+/// - `\r` (and `\x08`) — progress bars, spinners, counters.
+/// - Absolute/relative *column* moves — what PowerShell's PSReadLine uses to
+///   redraw its prompt, and the more common shape on Windows. These are
+///   invisible to a strip-then-replay-`\r` approach, because stripping throws
+///   the positioning away before anything can act on it. Hence a single pass
+///   that interprets rather than deletes.
+///
+/// # What is interpreted
+///
+/// | Sequence | Effect |
+/// |---|---|
+/// | `\r` | column 0 |
+/// | `\x08` | column − 1 |
+/// | `CSI n G` | column ← n−1 (absolute) |
+/// | `CSI r ; c H` / `... f` | column ← c−1; **row ignored** |
+/// | `CSI n C` / `CSI n D` | column ± n |
+/// | `CSI 0 K` / `CSI K` | erase from column to end of line |
+/// | `CSI 1 K` | blank columns 0..column |
+/// | `CSI 2 K` | clear the line |
+///
+/// Everything else — SGR color, cursor show/hide, OSC titles — is stripped,
+/// exactly as [`strip_ansi_escapes`] does.
+///
+/// # What is deliberately NOT handled, and what it would cost
+///
+/// **Row movement.** This models one line at a time with no grid, so a
+/// sequence that moves *between* rows is ignored (only its column component
+/// is honored). A full-screen TUI — an agent's own interface, `htop`-style
+/// output — therefore still concatenates its redraw frames here. Fixing that
+/// means maintaining a real 2D screen buffer, and then deciding what a
+/// "transcript over time" even means for one (a grid naturally yields only
+/// the *final* screen, whereas this file is supposed to be the whole run), so
+/// it needs scrollback emulation, not just a grid. That is a different piece
+/// of work and was scoped out deliberately, not overlooked. Note the live
+/// interactive attach path ("Open Terminal", xterm.js over the WebSocket
+/// relay) already renders those agents correctly, so the gap is confined to
+/// this derived log and the board's transcript tape.
+///
+/// **Consequence worth knowing before changing this:** interpreting overwrites
+/// means text that was overwritten no longer appears in the log at all. That
+/// matches what a human saw on screen, but it does mean this file stops being
+/// a byte-exact record of everything emitted. To go back to the old behavior,
+/// call [`strip_ansi_escapes`] here instead — it is still maintained (the
+/// runner's marker scan uses it, where rendering would be pointless and
+/// risky) and is a drop-in.
+///
+/// `librarian/assets/board/30-live-view.js::renderPaneLine` is a mirror of
+/// this function for the board's transcript tape. The two must stay in step —
+/// the tape and this log are the same bytes rendered twice.
+fn render_pane_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, line) in s.split('\n').enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        if line.contains('\r') {
-            let mut rendered: Vec<char> = Vec::new();
-            let mut col = 0usize;
-            for ch in line.chars() {
-                if ch == '\r' {
-                    col = 0;
-                    continue;
-                }
-                if col < rendered.len() {
-                    rendered[col] = ch;
-                } else {
-                    rendered.push(ch);
-                }
-                col += 1;
-            }
-            out.extend(rendered);
-        } else {
-            out.push_str(line);
-        }
+        out.push_str(&render_pane_line(line));
     }
     out
+}
+
+/// Render one line's worth of raw pane bytes — see [`render_pane_text`] for
+/// the full rationale and the table of interpreted sequences.
+fn render_pane_line(line: &str) -> String {
+    const ESC: char = '\u{1b}';
+    const BEL: char = '\u{07}';
+    // Fast path: nothing to replay, so the line is already what it renders as.
+    if !line.contains([ESC, '\r', '\u{08}']) {
+        return line.to_string();
+    }
+    let mut cells: Vec<char> = Vec::new();
+    let mut col: usize = 0;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => col = 0,
+            '\u{08}' => col = col.saturating_sub(1),
+            ESC => match chars.peek() {
+                Some('[') => {
+                    chars.next(); // consume '['
+                    let mut params = String::new();
+                    let mut final_byte = None;
+                    let mut scanned = 0usize;
+                    // Same bounded scan as `strip_ansi_escapes`: stop at a
+                    // newline (impossible inside a real CSI) and at the length
+                    // cap, so a truncated sequence cannot eat the rest.
+                    while let Some(&next) = chars.peek() {
+                        if next == '\n' || scanned >= MAX_CSI_SEQUENCE_LEN {
+                            break;
+                        }
+                        chars.next();
+                        scanned += 1;
+                        if ('@'..='~').contains(&next) {
+                            final_byte = Some(next);
+                            break;
+                        }
+                        params.push(next);
+                    }
+                    if let Some(fb) = final_byte {
+                        apply_csi(fb, &params, &mut cells, &mut col);
+                    }
+                }
+                Some(']') => {
+                    chars.next(); // consume ']'
+                    loop {
+                        match chars.next() {
+                            None | Some(BEL) => break,
+                            Some(ESC) if chars.peek() == Some(&'\\') => {
+                                chars.next();
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next(); // bare two-char escape
+                }
+                None => {}
+            },
+            _ => {
+                if col < cells.len() {
+                    cells[col] = c;
+                } else {
+                    while cells.len() < col {
+                        cells.push(' ');
+                    }
+                    cells.push(c);
+                }
+                col = col.saturating_add(1).min(MAX_RENDERED_LINE_COLS);
+            }
+        }
+    }
+    cells.into_iter().collect()
+}
+
+/// Apply one CSI sequence's cursor/erase effect to a line being rendered.
+/// Unrecognized final bytes (SGR `m`, cursor show/hide `h`/`l`, ...) are
+/// no-ops, which is what "stripped" means here.
+fn apply_csi(final_byte: char, params: &str, cells: &mut Vec<char>, col: &mut usize) {
+    // A private-marker sequence (`CSI ? 25 h`) parses to nothing useful, which
+    // is fine — none of the final bytes below are reachable for those.
+    let nums: Vec<usize> = params
+        .split(';')
+        .map(|p| p.trim().parse::<usize>().unwrap_or(0))
+        .collect();
+    // A 0 or absent parameter means 1 for every cursor-move sequence here.
+    let first_or_one = nums.first().copied().filter(|&n| n != 0).unwrap_or(1);
+    match final_byte {
+        // CHA — absolute column.
+        'G' => *col = (first_or_one - 1).min(MAX_RENDERED_LINE_COLS),
+        // CUP/HVP — absolute position; the row half is deliberately ignored.
+        'H' | 'f' => {
+            let c = nums.get(1).copied().filter(|&n| n != 0).unwrap_or(1);
+            *col = (c - 1).min(MAX_RENDERED_LINE_COLS);
+        }
+        // CUF / CUB — relative column.
+        'C' => *col = col.saturating_add(first_or_one).min(MAX_RENDERED_LINE_COLS),
+        'D' => *col = col.saturating_sub(first_or_one),
+        // EL — erase in line.
+        'K' => match nums.first().copied().unwrap_or(0) {
+            0 => cells.truncate(*col),
+            1 => {
+                for cell in cells.iter_mut().take(*col) {
+                    *cell = ' ';
+                }
+            }
+            2 => cells.clear(),
+            _ => {}
+        },
+        _ => {}
+    }
 }
 
 /// One requested slice of a `.raw` transcript (RAL-397 Phase 2F), for the
@@ -1177,9 +1321,9 @@ mod tests {
     }
 
     #[test]
-    fn render_carriage_returns_keeps_only_the_final_pass_of_a_rewritten_line() {
+    fn render_pane_text_keeps_only_the_final_pass_of_a_rewritten_line() {
         assert_eq!(
-            render_carriage_returns("  10%\r  50%\r 100%"),
+            render_pane_text("  10%\r  50%\r 100%"),
             " 100%",
             "a progress bar rewritten in place renders as its last frame"
         );
@@ -1189,19 +1333,89 @@ mod tests {
     /// `\r`": a shorter final pass leaves the tail of a longer earlier one on
     /// screen.
     #[test]
-    fn render_carriage_returns_overwrites_column_by_column() {
-        assert_eq!(render_carriage_returns("abcdef\rxy"), "xycdef");
+    fn render_pane_text_overwrites_column_by_column() {
+        assert_eq!(render_pane_text("abcdef\rxy"), "xycdef");
     }
 
     #[test]
-    fn render_carriage_returns_is_per_line_and_leaves_plain_text_untouched() {
+    fn render_pane_text_is_per_line_and_leaves_plain_text_untouched() {
         assert_eq!(
-            render_carriage_returns("one\rONE\ntwo\nthree\rTHREE"),
+            render_pane_text("one\rONE\ntwo\nthree\rTHREE"),
             "ONE\ntwo\nTHREE"
         );
         assert_eq!(
-            render_carriage_returns("no carriage returns"),
+            render_pane_text("no carriage returns"),
             "no carriage returns"
+        );
+    }
+
+    #[test]
+    fn render_pane_text_still_strips_color_and_other_non_cursor_sequences() {
+        assert_eq!(
+            render_pane_text("\u{1b}[36mcolored\u{1b}[m text"),
+            "colored text"
+        );
+        assert_eq!(render_pane_text("\u{1b}[?25hvisible"), "visible");
+    }
+
+    /// CHA — the absolute-column move. `CSI 1 G` is a `\r` by another name.
+    #[test]
+    fn render_pane_text_honors_absolute_column_moves() {
+        assert_eq!(render_pane_text("abcdef\u{1b}[1Gxy"), "xycdef");
+        assert_eq!(render_pane_text("abcdef\u{1b}[4GZ"), "abcZef");
+    }
+
+    /// CUP — what PSReadLine uses to redraw a prompt in place. The row half is
+    /// ignored by design; only the column is honored.
+    #[test]
+    fn render_pane_text_honors_cursor_position_column_and_ignores_the_row() {
+        assert_eq!(render_pane_text("abcdef\u{1b}[1;1HXY"), "XYcdef");
+        assert_eq!(
+            render_pane_text("abcdef\u{1b}[9;1HXY"),
+            "XYcdef",
+            "a different row must not change the column that is applied"
+        );
+    }
+
+    #[test]
+    fn render_pane_text_honors_relative_column_moves_and_backspace() {
+        assert_eq!(render_pane_text("abc\u{1b}[2DX"), "aXc");
+        // `[1G` -> col 0, write Z, col 1; `[2C` -> col 3, write Q there. The
+        // `c` at col 2 was never overwritten, so it survives.
+        assert_eq!(render_pane_text("abc\u{1b}[1GZ\u{1b}[2CQ"), "ZbcQ");
+        assert_eq!(render_pane_text("abc\u{8}X"), "abX");
+    }
+
+    #[test]
+    fn render_pane_text_honors_erase_in_line() {
+        assert_eq!(render_pane_text("abcdef\u{1b}[1G\u{1b}[Kxy"), "xy");
+        assert_eq!(render_pane_text("abcdef\u{1b}[4G\u{1b}[0K"), "abc");
+        assert_eq!(render_pane_text("abcdef\u{1b}[4G\u{1b}[1K"), "   def");
+        // Erase-in-line clears content but does *not* move the cursor, so a
+        // write after `[2K` lands at the column it was already at and the gap
+        // before it is blank. A real terminal does exactly this.
+        assert_eq!(render_pane_text("abcdef\u{1b}[2Kxy"), "      xy");
+        assert_eq!(render_pane_text("abcdef\u{1b}[2K\u{1b}[1Gxy"), "xy");
+    }
+
+    /// The real shape that motivated interpreting column moves: PowerShell
+    /// redrawing its prompt line rather than rewriting it with `\r`. Before
+    /// this, the frames concatenated into one unreadable line.
+    #[test]
+    fn render_pane_text_collapses_a_powershell_style_prompt_redraw() {
+        let raw = "PS C:\\r> \u{1b}[1;1HPS C:\\r> echo hi\u{1b}[1;1HPS C:\\r> echo hi!";
+        assert_eq!(render_pane_text(raw), "PS C:\\r> echo hi!");
+    }
+
+    /// A cursor move far past any real pane width must not pad out an
+    /// arbitrary number of cells.
+    #[test]
+    fn render_pane_text_bounds_an_absurd_column_move() {
+        let rendered = render_pane_text("a\u{1b}[999999999GX");
+        assert!(
+            rendered.len() <= MAX_RENDERED_LINE_COLS + 8,
+            "expected the column to be clamped, got {} chars",
+            rendered.len()
         );
     }
 

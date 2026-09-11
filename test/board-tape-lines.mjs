@@ -29,7 +29,7 @@ if (from === -1 || to === -1 || to < from) {
 }
 const source = html.slice(from + BEGIN.length, to);
 
-const exported = ["stripAnsiEscapes", "formatInlineTapeEvent", "classifyTapeLine", "renderTapeLines"];
+const exported = ["renderPaneLine", "applyCsi", "formatInlineTapeEvent", "classifyTapeLine", "renderTapeLines"];
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
 const factory = new Function(`${source}\nreturn { ${exported.join(", ")} };`);
 

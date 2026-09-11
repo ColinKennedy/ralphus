@@ -7,26 +7,67 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { lines } from "./board-tape-lines.mjs";
 
-const { stripAnsiEscapes, formatInlineTapeEvent, classifyTapeLine, renderTapeLines } = lines;
+const { renderPaneLine, formatInlineTapeEvent, classifyTapeLine, renderTapeLines } = lines;
 
-// ---- stripAnsiEscapes (a JS mirror of terminal_log.rs::strip_ansi_escapes) ----
+// ---- renderPaneLine (a JS mirror of terminal_log.rs::render_pane_line) ----
+// Kept assertion-for-assertion in step with the Rust tests of the same name;
+// the tape and the durable `.log` are the same bytes rendered twice.
 
-test("strips CSI (SGR/color, cursor) sequences", () => {
-  assert.equal(stripAnsiEscapes("\x1b[31mred\x1b[0m"), "red");
-  assert.equal(stripAnsiEscapes("\x1b[2K\x1b[1Gline"), "line");
+test("strips CSI (SGR/color) sequences", () => {
+  assert.equal(renderPaneLine("\x1b[31mred\x1b[0m"), "red");
+  assert.equal(renderPaneLine("\x1b[2K\x1b[1Gline"), "line");
 });
 
 test("strips OSC sequences terminated by BEL or ST", () => {
-  assert.equal(stripAnsiEscapes("\x1b]0;window title\x07after"), "after");
-  assert.equal(stripAnsiEscapes("\x1b]8;;http://x\x1b\\link"), "link");
+  assert.equal(renderPaneLine("\x1b]0;window title\x07after"), "after");
+  assert.equal(renderPaneLine("\x1b]8;;http://x\x1b\\link"), "link");
 });
 
-test("leaves plain text and newlines untouched", () => {
-  assert.equal(stripAnsiEscapes("plain text\nsecond"), "plain text\nsecond");
+test("leaves plain text untouched", () => {
+  assert.equal(renderPaneLine("plain text"), "plain text");
 });
 
 test("handles a bare trailing escape without hanging or throwing", () => {
-  assert.equal(stripAnsiEscapes("tail\x1b"), "tail");
+  assert.equal(renderPaneLine("tail\x1b"), "tail");
+});
+
+test("collapses a carriage-return progress bar to its final frame", () => {
+  assert.equal(renderPaneLine("  10%\r  50%\r 100%"), " 100%");
+});
+
+test("uses real overwrite semantics, not text-after-the-last-CR", () => {
+  assert.equal(renderPaneLine("abcdef\rxy"), "xycdef");
+});
+
+test("honors absolute column moves (CHA)", () => {
+  assert.equal(renderPaneLine("abcdef\x1b[1Gxy"), "xycdef");
+  assert.equal(renderPaneLine("abcdef\x1b[4GZ"), "abcZef");
+});
+
+test("honors the column of a cursor-position move and ignores the row (CUP)", () => {
+  assert.equal(renderPaneLine("abcdef\x1b[1;1HXY"), "XYcdef");
+  assert.equal(renderPaneLine("abcdef\x1b[9;1HXY"), "XYcdef");
+});
+
+test("honors relative column moves and backspace", () => {
+  assert.equal(renderPaneLine("abc\x1b[2DX"), "aXc");
+  assert.equal(renderPaneLine("abc\x1b[1GZ\x1b[2CQ"), "ZbcQ");
+  assert.equal(renderPaneLine("abc\bX"), "abX");
+});
+
+test("honors erase-in-line, which does not move the cursor", () => {
+  assert.equal(renderPaneLine("abcdef\x1b[4G\x1b[0K"), "abc");
+  assert.equal(renderPaneLine("abcdef\x1b[4G\x1b[1K"), "   def");
+  assert.equal(renderPaneLine("abcdef\x1b[2Kxy"), "      xy");
+});
+
+test("collapses a PowerShell-style prompt redraw into one line", () => {
+  const raw = "PS C:\\r> \x1b[1;1HPS C:\\r> echo hi\x1b[1;1HPS C:\\r> echo hi!";
+  assert.equal(renderPaneLine(raw), "PS C:\\r> echo hi!");
+});
+
+test("bounds an absurd column move instead of padding unboundedly", () => {
+  assert.ok(renderPaneLine("a\x1b[999999999GX").length <= 10008);
 });
 
 // ---- classifyTapeLine ----
