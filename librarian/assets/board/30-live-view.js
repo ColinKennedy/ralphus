@@ -433,43 +433,102 @@
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
       /** Max chars scanned for a CSI sequence's final byte before giving up. Matches daemon/src/terminal_log.rs::MAX_CSI_SEQUENCE_LEN. */
       const MAX_CSI_SEQUENCE_LEN = 32;
+      /** Widest column a rendered line will pad out to. Matches daemon/src/terminal_log.rs::MAX_RENDERED_LINE_COLS. */
+      const MAX_RENDERED_LINE_COLS = 10000;
       /**
-       * Strip ANSI/VT100 escape sequences from `s` — a faithful JS port of
-       * daemon/src/terminal_log.rs::strip_ansi_escapes (RAL-397 Phase 2E):
-       * CSI (`ESC [` … final byte `@`–`~`), OSC (`ESC ]` … BEL or `ESC \`), and
-       * bare two-char escapes as a catch-all. Not a full ECMA-48 parser — the
-       * same scope as the Rust original, sufficient for real pane output.
-       * @param {string} s
+       * Apply one CSI sequence's cursor/erase effect to the line being
+       * rendered. Mirrors daemon/src/terminal_log.rs::apply_csi. Unrecognized
+       * final bytes (SGR `m`, cursor show/hide `h`/`l`, …) are no-ops, which
+       * is what "stripped" means here. Mutates `cells` in place and returns
+       * the new column.
+       * @param {string} finalByte
+       * @param {string} params
+       * @param {string[]} cells
+       * @param {number} col
+       * @returns {number}
+       */
+      function applyCsi(finalByte, params, cells, col) {
+        const nums = params.split(";").map((p) => {
+          const n = parseInt(p.trim(), 10);
+          return Number.isFinite(n) ? n : 0;
+        });
+        const firstOrOne = nums[0] && nums[0] !== 0 ? nums[0] : 1;
+        switch (finalByte) {
+          case "G": // CHA — absolute column.
+            return Math.min(firstOrOne - 1, MAX_RENDERED_LINE_COLS);
+          case "H": // CUP/HVP — the row half is deliberately ignored.
+          case "f": {
+            const c = nums[1] && nums[1] !== 0 ? nums[1] : 1;
+            return Math.min(c - 1, MAX_RENDERED_LINE_COLS);
+          }
+          case "C": // CUF.
+            return Math.min(col + firstOrOne, MAX_RENDERED_LINE_COLS);
+          case "D": // CUB.
+            return Math.max(col - firstOrOne, 0);
+          case "K": { // EL — erase in line; does NOT move the cursor.
+            const mode = nums[0] || 0;
+            if (mode === 0) cells.length = Math.min(col, cells.length);
+            else if (mode === 1) { for (let i = 0; i < Math.min(col, cells.length); i++) cells[i] = " "; }
+            else if (mode === 2) cells.length = 0;
+            return col;
+          }
+          default:
+            return col;
+        }
+      }
+      /**
+       * Render one raw transcript line the way a terminal would display it —
+       * a JS mirror of daemon/src/terminal_log.rs::render_pane_line. See that
+       * function's doc comment for the full rationale, the table of
+       * interpreted sequences, and what is deliberately not handled (row
+       * movement, i.e. full-screen redraws). The two must stay in step: the
+       * board's tape and the durable `.log` are the same bytes rendered twice.
+       *
+       * Interpreting rather than deleting cursor moves is what collapses an
+       * in-place rewrite — a `cargo` progress bar (`\r`) or a PowerShell
+       * prompt redraw (`ESC[1;45H`) — back to the single line a human saw,
+       * instead of every frame concatenated.
+       * @param {string} line
        * @returns {string}
        */
-      function stripAnsiEscapes(s) {
+      function renderPaneLine(line) {
         const ESC = "\x1b", BEL = "\x07";
-        let out = "";
+        if (line.indexOf(ESC) === -1 && line.indexOf("\r") === -1 && line.indexOf("\b") === -1) return line;
+        /** @type {string[]} */
+        const cells = [];
+        let col = 0;
         let i = 0;
-        while (i < s.length) {
-          const c = s[i];
-          if (c !== ESC) { out += c; i++; continue; }
-          const next = s[i + 1];
+        while (i < line.length) {
+          const c = line[i];
+          if (c === "\r") { col = 0; i++; continue; }
+          if (c === "\b") { col = Math.max(col - 1, 0); i++; continue; }
+          if (c !== ESC) {
+            if (col < cells.length) cells[col] = c;
+            else { while (cells.length < col) cells.push(" "); cells.push(c); }
+            col = Math.min(col + 1, MAX_RENDERED_LINE_COLS);
+            i++;
+            continue;
+          }
+          const next = line[i + 1];
           if (next === "[") {
             i += 2;
-            // Bounded scan, mirroring the Rust: a newline can never appear
-            // inside a real CSI sequence, so it is a hard stop and is left
-            // unconsumed, and a malformed sequence that never terminates
-            // gives up after MAX_CSI_SEQUENCE_LEN instead of swallowing
-            // everything up to the next letter later in the tape.
+            let params = "";
+            let finalByte = null;
             let scanned = 0;
-            while (i < s.length) {
-              const ch = s[i];
+            while (i < line.length) {
+              const ch = line[i];
               if (ch === "\n" || scanned >= MAX_CSI_SEQUENCE_LEN) break;
               i++; scanned++;
-              if (ch >= "@" && ch <= "~") break;
+              if (ch >= "@" && ch <= "~") { finalByte = ch; break; }
+              params += ch;
             }
+            if (finalByte !== null) col = applyCsi(finalByte, params, cells, col);
           } else if (next === "]") {
             i += 2;
-            while (i < s.length) {
-              const ch = s[i];
+            while (i < line.length) {
+              const ch = line[i];
               if (ch === BEL) { i++; break; }
-              if (ch === ESC && s[i + 1] === "\\") { i += 2; break; }
+              if (ch === ESC && line[i + 1] === "\\") { i += 2; break; }
               i++;
             }
           } else if (next !== undefined) {
@@ -478,7 +537,7 @@
             i += 1; // bare trailing ESC
           }
         }
-        return out;
+        return cells.join("");
       }
       /**
        * Render one `RALPHUS_EVENT` payload (the trailing JSON after the marker)
@@ -534,7 +593,7 @@
       function renderTapeLines(lines, showDebug) {
         const out = [];
         for (const raw of lines) {
-          const rendered = classifyTapeLine(stripAnsiEscapes(raw), showDebug);
+          const rendered = classifyTapeLine(renderPaneLine(raw), showDebug);
           if (rendered !== null) out.push(rendered);
         }
         return out.join("\n");
