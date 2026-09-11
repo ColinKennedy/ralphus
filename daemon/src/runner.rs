@@ -1031,6 +1031,27 @@ const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// [`SubprocessRunner::read_tmux_result`]'s 60-line failure-diagnostic tail.
 pub(crate) const LIVE_SNAPSHOT_CAPTURE_LINES: u32 = 500;
 
+/// How many lines the per-poll `capture_pane` pulls once the poll loop has
+/// fallen back to scanning the pane for `RALPHUS_EVENT:` markers (a `.raw`
+/// transcript that never materialized — see `pane_event_fallback` in
+/// `run_via_tmux_attempt`). The visible-window read
+/// [`LIVE_SNAPSHOT_CAPTURE_LINES`] is sized for a *snapshot*; an event scan
+/// needs enough depth that a marker printed between two polls is still on
+/// screen, so this restores the pre-Phase-2D scan depth. It costs nothing in
+/// pane memory — that ceiling is `history-limit` (Phase 2H), which this does
+/// not change; `capture-pane` simply returns fewer lines than asked for when
+/// scrollback is shallower, which is the normal case now.
+const FALLBACK_EVENT_CAPTURE_LINES: u32 = 10_000;
+
+/// How long `run_via_tmux_attempt` waits for the `.raw` transcript to produce
+/// its first byte before concluding the sink is not working and falling back
+/// to pane scanning for events. A working `pipe-pane` tee captures the pane's
+/// own shell prompt, so its first bytes land almost immediately; this is three
+/// poll intervals of slack on top of that, short enough that a cell whose
+/// session dies early still gets its `agent_session_id` captured in time to
+/// reattach.
+const TRANSCRIPT_FALLBACK_GRACE: Duration = Duration::from_millis(1500);
+
 /// RAL-241: how long a tmux-wrapped session may show no pane growth before a
 /// `high`-priority mailbox stall escalation fires (see
 /// `SubprocessRunner::check_stall_escalation`). Overridable via
@@ -1138,11 +1159,20 @@ pub(crate) struct TranscriptTailer {
 }
 
 impl TranscriptTailer {
-    fn new(session_name: &str, attempt: u32) -> Self {
-        Self::at_path(crate::terminal_log::raw_transcript_path(
+    /// `start_offset` is the byte offset to begin tailing from — the length
+    /// the `.raw` file already had when this attempt started. Normally 0 (the
+    /// attempt clears the file first), but a previous run's sink can still
+    /// hold the handle open on Windows and defeat that removal, in which case
+    /// starting past the survivors is what keeps a stale completion sentinel
+    /// from ending this attempt on its first poll. See the reset in
+    /// `run_via_tmux_attempt`.
+    fn new(session_name: &str, attempt: u32, start_offset: u64) -> Self {
+        let mut tailer = Self::at_path(crate::terminal_log::raw_transcript_path(
             session_name,
             attempt,
-        ))
+        ));
+        tailer.offset = start_offset;
+        tailer
     }
 
     pub(crate) fn at_path(path: std::path::PathBuf) -> Self {
@@ -1176,9 +1206,12 @@ impl TranscriptTailer {
         let Ok(total) = file.metadata().map(|m| m.len()) else {
             return DrainedLines::default();
         };
-        // File shrank beneath us (pipe-sink hit its byte cap and truncated, or
-        // the path was reused) — restart from the top rather than seek past
-        // the new end.
+        // File shrank beneath us — the path was reused (a re-run clearing the
+        // previous run's transcript, see `run_via_tmux_attempt`) or it was
+        // pruned and recreated. Restart from the top rather than seek past the
+        // new end. Note this is *not* the byte-cap path: `pipe-sink` stops
+        // appending at its cap, it never truncates, so a capped file only ever
+        // stops growing.
         if total < self.offset {
             self.offset = 0;
             self.carry.clear();
@@ -1608,6 +1641,18 @@ impl SubprocessRunner {
         // `TranscriptTailer` in the poll loop below), and Phase 2E derives this
         // attempt's durable terminal log from it.
         let transcript_path = crate::terminal_log::raw_transcript_path(session_name, attempt);
+        // The `.raw` path is keyed on `(session_name, attempt)`, both of which
+        // are deterministic — `attempt` restarts at 0 every time a cell is
+        // re-run — while `pipe-sink` opens its target in append mode. Left
+        // alone, a re-run tails the *previous* run's transcript from byte 0
+        // and finds its completion sentinel on the very first poll, ending the
+        // new attempt before its own agent has produced a single byte (and
+        // replaying that run's stale `agent_session_id` and cost figures on
+        // the way out). Clear the file up front, then start the tailer past
+        // whatever survived — on Windows a previous run's sink can still hold
+        // the handle and defeat the removal.
+        let _ = std::fs::remove_file(&transcript_path);
+        let transcript_baseline = std::fs::metadata(&transcript_path).map_or(0, |m| m.len());
         if let Err(e) = tmux.new_detached_session_with_command(
             session_name,
             &attempt_spec.cwd,
@@ -1671,8 +1716,32 @@ impl SubprocessRunner {
         // attempt, tailing the durable `.raw` transcript this attempt's
         // `pipe_pane` wiring (Phase 2C) streams to. Fresh per attempt — see
         // `TranscriptTailer`'s doc comment on how a reattach re-targets it.
-        let mut tailer = TranscriptTailer::new(session_name, attempt);
+        let mut tailer = TranscriptTailer::new(session_name, attempt, transcript_baseline);
         let mut last_pane: Option<String> = None;
+        // RAL-397: `pipe_pane` is best-effort by design (a `pipe-pane` call
+        // that returns `Ok` only means tmux accepted the target string — the
+        // sink can still fail to exec, die, or never get write access), but
+        // Phase 2D made the transcript the *only* source of `RALPHUS_EVENT:`
+        // markers. Without a fallback that combination silently costs this
+        // cell its `agent_session_id`, which is the one thing a reattach after
+        // an unexpected session death needs — the cell still completes (the
+        // done sentinel has its own `capture_pane` safety net below), it just
+        // can never be resumed. So: if the pane is visibly producing output
+        // while the transcript has yielded nothing at all, fall back to
+        // scanning the pane for events, exactly as the pre-2D code did.
+        //
+        // The two sources are mutually exclusive once the fallback engages,
+        // so an event can never be forwarded twice (duplicate Cartographer
+        // rows, double-counted usage), and the fallback never disengages —
+        // flipping back mid-attempt would either duplicate or skip whatever
+        // straddled the switch. The pane cursor is inherently lossier than the
+        // transcript (output that scrolls past `history-limit` between two
+        // polls is gone), which is precisely why it is the fallback and not
+        // the primary; it is still strictly better than capturing nothing.
+        let mut pane_event_fallback = false;
+        let mut pane_lines_seen: usize = 0;
+        let mut transcript_ever_produced_bytes = false;
+        let attempt_started_at = Instant::now();
         let mut missing_session_strikes: u32 = 0;
         // A session that appears gone must be confirmed gone across a couple
         // of consecutive polls (not acted on the first miss) — root cause not
@@ -1776,12 +1845,20 @@ impl SubprocessRunner {
                 // `capture_pane` call below and of any transient capture error.
                 let drained = tailer.drain();
                 if drained.saw_new_bytes {
+                    transcript_ever_produced_bytes = true;
                     self.note_live_activity(session_name);
                 }
                 let mut done = false;
                 for line in &drained.lines {
                     if line_is_done_sentinel(line) {
                         done = true;
+                    }
+                    // Once the pane fallback owns event parsing the two
+                    // sources are mutually exclusive, so the same marker can
+                    // never be forwarded twice. Sentinel detection above stays
+                    // active either way — it is an idempotent boolean.
+                    if pane_event_fallback {
+                        continue;
                     }
                     if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
                         let fwd = forward_runner_event(
@@ -1812,10 +1889,75 @@ impl SubprocessRunner {
                 // still catching up or the `.raw` file never materialized (a
                 // best-effort `pipe_pane` that silently failed) — so completion
                 // detection never becomes dependent on the transcript alone.
-                match tmux.capture_pane(session_name, LIVE_SNAPSHOT_CAPTURE_LINES) {
+                let capture_lines = if pane_event_fallback {
+                    FALLBACK_EVENT_CAPTURE_LINES
+                } else {
+                    LIVE_SNAPSHOT_CAPTURE_LINES
+                };
+                match tmux.capture_pane(session_name, capture_lines) {
                     Ok(pane) => {
                         missing_session_strikes = 0;
                         done = done || pane_shows_done_sentinel(&pane);
+                        // RAL-241 liveness must not hang off the transcript
+                        // alone: with a failed sink `saw_new_bytes` is never
+                        // true, so `live_activity_ms` would stay `None` for
+                        // the whole run — which both fires a `high`-priority
+                        // stall escalation on every cell that outlives the
+                        // threshold and makes a genuine stall undetectable. A
+                        // changed pane is the same "something happened"
+                        // signal the pre-2D `all_lines.len() > lines_seen`
+                        // check provided.
+                        if last_pane.as_deref() != Some(pane.as_str()) {
+                            self.note_live_activity(session_name);
+                        }
+                        // Engage the fallback only on the unambiguous signal:
+                        // the pane has printed something, the transcript has
+                        // yielded literally nothing since the attempt began,
+                        // and enough time has passed that a working sink would
+                        // certainly have flushed (it tees the shell's own
+                        // prompt, so its first bytes land almost immediately).
+                        if !pane_event_fallback
+                            && !transcript_ever_produced_bytes
+                            && !pane.trim().is_empty()
+                            && attempt_started_at.elapsed() >= TRANSCRIPT_FALLBACK_GRACE
+                        {
+                            pane_event_fallback = true;
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [runner] transcript produced no bytes in {}ms while the pane has output -- falling back to pane scanning for events squad={} cell={} session={session_name}",
+                                TRANSCRIPT_FALLBACK_GRACE.as_millis(),
+                                attempt_spec.squad_id,
+                                attempt_spec.cell_id,
+                            );
+                            self.emit_tmux_note(
+                                attempt_spec,
+                                "transcript unavailable: falling back to pane scanning for events",
+                                session_name,
+                            );
+                        }
+                        if pane_event_fallback {
+                            let all_lines: Vec<&str> = pane.lines().collect();
+                            if all_lines.len() > pane_lines_seen {
+                                for line in &all_lines[pane_lines_seen..] {
+                                    if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
+                                        let fwd = forward_runner_event(
+                                            self.cartographer.as_ref(),
+                                            &attempt_spec.squad_id,
+                                            &attempt_spec.cell_id,
+                                            &attempt_spec.task,
+                                            json,
+                                        );
+                                        if let Some(sid) = fwd.agent_session_id {
+                                            *resumable_agent_session_id = Some(sid);
+                                        }
+                                        if let Some(usage) = fwd.live_usage {
+                                            current_usage = usage;
+                                        }
+                                    }
+                                }
+                                pane_lines_seen = all_lines.len();
+                            }
+                        }
                         last_pane = Some(pane);
                     }
                     Err(_) => {
@@ -4771,6 +4913,65 @@ prompt = "make it build"
         let drained = tailer.drain();
         assert!(!drained.saw_new_bytes);
         assert!(drained.lines.is_empty());
+    }
+
+    /// The `.raw` path is deterministic in `(session_name, attempt)` and
+    /// `attempt` restarts at 0 on every re-run of a cell, while `pipe-sink`
+    /// appends. Without the attempt-start reset in `run_via_tmux_attempt` a
+    /// re-run tails the *previous* run's transcript and finds its completion
+    /// sentinel on the first poll, ending the attempt before its own agent
+    /// printed a byte. Seeding the tailer past whatever survived is the
+    /// backstop for when the file removal itself fails — on Windows a
+    /// previous run's sink can still hold the handle.
+    #[test]
+    fn transcript_tailer_seeded_past_a_stale_file_replays_nothing() {
+        let path = unique_raw_path("stale-seed");
+        std::fs::write(
+            &path,
+            b"RALPHUS_EVENT: {\"source\":\"llm-invoke\"}\nRALPHUS_TMUX_DONE: done\n",
+        )
+        .unwrap();
+        let stale_len = std::fs::metadata(&path).unwrap().len();
+
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+        tailer.offset = stale_len;
+        let drained = tailer.drain();
+        assert!(
+            drained.lines.is_empty(),
+            "a seeded tailer must not replay the previous run's lines, got: {:?}",
+            drained.lines
+        );
+
+        // ...while everything this attempt actually appends still arrives.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopen the transcript for append");
+            file.write_all(b"fresh line\n").unwrap();
+        }
+        let next = tailer.drain();
+        assert_eq!(next.lines, vec!["fresh line".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same stale file read from offset 0 *does* surface the previous
+    /// run's sentinel — pinning what the seeding above is protecting against,
+    /// so this can't silently stop being a real hazard.
+    #[test]
+    fn transcript_tailer_from_zero_would_replay_a_stale_done_sentinel() {
+        let path = unique_raw_path("stale-zero");
+        std::fs::write(&path, b"RALPHUS_TMUX_DONE: done\n").unwrap();
+
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+        let drained = tailer.drain();
+        assert!(
+            drained.lines.iter().any(|l| line_is_done_sentinel(l)),
+            "expected the stale sentinel to be visible from offset 0, got: {:?}",
+            drained.lines
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

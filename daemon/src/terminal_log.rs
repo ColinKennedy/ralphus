@@ -157,6 +157,13 @@ pub fn write_attempt(session_name: &str, attempt: u32, content: &str, max_lines:
 /// practice is very unlikely.
 const RAW_TRANSCRIPT_TAIL_READ_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Hard ceiling on a single [`read_raw_transcript_range`] request, regardless
+/// of what `limit` the caller asked for. The board pages the transcript in
+/// 64 KiB chunks, so this is three orders of magnitude of headroom over any
+/// legitimate request — it exists purely so an arbitrary number off a query
+/// string can never become an arbitrary daemon-side allocation.
+const MAX_TRANSCRIPT_RANGE_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// Derive `session_name`'s attempt `attempt` durable, human-readable log from
 /// its `.raw` pipe-pane transcript (RAL-397 Phase 2E) instead of a single
 /// point-in-time `capture-pane` snapshot — the transcript is unbounded-depth
@@ -198,8 +205,65 @@ fn write_attempt_from_raw_transcript_in(
     // leading sequence with U+FFFD rather than failing the whole read.
     let text = String::from_utf8_lossy(&tail_bytes);
     let stripped = strip_ansi_escapes(&text);
-    write_attempt_in(root, session_name, attempt, &stripped, max_lines);
+    let rendered = render_carriage_returns(&stripped);
+    write_attempt_in(root, session_name, attempt, &rendered, max_lines);
     Ok(())
+}
+
+/// Max bytes [`strip_ansi_escapes`] will scan looking for a CSI sequence's
+/// final byte before giving up and treating the rest as ordinary text. Real
+/// sequences are a small number of parameter bytes; this is generous headroom
+/// over the longest one a pane realistically emits.
+const MAX_CSI_SEQUENCE_LEN: usize = 32;
+
+/// Apply carriage-return overwrite semantics to each line of `s`, so the
+/// derived log shows what the pane was actually *displaying* rather than
+/// every intermediate pass that produced it.
+///
+/// Before RAL-397 Phase 2E the durable log came from `capture-pane -p`, i.e.
+/// the screen psmux had already composited. Deriving it from the raw byte
+/// stream instead means every progress-bar frame a `cargo`/`npm`/`pip` build
+/// rewrites in place with a bare `\r` arrives as separate content — hundreds
+/// of near-identical passes over one line, which then push everything else
+/// out through `max_lines` truncation. Replaying the overwrites restores the
+/// single rendered line a human expects to read.
+///
+/// This is per-line only: `\r` returns the cursor to column 0 and later
+/// characters overwrite earlier ones position by position (a shorter final
+/// pass therefore leaves the tail of a longer earlier one visible, exactly as
+/// a terminal would). Full-screen cursor-addressed redraws are *not* replayed
+/// — that would need a real terminal emulator — so a full-screen TUI agent's
+/// log is still more verbose than its rendered screen.
+fn render_carriage_returns(s: &str) -> String {
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.contains('\r') {
+            let mut rendered: Vec<char> = Vec::new();
+            let mut col = 0usize;
+            for ch in line.chars() {
+                if ch == '\r' {
+                    col = 0;
+                    continue;
+                }
+                if col < rendered.len() {
+                    rendered[col] = ch;
+                } else {
+                    rendered.push(ch);
+                }
+                col += 1;
+            }
+            out.extend(rendered);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// One requested slice of a `.raw` transcript (RAL-397 Phase 2F), for the
@@ -253,9 +317,29 @@ fn read_raw_transcript_range_in(
     let total = file.metadata().ok()?.len();
     let start = offset.min(total);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = vec![0u8; usize::try_from(limit).unwrap_or(usize::MAX)];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
+    // Size the buffer from what the file can actually supply, never from the
+    // caller's number. `limit` arrives straight off a query string, so
+    // allocating it directly turns `?limit=18446744073709551615` into an
+    // allocation failure — which aborts the process rather than unwinding,
+    // taking the whole daemon with it. Clamping against `total` also means a
+    // merely-large request costs no more than the file's real size.
+    let want = limit
+        .min(MAX_TRANSCRIPT_RANGE_LIMIT)
+        .min(total.saturating_sub(start));
+    let mut buf = vec![0u8; usize::try_from(want).unwrap_or(usize::MAX)];
+    // `Read::read` may legally return a short read. Loop so a slice never
+    // comes back with a hole in the middle that the client would splice into
+    // its tape as if it were contiguous content.
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    buf.truncate(filled);
     Some(RawTranscriptRange {
         content: String::from_utf8_lossy(&buf).into_owned(),
         start,
@@ -341,7 +425,23 @@ pub(crate) fn strip_ansi_escapes(s: &str) -> String {
         match chars.peek() {
             Some('[') => {
                 chars.next(); // consume '['
-                for next in chars.by_ref() {
+                // Bound the scan. A real CSI sequence is a few parameter
+                // bytes then one final byte in `@`-`~`; an `ESC [` that never
+                // gets its terminator — a sequence split across a partial
+                // write, or stray bytes inside binary output — would
+                // otherwise consume everything up to the next letter
+                // *anywhere later in the file*, silently merging or deleting
+                // whole lines. A newline can never appear inside a real CSI
+                // sequence, so it is a hard stop (and is deliberately not
+                // consumed, so the line structure survives); the length cap
+                // catches malformed input that has no newline either.
+                let mut scanned = 0usize;
+                while let Some(&next) = chars.peek() {
+                    if next == '\n' || scanned >= MAX_CSI_SEQUENCE_LEN {
+                        break;
+                    }
+                    chars.next();
+                    scanned += 1;
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -1018,6 +1118,118 @@ mod tests {
     fn read_raw_transcript_range_is_none_for_a_missing_file() {
         let root = TempRoot::new("range-missing");
         assert!(read_raw_transcript_range_in(&root.0, "sess-a", 0, 0, 10).is_none());
+    }
+
+    /// `limit` arrives straight off a query string. Sizing the buffer from it
+    /// directly made `?limit=18446744073709551615` an allocation failure,
+    /// which aborts the daemon process rather than unwinding.
+    #[test]
+    fn read_raw_transcript_range_does_not_allocate_an_absurd_caller_limit() {
+        let root = TempRoot::new("range-absurd-limit");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, b"0123456789").unwrap();
+
+        let range = read_raw_transcript_range_in(&root.0, "sess-a", 0, 0, u64::MAX).unwrap();
+        assert_eq!(range.content, "0123456789");
+        assert_eq!(range.total, 10);
+    }
+
+    /// A request larger than the file still only ever costs the file's size,
+    /// so a merely-large `limit` is not a large allocation either.
+    #[test]
+    fn read_raw_transcript_range_caps_a_large_limit_at_what_the_file_holds() {
+        let root = TempRoot::new("range-large-limit");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        std::fs::write(&raw_path, b"abcdef").unwrap();
+
+        let range = read_raw_transcript_range_in(&root.0, "sess-a", 0, 3, 4 * 1024 * 1024).unwrap();
+        assert_eq!(range.content, "def");
+        assert_eq!(range.start, 3);
+    }
+
+    /// An `ESC [` whose terminator never arrives (a sequence split by a
+    /// partial write, or stray bytes in binary output) must not consume the
+    /// newline after it — that silently merged or deleted whole lines of the
+    /// derived log.
+    #[test]
+    fn strip_ansi_escapes_stops_an_unterminated_csi_at_the_newline() {
+        let stripped = strip_ansi_escapes("before\u{1b}[\nafter");
+        assert_eq!(stripped, "before\nafter");
+    }
+
+    /// The same bail-out, for a malformed sequence with no newline to stop
+    /// it: give up after the length cap rather than swallowing everything up
+    /// to the next letter arbitrarily far away.
+    #[test]
+    fn strip_ansi_escapes_gives_up_on_a_csi_longer_than_the_cap() {
+        let digits = "1".repeat(MAX_CSI_SEQUENCE_LEN + 10);
+        let stripped = strip_ansi_escapes(&format!("x\u{1b}[{digits}"));
+        assert!(
+            stripped.starts_with('x'),
+            "the leading real text must survive, got: {stripped:?}"
+        );
+        assert!(
+            stripped.len() > 1,
+            "the over-long parameter run must be emitted as text, not swallowed whole"
+        );
+    }
+
+    #[test]
+    fn render_carriage_returns_keeps_only_the_final_pass_of_a_rewritten_line() {
+        assert_eq!(
+            render_carriage_returns("  10%\r  50%\r 100%"),
+            " 100%",
+            "a progress bar rewritten in place renders as its last frame"
+        );
+    }
+
+    /// Real terminal overwrite semantics, not "take the text after the last
+    /// `\r`": a shorter final pass leaves the tail of a longer earlier one on
+    /// screen.
+    #[test]
+    fn render_carriage_returns_overwrites_column_by_column() {
+        assert_eq!(render_carriage_returns("abcdef\rxy"), "xycdef");
+    }
+
+    #[test]
+    fn render_carriage_returns_is_per_line_and_leaves_plain_text_untouched() {
+        assert_eq!(
+            render_carriage_returns("one\rONE\ntwo\nthree\rTHREE"),
+            "ONE\ntwo\nTHREE"
+        );
+        assert_eq!(
+            render_carriage_returns("no carriage returns"),
+            "no carriage returns"
+        );
+    }
+
+    /// The whole point of the fix: the derived `.log` should show the rendered
+    /// line, not every intermediate frame that produced it.
+    #[test]
+    fn derived_log_collapses_a_progress_bar_into_one_line() {
+        let root = TempRoot::new("derive-progress");
+        let raw_path = raw_transcript_path_in(&root.0, "sess-a", 0);
+        std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+        let mut raw = String::from("Compiling\n");
+        for pct in 0..=100 {
+            raw.push_str(&format!("\r\u{1b}[2K[{pct:3}%] building"));
+        }
+        raw.push_str("\ndone\n");
+        std::fs::write(&raw_path, raw.as_bytes()).unwrap();
+
+        write_attempt_from_raw_transcript_in(&root.0, "sess-a", 0, 4000).unwrap();
+
+        let log = std::fs::read_to_string(attempt_path_in(&root.0, "sess-a", 0)).unwrap();
+        assert!(
+            log.contains("[100%] building"),
+            "the final frame must survive, got: {log:?}"
+        );
+        assert!(
+            !log.contains("[ 50%]"),
+            "intermediate frames must not each occupy their own content, got: {log:?}"
+        );
     }
 
     #[test]

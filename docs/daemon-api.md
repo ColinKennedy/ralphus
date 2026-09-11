@@ -3032,6 +3032,13 @@ it's not on disk).
   to `total`); `total` is the transcript's size at read time, so the client
   can tell whether it has reached the beginning (`start == 0`) or the live end
   (`start + content.length == total`).
+- `limit` is clamped server-side to whatever the file can actually supply,
+  and to a hard 8 MiB ceiling (`MAX_TRANSCRIPT_RANGE_LIMIT`,
+  `daemon/src/terminal_log.rs`) — so a larger `limit` than either simply
+  returns less, it is never an error. The clamp is a hard requirement, not a
+  nicety: the buffer is sized from this parameter, so an unclamped
+  `?limit=18446744073709551615` was an allocation failure, which aborts the
+  daemon process rather than unwinding.
 - `content` is the raw byte range, ANSI escape codes included (the Phase 0
   "raw + xterm" design decision — this endpoint does not strip them; a
   consumer intending to render faithfully should feed the bytes to a real
@@ -3048,16 +3055,22 @@ it's not on disk).
   partially survive at the edge — an inherent limitation of range-based
   redaction on top of substring-based scrubbing).
 
-**Not yet wired into the board UI.** The endpoint is fully implemented and
-tested, but surfacing it in the Live View peek box turned out to need either
-a genuine API extension (this endpoint's line-based sibling, `GET .../pane`,
-does not expose a byte offset the client could use to know "where in the
-transcript the currently-displayed scrollback starts", so there is no shared
-coordinate space to stitch the two views on) or a materially different,
-simpler affordance (e.g. a separate "view full transcript from the start"
-reader, disconnected from the live tail). That UI/API design decision was
-deliberately left open rather than guessed at — see `PSMUX_MEMORY_FIX.local.md`
-Phase 2G for the full writeup of what was tried and why it was reverted.
+**Wired into the board UI** (Phase 2G-A): the Live View peek box is driven
+from this endpoint as a byte-addressed "tape" rather than stitched onto the
+line-based `GET .../pane`, which sidesteps the coordinate-space problem
+instead of solving it — the two endpoints still share no common offset space,
+and `.../pane` remains the fallback for a cell that has no `.raw` transcript
+at all. The board ANSI-strips the bytes itself
+(`librarian/assets/board/30-live-view.js::stripAnsiEscapes`, a mirror of
+`daemon/src/terminal_log.rs::strip_ansi_escapes`), so nothing currently
+renders the escape codes this endpoint deliberately preserves.
+
+Known limitation: a request that omits `attempt` re-resolves the latest
+attempt on every call, so a reattach that bumps the attempt number mid-view
+leaves the already-loaded window describing the previous attempt's bytes
+while subsequent fetches read the new one's. A client paging through a live
+transcript should resolve the attempt once and pin `attempt=` on every
+following request.
 
 Wired for all four contexts `capture_pane_reply` serves, each with the
 identical `attempt`/`offset`/`limit` params, `{ content, start, total }`

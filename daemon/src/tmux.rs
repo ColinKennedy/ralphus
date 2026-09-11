@@ -333,7 +333,38 @@ pub fn session_name(run_id: &str, task: &str, session_id: &str) -> String {
 /// `guardian_delete`, which would need to enumerate each deleted entity's
 /// session names before their rows are gone).
 fn pane_snapshot_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(root) = PANE_SNAPSHOT_TEST_ROOT.with(|r| r.borrow().clone()) {
+            return root;
+        }
+    }
     crate::state_dir().join("pane_snapshots")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-scoped override for [`pane_snapshot_dir`], set via
+    /// [`set_pane_snapshot_test_root`].
+    static PANE_SNAPSHOT_TEST_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Redirect this thread's pane-snapshot storage to `root` for the duration of
+/// a test — the sibling of `crate::terminal_log::set_test_root`, and needed
+/// for the same reason.
+///
+/// A test's in-memory store hands out ids from 1, so a freshly created
+/// guardian is `guardian-000000000001` with branch `branch-000000000001` —
+/// exactly the ids a developer's real `~/.ralphus/pane_snapshots` is full of.
+/// Any lookup that resolves a session by *recency of its pane snapshot*
+/// (`server::freshest_resolver_or_feedback`) would otherwise read those real
+/// files and pick a different session than the test set up, failing only on
+/// machines with history and passing on clean CI. Isolating the terminal-log
+/// root alone does not cover this: pane snapshots live in their own
+/// `state_dir()` subtree.
+#[cfg(test)]
+pub(crate) fn set_pane_snapshot_test_root(root: PathBuf) {
+    PANE_SNAPSHOT_TEST_ROOT.with(|r| *r.borrow_mut() = Some(root));
 }
 
 /// Path a session's persisted last-pane-content snapshot lives (or would
@@ -954,16 +985,48 @@ impl Tmux {
         // single time. Best-effort: a `set-option` failure here is not
         // load-bearing for the cell's own result.
         let terminal_log_config = crate::config::load_terminal_log_config();
-        let history_limit = terminal_log_config
-            .pane_history_limit()
-            .map_or_else(|| TMUX_HISTORY_LIMIT.to_string(), |n| n.to_string());
-        let _ = self.run(&[
+        // The done-sentinel safety net and `read_tmux_result`'s 60-line
+        // failure diagnostic both read back through the visible window, so a
+        // pane whose scrollback is shallower than that window silently loses
+        // completion detection and truncates every error message. An operator
+        // may tune the live window down for memory, but not below the floor
+        // the rest of the poll loop assumes — warn and clamp rather than
+        // reject, so a project file that already sets a smaller value keeps
+        // starting sessions instead of suddenly failing them.
+        let configured = terminal_log_config.pane_history_limit();
+        let history_limit = match configured {
+            Some(n) if n < crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES => {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [tmux] [terminal_logs] pane_history_limit={n} is below the {}-line floor the done-sentinel safety net and failure diagnostics need -- clamping up for {name}",
+                    crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES
+                );
+                crate::runner::LIVE_SNAPSHOT_CAPTURE_LINES.to_string()
+            }
+            Some(n) => n.to_string(),
+            None => TMUX_HISTORY_LIMIT.to_string(),
+        };
+        // Not best-effort: this single call is what bounds the pane's resident
+        // memory (`history-limit × pane width`), i.e. the entire point of
+        // RAL-397 Phase 1/2H. Silently swallowing a failure leaves the pane on
+        // psmux's own default scrollback, which is exactly the unbounded
+        // ceiling this ticket exists to remove — and leaves no breadcrumb when
+        // the OOM comes back. The session itself is still usable, so this
+        // warns rather than aborting the start.
+        if let Err(e) = self.run(&[
             "set-option",
             "-t",
             name,
             "history-limit",
             history_limit.as_str(),
-        ]);
+        ]) {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [tmux] could not set history-limit={history_limit} for {name}: {e} -- this pane keeps the tmux/psmux default scrollback and is NOT memory-bounded"
+            );
+        }
         if let Some(path) = transcript_path {
             // RAL-397 Phase 2H: the configured per-attempt transcript byte
             // cap, threaded through as `--max-bytes` so it's not silently
@@ -982,12 +1045,25 @@ impl Tmux {
                     max_bytes.to_string(),
                 ],
             );
-            // Best-effort: a transcript is a durable-capture nicety, not
-            // load-bearing for the cell's own correctness while Phase 2D is
-            // still pending (the poll loop still reads events/the done
-            // sentinel from scrollback, not this file) -- so a pipe-pane
-            // failure here must never fail session creation.
-            let _ = self.pipe_pane(name, &target);
+            // Phase 2D made this transcript the poll loop's primary source of
+            // `RALPHUS_EVENT:` markers and the done sentinel, so it is no
+            // longer merely a durable-capture nicety. It still must not fail
+            // session creation: an `Err` here means only that tmux rejected
+            // the `pipe-pane` call, and `Ok` is no guarantee either — tmux
+            // accepts the target string up front and the sink can still fail
+            // to exec, die, or be denied write access later, with no error
+            // path back to this call. Correctness therefore cannot rest on
+            // this succeeding, and does not: `run_via_tmux_attempt` watches
+            // for a transcript that never produces bytes and falls back to
+            // scanning the pane for events (`pane_event_fallback`), while the
+            // done sentinel keeps its own `capture_pane` safety net.
+            if let Err(e) = self.pipe_pane(name, &target) {
+                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [tmux] could not start the pipe-pane transcript tee for {name}: {e} -- this cell falls back to pane scanning for events"
+                );
+            }
             // Confirmed race (RAL-397 Phase 0 spike): the sink process needs
             // a moment to reach its blocking stdin read before pipe-pane
             // actually forwards to it. This settles before the payload
