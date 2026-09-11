@@ -205,33 +205,47 @@
           if (!before) return;
           const atBottom = forceBottom || before.scrollTop + before.clientHeight >= before.scrollHeight - 4;
 
-          // Liveness: poll `/pane` purely for its authoritative `active` flag
-          // (RAL-397 Phase 2G-A — its pane content is ignored; the tape below
-          // is the content source). A failed probe leaves `live` null so the
-          // tape-growth fallback decides.
+          // Liveness + fallback content: poll `/pane` for its authoritative
+          // `active` flag (RAL-397 Phase 2G-A) and its rendered snapshot. The
+          // transcript tape below is the primary content source, but when no
+          // `.raw` transcript exists — an older cell that ran before transcript
+          // capture, a still-settling fresh attempt, or a session whose
+          // pipe-pane capture never engaged — the `/pane` snapshot is shown
+          // instead, so the box never dead-ends on "Waiting for output…". A
+          // failed probe leaves `live` null so the tape-growth fallback decides.
           /** @type {boolean|null} */
           let live = null;
+          /** @type {string|undefined} */
+          let paneContent;
           const liveUrl = peekUrlFor(key);
           if (liveUrl) {
             try {
               const lr = await fetch(liveUrl);
-              if (lr.ok) { /** @type {PeekPaneResponse} */ const ld = await lr.json(); live = ld.active ?? null; }
-            } catch (_) { /* leave live=null; tape-growth fallback decides */ }
+              if (lr.ok) {
+                /** @type {PeekPaneResponse} */
+                const ld = await lr.json();
+                live = ld.active ?? null;
+                if (typeof ld.content === "string") paneContent = ld.content;
+              }
+            } catch (_) { /* leave live=null / paneContent undefined; fallbacks decide */ }
           }
 
-          // Content: page the transcript tape. Seed the tail on first open
-          // (probe total, then fetch the last chunk); afterwards follow the
-          // tail by fetching only bytes appended past `loadedEnd`.
+          // Content: page the transcript tape when one exists. Seed the tail on
+          // first open (probe total, then fetch the last chunk); afterwards
+          // follow the tail by fetching only bytes appended past `loadedEnd`.
+          // `usingTape` stays false when there is no `.raw` — then the `/pane`
+          // snapshot above is rendered as the fallback.
           const prevTape = peekTape[key];
           const prevTotal = prevTape ? prevTape.total : 0;
           let win = prevTape;
+          let usingTape = true;
           if (!win) {
             const probe = await fetchTapeRange(tapeUrl, TAPE_PROBE_OFFSET, 1);
-            if (probe === null) { setPeekPreText(preId, "Waiting for output…"); return; }
-            const seedStart = Math.max(0, probe.total - TAPE_CHUNK_BYTES);
-            const seed = await fetchTapeRange(tapeUrl, seedStart, TAPE_CHUNK_BYTES);
-            if (seed === null) { setPeekPreText(preId, "Waiting for output…"); return; }
-            win = tapeAppend(emptyTapeWindow(), { start: seed.start, content: seed.content, total: seed.total, requested: TAPE_CHUNK_BYTES });
+            const seed = probe === null
+              ? null
+              : await fetchTapeRange(tapeUrl, Math.max(0, probe.total - TAPE_CHUNK_BYTES), TAPE_CHUNK_BYTES);
+            if (seed === null) usingTape = false;
+            else win = tapeAppend(emptyTapeWindow(), { start: seed.start, content: seed.content, total: seed.total, requested: TAPE_CHUNK_BYTES });
           } else {
             const chunk = await fetchTapeRange(tapeUrl, win.loadedEnd, TAPE_CHUNK_BYTES);
             if (chunk !== null) {
@@ -241,8 +255,14 @@
               if (atBottom && !peekLoadingOlder.has(key)) win = tapeTrimFront(win, TAPE_MAX_WINDOW_CHARS);
             }
           }
-          peekTape[key] = win;
-          const grew = win.total > prevTotal;
+          let grew = false;
+          if (usingTape && win) {
+            grew = win.total > prevTotal;
+            peekTape[key] = win;
+          } else {
+            // No transcript available — render the /pane snapshot instead.
+            delete peekTape[key];
+          }
 
           /** @type {PeekPaneState} */
           const prev = {
@@ -255,10 +275,11 @@
           peekMissingStrikes[key] = next.state.missingStrikes;
           peekLastActivity[key] = next.state.lastActivityMs;
 
-          // Render the tape window through the ANSI-strip/classify pipeline
-          // and patch it into the DOM (re-resolves the `<pre>` by id, per the
-          // RAL-186 rule above).
-          renderPeekTape(key);
+          // Render from the tape when we have one (ANSI-strip/classify pipeline,
+          // re-resolving the `<pre>` by id per the RAL-186 rule above), else
+          // from the `/pane` snapshot fallback.
+          if (usingTape && peekTape[key]) renderPeekTape(key);
+          else renderPeekFallback(key, paneContent);
           if (next.headerChanged) {
             if (sel.kind) renderDetails();
             if (selectedGuardian) renderReviewDetail();
@@ -308,6 +329,32 @@
             ? `${text}\n\n[Read-only historical record — this terminal session has ended.]`
             : "Terminal cell has ended. No output was recorded before it ended.";
         } else if (text === "") {
+          text = "(no output yet)";
+        }
+        peekContent[key] = text;
+        setPeekPreText(`peek-pre-${peekCssKey(key)}`, text);
+      }
+      /**
+       * Renders peek key `key` from the `/pane` snapshot `paneContent` — the
+       * fallback used when no `.raw` transcript exists for the cell (an older
+       * cell that predates transcript capture, or one whose pipe-pane capture
+       * never engaged). The daemon already strips ralphus's own marker lines and
+       * redacts `/pane`, but scrub again defensively; applies the same
+       * ended/empty affordances as {@link renderPeekTape}. Inline debug is
+       * unavailable in this mode (the markers aren't in the `/pane` snapshot),
+       * so the "Show Debug Messages" toggle is inert while falling back.
+       * @param {string} key
+       * @param {string|undefined} paneContent
+       * @returns {void}
+       */
+      function renderPeekFallback(key, paneContent) {
+        const ended = !!peekEnded[key];
+        let text = scrubSecrets(paneContent || "");
+        if (ended) {
+          text = text.trim()
+            ? `${text}\n\n[Read-only historical record — this terminal session has ended.]`
+            : "Terminal cell has ended. No output was recorded before it ended.";
+        } else if (text.trim() === "") {
           text = "(no output yet)";
         }
         peekContent[key] = text;
