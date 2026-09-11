@@ -12271,6 +12271,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create isolated terminal-log root");
         crate::terminal_log::set_test_root(dir.clone());
+        // Pane snapshots live in their own `state_dir()` subtree, so isolating
+        // the terminal-log root alone still leaves any session lookup that
+        // ranks candidates by pane-snapshot recency reading the developer's
+        // real `~/.ralphus` — where `guardian-000000000001` is a real guardian
+        // with real snapshots, not the in-memory one this test just made. See
+        // `tmux::set_pane_snapshot_test_root`.
+        let snapshots = dir.join("pane_snapshots");
+        std::fs::create_dir_all(&snapshots).expect("create isolated pane-snapshot root");
+        crate::tmux::set_pane_snapshot_test_root(snapshots);
         dir
     }
 

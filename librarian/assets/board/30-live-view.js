@@ -431,6 +431,8 @@
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
+      /** Max chars scanned for a CSI sequence's final byte before giving up. Matches daemon/src/terminal_log.rs::MAX_CSI_SEQUENCE_LEN. */
+      const MAX_CSI_SEQUENCE_LEN = 32;
       /**
        * Strip ANSI/VT100 escape sequences from `s` — a faithful JS port of
        * daemon/src/terminal_log.rs::strip_ansi_escapes (RAL-397 Phase 2E):
@@ -450,7 +452,18 @@
           const next = s[i + 1];
           if (next === "[") {
             i += 2;
-            while (i < s.length) { const ch = s[i]; i++; if (ch >= "@" && ch <= "~") break; }
+            // Bounded scan, mirroring the Rust: a newline can never appear
+            // inside a real CSI sequence, so it is a hard stop and is left
+            // unconsumed, and a malformed sequence that never terminates
+            // gives up after MAX_CSI_SEQUENCE_LEN instead of swallowing
+            // everything up to the next letter later in the tape.
+            let scanned = 0;
+            while (i < s.length) {
+              const ch = s[i];
+              if (ch === "\n" || scanned >= MAX_CSI_SEQUENCE_LEN) break;
+              i++; scanned++;
+              if (ch >= "@" && ch <= "~") break;
+            }
           } else if (next === "]") {
             i += 2;
             while (i < s.length) {
