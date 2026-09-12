@@ -1044,13 +1044,15 @@ Work submitted against it will fail — fix the machine or deregister the provid
       /**
        * Polls `GET /api/hidden` for the current (or, under RAL-332's "Edit
        * Profile", visited) user's hidden squads/reviews (RAL-328/RAL-329),
-       * plus `GET /api/tasks`/`GET /api/guardians` to resolve their display names, and
+       * plus `GET /api/tasks`/`GET /api/guardians` to resolve their display names,
+       * the full personal-mailbox message history (RAL-401), and
        * re-renders the Preferences tab.
        * @returns {Promise<void>}
        */
       async function pollPrefs() {
         try {
           await pollWatches();
+          await pollMailboxHistory();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
             fetch("/api/tasks"),
@@ -1134,10 +1136,12 @@ Work submitted against it will fail — fix the machine or deregister the provid
           </tr>`;
       }
       /**
-       * Renders the Preferences tab: the theme setting and the hidden-items list/filters.
+       * Renders the Preferences tab: the theme setting, the hidden-items
+       * list/filters, and the message-history table (RAL-401).
        * @returns {void}
        */
       function renderPrefs() {
+        renderMailboxHistory();
         const banner = byId("prefs-visit-banner");
         if (prefsViewingAs) {
           banner.style.display = "";

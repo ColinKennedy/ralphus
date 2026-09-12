@@ -179,6 +179,7 @@
         await pollWhoAmI();
         await pollHidden();
         await pollWatches();
+        await pollMailbox();
         if (tab === "reviews") { await updateCounter(); await pollReviews(); }
         else if (tab === "resources") { await updateCounter(); await pollResources(); }
         else if (tab === "queue") { await updateCounter(); if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }

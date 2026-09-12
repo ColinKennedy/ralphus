@@ -235,6 +235,10 @@
         <label data-tip="Show hidden reviews."><input type="checkbox" id="hidden-filter-review" checked onchange="toggleHiddenType('review', this.checked)"> Reviews</label>
       </div>
       <div id="hidden-items"><div class="empty">Loading…</div></div>
+      <div class="row" style="justify-content:space-between;margin:20px 0 12px;align-items:baseline">
+        <b data-tip="Message history (RAL-401) — every message ever delivered to your personal mailbox, including ones you've already dismissed.\nThe live inbox widget (bottom-right corner) only shows what's still unread by default; this page is the permanent record.">Message history</b>
+      </div>
+      <div id="mailbox-history"><div class="empty">Loading…</div></div>
     </main>
 
     <main id="machines-page" style="display:none">
@@ -269,6 +273,13 @@
 
     <div id="modal-root"></div>
     <div id="toast-root" class="toast-root"></div>
+    <div id="mailbox-widget" class="mailbox-widget" style="display:none">
+      <div class="mailbox-widget-bar">
+        <span id="mailbox-widget-summary" class="mailbox-widget-summary"></span>
+        <button type="button" class="mailbox-widget-toggle" id="mailbox-widget-toggle-btn" onclick="toggleMailboxWidget()" aria-label="Expand message inbox" data-tip="Expand or collapse your personal mailbox (RAL-241/RAL-320) message list.\nA message here is one your watched squads/reviews sent you at a priority tier you subscribed to."></button>
+      </div>
+      <div id="mailbox-widget-list" class="mailbox-widget-list" style="display:none"></div>
+    </div>
 
     <!--
       Vendored: xterm.js v5.3.0 (core/lib/xterm.js) + xterm-addon-fit v0.8.0,
@@ -304,5 +315,6 @@
     <script src="/board/75-projects-machines.js"></script>
     <script src="/board/80-queue.js"></script>
     <script src="/board/81-worktree-retirement.js"></script>
+    <script src="/board/82-mailbox.js"></script>
   </body>
 </html>
