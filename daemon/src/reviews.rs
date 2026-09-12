@@ -357,6 +357,13 @@ struct Membership {
     /// Explicit opt-out of the auto_build requirement (`[[review]]
     /// skip_auto_build = true`, RAL-342), mutually exclusive with `auto_build`.
     skip_auto_build: bool,
+    /// RAL-395: optional auto-fix-PR-errors override declared on the review
+    /// (`[[review]] auto_fix_pr_errors`).
+    auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: optional auto-fix prompt template override declared on the
+    /// review (`[[review]] auto_fix_prompt_template`), already validated
+    /// (`core::validate`) to contain the literal `<<prompt>>` placeholder.
+    auto_fix_prompt_template: Option<String>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -700,6 +707,10 @@ pub fn derive_reviews(
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
             auto_build: rv.map(|r| r.auto_build.clone()).unwrap_or_default(),
             skip_auto_build: rv.is_some_and(|r| r.skip_auto_build),
+            auto_fix_pr_errors: rv.and_then(|r| r.auto_fix_pr_errors),
+            auto_fix_prompt_template: rv
+                .and_then(|r| r.auto_fix_prompt_template.clone())
+                .filter(|s| !s.trim().is_empty()),
         });
     }
 
@@ -969,6 +980,23 @@ fn apply_project_review_defaults(
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
     }
+    // RAL-395: fill the auto-fix-PR-errors/template gap from the project
+    // config -- the single call site that guarantees an Arbiter/Triage
+    // review (no `[[review]]` block of its own) always ends up using the
+    // project default unconditionally, same as `machine`/
+    // `maximum_budget_usd` above.
+    if row.auto_fix_pr_errors.is_none() && cfg.auto_fix_pr_errors() {
+        store
+            .set_guardian_auto_fix_pr_errors(gid, Some(true))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if row.auto_fix_prompt_template.is_none() {
+        if let Some(template) = cfg.auto_fix_prompt_template() {
+            store
+                .set_guardian_auto_fix_prompt_template(gid, Some(template))
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
+    }
     Ok(())
 }
 
@@ -1045,6 +1073,24 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.separate_pr_branch) {
         store
             .set_guardian_separate_pr_branch(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-395: this review's own auto-fix-PR-errors override, authored via
+    // `[[review]] auto_fix_pr_errors`.
+    if let Some(enabled) = members.iter().find_map(|m| m.auto_fix_pr_errors) {
+        store
+            .set_guardian_auto_fix_pr_errors(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-395: this review's own auto-fix prompt template override, authored
+    // via `[[review]] auto_fix_prompt_template`. Validated offline
+    // (`core::validate`) to contain the literal `<<prompt>>` placeholder.
+    if let Some(template) = members
+        .iter()
+        .find_map(|m| m.auto_fix_prompt_template.clone())
+    {
+        store
+            .set_guardian_auto_fix_prompt_template(gid, Some(&template))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -2162,6 +2208,8 @@ mod tests {
             separate_pr_branch: None,
             auto_build: Vec::new(),
             skip_auto_build: false,
+            auto_fix_pr_errors: None,
+            auto_fix_prompt_template: None,
         }
     }
 
@@ -2805,6 +2853,138 @@ print(json.dumps(result))
         );
         assert_eq!(g.maximum_budget_usd, Some(2.5));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── RAL-395: per-project auto-fix defaults ────────────────────────────
+
+    #[test]
+    fn apply_project_review_defaults_fills_auto_fix_settings_from_project_config() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nauto_fix_pr_errors = true\nauto_fix_prompt_template = \"fix: <<prompt>>\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.auto_fix_pr_errors, Some(true));
+        assert_eq!(
+            g.auto_fix_prompt_template.as_deref(),
+            Some("fix: <<prompt>>")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_project_review_defaults_does_not_clobber_an_already_set_auto_fix_template() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nauto_fix_prompt_template = \"from-config: <<prompt>>\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+        store
+            .set_guardian_auto_fix_prompt_template(&gid, Some("explicit: <<prompt>>"))
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.auto_fix_prompt_template.as_deref(),
+            Some("explicit: <<prompt>>"),
+            "an already-set template must never be overwritten by the project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_review_from_triage_pool_applies_project_default_auto_fix_settings() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nauto_fix_pr_errors = true\nauto_fix_prompt_template = \"pooled: <<prompt>>\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+
+        let gid = create_review_from_triage_pool(&store, "proj", "security")
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.auto_fix_pr_errors,
+            Some(true),
+            "the Arbiter has no [[review]] block to declare auto_fix_pr_errors, so it must \
+             pick up the project's default unconditionally"
+        );
+        assert_eq!(
+            g.auto_fix_prompt_template.as_deref(),
+            Some("pooled: <<prompt>>")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── RAL-395: [[review]] auto_fix_pr_errors / auto_fix_prompt_template wiring ──
+
+    #[test]
+    fn apply_resolver_sets_auto_fix_pr_errors_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            auto_fix_pr_errors: Some(true),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().auto_fix_pr_errors,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_resolver_leaves_auto_fix_pr_errors_unset_when_no_member_declares_one() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(store.get_guardian(&gid).unwrap().auto_fix_pr_errors, None);
+    }
+
+    #[test]
+    fn apply_resolver_sets_auto_fix_prompt_template_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            auto_fix_prompt_template: Some("member: <<prompt>>".to_string()),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store
+                .get_guardian(&gid)
+                .unwrap()
+                .auto_fix_prompt_template
+                .as_deref(),
+            Some("member: <<prompt>>")
+        );
     }
 
     #[test]

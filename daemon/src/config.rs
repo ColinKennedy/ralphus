@@ -213,7 +213,36 @@ pub struct ReviewConfig {
     /// `Guardian::separate_pr_branch` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub separate_pr_branch: Option<bool>,
+    /// RAL-395: whether a review automatically dispatches its agent to fix a
+    /// failing PR/MR CI status. `None` means unset, which resolves to
+    /// `false` (see [`Self::auto_fix_pr_errors`]); per-project scalars win
+    /// over the global layer, same as `skip_worktrees`. A per-review
+    /// override (see `Guardian::auto_fix_pr_errors` in `guardian.rs`) wins
+    /// over this. Auto-created reviews (Arbiter/Triage) have no `[[review]]`
+    /// block to override it with, so they always use this project default.
+    #[serde(default)]
+    pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: the prompt template handed to the resolver agent when
+    /// `auto_fix_pr_errors` fires, with `<<prompt>>` replaced by the
+    /// concatenated prompts of the failing branch's attached Cells. `None`
+    /// means unset, which resolves to a built-in default template (see
+    /// [`Self::auto_fix_prompt_template`]); per-project scalars win over the
+    /// global layer, same as `skip_worktrees`. A per-review override (see
+    /// `Guardian::auto_fix_prompt_template` in `guardian.rs`) wins over
+    /// this. Auto-created reviews (Arbiter/Triage) have no `[[review]]`
+    /// block to override it with, so they always use this project default.
+    /// Validated (`ralphus_core::validate`) to contain the literal
+    /// `<<prompt>>` placeholder.
+    #[serde(default)]
+    pub auto_fix_prompt_template: Option<String>,
 }
+
+/// RAL-395: the built-in fallback prompt template for auto-fixing a failing
+/// PR/MR, used when neither a per-review override nor a project-level
+/// `.ralphus.toml [review] auto_fix_prompt_template` is set. The "current
+/// machine" phrasing (not "locally") is deliberate: the fix may run on a
+/// remote machine.
+pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
 
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
@@ -313,6 +342,39 @@ impl ReviewConfig {
         self.separate_pr_branch.unwrap_or(false)
     }
 
+    /// Whether a review automatically dispatches its agent to fix a failing
+    /// PR/MR CI status (unset resolves to `false`). RAL-395.
+    #[must_use]
+    pub fn auto_fix_pr_errors(&self) -> bool {
+        self.auto_fix_pr_errors.unwrap_or(false)
+    }
+
+    /// The configured default auto-fix prompt template, unset resolves to
+    /// `None` -- callers fall back to [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`].
+    /// RAL-395.
+    #[must_use]
+    pub fn auto_fix_prompt_template(&self) -> Option<&str> {
+        self.auto_fix_prompt_template.as_deref()
+    }
+
+    /// Validate this config's own scalars, independent of a `[[review]]`
+    /// submission's own validation (`ralphus_core::validate`). RAL-395: a
+    /// project-level `auto_fix_prompt_template` default must contain the
+    /// same literal `<<prompt>>` placeholder a per-submission override is
+    /// required to have, so the rule lives once, in `core::validate`, and is
+    /// applied here as well as there.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if let Some(template) = self.auto_fix_prompt_template.as_deref() {
+            if !ralphus_core::validate::auto_fix_template_has_placeholder(template) {
+                return Err(format!(
+                    "[review] auto_fix_prompt_template must contain the literal placeholder \"{}\"",
+                    ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Layer `self` (global) under `over` (per-project). Per-project scalars win
     /// when present; list fields are unioned (global first, then new per-project
     /// entries, order-preserving and de-duplicated).
@@ -341,6 +403,10 @@ impl ReviewConfig {
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
             auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
             separate_pr_branch: over.separate_pr_branch.or(self.separate_pr_branch),
+            auto_fix_pr_errors: over.auto_fix_pr_errors.or(self.auto_fix_pr_errors),
+            auto_fix_prompt_template: over
+                .auto_fix_prompt_template
+                .or(self.auto_fix_prompt_template),
         }
     }
 }
@@ -469,6 +535,14 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
              project-wide skip would silently disable build gating for every auto-review \
              the project ever creates (see `reviews::require_auto_build_declaration`).",
         ),
+    ),
+    (
+        "auto_fix_pr_errors",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_fix_pr_errors.is_some()),
+    ),
+    (
+        "auto_fix_prompt_template",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_fix_prompt_template.is_some()),
     ),
 ];
 
@@ -2382,6 +2456,91 @@ mod tests {
         assert_eq!(
             global.merge(ReviewConfig::default()).default_proof_scope(),
             "final_branch"
+        );
+    }
+
+    // ── auto_fix_pr_errors / auto_fix_prompt_template (RAL-395) ─────────────
+
+    #[test]
+    fn auto_fix_pr_errors_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().auto_fix_pr_errors());
+    }
+
+    #[test]
+    fn auto_fix_pr_errors_reads_from_toml() {
+        let c = from_toml_str("[review]\nauto_fix_pr_errors = true\n");
+        assert!(c.auto_fix_pr_errors());
+    }
+
+    #[test]
+    fn auto_fix_prompt_template_defaults_to_none_when_unset() {
+        assert_eq!(ReviewConfig::default().auto_fix_prompt_template(), None);
+    }
+
+    #[test]
+    fn auto_fix_prompt_template_reads_from_toml() {
+        let c = from_toml_str("[review]\nauto_fix_prompt_template = \"fix: <<prompt>>\"\n");
+        assert_eq!(c.auto_fix_prompt_template(), Some("fix: <<prompt>>"));
+    }
+
+    #[test]
+    fn auto_fix_prompt_template_valid_passes_validation() {
+        let c = ReviewConfig {
+            auto_fix_prompt_template: Some("fix: <<prompt>>".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_fix_prompt_template_missing_placeholder_fails_validation() {
+        let c = ReviewConfig {
+            auto_fix_prompt_template: Some("fix it please".to_string()),
+            ..ReviewConfig::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("auto_fix_prompt_template"), "{err}");
+        assert!(err.contains("<<prompt>>"), "{err}");
+    }
+
+    #[test]
+    fn auto_fix_prompt_template_unset_passes_validation() {
+        assert!(ReviewConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn merge_auto_fix_pr_errors_project_wins() {
+        let global = ReviewConfig {
+            auto_fix_pr_errors: Some(false),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            auto_fix_pr_errors: Some(true),
+            ..ReviewConfig::default()
+        };
+        assert!(global.clone().merge(project).auto_fix_pr_errors());
+        assert!(!global.merge(ReviewConfig::default()).auto_fix_pr_errors());
+    }
+
+    #[test]
+    fn merge_auto_fix_prompt_template_project_wins() {
+        let global = ReviewConfig {
+            auto_fix_prompt_template: Some("global: <<prompt>>".to_string()),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            auto_fix_prompt_template: Some("project: <<prompt>>".to_string()),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).auto_fix_prompt_template(),
+            Some("project: <<prompt>>")
+        );
+        assert_eq!(
+            global
+                .merge(ReviewConfig::default())
+                .auto_fix_prompt_template(),
+            Some("global: <<prompt>>")
         );
     }
 

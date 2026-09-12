@@ -596,6 +596,28 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return `<h3 class="section" data-tip="A summary appears here as soon as one branch's source task cell finishes — no need to wait for merging/rebasing.">change summary</h3><div class="empty">waiting for a branch to be ready…</div>`;
       }
       // ---------- PR submission + sync (RAL-117/RAL-190) ----------
+      /** RAL-395: PR lifecycle-state color roles, reusing existing status hues (docs/colors.md) rather than inventing new ones -- mirrors the Tasks tab's `TT_PR_COLORS` (10-tab-registry.js) so the two surfaces never drift apart on what a PR state means visually. */
+      /** @type {{[state: string]: string}} */
+      const PR_STATE_COLORS = { open: "--accent", merged: "--done", closed: "--cancelled", dropped: "--failed" };
+      /** RAL-395: CI/CD status color roles for an *open* PR, reusing the same status hues -- see docs/colors.md's "PR CI/CD status" subsection. Mirrors the Tasks tab's `TT_PR_CI_COLORS`. */
+      /** @type {{[status: string]: string}} */
+      const PR_CI_COLORS = { passing: "--done", failing: "--failed", pending: "--pending" };
+      /**
+       * The color role for a PR chip/badge (RAL-395): once a PR is no longer
+       * `open` (merged/closed/dropped), its CI status is moot -- use
+       * `PR_STATE_COLORS`' lifecycle coloring. While `open`, prefer the
+       * polled CI status (a distinct color for failing vs. passing vs.
+       * not-yet-known) over the flat "in-flight" accent color, so a reviewer
+       * sees red/green without opening the PR.
+       * @param {PullRequestView} p
+       * @returns {string} a `var(--name)` CSS value, ready to drop into a `style` attribute.
+       */
+      function prColorVar(p) {
+        const role = p.state === "open" && p.ci_status
+          ? (PR_CI_COLORS[p.ci_status] || PR_STATE_COLORS.open)
+          : (PR_STATE_COLORS[p.state] || "--muted");
+        return `var(${role})`;
+      }
       /**
        * Renders one existing PR's status row: forge/number/state, and a drift
        * banner (RAL-190) offering "pull PR commits" when the PR branch has
@@ -619,10 +641,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="This review worktree has commits not yet reflected on the PR branch -- e.g. feedback was just resolved.\nInformational only: submitting again, or resolving PR feedback, pushes the latest worktree state to the PR branch automatically.">worktree ahead of PR — syncs on next push</span>
             </div>`;
         }
+        const badgeColor = prColorVar(p);
+        const ciTip = p.state === "open" && p.ci_status
+          ? ` data-tip="CI/CD status: ${esc(p.ci_status)}."`
+          : "";
+        const badgeLabel = p.state === "open" && p.ci_status ? `${esc(p.state)} · ${esc(p.ci_status)}` : esc(p.state);
         return `<div class="pr-card" style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px" data-tip="Pull/merge request submitted via ${esc(p.forge)}.">
             <div class="row" style="justify-content:space-between;gap:6px">
               <span>${esc(p.forge)} ${link} <span class="mono" style="color:var(--muted);font-size:11px">${esc(p.branch_alias)} → ${esc(p.base_ref)}</span></span>
-              <span class="badge" style="font-size:11px">${esc(p.state)}</span>
+              <span class="badge" style="font-size:11px;color:${badgeColor};border-color:${badgeColor}"${ciTip}>${badgeLabel}</span>
             </div>
             ${drift}
           </div>`;
@@ -641,7 +668,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function branchPrLink(g, b) {
         const pr = (pullRequests[g.id] || []).find((p) => p.branch_id === b.id && p.state === "open");
         if (!pr || !pr.pr_url) return "";
-        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:var(--accent);border-color:var(--accent)" onclick="event.stopPropagation()" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+        const color = prColorVar(pr);
+        const ciNote = pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
+        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
       }
       /**
        * Renders the PR status section for one stacked branch (RAL-190+):

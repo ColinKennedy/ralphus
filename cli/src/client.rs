@@ -1309,6 +1309,12 @@ impl DaemonClient {
             settings.auto_submit_pr_stack,
         );
         set_if_some(&mut body, "separate_pr_branch", settings.separate_pr_branch);
+        set_if_some(&mut body, "auto_fix_pr_errors", settings.auto_fix_pr_errors);
+        set_if_some(
+            &mut body,
+            "auto_fix_prompt_template",
+            settings.auto_fix_prompt_template.map(str::to_string),
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1584,6 +1590,11 @@ pub struct GuardianSettings<'a> {
     /// RAL-378: whether this review's pull request is pushed to a branch
     /// separate from its review branch.
     pub separate_pr_branch: Option<bool>,
+    /// RAL-395: whether this review auto-dispatches its agent to fix a
+    /// failing PR's CI status.
+    pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: the prompt template used for the auto-fix dispatch above.
+    pub auto_fix_prompt_template: Option<&'a str>,
 }
 
 #[cfg(test)]

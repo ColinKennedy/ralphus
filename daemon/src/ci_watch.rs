@@ -1,4 +1,6 @@
-//! Watch a PR's CI/CD + mergeability after a review-feedback push (RAL-375).
+//! Watch a PR's CI/CD + mergeability after a review-feedback push (RAL-375),
+//! and (RAL-395) a standing poll of every open PR that persists the result
+//! and can trigger an auto-fix dispatch.
 //!
 //! [`watch_after_feedback_push`] is called right after
 //! `guardian_merge::run_feedback` pushes a new commit onto a stacked branch:
@@ -11,20 +13,32 @@
 //! excerpt, then asks whether to fix it immediately in a subagent. A
 //! terminal success is silent.
 //!
+//! [`poll_open_pr_ci_status`] (RAL-395) is the standing counterpart: called
+//! on every `review_maintenance` pass (throttled per guardian, see
+//! [`STANDING_POLL_INTERVAL`]) so a PR's CI status is known to the board even
+//! when no feedback push has recently fired `watch_after_feedback_push` --
+//! e.g. the very first CI run after a stack is opened, or a watch that gave
+//! up after [`MAX_WATCH_DURATION`]. It persists every poll's outcome
+//! (`crate::pr::PullRequestView::ci_status`) and, when the guardian has
+//! opted into `auto_fix_pr_errors`, dispatches [`dispatch_pr_auto_fix`] on a
+//! freshly observed failure.
+//!
 //! There is no new tracking type here: a PR is already reachable from a
 //! review worktree via the `guardian_id`/`branch_id` pair
 //! `PullRequestView` and `BranchView` share.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::cancel::CancelToken;
 use crate::forge::{PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;
 use crate::pr::PullRequestView;
+use crate::runner::Runner;
 use crate::store::{Store, now_ms};
 
 /// Fast-start/backoff poll cadence (RAL-375): quick enough to catch a
@@ -282,6 +296,11 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "passing"}),
                 );
+                let _ = store.lock().expect("poisoned").set_pr_ci_status(
+                    &pr.id,
+                    PrCiState::Passing.as_str(),
+                    None,
+                );
                 return;
             }
             Ok(PrCiState::Failing(failure)) => {
@@ -296,6 +315,11 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
                         failure.reason
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "failing", "reason": failure.reason}),
+                );
+                let _ = store.lock().expect("poisoned").set_pr_ci_status(
+                    &pr.id,
+                    PrCiState::Failing(failure.clone()).as_str(),
+                    failure.job_url.as_deref(),
                 );
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
@@ -381,6 +405,313 @@ fn enqueue_ci_failure_notice(
             serde_json::json!({"outcome": "mailbox_enqueue_failed", "error": e.to_string()}),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// RAL-395: standing poll of every open PR + auto-fix dispatch
+// ---------------------------------------------------------------------------
+
+/// Minimum interval between standing CI-status polls for the same guardian
+/// (RAL-395) -- independent of [`watch_after_feedback_push`]'s fast-then-
+/// backoff poll of a single just-pushed branch. [`poll_open_pr_ci_status`]
+/// is cheap to call on every `review_maintenance` pass (a 5s cadence), so it
+/// needs its own, much coarser throttle to stay within forge rate-limit
+/// expectations (`.agent/forge-design-principles.md`).
+const STANDING_POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
+
+/// Last standing-poll time per guardian id (RAL-395) -- mirrors
+/// `guardian_merge::IDLE_MAINT_LAST`'s shape, but keyed and intervaled
+/// independently since this throttles a forge call, not a maintenance pass.
+static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Poll every open, forge-numbered PR of `guardian_id` for its current CI
+/// status (RAL-395), persist the result (`crate::pr::PullRequestView::ci_status`)
+/// so the board can read it without a live forge call on every page load, and
+/// dispatch [`dispatch_pr_auto_fix`] on a freshly observed failure when the
+/// guardian has opted into `auto_fix_pr_errors`. Throttled to at most once
+/// per [`STANDING_POLL_INTERVAL`] per guardian -- safe to call on every
+/// `review_maintenance` pass. Fail-safe by design, matching
+/// `watch_after_feedback_push`'s precedent: an unresolvable forge client or a
+/// poll error for one PR never blocks or fails the caller, and never stops
+/// the remaining PRs in the same guardian from being polled.
+pub fn poll_open_pr_ci_status(store: &Arc<Mutex<Store>>, runner: &dyn Runner, guardian_id: &str) {
+    {
+        let mut last = STANDING_POLL_LAST.lock().expect("poisoned");
+        let now = Instant::now();
+        if last
+            .get(guardian_id)
+            .is_some_and(|prev| now.duration_since(*prev) < STANDING_POLL_INTERVAL)
+        {
+            return;
+        }
+        last.insert(guardian_id.to_string(), now);
+    }
+    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(guardian_id) else {
+        return;
+    };
+    let Ok(prs) = store
+        .lock()
+        .expect("poisoned")
+        .list_pull_requests_for_guardian(guardian_id)
+    else {
+        return;
+    };
+    let open: Vec<PullRequestView> = prs
+        .into_iter()
+        .filter(|p| p.state == "open" && p.pr_number.is_some())
+        .collect();
+    if open.is_empty() {
+        return;
+    }
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let client = match crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            log_ci_watch(
+                store,
+                guardian_id,
+                "",
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} standing poll: could not resolve forge client: {e}"
+                ),
+                serde_json::json!({"outcome": "unavailable", "error": e}),
+            );
+            return;
+        }
+    };
+    for pr in &open {
+        let number = pr.pr_number.expect("filtered above");
+        let state = match client.check_pr_ci_status(number) {
+            Ok(s) => s,
+            Err(e) => {
+                log_ci_watch(
+                    store,
+                    guardian_id,
+                    pr.branch_id.as_deref().unwrap_or(""),
+                    LogLevel::DEBUG,
+                    format!(
+                        "ralphus [ci-watch] review {guardian_id} pr #{number} standing poll error (will retry next pass): {e}"
+                    ),
+                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
+                );
+                continue;
+            }
+        };
+        let job_url = match &state {
+            PrCiState::Failing(f) => f.job_url.clone(),
+            _ => None,
+        };
+        let _ = store.lock().expect("poisoned").set_pr_ci_status(
+            &pr.id,
+            state.as_str(),
+            job_url.as_deref(),
+        );
+        if let PrCiState::Failing(failure) = state {
+            dispatch_pr_auto_fix(store, runner, &guardian, pr, &failure);
+        }
+    }
+}
+
+/// How many lines of a CI failure log trigger the "this may be very large"
+/// caution in the auto-fix prompt (RAL-395, interview Q6) -- an arbitrary but
+/// generous threshold; the point is giving the agent a size signal, not
+/// precisely classifying "large".
+const LARGE_LOG_LINE_THRESHOLD: usize = 500;
+
+/// Write a PR's full, untrimmed CI failure log to disk inside the branch's
+/// own worktree (RAL-395, interview Q6) -- colocated with wherever the
+/// auto-fix agent actually runs (the same `cwd` `run_feedback` gives it,
+/// local or remote), unlike `capture_and_trim_log`'s throwaway daemon-host
+/// temp directory, which only ever produces a short excerpt for a mailbox
+/// message a human reads on this machine. Overwrites any previous failure
+/// log for this branch -- only the most recent failure is ever relevant.
+/// Best-effort: returns `None` (logged) if the write fails, and the caller
+/// still dispatches auto-fix without an on-disk path in that case.
+fn write_ci_failure_log(worktree: &str, log_text: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(worktree).join(".ralphus-ci-failure.log");
+    std::fs::write(&path, log_text).ok().map(|()| path)
+}
+
+/// Dispatch the review's agent to fix a failing PR/MR (RAL-395): composes the
+/// auto-fix prompt (project/per-review template, `<<prompt>>` replaced by the
+/// failing branch's own Cells' prompts, `{insert URL here}` replaced by the
+/// PR's URL when present) and runs it through `guardian_merge::run_feedback`
+/// with `require_proof: true`, gating success/failure specifically on the
+/// agent's own `RALPHUS_PROOF` verdict (interview Q7) rather than
+/// `run_feedback`'s own `Done`/`Failed` distinction, which doesn't tell
+/// "agent fixed it" apart from "agent gave up without erroring".
+///
+/// No-ops when `auto_fix_pr_errors` isn't enabled for this guardian, or when
+/// auto-fix was already attempted for this PR's *current* failure (single
+/// attempt per failure, interview Q5) -- the attempted marker is set before
+/// the (potentially long-running) agent call, not after, so a second
+/// standing-poll tick landing mid-dispatch can never double-fire it.
+///
+/// `pub` (rather than `pub(crate)`) specifically so `daemon/tests/
+/// guardian_merge.rs`'s existing stacked-branch fixtures can drive this
+/// directly, the same way that file already calls `run_feedback` -- the
+/// PR-stacking regression coverage this needs (an auto-fix commit must still
+/// fold into the review's linear stack and restack correctly) belongs
+/// alongside `run_feedback`'s other restack tests, not duplicated here.
+pub fn dispatch_pr_auto_fix(
+    store: &Arc<Mutex<Store>>,
+    runner: &dyn Runner,
+    guardian: &GuardianView,
+    pr: &PullRequestView,
+    failure: &PrFailure,
+) {
+    if !guardian.auto_fix_pr_errors.unwrap_or(false) {
+        return;
+    }
+    if pr.auto_fix_attempted_at_ms.is_some() {
+        return;
+    }
+    let branch_id = match &pr.branch_id {
+        Some(bid) => bid.clone(),
+        None => match guardian
+            .branches
+            .iter()
+            .filter(|b| b.enabled)
+            .max_by_key(|b| b.position)
+        {
+            Some(b) => b.id.clone(),
+            None => return,
+        },
+    };
+    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+        return;
+    };
+
+    // RAL-395: single attempt per failure -- claim it now, before the
+    // (potentially long-running) agent dispatch below, not after.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .mark_pr_auto_fix_attempted(&pr.id);
+
+    let cell_prompts = store
+        .lock()
+        .expect("poisoned")
+        .cell_prompts_for_review_branch(&guardian.id, &branch.branch)
+        .unwrap_or_default();
+
+    let log_note = match (&branch.worktree, &failure.log_text) {
+        (Some(worktree), Some(log_text)) => {
+            let line_count = log_text.lines().count();
+            match write_ci_failure_log(worktree, log_text) {
+                Some(path) => {
+                    let size_note = if line_count > LARGE_LOG_LINE_THRESHOLD {
+                        format!(
+                            " This log has {line_count} lines and may be very large (tens of \
+                             thousands of lines in the worst case) -- use your judgment about \
+                             whether to read it in full or just the parts that look relevant \
+                             (e.g. the tail, or a search for the failing check's name)."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "The full CI failure log ({line_count} line(s)) was written to \
+                         {} on this machine.{size_note}",
+                        path.display()
+                    )
+                }
+                None => "The CI failure log could not be written to disk; \
+                         only the failure summary below is available."
+                    .to_string(),
+            }
+        }
+        (_, Some(_)) => {
+            "A CI failure log is available from the forge, but this branch has no known \
+             worktree path to write it into."
+                .to_string()
+        }
+        (_, None) => "The forge did not provide a CI failure log for this job.".to_string(),
+    };
+    let job_note = failure
+        .job_url
+        .as_deref()
+        .map_or_else(String::new, |url| format!("Failing job: {url}\n"));
+
+    let prompt_body = format!(
+        "Reason: {reason}\n{job_note}{log_note}\n\n\
+         The following are the prompts of the work already done on this branch -- keep this \
+         behavior intact while fixing the CI failure:\n\n{cells}",
+        reason = failure.reason,
+        cells = if cell_prompts.is_empty() {
+            "(no cell prompts recorded for this branch)".to_string()
+        } else {
+            cell_prompts.join("\n\n---\n\n")
+        },
+    );
+
+    let template = guardian
+        .auto_fix_prompt_template
+        .clone()
+        .unwrap_or_else(|| crate::config::DEFAULT_AUTO_FIX_PROMPT_TEMPLATE.to_string());
+    let pr_url = pr
+        .pr_url
+        .clone()
+        .unwrap_or_else(|| format!("{} PR/MR #{}", pr.forge, pr.pr_number.unwrap_or_default()));
+    let feedback = template.replace("{insert URL here}", &pr_url).replace(
+        ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER,
+        &prompt_body,
+    );
+
+    log_ci_watch(
+        store,
+        &guardian.id,
+        &branch_id,
+        LogLevel::INFO,
+        format!(
+            "ralphus [ci-watch] review {} branch {} auto-fix dispatching for pr #{}",
+            guardian.id,
+            branch_id,
+            pr.pr_number.unwrap_or_default()
+        ),
+        serde_json::json!({"pr_number": pr.pr_number, "outcome": "auto_fix_dispatching"}),
+    );
+    let outcome = crate::guardian_merge::run_feedback(
+        store,
+        runner,
+        &guardian.id,
+        &branch_id,
+        &feedback,
+        None,
+        true,
+        &CancelToken::never(),
+    );
+    let passed = outcome.proof_passed.unwrap_or(false);
+    log_ci_watch(
+        store,
+        &guardian.id,
+        &branch_id,
+        if passed {
+            LogLevel::INFO
+        } else {
+            LogLevel::WARNING
+        },
+        format!(
+            "ralphus [ci-watch] review {} branch {} auto-fix {} for pr #{}",
+            guardian.id,
+            branch_id,
+            if passed {
+                "succeeded"
+            } else {
+                "did not confirm a fix"
+            },
+            pr.pr_number.unwrap_or_default()
+        ),
+        serde_json::json!({
+            "pr_number": pr.pr_number,
+            "outcome": if passed { "auto_fix_passed" } else { "auto_fix_failed" },
+            "committed": outcome.committed,
+            "pushed": outcome.pushed,
+        }),
+    );
 }
 
 #[cfg(test)]

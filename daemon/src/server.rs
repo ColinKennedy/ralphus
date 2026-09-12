@@ -9415,6 +9415,17 @@ struct GuardianSettingsBody {
     /// field being absent) means "inherit the project/global default".
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    /// RAL-395: this review's own override for whether it auto-dispatches
+    /// its agent to fix a failing PR/MR CI status. `None` (or the field
+    /// being absent) means "inherit the project/global default".
+    #[serde(default)]
+    auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: this review's own override of the auto-fix prompt template.
+    /// Must contain the literal `<<prompt>>` placeholder; an empty string
+    /// resets it to "inherit the project default" (same convention as
+    /// `proof_scope` above).
+    #[serde(default)]
+    auto_fix_prompt_template: Option<String>,
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -9449,6 +9460,12 @@ struct GuardianDetailsBody {
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
     auto_submit_pr_stack: Option<bool>,
+    /// RAL-395: see [`GuardianSettingsBody::auto_fix_pr_errors`].
+    #[serde(default)]
+    auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: see [`GuardianSettingsBody::auto_fix_prompt_template`].
+    #[serde(default)]
+    auto_fix_prompt_template: Option<String>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -9716,6 +9733,30 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.auto_fix_pr_errors {
+        if let Err(e) = store.set_guardian_auto_fix_pr_errors(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(template) = req.auto_fix_prompt_template.as_deref() {
+        if template.is_empty() {
+            if let Err(e) = store.set_guardian_auto_fix_prompt_template(id, None) {
+                return store_error(&e);
+            }
+        } else if !ralphus_core::validate::auto_fix_template_has_placeholder(template) {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "auto_fix_prompt_template must contain the literal placeholder \"{}\"",
+                    ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER
+                ),
+                vec![],
+            );
+        } else if let Err(e) = store.set_guardian_auto_fix_prompt_template(id, Some(template)) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -9911,6 +9952,21 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             }
         }
     }
+    if let Some(template) = req.auto_fix_prompt_template.as_deref() {
+        if !template.is_empty()
+            && !ralphus_core::validate::auto_fix_template_has_placeholder(template)
+        {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "auto_fix_prompt_template must contain the literal placeholder \"{}\"",
+                    ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER
+                ),
+                vec![],
+            );
+        }
+    }
 
     if let Some(name) = req.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if let Err(e) = store.rename_guardian(id, name) {
@@ -9968,6 +10024,21 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_submit_pr_stack {
         if let Err(e) = store.set_guardian_auto_submit_pr_stack(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.auto_fix_pr_errors {
+        if let Err(e) = store.set_guardian_auto_fix_pr_errors(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(template) = req.auto_fix_prompt_template.as_deref() {
+        let template = if template.is_empty() {
+            None
+        } else {
+            Some(template)
+        };
+        if let Err(e) = store.set_guardian_auto_fix_prompt_template(id, template) {
             return store_error(&e);
         }
     }

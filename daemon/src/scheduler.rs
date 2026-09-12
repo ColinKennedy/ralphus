@@ -2834,6 +2834,7 @@ fn resume_feedback(
             &branch_id,
             &feedback,
             message_seq,
+            false,
             &token,
         );
         cancellations.remove(&format!("guardian:{gid}"));

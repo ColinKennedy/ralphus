@@ -235,7 +235,25 @@ pub const REVIEW_KEYS: &[&str] = &[
     "separate_pr_branch",
     "auto_build",
     "skip_auto_build",
+    "auto_fix_pr_errors",
+    "auto_fix_prompt_template",
 ];
+/// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
+/// contain -- shared between `[[review]]` submission validation
+/// (`validate_review_blocks`, below) and the project-level `.ralphus.toml
+/// [review] auto_fix_prompt_template` default, which the daemon validates
+/// with this same constant (`daemon::config::ReviewConfig::validate`) since
+/// only `core::validate` is meant to own the rule for what makes a template
+/// well-formed.
+pub const AUTO_FIX_PROMPT_PLACEHOLDER: &str = "<<prompt>>";
+
+/// Whether an auto-fix prompt template contains the required
+/// [`AUTO_FIX_PROMPT_PLACEHOLDER`] substring. RAL-395.
+#[must_use]
+pub fn auto_fix_template_has_placeholder(template: &str) -> bool {
+    template.contains(AUTO_FIX_PROMPT_PLACEHOLDER)
+}
+
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
 const AUTO_BUILD_KEYS: &[&str] = &[
@@ -1204,6 +1222,30 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         }
         check_type(ctx, table, "skip_auto_build", Ty::Bool, &rpath, header);
         validate_auto_build_table(table, &rpath, ctx, header);
+        check_type(ctx, table, "auto_fix_pr_errors", Ty::Bool, &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "auto_fix_prompt_template",
+            Ty::Str,
+            &rpath,
+            header,
+        );
+        if let Some(template) = table
+            .get("auto_fix_prompt_template")
+            .and_then(toml::Value::as_str)
+        {
+            if !auto_fix_template_has_placeholder(template) {
+                ctx.error(
+                    &format!("{rpath}.auto_fix_prompt_template"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'auto_fix_prompt_template' must contain the literal placeholder \"{AUTO_FIX_PROMPT_PLACEHOLDER}\""
+                    ),
+                    ctx.key_line(header, "auto_fix_prompt_template"),
+                );
+            }
+        }
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -2412,6 +2454,71 @@ command = "cargo build"
                 r.errors
             );
         }
+    }
+
+    // ── [[review]] auto_fix_pr_errors / auto_fix_prompt_template (RAL-395) ──
+
+    #[test]
+    fn review_auto_fix_pr_errors_accepted() {
+        for value in ["true", "false"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_fix_pr_errors={value}\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_auto_fix_pr_errors_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_fix_pr_errors=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(
+                |e| e.kind == ErrorKind::WrongType && e.message.contains("auto_fix_pr_errors")
+            ),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_auto_fix_prompt_template_accepted_with_placeholder() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_fix_prompt_template=\"fix it: <<prompt>>\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_auto_fix_prompt_template_missing_placeholder_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_fix_prompt_template=\"fix it please\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("auto_fix_prompt_template")
+                && e.message.contains("<<prompt>>")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_auto_fix_prompt_template_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nauto_fix_prompt_template=1\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
+                && e.message.contains("auto_fix_prompt_template")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn auto_fix_template_has_placeholder_checks_the_literal_substring() {
+        assert!(auto_fix_template_has_placeholder("fix: <<prompt>>"));
+        assert!(!auto_fix_template_has_placeholder("fix: <prompt>"));
+        assert!(!auto_fix_template_has_placeholder(""));
     }
 
     #[test]

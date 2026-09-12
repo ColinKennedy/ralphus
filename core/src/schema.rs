@@ -924,6 +924,27 @@ pub struct ReviewDef {
     /// that every review say something about how (or whether) it builds.
     #[serde(default)]
     pub skip_auto_build: bool,
+    /// RAL-395: whether this review automatically dispatches its agent to
+    /// fix a failing PR/MR CI status, instead of leaving the failure for a
+    /// human to notice and action manually. Unset inherits the
+    /// project-level `.ralphus.toml [review] auto_fix_pr_errors` default,
+    /// then `false`. Auto-created reviews (Arbiter/Triage) always use the
+    /// project default and never set this directly, since they have no
+    /// `[[review]]` block to read it from.
+    #[serde(default)]
+    pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: this review's own override of the prompt template handed to
+    /// the resolver agent when `auto_fix_pr_errors` fires. Must contain the
+    /// literal `<<prompt>>` placeholder, which is replaced with the
+    /// concatenated prompts of every Cell attached to the specific branch
+    /// whose PR failed (validated in `ralphus_core::validate`). Unset
+    /// inherits the project-level `.ralphus.toml [review]
+    /// auto_fix_prompt_template` default, then a built-in default template.
+    /// Auto-created reviews (Arbiter/Triage) always use the project default
+    /// and never set this directly, since they have no `[[review]]` block
+    /// to read it from.
+    #[serde(default)]
+    pub auto_fix_prompt_template: Option<String>,
 }
 
 /// This review's own declared build step (RAL-342): either a static

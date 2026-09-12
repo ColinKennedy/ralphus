@@ -108,6 +108,11 @@ pub enum ReviewCommand {
         /// RAL-378: this review's own override for whether its pull request
         /// is pushed to a branch separate from its review branch.
         separate_pr_branch: Option<bool>,
+        /// RAL-395: whether this review auto-dispatches its agent to fix a
+        /// failing PR's CI status.
+        auto_fix_pr_errors: Option<bool>,
+        /// RAL-395: the prompt template used for the auto-fix dispatch above.
+        auto_fix_prompt_template: Option<String>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -371,6 +376,11 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
             let auto_submit_pr_stack = take_tri_bool(&mut scanner, "--auto-submit-pr-stack");
             let separate_pr_branch = take_tri_bool(&mut scanner, "--separate-pr-branch");
+            let auto_fix_pr_errors = take_tri_bool(&mut scanner, "--auto-fix-pr-errors");
+            let auto_fix_prompt_template = scanner
+                .take_value("--auto-fix-prompt-template")
+                .ok()
+                .flatten();
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -385,6 +395,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                auto_fix_pr_errors,
+                auto_fix_prompt_template,
             })
         }
         Some("env") => {
@@ -1282,6 +1294,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             match_pr_branch_name,
             auto_submit_pr_stack,
             separate_pr_branch,
+            auto_fix_pr_errors,
+            auto_fix_prompt_template,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1297,6 +1311,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                auto_fix_pr_errors,
+                auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));

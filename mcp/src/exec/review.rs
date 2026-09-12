@@ -155,6 +155,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             match_pr_branch_name,
             auto_submit_pr_stack,
             separate_pr_branch,
+            auto_fix_pr_errors,
+            auto_fix_prompt_template,
         } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -170,6 +172,8 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                auto_fix_pr_errors,
+                auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
             };
             Ok(client.guardian_settings(&resolved.guardian_id, &settings)?)
         }

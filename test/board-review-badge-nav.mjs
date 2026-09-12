@@ -48,7 +48,22 @@ function constSourceOf(name) {
   if (!m) throw new Error(`board-review-badge-nav: could not find the ${name} definition in the board source.`);
   return m[0];
 }
-const BADGE_GLOBALS_SRC = `${constSourceOf("G_COLORS")}\n${constSourceOf("TT_PR_COLORS")}`;
+/** Same idea as `constSourceOf`, but for a `function name(...) { ... }` whose
+ * body may itself contain nested braces (RAL-395's `ttPrColorVar`) -- scans
+ * forward from the opening brace counting depth instead of stopping at the
+ * first `}`. */
+function funcSourceOf(name) {
+  const start = boardSource.indexOf(`function ${name}(`);
+  if (start === -1) throw new Error(`board-review-badge-nav: could not find the ${name} definition in the board source.`);
+  const bodyStart = boardSource.indexOf("{", start);
+  let depth = 0;
+  for (let i = bodyStart; i < boardSource.length; i++) {
+    if (boardSource[i] === "{") depth++;
+    else if (boardSource[i] === "}" && --depth === 0) return boardSource.slice(start, i + 1);
+  }
+  throw new Error(`board-review-badge-nav: unbalanced braces scanning ${name} in the board source.`);
+}
+const BADGE_GLOBALS_SRC = `${constSourceOf("G_COLORS")}\n${constSourceOf("TT_PR_COLORS")}\n${constSourceOf("TT_PR_CI_COLORS")}\n${funcSourceOf("ttPrColorVar")}`;
 
 /**
  * Builds the Tasks-tab Review/PR badge lane renderer with injectable `esc`/`cvar`

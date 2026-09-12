@@ -2308,6 +2308,37 @@ impl Store {
             // treated as "not this category" by a category filter (see
             // `crate::mailbox::mailbox_messages_for_client_filtered`).
             "ALTER TABLE mailbox_messages ADD COLUMN category TEXT",
+            // RAL-395: per-review opt-in to auto-dispatch the resolver agent
+            // when this review's PR/MR CI status is detected failing. `NULL`
+            // = inherit the project/global `.ralphus.toml [review]
+            // auto_fix_pr_errors` default (filled in at creation time by
+            // `reviews::apply_project_review_defaults`, same as `machine`),
+            // then `false`.
+            "ALTER TABLE guardians ADD COLUMN auto_fix_pr_errors INTEGER",
+            // RAL-395: this review's own override of the auto-fix prompt
+            // template. `NULL` = inherit the project/global default (same
+            // layering as `auto_fix_pr_errors`), then the built-in
+            // `config::DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`.
+            "ALTER TABLE guardians ADD COLUMN auto_fix_prompt_template TEXT",
+            // RAL-395: the last polled CI/CD status for this PR/MR --
+            // `"pending"`, `"passing"`, or `"failing"` (mirrors
+            // `crate::forge::PrCiState`, stored as its `as_str()` so the
+            // board can read it without a live forge call on every page
+            // load). NULL for a PR never polled yet (pre-RAL-395 rows, or
+            // one not reached by a poll cycle).
+            "ALTER TABLE guardian_pull_requests ADD COLUMN ci_status TEXT",
+            // RAL-395: the failing job's forge URL from the most recent
+            // `Failing` poll, mirroring `PrFailure::job_url`. NULL when the
+            // last poll wasn't failing, or failed with no job URL (e.g. a
+            // forge-verdict merge conflict).
+            "ALTER TABLE guardian_pull_requests ADD COLUMN ci_failure_job_url TEXT",
+            // RAL-395: a one-shot marker recording that auto-fix has already
+            // been attempted for the *current* failing CI state on this PR
+            // -- caps auto-fix at a single attempt per failure (interview
+            // Q5) and is cleared whenever the PR's CI status is next
+            // observed as anything other than `failing` (i.e. a fresh
+            // failure gets a fresh attempt).
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempted_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3779,6 +3810,38 @@ impl Store {
         }
 
         Ok(map)
+    }
+
+    /// RAL-395: every non-empty `prompt` from a Cell attached to exactly one
+    /// review branch/worktree -- the `<<prompt>>` auto-fix template
+    /// placeholder's source, deliberately scoped to the single branch whose
+    /// PR failed rather than every branch in a stacked review (interview
+    /// Q3). Oldest first (`rowid` order), matching every other cell listing
+    /// in this file.
+    ///
+    /// Mirrors [`Self::reviews_by_branch`]'s two-tier join: a cell that
+    /// recorded its owning guardian directly (`review_guardian_id`, set at
+    /// submit time by `reviews::derive_reviews`) is matched by guardian id
+    /// *and* branch name; a pre-RAL-314 or manually-attached cell with no
+    /// `review_guardian_id` falls back to a bare branch-name match. Either
+    /// way the match is scoped to `branch_name`, never the guardian's other
+    /// branches.
+    pub(crate) fn cell_prompts_for_review_branch(
+        &self,
+        guardian_id: &str,
+        branch_name: &str,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.prompt FROM cells s
+             WHERE s.review_branch = ?1
+               AND (s.review_guardian_id = ?2 OR s.review_guardian_id IS NULL)
+               AND s.prompt IS NOT NULL AND trim(s.prompt) != ''
+             ORDER BY s.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![branch_name, guardian_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// All proof steps belonging to `squad_id`, fetched in one statement and
@@ -8758,6 +8821,102 @@ command = "cargo test"
 
     fn parse(src: &str) -> TaskFile {
         toml::from_str(src).expect("valid toml")
+    }
+
+    // ── cell_prompts_for_review_branch (RAL-395) ────────────────────────────
+
+    #[test]
+    fn cell_prompts_for_review_branch_scopes_to_the_named_branch_only() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_id = store
+            .insert_squad(
+                &parse(
+                    r#"
+[[task]]
+name = "a"
+[[task.cell]]
+cwd = "/repo"
+prompt = "fix the widget"
+[[task]]
+name = "b"
+[[task.cell]]
+cwd = "/repo"
+prompt = "fix the gadget"
+"#,
+                ),
+                None,
+                false,
+            )
+            .unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_cell_review_branch(&squad_id, 0, 0, "feature/a")
+            .unwrap();
+        store
+            .set_cell_review_guardian(&squad_id, 0, 0, &gid)
+            .unwrap();
+        store
+            .set_cell_review_branch(&squad_id, 1, 0, "feature/b")
+            .unwrap();
+        store
+            .set_cell_review_guardian(&squad_id, 1, 0, &gid)
+            .unwrap();
+
+        let prompts = store
+            .cell_prompts_for_review_branch(&gid, "feature/a")
+            .unwrap();
+        assert_eq!(prompts, vec!["fix the widget".to_string()]);
+
+        let other = store
+            .cell_prompts_for_review_branch(&gid, "feature/b")
+            .unwrap();
+        assert_eq!(other, vec!["fix the gadget".to_string()]);
+    }
+
+    #[test]
+    fn cell_prompts_for_review_branch_falls_back_to_branch_name_match_with_no_guardian_link() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_id = store
+            .insert_squad(
+                &parse(
+                    r#"
+[[task]]
+name = "a"
+[[task.cell]]
+cwd = "/repo"
+prompt = "legacy cell, no review_guardian_id"
+"#,
+                ),
+                None,
+                false,
+            )
+            .unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        // RAL-314 pre-migration shape: only `review_branch` is set, never
+        // `review_guardian_id` -- the fallback tier must still match it.
+        store
+            .set_cell_review_branch(&squad_id, 0, 0, "feature/a")
+            .unwrap();
+
+        let prompts = store
+            .cell_prompts_for_review_branch(&gid, "feature/a")
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["legacy cell, no review_guardian_id".to_string()]
+        );
+    }
+
+    #[test]
+    fn cell_prompts_for_review_branch_returns_empty_for_no_match() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(
+            store
+                .cell_prompts_for_review_branch(&gid, "no-such-branch")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// `Store::open_in_memory()` always starts from the current schema, so it

@@ -586,6 +586,8 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         "settings",
         &["selector [str]"],
         &[
+            "--auto-fix-pr-errors/--no-auto-fix-pr-errors",
+            "--auto-fix-prompt-template [str]",
             "--auto-pr-feedback/--no-auto-pr-feedback",
             "--auto-submit-pr-stack/--no-auto-submit-pr-stack",
             "--base-branch [branch]",
