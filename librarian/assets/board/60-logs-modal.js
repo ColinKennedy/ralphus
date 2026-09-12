@@ -7,6 +7,57 @@
       // can't drift from each other.
       const TASK_REASON_TOOLTIP = "A task-level failure reason (RAL-291) — set only when the task itself failed for a reason with no underlying cell/proof error to point to, e.g. the RAL-156 no-commits-since-baseline guard.\nEmpty when the task instead failed because one of its own cells or proof steps failed — that failure is already visible in the cells/proofs tabs.";
       const CELL_CUM_TOOLTIP = "Sum of input/output tokens and $ cost across every completed attempt of this cell (including restarts), read from the Cartographer event log.\nMay undercount if older attempts have aged out of Cartographer retention (see [cartographer] in .ralphus.toml).";
+      // Detects the one specific task.error text `daemon/src/worktrees.rs`'s
+      // default_branch() produces when a git project's `origin` remote has
+      // no refs/remotes/origin/HEAD symref -- must stay in sync with that
+      // function's error string (the exact command, quoted the same way).
+      const DEFAULT_BRANCH_AUTOFIX_MARKER = "git remote set-head origin --auto";
+      /**
+       * Renders an inline "Autofix" button beside a task's failure reason
+       * when it's the specific `?upstream=<<default>>` failure a missing
+       * `origin/HEAD` symref causes (see DEFAULT_BRANCH_AUTOFIX_MARKER) --
+       * empty string for every other reason. The button calls
+       * `POST /api/projects/{project}/default-branch/autofix`, which runs
+       * `git remote set-head origin --auto` in the project's path, then
+       * offers to restart the task.
+       * @param {string|null|undefined} error
+       * @param {string} project
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {string}
+       */
+      function taskErrorAutofixBtn(error, project, squadId, taskIdx) {
+        if (!error || !error.includes(DEFAULT_BRANCH_AUTOFIX_MARKER)) return "";
+        return `<button class="btn" style="padding:1px 6px;font-size:11px;margin-left:6px" data-click="autofixDefaultBranch" data-project="${esc(project)}" data-squad-id="${esc(squadId)}" data-task-idx="${taskIdx}" data-tip="Runs \`git remote set-head origin --auto\` for project \"${esc(project)}\" -- points its local default-branch pointer at whatever the \"origin\" remote reports as its own default branch, then offers to restart this task.\nWho/when: this task failed because its project has no refs/remotes/origin/HEAD symref set locally (common for a repo not created via a plain \`git clone\`), which \"?upstream=&lt;&lt;default&gt;&gt;\" needs to resolve.\nAlways targets the remote named \"origin\" specifically -- never a fallback remote.">⚡ Autofix</button>`;
+      }
+      /**
+       * Runs the origin/HEAD autofix for `project` (see taskErrorAutofixBtn),
+       * then offers to restart the task whose failure reason it was attached
+       * to.
+       * @param {string} project
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {Promise<void>}
+       */
+      async function autofixDefaultBranch(project, squadId, taskIdx) {
+        if (!confirm(`Run \`git remote set-head origin --auto\` for project "${project}"?\nThis points its local default-branch pointer (origin/HEAD) at whatever branch the "origin" remote reports as its own default.`)) return;
+        let resp;
+        try {
+          resp = await post(`/api/projects/${encodeURIComponent(project)}/default-branch/autofix`);
+        } catch (e) {
+          alert("Autofix failed: daemon unreachable");
+          return;
+        }
+        if (!resp.ok) {
+          let msg = `autofix failed (${resp.status})`;
+          try { const body = await resp.json(); if (body && body.error && body.error.message) msg = body.error.message; } catch (_) {}
+          alert(`Autofix failed: ${msg}`);
+          return;
+        }
+        const body = await resp.json();
+        alert(`Default branch set to "${body.branch}". You can now restart this task.`);
+        await restartTask(squadId, taskIdx);
+      }
       /**
        * Opens the Logs modal for a squad (defaults to the selected squad).
        * @param {string|null} [id]
@@ -169,11 +220,13 @@
         }
         if (logsTab === "tasks") {
           const reasonHead = `<span data-tip="${TASK_REASON_TOOLTIP}">reason</span>`;
-          return T(["task", "state", "cells", reasonHead], squad.tasks.map((t) => tblRow([
+          return T(["task", "state", "cells", reasonHead], squad.tasks.map((t, ti) => tblRow([
             esc(t.name),
             pill(t.state),
             t.cells.length,
-            t.error ? `<span style="color:var(--failed)">${esc(t.error)}</span>` : "",
+            t.error
+              ? `<span style="color:var(--failed)">${esc(t.error)}</span>${taskErrorAutofixBtn(t.error, t.project, squad.id, ti)}`
+              : "",
           ])));
         }
         if (logsTab === "proofs") {

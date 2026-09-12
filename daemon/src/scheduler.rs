@@ -3058,7 +3058,11 @@ fn try_start_ready_reviews_for_task(
 ///
 /// `set_squad_state`/`set_task_state` already log the state transition itself
 /// (`squad X → Failed`), but not *why* — so `reason` is logged and recorded to
-/// Cartographer here, once, rather than being dropped on the floor.
+/// Cartographer here, once, rather than being dropped on the floor. It is
+/// also written to every task's `error` field via `set_task_error` (RAL-291)
+/// so it's visible in the board's Logs modal (tasks tab), not just in
+/// Cartographer/stderr — this is exactly the "task-level reason with no
+/// underlying cell/proof error to point to" case that field exists for.
 fn finalize_all_failed(
     store: &Arc<Mutex<Store>>,
     squad_id: &str,
@@ -3085,6 +3089,7 @@ fn finalize_all_failed(
     });
     for task in tasks {
         let _ = guard.set_task_state(squad_id, task.idx, NodeState::Failed);
+        let _ = guard.set_task_error(squad_id, task.idx, Some(reason));
     }
     let _ = guard.set_squad_state(squad_id, SquadState::Failed);
 }
@@ -5391,6 +5396,29 @@ mod tests {
                         .is_some_and(|reason| !reason.is_empty())),
             "expected a Cartographer entry recording the failure reason: {:?}",
             page.rows
+        );
+    }
+
+    #[test]
+    fn finalize_all_failed_also_records_the_reason_onto_every_task_error() {
+        // Cartographer alone isn't enough: the board's Logs modal reads
+        // `task.error` (RAL-291), not Cartographer, for its per-task "reason"
+        // column -- so a precondition failure has to land there too, or a
+        // user looking at that tab sees "Failed" with a blank reason.
+        let cyclic = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\".\"\ncommand=\"x\"\ndepends_on=[\"b\"]\n[[task.cell]]\nid=\"b\"\ncwd=\".\"\ncommand=\"y\"\ndepends_on=[\"a\"]\n";
+        let (store, id) = store_with(cyclic);
+        let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
+        execute_squad(&store, runner.as_ref(), &id);
+
+        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        assert_eq!(squad.tasks.len(), 1);
+        assert!(
+            squad.tasks[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| !e.is_empty()),
+            "expected task.error to carry the same reason as the Cartographer entry: {:?}",
+            squad.tasks[0].error
         );
     }
 

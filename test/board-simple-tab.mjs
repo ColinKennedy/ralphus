@@ -42,6 +42,7 @@ const exported = [
   "ntPlannedGenerationKinds",
   "ntSimpleSubmitAction",
   "ntResolveDefaultTab",
+  "ntSanitizeSquadLabel",
 ];
 // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
 const factory = new Function(`${source}\nreturn { ${exported.join(", ")} };`);
