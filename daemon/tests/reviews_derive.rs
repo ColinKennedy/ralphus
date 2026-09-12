@@ -6,8 +6,8 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{git, init_repo};
@@ -18,6 +18,7 @@ use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use ralphus_daemon::scheduler::{Semaphore, execute_squad, execute_squad_with};
 use ralphus_daemon::store::{NodeState, SquadState, Store};
+use ralphus_daemon::store_lock::StoreMutex;
 
 /// A runner that reports every session done without touching disk.
 struct OkRunner;
@@ -758,9 +759,9 @@ fn reviews_auto_start_when_the_run_succeeds() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(g.get_guardian(&ids[0]).unwrap().status, "collecting");
@@ -769,17 +770,14 @@ fn reviews_auto_start_when_the_run_succeeds() {
 
     // Running the run to success should auto-start the review merge.
     execute_squad(&store, &OkRunner, &run_id);
-    assert_eq!(
-        store.lock().unwrap().squad_state(&run_id).unwrap(),
-        SquadState::Done
-    );
+    assert_eq!(store.lock().squad_state(&run_id).unwrap(), SquadState::Done);
 
     // The merge runs on a spawned thread; poll until it reaches review. Bounded
     // generously (30s) since this does real git subprocess work and can be
     // slow under CPU contention when the full suite runs many tests in parallel.
     let mut status = String::new();
     for _ in 0..2000 {
-        status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+        status = store.lock().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
         }
@@ -817,14 +815,10 @@ fn start_merge_resolves_conflicts_with_agent() {
          [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
     // RAL-255: start_merge now defers a still-collecting guardian's merge
@@ -832,7 +826,7 @@ fn start_merge_resolves_conflicts_with_agent() {
     // cells done first -- matching the real precondition for the "Merge /
     // rebase" button to actually be pressable.
     {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         g.set_cell_state(&run_id, 0, 0, NodeState::Done).unwrap();
         g.set_cell_state(&run_id, 1, 0, NodeState::Done).unwrap();
     }
@@ -852,7 +846,7 @@ fn start_merge_resolves_conflicts_with_agent() {
     // than it does in isolation even though no live network call is involved.
     let mut status = String::new();
     for _ in 0..2400 {
-        status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+        status = store.lock().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
         }
@@ -863,7 +857,7 @@ fn start_merge_resolves_conflicts_with_agent() {
         "conflict must be resolved and guardian reach in_review"
     );
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     let combined = view
         .combined_worktree
         .expect("combined worktree must exist");
@@ -929,21 +923,17 @@ fn force_push_then_merge_resolves_cleanly() {
          [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
 
     // First merge: A and B don't conflict, so OkRunner (no resolution needed).
     run_merge(&store, &OkRunner, &gid);
     assert_eq!(
-        store.lock().unwrap().get_guardian(&gid).unwrap().status,
+        store.lock().get_guardian(&gid).unwrap().status,
         "in_review",
         "initial clean merge should reach in_review"
     );
@@ -971,7 +961,7 @@ fn force_push_then_merge_resolves_cleanly() {
 
     let mut status = String::new();
     for _ in 0..2000 {
-        status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+        status = store.lock().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
         }
@@ -982,7 +972,7 @@ fn force_push_then_merge_resolves_cleanly() {
         "after force-push conflict, Merge/rebase must resolve cleanly"
     );
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     let combined = view
         .combined_worktree
         .expect("combined worktree must exist");
@@ -1040,14 +1030,10 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
          [[review]]\nid=\"rev\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
 
@@ -1055,7 +1041,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     // branches done.
     run_merge(&store, &OkRunner, &gid);
     {
-        let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let view = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(view.status, "in_review");
         assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     }
@@ -1081,7 +1067,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     // single-merge polling loops in this file (which use 200 * 25ms = 5s).
     let mut status = String::new();
     for _ in 0..1200 {
-        status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+        status = store.lock().get_guardian(&gid).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
         }
@@ -1091,7 +1077,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
         status, "in_review",
         "forced rebase must complete and return to in_review"
     );
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert!(
         view.branches.iter().all(|b| b.merge_status == "done"),
         "branches must be walked back through to done: {:?}",
@@ -1125,29 +1111,20 @@ fn no_checks_configured_runs_project_auto_build_default() {
 
     let toml = session_toml(&cwd, "rev", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
     assert!(
-        store
-            .lock()
-            .unwrap()
-            .guardian_checks(&gid)
-            .unwrap()
-            .is_empty(),
+        store.lock().guardian_checks(&gid).unwrap().is_empty(),
         "sanity: this review has no explicit checks configured"
     );
 
     run_merge(&store, &OkRunner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
         view.status, "in_review",
         "auto-build must pass and the review must reach in_review: detail={:?}",
@@ -1191,25 +1168,20 @@ fn checks_configured_does_not_also_run_auto_build() {
 
     let toml = session_toml(&cwd, "rev", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let run_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
     };
     store
         .lock()
-        .unwrap()
         .set_guardian_checks(&gid, &["exit 0".to_string()])
         .unwrap();
 
     run_merge(&store, &OkRunner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
         view.status, "in_review",
         "explicit checks passed; the always-failing auto_build default must not have run \
@@ -1321,9 +1293,9 @@ fn non_overlapping_task_does_not_block_readiness() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only task A declared a review");
@@ -1366,7 +1338,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     poll_until(
         Duration::from_secs(5),
         "guardian should start (not 'collecting') once task A is done",
-        || store.lock().unwrap().get_guardian(&gid).unwrap().status != "collecting",
+        || store.lock().get_guardian(&gid).unwrap().status != "collecting",
     );
 
     // Guardian started while task B is still blocking — confirm task B hasn't
@@ -1402,9 +1374,9 @@ fn undeclared_overlapping_task_blocks_readiness() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only one project so one review");
@@ -1443,7 +1415,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     });
 
     // Task A done but task B still running — guardian must NOT have started.
-    let status = store.lock().unwrap().get_guardian(&gid).unwrap().status;
+    let status = store.lock().get_guardian(&gid).unwrap().status;
     assert_eq!(
         status, "collecting",
         "guardian should still be collecting while the overlapping task B is running"
@@ -1455,7 +1427,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     poll_until(
         Duration::from_secs(5),
         "guardian should start after both blocking tasks are done",
-        || store.lock().unwrap().get_guardian(&gid).unwrap().status != "collecting",
+        || store.lock().get_guardian(&gid).unwrap().status != "collecting",
     );
 
     handle.join().unwrap();
@@ -1605,44 +1577,32 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
     // 2) Submit (ingest) and 3) run the tasks to success.
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         g.insert_squad(&file, Some("ticket-42"), false).unwrap()
     };
     execute_squad(&store, &OkRunner, &run_id);
-    assert_eq!(
-        store.lock().unwrap().squad_state(&run_id).unwrap(),
-        SquadState::Done
-    );
+    assert_eq!(store.lock().squad_state(&run_id).unwrap(), SquadState::Done);
 
     // 4) Derive the review: both worktrees are one project -> one guardian with
     //    two branches in topological order (a then b). Derived explicitly here
     //    (rather than via submit's auto-start) so we can inject a real ollama
     //    runner for the conflict resolution.
     let ids = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &run_id, &file).expect("derive")
     };
     assert_eq!(ids.len(), 1, "one project -> one review");
     let gid = ids[0].clone();
-    assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .get_guardian(&gid)
-            .unwrap()
-            .branches
-            .len(),
-        2
-    );
+    assert_eq!(store.lock().get_guardian(&gid).unwrap().branches.len(), 2);
 
     // 5) Build the review. feature/b conflicts with feature/a on shared.txt; the
     //    live agent must resolve it for the stack to reach review.
     let runner = SubprocessRunner::new(&runner_cmd);
     run_merge(&store, &runner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         view.branches
@@ -1827,7 +1787,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     git(wt_b, &["add", "."]);
     git(wt_b, &["commit", "-m", "b change"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     // One submission with two sessions (repo A + repo B) sharing the key.
     let file: TaskFile = toml::from_str(&two_session_toml(
@@ -1838,21 +1798,21 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     ))
     .unwrap();
     let gid = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         let r = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &r, &file).expect("derive");
         ids[0].clone()
     };
 
     // The guardian now has branches from two different repos.
-    let g = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let g = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(g.projects.len(), 2, "two distinct projects");
 
     // Run the merge. Each project's branches are stacked independently.
     // OkRunner never touches disk; the rebase works on real worktrees.
     ralphus_daemon::guardian_merge::run_merge(&store, &OkRunner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
         view.status, "in_review",
         "all projects merged -> guardian reaches in_review; detail: {:?}",
@@ -1883,9 +1843,9 @@ fn multi_project_all_must_pass_one_fails_makes_merge_failed() {
     let cwd_b = format!("{}/nonexistent/path", base_a.display());
 
     // Manually build a guardian with branches from two "projects" — one real, one fake.
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let gid = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g.create_guardian("fail test", "main", &cwd_a).unwrap();
         g.add_guardian_branch_with_project(&id, "feature/a", None)
             .unwrap();
@@ -1897,7 +1857,7 @@ fn multi_project_all_must_pass_one_fails_makes_merge_failed() {
 
     ralphus_daemon::guardian_merge::run_merge(&store, &OkRunner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(
         view.status, "merge_failed",
         "invalid project root must cause merge_failed"
@@ -2109,9 +2069,9 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&g, &run_id, &file).expect("derive");
         (run_id, ids[0].clone())
@@ -2129,7 +2089,6 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
                 barrier.wait();
                 store
                     .lock()
-                    .unwrap()
                     .set_cell_state(&run_id, task_idx, idx, NodeState::Done)
                     .unwrap();
             })
@@ -2150,7 +2109,6 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
                 barrier2.wait();
                 store
                     .lock()
-                    .unwrap()
                     .mark_ready_branches_with_done_cells(&gid)
                     .unwrap()
             })
@@ -2163,7 +2121,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
         "the branch must be promoted to ready exactly once, not zero or twice"
     );
     assert_eq!(
-        store.lock().unwrap().get_guardian(&gid).unwrap().branches[0].merge_status,
+        store.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
         "ready"
     );
 

@@ -411,7 +411,7 @@ pub struct ProviderRunner {
     /// forwarded into Cartographer, exactly as `SubprocessRunner` does for a
     /// local run — without this a remote cell is invisible to Cartographer
     /// and, worse, its live cost cap silently stops being enforced.
-    cartographer: Option<Arc<Mutex<Store>>>,
+    cartographer: Option<crate::store_lock::StoreHandle>,
     /// The most recent usage snapshot seen on any invocation's
     /// stderr (RAL-161/RAL-201), so [`Self::poll_to_completion`] can enforce
     /// `maximum_budget_usd` the same way [`crate::runner::SubprocessRunner`]
@@ -467,7 +467,7 @@ impl ProviderRunner {
 
     /// Forward the provider's `RALPHUS_EVENT:` stderr lines into Cartographer.
     #[must_use]
-    pub fn with_cartographer(mut self, store: Arc<Mutex<Store>>) -> Self {
+    pub fn with_cartographer(mut self, store: crate::store_lock::StoreHandle) -> Self {
         self.cartographer = Some(store);
         self
     }
@@ -646,9 +646,7 @@ impl ProviderRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(guard) = store.lock() else {
-            return;
-        };
+        let guard = store.lock();
         crate::cartographer::Note::new("remote")
             .level(level)
             .scope("cell")
@@ -932,21 +930,19 @@ impl ProviderRunner {
                 // dispatch, the same way every other Cartographer write in
                 // this module is best-effort.
                 if let Some(store) = &self.cartographer {
-                    if let Ok(guard) = store.lock() {
-                        let _ = guard.save_remote_exec_handle(
-                            &spec.squad_id,
-                            &spec.cell_id,
-                            &self.scheme,
-                            &self.uri,
-                            &handle,
-                        );
-                    }
+                    let guard = store.lock();
+                    let _ = guard.save_remote_exec_handle(
+                        &spec.squad_id,
+                        &spec.cell_id,
+                        &self.scheme,
+                        &self.uri,
+                        &handle,
+                    );
                 }
                 let result = self.poll_to_completion(&handle, &spec, cancel);
                 if let Some(store) = &self.cartographer {
-                    if let Ok(guard) = store.lock() {
-                        let _ = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id);
-                    }
+                    let guard = store.lock();
+                    let _ = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id);
                 }
                 result
             }
@@ -1372,7 +1368,7 @@ impl Runner for ProviderRunner {
 /// Build the provider for `machine` from an already-borrowed [`Store`], or
 /// `None` when it resolves local.
 ///
-/// Takes `&Store` rather than the `Arc<Mutex<Store>>` a [`MachineRouter`]
+/// Takes `&Store` rather than the `crate::store_lock::StoreHandle` a [`MachineRouter`]
 /// holds so callers already inside the store lock can use it without
 /// deadlocking on a second acquisition.
 ///
@@ -1509,14 +1505,14 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
 /// exactly the path they always did.
 pub struct MachineRouter {
     local: Arc<dyn Runner>,
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
 }
 
 impl MachineRouter {
     /// Wrap `local` (normally a [`crate::runner::SubprocessRunner`]), using
     /// `store` to resolve machine values against the provider registry.
     #[must_use]
-    pub fn new(local: Arc<dyn Runner>, store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(local: Arc<dyn Runner>, store: crate::store_lock::StoreHandle) -> Self {
         Self { local, store }
     }
 
@@ -1524,7 +1520,7 @@ impl MachineRouter {
     /// local. `Err` when the machine cannot be resolved or dispatched.
     fn provider_for(&self, machine: &str) -> Result<Option<ProviderRunner>, String> {
         let built = {
-            let guard = self.store.lock().expect("store mutex poisoned");
+            let guard = self.store.lock();
             provider_from_store(&guard, machine)?
         };
         Ok(built.map(|p| p.with_cartographer(Arc::clone(&self.store))))
@@ -1677,7 +1673,7 @@ mod tests {
         }
     }
 
-    fn router(store: Arc<Mutex<Store>>) -> (MachineRouter, Arc<RecordingLocal>) {
+    fn router(store: crate::store_lock::StoreHandle) -> (MachineRouter, Arc<RecordingLocal>) {
         let local = Arc::new(RecordingLocal {
             seen: Mutex::new(vec![]),
         });
@@ -1685,8 +1681,10 @@ mod tests {
         (router, local)
     }
 
-    fn store() -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    fn store() -> crate::store_lock::StoreHandle {
+        Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ))
     }
 
     #[test]
@@ -1728,11 +1726,10 @@ mod tests {
     fn a_deregistered_provider_fails_rather_than_running_locally() {
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider("ib", "", "/opt/ib.sh", &[], PROTOCOL_VERSION, false)
             .unwrap();
         let (router, local) = router(Arc::clone(&s));
-        s.lock().unwrap().deregister_machine_provider("ib").unwrap();
+        s.lock().deregister_machine_provider("ib").unwrap();
         let r = router.run(&spec(Some("ib:A")));
         assert_eq!(r.status, "failed");
         assert!(local.seen.lock().unwrap().is_empty());
@@ -1742,7 +1739,6 @@ mod tests {
     fn cancelling_before_dispatch_does_not_reach_the_provider() {
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -1908,7 +1904,6 @@ else:
         );
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -1991,7 +1986,6 @@ else:
         );
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -2017,7 +2011,6 @@ else:
         );
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -2044,7 +2037,6 @@ else:
         let script = fake_provider("exec-silent", "", &["boom: no ssh key"]);
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -2078,7 +2070,6 @@ else:
         );
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -2093,7 +2084,6 @@ else:
         assert_eq!(r.status, "done", "{r:?}");
         let page = s
             .lock()
-            .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter {
                 squad_id: Some("squad-1".to_string()),
                 ..crate::cartographer::CartographerFilter::recent(50)
@@ -2137,9 +2127,8 @@ else:
         }
     }
 
-    fn register(s: &Arc<Mutex<Store>>, scheme: &str, script: &std::path::Path) {
+    fn register(s: &crate::store_lock::StoreHandle, scheme: &str, script: &std::path::Path) {
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 scheme,
                 "",
@@ -2294,11 +2283,7 @@ else:
         let r = router.run(&spec(Some("ib:A")));
         assert_eq!(r.status, "done", "{r:?}");
         assert!(
-            s.lock()
-                .unwrap()
-                .all_remote_exec_handles()
-                .unwrap()
-                .is_empty(),
+            s.lock().all_remote_exec_handles().unwrap().is_empty(),
             "the handle row must be cleared once the cell finishes"
         );
     }
@@ -2318,23 +2303,17 @@ else:
         let s = store();
         register(&s, "ib", &script);
         s.lock()
-            .unwrap()
             .save_remote_exec_handle("squad-1", "s0", "ib", "A", "stale-handle")
             .unwrap();
 
-        reconcile_remote_exec_handles(&s.lock().unwrap());
+        reconcile_remote_exec_handles(&s.lock());
 
         assert!(
-            s.lock()
-                .unwrap()
-                .all_remote_exec_handles()
-                .unwrap()
-                .is_empty(),
+            s.lock().all_remote_exec_handles().unwrap().is_empty(),
             "the stale row must be cleared after reconciliation"
         );
         let page = s
             .lock()
-            .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter {
                 squad_id: Some("squad-1".to_string()),
                 ..crate::cartographer::CartographerFilter::recent(50)
@@ -2356,17 +2335,10 @@ else:
         // must not leave the row stuck forever in that case.
         let s = store();
         s.lock()
-            .unwrap()
             .save_remote_exec_handle("squad-1", "s0", "ghostscheme", "A", "h1")
             .unwrap();
-        reconcile_remote_exec_handles(&s.lock().unwrap());
-        assert!(
-            s.lock()
-                .unwrap()
-                .all_remote_exec_handles()
-                .unwrap()
-                .is_empty()
-        );
+        reconcile_remote_exec_handles(&s.lock());
+        assert!(s.lock().all_remote_exec_handles().unwrap().is_empty());
     }
 
     #[test]
@@ -2502,7 +2474,9 @@ else:
         // `MachineRouter::provider_for` always wires up in production.
         let provider =
             ProviderRunner::new("python", vec![py.to_string_lossy().into_owned()], "ct", "A")
-                .with_cartographer(Arc::new(Mutex::new(Store::open_in_memory().unwrap())));
+                .with_cartographer(Arc::new(crate::store_lock::StoreMutex::new(
+                    Store::open_in_memory().unwrap(),
+                )));
         let mut over_budget = spec(Some("ct:A"));
         over_budget.maximum_budget_usd = Some(1.0);
         let r = provider.run(&over_budget);
@@ -2634,7 +2608,6 @@ else:
     fn a_provider_program_that_cannot_be_spawned_reports_which_provider_failed() {
         let s = store();
         s.lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",

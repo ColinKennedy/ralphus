@@ -959,7 +959,7 @@ impl Store {
     /// the internal pool-counting table.
     ///
     /// Race-safety note: every `Store` method is called through the
-    /// daemon's single `Arc<Mutex<Store>>` (see `crate::scheduler`/
+    /// daemon's single `crate::store_lock::StoreHandle` (see `crate::scheduler`/
     /// `crate::server`), so the read-then-delete sequence here already
     /// can't race a concurrent insert/drain from another thread -- the same
     /// reliance every other cumulative-then-act sequence in this codebase
@@ -1245,10 +1245,10 @@ pub fn advance_schedule(
 /// concurrent submission's own count-threshold check (both ultimately drain
 /// through `Store::drain_triage_pool`, which no-ops on an already-empty
 /// pool).
-pub fn run_schedule_tick(store: &std::sync::Arc<std::sync::Mutex<Store>>) {
+pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
     let now = now_ms();
     let schedules = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard.list_triage_schedules(None).unwrap_or_default()
     };
     for sched in schedules {
@@ -1262,7 +1262,7 @@ pub fn run_schedule_tick(store: &std::sync::Arc<std::sync::Mutex<Store>>) {
         ) else {
             continue;
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.advance_triage_schedule(sched.id, count, last);
         if fired {
             match crate::reviews::create_review_from_triage_project_sweep(
@@ -1749,9 +1749,11 @@ mod tests {
 
     #[test]
     fn run_schedule_tick_fires_a_due_schedule_and_creates_a_review() {
-        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
                 .unwrap();
@@ -1764,7 +1766,7 @@ mod tests {
                 .unwrap();
         }
         run_schedule_tick(&store);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.triage_pool_count("proj", "security").unwrap(), 0);
         let guardians = guard.list_guardians().unwrap();
         assert_eq!(guardians.len(), 1);
@@ -1783,9 +1785,11 @@ mod tests {
     /// threshold -- the whole point of the Arbiter's independent cron sweep.
     #[test]
     fn run_schedule_tick_straggler_sweep_elevates_stragglers_across_subproject_pools() {
-        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             // One straggler each in the plain pool and two subproject pools,
             // none of which individually reached any count threshold.
             guard
@@ -1806,7 +1810,7 @@ mod tests {
                 .unwrap();
         }
         run_schedule_tick(&store);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.triage_pool_count("proj", "bug").unwrap(), 0);
         assert_eq!(guard.triage_pool_count("proj::core", "bug").unwrap(), 0);
         assert_eq!(guard.triage_pool_count("proj::utils", "bug").unwrap(), 0);
@@ -1830,9 +1834,11 @@ mod tests {
 
     #[test]
     fn run_schedule_tick_does_not_fire_a_not_yet_due_schedule() {
-        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
                 .unwrap();
@@ -1843,7 +1849,7 @@ mod tests {
                 .unwrap();
         }
         run_schedule_tick(&store);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.triage_pool_count("proj", "security").unwrap(), 1);
         assert!(guard.list_guardians().unwrap().is_empty());
     }

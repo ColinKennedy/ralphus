@@ -79,7 +79,7 @@ struct Subscriber {
 const SUBSCRIBER_CHANNEL_CAPACITY: usize = 256;
 
 /// In-memory broadcast registry for daemon state-change events. One instance
-/// lives on [`crate::store::Store`], so every `Arc<Mutex<Store>>` holder
+/// lives on [`crate::store::Store`], so every `crate::store_lock::StoreHandle` holder
 /// already serializes access to it via the same lock that guards every other
 /// mutation — no separate synchronization story to reason about.
 #[derive(Default)]

@@ -1491,7 +1491,7 @@ fn add_new_branches(
 /// Race-safety: the threshold-check here and the scheduler's independent
 /// cron-check race on the same pool, but both ultimately call
 /// [`Store::drain_triage_pool`], a single atomic `DELETE ... RETURNING`
-/// executed while holding the daemon's one `Arc<Mutex<Store>>` (same
+/// executed while holding the daemon's one `crate::store_lock::StoreHandle` (same
 /// reliance every other cumulative-then-act sequence in this module makes) --
 /// whichever caller drains first empties the pool for the other, so no cell
 /// is ever double-counted across two forced reviews.
@@ -3128,10 +3128,11 @@ print(json.dumps(result))
         // trusting `Workspace::git`'s local branch (already covered above).
         let dir = std::env::temp_dir().join(format!("ral355-guard-ahead-{}", std::process::id()));
         let py = fake_baseline_check_provider(&dir, 2);
-        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "guardtest",
                 "",
@@ -3155,10 +3156,11 @@ print(json.dumps(result))
         let dir =
             std::env::temp_dir().join(format!("ral355-guard-no-ahead-{}", std::process::id()));
         let py = fake_baseline_check_provider(&dir, 0);
-        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "guardtest2",
                 "",

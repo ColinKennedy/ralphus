@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
 
@@ -392,7 +392,7 @@ pub fn reap(
 /// escalation always run. Reaping is additionally constrained by each
 /// project's ceiling and only happens in explicit `Reap` mode.
 pub fn sweep(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
     sem: &Arc<Semaphore>,
     mode: SweepMode,
@@ -404,7 +404,7 @@ pub fn sweep(
 /// cadence, persisted across daemon restarts. It always uses the deletion-off
 /// mode.
 pub fn periodic_sweep(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
     sem: &Arc<Semaphore>,
 ) -> SweepReport {
@@ -412,17 +412,13 @@ pub fn periodic_sweep(
 }
 
 fn sweep_inner(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
     sem: &Arc<Semaphore>,
     mode: SweepMode,
     only_due: bool,
 ) -> SweepReport {
-    let projects = store
-        .lock()
-        .expect("store mutex poisoned")
-        .list_projects()
-        .unwrap_or_default();
+    let projects = store.lock().list_projects().unwrap_or_default();
     let mut report = SweepReport::default();
     for project in projects.into_iter().filter(|p| p.vcs == "git") {
         let root = PathBuf::from(&project.path);
@@ -433,7 +429,7 @@ fn sweep_inner(
         }
         if only_due {
             let due = {
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 let last: Option<i64> = guard
                     .conn
                     .query_row(
@@ -452,7 +448,7 @@ fn sweep_inner(
             }
         }
         let (snapshot, notified) = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             (
                 store_snapshot(&guard, &root).ok(),
                 notify_old_reviews(&guard, &root, &cfg).unwrap_or(0),
@@ -468,7 +464,7 @@ fn sweep_inner(
         report.stale += candidates.len();
         report.notified += notified;
         if only_due {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.conn.execute(
                 "INSERT INTO ark_sweeps(project_path, swept_at_ms) VALUES(?1, ?2)
                  ON CONFLICT(project_path) DO UPDATE SET swept_at_ms=excluded.swept_at_ms",
@@ -487,7 +483,8 @@ fn sweep_inner(
             }
         }
     }
-    if let Ok(guard) = store.lock() {
+    {
+        let guard = store.lock();
         crate::cartographer::Note::new("ark").emit(
             &guard,
             format!(

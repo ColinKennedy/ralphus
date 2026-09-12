@@ -13,8 +13,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::store::Store;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
     Low,
@@ -136,7 +134,7 @@ impl SummaryQueue {
 /// Pop guardian ids forever (until `shutdown` and drained) and recompute each
 /// one's preliminary summary. Safe to run on multiple threads concurrently —
 /// [`SummaryQueue::pop`] hands out each id to exactly one worker.
-pub fn worker_loop(queue: &SummaryQueue, store: &Arc<Mutex<Store>>) {
+pub fn worker_loop(queue: &SummaryQueue, store: &crate::store_lock::StoreHandle) {
     while let Some(id) = queue.pop() {
         crate::guardian_merge::recompute_preliminary_summary(store, &id);
     }
@@ -145,7 +143,7 @@ pub fn worker_loop(queue: &SummaryQueue, store: &Arc<Mutex<Store>>) {
 /// Spawn `count` (min 1) persistent worker threads draining `queue`.
 pub fn spawn_workers(
     queue: &Arc<SummaryQueue>,
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     count: usize,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..count.max(1))

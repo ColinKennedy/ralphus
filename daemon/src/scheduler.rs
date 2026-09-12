@@ -179,7 +179,7 @@ enum SessionShare {
 /// cells (see [`sharing_blocked_reason`]'s doc comment for that report). A
 /// cell that hasn't opted in never even reaches the dependency scan below.
 fn resolve_shared_session_id(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     row: &crate::store::CellRow,
     cells: &[crate::store::CellRow],
@@ -195,7 +195,7 @@ fn resolve_shared_session_id(
     // (`resolve_agent_selection` reads `.ralphus.toml` from disk, which must
     // not happen while holding the global store mutex).
     let dep_sessions: Vec<(usize, String)> = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         plan.deps[i]
             .iter()
             .filter_map(|&d| {
@@ -245,11 +245,11 @@ fn resolve_shared_session_id(
 /// scrubbed too when its name matches. Called at the two points a cell's
 /// (or proof step's) final env map is fully merged, right before dispatch.
 fn register_secret_named_env_values(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     env: &std::collections::BTreeMap<String, String>,
 ) {
     let secret_names = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard.secret_env_names_cached().unwrap_or_default()
     };
     for (key, value) in env {
@@ -403,7 +403,7 @@ impl Drop for SemaphorePermit<'_> {
 /// spawned separately (`server::serve`), so this loop only ever enqueues into
 /// it, never processes it inline.
 pub fn run_loop(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     _max_concurrent: i64,
     cancellations: Cancellations,
@@ -442,7 +442,7 @@ pub fn run_loop(
     // branches were reset to `pending` by `run_merge_cancellable`).
     {
         let ids = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let ids = guard.collecting_guardians_ready().unwrap_or_default();
             for gid in &ids {
                 let _ = guard.mark_guardian_branches_ready(gid);
@@ -458,7 +458,7 @@ pub fn run_loop(
     // whatever state the crash left them; the pass re-evaluates.
     {
         let ids = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             guard.collecting_guardians_resumable().unwrap_or_default()
         };
         start_reviews(&store, ids, &sem, &cancellations);
@@ -490,7 +490,7 @@ pub fn run_loop(
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             match guard.cartographer_prune(cfg.retention_days(), cfg.max_rows()) {
                 Ok(deleted) if deleted > 0 => {
                     crate::cartographer::Note::new("scheduler").emit(
@@ -520,7 +520,7 @@ pub fn run_loop(
             // breadcrumb note.
             let deleted = crate::terminal_log::prune(cfg.retention_days(), cfg.max_files());
             if deleted > 0 {
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 crate::cartographer::Note::new("scheduler").emit(
                     &guard,
                     format!("terminal-log pruned {deleted} attempt file(s)"),
@@ -550,7 +550,7 @@ pub fn run_loop(
 /// cell (task) level instead, so every ready squad gets a worker and its
 /// cells compete for the global slots.
 pub fn tick(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &Arc<dyn Runner>,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
@@ -615,10 +615,10 @@ pub fn tick(
 /// safe: once the live worker finishes and removes its token, the next tick
 /// claims the squad fresh and picks up whatever was reset in the meantime.
 fn claim_ready(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     cancellations: &Cancellations,
 ) -> Vec<(String, CancelToken)> {
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let ready = guard.list_ready().unwrap_or_default();
     let mut claimed = Vec::new();
     for squad_id in ready {
@@ -661,7 +661,7 @@ fn claim_ready(
 /// daemon's real background summary workers spawned in `server::serve`, but
 /// still need any guardian-summary work their squad triggers to actually run
 /// (and finish) rather than being enqueued into the void.
-fn with_standalone_summary_queue<F>(store: &Arc<Mutex<Store>>, f: F)
+fn with_standalone_summary_queue<F>(store: &crate::store_lock::StoreHandle, f: F)
 where
     F: FnOnce(&Arc<crate::summary_worker::SummaryQueue>),
 {
@@ -680,7 +680,7 @@ where
 ///
 /// This single-squad entry point owns a private [`Semaphore`], so its independent
 /// cells still run concurrently up to the default limit.
-pub fn execute_squad(store: &Arc<Mutex<Store>>, runner: &dyn Runner, squad_id: &str) {
+pub fn execute_squad(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, squad_id: &str) {
     let sem = Arc::new(Semaphore::new(crate::DEFAULT_MAX_CONCURRENT));
     with_standalone_summary_queue(store, |queue| {
         execute_squad_inner(
@@ -709,7 +709,7 @@ pub fn execute_squad(store: &Arc<Mutex<Store>>, runner: &dyn Runner, squad_id: &
 /// same registry a settings change/`cancel_and_merge` looks up -- not just the
 /// caller's own `cancel` token, which only covers this squad's own cells.
 pub fn execute_squad_with(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     cancel: &CancelToken,
@@ -780,7 +780,7 @@ struct Progress {
 /// terminal, task-level proofs and finalization run exactly as before.
 #[allow(clippy::too_many_arguments)]
 fn execute_squad_inner(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     cancel: &CancelToken,
@@ -790,7 +790,6 @@ fn execute_squad_inner(
 ) {
     let trace_context = store
         .lock()
-        .expect("store mutex poisoned")
         .squad_trace_context(squad_id)
         .unwrap_or_default();
     let squad_cx = otel::context_from_traceparent(trace_context.as_deref());
@@ -812,7 +811,7 @@ fn execute_squad_inner(
         cancelled_cell_set,
         cancelled_task_set,
     ) = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         // RAL-405: no longer marked Running here — this runs before worktree
         // placeholder resolution below, which must not visibly present as
         // "running" either. The squad only becomes Running once the dispatch
@@ -901,7 +900,7 @@ fn execute_squad_inner(
     // project/worktree can no longer be resolved (e.g. deregistered after
     // submit) fails the whole squad cleanly rather than panicking mid-dispatch.
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let result = crate::worktrees::resolve_placeholders_with_prefetch(
             &guard,
             squad_id,
@@ -924,7 +923,7 @@ fn execute_squad_inner(
         tasks.len()
     );
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "scheduler",
@@ -1103,7 +1102,7 @@ fn execute_squad_inner(
                 // just keyed off the cell's own Detached-in-progress status
                 // instead of its owning task's finalized-ness.
                 let reclaimed_detached: Vec<usize> = {
-                    let guard = store.lock().expect("store mutex poisoned");
+                    let guard = store.lock();
                     let prog = progress.lock().expect("progress mutex poisoned");
                     (0..n)
                         .filter(|&i| prog.status[i] == CellState::Detached)
@@ -1128,7 +1127,7 @@ fn execute_squad_inner(
                     Vec<usize>,
                     Vec<usize>,
                 ) = {
-                    let guard = store.lock().expect("store mutex poisoned");
+                    let guard = store.lock();
                     let reclaimed_tasks: Vec<i64> = finalized
                         .iter()
                         .copied()
@@ -1268,7 +1267,6 @@ fn execute_squad_inner(
             // in-flight cell's task only takes effect at its next cell.
             let soloed_tasks = store
                 .lock()
-                .expect("store mutex poisoned")
                 .soloed_task_indices(squad_id)
                 .unwrap_or_default();
             let any_soloed = !soloed_tasks.is_empty();
@@ -1426,7 +1424,7 @@ fn execute_squad_inner(
                     error: Some("blocked by a failed dependency".to_string()),
                     agent_session_id: None,
                 };
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Failed);
                 let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
             }
@@ -1442,7 +1440,7 @@ fn execute_squad_inner(
                     error: Some("blocked by a cancelled dependency".to_string()),
                     agent_session_id: None,
                 };
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Cancelled);
                 let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
                 let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Cancelled);
@@ -1530,7 +1528,7 @@ fn execute_squad_inner(
     // not be reported Done just because nothing is left to poll.
     let any_detached = progress.status.contains(&CellState::Detached);
 
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     // If an edit reset this squad to Pending mid-flight after we had already
     // marked it Running, don't clobber it with a terminal state — leave it
     // Pending so it re-runs with the new values. A squad this dispatcher
@@ -1767,11 +1765,11 @@ fn enqueue_proof_failure_mailbox(
 /// or not first-in-line yet) gets `f64::INFINITY` — deprioritized, never
 /// excluded.
 fn cell_dispatch_priority(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     row: &crate::store::CellRow,
 ) -> f64 {
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     match guard.cell_review_dispatch_priority(squad_id, row.task_idx, row.idx) {
         Ok(Some(enabled_branch_count)) => -(enabled_branch_count as f64),
         _ => f64::INFINITY,
@@ -1790,7 +1788,7 @@ fn cell_dispatch_priority(
 /// see [`cell_dispatch_priority`].
 #[allow(clippy::too_many_arguments)]
 fn run_cell_worker(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     cancel: &CancelToken,
@@ -1823,7 +1821,7 @@ fn run_cell_worker(
         row.model.as_deref().unwrap_or("default"),
     );
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "scheduler",
@@ -1870,7 +1868,7 @@ fn run_cell_worker(
             agent_session_id: None,
         };
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::ERROR,
@@ -1899,7 +1897,7 @@ fn run_cell_worker(
         return;
     }
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.set_cell_state(squad_id, row.task_idx, row.idx, NodeState::Running);
         let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Running);
         // RAL-288: a fresh dispatch clears any stale `detached_at_ms` from a
@@ -1923,7 +1921,7 @@ fn run_cell_worker(
     // itself (not `system_prompt`), since `append_system_prompt` is only
     // honoured by the claude-code backend today and every agent must see it.
     let ghost_context = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let own_uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
         let own = guard.get_ghost(&own_uri).ok().flatten();
         let parents: Vec<(String, crate::ghost::GhostView)> = plan.deps[i]
@@ -1950,7 +1948,7 @@ fn run_cell_worker(
                 agent_session_id: None,
             };
             {
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
             }
             let mut prog = progress.lock().expect("progress mutex poisoned");
@@ -1970,7 +1968,7 @@ fn run_cell_worker(
     }
     spec.trace_context = cell_trace_context.clone();
     spec.env_overrides = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if let Some(snapshot) = guard
             .get_cell_materialized_env_overrides(squad_id, row.task_idx, row.idx)
             .unwrap_or_default()
@@ -2032,7 +2030,7 @@ fn run_cell_worker(
     // sibling. `take_...` clears the flag as it reads it, so it can only
     // ever fire once per resume-automation call.
     let own_resume = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if guard.take_force_resume_own_session(squad_id, row.task_idx, row.idx) {
             guard
                 .get_cell_agent_resume(squad_id, row.task_idx, row.idx)
@@ -2050,7 +2048,7 @@ fn run_cell_worker(
             session_id,
         );
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "scheduler",
@@ -2126,7 +2124,7 @@ fn run_cell_worker(
     {
         let assigned = crate::runner::generate_agent_session_id();
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.set_cell_agent_session_id_live(
                 squad_id,
                 &row.task_name,
@@ -2138,7 +2136,7 @@ fn run_cell_worker(
     }
 
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.set_cell_effective_system_prompt(
             squad_id,
             row.task_idx,
@@ -2157,7 +2155,7 @@ fn run_cell_worker(
             agent_session_id: None,
         };
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::WARNING,
@@ -2221,7 +2219,7 @@ fn run_cell_worker(
             error: None,
             agent_session_id: result.agent_session_id.clone(),
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
         let _ = guard.mark_cell_detached(squad_id, row.task_idx, row.idx);
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -2264,7 +2262,7 @@ fn run_cell_worker(
         agent_session_id: result.agent_session_id.clone(),
     };
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: if result.is_done() {
@@ -2330,7 +2328,7 @@ fn run_cell_worker(
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
             let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             if guard
                 .upsert_ghost(
                     &uri,
@@ -2413,7 +2411,7 @@ fn run_cell_worker(
     // `steps_passed < steps_run` rather than `!all_ok`, since `all_ok` alone
     // is also false for a pure cancellation with zero genuine failures.
     if proof_outcome.steps_passed < proof_outcome.steps_run {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         enqueue_proof_failure_mailbox(&guard, squad_id, "cell", Some(&row.cell_id), &row.task_name);
     }
     // Publish the terminal status and the failure flag together, so the
@@ -2445,7 +2443,7 @@ fn run_cell_worker(
 /// cell from Running to Done/Failed in `progress` after proofs complete.
 #[allow(clippy::too_many_arguments)]
 fn run_proof_only_worker(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     cancel: &CancelToken,
@@ -2474,7 +2472,7 @@ fn run_proof_only_worker(
     // Mark the owning task Running while proofs execute so the board doesn't
     // show a task as Done while its cell-level proofs are still in flight.
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let _ = guard.set_task_state(squad_id, row.task_idx, NodeState::Running);
     }
     let cwd = row.cwd.clone().unwrap_or_default();
@@ -2519,7 +2517,7 @@ fn run_proof_only_worker(
     // handles it, and a write would break the cancelled-vs-failed
     // distinction).
     if proof_outcome.steps_passed < proof_outcome.steps_run {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         enqueue_proof_failure_mailbox(&guard, squad_id, "cell", Some(&row.cell_id), &row.task_name);
     }
     let mut prog = progress.lock().expect("progress mutex poisoned");
@@ -2564,14 +2562,14 @@ fn run_proof_only_worker(
 /// outside the store lock, matching this module's "subprocess waits happen
 /// outside the store lock" rule.
 fn check_task_no_commits_guard(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     task_idx: i64,
     task_name: &str,
     cells: &[crate::store::CellRow],
 ) -> bool {
     let (info, is_git) = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, task_idx) else {
             return true;
         };
@@ -2602,7 +2600,7 @@ fn check_task_no_commits_guard(
         WARNING,
         "ralphus [proof] task {squad_id}/{task_name} failed: marked done with zero new commits since baseline"
     );
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::WARNING,
         source: "proof",
@@ -2638,7 +2636,7 @@ fn check_task_no_commits_guard(
 /// global concurrency cap as cells and guardian review merges.
 #[allow(clippy::too_many_arguments)]
 fn run_task_finalizer(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     cancel: &CancelToken,
@@ -2744,7 +2742,7 @@ fn run_task_finalizer(
         // a partial restart) the task can be Done in the DB while its finalizer
         // re-runs the proofs — this guard closes that window.
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             if matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
                 let _ = guard.set_task_state(squad_id, task_idx, NodeState::Running);
             }
@@ -2801,7 +2799,7 @@ fn run_task_finalizer(
             // supplies a representative cell id for the message, matching
             // `note_proof_outcome` above.
             if proof_outcome.steps_passed < proof_outcome.steps_run {
-                let guard = store.lock().expect("store mutex poisoned");
+                let guard = store.lock();
                 enqueue_proof_failure_mailbox(
                     &guard,
                     squad_id,
@@ -2858,7 +2856,7 @@ fn run_task_finalizer(
         .task_finalized
         .insert(task_idx);
     let did_write = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         // Don't clobber a squad an edit reset to Pending mid-flight (mirrors the
         // squad-level guard); leave the task for the re-run.
         if matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
@@ -2912,12 +2910,12 @@ fn run_task_finalizer(
 /// exactly this reason) -- this is the sole startup recovery path for
 /// interrupted merges/feedback.
 pub fn recover_interrupted_reviews(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
 ) {
     let (interrupted, pending_feedback) = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let interrupted = guard.interrupted_merges().unwrap_or_default();
         for gid in &interrupted {
             let _ = guard.reset_guardian_to_collecting(gid);
@@ -2932,7 +2930,6 @@ pub fn recover_interrupted_reviews(
         );
         let _ = store
             .lock()
-            .expect("store mutex poisoned")
             .cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::WARNING,
                 source: "recovery",
@@ -2963,7 +2960,7 @@ pub fn recover_interrupted_reviews(
 /// `received` message on this branch (if any survived whatever crashed) is
 /// unambiguously the one this recovery run is resuming.
 fn resume_feedback(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
     gid: String,
@@ -2984,7 +2981,6 @@ fn resume_feedback(
         let token = cancellations.register(&format!("guardian:{gid}"));
         let message_seq = store
             .lock()
-            .expect("poisoned")
             .latest_received_feedback_message_seq(&gid, &branch_id)
             .unwrap_or_default();
         crate::guardian_merge::run_feedback(
@@ -3020,7 +3016,7 @@ fn resume_feedback(
 /// merge, same as `guardian_merge::start_merge`, so a settings change made
 /// while one of these guardians is merging can stop it.
 fn start_reviews(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian_ids: Vec<String>,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
@@ -3028,7 +3024,7 @@ fn start_reviews(
     for gid in guardian_ids {
         crate::rlog!(INFO, "ralphus [scheduler] review {gid} starting merge");
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "scheduler",
@@ -3049,11 +3045,7 @@ fn start_reviews(
         std::thread::spawn(move || {
             // Atomically claim the merge: the first caller to win the
             // collecting→merging transition proceeds; others bail out.
-            let claimed = store
-                .lock()
-                .expect("store mutex poisoned")
-                .claim_guardian_merge(&gid)
-                .unwrap_or(false);
+            let claimed = store.lock().claim_guardian_merge(&gid).unwrap_or(false);
             if claimed {
                 let _permit = sem.acquire();
                 // RAL-201: wrapped in `MachineRouter` (matching every
@@ -3130,7 +3122,7 @@ fn guardian_blocking_tasks(cells: &[crate::store::CellRow], git_root: &str) -> H
 /// yet.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_start_ready_reviews_for_task(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     cells: &[crate::store::CellRow],
     completed_task_idx: i64,
@@ -3139,7 +3131,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
     cancellations: &Cancellations,
 ) {
     let guardian_ids = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         // Combine guardians tagged with this squad_id AND collecting guardians
         // that have branches contributed by this squad's cells. The latter
         // handles linked reviews whose guardian was created by an earlier
@@ -3161,7 +3153,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
     let mut ready = Vec::new();
     for gid in &guardian_ids {
         let git_root = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             match guard.get_guardian(gid) {
                 Ok(g) => g.git_root,
                 Err(_) => continue,
@@ -3182,7 +3174,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
         // (`mark_ready_branches_with_done_cells`), just invoked eagerly
         // here rather than on the periodic maintenance sweep.
         let needs_summary = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let promoted = guard.mark_ready_branches_with_done_cells(gid).unwrap_or(0);
             promoted > 0
         };
@@ -3201,7 +3193,7 @@ pub(crate) fn try_start_ready_reviews_for_task(
         // completion of a still-`collecting` guardian. It no-ops back to
         // `Collecting` if the next buildable branch isn't ready yet.
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let collecting = guard
                 .get_guardian(gid)
                 .map(|g| g.status == "collecting")
@@ -3236,12 +3228,12 @@ pub(crate) fn try_start_ready_reviews_for_task(
 /// Cartographer/stderr — this is exactly the "task-level reason with no
 /// underlying cell/proof error to point to" case that field exists for.
 fn finalize_all_failed(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     tasks: &[crate::store::TaskRow],
     reason: &str,
 ) {
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     crate::rlog!(
         ERROR,
         "ralphus [scheduler] squad {squad_id} failed before execution: {reason}"
@@ -3323,7 +3315,7 @@ struct ProofOutcome {
 /// `model` (from `proof_specs`) overriding it when set.
 #[allow(clippy::too_many_arguments)]
 fn run_proofs(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     squad_id: &str,
     task_idx: i64,
@@ -3355,7 +3347,7 @@ fn run_proofs(
         }
     };
     let specs = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard
             .proof_specs(squad_id, task_idx, scope, cell_idx)
             .unwrap_or_default()
@@ -3389,7 +3381,7 @@ fn run_proofs(
         // running an already-done proof on a full re-execution of the
         // owning task/squad is intentional (RAL-64).
         let current_state = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             guard
                 .proof_state(squad_id, task_idx, scope, cell_idx, idx)
                 .unwrap_or_default()
@@ -3412,7 +3404,7 @@ fn run_proofs(
         // carries its own narrowest env layer on top of the scope's, so two
         // steps under the same task can set the same key to different values.
         let env_overrides = {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             if let Some(snapshot) = guard
                 .get_proof_materialized_env_overrides(squad_id, task_idx, scope, cell_idx, idx)
                 .unwrap_or_default()
@@ -3475,7 +3467,7 @@ fn run_proofs(
                     "ralphus [scheduler] proof {squad_id}/t{task_idx}/{scope}/#{idx} kind=command starting"
                 );
                 {
-                    let guard = store.lock().expect("store mutex poisoned");
+                    let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                         level: crate::logging::LogLevel::DEBUG,
                         source: "scheduler",
@@ -3538,7 +3530,7 @@ fn run_proofs(
                     model.unwrap_or("default"),
                 );
                 {
-                    let guard = store.lock().expect("store mutex poisoned");
+                    let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                         level: crate::logging::LogLevel::DEBUG,
                         source: "scheduler",
@@ -3582,7 +3574,7 @@ fn run_proofs(
                 // RAL-185: a proof step runs where its owning cell/task does.
                 runner_spec.machine = cell_machine.map(str::to_string);
                 {
-                    let guard = store.lock().expect("store mutex poisoned");
+                    let guard = store.lock();
                     let _ = guard.set_proof_effective_system_prompt(
                         squad_id,
                         task_idx,
@@ -3642,7 +3634,7 @@ fn run_proofs(
             None => format!("task-proof:{idx}"),
         };
         {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let _ = guard.set_proof_result(
                 squad_id,
                 task_idx,
@@ -3707,7 +3699,7 @@ fn run_proofs(
 /// partial pass is not a meaningful signal either way).
 #[allow(clippy::too_many_arguments)]
 fn note_proof_outcome(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     outcome: &ProofOutcome,
     uri: &str,
     squad_id: &str,
@@ -3721,7 +3713,7 @@ fn note_proof_outcome(
     }
     let note = crate::ghost::proof_outcome_note(outcome.steps_passed, outcome.steps_run);
     let revision = crate::ghost::current_revision(cwd);
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     if guard
         .upsert_ghost(
             uri,
@@ -3752,14 +3744,14 @@ fn note_proof_outcome(
 
 /// Mark one proof step `Running` before executing it.
 fn set_proof_running(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     task_idx: i64,
     scope: &str,
     cell_idx: i64,
     idx: i64,
 ) {
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.set_proof_state(squad_id, task_idx, scope, cell_idx, idx, NodeState::Running);
 }
 
@@ -3912,7 +3904,7 @@ mod tests {
         // detach path itself is the most realistic way to get there.
         execute_squad(&store, &DetachRunner, &id);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let squad = guard.get_squad(&id).unwrap();
             assert_eq!(
                 squad.tasks[0].cells[0].agent_session_id.as_deref(),
@@ -3929,7 +3921,7 @@ mod tests {
         execute_squad(&store, &runner, &id);
 
         assert_eq!(seen.lock().unwrap().as_deref(), Some("sess-detach-1"));
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
     }
 
@@ -3938,7 +3930,7 @@ mod tests {
         let (store, id) = store_with(ONE_CELL);
         execute_squad(&store, &DetachRunner, &id);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.set_force_resume_own_session(&id, 0, 0).unwrap();
         }
         let seen = Arc::new(Mutex::new(None));
@@ -3955,7 +3947,7 @@ mod tests {
         // A later, unrelated restart must NOT still be treated as a resume
         // -- the flag was a one-shot hint, not a durable "always resume this
         // cell" toggle.
-        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        store.lock().restart_cell(&id, 0, 0).unwrap();
         let seen2 = Arc::new(Mutex::new(Some("unset".to_string())));
         execute_squad(
             &store,
@@ -3990,7 +3982,7 @@ mod tests {
         let (store, id) = store_with(ONE_PROMPT_CELL);
         execute_squad(&store, &DetachRunner, &id);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.set_force_resume_own_session(&id, 0, 0).unwrap();
         }
         let seen_prompt = Arc::new(Mutex::new(None));
@@ -4010,7 +4002,7 @@ mod tests {
         // A plain restart (no resume-automation flag set) must not pick up
         // the nudge -- it's specific to "a human just handed this back",
         // not every resumed/restarted dispatch.
-        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        store.lock().restart_cell(&id, 0, 0).unwrap();
         let seen_plain_prompt = Arc::new(Mutex::new(None));
         execute_squad(
             &store,
@@ -4050,7 +4042,7 @@ mod tests {
         let (store, id) = store_with(ONE_CELL);
         execute_squad(&store, &DetachRunner, &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].cells[0].state, "running");
         assert_eq!(squad.tasks[0].cells[0].tokens_in, 3);
@@ -4102,7 +4094,7 @@ mod tests {
         }
         handle.join().unwrap();
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].cells[0].state, "running");
         assert!(squad.tasks[0].cells[0].detached_at_ms.is_some());
@@ -4237,7 +4229,7 @@ mod tests {
 
         // Poll until task a's cell has actually detached.
         loop {
-            let detached = store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0]
+            let detached = store.lock().get_squad(&id).unwrap().tasks[0].cells[0]
                 .detached_at_ms
                 .is_some();
             if detached {
@@ -4256,12 +4248,12 @@ mod tests {
         // still genuinely running (blocked in `release_b`). This must never
         // touch the squad's own row: only the target cell resets.
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.set_force_resume_own_session(&id, 0, 0).unwrap();
             guard.resume_detached_cell(&id, 0, 0).unwrap();
         }
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Running,
             "resuming one detached cell must never touch the squad's own row"
         );
@@ -4270,7 +4262,7 @@ mod tests {
         // without needing b to finish first.
         loop {
             let cell_a_done =
-                store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0].state == "done";
+                store.lock().get_squad(&id).unwrap().tasks[0].cells[0].state == "done";
             if cell_a_done {
                 break;
             }
@@ -4293,17 +4285,14 @@ mod tests {
         // The squad row was never touched by the resume, so this same live
         // worker's own end-of-pass guard sees `Running` throughout and
         // finalizes normally in this single pass -- no extra reclaim needed.
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
-    fn store_with(toml: &str) -> (Arc<Mutex<Store>>, String) {
+    fn store_with(toml: &str) -> (crate::store_lock::StoreHandle, String) {
         let mut store = Store::open_in_memory().unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        (Arc::new(Mutex::new(store)), id)
+        (Arc::new(crate::store_lock::StoreMutex::new(store)), id)
     }
 
     const ONE_CELL: &str =
@@ -4416,10 +4405,7 @@ mod tests {
         let runner: Arc<dyn Runner> = concurrency;
         execute_squad(&store, runner.as_ref(), &id);
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
         assert_eq!(
             peak.load(Ordering::SeqCst),
             2,
@@ -4433,7 +4419,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].state, "done");
@@ -4450,7 +4436,7 @@ mod tests {
         });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
     }
@@ -4476,7 +4462,7 @@ mod tests {
         let (store, id) = store_with(ONE_CELL);
         execute_squad(&store, &PreflightFailingRunner, &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].cells[0].state, "failed");
@@ -4499,7 +4485,7 @@ mod tests {
     #[test]
     fn soloing_a_task_pauses_its_independent_sibling_until_unsoloed() {
         let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
-        store.lock().unwrap().solo_task(&id, 0).unwrap();
+        store.lock().solo_task(&id, 0).unwrap();
 
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         let squad_store = Arc::clone(&store);
@@ -4511,7 +4497,7 @@ mod tests {
         // Wait for the soloed task to finish.
         let mut waited = 0;
         loop {
-            let done = store.lock().unwrap().get_squad(&id).unwrap().tasks[0].state == "done";
+            let done = store.lock().get_squad(&id).unwrap().tasks[0].state == "done";
             if done {
                 break;
             }
@@ -4523,7 +4509,7 @@ mod tests {
         // dispatch task b's cell if the solo gate didn't hold.
         std::thread::sleep(Duration::from_millis(150));
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let squad = guard.get_squad(&id).unwrap();
             assert_eq!(
                 squad.tasks[1].state, "pending",
@@ -4537,10 +4523,10 @@ mod tests {
             );
         }
 
-        store.lock().unwrap().unsolo_task(&id, 0).unwrap();
+        store.lock().unsolo_task(&id, 0).unwrap();
         handle.join().unwrap();
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
         assert_eq!(
             guard.get_squad(&id).unwrap().tasks[1].state,
@@ -4683,7 +4669,7 @@ mod tests {
         tick(&store, &runner, &sem, &Cancellations::new(), &summary_queue);
         let mut waited = 0;
         loop {
-            let state = store.lock().unwrap().squad_state(&id).unwrap();
+            let state = store.lock().squad_state(&id).unwrap();
             if state.is_terminal() || waited > 200 {
                 assert_eq!(state, SquadState::Done);
                 break;
@@ -4713,7 +4699,6 @@ mod tests {
         );
         let page = store
             .lock()
-            .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter {
                 squad_id: Some(id),
                 source: Some("scheduler".to_string()),
@@ -4856,7 +4841,7 @@ mod tests {
     fn review_branch_cell_wins_a_freed_dispatch_slot_over_a_plain_sibling() {
         let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let gid = guard
                 .create_guardian_for_squad("Stack", "main", "/repo", Some(&id))
                 .unwrap();
@@ -4908,10 +4893,7 @@ mod tests {
             "the Review-feeding cell must win the freed slot ahead of its plain \
              sibling, which must still run afterward rather than starve"
         );
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     /// Stands in for a long-running cell: blocks in `run_cancellable` until
@@ -4967,11 +4949,11 @@ mod tests {
         while !started.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        store.lock().unwrap().cancel(&id).unwrap();
+        store.lock().cancel(&id).unwrap();
         token.cancel();
         worker.join().unwrap();
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Cancelled);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].state, "cancelled");
@@ -5081,7 +5063,7 @@ mod tests {
         let mut a_failed = false;
         for _ in 0..500 {
             if matches!(
-                store.lock().unwrap().cell_state(&id, 0, 0),
+                store.lock().cell_state(&id, 0, 0),
                 Ok(Some(crate::store::NodeState::Failed))
             ) {
                 a_failed = true;
@@ -5097,7 +5079,7 @@ mod tests {
         // Restart task a's already-failed cell at the store level — what
         // the HTTP handler does without cancelling the worker once the
         // target is confirmed terminal.
-        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        store.lock().restart_cell(&id, 0, 0).unwrap();
 
         // The still-running worker (not a fresh claim after b finishes) must
         // pick this up and re-run task a within a few dispatcher-loop ticks.
@@ -5269,10 +5251,7 @@ mod tests {
         // load even though the worker itself reacts promptly in isolation.
         let mut a_failed = false;
         for _ in 0..4000 {
-            if matches!(
-                store.lock().unwrap().task_state(&id, 0),
-                Ok(Some(NodeState::Failed))
-            ) {
+            if matches!(store.lock().task_state(&id, 0), Ok(Some(NodeState::Failed))) {
                 a_failed = true;
                 break;
             }
@@ -5285,11 +5264,7 @@ mod tests {
 
         // Restart the failed proof, exactly as the board's right-click
         // "Restart" action on a proof step does.
-        store
-            .lock()
-            .unwrap()
-            .restart_cell_proof(&id, 0, 0, 0)
-            .unwrap();
+        store.lock().restart_cell_proof(&id, 0, 0, 0).unwrap();
 
         // Give the still-alive worker plenty of dispatcher ticks to react.
         std::thread::sleep(Duration::from_millis(300));
@@ -5429,10 +5404,7 @@ mod tests {
         // Let task "a" actually finalize as Failed before restarting it.
         let mut a_failed = false;
         for _ in 0..4000 {
-            if matches!(
-                store.lock().unwrap().task_state(&id, 0),
-                Ok(Some(NodeState::Failed))
-            ) {
+            if matches!(store.lock().task_state(&id, 0), Ok(Some(NodeState::Failed))) {
                 a_failed = true;
                 break;
             }
@@ -5447,13 +5419,13 @@ mod tests {
         // via the store — exactly what `server::restart_cell` does once it
         // decides the target isn't currently active and skips cancelling
         // the still-alive worker (see that handler's doc comment).
-        store.lock().unwrap().restart_cell(&id, 0, 1).unwrap();
+        store.lock().restart_cell(&id, 0, 1).unwrap();
 
         // Give the still-alive worker plenty of dispatcher ticks to reclaim
         // "a", re-run "finalize", and re-finalize the task.
         let mut a_state = None;
         for _ in 0..4000 {
-            let state = store.lock().unwrap().task_state(&id, 0).unwrap();
+            let state = store.lock().task_state(&id, 0).unwrap();
             if matches!(state, Some(NodeState::Done) | Some(NodeState::Failed)) {
                 a_state = state;
                 break;
@@ -5467,7 +5439,7 @@ mod tests {
              reached a terminal state promptly — stuck at {:?} because the \
              finalizer's terminal-state write was silently skipped while the \
              squad row stayed desynced from Running",
-            store.lock().unwrap().task_state(&id, 0).unwrap()
+            store.lock().task_state(&id, 0).unwrap()
         );
 
         b_release.store(true, Ordering::SeqCst);
@@ -5523,10 +5495,7 @@ mod tests {
         });
         execute_squad(&store, runner.as_ref(), &id);
         assert_eq!(*order.lock().unwrap(), vec!["cmd-a", "cmd-b"]);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     #[test]
@@ -5540,11 +5509,8 @@ mod tests {
         execute_squad(&store, runner.as_ref(), &id);
         // `b` must never run because `a` failed.
         assert_eq!(*order.lock().unwrap(), vec!["cmd-a"]);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        let squad = store.lock().get_squad(&id).unwrap();
         let b = squad.tasks[0].cells.iter().find(|s| s.id == "b").unwrap();
         assert_eq!(b.state, "failed");
         assert_eq!(b.error.as_deref(), Some("blocked by a failed dependency"));
@@ -5557,12 +5523,9 @@ mod tests {
             fail_on: Some("do-thing".to_string()),
         });
         execute_squad(&store, runner.as_ref(), &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let client_id = guard.register_mailbox_client().unwrap();
         let messages = guard
             .mailbox_messages_for_client(&client_id, true, None)
@@ -5600,11 +5563,8 @@ mod tests {
         // `Runner` (and so shows up in `order` too) rather than a direct,
         // unrecorded subprocess — "b" (`cmd-b`) still must never run.
         assert_eq!(*order.lock().unwrap(), vec!["cmd-a", "exit 1"]);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        let squad = store.lock().get_squad(&id).unwrap();
         let b = squad.tasks[0].cells.iter().find(|s| s.id == "b").unwrap();
         assert_eq!(b.state, "failed");
         assert_eq!(b.error.as_deref(), Some("blocked by a failed dependency"));
@@ -5626,14 +5586,14 @@ mod tests {
         });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        let squad = store.lock().get_squad(&id).unwrap();
         let a = squad.tasks[0].cells.iter().find(|s| s.id == "a").unwrap();
         assert_eq!(
             a.state, "failed",
             "cell body succeeded but its proof failed"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let client_id = guard.register_mailbox_client().unwrap();
         let messages = guard
             .mailbox_messages_for_client(&client_id, true, None)
@@ -5673,11 +5633,8 @@ mod tests {
         // `Runner` (and so shows up in `order` too) rather than a direct,
         // unrecorded subprocess — "b" (`cmd-b`) still must never run.
         assert_eq!(*order.lock().unwrap(), vec!["cmd-a", "exit 1"]);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        let squad = store.lock().get_squad(&id).unwrap();
         let a_task = squad.tasks.iter().find(|t| t.name == "a").unwrap();
         assert_eq!(a_task.state, "failed");
         let b_task = squad.tasks.iter().find(|t| t.name == "b").unwrap();
@@ -5704,7 +5661,7 @@ mod tests {
         });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let client_id = guard.register_mailbox_client().unwrap();
         let messages = guard
             .mailbox_messages_for_client(&client_id, true, None)
@@ -5723,10 +5680,7 @@ mod tests {
         let (store, id) = store_with(cyclic);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
     }
 
     #[test]
@@ -5741,7 +5695,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let page = guard
             .cartographer_query(&crate::cartographer::CartographerFilter {
                 squad_id: Some(id.clone()),
@@ -5772,7 +5726,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        let squad = store.lock().get_squad(&id).unwrap();
         assert_eq!(squad.tasks.len(), 1);
         assert!(
             squad.tasks[0]
@@ -5789,10 +5743,7 @@ mod tests {
         let (store, id) = store_with(CELL_PASSING_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     #[test]
@@ -5800,10 +5751,7 @@ mod tests {
         let (store, id) = store_with(TASK_FAILING_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Failed
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
     }
 
     // RAL-152: a daemon-observed proof outcome must be folded onto the
@@ -5816,7 +5764,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
         let uri = crate::ghost::cell_uri(&id, 0, 0);
-        let ghost = store.lock().unwrap().get_ghost(&uri).unwrap().unwrap();
+        let ghost = store.lock().get_ghost(&uri).unwrap().unwrap();
         assert!(
             ghost.content.contains("internally validated"),
             "expected a ground-truth validated note in the ghost: {}",
@@ -5833,7 +5781,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
         let uri = crate::ghost::cell_uri(&id, 0, 0);
-        let ghost = store.lock().unwrap().get_ghost(&uri).unwrap().unwrap();
+        let ghost = store.lock().get_ghost(&uri).unwrap().unwrap();
         assert!(
             ghost.content.contains("did NOT all pass"),
             "expected a ground-truth failed note in the ghost: {}",
@@ -5849,7 +5797,7 @@ mod tests {
         execute_squad(&store, runner.as_ref(), &id);
         let uri = crate::ghost::cell_uri(&id, 0, 0);
         assert!(
-            store.lock().unwrap().get_ghost(&uri).unwrap().is_none(),
+            store.lock().get_ghost(&uri).unwrap().is_none(),
             "a scope with no proof steps must never claim its work was validated"
         );
     }
@@ -5869,14 +5817,13 @@ mod tests {
         let (store, id) = store_with(CELL_TWO_PROOFS_SECOND_WOULD_FAIL);
         store
             .lock()
-            .unwrap()
             .set_proof_state(&id, 0, "cell", 0, 1, NodeState::Ignored)
             .unwrap();
 
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.squad_state(&id).unwrap(),
             SquadState::Done,
@@ -5910,12 +5857,10 @@ mod tests {
         let (store, id) = store_with(CELL_THREE_PROOFS_TAIL_CANCELLED);
         store
             .lock()
-            .unwrap()
             .set_proof_state(&id, 0, "cell", 0, 1, NodeState::Cancelled)
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_proof_state(&id, 0, "cell", 0, 2, NodeState::Cancelled)
             .unwrap();
 
@@ -5932,7 +5877,7 @@ mod tests {
             "a cancelled proof step (and anything after it) must never actually execute"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.squad_state(&id).unwrap(),
             SquadState::Failed,
@@ -5974,7 +5919,7 @@ mod tests {
         let (store, id) = store_with(TASK_PROMPT_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
         let squad = guard.get_squad(&id).unwrap();
         let v = &squad.tasks[0].proof[0];
@@ -5993,7 +5938,7 @@ mod tests {
         let (store, id) = store_with(TASK_PROMPT_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         let v = &squad.tasks[0].proof[0];
         assert_eq!(v.state, "done");
@@ -6017,7 +5962,7 @@ mod tests {
         let (store, id) = store_with(TASK_PROMPT_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let page = guard
             .cartographer_query(&crate::cartographer::CartographerFilter {
                 squad_id: Some(id.clone()),
@@ -6047,7 +5992,7 @@ mod tests {
             fail_on: Some("check it".to_string()),
         });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].proof[0].state, "failed");
@@ -6060,7 +6005,7 @@ mod tests {
         let (store, id) = store_with(TASK_BRAIN_PROOF);
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].proof[0].state, "pending");
@@ -6076,7 +6021,7 @@ mod tests {
         // "running" indefinitely even though the squad has already finished.
         let (store, id) = store_with(ONE_CELL);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .conn
                 .execute(
@@ -6088,7 +6033,7 @@ mod tests {
         }
         let runner: Arc<dyn Runner> = Arc::new(FakeRunner { fail_on: None });
         execute_squad(&store, runner.as_ref(), &id);
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
         let squad = guard.get_squad(&id).unwrap();
         let v = &squad.tasks[0].proof[0];
@@ -6173,14 +6118,14 @@ mod tests {
     /// proof spec runs — lets the RAL-64 regression test assert the task is
     /// Running (not Done) while its proof is executing.
     struct ProofStateCapturingRunner {
-        store: Arc<Mutex<Store>>,
+        store: crate::store_lock::StoreHandle,
         captured: Arc<Mutex<Vec<String>>>,
     }
 
     impl Runner for ProofStateCapturingRunner {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             if spec.proof {
-                let guard = self.store.lock().unwrap();
+                let guard = self.store.lock();
                 if let Ok(squad) = guard.get_squad(&spec.squad_id) {
                     if let Some(task) = squad.tasks.iter().find(|t| t.name == spec.task) {
                         self.captured.lock().unwrap().push(task.state.clone());
@@ -6217,7 +6162,7 @@ mod tests {
         // First run: both tasks complete successfully.
         execute_squad(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             assert_eq!(g.squad_state(&id).unwrap(), SquadState::Done);
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[1].state, "done");
@@ -6227,9 +6172,9 @@ mod tests {
         // Restart task "a" only (task_idx=0, cell_idx=0).
         // Task "b" (task_idx=1) is intentionally NOT reset: its cell stays Done
         // and its task state stays "done" — the RAL-64 scenario.
-        store.lock().unwrap().restart_cell(&id, 0, 0).unwrap();
+        store.lock().restart_cell(&id, 0, 0).unwrap();
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[0].state, "pending", "task 'a' should be reset");
             assert_eq!(squad.tasks[1].state, "done", "task 'b' should be unchanged");
@@ -6260,11 +6205,8 @@ mod tests {
         );
 
         // Squad ends Done.
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
-        let squad = store.lock().unwrap().get_squad(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
+        let squad = store.lock().get_squad(&id).unwrap();
         assert_eq!(squad.tasks[1].state, "done");
     }
 
@@ -6286,7 +6228,7 @@ mod tests {
         // Task "a" → Failed, task "b" → Done, squad → Failed.
         execute_squad(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             assert_eq!(g.squad_state(&id).unwrap(), SquadState::Failed);
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[0].state, "failed", "task 'a' should be failed");
@@ -6295,14 +6237,14 @@ mod tests {
 
         // Restart only task "b"'s cell (task_idx=1, cell_idx=0).
         // Task "a"'s cell stays Done and its failing proof stays Failed.
-        store.lock().unwrap().restart_cell(&id, 1, 0).unwrap();
+        store.lock().restart_cell(&id, 1, 0).unwrap();
 
         // Re-run: task "a"'s cell is in `already_done` (skipped), but its
         // prior proof failure must seed `progress.failed` so the task finalizer
         // marks it Failed rather than Done.
         execute_squad(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.squad_state(&id).unwrap(),
             SquadState::Failed,
@@ -6382,7 +6324,7 @@ mod tests {
         // (command "y") succeeds.
         execute_squad(&store, &runner, &id);
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             assert_eq!(g.squad_state(&id).unwrap(), SquadState::Failed);
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[0].state, "failed", "task 'a' should be failed");
@@ -6391,7 +6333,7 @@ mod tests {
 
         // Restart only task "b"'s cell (task_idx=1, cell_idx=0) --
         // completely unrelated to task "a" (no dependency either way).
-        store.lock().unwrap().restart_cell(&id, 1, 0).unwrap();
+        store.lock().restart_cell(&id, 1, 0).unwrap();
 
         // Re-run: task "b" re-executes (it was explicitly restarted), but task
         // "a"'s already-failed cell must NOT be redispatched just because
@@ -6412,7 +6354,7 @@ mod tests {
              (it was explicitly restarted the second time): {invocations:?}"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.squad_state(&id).unwrap(),
             SquadState::Failed,
@@ -6531,17 +6473,17 @@ mod tests {
         // running cell — mirroring the reported squad.
         wait_until("task 'a' running and task 'b' done", || {
             let b_done = {
-                let g = store.lock().unwrap();
+                let g = store.lock();
                 g.get_squad(&id).unwrap().tasks[1].cells[0].state == "done"
             };
             b_done && blocking.load(Ordering::SeqCst)
         });
 
-        store.lock().unwrap().cancel(&id).unwrap();
+        store.lock().cancel(&id).unwrap();
         token.cancel();
         worker.join().unwrap();
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
             assert_eq!(squad.tasks[1].cells[0].state, "done");
@@ -6549,7 +6491,7 @@ mod tests {
 
         // Restart ONLY task "b"'s cell — no dependency relationship to task
         // "a" in either direction.
-        store.lock().unwrap().restart_cell(&id, 1, 0).unwrap();
+        store.lock().restart_cell(&id, 1, 0).unwrap();
 
         // Re-run with a non-blocking runner sharing the same tally, so a
         // regression shows up as an extra recorded "x" instead of a 2s stall.
@@ -6573,7 +6515,7 @@ mod tests {
              target the second time): {invocations:?}"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(
             squad.tasks[0].cells[0].state, "cancelled",
@@ -6634,7 +6576,7 @@ mod tests {
             })
         };
         wait_until("cell 'a' running", || blocking.load(Ordering::SeqCst));
-        store.lock().unwrap().cancel(&id).unwrap();
+        store.lock().cancel(&id).unwrap();
         token.cancel();
         worker.join().unwrap();
 
@@ -6642,9 +6584,9 @@ mod tests {
         // the impact set (the BFS runs forward), so "a" stays cancelled while
         // "b" goes back to Pending — the one shape that produces a Pending
         // cell with a Cancelled prerequisite.
-        store.lock().unwrap().restart_cell(&id, 0, 1).unwrap();
+        store.lock().restart_cell(&id, 0, 1).unwrap();
         {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             let squad = g.get_squad(&id).unwrap();
             assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
             assert_eq!(squad.tasks[0].cells[1].state, "pending");
@@ -6664,7 +6606,7 @@ mod tests {
             0,
             "'b' must not run while its prerequisite is cancelled: {invocations:?}"
         );
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].cells[1].state, "cancelled");
         assert_eq!(
@@ -6704,15 +6646,15 @@ mod tests {
             })
         };
         wait_until("task 'a' running", || blocking.load(Ordering::SeqCst));
-        store.lock().unwrap().cancel(&id).unwrap();
+        store.lock().cancel(&id).unwrap();
         token.cancel();
         worker.join().unwrap();
         assert_eq!(
-            store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0].state,
+            store.lock().get_squad(&id).unwrap().tasks[0].cells[0].state,
             "cancelled"
         );
 
-        store.lock().unwrap().restart_squad(&id).unwrap();
+        store.lock().restart_squad(&id).unwrap();
         let rerun = CountingRunner {
             fail_on: None,
             invoked: Arc::clone(&invoked),
@@ -6724,7 +6666,7 @@ mod tests {
             invocations.iter().filter(|t| t.as_str() == "x").count() >= 2,
             "a whole-squad restart must re-run the cancelled cell: {invocations:?}"
         );
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
         let squad = guard.get_squad(&id).unwrap();
         assert_eq!(squad.tasks[0].state, "done");
@@ -6986,10 +6928,7 @@ mod tests {
             .as_ref(),
             &id,
         );
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
         assert!(
             calls.lock().unwrap().contains(&"do-work".to_string()),
             "cell body must run on first pass"
@@ -7000,11 +6939,7 @@ mod tests {
         );
 
         // Restart only the cell-level proof.
-        store
-            .lock()
-            .unwrap()
-            .restart_cell_proof(&id, 0, 0, 0)
-            .unwrap();
+        store.lock().restart_cell_proof(&id, 0, 0, 0).unwrap();
 
         // Re-run: cell body must NOT be called again; only the prompt proof re-runs.
         calls.lock().unwrap().clear();
@@ -7026,10 +6961,7 @@ mod tests {
             recorded.contains(&"check-output".to_string()),
             "prompt proof must re-run; got: {recorded:?}"
         );
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     #[test]
@@ -7045,13 +6977,10 @@ mod tests {
 
         // First run: all succeed.
         execute_squad(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
 
         // Restart only the task-level proof.
-        store.lock().unwrap().restart_task_proof(&id, 0, 0).unwrap();
+        store.lock().restart_task_proof(&id, 0, 0).unwrap();
 
         // Re-run: cell body "do-work" must NOT be called; only "task-check" runs.
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -7073,10 +7002,7 @@ mod tests {
             recorded.contains(&"task-check".to_string()),
             "task prompt proof must re-run; got: {recorded:?}"
         );
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     // ── Worktree placeholder cwd (RAL-100) ───────────────────────────────────
@@ -7129,15 +7055,12 @@ mod tests {
             .unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
-        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
+        let cells = store.lock().cells_of(&id).unwrap();
         let cwd = cells[0].cwd.clone().unwrap();
         assert_ne!(
             cwd, "ralphus:new-worktree/feat-a?upstream=main",
@@ -7162,15 +7085,12 @@ mod tests {
             .unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
-        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
+        let cells = store.lock().cells_of(&id).unwrap();
         let cwds: Vec<String> = cells.iter().map(|s| s.cwd.clone().unwrap()).collect();
         assert_eq!(cwds[0], cwds[1], "both cells must resolve to one worktree");
         // Exactly one worktree registered in git for the shared branch.
@@ -7195,28 +7115,19 @@ mod tests {
             .unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
-        let first_cwd = store.lock().unwrap().cells_of(&id).unwrap()[0]
-            .cwd
-            .clone()
-            .unwrap();
+        let first_cwd = store.lock().cells_of(&id).unwrap()[0].cwd.clone().unwrap();
 
         // Simulate a restart: reset the squad back to Pending/cell to pending and
         // re-execute. The already-resolved (real, non-placeholder) cwd must be
         // reused as-is, and re-materializing it must not error or recreate it.
-        store.lock().unwrap().restart_squad(&id).unwrap();
+        store.lock().restart_squad(&id).unwrap();
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
-        let second_cwd = store.lock().unwrap().cells_of(&id).unwrap()[0]
-            .cwd
-            .clone()
-            .unwrap();
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
+        let second_cwd = store.lock().cells_of(&id).unwrap()[0].cwd.clone().unwrap();
         assert_eq!(
             first_cwd, second_cwd,
             "restart must reuse the same worktree path"
@@ -7265,7 +7176,7 @@ mod tests {
             .unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
         let seen = Arc::new(Mutex::new(Vec::new()));
 
         execute_squad(
@@ -7276,7 +7187,7 @@ mod tests {
             .as_ref(),
             &id,
         );
-        store.lock().unwrap().restart_squad(&id).unwrap();
+        store.lock().restart_squad(&id).unwrap();
         execute_squad(
             &store,
             Arc::new(EnvCapturingRunner {
@@ -7293,7 +7204,7 @@ mod tests {
             "restart must reuse the first materialized env"
         );
         let wt = seen[0].get("WT").expect("materialized env");
-        let persisted_cwd = store.lock().unwrap().get_squad(&id).unwrap().tasks[0].cells[0]
+        let persisted_cwd = store.lock().get_squad(&id).unwrap().tasks[0].cells[0]
             .cwd
             .clone()
             .expect("persisted cwd");
@@ -7317,7 +7228,6 @@ mod tests {
         );
         let snapshot = store
             .lock()
-            .unwrap()
             .get_cell_materialized_env_overrides(&id, 0, 0)
             .unwrap()
             .expect("persisted snapshot");
@@ -7343,7 +7253,7 @@ mod tests {
             let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do-thing\"\nenvironment={MY_SECRET_TOKEN=\"sekret-val-xyz\"}\n";
             let file = toml::from_str(toml).unwrap();
             let id = store.insert_squad(&file, None, false).unwrap();
-            let store = Arc::new(Mutex::new(store));
+            let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
             execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
@@ -7410,13 +7320,13 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         // FakeRunner never touches the filesystem, so no commit is made.
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Failed,
             "a git-backed task with zero new commits must fail"
         );
@@ -7438,11 +7348,11 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let squad = guard.get_squad(&id).unwrap();
         let task = &squad.tasks[0];
         assert_eq!(task.state, "failed");
@@ -7473,11 +7383,11 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &CommittingRunner, &id);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.squad_state(&id).unwrap(),
             SquadState::Done,
@@ -7505,20 +7415,20 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
         assert!(
-            store.lock().unwrap().get_squad(&id).unwrap().tasks[0]
+            store.lock().get_squad(&id).unwrap().tasks[0]
                 .error
                 .is_some(),
             "precondition: the guard must have recorded an error"
         );
 
-        store.lock().unwrap().restart_task(&id, 0).unwrap();
+        store.lock().restart_task(&id, 0).unwrap();
 
         assert!(
-            store.lock().unwrap().get_squad(&id).unwrap().tasks[0]
+            store.lock().get_squad(&id).unwrap().tasks[0]
                 .error
                 .is_none(),
             "restart_task must clear the task's stale failure reason"
@@ -7564,7 +7474,7 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         // This run's own cell makes no commit -- FakeRunner never touches
         // the filesystem -- yet the task must still pass on the strength of
@@ -7572,7 +7482,7 @@ mod tests {
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Done,
             "a worktree already ahead of upstream must pass, regardless of which run made the commit"
         );
@@ -7595,23 +7505,20 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         // First run: the cell really commits, so the task passes.
         execute_squad(&store, &CommittingRunner, &id);
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
 
         // Restart the task and re-run with a runner that makes no further
         // commit. The worktree's git state (and its earlier commit) is left
         // exactly as the first run finished it.
-        store.lock().unwrap().restart_task(&id, 0).unwrap();
+        store.lock().restart_task(&id, 0).unwrap();
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Done,
             "a restarted task must still pass on the strength of the earlier run's commit"
         );
@@ -7630,12 +7537,12 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Done,
             "no_commit_required must bypass the guard even with zero commits"
         );
@@ -7649,12 +7556,12 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let file = toml::from_str(toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Done,
             "a non-git-backed task must never be subject to the guard"
         );
@@ -7681,14 +7588,11 @@ mod tests {
             .unwrap();
         let file = toml::from_str(&toml).unwrap();
         let id = store.insert_squad(&file, None, false).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store));
 
         execute_squad(&store, &FakeRunner { fail_on: None }, &id);
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Done
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     // ── RAL-248 cross-cell session sharing ────────────────────────────────
@@ -7968,12 +7872,7 @@ mod tests {
         );
         // Persisted before the runner ever ran, not just handed to it in-memory.
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .get_cell_agent_resume(&id, 0, 0)
-                .unwrap()
-                .2,
+            store.lock().get_cell_agent_resume(&id, 0, 0).unwrap().2,
             Some(assigned)
         );
     }
