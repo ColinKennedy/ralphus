@@ -1318,22 +1318,40 @@ impl Store {
                 PRIMARY KEY (project, user)
             );
             -- RAL-328: view preferences are scoped to a registered user and
-            -- reference exactly one squad or review. Entity deletion removes
-            -- the preference before sequential ids can be reused.
+            -- reference exactly one squad, review, or (RAL-365) task. Entity
+            -- deletion removes the preference before sequential ids can be
+            -- reused. `task_idx` is only set for `kind='task'`, so a squad
+            -- row and a task row of that same squad always differ on
+            -- `task_idx` and coexist. A single table-level
+            -- `UNIQUE(user_name, squad_id, task_idx)` can't also make
+            -- *repeated* squad hides idempotent though: every squad row has
+            -- `task_idx IS NULL`, and SQLite treats NULLs as distinct within
+            -- a unique index, so two such rows never collide. Hence the two
+            -- partial unique indexes below instead, one per kind that has a
+            -- `squad_id`, each restricted (via `WHERE kind=...`) to rows
+            -- where every indexed column is genuinely non-NULL.
             CREATE TABLE IF NOT EXISTS hidden_items (
-                kind          TEXT NOT NULL CHECK(kind IN ('squad', 'review')),
+                kind          TEXT NOT NULL CHECK(kind IN ('squad', 'review', 'task')),
                 squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
                 guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
+                task_idx      INTEGER,
                 user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE ON UPDATE CASCADE,
                 hidden_at_ms  INTEGER NOT NULL,
                 CHECK(
-                    (kind = 'squad' AND squad_id IS NOT NULL AND guardian_id IS NULL)
+                    (kind = 'squad' AND squad_id IS NOT NULL AND guardian_id IS NULL AND task_idx IS NULL)
                     OR
-                    (kind = 'review' AND squad_id IS NULL AND guardian_id IS NOT NULL)
+                    (kind = 'review' AND squad_id IS NULL AND guardian_id IS NOT NULL AND task_idx IS NULL)
+                    OR
+                    (kind = 'task' AND squad_id IS NOT NULL AND guardian_id IS NULL AND task_idx IS NOT NULL)
                 ),
-                UNIQUE(user_name, squad_id),
                 UNIQUE(user_name, guardian_id)
             );
+            -- The two partial unique indexes on `task_idx` are created
+            -- separately, after the RAL-365 rebuild migration below runs --
+            -- not here, since this whole batch runs unconditionally on
+            -- every start including against a pre-RAL-365 `hidden_items`
+            -- table this `CREATE TABLE IF NOT EXISTS` leaves untouched, and
+            -- that legacy table has no `task_idx` column yet.
             CREATE INDEX IF NOT EXISTS idx_hidden_items_user ON hidden_items(user_name);
             CREATE INDEX IF NOT EXISTS idx_hidden_items_squad ON hidden_items(squad_id);
             CREATE INDEX IF NOT EXISTS idx_hidden_items_guardian ON hidden_items(guardian_id);
@@ -2604,6 +2622,77 @@ impl Store {
                  DROP TABLE guardian_worktree_retirements_ral385;",
             )?;
         }
+        // RAL-365: broaden `hidden_items.kind` to add 'task', for hiding one
+        // task independent of its owning squad. SQLite cannot alter a CHECK
+        // constraint or add/drop a unique index set in place, so a database
+        // created under the RAL-328 schema is migrated by rebuilding the
+        // table -- detected the same way as the
+        // `guardian_worktree_retirements` rebuild just above: sniffing its
+        // own recorded DDL for the new 'task' kind rather than a version
+        // counter this codebase doesn't otherwise keep. Every existing row
+        // is `squad` or `review`, both still valid under the broadened
+        // constraint, so the copy is a plain `INSERT ... SELECT` with
+        // `task_idx` defaulting to `NULL`. The old table-level
+        // `UNIQUE(user_name, squad_id)` becomes the partial index
+        // `idx_hidden_items_squad_uniq` below rather than a table-level
+        // `UNIQUE(user_name, squad_id, task_idx)` -- see this table's schema
+        // comment in the `CREATE TABLE IF NOT EXISTS hidden_items` block
+        // above for why a table-level 3-column unique can't also keep
+        // repeated squad hides idempotent (every squad row has
+        // `task_idx IS NULL`, and SQLite never treats two NULLs as equal).
+        let hidden_items_need_rebuild = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='hidden_items'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|sql| !sql.contains("'task'"))
+            .unwrap_or(false);
+        if hidden_items_need_rebuild {
+            self.conn.execute_batch(
+                "ALTER TABLE hidden_items RENAME TO hidden_items_ral328;
+                 CREATE TABLE hidden_items (
+                     kind          TEXT NOT NULL CHECK(kind IN ('squad', 'review', 'task')),
+                     squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
+                     guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
+                     task_idx      INTEGER,
+                     user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE ON UPDATE CASCADE,
+                     hidden_at_ms  INTEGER NOT NULL,
+                     CHECK(
+                         (kind = 'squad' AND squad_id IS NOT NULL AND guardian_id IS NULL AND task_idx IS NULL)
+                         OR
+                         (kind = 'review' AND squad_id IS NULL AND guardian_id IS NOT NULL AND task_idx IS NULL)
+                         OR
+                         (kind = 'task' AND squad_id IS NOT NULL AND guardian_id IS NULL AND task_idx IS NOT NULL)
+                     ),
+                     UNIQUE(user_name, guardian_id)
+                 );
+                 INSERT INTO hidden_items
+                     (kind, squad_id, guardian_id, task_idx, user_name, hidden_at_ms)
+                 SELECT kind, squad_id, guardian_id, NULL, user_name, hidden_at_ms
+                 FROM hidden_items_ral328;
+                 DROP TABLE hidden_items_ral328;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_hidden_items_squad_uniq
+                     ON hidden_items(user_name, squad_id) WHERE kind = 'squad';
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_hidden_items_task_uniq
+                     ON hidden_items(user_name, squad_id, task_idx) WHERE kind = 'task';
+                 CREATE INDEX IF NOT EXISTS idx_hidden_items_user ON hidden_items(user_name);
+                 CREATE INDEX IF NOT EXISTS idx_hidden_items_squad ON hidden_items(squad_id);
+                 CREATE INDEX IF NOT EXISTS idx_hidden_items_guardian ON hidden_items(guardian_id);",
+            )?;
+        }
+        // Safe unconditionally at this point: either the table was just
+        // rebuilt above (and already has these), or it never needed
+        // rebuilding because it already has `task_idx` (a fresh DB's
+        // `CREATE TABLE IF NOT EXISTS hidden_items` above already declares
+        // the up-to-date columns). Either way `task_idx` exists by now.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hidden_items_squad_uniq
+                 ON hidden_items(user_name, squad_id) WHERE kind = 'squad';
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_hidden_items_task_uniq
+                 ON hidden_items(user_name, squad_id, task_idx) WHERE kind = 'task';",
+        )?;
         Ok(())
     }
 
@@ -9523,6 +9612,117 @@ prompt = "legacy cell, no review_guardian_id"
             .expect("legacy-proj must still be found");
         assert!(project.clone_url.is_none());
         assert_eq!(project.path, "/srv/legacy-proj");
+    }
+
+    #[test]
+    fn migration_broadens_hidden_items_kind_to_include_task() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE users (name TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL);
+             CREATE TABLE squads (id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL);
+             CREATE TABLE guardians (id TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL);
+             INSERT INTO users (name, created_at_ms) VALUES ('alice', 0);
+             INSERT INTO squads (id, created_at_ms) VALUES ('r1', 0);
+             INSERT INTO guardians (id, created_at_ms) VALUES ('g1', 0);
+             CREATE TABLE hidden_items (
+                kind          TEXT NOT NULL CHECK(kind IN ('squad', 'review')),
+                squad_id      TEXT REFERENCES squads(id) ON DELETE CASCADE,
+                guardian_id   TEXT REFERENCES guardians(id) ON DELETE CASCADE,
+                user_name     TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                hidden_at_ms  INTEGER NOT NULL,
+                CHECK(
+                    (kind = 'squad' AND squad_id IS NOT NULL AND guardian_id IS NULL)
+                    OR
+                    (kind = 'review' AND squad_id IS NULL AND guardian_id IS NOT NULL)
+                ),
+                UNIQUE(user_name, squad_id),
+                UNIQUE(user_name, guardian_id)
+             );
+             CREATE INDEX idx_hidden_items_user ON hidden_items(user_name);
+             CREATE INDEX idx_hidden_items_squad ON hidden_items(squad_id);
+             CREATE INDEX idx_hidden_items_guardian ON hidden_items(guardian_id);
+             INSERT INTO hidden_items (kind, squad_id, guardian_id, user_name, hidden_at_ms)
+             VALUES ('squad', 'r1', NULL, 'alice', 100);
+             INSERT INTO hidden_items (kind, squad_id, guardian_id, user_name, hidden_at_ms)
+             VALUES ('review', NULL, 'g1', 'alice', 200);",
+        )
+        .expect("create legacy (pre-RAL-365) hidden_items schema");
+
+        let store = Store {
+            conn,
+            event_bus: crate::events::EventBus::new(),
+            live_activity: HashMap::new(),
+            guardian_summary_debounce: HashMap::new(),
+            guardian_worktree_leases: HashMap::new(),
+            guardian_restack_requests: HashMap::new(),
+            guardian_restack_running: std::collections::HashSet::new(),
+            stall_escalated: HashMap::new(),
+            secret_env_names_cache: std::sync::RwLock::new(None),
+        };
+        store
+            .init_schema()
+            .expect("migration must broaden hidden_items.kind to include 'task'");
+
+        // Pre-existing rows survive, with task_idx defaulting to NULL.
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT kind, squad_id, guardian_id, task_idx, hidden_at_ms
+                 FROM hidden_items ORDER BY hidden_at_ms",
+            )
+            .unwrap();
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<i64>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("squad".into(), Some("r1".into()), None, None, 100),
+                ("review".into(), None, Some("g1".into()), None, 200),
+            ]
+        );
+
+        // The new 'task' kind is now accepted, coexisting with the migrated
+        // squad row on the same squad_id (NULLs are distinct in the
+        // broadened UNIQUE(user_name, squad_id, task_idx) index).
+        store
+            .conn
+            .execute(
+                "INSERT INTO hidden_items
+                     (kind, squad_id, guardian_id, task_idx, user_name, hidden_at_ms)
+                 VALUES ('task', 'r1', NULL, 2, 'alice', 300)",
+                [],
+            )
+            .expect("'task' kind must be accepted after migration");
+
+        // All three pre-existing indexes survive the rebuild.
+        let index_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND tbl_name='hidden_items'
+                   AND name IN ('idx_hidden_items_user', 'idx_hidden_items_squad', 'idx_hidden_items_guardian')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 3);
+
+        // Guarded to run exactly once: a second init_schema() call must not
+        // fail or duplicate/drop any row.
+        store
+            .init_schema()
+            .expect("migration must be a no-op the second time");
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM hidden_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3);
     }
 
     #[test]

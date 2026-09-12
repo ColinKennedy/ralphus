@@ -476,6 +476,35 @@ struct HiddenBatchResponse {
     failed: Vec<HiddenBatchFailure>,
 }
 
+/// One `(squad_id, task_idx)` pair in a [`HiddenTasksBatchBody`].
+#[derive(Deserialize)]
+struct HiddenTaskRef {
+    squad_id: String,
+    task_idx: i64,
+}
+
+/// `POST /api/hidden/tasks/batch` body (RAL-365) -- the board's multi-select
+/// Hide/Unhide menu items send every selected `(squad_id, task_idx)` pair in
+/// one request instead of one HTTP round trip per task.
+#[derive(Deserialize)]
+struct HiddenTasksBatchBody {
+    tasks: Vec<HiddenTaskRef>,
+    hidden: bool,
+}
+
+#[derive(Serialize)]
+struct HiddenTaskBatchFailure {
+    squad_id: String,
+    task_idx: i64,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct HiddenTasksBatchResponse {
+    hidden: bool,
+    failed: Vec<HiddenTaskBatchFailure>,
+}
+
 /// `POST /api/users` body -- see `crate::users`'s module doc comment for why
 /// this is a placeholder identity registry, not authentication.
 #[derive(Deserialize)]
@@ -983,6 +1012,15 @@ fn route_for_user(
         }
         ("DELETE", ["api", "hidden", "reviews", id]) => {
             set_review_hidden(daemon, user_header, id, false)
+        }
+        ("POST", ["api", "hidden", "tasks", "batch"]) => {
+            set_tasks_hidden_batch(daemon, user_header, body)
+        }
+        ("POST", ["api", "hidden", "tasks", squad_id, ti]) => {
+            set_task_hidden(daemon, user_header, squad_id, ti, true)
+        }
+        ("DELETE", ["api", "hidden", "tasks", squad_id, ti]) => {
+            set_task_hidden(daemon, user_header, squad_id, ti, false)
         }
         // RAL-281: user-editable list of env-var names treated as secret --
         // see `crate::secret_env_names`'s module doc comment. RAL-332:
@@ -3167,6 +3205,122 @@ fn set_review_hidden(
             serde_json::json!({ "user_name": user_name }),
         );
     json(200, &HiddenStateResponse { hidden })
+}
+
+/// Hide/unhide one task (RAL-365) -- independent of its owning squad's own
+/// hidden state; see `hidden::hide_task`'s doc comment for the union rule.
+fn set_task_hidden(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    squad_id: &str,
+    ti: &str,
+    hidden: bool,
+) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let store = daemon.lock();
+    let result = if hidden {
+        store.hide_task(&user_name, squad_id, task_idx)
+    } else {
+        store.unhide_task(&user_name, squad_id, task_idx)
+    };
+    if let Err(e) = result {
+        return store_error(&e);
+    }
+    // RAL-332: admin-only Cartographer visibility -- see `set_squad_hidden`'s
+    // matching comment above.
+    let task_name = store.get_task_name(squad_id, task_idx).ok();
+    let mut note = crate::cartographer::Note::new("hidden")
+        .squad(squad_id)
+        .scope("task")
+        .admin_only();
+    if let Some(name) = task_name.as_deref() {
+        note = note.task(name);
+    }
+    note.emit(
+        &store,
+        if hidden {
+            "task hidden"
+        } else {
+            "task unhidden"
+        },
+        serde_json::json!({ "user_name": user_name, "task_idx": task_idx }),
+    );
+    json(200, &HiddenStateResponse { hidden })
+}
+
+/// Batch form of [`set_task_hidden`] -- one request for the board's
+/// multi-select Hide/Unhide menu items, applying every `(squad_id,
+/// task_idx)` pair under a single held `Store` lock instead of one HTTP
+/// round trip per task. Best-effort: a pair that fails (e.g. already
+/// deleted) is reported in `failed` rather than aborting the rest of the
+/// batch, and the response is still `200`.
+fn set_tasks_hidden_batch(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Reply {
+    let user_name = match require_current_user(daemon, user_header) {
+        Ok(name) => name,
+        Err(reply) => return reply,
+    };
+    let Ok(req) = serde_json::from_str::<HiddenTasksBatchBody>(body) else {
+        return error(400, "bad_request", "invalid body", vec![]);
+    };
+    if req.tasks.is_empty() {
+        return error(400, "bad_request", "tasks must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    let pairs: Vec<(String, i64)> = req
+        .tasks
+        .iter()
+        .map(|t| (t.squad_id.clone(), t.task_idx))
+        .collect();
+    let failed = store.set_tasks_hidden(&user_name, &pairs, req.hidden);
+    let failed_set: std::collections::HashSet<(&str, i64)> = failed
+        .iter()
+        .map(|((id, ti), _)| (id.as_str(), *ti))
+        .collect();
+    // RAL-332: admin-only Cartographer visibility -- see `set_squad_hidden`'s
+    // matching comment above. One note per task that actually changed,
+    // mirroring the granularity of the single-item endpoint.
+    for t in &req.tasks {
+        if failed_set.contains(&(t.squad_id.as_str(), t.task_idx)) {
+            continue;
+        }
+        let task_name = store.get_task_name(&t.squad_id, t.task_idx).ok();
+        let mut note = crate::cartographer::Note::new("hidden")
+            .squad(&t.squad_id)
+            .scope("task")
+            .admin_only();
+        if let Some(name) = task_name.as_deref() {
+            note = note.task(name);
+        }
+        note.emit(
+            &store,
+            if req.hidden {
+                "task hidden"
+            } else {
+                "task unhidden"
+            },
+            serde_json::json!({ "user_name": user_name, "task_idx": t.task_idx }),
+        );
+    }
+    json(
+        200,
+        &HiddenTasksBatchResponse {
+            hidden: req.hidden,
+            failed: failed
+                .into_iter()
+                .map(|((squad_id, task_idx), e)| HiddenTaskBatchFailure {
+                    squad_id,
+                    task_idx,
+                    error: e.to_string(),
+                })
+                .collect(),
+        },
+    )
 }
 
 /// All registered users (RAL-?) -- see `crate::users`'s module doc comment.

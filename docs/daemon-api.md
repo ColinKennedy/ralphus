@@ -43,12 +43,15 @@ where one exists.
 | GET | `/api/resolve` | [Resolve a ralphus URI](#get-apiresolve-ral-188) to positional coordinates; `?uri=` |
 | GET | `/api/ghosts/{owner_uri}` | [Fetch a ghost](#get-apighostsowner_uri) by its owning cell/review URI |
 | POST | `/api/ghosts/copy` | [Copy a ghost](#post-apighostscopy) onto another owner, independent of the dependency graph |
-| GET | `/api/hidden` | [List the current user's hidden squads and reviews](#hidden-items-ral-328) |
+| GET | `/api/hidden` | [List the current user's hidden squads, reviews, and tasks](#hidden-items-ral-328) |
 | POST | `/api/hidden/squads/{id}` | [Hide a squad for the current user](#hidden-items-ral-328) |
 | DELETE | `/api/hidden/squads/{id}` | [Re-enable a squad for the current user](#hidden-items-ral-328) |
 | POST | `/api/hidden/squads/batch` | [Hide/unhide many squads for the current user in one request](#hidden-items-ral-328) |
 | POST | `/api/hidden/reviews/{id}` | [Hide a review for the current user](#hidden-items-ral-328) |
 | DELETE | `/api/hidden/reviews/{id}` | [Re-enable a review for the current user](#hidden-items-ral-328) |
+| POST | `/api/hidden/tasks/{squad_id}/{task_idx}` | [Hide one task for the current user](#hidden-items-ral-328) |
+| DELETE | `/api/hidden/tasks/{squad_id}/{task_idx}` | [Re-enable a task for the current user](#hidden-items-ral-328) |
+| POST | `/api/hidden/tasks/batch` | [Hide/unhide many tasks for the current user in one request](#hidden-items-ral-328) |
 
 **Squads**
 | Method | Path | What |
@@ -787,21 +790,31 @@ This is caller-claimed identity, not authentication.
 ```json
 {
   "hidden": [
-    { "kind": "squad", "squad_id": "squad-000000000001", "guardian_id": null, "hidden_at_ms": 0 },
-    { "kind": "review", "squad_id": null, "guardian_id": "guardian-000000000001", "hidden_at_ms": 0 }
+    { "kind": "squad", "squad_id": "squad-000000000001", "guardian_id": null, "task_idx": null, "hidden_at_ms": 0 },
+    { "kind": "review", "squad_id": null, "guardian_id": "guardian-000000000001", "task_idx": null, "hidden_at_ms": 0 },
+    { "kind": "task", "squad_id": "squad-000000000001", "guardian_id": null, "task_idx": 2, "hidden_at_ms": 0 }
   ]
 }
 ```
 
-`POST /api/hidden/squads/{id}` and `POST /api/hidden/reviews/{id}` hide an
-entity. Repeating the request is a no-op and preserves the first
-`hidden_at_ms`; the response is `{ "hidden": true }`. The corresponding
-`DELETE` endpoints re-enable it idempotently and return `{ "hidden": false }`.
-Deleting a squad or review also deletes every user's preference for it.
+`POST /api/hidden/squads/{id}`, `POST /api/hidden/reviews/{id}`, and
+`POST /api/hidden/tasks/{squad_id}/{task_idx}` hide an entity. Repeating the
+request is a no-op and preserves the first `hidden_at_ms`; the response is
+`{ "hidden": true }`. The corresponding `DELETE` endpoints re-enable it
+idempotently and return `{ "hidden": false }`. Deleting a squad or review also
+deletes every user's preference for it and for any of its tasks.
+
+Hiding a task (RAL-365) is independent of hiding its owning squad -- the two
+are separate rows, unioned at read time by callers such as the board's Tasks
+tab. Unhiding a squad leaves an explicitly-hidden task of it still hidden,
+and hiding a squad does not itself hide (or write any row for) its tasks.
+`task_idx` addresses a task by its position within the squad (`tasks` has no
+separate id), which is stable for the squad's lifetime.
 
 These endpoints return `400 current_user_required` when neither identity
-source is set, `400 unknown_user` for an unregistered identity, and `404` when
-a hide request names an entity that does not exist.
+source is set, `400 unknown_user` for an unregistered identity, `400
+bad_request` when `{task_idx}` isn't an integer, and `404` when a hide request
+names an entity that does not exist.
 
 `POST /api/hidden/squads/batch` hides or unhides many squads in one request
 (RAL-331) -- the board's multi-select Hide/Unhide menu items send every
@@ -820,6 +833,19 @@ batch, and the response is still `200`:
 ```
 
 `400 bad_request` if `ids` is empty or the body doesn't parse.
+
+`POST /api/hidden/tasks/batch` is the same idea for `(squad_id, task_idx)`
+pairs (RAL-365):
+
+```json
+{ "tasks": [ { "squad_id": "squad-000000000001", "task_idx": 0 }, { "squad_id": "squad-000000000001", "task_idx": 2 } ], "hidden": true }
+```
+
+```json
+{ "hidden": true, "failed": [ { "squad_id": "squad-000000000001", "task_idx": 9, "error": "not found" } ] }
+```
+
+`400 bad_request` if `tasks` is empty or the body doesn't parse.
 
 ### `GET /api/secret-env-names`
 List the user-configurable set of env-var **names** treated as secret
