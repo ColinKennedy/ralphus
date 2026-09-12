@@ -7581,7 +7581,11 @@ fn cleanup_review_worktrees(
 /// accumulation in a daemon that runs for months.
 pub(crate) const WORKTREE_RETIREMENT_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
-fn normalized_worktree_path(path: &Path) -> String {
+/// Canonicalize a worktree path the same way regardless of which caller
+/// compares it -- also used by `crate::worktree_transcript_retirement`
+/// (RAL-348) so the sweep for a retiring worktree's session artifacts
+/// matches the exact same path a cell/proof's persisted `cwd` normalizes to.
+pub(crate) fn normalized_worktree_path(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
@@ -7810,13 +7814,27 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     crate::store::now_ms(),
                     None,
                 );
+                // RAL-348: the worktree itself is confirmed gone, so every
+                // cell/proof session that ever ran with it as `cwd` -- across
+                // every attempt/restart -- is now safe to forget too. Never
+                // called from the Deferred/OptedOut/Failed arms below: those
+                // worktrees are merely eligible or still blocked, not retired.
+                let transcripts_swept =
+                    crate::worktree_transcript_retirement::retire_session_artifacts_for_worktree(
+                        &guard,
+                        &record.path,
+                    );
                 crate::cartographer::Note::new("guardian")
                     .guardian(&record.guardian_id)
                     .scope("guardian")
                     .emit(
                         &guard,
                         "retired old guardian worktree",
-                        serde_json::json!({"worktree": record.path, "age_threshold_days": 30}),
+                        serde_json::json!({
+                            "worktree": record.path,
+                            "age_threshold_days": 30,
+                            "transcripts_swept": transcripts_swept,
+                        }),
                     );
             }
             crate::remote_runner::RetirementOutcome::Deferred {

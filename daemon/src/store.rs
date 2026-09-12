@@ -642,6 +642,21 @@ pub(crate) struct WorktreeClaim {
     pub state: String,
 }
 
+/// One persisted cell or proof session whose `cwd` may belong to a
+/// worktree, carrying enough identity to reconstruct the
+/// tmux/pane-snapshot/terminal-log session name that session used (see
+/// `tmux::session_name`). Used by
+/// `crate::worktree_transcript_retirement::retire_session_artifacts_for_worktree`
+/// to find every transcript/pane snapshot a retiring worktree's cells and
+/// proofs ever produced, across every attempt and restart (RAL-348).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeSessionOwner {
+    pub squad_id: String,
+    pub task_name: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
 /// One review-worktree path and the timestamp of its owner's last activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuardianWorktreeRecord {
@@ -4529,6 +4544,41 @@ impl Store {
                     owner: r.get(1)?,
                     path: r.get(2)?,
                     state: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every cell/proof session whose persisted `cwd` can name a worktree,
+    /// unfiltered by which one -- the path-equality check against a specific
+    /// worktree happens in Rust via `guardian_merge::normalized_worktree_path`,
+    /// the same canonicalizing comparison `retire_stale_worktrees` itself
+    /// uses, so a symlink or differently-cased path still matches. Proof
+    /// session ids are synthesized as `proof-{scope}-{idx}` to match what
+    /// `scheduler::run_proofs` actually runs them under; proof cwd selection
+    /// mirrors `worktree_claims` above. Used by
+    /// `worktree_transcript_retirement` (RAL-348).
+    pub(crate) fn worktree_session_owners(&self) -> Result<Vec<WorktreeSessionOwner>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.squad_id, t.name, c.sid, c.cwd
+             FROM cells c JOIN tasks t ON t.squad_id=c.squad_id AND t.idx=c.task_idx
+             WHERE c.cwd IS NOT NULL AND c.sid IS NOT NULL
+             UNION ALL
+             SELECT p.squad_id, t.name, 'proof-' || p.scope || '-' || p.idx, c.cwd
+             FROM proofs p JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
+                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
+                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
+             JOIN tasks t ON t.squad_id=p.squad_id AND t.idx=p.task_idx
+             WHERE c.cwd IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(WorktreeSessionOwner {
+                    squad_id: r.get(0)?,
+                    task_name: r.get(1)?,
+                    session_id: r.get(2)?,
+                    cwd: r.get(3)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)

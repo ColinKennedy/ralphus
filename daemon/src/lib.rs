@@ -63,6 +63,7 @@ pub mod vcs;
 pub mod watches;
 pub mod workspace;
 pub(crate) mod worktree_claims;
+pub(crate) mod worktree_transcript_retirement;
 pub mod worktrees;
 
 use std::path::PathBuf;

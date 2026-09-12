@@ -324,14 +324,15 @@ pub fn session_name(run_id: &str, task: &str, session_id: &str) -> String {
 /// well past the session ending (and a daemon restart), not just long enough
 /// for one runner invocation to hand off its result.
 ///
-/// Not yet cleaned up on run/guardian deletion — each snapshot is a small,
-/// bounded text file (`PANE_SNAPSHOT_MAX_LINES`), so this is a modest,
-/// bounded-per-entry disk-space cost over a long project lifetime, not the
-/// unbounded resource leak documented for orphaned tmux/psmux processes in
-/// `PSMUX_CRASH_NOTES.local.md`. Worth revisiting if it ever matters in
-/// practice (e.g. tie deletion to `Store::delete_run`/`clear_all`/
-/// `guardian_delete`, which would need to enumerate each deleted entity's
-/// session names before their rows are gone).
+/// Not cleaned up on run/guardian deletion itself -- each snapshot is a
+/// small, bounded text file (`PANE_SNAPSHOT_MAX_LINES`), so a leftover one is
+/// a modest, bounded-per-entry disk-space cost, not the unbounded resource
+/// leak documented for orphaned tmux/psmux processes in
+/// `PSMUX_CRASH_NOTES.local.md`. Retired instead by
+/// `crate::worktree_transcript_retirement` (RAL-348), which piggybacks on
+/// worktree retirement (`guardian_merge::retire_stale_worktrees`): once a
+/// worktree is gone, every cell/proof session that ever ran in it is safe to
+/// forget too, via [`delete_pane_snapshot`].
 fn pane_snapshot_dir() -> PathBuf {
     #[cfg(test)]
     {
@@ -468,6 +469,22 @@ fn read_pane_snapshot_in(dir: &std::path::Path, session_name: &str) -> Option<St
 #[must_use]
 pub fn read_pane_snapshot(session_name: &str) -> Option<String> {
     read_pane_snapshot_in(&pane_snapshot_dir(), session_name)
+}
+
+fn delete_pane_snapshot_in(dir: &std::path::Path, session_name: &str) {
+    let _ = std::fs::remove_file(pane_snapshot_path_in(dir, session_name));
+}
+
+/// Delete a session's persisted pane snapshot outright, if one exists.
+/// Best-effort and silent on any I/O error (including "already gone"),
+/// matching `terminal_log::delete_for_session`'s cleanup contract -- called
+/// by `crate::worktree_transcript_retirement` once the worktree a session
+/// ran in has itself been retired (RAL-348). This deletes rather than
+/// archives; unlike local worktree pruning, which has a remote backup,
+/// pane-snapshot archival before deletion has no destination yet and is
+/// deliberately deferred future work.
+pub fn delete_pane_snapshot(session_name: &str) {
+    delete_pane_snapshot_in(&pane_snapshot_dir(), session_name);
 }
 
 /// Strip genuinely empty trailing rows from a raw `capture-pane` result —
@@ -1754,6 +1771,21 @@ mod tests {
     fn pane_snapshot_missing_file_is_none() {
         let dir = TempSnapshotDir::new("missing");
         assert_eq!(read_pane_snapshot_in(&dir.0, "never-written"), None);
+    }
+
+    #[test]
+    fn delete_pane_snapshot_removes_the_file() {
+        let dir = TempSnapshotDir::new("delete");
+        write_pane_snapshot_in(&dir.0, "s", "some output");
+        assert!(pane_snapshot_path_in(&dir.0, "s").exists());
+        delete_pane_snapshot_in(&dir.0, "s");
+        assert!(!pane_snapshot_path_in(&dir.0, "s").exists());
+    }
+
+    #[test]
+    fn delete_pane_snapshot_of_a_never_written_session_is_a_silent_no_op() {
+        let dir = TempSnapshotDir::new("delete-missing");
+        delete_pane_snapshot_in(&dir.0, "never-written");
     }
 
     #[test]
