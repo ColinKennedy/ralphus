@@ -931,6 +931,12 @@ fn route_for_user(
         ("POST", ["api", "squads", id, "tasks", ti, "restart"]) => {
             restart_task(daemon, id, ti, body)
         }
+        ("POST", ["api", "squads", id, "tasks", ti, "rename"]) => {
+            rename_task_route(daemon, id, ti, body)
+        }
+        ("POST", ["api", "squads", id, "tasks", ti, "suggest-name"]) => {
+            suggest_task_name(daemon, id, ti, body)
+        }
         ("POST", ["api", "squads", id, "env"]) => set_squad_env(daemon, id, body),
         // RAL-324: each `POST .../env` route below has a read-only `GET` twin
         // on the same path serving that surface's resolved environment with
@@ -4864,6 +4870,123 @@ fn unsolo_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
         },
         Err(e) => store_error(&e),
     }
+}
+
+#[derive(Deserialize)]
+struct RenameTaskBody {
+    name: String,
+}
+
+/// `POST /api/squads/{id}/tasks/{ti}/rename` (RAL-398): rename a task's
+/// display name in place, via [`crate::store::Store::rename_task`]. Purely
+/// cosmetic — unlike a `"task"`-kind `POST .../edit`, this never resets the
+/// squad back to Pending. Body: `{"name": "<new-name>"}`. Returns the
+/// refreshed [`SquadView`].
+fn rename_task_route(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let Ok(req) = serde_json::from_str::<RenameTaskBody>(body) else {
+        return error(400, "bad_request", "invalid rename body", vec![]);
+    };
+    let guard = daemon.lock();
+    match guard.rename_task(id, task_idx, &req.name) {
+        Ok(()) => match guard.get_squad(id) {
+            Ok(squad) => json(200, &squad),
+            Err(e) => store_error(&e),
+        },
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SuggestNameBody {
+    cwd: String,
+    agent: String,
+    #[serde(default)]
+    model: Option<String>,
+    prompt_context: String,
+    /// The name to rename the task to if the LLM call fails or produces an
+    /// unusable result — the Simple tab passes its own `simple-<random>`
+    /// worktree-branch slug, so a failure here still ends the placeholder
+    /// state rather than leaving it stuck forever.
+    fallback_name: String,
+}
+
+/// `POST /api/squads/{id}/tasks/{ti}/suggest-name` (RAL-398): the Simple
+/// tab's automatic naming fallback for a prompt with no ticket-id-shaped
+/// token to name the task after (`extractTicketId` in
+/// `55-new-task-modal.js` handles the common case entirely client-side,
+/// with no LLM call at all). Spawns a background thread that runs one
+/// `"task_name"` generation call and, on success, renames the task and — if
+/// the squad's label is still unset — sets the squad's label too, both via
+/// direct store calls rather than the generic edit path (same rationale as
+/// [`rename_task_route`]: purely cosmetic, must not reset the squad to
+/// Pending). Mirrors `generate_start`'s fire-and-forget-plus-poll rationale
+/// for why this can't block the accept loop — except here there is no poll
+/// endpoint, since the caller (a squad that was just created) has nothing
+/// useful to do with the result beyond what this endpoint already applies
+/// on its behalf; the board picks up the renamed task/squad on its next
+/// regular poll. Always `202`, even for an unknown squad/task index — the
+/// background thread's `rename_task` failure is logged and otherwise
+/// swallowed, since there is no synchronous caller left to report it to.
+fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let req: SuggestNameBody = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid suggest-name request body: {e}"),
+                vec![],
+            );
+        }
+    };
+    let squad_id = id.to_string();
+    let store = daemon.store_handle();
+    let cancellations = daemon.cancellations_handle();
+    let cancel_id = format!("suggest-name-{squad_id}-{task_idx}");
+    std::thread::spawn(move || {
+        let token = cancellations.register(&cancel_id);
+        let gen_req = crate::generation::GenerateRequest {
+            kind: "task_name".to_string(),
+            cwd: req.cwd,
+            agent: req.agent,
+            model: req.model,
+            prompt_context: req.prompt_context,
+        };
+        let result = crate::generation::run_generation(&gen_req, &token);
+        cancellations.remove(&cancel_id);
+        let (name, label) = match result {
+            crate::generation::GenerationJob::Done { items } if !items.is_empty() => {
+                let item = &items[0];
+                match crate::generation::slugify_task_name(&item.value) {
+                    Some(slug) => (slug, Some(item.label.clone())),
+                    None => (req.fallback_name.clone(), None),
+                }
+            }
+            _ => (req.fallback_name.clone(), None),
+        };
+        let guard = store.lock().expect("store mutex poisoned");
+        if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [naming] suggest-name rename failed squad={squad_id} task_idx={task_idx}: {e}"
+            );
+        }
+        if let Some(label) = label {
+            let already_labeled = guard
+                .get_squad(&squad_id)
+                .is_ok_and(|s| s.label.as_deref().is_some_and(|l| !l.is_empty()));
+            if !already_labeled {
+                let _ = guard.edit_squad_label(&squad_id, Some(&label));
+            }
+        }
+    });
+    json(202, &serde_json::json!({}))
 }
 
 #[derive(Deserialize)]
@@ -16598,6 +16721,98 @@ command = "true"
             "POST",
             "/api/squads/squad-000000000001/tasks/nope/solo",
             "",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn rename_task_route_renames_and_returns_refreshed_squad() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            r#"{"name": "pipe-5163-add-retry-logic"}"#,
+        );
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["name"], "pipe-5163-add-retry-logic");
+    }
+
+    #[test]
+    fn rename_task_route_duplicate_name_is_conflict() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TWO_TASKS));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            r#"{"name": "b"}"#,
+        );
+        assert_eq!(r.status, 409);
+    }
+
+    #[test]
+    fn rename_task_route_unknown_squad_is_not_found() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-nope/tasks/0/rename",
+            r#"{"name": "x"}"#,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn rename_task_route_non_integer_index_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/nope/rename",
+            r#"{"name": "x"}"#,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn rename_task_route_invalid_body_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            "not json",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn suggest_task_name_non_integer_index_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/nope/suggest-name",
+            r#"{"cwd":".","agent":"claude","prompt_context":"do it","fallback_name":"fallback"}"#,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn suggest_task_name_invalid_body_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/suggest-name",
+            "not json",
         );
         assert_eq!(r.status, 400);
     }

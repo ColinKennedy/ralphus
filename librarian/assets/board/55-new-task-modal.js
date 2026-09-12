@@ -171,6 +171,11 @@
       /**
        * @typedef {object} NtSimpleState
        * @property {string} templateName
+       * @property {string} label Optional, user-typed squad label/task-name
+       *   basis (RAL-398). Left blank, the submit flow names the squad/task
+       *   after a ticket id found in the prompt, or (failing that) an
+       *   AI-suggested name applied once the background `suggest-name` job
+       *   resolves -- see `ntResolveNaming`.
        * @property {string} prompt
        * @property {{[fieldName: string]: string}} fieldValues
        * @property {string} agent
@@ -207,6 +212,7 @@
       function ntFreshSimpleState() {
         return {
           templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
+          label: "",
           prompt: "", fieldValues: {}, agent: ntAgentCatalogDefault, model: "",
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
           skipAutoBuild: true, generateAutoBuild: true,
@@ -441,6 +447,72 @@
         const cleaned = prompt.slice(0, 60).replace(/,/g, "").trim();
         return cleaned || null;
       }
+      // RAL-398: a ticket-id-shaped token found in the prompt (JIRA-style --
+      // a short alpha prefix, a separator, a number, optionally more
+      // separator-joined words) is a strong, free, zero-latency naming
+      // signal -- deliberately permissive (case-insensitive, `-`/`_`
+      // interchangeable) since a submitter isn't going to reformat their
+      // prompt to make the ticket easier to find.
+      const TICKET_ID_RE = /\b[a-z]{2,10}[-_]\d{2,8}(?:[-_][a-z0-9]+)*\b/i;
+      /**
+       * The first ticket-id-shaped token in `text` (e.g. `"PIPE-5163"`,
+       * `"dev_1234"`, `"FOO-980713-some_description"`), or `null` if none is
+       * found.
+       * @param {string} text
+       * @returns {string|null}
+       */
+      function extractTicketId(text) {
+        const m = TICKET_ID_RE.exec(text);
+        return m ? m[0] : null;
+      }
+      /**
+       * Sanitizes free text into a name safe to store as a task's `name`
+       * (and use as part of a git branch): lowercased, runs of anything
+       * other than `[a-z0-9]` collapsed to a single `-`, leading/trailing
+       * `-` trimmed, capped at 60 chars. Mirrors `slugify_task_name` in
+       * `daemon/src/generation.rs` (the same rules, applied to an
+       * AI-suggested name instead of user/ticket text) -- kept as a
+       * separate implementation since the two run in different runtimes,
+       * not as a shared module.
+       * @param {string} s
+       * @returns {string}
+       */
+      function slugifyTaskName(s) {
+        const slug = s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+        return slug.slice(0, 60);
+      }
+      /**
+       * @typedef {object} NtNaming
+       * @property {string|null} taskName A slug ready to use as the task's
+       *   `name`, or `null` when neither a typed label nor a ticket id was
+       *   available and an AI suggestion must be requested after submit.
+       * @property {string|null} squadLabel The squad label to submit
+       *   (verbatim typed text or the raw ticket id), or `null` when it must
+       *   wait on the same AI suggestion as `taskName`.
+       * @property {boolean} needsGeneration Whether the Simple tab must fire
+       *   `POST .../suggest-name` after submit.
+       */
+      /**
+       * Resolves the Simple tab's task name / squad label (RAL-398): a
+       * typed label wins outright; failing that, a ticket-id-shaped token in
+       * the prompt (found instantly, no LLM call); failing that, both are
+       * left unresolved so the caller falls back to a placeholder name and
+       * asks the daemon to suggest one in the background.
+       * @param {string} prompt
+       * @param {string} label
+       * @returns {NtNaming}
+       */
+      function ntResolveNaming(prompt, label) {
+        const typedLabel = label.trim();
+        if (typedLabel) {
+          return { taskName: slugifyTaskName(typedLabel), squadLabel: typedLabel, needsGeneration: false };
+        }
+        const ticket = extractTicketId(prompt);
+        if (ticket) {
+          return { taskName: slugifyTaskName(ticket), squadLabel: ticket, needsGeneration: false };
+        }
+        return { taskName: null, squadLabel: null, needsGeneration: true };
+      }
       // RALPHUS-SIMPLE-TAB:END
       // `ntSimple`'s initial value is assigned here, after the marked region
       // above, rather than at its `let` declaration near `ntFreshSimpleState`.
@@ -564,7 +636,13 @@
        * `[[review.action]]` entries); `"auto"` sets `triage = true` on the
        * work cell instead, with no `[[review]]` block (the daemon's Arbiter
        * pools and auto-creates the review later); `"none"` sets neither.
-       * @returns {string}
+       * @returns {{toml: string, naming: NtNaming, taskName: string, fallbackName: string}}
+       *   the assembled TOML plus the naming decision `submitTaskSimple`
+       *   needs to pick the squad label and decide whether to fire
+       *   `POST .../suggest-name` after submit (RAL-398). `taskName` is
+       *   what's actually in the TOML (a placeholder when generation is
+       *   still needed); `fallbackName` is the safe, non-placeholder name
+       *   to pass as `suggest-name`'s `fallback_name`.
        */
       function ntSimpleBuildToml() {
         const branch = `simple-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -575,10 +653,24 @@
         const upstream = ntSimple.upstreamBranch.trim() || "<<default>>";
         const cwd = `<<ralphus:new-worktree/${branch}?upstream=${upstream}>>`;
         const prompt = ntSimpleEffectivePrompt();
+        // RAL-398: the task's display `name` is resolved independently of
+        // `branch` (which stays the fast, always-unique, purely internal
+        // worktree slug) -- a ticket id or typed label names it instantly;
+        // otherwise `pending-name-<branch>` is a recognizable-as-temporary
+        // placeholder (see `ntTaskDisplayName`) until the post-submit
+        // `suggest-name` background job renames it for real. `fallbackName`
+        // (plain `branch`, no `pending-name-` prefix) is what the daemon
+        // renames to instead if that background call fails -- it must NOT
+        // reuse the placeholder text, or a failed rename would still match
+        // `ntTaskDisplayName`'s check and show "generating…" forever even
+        // though nothing is generating anymore.
+        const naming = ntResolveNaming(ntSimple.prompt, ntSimple.label);
+        const taskName = naming.taskName || `pending-name-${branch}`;
+        const fallbackName = naming.taskName || branch;
         /** @type {string[]} */
         const lines = [];
         lines.push("[[task]]");
-        lines.push(`name = ${tomlStr(branch)}`);
+        lines.push(`name = ${tomlStr(taskName)}`);
         lines.push(`project = ${tomlStr(ntSimple.project)}`);
         lines.push("");
         lines.push("[[task.cell]]");
@@ -629,7 +721,7 @@
             lines.push(`prompt = ${tomlStr(it.value.trim())}`);
           });
         }
-        return `${lines.join("\n")}\n`;
+        return { toml: `${lines.join("\n")}\n`, naming, taskName, fallbackName };
       }
       // ---------- generic editable-list-widget primitive (RAL-297) ----------
       // Reused as-is for proof steps, manual checks, and auto-build steps --
@@ -868,7 +960,11 @@
         const selectedProject = projects.find((p) => p.name === ntSimple.project);
         const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
         return `
-          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in default template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
+          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="Optional display name for this squad and its task, shown in the sidebar and board view.\nLeave blank to name it automatically: a ticket id (e.g. ABC-1234) found in your prompt is used if there is one; otherwise the agent is asked to suggest a short name once you submit.">
+            Squad label (optional)
+            <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.label)}" oninput="ntSimple.label=this.value" placeholder="e.g. PIPE-5163, or leave blank to auto-name">
+          </label>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in default template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
             Template
             <select style="${NT_INPUT_STYLE}" ${ntTemplatesFallback ? "disabled" : ""} onchange="ntSimple.templateName=this.value;ntSimple.fieldValues={};renderNewTaskModal()">${templateOptions}</select>
           </label>
@@ -990,7 +1086,7 @@
           return;
         }
 
-        const toml = ntSimpleBuildToml();
+        const { toml, naming, fallbackName } = ntSimpleBuildToml();
         const v = await ntValidateOne(toml);
         if (!v.valid) {
           errEl.innerHTML = (v.errors || []).map((e) => `line ${e.line ?? "?"}: ${esc(e.message)}`).join("<br>") || "validation failed";
@@ -998,7 +1094,8 @@
         }
         /** @type {(label: string|null) => Promise<Response>} */
         const postSquad = (label) => fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label }) });
-        let resp = await postSquad(ntSanitizeSquadLabel(ntSimple.prompt));
+        const squadLabel = naming.squadLabel === null ? null : ntSanitizeSquadLabel(naming.squadLabel);
+        let resp = await postSquad(squadLabel);
         if (!resp.ok) {
           const b = await resp.json().catch(() => ({}));
           // The label is sanitized above, but if the daemon still rejects
@@ -1012,8 +1109,36 @@
           }
         }
         if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        if (naming.needsGeneration) {
+          const created = await resp.json().catch(() => null);
+          if (created && created.squad_id) ntRequestSuggestedName(created.squad_id, fallbackName);
+        }
         ntSimpleResetKeepingProjectFields();
         closeModal(); tick();
+      }
+      /**
+       * Fires `POST /api/squads/{squadId}/tasks/0/suggest-name` (RAL-398)
+       * after a Simple-tab submit whose prompt had neither a typed label nor
+       * a ticket-id-shaped token to name the task after. Fire-and-forget --
+       * the daemon runs the naming call and applies the result (or falls
+       * back to `fallbackName`) entirely on its own background thread, so
+       * there is nothing here to poll: the renamed task/squad shows up on
+       * the board's next regular poll, whether or not this modal (or even
+       * this browser tab) is still open by then.
+       * @param {string} squadId
+       * @param {string} fallbackName
+       * @returns {void}
+       */
+      function ntRequestSuggestedName(squadId, fallbackName) {
+        const project = projects.find((p) => p.name === ntSimple.project);
+        const cwd = project ? project.path : ".";
+        fetch(`/api/squads/${encodeURIComponent(squadId)}/tasks/0/suggest-name`, {
+          method: "POST",
+          body: JSON.stringify({
+            cwd, agent: ntSimple.agent, model: ntSimple.model.trim() || undefined,
+            prompt_context: ntSimpleEffectivePrompt(), fallback_name: fallbackName,
+          }),
+        }).catch(() => {});
       }
 
       // ---------- new task modal: Files tab ----------

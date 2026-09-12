@@ -482,7 +482,7 @@
         const needsDot = row.needsMe ? `<span style="color:var(--accent)" data-tip="${esc(row.needsMeReason || "")}">●</span>` : "";
         return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
           + ttColCell("star", star)
-          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
+          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(ntTaskDisplayName(row.name))}</span>${needsDot}</span>`)
           + ttColCell("squad", ttSquadChipHtml(row))
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))

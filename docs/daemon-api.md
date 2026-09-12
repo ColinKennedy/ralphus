@@ -89,6 +89,8 @@ where one exists.
 | GET | *(each of the six `.../env` paths above)* | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that surface, secret values masked (RAL-324) |
 | POST | `/api/squads/{id}/tasks/{ti}/solo` | [Solo a task](#post-apisquadsidtaskstisolo) (RAL-157) — pauses every other task in the squad until un-soloed |
 | POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
+| POST | `/api/squads/{id}/tasks/{ti}/rename` | [Rename a task](#post-apisquadsidtaskstirename) (RAL-398) — purely cosmetic, unlike a `"task"`-kind edit |
+| POST | `/api/squads/{id}/tasks/{ti}/suggest-name` | [Auto-name a task/squad in the background](#post-apisquadsidtaskstisuggest-name) (RAL-398) — the Simple tab's naming fallback |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/terminal-ticket` | [Mint a one-shot ticket for the **remote** Open Agent terminal relay](#post-apisquadsidcellstisiterminal-ticket) (RAL-355 Phase 10) — a WebSocket alternative to `open-terminal?mode=agent` for cells running on a `machine`, since that route only ever spawns a window on the daemon's own desktop |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
@@ -2577,6 +2579,37 @@ squad or task index is a `404`; a non-integer `{ti}` is a `400`.
 Un-solo a task (RAL-157) — the reverse of
 [`POST /api/squads/{id}/tasks/{ti}/solo`](#post-apisquadsidtaskstisolo). Returns
 the refreshed `SquadView`. Idempotent; same error responses as `solo`.
+
+### `POST /api/squads/{id}/tasks/{ti}/rename`
+Rename a task's display name in place (RAL-398). Body: `{"name": "<new-name>"}`.
+Purely cosmetic — unlike a `"task"`-kind [`POST /api/squads/{id}/edit`](#post-apisquadsidedit),
+this never resets the squad back to Pending, since a name doesn't affect what
+runs. Rewrites the new name into any other same-squad task's `depends_on`
+that referenced the old one, so within-squad dependency wiring survives the
+rename. Returns the refreshed `SquadView` (`200`). `400` if the name is
+empty; `409` if another task in the squad already has that name; `404` for
+an unknown squad or task index.
+
+### `POST /api/squads/{id}/tasks/{ti}/suggest-name`
+The Simple tab's automatic naming fallback (RAL-398) for a prompt with no
+ticket-id-shaped token to name the task after — the common case (a token
+like `ABC-1234` in the prompt) is resolved entirely client-side by regex,
+with no LLM call and no request to this endpoint at all. Body:
+```json
+{"cwd": "...", "agent": "...", "model": "...", "prompt_context": "...", "fallback_name": "..."}
+```
+`model` is optional. Always `202`, immediately — this spawns a background
+thread (mirroring `POST /api/generate`'s fire-and-forget rationale) that runs
+one `"task_name"` generation call and, on success, renames the task and — if
+the squad's label is still unset — sets the squad's label too, both via
+direct store calls rather than the generic edit path (same rationale as
+`rename`: purely cosmetic, must not reset the squad to Pending). On failure
+(or an unusable result), the task is renamed to `fallback_name` instead, so
+it never gets stuck showing its `pending-name-...` placeholder forever.
+There is no poll endpoint for this job — the caller (a squad that was just
+created) has nothing useful to do with the result beyond what this endpoint
+already applies on its behalf, and the board picks up the renamed task/squad
+on its next regular poll.
 
 ### `POST /api/squads/{id}/cancel/preview`
 Dry-run preview of [`POST /api/squads/{id}/cancel`](#post-apisquadsidcancel)

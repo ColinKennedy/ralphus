@@ -5622,6 +5622,79 @@ impl Store {
         }
     }
 
+    /// Rename a task's display name in place. Purely cosmetic, unlike
+    /// `edit_task_fields`'s `"task"` edit kind: a name doesn't affect what
+    /// runs, so this never resets the squad back to Pending. Rewrites the
+    /// new name into any other same-squad task's `depends_on` that
+    /// referenced the old one, so within-squad dependency wiring survives
+    /// the rename. Used both by a direct user rename action and by the
+    /// Simple-tab auto-naming background job (`generation.rs`'s
+    /// `"task_name"` kind) once it resolves a suggested name.
+    pub fn rename_task(&self, squad_id: &str, task_idx: i64, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err(StoreError::InvalidTransition(
+                "task name must not be empty".to_string(),
+            ));
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx, name, depends_on FROM tasks WHERE squad_id=?")?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((_, old_name, _)) = rows.iter().find(|(idx, _, _)| *idx == task_idx) else {
+            return Err(StoreError::NotFound);
+        };
+        if old_name == new_name {
+            return Ok(());
+        }
+        if rows
+            .iter()
+            .any(|(idx, name, _)| *idx != task_idx && name == new_name)
+        {
+            return Err(StoreError::InvalidTransition(format!(
+                "task name \"{new_name}\" is already used in this squad"
+            )));
+        }
+        let old_name = old_name.clone();
+        self.conn.execute(
+            "UPDATE tasks SET name=? WHERE squad_id=? AND idx=?",
+            params![new_name, squad_id, task_idx],
+        )?;
+        for (idx, _, deps_json) in &rows {
+            if *idx == task_idx {
+                continue;
+            }
+            let mut deps = from_json(deps_json);
+            if deps.iter().any(|d| d == &old_name) {
+                for d in &mut deps {
+                    if *d == old_name {
+                        *d = new_name.to_string();
+                    }
+                }
+                self.conn.execute(
+                    "UPDATE tasks SET depends_on=? WHERE squad_id=? AND idx=?",
+                    params![to_json(&deps), squad_id, idx],
+                )?;
+            }
+        }
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+            &format!("squad:{squad_id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "task renamed",
+            Some(squad_id),
+        );
+        Ok(())
+    }
+
     /// Edit a proof step's editable definition fields. A field the caller
     /// didn't mention (`None` in `edit`) leaves the corresponding column
     /// untouched -- see [`ProofEdit`]'s doc comment.
@@ -13241,5 +13314,94 @@ command = "check-c"
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_task_renames_and_cascades_depends_on() {
+        let src = r#"
+[[task]]
+name = "a"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do a"
+
+[[task]]
+name = "b"
+depends_on = ["a"]
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do b"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+
+        store.rename_task(&id, 0, "renamed-a").unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].name, "renamed-a");
+        assert_eq!(
+            squad.tasks[1].depends_on,
+            vec!["renamed-a".to_string()],
+            "the sibling task's depends_on must follow the rename"
+        );
+    }
+
+    #[test]
+    fn rename_task_rejects_empty_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let err = store.rename_task(&id, 0, "   ").unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+    }
+
+    #[test]
+    fn rename_task_rejects_collision_with_a_sibling_task() {
+        let src = r#"
+[[task]]
+name = "a"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do a"
+
+[[task]]
+name = "b"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do b"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let err = store.rename_task(&id, 0, "b").unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+        // The rejected rename must not have partially applied.
+        assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "a");
+    }
+
+    #[test]
+    fn rename_task_unknown_squad_or_task_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.rename_task("squad-nope", 0, "x"),
+            Err(StoreError::NotFound)
+        ));
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert!(matches!(
+            store.rename_task(&id, 99, "x"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn rename_task_to_its_own_current_name_is_a_no_op() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_squad(&parse(SAMPLE), Some("my squad"), false)
+            .unwrap();
+        store.rename_task(&id, 0, "build").unwrap();
+        assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "build");
     }
 }

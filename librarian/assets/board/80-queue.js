@@ -344,7 +344,7 @@
         const goto = `<button class="q-goto" data-click="gotoSquadItemStopProp" data-squad-id="${esc(it.squad_id)}" data-kind="${esc(gotoKind)}" data-ti="${it.task_idx}" data-si="${it.cell_idx}" data-vi="${vi}" data-tip="Jump to this ${esc(kindLabel)} on the Squads tab.\nSelects the matching squad/task/cell/proof so you don't have to hunt for it manually.">↗</button>`;
         return `<div class="q-row item${selCls}" data-path="${esc(it.path)}" data-drop-before="${esc(it.path)}" style="padding-left:${pad}px" ${dnd}
             data-click="queueRowClick" data-ctx="queueMenu"
-            data-tip="${esc(kindLabel)} '${esc(it.name)}' — ${rd}.\nDrag to reorder (dependencies come along); right-click for Set position / Set status.\nOrder is a best-effort hint honored when a compute slot frees, not a hard guarantee.">${grip}${sdot(it.state)}<span class="q-name">${esc(it.name)} <span class="q-meta">${kindLabel}</span></span>${dep}${blocked}<span class="q-badge q-${rd}">${rd}</span>${goto}</div>`;
+            data-tip="${esc(kindLabel)} '${esc(it.name)}' — ${rd}.\nDrag to reorder (dependencies come along); right-click for Set position / Set status.\nOrder is a best-effort hint honored when a compute slot frees, not a hard guarantee.">${grip}${sdot(it.state)}<span class="q-name">${esc(ntTaskDisplayName(it.name))} <span class="q-meta">${kindLabel}</span></span>${dep}${blocked}<span class="q-badge q-${rd}">${rd}</span>${goto}</div>`;
       }
 
       // ---- selection ----
