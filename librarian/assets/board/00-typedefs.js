@@ -190,13 +190,17 @@
        * @property {string} [value]
        */
       /**
-       * One squad or review a user has chosen to hide from their own view
-       * (RAL-328/RAL-331). `squad_id`/`guardian_id` are mutually exclusive,
-       * set per `kind`.
+       * One squad, review, or (RAL-365) individual task a user has chosen
+       * to hide from their own view (RAL-328/RAL-331/RAL-365). `squad_id`
+       * is set for both "squad" and "task" kinds (a task's owning squad);
+       * `task_idx` is set only for "task". A hidden task and its owning
+       * hidden squad are independent rows -- see the daemon's
+       * `hidden::hide_task` doc comment for the union rule.
        * @typedef {object} HiddenItem
-       * @property {string} kind - "squad" | "review"
+       * @property {string} kind - "squad" | "review" | "task"
        * @property {string|null} squad_id
        * @property {string|null} guardian_id
+       * @property {number|null} task_idx
        * @property {number} hidden_at_ms
        */
       /**
@@ -206,6 +210,13 @@
        * @typedef {object} HiddenBatchResult
        * @property {boolean} hidden
        * @property {{id: string, error: string}[]} failed
+       */
+      /**
+       * Response from `POST /api/hidden/tasks/batch` (RAL-365) -- same idea
+       * as `HiddenBatchResult`, but keyed by `(squad_id, task_idx)` pairs.
+       * @typedef {object} HiddenTasksBatchResult
+       * @property {boolean} hidden
+       * @property {{squad_id: string, task_idx: number, error: string}[]} failed
        */
       /**
        * @typedef {object} GuardianView

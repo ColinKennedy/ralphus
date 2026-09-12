@@ -27,7 +27,7 @@
           <button id="tab-secrets" class="tab" style="display:none" onclick="showTab('secrets', true)" data-tip="Secrets — env-var names treated as secret (RAL-281).\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, in addition to the existing from_env-sourced agent-profile secrets.\nChanges apply immediately, no daemon restart needed.\nAdmin-only (RAL-332).">Secrets</button>
           <button id="tab-worktree-retirement" class="tab" style="display:none" onclick="showTab('worktree-retirement', true)" data-tip="Worktree retirement (RAL-385/386) — every review worktree across every review, by retirement state: scheduled, eligible, claimed, failed, deferred, opted_out, retired.\nA daily daemon sweep removes review worktrees idle 30+ days; anyone watching a review gets one mailbox heads-up before its worktree is actually removed.\nAdmin-only in this UI (RAL-332) -- the same data is queryable by any user via `ralphus review worktree-retirements`, admin or not.">⏳ Retirement</button>
           <!-- RAL-329: reached via the ⚙ button in the header, not the visible tab row -- kept as a real tab button (hidden) so it shares showTab's page show/hide bookkeeping. -->
-          <button id="tab-prefs" class="tab" style="display:none" onclick="showTab('prefs', true)" data-tip="Preferences — your theme setting and your hidden squads/reviews.">Preferences</button>
+          <button id="tab-prefs" class="tab" style="display:none" onclick="showTab('prefs', true)" data-tip="Preferences — your theme setting and your hidden squads/reviews/tasks.">Preferences</button>
         </nav>
       </div>
       <div class="status-right">
@@ -37,7 +37,7 @@
         </div>
         <span id="updated" data-tip="Last time the CURRENT tab refreshed its own view of the daemon.\nRefreshes are pushed by the daemon as things change, with a slower periodic re-check as a safety net — so this updates whenever something actually happened, not on a fixed clock. Resets to — on switching tabs until that tab loads its own data, and shows 'daemon unreachable' instead of a stale time when a fetch fails.">—</span>
         <button class="icon-btn" onclick="openGotoSearch()" id="goto-search-btn" data-tip="Open task go-to search across every squad.\nWho/when: use this from any tab when you know a task name but not where its squad currently is.\nHotkey: press / while you're not typing in an input.">⌕</button>
-        <button class="icon-btn" onclick="showTab('prefs', true)" id="prefs-btn" data-tip="Preferences — your theme setting and your hidden squads/reviews.\nWho/when: open this to re-enable something you previously hid, or to switch theme from a dedicated page instead of the toggle below.\nOnly affects your own view — resolved from the X-Ralphus-User header, falling back to default_user. There is no sign-in yet (RAL-252).">⚙</button>
+        <button class="icon-btn" onclick="showTab('prefs', true)" id="prefs-btn" data-tip="Preferences — your theme setting and your hidden squads/reviews/tasks.\nWho/when: open this to re-enable something you previously hid, or to switch theme from a dedicated page instead of the toggle below.\nOnly affects your own view — resolved from the X-Ralphus-User header, falling back to default_user. There is no sign-in yet (RAL-252).">⚙</button>
         <button class="icon-btn" onclick="toggleTheme()" id="theme-btn" aria-label="Toggle theme" data-tip="Toggle the board theme — the flashbang icon is the bright light theme, the night-vision goggles are the dark theme.\nUse it if the current theme is hard on your eyes or to match your surroundings."><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="13" r="4.4"/><circle cx="16" cy="13" r="4.4"/><circle cx="8" cy="13" r="1.9"/><circle cx="16" cy="13" r="1.9"/><line x1="12" y1="11.8" x2="12" y2="14.2"/><path d="M7.6 8.7c-2.5-1.2-4.2-1.2-4.5-2"/><path d="M16.4 8.7c2.5-1.2 4.2-1.2 4.5-2"/></svg></button>
 
       </div>
@@ -76,7 +76,7 @@
       <div style="grid-area:toolbar" class="tt-toolbar">
         <input type="text" id="tt-filter" placeholder="filter by task name…" oninput="ttSetNameFilter(this.value)" data-tip="Filter rows by task name (case-insensitive substring).\nWho/when: narrow a board with thousands of tasks down to the ones you're looking for." />
         <div class="row" id="tt-status-filters"></div>
-        <label data-tip="Include tasks belonging to a squad you've hidden from your own view (Squads tab).\nHiding is squad-level only -- there is no per-task hiding yet.\nA personal preference — it never changes anything's status, and never affects what other users see.">
+        <label data-tip="Include tasks you've explicitly hidden and tasks belonging to a squad you've hidden (Squads tab). A revealed hidden row is marked with 🙈.\nA personal preference — it never changes anything's status, and never affects what other users see.">
           <input type="checkbox" id="tt-show-hidden" onchange="ttToggleShowHidden(this.checked)"> show hidden
         </label>
         <label class="tt-needs-me-chip" data-tip="Only rows you're watching (directly or via a watched squad) that are blocked on you: failed, awaiting your review approval, or approved with no PR submitted yet.\nUnwatched work never appears here, even if it's failed -- turn on Auto-watch in Preferences to watch everything.">
@@ -227,12 +227,13 @@
         <button class="icon-btn" onclick="toggleTheme()" id="prefs-theme-btn" aria-label="Toggle theme" data-tip="Toggle the board theme — the flashbang icon is the bright light theme, the night-vision goggles are the dark theme.\nUse it if the current theme is hard on your eyes or to match your surroundings."></button>
       </div>
       <div class="row" style="justify-content:space-between;margin-bottom:12px;align-items:baseline">
-        <b data-tip="Hidden squads and reviews (RAL-328) — items you've chosen to omit from your normal views.\nA hidden item is removed from this list the moment its underlying squad/review is deleted, so everything shown here is always live.">Hidden items</b>
+        <b data-tip="Hidden squads, reviews, and tasks (RAL-328/RAL-365) — items you've chosen to omit from your normal views.\nA hidden item is removed from this list the moment its underlying squad/review/task is deleted, so everything shown here is always live.">Hidden items</b>
       </div>
       <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:10px">
         <input id="hidden-filter" type="text" placeholder="search hidden items by name or id…" oninput="onHiddenFilter(this.value)" style="width:280px" data-tip="Filter the list below by squad/review name or id." />
         <label data-tip="Show hidden squads."><input type="checkbox" id="hidden-filter-squad" checked onchange="toggleHiddenType('squad', this.checked)"> Squads</label>
         <label data-tip="Show hidden reviews."><input type="checkbox" id="hidden-filter-review" checked onchange="toggleHiddenType('review', this.checked)"> Reviews</label>
+        <label data-tip="Show individually-hidden tasks (RAL-365) -- not tasks that are only hidden because their squad is hidden."><input type="checkbox" id="hidden-filter-task" checked onchange="toggleHiddenType('task', this.checked)"> Tasks</label>
       </div>
       <div id="hidden-items"><div class="empty">Loading…</div></div>
     </main>

@@ -116,7 +116,7 @@
       function renderTasksTab() {
         ttAllRows = ttBuildRows();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
-        const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys));
+        const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys));
         filtered.sort((a, b) => ttCompareRows(a, b, taskTabFilters.sort) * taskTabFilters.dir);
         ttDisplayItems = ttBuildDisplayList(filtered, taskTabFilters.groupBySquad, taskTabExpanded);
         renderTtSummary(ttAllRows, filtered, needsMeKeys);
@@ -579,10 +579,16 @@
             : "Watching this task. Click to unwatch.";
         const star = `<span class="tt-star ${starCls}" onclick="event.stopPropagation();ttToggleWatch('${esc(row.squadId)}',${row.taskIdx})" data-tip="${esc(starTip)}">${row.watch.inherited ? "◆" : "★"}</span>`;
         const needsDot = row.needsMe ? `<span style="color:var(--accent)" data-tip="${esc(row.needsMeReason || "")}">●</span>` : "";
+        // RAL-365: only drawn once "show hidden" has revealed the row --
+        // an explicitly-hidden task and a task of a hidden squad get the
+        // same marker, distinguished only by the tooltip.
+        const hiddenMarker = taskTabFilters.showHidden && ttRowIsHidden(row, hiddenSquadIds, hiddenTaskKeys)
+          ? `<span data-tip="${esc(hiddenTaskKeys.has(row.key) ? "This task is hidden from your own view." : "This task's squad is hidden from your own view.")}">🙈</span>`
+          : "";
         return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
           + ttColCell("sel", selCb)
           + ttColCell("star", star)
-          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
+          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}${hiddenMarker}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
           + ttColCell("squad", ttSquadChipHtml(row))
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
@@ -867,13 +873,14 @@
        * Opens the row meatball menu (RAL-362 §3: "the only place task actions
        * live") -- reuses the Squads tab's own task graph-node menu
        * (restart/stop/status/solo) verbatim, plus Tasks-tab-only shortcuts
-       * (open on Squads tab, hide/unhide the squad). RAL-350: when the
-       * clicked row is part of the current multi-selection, every action
-       * (including the graph-node menu's own restart/stop/status/solo)
-       * applies to every selected row still visible under the current
-       * filter (`ttVisibleSelectedRows`) instead of just this one --
-       * except "Open in Squads tab", which stays single-target only and is
-       * shown disabled with an explanatory tooltip rather than hidden.
+       * (open on Squads tab, hide/unhide the squad, hide/unhide the task
+       * itself (RAL-365)). RAL-350: when the clicked row is part of the
+       * current multi-selection, every action (including the graph-node
+       * menu's own restart/stop/status/solo) applies to every selected row
+       * still visible under the current filter (`ttVisibleSelectedRows`)
+       * instead of just this one -- except "Open in Squads tab", which
+       * stays single-target only and is shown disabled with an explanatory
+       * tooltip rather than hidden.
        * @param {MouseEvent} e
        * @param {string} squadId
        * @param {number} taskIdx
@@ -891,25 +898,33 @@
         if (!menu) return;
         const multi = rows.length > 1;
         _ttRowMenuSquadIds = [...new Set(rows.map((r) => r.squadId))];
+        _ttRowMenuTaskRefs = rows.map((r) => ({ squadId: r.squadId, taskIdx: r.taskIdx }));
         const openRow = multi
           ? `<span data-tip="Open in Squads tab is single-target only -- it can't jump to more than one task's place in the dependency graph at once. Select just this one task to use it.">`
             + `<div style="opacity:.5;cursor:not-allowed;pointer-events:none">↗ Open in Squads tab</div></span>`
           : `<div onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Open this task on the Squads tab, where the full dependency graph and every task action live.">↗ Open in Squads tab</div>`;
         const squadWord = _ttRowMenuSquadIds.length === 1 ? "squad" : "squads";
-        const hideRow = multi
-          ? `<div onclick="ttHideSquads(true)" data-tip="Hide the ${squadWord} of all ${rows.length} selected tasks from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide ${_ttRowMenuSquadIds.length} ${squadWord}</div>`
+        const hideSquadRow = multi
+          ? `<div onclick="ttHideSquads(true)" data-tip="Hide the ${squadWord} of all ${rows.length} selected tasks from your own view.">🙈 Hide ${_ttRowMenuSquadIds.length} ${squadWord}</div>`
             + `<div onclick="ttHideSquads(false)" data-tip="Re-enable the ${squadWord} of all ${rows.length} selected tasks in your own view.">🙉 Unhide ${_ttRowMenuSquadIds.length} ${squadWord}</div>`
           : hiddenSquadIds.has(squadId)
             ? `<div onclick="ttHideSquads(false)" data-tip="Re-enable this task's squad in your own view (Squads tab).">🙉 Unhide squad</div>`
-            : `<div onclick="ttHideSquads(true)" data-tip="Hide this task's whole squad from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide squad</div>`;
-        menu.insertAdjacentHTML("beforeend", `<div class="ctx-sep"></div>${openRow}${hideRow}`);
+            : `<div onclick="ttHideSquads(true)" data-tip="Hide this task's whole squad from your own view.">🙈 Hide squad</div>`;
+        const taskWord = rows.length === 1 ? "task" : "tasks";
+        const hideTaskRow = multi
+          ? `<div onclick="ttHideTasks(true)" data-tip="Hide these ${rows.length} selected tasks from your own view, independent of their squads' hidden state.">🙈 Hide ${rows.length} ${taskWord}</div>`
+            + `<div onclick="ttHideTasks(false)" data-tip="Re-enable these ${rows.length} selected tasks in your own view.">👁 Unhide ${rows.length} ${taskWord}</div>`
+          : hiddenTaskKeys.has(key)
+            ? `<div onclick="ttHideTasks(false)" data-tip="Re-enable this task in your own view.">👁 Unhide task</div>`
+            : `<div onclick="ttHideTasks(true)" data-tip="Hide this task from your own view, independent of its squad's hidden state.">🙈 Hide task</div>`;
+        menu.insertAdjacentHTML("beforeend", `<div class="ctx-sep"></div>${openRow}${hideTaskRow}${hideSquadRow}`);
       }
       /**
        * Hides/unhides every squad captured by the currently open Tasks-tab
        * row meatball menu (`_ttRowMenuSquadIds`, RAL-350) -- one squad for a
        * single-row menu, or the deduplicated squads of every selected,
-       * visible row for a multi-row menu. Hiding stays squad-level only
-       * (RAL-331); there is no per-task hiding.
+       * visible row for a multi-row menu. Independent of `ttHideTasks` --
+       * hiding a squad never writes a task-hidden row (RAL-365 union rule).
        * @param {boolean} hide
        * @returns {Promise<void>}
        */
@@ -924,6 +939,39 @@
           if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
           if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
         }
+        renderTasksTab();
+      }
+      /**
+       * Hides/unhides every task captured by the currently open Tasks-tab
+       * row meatball menu (`_ttRowMenuTaskRefs`, RAL-365) -- one task for a
+       * single-row menu, or every selected, currently-visible row for a
+       * multi-row menu. Uses the batch endpoint (one request) rather than
+       * looping, mirroring the Squads tab's own `setSquadsHiddenBatch`.
+       * @param {boolean} hide
+       * @returns {Promise<void>}
+       */
+      async function ttHideTasks(hide) {
+        ttCloseColMenu();
+        closeGraphMenu();
+        const refs = _ttRowMenuTaskRefs;
+        if (!refs.length) return;
+        let resp;
+        try {
+          resp = await post("/api/hidden/tasks/batch", {
+            tasks: refs.map((r) => ({ squad_id: r.squadId, task_idx: r.taskIdx })),
+            hidden: hide,
+          });
+        } catch (e) { alert("daemon unreachable"); return; }
+        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        /** @type {HiddenTasksBatchResult} */
+        const result = await resp.json();
+        const failedKeys = new Set(result.failed.map((f) => `${f.squad_id}:${f.task_idx}`));
+        for (const r of refs) {
+          const key = `${r.squadId}:${r.taskIdx}`;
+          if (failedKeys.has(key)) continue;
+          if (hide) hiddenTaskKeys.add(key); else hiddenTaskKeys.delete(key);
+        }
+        if (result.failed.length) alert(`${result.failed.length} task(s) could not be ${hide ? "hidden" : "unhidden"} (already deleted?).`);
         renderTasksTab();
       }
       // RALPHUS-TT-SCROLL-SELECTION:BEGIN
@@ -1079,14 +1127,17 @@
       let multiSel = new Set();
       /** @type {Set<string>} multi-selected task/cell/proof nodes in the current graph */
       let nodeMultiSel = new Set();
-      // RAL-328/RAL-331: the current user's hidden-item set, refreshed by
-      // pollHidden() every tick regardless of active tab (goto-search and
-      // both sidebars need it). Hiding is a personal view preference -- it
-      // never changes `squads`/`guardians` themselves or their counters.
+      // RAL-328/RAL-331/RAL-365: the current user's hidden-item set,
+      // refreshed by pollHidden() every tick regardless of active tab
+      // (goto-search and both sidebars need it). Hiding is a personal view
+      // preference -- it never changes `squads`/`guardians`/tasks
+      // themselves or their counters.
       /** @type {Set<string>} squad ids the current user has hidden */
       let hiddenSquadIds = new Set();
       /** @type {Set<string>} guardian ids the current user has hidden */
       let hiddenGuardianIds = new Set();
+      /** @type {Set<string>} "<squadId>:<taskIdx>" keys of explicitly-hidden tasks (RAL-365) */
+      let hiddenTaskKeys = new Set();
       // A hidden item still shown because it's the one the user just
       // navigated to (goto-search, the Running widget, a Cartographer link,
       // a direct URL) -- "reveal just this one" rather than flipping the
