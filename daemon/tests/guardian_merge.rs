@@ -26,6 +26,7 @@ use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
 use ralphus_daemon::server::{Daemon, route};
 use ralphus_daemon::store::{NodeState, Store};
+use ralphus_daemon::store_lock::StoreMutex;
 use ralphus_daemon::workspace::Workspace;
 
 fn write(root: &Path, name: &str, content: &str) {
@@ -246,13 +247,13 @@ impl Runner for FeedbackRunner {
 /// directly from inside the resolver call, before `run_feedback` goes on to
 /// restack the downstream branches.
 struct RaceInjectingRunner {
-    store: Arc<Mutex<Store>>,
+    store: Arc<StoreMutex>,
     id: String,
 }
 impl Runner for RaceInjectingRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
-        let _ = self.store.lock().unwrap().set_guardian_status(
+        let _ = self.store.lock().set_guardian_status(
             &self.id,
             GuardianStatus::MergeFailed,
             Some("simulated concurrent failure"),
@@ -433,9 +434,9 @@ fn builds_review_branch_from_two_features() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("review", "main", root.to_str().unwrap())
             .unwrap();
@@ -446,7 +447,7 @@ fn builds_review_branch_from_two_features() {
 
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let review = view.review_branch.expect("review branch set");
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
@@ -459,9 +460,9 @@ fn builds_review_branch_from_two_features() {
 
 #[test]
 fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (root, gid) = {
-        let mut guard = store.lock().unwrap();
+        let mut guard = store.lock();
         setup_review_with_pending_last_branch(&mut guard)
     };
 
@@ -479,7 +480,7 @@ fn start_merge_defers_while_an_enabled_branch_is_still_pending() {
         reply.body
     );
 
-    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let guardian = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(guardian.status, "collecting");
     assert_eq!(guardian.base_branch, "main");
     assert_eq!(guardian.branches[0].merge_status, "ready");
@@ -498,11 +499,8 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
     let (root, store, gid, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
     mark_ready(&store, &gid, &bids[0]);
 
-    store.lock().unwrap().cancel_guardian(&gid).unwrap();
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&gid).unwrap().status,
-        "cancelled"
-    );
+    store.lock().cancel_guardian(&gid).unwrap();
+    assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "cancelled");
 
     let reply = reopen_cancelled_guardian_merge(
         Arc::clone(&store),
@@ -520,13 +518,13 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
 
     // The staged pass runs on a spawned thread; poll until it lands somewhere
     // other than the transient `merging` state `claim_guardian_merge` set.
-    let mut guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let mut guardian = store.lock().get_guardian(&gid).unwrap();
     for _ in 0..600 {
         if guardian.status != "merging" {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
-        guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        guardian = store.lock().get_guardian(&gid).unwrap();
     }
     assert_eq!(
         guardian.status, "collecting",
@@ -544,9 +542,9 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
 
 #[test]
 fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (root, gid) = {
-        let mut guard = store.lock().unwrap();
+        let mut guard = store.lock();
         setup_review_with_pending_last_branch(&mut guard)
     };
 
@@ -561,7 +559,7 @@ fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
     );
     assert_eq!(reply.status, 500, "body={}", reply.body);
 
-    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let guardian = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(guardian.status, "collecting");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -572,7 +570,7 @@ fn change_base_route_records_base_but_defers_merge_while_last_branch_is_pending(
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
     let store = daemon.store_handle();
     let (root, gid) = {
-        let mut guard = store.lock().unwrap();
+        let mut guard = store.lock();
         setup_review_with_pending_last_branch(&mut guard)
     };
 
@@ -591,7 +589,7 @@ fn change_base_route_records_base_but_defers_merge_while_last_branch_is_pending(
         "We will use 'release/2026' once the branches are ready to merge."
     );
 
-    let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let guardian = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(guardian.status, "collecting");
     assert_eq!(guardian.base_branch, "release/2026");
     assert_eq!(guardian.branches[0].merge_status, "ready");
@@ -664,9 +662,9 @@ fn squash_collapses_multi_commit_branch_to_single_commit() {
     git(&root, &["checkout", "main"]);
 
     let root_str = root.to_str().unwrap().to_string();
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g.create_guardian("r", "main", &root_str).unwrap();
         g.add_guardian_branch(&id, "feature/a").unwrap();
         // Enable squash for this (single) project.
@@ -675,7 +673,7 @@ fn squash_collapses_multi_commit_branch_to_single_commit() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         view.squash_projects.contains(&root_str),
@@ -726,9 +724,9 @@ fn squash_setting_is_per_project_independent() {
     let a_str = root_a.to_str().unwrap().to_string();
     let b_str = root_b.to_str().unwrap().to_string();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g.create_guardian("multi", "main", &a_str).unwrap();
         g.add_guardian_branch_with_project(&id, "feature/a", Some(&a_str))
             .unwrap();
@@ -740,7 +738,7 @@ fn squash_setting_is_per_project_independent() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let rb = |branch: &str| -> String {
@@ -788,9 +786,9 @@ fn without_squash_multi_commit_branch_is_preserved() {
     }
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -799,7 +797,7 @@ fn without_squash_multi_commit_branch_is_preserved() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let review = view.review_branch.expect("review branch set");
     let count = git(&root, &["rev-list", "--count", &format!("main..{review}")]);
@@ -831,9 +829,9 @@ fn per_branch_and_combined_worktrees_are_recorded() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -843,7 +841,7 @@ fn per_branch_and_combined_worktrees_are_recorded() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     // Each feature has its own recorded review branch + worktree on disk.
@@ -900,9 +898,9 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -913,7 +911,7 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     run_merge(&store, &NoopRunner, &id);
 
     // Give feedback on branch 0 (feature/a); the agent adds note.txt.
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     run_feedback(
@@ -927,7 +925,7 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
         &CancelToken::never(),
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     // The feedback lands on branch 0's review branch...
@@ -991,9 +989,9 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1003,12 +1001,11 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     let pr_id = store
         .lock()
-        .unwrap()
         .create_pull_request(
             &id,
             Some(&bid0),
@@ -1024,12 +1021,11 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
         .unwrap();
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_fix_pr_errors(&id, Some(true))
         .unwrap();
 
-    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
-    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
     let failure = ralphus_daemon::forge::PrFailure {
         reason: "check 'build' failed".to_string(),
         job_url: None,
@@ -1040,13 +1036,13 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
 
     let calls_after_first = runner.calls.load(Ordering::Relaxed);
     assert!(calls_after_first > 0, "the resolver agent must have run");
-    let pr_after = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let pr_after = store.lock().get_pull_request(&pr_id).unwrap();
     assert!(
         pr_after.auto_fix_attempted_at_ms.is_some(),
         "single-attempt marker must be stamped"
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let sha0 = git(&root, &["rev-parse", &rev0]).trim().to_string();
@@ -1064,7 +1060,6 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
 
     let page = store
         .lock()
-        .unwrap()
         .cartographer_query(&CartographerFilter {
             guardian_id: Some(id.clone()),
             ..CartographerFilter::recent(10)
@@ -1078,7 +1073,7 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     );
 
     // A second poll tick against the now-stamped PR is a no-op.
-    let guardian2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let guardian2 = store.lock().get_guardian(&id).unwrap();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
         &store, &runner, &guardian2, &pr_after, &failure,
     );
@@ -1087,7 +1082,7 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
         calls_after_first,
         "a second dispatch against an already-attempted PR must not run the agent again"
     );
-    let rev0_again = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let rev0_again = store.lock().get_guardian(&id).unwrap().branches[0]
         .review_branch
         .clone()
         .unwrap();
@@ -1130,9 +1125,9 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1142,12 +1137,11 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     let pr_id = store
         .lock()
-        .unwrap()
         .create_pull_request(
             &id,
             Some(&bid0),
@@ -1163,21 +1157,19 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         .unwrap();
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_fix_pr_errors(&id, Some(true))
         .unwrap();
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_fix_prompt_template(
             &id,
             Some("Fix this: <<prompt>> (see {insert URL here})"),
         )
         .unwrap();
 
-    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    let guardian = store.lock().get_guardian(&id).unwrap();
     let worktree = guardian.branches[0].worktree.clone().expect("worktree");
-    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
     let failure = ralphus_daemon::forge::PrFailure {
         reason: "check 'test' failed".to_string(),
         job_url: None,
@@ -1190,7 +1182,7 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
     let log_contents = std::fs::read_to_string(&log_path).expect("ci failure log written");
     assert_eq!(log_contents, "line1\nline2\nline3\n");
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
     assert!(files0.contains("fix.txt"), "auto-fix commit on branch 0");
@@ -1227,9 +1219,9 @@ fn run_feedback_marks_its_reviewer_message_done_on_success() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1237,13 +1229,12 @@ fn run_feedback_marks_its_reviewer_message_done_on_success() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
 
     let seq = store
         .lock()
-        .unwrap()
         .add_guardian_message(
             &id,
             "reviewer",
@@ -1255,11 +1246,7 @@ fn run_feedback_marks_its_reviewer_message_done_on_success() {
         )
         .unwrap();
     assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .guardian_branch_messages(&id, &bid0)
-            .unwrap()[0]
+        store.lock().guardian_branch_messages(&id, &bid0).unwrap()[0]
             .action_status
             .as_deref(),
         Some("received")
@@ -1276,11 +1263,7 @@ fn run_feedback_marks_its_reviewer_message_done_on_success() {
         &CancelToken::never(),
     );
 
-    let msgs = store
-        .lock()
-        .unwrap()
-        .guardian_branch_messages(&id, &bid0)
-        .unwrap();
+    let msgs = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
     assert_eq!(msgs[0].action_status.as_deref(), Some("done"));
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1310,9 +1293,9 @@ fn run_feedback_marks_its_reviewer_message_failed_on_agent_error() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1320,13 +1303,12 @@ fn run_feedback_marks_its_reviewer_message_failed_on_agent_error() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
 
     let seq = store
         .lock()
-        .unwrap()
         .add_guardian_message(&id, "reviewer", "please fix", None, Some(&bid0), None, None)
         .unwrap();
 
@@ -1341,11 +1323,7 @@ fn run_feedback_marks_its_reviewer_message_failed_on_agent_error() {
         &CancelToken::never(),
     );
 
-    let msgs = store
-        .lock()
-        .unwrap()
-        .guardian_branch_messages(&id, &bid0)
-        .unwrap();
+    let msgs = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
     assert_eq!(msgs[0].action_status.as_deref(), Some("failed"));
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1390,9 +1368,9 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1400,7 +1378,7 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
 
@@ -1409,26 +1387,17 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
     // (or partway through it -- either way, nothing cleared this record).
     store
         .lock()
-        .unwrap()
         .set_branch_pending_feedback(&id, &bid0, "add a note file")
         .unwrap();
     assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .branches_with_pending_feedback()
-            .unwrap(),
+        store.lock().branches_with_pending_feedback().unwrap(),
         vec![(id.clone(), bid0.clone(), "add a note file".to_string())],
         "the crash-simulated pending feedback must be durably findable"
     );
 
     // Simulate daemon restart recovery: reapply every branch's pending
     // feedback exactly as `scheduler::recover_interrupted_reviews` does.
-    let pending = store
-        .lock()
-        .unwrap()
-        .branches_with_pending_feedback()
-        .unwrap();
+    let pending = store.lock().branches_with_pending_feedback().unwrap();
     for (gid, branch_id, feedback) in pending {
         run_feedback(
             &store,
@@ -1443,7 +1412,7 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
     }
 
     // The feedback actually landed -- not just a status flip.
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
     assert!(
@@ -1461,7 +1430,6 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
     assert!(
         store
             .lock()
-            .unwrap()
             .branches_with_pending_feedback()
             .unwrap()
             .is_empty(),
@@ -1502,9 +1470,9 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1515,13 +1483,13 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
 
     // RAL-389 queues terminal transitions without running forge work inline.
     assert!(
-        store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        store.lock().get_guardian(&id).unwrap().branches[0]
             .auto_submit_error
             .is_none(),
         "precondition: no auto-submit work ran synchronously"
@@ -1538,18 +1506,14 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         &CancelToken::never(),
     );
 
-    let due = store
-        .lock()
-        .unwrap()
-        .take_due_auto_submits(i64::MAX / 2, 0)
-        .unwrap();
+    let due = store.lock().take_due_auto_submits(i64::MAX / 2, 0).unwrap();
     assert_eq!(
         due,
         vec![id.clone()],
         "feedback must queue the PR auto-submit hook"
     );
     ralphus_daemon::pr::maybe_auto_submit_branch(&store, &NoopRunner, &id, &bid0);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
     assert!(
         detail0.starts_with("feedback applied"),
@@ -1590,9 +1554,9 @@ fn auto_submit_debounce_runs_off_thread_for_every_terminal_branch() {
         git(&root, &["checkout", "main"]);
     }
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let id = guard
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1608,7 +1572,7 @@ fn auto_submit_debounce_runs_off_thread_for_every_terminal_branch() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert_eq!(view.branches.len(), 3);
     assert!(
@@ -1622,7 +1586,7 @@ fn auto_submit_debounce_runs_off_thread_for_every_terminal_branch() {
     ralphus_daemon::pr::sweep_pending_pr_auto_submits_once(&store);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let view = store.lock().unwrap().get_guardian(&id).unwrap();
+        let view = store.lock().get_guardian(&id).unwrap();
         if view
             .branches
             .iter()
@@ -1681,9 +1645,9 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1693,7 +1657,7 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     let runner = RaceInjectingRunner {
@@ -1714,7 +1678,7 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
     // The restack must have noticed the injected `merge_failed` stamp and
     // corrected it back to `merging` before advancing the downstream branch,
     // not left it stuck until `finalize_review` overwrites it at the very end.
-    let events = store.lock().unwrap().events_for_guardian(&id, 100).unwrap();
+    let events = store.lock().events_for_guardian(&id, 100).unwrap();
     let failed_idx = events
         .iter()
         .position(|e| e.scope == "guardian" && e.message.contains("merge_failed"))
@@ -1729,7 +1693,7 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
     );
 
     // ...and the review still finishes normally afterwards.
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1748,11 +1712,10 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // generation always no-ops instead of racing a real API call.
     store
         .lock()
-        .unwrap()
         .set_guardian_resolver(&id, Some("claude-code"), None)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
 
@@ -1767,11 +1730,7 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     );
     assert_eq!(reply.status, 202);
 
-    let msgs = store
-        .lock()
-        .unwrap()
-        .guardian_branch_messages(&id, &bid0)
-        .unwrap();
+    let msgs = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].role, "reviewer");
     assert_eq!(msgs[0].text, "please add a note file");
@@ -1782,7 +1741,6 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     assert!(
         store
             .lock()
-            .unwrap()
             .guardian_branch_messages(&id, "some-other-branch")
             .unwrap()
             .is_empty()
@@ -1813,9 +1771,9 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1824,11 +1782,11 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     let review_tip_before = {
-        let rb = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let rb = store.lock().get_guardian(&id).unwrap().branches[0]
             .review_branch
             .clone()
             .unwrap();
@@ -1846,7 +1804,7 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
         &CancelToken::never(),
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let detail = view.branches[0].detail.clone();
     assert_ne!(
         detail.as_deref(),
@@ -1869,7 +1827,7 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-fn single_feature_repo() -> (PathBuf, Arc<Mutex<Store>>, String) {
+fn single_feature_repo() -> (PathBuf, Arc<StoreMutex>, String) {
     let root = temp_repo();
     init_repo(&root);
     write(&root, "base.txt", "base\n");
@@ -1881,9 +1839,9 @@ fn single_feature_repo() -> (PathBuf, Arc<Mutex<Store>>, String) {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1898,14 +1856,10 @@ fn passing_check_gate_reaches_review() {
     let (root, store, id) = single_feature_repo();
     store
         .lock()
-        .unwrap()
         .set_guardian_checks(&id, &["test -f a.txt".to_string()])
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1914,11 +1868,10 @@ fn failing_check_gate_fails_the_merge() {
     let (root, store, id) = single_feature_repo();
     store
         .lock()
-        .unwrap()
         .set_guardian_checks(&id, &["test -f does_not_exist.txt".to_string()])
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "merge_failed");
     assert!(view.detail.unwrap_or_default().contains("check failed"));
     let _ = std::fs::remove_dir_all(&root);
@@ -1946,11 +1899,7 @@ fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
     } else {
         format!("touch {started_str}; sleep 20")
     };
-    store
-        .lock()
-        .unwrap()
-        .set_guardian_checks(&id, &[check_cmd])
-        .unwrap();
+    store.lock().set_guardian_checks(&id, &[check_cmd]).unwrap();
 
     let cancellations = Cancellations::new();
     let sem = Arc::new(Semaphore::new(4));
@@ -1975,7 +1924,7 @@ fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
 
     // Cancel the review exactly the way the `review cancel` HTTP handler does.
     stop_merge_worker_for_cancel(&cancellations, &id);
-    store.lock().unwrap().cancel_guardian(&id).unwrap();
+    store.lock().cancel_guardian(&id).unwrap();
 
     // The worker must stop well within the ~20s the check gate would
     // otherwise keep sleeping for -- a generous but bounded budget so this
@@ -1991,10 +1940,7 @@ fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
         !cancellations.is_active(&key),
         "merge worker kept running the check-gate command well past the cancel"
     );
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "cancelled"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "cancelled");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&marker_dir);
@@ -2011,7 +1957,7 @@ fn auto_build_runs_when_no_checks_configured() {
         "[review]\nauto_build = \"test -f a.txt\"\n",
     );
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         view.detail.unwrap_or_default().contains("auto-built"),
@@ -2029,7 +1975,7 @@ fn failing_auto_build_fails_the_merge() {
         "[review]\nauto_build = \"test -f does_not_exist.txt\"\n",
     );
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "merge_failed");
     assert!(
         view.detail
@@ -2052,11 +1998,10 @@ fn configured_checks_are_not_double_built_by_auto_build() {
     );
     store
         .lock()
-        .unwrap()
         .set_guardian_checks(&id, &["test -f a.txt".to_string()])
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         !view.detail.unwrap_or_default().contains("auto-built"),
@@ -2078,11 +2023,10 @@ fn skip_auto_build_also_opts_out_of_config_auto_build() {
     );
     store
         .lock()
-        .unwrap()
         .set_guardian_skip_auto_build(&id, true)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2101,7 +2045,6 @@ fn review_declared_auto_build_command_wins_over_project_default() {
     );
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_build(
             &id,
             Some(&GuardianAutoBuild {
@@ -2115,7 +2058,7 @@ fn review_declared_auto_build_command_wins_over_project_default() {
         )
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         view.detail
@@ -2163,7 +2106,6 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
     let (root, store, id) = single_feature_repo();
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_build(
             &id,
             Some(&GuardianAutoBuild {
@@ -2177,7 +2119,7 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
         )
         .unwrap();
     run_merge(&store, &FailingAutoBuildRunner, &id);
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "in_review",
         "a failed review-declared auto_build agent call must still reach in_review: {:?}",
@@ -2195,7 +2137,6 @@ fn review_declared_auto_build_agent_failure_is_advisory_not_fatal() {
 
     let page = store
         .lock()
-        .unwrap()
         .cartographer_query(&CartographerFilter {
             guardian_id: Some(id.clone()),
             ..CartographerFilter::recent(10)
@@ -2236,9 +2177,9 @@ fn proof_scope_nothing_suppresses_final_verify() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let guardian_id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("skip-checks", "main", root.to_str().unwrap())
             .unwrap();
@@ -2302,7 +2243,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
 
     run_merge(&store, &runner, &guardian_id);
 
-    let view = store.lock().unwrap().get_guardian(&guardian_id).unwrap();
+    let view = store.lock().get_guardian(&guardian_id).unwrap();
     assert_eq!(view.status, "in_review", "merge failed: {:?}", view.detail);
     let x = view
         .branches
@@ -2360,9 +2301,9 @@ fn stacked_feature_branch_keeps_its_own_commit() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("stacked", "main", root.to_str().unwrap())
             .unwrap();
@@ -2373,7 +2314,7 @@ fn stacked_feature_branch_keeps_its_own_commit() {
 
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     // The combined review has BOTH features' files — b's commit was not dropped.
@@ -2411,9 +2352,9 @@ fn skip_worktrees_shared_stack_rebases_all_branches() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("shared", "main", root.to_str().unwrap())
             .unwrap();
@@ -2425,7 +2366,7 @@ fn skip_worktrees_shared_stack_rebases_all_branches() {
 
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     // Every branch shares the one combined review branch (RAL-378: named
@@ -2458,7 +2399,7 @@ fn branch_with_no_new_commits_fails_the_merge() {
     let (root, store, id) = single_feature_repo();
     // Replace the single feature with one that has NO commits beyond main.
     {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let g2 = g
             .create_guardian("empty", "main", root.to_str().unwrap())
             .unwrap();
@@ -2466,7 +2407,7 @@ fn branch_with_no_new_commits_fails_the_merge() {
         g.add_guardian_branch(&g2, "feature/empty").unwrap();
         drop(g);
         run_merge(&store, &NoopRunner, &g2);
-        let view = store.lock().unwrap().get_guardian(&g2).unwrap();
+        let view = store.lock().get_guardian(&g2).unwrap();
         assert_eq!(
             view.status, "merge_failed",
             "an empty branch must fail the review, not quietly pass it: detail: {:?}",
@@ -2497,7 +2438,7 @@ fn branch_with_no_new_commits_fails_the_merge() {
 fn base_branch_shift_triggers_rebuild() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     assert_eq!(before.status, "in_review");
     let base_before = before.base_commit.clone().expect("base recorded");
 
@@ -2511,7 +2452,7 @@ fn base_branch_shift_triggers_rebuild() {
     let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(rebuilt, "a base-branch shift should trigger a rebuild");
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     assert_ne!(
         after.base_commit.as_deref(),
@@ -2539,7 +2480,7 @@ fn base_branch_shift_triggers_rebuild() {
     // from the base branch simply being repointed to a different upstream
     // during debugging (see guardian-000000000060's mystery 813-conflict
     // rebuild, which had an empty payload and no recorded prior commit).
-    let events = store.lock().unwrap().events_for_guardian(&id, 500).unwrap();
+    let events = store.lock().events_for_guardian(&id, 500).unwrap();
     let shift_event = events
         .iter()
         .find(|e| e.message.contains("base branch changed; rebuilding"))
@@ -2584,9 +2525,9 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         // Remote-tracking form is the whole point of this test -- a bare
         // "main" never goes through the fetch path at all.
         let id = g
@@ -2596,7 +2537,7 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     assert_eq!(before.status, "in_review");
     let base_before = before.base_commit.clone().expect("base recorded");
 
@@ -2644,7 +2585,7 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
         "the freshly fetched ref should trigger the existing rebuild-on-shift path"
     );
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     assert_ne!(
         after.base_commit.as_deref(),
@@ -2658,7 +2599,7 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
         "the out-of-band merge's content was picked up"
     );
 
-    let events = store.lock().unwrap().events_for_guardian(&id, 500).unwrap();
+    let events = store.lock().events_for_guardian(&id, 500).unwrap();
     assert!(
         events
             .iter()
@@ -2677,17 +2618,12 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
 #[test]
 fn base_shift_for_skip_worktrees_uses_cancellable_fallback() {
     let (root, store, id) = single_feature_repo();
-    store
-        .lock()
-        .unwrap()
-        .set_guardian_skip_worktrees(&id, true)
-        .unwrap();
+    store.lock().set_guardian_skip_worktrees(&id, true).unwrap();
     run_merge(&store, &NoopRunner, &id);
 
     let event_counts = || {
         let page = store
             .lock()
-            .unwrap()
             .cartographer_query(&CartographerFilter {
                 guardian_id: Some(id.clone()),
                 limit: 100,
@@ -2726,7 +2662,7 @@ fn base_shift_for_skip_worktrees_uses_cancellable_fallback() {
         after.1, before.1,
         "shared-worktree fallback must return before staged execution"
     );
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(
         Path::new(view.combined_worktree.as_deref().expect("combined"))
@@ -2746,7 +2682,7 @@ fn base_shift_for_skip_worktrees_uses_cancellable_fallback() {
 fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     assert_eq!(before.status, "in_review");
     let review_branch = before.branches[0]
         .review_branch
@@ -2764,7 +2700,7 @@ fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() 
     // matters is the guardian's status below, not this return value.
     rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         after.status, "approved",
         "must approve instead of rebuilding: detail {:?}",
@@ -2778,7 +2714,7 @@ fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() 
 fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     let branch = &before.branches[0];
     let review_branch = branch.review_branch.as_deref().expect("review branch");
     let worktree = branch.worktree.as_deref().expect("review worktree");
@@ -2798,10 +2734,7 @@ fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
     );
     assert_eq!(reply.status, 200, "body={}", reply.body);
     assert!(reply.body.contains("\"status\":\"approved\""));
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "approved"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "approved");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2813,20 +2746,18 @@ fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
 fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     assert_eq!(before.status, "in_review");
     let base_before = before.base_commit.clone().expect("base recorded");
 
     // Opt this review out of base-branch auto-updates.
     store
         .lock()
-        .unwrap()
         .set_guardian_skip_base_updates(&id, Some(true))
         .unwrap();
     assert!(
         store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .effective_skip_base_updates
@@ -2843,7 +2774,7 @@ fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
         !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
         "opted-out review must not auto-rebuild on a base shift"
     );
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "status untouched");
     assert_eq!(
         after.base_commit.as_deref(),
@@ -2855,7 +2786,6 @@ fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
     // so the very next sweep rebuilds — restoring the auto-update behavior.
     store
         .lock()
-        .unwrap()
         .set_guardian_skip_base_updates(&id, Some(false))
         .unwrap();
     assert!(
@@ -2921,24 +2851,21 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
         .set_cell_state(&run_a, 0, 0, NodeState::Done)
         .unwrap();
 
-    let store = Arc::new(Mutex::new(owned_store));
+    let store = Arc::new(StoreMutex::new(owned_store));
     // Run A's task completing drives the guardian all the way to `in_review`,
     // exactly as the scheduler would once `feature/a`'s branch is the only one
     // the guardian knows about yet.
     run_merge(&store, &NoopRunner, &id);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
 
     // RAL-98's task now finishes, in a SEPARATE run, contributing a second
     // branch to the SAME (already `in_review`) guardian by review-key linkage.
     let run_b = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         g.insert_squad(&sample, Some("b"), false).unwrap()
     };
     {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         g.add_guardian_branch(&id, "feature/b").unwrap();
         g.set_cell_review_branch(&run_b, 0, 0, "feature/b").unwrap();
         g.set_cell_state(&run_b, 0, 0, NodeState::Done).unwrap();
@@ -2946,7 +2873,7 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
 
     // Sanity check: this is the bug. The straggler branch is stuck `pending`
     // with no worktree even though its contributing session is `done`.
-    let stuck = store.lock().unwrap().get_guardian(&id).unwrap();
+    let stuck = store.lock().get_guardian(&id).unwrap();
     assert_eq!(stuck.status, "in_review");
     let straggler = stuck
         .branches
@@ -2963,7 +2890,7 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
     let reopened = reopen_straggler(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(reopened, "a ready straggler branch must trigger a reopen");
 
-    let healed = store.lock().unwrap().get_guardian(&id).unwrap();
+    let healed = store.lock().get_guardian(&id).unwrap();
     assert_eq!(healed.status, "in_review", "detail: {:?}", healed.detail);
     assert!(
         healed.branches.iter().all(|b| b.merge_status == "done"),
@@ -3012,9 +2939,9 @@ fn staged_base_shift_preserves_prior_resolution_and_worktree() {
     write(&root, "conflict.txt", "line1\nMAIN2\nline3\n");
     git(&root, &["commit", "-am", "main advances"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("carry", "main", root.to_str().unwrap())
             .unwrap();
@@ -3025,12 +2952,12 @@ fn staged_base_shift_preserves_prior_resolution_and_worktree() {
     // Build 1 through the staged engine: rebasing feature/x onto the advanced
     // base conflicts; the agent resolves it (StageDoneRunner strips markers,
     // keeping both sides) and records the build signature used below.
-    let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     mark_ready(&store, &id, &branch_id);
     run_merge_staged(&store, &StageDoneRunner, &id, &CancelToken::never());
-    let v1 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let v1 = store.lock().get_guardian(&id).unwrap();
     assert_eq!(v1.status, "in_review", "detail: {:?}", v1.detail);
     let x1 = v1
         .branches
@@ -3069,7 +2996,7 @@ fn staged_base_shift_preserves_prior_resolution_and_worktree() {
         "the second base shift should trigger a rebuild"
     );
 
-    let v2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let v2 = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         v2.status, "in_review",
         "carry-forward should reach review without the agent; detail: {:?}",
@@ -3173,16 +3100,16 @@ fn staged_finalize_keeps_the_base_the_stack_was_built_on() {
     git(&root, &["commit", "-am", "main advances"]);
     let built_on = git(&root, &["rev-parse", "main"]).trim().to_string();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("mid-merge-shift", "main", root.to_str().unwrap())
             .unwrap();
         g.add_guardian_branch(&id, "feature/x").unwrap();
         id
     };
-    let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     mark_ready(&store, &id, &branch_id);
@@ -3200,7 +3127,7 @@ fn staged_finalize_keeps_the_base_the_stack_was_built_on() {
     let moved = git(&root, &["rev-parse", "main"]).trim().to_string();
     assert_ne!(moved, built_on, "the base must have advanced mid-merge");
 
-    let v1 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let v1 = store.lock().get_guardian(&id).unwrap();
     assert_eq!(v1.status, "in_review", "detail: {:?}", v1.detail);
     assert_eq!(v1.base_commits.len(), 1, "single-project guardian");
     assert_eq!(
@@ -3216,7 +3143,7 @@ fn staged_finalize_keeps_the_base_the_stack_was_built_on() {
         "a base that moved mid-merge must still trigger a rebuild afterwards"
     );
 
-    let v2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let v2 = store.lock().get_guardian(&id).unwrap();
     assert_eq!(v2.status, "in_review", "detail: {:?}", v2.detail);
     assert_eq!(
         v2.base_commits.values().next().map(String::as_str),
@@ -3252,9 +3179,9 @@ fn full_rebuild_preserves_prior_resolution_state() {
     write(&root, "conflict.txt", "line1\nMAIN2\nline3\n");
     git(&root, &["commit", "-am", "main advances"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let id = guard
             .create_guardian("full rebuild parity", "main", root.to_str().unwrap())
             .unwrap();
@@ -3263,7 +3190,7 @@ fn full_rebuild_preserves_prior_resolution_state() {
     };
     run_merge(&store, &StageDoneRunner, &id);
     assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().branches[0].merge_status,
+        store.lock().get_guardian(&id).unwrap().branches[0].merge_status,
         "conflict_resolved"
     );
 
@@ -3273,7 +3200,7 @@ fn full_rebuild_preserves_prior_resolution_state() {
     git(&root, &["commit", "-m", "unrelated base move"]);
     run_merge(&store, &NoopRunner, &id);
 
-    let rebuilt = store.lock().unwrap().get_guardian(&id).unwrap();
+    let rebuilt = store.lock().get_guardian(&id).unwrap();
     assert_eq!(rebuilt.status, "in_review", "detail: {:?}", rebuilt.detail);
     assert_eq!(rebuilt.branches[0].merge_status, "done");
     let review = rebuilt.review_branch.expect("review branch");
@@ -3305,9 +3232,9 @@ fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("carry-fail", "main", root.to_str().unwrap())
             .unwrap();
@@ -3317,17 +3244,13 @@ fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
 
     // Build 1 succeeds and records a review branch (no conflict).
     run_merge(&store, &NoopRunner, &id);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
 
     // Arm a check gate that always fails, then shift the base so a rebuild runs.
     // During that rebuild carry-forward pins build 1's review commit, then the
     // check gate fails and the merge returns early — the guard must still fire.
     store
         .lock()
-        .unwrap()
         .set_guardian_checks(&id, &["test -f nonexistent.txt".to_string()])
         .unwrap();
     git(&root, &["checkout", "main"]);
@@ -3344,7 +3267,7 @@ fn carry_forward_refs_are_cleaned_up_when_a_rebuild_fails() {
         &CancelToken::never()
     ));
     assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        store.lock().get_guardian(&id).unwrap().status,
         "merge_failed"
     );
 
@@ -3407,9 +3330,9 @@ fn conflict_counters_reset_across_sequential_conflicting_commits() {
     git(&root, &["commit", "-am", "y2"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("conflict review", "main", root.to_str().unwrap())
             .unwrap();
@@ -3420,7 +3343,7 @@ fn conflict_counters_reset_across_sequential_conflicting_commits() {
 
     run_merge(&store, &MarkerStrippingRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let y = view
         .branches
@@ -3468,9 +3391,9 @@ fn resolves_a_conflict_with_the_agent() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("conflict review", "main", root.to_str().unwrap())
             .unwrap();
@@ -3481,7 +3404,7 @@ fn resolves_a_conflict_with_the_agent() {
 
     run_merge(&store, &MarkerStrippingRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let review = view.review_branch.expect("review branch");
     // The second branch conflicted and was resolved by the agent.
@@ -3535,9 +3458,9 @@ fn conflict_resolution_publishes_a_review_ghost() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("conflict review", "main", root.to_str().unwrap())
             .unwrap();
@@ -3548,7 +3471,7 @@ fn conflict_resolution_publishes_a_review_ghost() {
 
     run_merge(&store, &MarkerStrippingWithGhostRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let y = view
         .branches
         .iter()
@@ -3559,7 +3482,6 @@ fn conflict_resolution_publishes_a_review_ghost() {
     let uri = ralphus_daemon::ghost::review_uri(&id, Some(&y.id));
     let ghost = store
         .lock()
-        .unwrap()
         .get_ghost(&uri)
         .unwrap()
         .expect("resolver's handoff note was published as a review ghost");
@@ -3592,9 +3514,9 @@ fn new_naming_convention_per_branch_and_combined() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("naming", "main", root.to_str().unwrap())
             .unwrap();
@@ -3604,7 +3526,7 @@ fn new_naming_convention_per_branch_and_combined() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     // Per-branch refs follow `<task branch>-review`.
@@ -3665,7 +3587,7 @@ prompt = "The code must follow project style guidelines and be readable"
 command = "cargo test --workspace"
 "#;
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     // Insert the squad then link the guardian to it. feature/y is the branch
     // that will conflict (rebased on top of feature/x), so its cell gets the
@@ -3674,13 +3596,12 @@ command = "cargo test --workspace"
         let task_file: ralphus_core::schema::TaskFile = toml::from_str(TASK_TOML).unwrap();
         store
             .lock()
-            .unwrap()
             .insert_squad(&task_file, Some("synthesis test"), false)
             .unwrap()
     };
 
     let guardian_id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian_for_squad("review", "main", root.to_str().unwrap(), Some(&run_id))
             .unwrap();
@@ -3789,7 +3710,7 @@ command = "cargo test --workspace"
     run_merge(&store, &runner, &guardian_id);
 
     // The merge must complete successfully.
-    let view = store.lock().unwrap().get_guardian(&guardian_id).unwrap();
+    let view = store.lock().get_guardian(&guardian_id).unwrap();
     assert_eq!(view.status, "in_review", "merge failed: {:?}", view.detail);
 
     let specs = captured.lock().unwrap();
@@ -3857,11 +3778,7 @@ command = "cargo test --workspace"
     );
 
     // 4. Synthesis events were written to the guardian log.
-    let events = store
-        .lock()
-        .unwrap()
-        .events_for_guardian(&guardian_id, 50)
-        .unwrap();
+    let events = store.lock().events_for_guardian(&guardian_id, 50).unwrap();
     assert!(
         events
             .iter()
@@ -3885,7 +3802,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt_str = view.branches[0].worktree.clone().expect("worktree");
     let wt = PathBuf::from(&wt_str);
     let rev = view.branches[0]
@@ -3930,7 +3847,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
     );
 
     // Guardian must be back in review after the no-commit turn.
-    let view2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view2 = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view2.status, "in_review",
         "guardian status after no-commit: {:?}",
@@ -3948,7 +3865,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt_str = view.branches[0].worktree.clone().expect("worktree");
     let wt = PathBuf::from(&wt_str);
     let bid0 = view.branches[0].id.clone();
@@ -3981,7 +3898,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &CancelToken::never(),
     );
 
-    let view2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view2 = store.lock().get_guardian(&id).unwrap();
     let rev = view2.branches[0]
         .review_branch
         .clone()
@@ -4034,9 +3951,9 @@ fn rerun_resets_downstream_branches_to_pending_before_processing() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -4048,7 +3965,7 @@ fn rerun_resets_downstream_branches_to_pending_before_processing() {
     // First run: both branches reach Done.
     run_merge(&store, &NoopRunner, &id);
     {
-        let view = store.lock().unwrap().get_guardian(&id).unwrap();
+        let view = store.lock().get_guardian(&id).unwrap();
         assert_eq!(view.status, "in_review");
         assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     }
@@ -4060,7 +3977,7 @@ fn rerun_resets_downstream_branches_to_pending_before_processing() {
     // new RAL-54 bulk-reset) rather than "done" (stale from the first run).
     run_merge(&store, &NoopRunner, &id);
     {
-        let view = store.lock().unwrap().get_guardian(&id).unwrap();
+        let view = store.lock().get_guardian(&id).unwrap();
         assert_eq!(view.branches[0].merge_status, "failed", "branch 0 failed");
         assert_eq!(
             view.branches[1].merge_status, "pending",
@@ -4080,10 +3997,7 @@ fn rebase_succeeds_when_worktree_has_untracked_file_introduced_by_new_base() {
     // rebuild.
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
 
     // Advance the base branch with a NEW file (leftover.txt).
     git(&root, &["checkout", "main"]);
@@ -4093,7 +4007,7 @@ fn rebase_succeeds_when_worktree_has_untracked_file_introduced_by_new_base() {
 
     // Simulate the scenario: an agent session created leftover.txt in the
     // worktree but never staged or committed it (an untracked leftover).
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt_path = view
         .branches
         .first()
@@ -4109,7 +4023,7 @@ fn rebase_succeeds_when_worktree_has_untracked_file_introduced_by_new_base() {
     let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
     assert!(rebuilt, "base shift should trigger rebuild");
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         after.status, "in_review",
         "rebuild must reach in_review; detail: {:?}",
@@ -4140,9 +4054,9 @@ fn stage_done_signal_triggers_fast_path_rebase_continue() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("stage-done", "main", root.to_str().unwrap())
             .unwrap();
@@ -4153,7 +4067,7 @@ fn stage_done_signal_triggers_fast_path_rebase_continue() {
 
     run_merge(&store, &StageDoneRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let y = view
@@ -4248,9 +4162,9 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
         specs: captured.clone(),
     };
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("sys-prompt-check", "main", root.to_str().unwrap())
             .unwrap();
@@ -4325,9 +4239,9 @@ fn review_resolver_agent_resolves_a_custom_agent_profile() {
         specs: captured.clone(),
     };
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("resolver-profile-check", "main", root.to_str().unwrap())
             .unwrap();
@@ -4459,9 +4373,9 @@ fn conflict_counters_are_rescoped_across_resolver_passes() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("counter-rescope", "main", root.to_str().unwrap())
             .unwrap();
@@ -4482,7 +4396,7 @@ fn conflict_counters_are_rescoped_across_resolver_passes() {
         "resolver must be invoked twice: once per file, one file per pass"
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let y = view
@@ -4578,9 +4492,9 @@ fn stuck_commit_resumes_the_session_and_gives_up_after_two_attempts() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("stuck-commit-check", "main", root.to_str().unwrap())
             .unwrap();
@@ -4614,7 +4528,7 @@ fn stuck_commit_resumes_the_session_and_gives_up_after_two_attempts() {
         "the retry must resume the first pass's own agent session instead of starting cold"
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let y = view
         .branches
         .iter()
@@ -4703,9 +4617,9 @@ fn rerere_autoupdate_resolves_conflict_without_agent() {
     // resolution — rerere handles it transparently via rerere.autoupdate.
     // If the agent were called and failed, the guardian would end up
     // merge_failed and the status assertion below would catch it.
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let gid = g
             .create_guardian("rerere", "main", root.to_str().unwrap())
             .unwrap();
@@ -4715,7 +4629,7 @@ fn rerere_autoupdate_resolves_conflict_without_agent() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let y = view
@@ -4768,9 +4682,9 @@ fn resolver_content_loss_is_detected_and_the_branch_is_not_silently_finished() {
     git(&root, &["commit", "-m", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let gid = g
             .create_guardian("lossy", "main", root.to_str().unwrap())
             .unwrap();
@@ -4780,7 +4694,7 @@ fn resolver_content_loss_is_detected_and_the_branch_is_not_silently_finished() {
     };
     run_merge(&store, &LossyRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "merge_failed",
         "a resolution that drops real content must not silently reach in_review; detail: {:?}",
@@ -4824,9 +4738,9 @@ fn manual_push_to_review_worktree_rebases_downstream() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("manual-push", "main", root.to_str().unwrap())
             .unwrap();
@@ -4845,7 +4759,7 @@ fn manual_push_to_review_worktree_rebases_downstream() {
     );
 
     // Reviewer opens a terminal in branch 0's review worktree and commits a fix.
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
     write(&wt0, "manual.txt", "reviewer fix\n");
     git(&wt0, &["add", "-A"]);
@@ -4857,7 +4771,7 @@ fn manual_push_to_review_worktree_rebases_downstream() {
         "a manual push to the review worktree must trigger a downstream rebase"
     );
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
 
     // The downstream review branch and the combined worktree carry the manual
@@ -4888,7 +4802,7 @@ fn manual_push_to_last_branch_refreshes_combined() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
     write(&wt0, "manual.txt", "reviewer fix\n");
     git(&wt0, &["add", "-A"]);
@@ -4900,7 +4814,7 @@ fn manual_push_to_last_branch_refreshes_combined() {
         "a manual push must trigger a rebuild even with no downstream branch"
     );
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     let combined = after.combined_worktree.as_deref().expect("combined");
     assert!(
@@ -4924,7 +4838,6 @@ fn manual_push_clears_stale_manual_commands() {
     // Seed stale commands as if a prior generation had succeeded.
     store
         .lock()
-        .unwrap()
         .set_guardian_manual_commands(
             &id,
             &[GuardianCheck {
@@ -4939,16 +4852,11 @@ fn manual_push_clears_stale_manual_commands() {
         )
         .unwrap();
     assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .get_guardian(&id)
-            .unwrap()
-            .checks_state,
+        store.lock().get_guardian(&id).unwrap().checks_state,
         "ready"
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
     write(&wt0, "manual.txt", "reviewer fix\n");
     git(&wt0, &["add", "-A"]);
@@ -4959,7 +4867,7 @@ fn manual_push_clears_stale_manual_commands() {
 
     // NoopRunner fails every call, so `generate_manual_commands` cannot have
     // repopulated the list -- if it's empty, the stale entry was cleared.
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert!(
         after.manual_commands.is_empty(),
         "stale manual commands must not survive a forced regeneration: {:?}",
@@ -4995,9 +4903,9 @@ fn manual_push_conflict_flows_through_resolver() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("manual-conflict", "main", root.to_str().unwrap())
             .unwrap();
@@ -5007,14 +4915,11 @@ fn manual_push_conflict_flows_through_resolver() {
     };
     // Initial build is clean (feature/a and feature/b touch different lines/files).
     run_merge(&store, &NoopRunner, &id);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
 
     // Reviewer manually changes the SAME middle line to X on feature/a's review
     // worktree — this now conflicts with feature/b's Y when restacked.
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let wt0 = PathBuf::from(view.branches[0].worktree.as_deref().expect("worktree"));
     write(&wt0, "conflict.txt", "line1\nX\nline3\n");
     git(&wt0, &["add", "-A"]);
@@ -5030,7 +4935,7 @@ fn manual_push_conflict_flows_through_resolver() {
         &sem
     ));
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     let b = after
         .branches
@@ -5080,9 +4985,9 @@ fn disabled_branch_is_skipped_and_reintroduced_at_its_original_position() {
     }
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("drop-branch", "main", root.to_str().unwrap())
             .unwrap();
@@ -5098,7 +5003,7 @@ fn disabled_branch_is_skipped_and_reintroduced_at_its_original_position() {
     // enabled, so this exercises the same immediate-proceed path a real
     // Collecting review takes once its remaining blocking tasks finish.
     {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         assert_eq!(g.get_guardian(&id).unwrap().status, "collecting");
         g.set_branch_enabled_by_name(&id, "feature/b", false)
             .unwrap();
@@ -5106,7 +5011,7 @@ fn disabled_branch_is_skipped_and_reintroduced_at_its_original_position() {
 
     run_merge(&store, &NoopRunner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "in_review",
         "review must proceed without the dropped branch: {:?}",
@@ -5141,12 +5046,11 @@ fn disabled_branch_is_skipped_and_reintroduced_at_its_original_position() {
     // end.
     store
         .lock()
-        .unwrap()
         .set_branch_enabled_by_name(&id, "feature/b", true)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     let review2 = after.review_branch.clone().expect("review branch set");
     let files2 = git(&root, &["ls-tree", "-r", "--name-only", &review2]);
@@ -5221,9 +5125,9 @@ fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
     git(&root, &["commit", "-m", "add c"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (r1, r2) = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let r1 = g
             .create_guardian("r1", "main", root.to_str().unwrap())
             .unwrap();
@@ -5239,24 +5143,14 @@ fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
     // Build both stacks once before the move, same as any real workflow.
     run_merge(&store, &NoopRunner, &r1);
     run_merge(&store, &NoopRunner, &r2);
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&r1).unwrap().status,
-        "in_review"
-    );
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&r2).unwrap().status,
-        "in_review"
-    );
+    assert_eq!(store.lock().get_guardian(&r1).unwrap().status, "in_review");
+    assert_eq!(store.lock().get_guardian(&r2).unwrap().status, "in_review");
 
     // Move feature/a (r1 position 0) into r2.
-    let bid_a = store.lock().unwrap().get_guardian(&r1).unwrap().branches[0]
+    let bid_a = store.lock().get_guardian(&r1).unwrap().branches[0]
         .id
         .clone();
-    let new_pos = store
-        .lock()
-        .unwrap()
-        .move_guardian_branch(&r1, &bid_a, &r2)
-        .unwrap();
+    let new_pos = store.lock().move_guardian_branch(&r1, &bid_a, &r2).unwrap();
     assert_eq!(new_pos, 1, "appended after r2's existing feature/c");
 
     // Same carry-forward purge the HTTP handler (`server::guardian_move_branch`)
@@ -5269,7 +5163,7 @@ fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
 
     // Source (r1): only feature/b remains, renumbered to position 0, and its
     // review branch no longer contains feature/a's file.
-    let after_r1 = store.lock().unwrap().get_guardian(&r1).unwrap();
+    let after_r1 = store.lock().get_guardian(&r1).unwrap();
     assert_eq!(
         after_r1.status, "in_review",
         "detail: {:?}",
@@ -5288,7 +5182,7 @@ fn move_branch_rebuilds_correctly_in_both_source_and_destination() {
 
     // Destination (r2): feature/c then feature/a, correctly stacked on r2's
     // own base -- not on anything from r1.
-    let after_r2 = store.lock().unwrap().get_guardian(&r2).unwrap();
+    let after_r2 = store.lock().get_guardian(&r2).unwrap();
     assert_eq!(
         after_r2.status, "in_review",
         "detail: {:?}",
@@ -5448,9 +5342,9 @@ fn generate_summary_live_ollama_produces_one_bullet_per_branch() {
     git(&root, &["commit", "-m", "Fix a bug in the gadget"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("review", "main", root.to_str().unwrap())
             .unwrap();
@@ -5462,7 +5356,7 @@ fn generate_summary_live_ollama_produces_one_bullet_per_branch() {
     let runner = ralphus_daemon::runner::SubprocessRunner::new(&runner_cmd);
     run_merge(&store, &runner, &id);
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let summary = view
         .change_summary
@@ -5516,9 +5410,9 @@ fn pull_pr_commits_rebases_reviewer_pushed_commits_and_restacks_downstream() {
     git(&root, &["commit", "-m", "add b"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("review", "main", root.to_str().unwrap())
             .unwrap();
@@ -5527,7 +5421,7 @@ fn pull_pr_commits_rebases_reviewer_pushed_commits_and_restacks_downstream() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     assert_eq!(before.status, "in_review", "detail: {:?}", before.detail);
     let branch_a = before
         .branches
@@ -5577,7 +5471,7 @@ fn pull_pr_commits_rebases_reviewer_pushed_commits_and_restacks_downstream() {
     .expect("pull_pr_commits should succeed");
     assert!(pulled, "reviewer's commit should have been pulled");
 
-    let after = store.lock().unwrap().get_guardian(&id).unwrap();
+    let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(after.status, "in_review", "detail: {:?}", after.detail);
     let a2 = after.branches.iter().find(|b| b.id == branch_a_id).unwrap();
     let review_a2 = a2.review_branch.clone().unwrap();
@@ -5622,9 +5516,9 @@ fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("review", "main", root.to_str().unwrap())
             .unwrap();
@@ -5632,7 +5526,7 @@ fn pull_pr_commits_is_a_noop_when_already_up_to_date() {
         id
     };
     run_merge(&store, &NoopRunner, &id);
-    let g = store.lock().unwrap().get_guardian(&id).unwrap();
+    let g = store.lock().get_guardian(&id).unwrap();
     let branch_a = g.branches.iter().find(|b| b.branch == "feature/a").unwrap();
     let branch_a_id = branch_a.id.clone();
     let review_a = branch_a.review_branch.clone().unwrap();
@@ -5701,9 +5595,9 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("cancellable merge", "main", root.to_str().unwrap())
             .unwrap();
@@ -5823,17 +5717,13 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
         resolve_started.load(Ordering::SeqCst),
         "merge never reached the blocking resolve call"
     );
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "merging"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "merging");
 
     // The settings change: turn Proof off entirely, then trigger the same
     // restart path `guardian_settings`'s HTTP handler now calls whenever a
     // setting is changed while `status == "merging"`.
     store
         .lock()
-        .unwrap()
         .set_guardian_proof_scope(&id, Some("nothing"))
         .unwrap();
     let restart_reply = restart_guardian_merge(
@@ -5852,7 +5742,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
     // Same 120s headroom as the wait above, for the same reason.
     let mut status = String::new();
     for _ in 0..24000 {
-        status = store.lock().unwrap().get_guardian(&id).unwrap().status;
+        status = store.lock().get_guardian(&id).unwrap().status;
         if status == "in_review" || status == "merge_failed" {
             break;
         }
@@ -5873,7 +5763,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
 
     // (b) Every branch ends in a clean, consistent terminal status -- not
     // stuck `in_progress`/`proof_pending` from the cancelled first attempt.
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     for b in &view.branches {
         assert!(
             matches!(b.merge_status.as_str(), "done" | "conflict_resolved"),
@@ -5916,7 +5806,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
 /// (each adding its own `<name>.txt`), a guardian over all of them, and their
 /// branch ids in position order. Nothing is marked ready — callers set
 /// `MergeStatus::Ready` on the branches they want buildable.
-fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<Mutex<Store>>, String, Vec<String>) {
+fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<StoreMutex>, String, Vec<String>) {
     let root = temp_repo();
     init_repo(&root);
     write(&root, "base.txt", "base\n");
@@ -5930,9 +5820,9 @@ fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<Mutex<Store>>, String, V
         git(&root, &["commit", "-m", &format!("add {file}")]);
         git(&root, &["checkout", "main"]);
     }
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -5943,7 +5833,6 @@ fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<Mutex<Store>>, String, V
     };
     let branch_ids: Vec<String> = store
         .lock()
-        .unwrap()
         .get_guardian(&id)
         .unwrap()
         .branches
@@ -5953,10 +5842,9 @@ fn staged_feature_repo(names: &[&str]) -> (PathBuf, Arc<Mutex<Store>>, String, V
     (root, store, id, branch_ids)
 }
 
-fn mark_ready(store: &Arc<Mutex<Store>>, id: &str, branch_id: &str) {
+fn mark_ready(store: &Arc<StoreMutex>, id: &str, branch_id: &str) {
     store
         .lock()
-        .unwrap()
         .set_branch_status(id, branch_id, MergeStatus::Ready, None)
         .unwrap();
 }
@@ -5972,7 +5860,7 @@ fn staged_merge_builds_ready_prefix_and_waits_in_collecting() {
 
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "collecting",
         "must not finalize early: {:?}",
@@ -6016,7 +5904,7 @@ fn staged_merge_resumes_from_prior_built_tip() {
     mark_ready(&store, &id, &bids[1]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "collecting");
     assert_eq!(view.branches[0].merge_status, "done");
     assert_eq!(view.branches[1].merge_status, "done");
@@ -6064,7 +5952,7 @@ fn staged_merge_rebuilds_prefix_when_base_moves() {
     mark_ready(&store, &id, &bids[1]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         view.status, "in_review",
         "both branches done: {:?}",
@@ -6102,7 +5990,7 @@ fn staged_merge_rebuilds_whole_stack_in_one_pass_when_all_ready() {
     mark_ready(&store, &id, &bids[1]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     let combined = view.combined_worktree.expect("combined worktree");
@@ -6130,14 +6018,13 @@ fn staged_merge_rebuilds_when_branch_set_changes() {
     // no longer considered valid to resume from.
     store
         .lock()
-        .unwrap()
         .reorder_guardian_branches(&id, &["feature/b".to_string(), "feature/a".to_string()])
         .unwrap();
 
     mark_ready(&store, &id, &bids[1]);
     run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     assert!(view.branches.iter().all(|b| b.merge_status == "done"));
     let tip_a_new = git(&root, &["rev-parse", rev_a]).trim().to_string();
@@ -6173,9 +6060,9 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
     git(&root, &["commit", "-am", "y"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("stopped merge", "main", root.to_str().unwrap())
             .unwrap();
@@ -6244,10 +6131,7 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
         resolve_started.load(Ordering::SeqCst),
         "merge never reached the blocking resolve call"
     );
-    assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
-        "merging"
-    );
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "merging");
 
     // Stop it mid-rebase, the way `POST /api/guardians/{id}/stop` does.
     let stop_reply = stop_guardian_merge(Arc::clone(&store), cancellations.clone(), &id);
@@ -6272,7 +6156,7 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
         "merge worker did not stop after being told to"
     );
     assert_eq!(
-        store.lock().unwrap().get_guardian(&id).unwrap().status,
+        store.lock().get_guardian(&id).unwrap().status,
         "merge_stopped",
         "a stopped review is merge_stopped, not cancelled"
     );
@@ -6283,7 +6167,7 @@ fn stopping_a_mid_rebase_leaves_the_review_resumable_not_cancelled() {
     // The stopped review is resumable (claimable for a fresh merge) and
     // cancellable (abandonable) — RAL-249's "recoverable, not dead".
     {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         assert!(g.claim_guardian_merge(&id).unwrap());
         assert_eq!(
             g.get_guardian(&id).unwrap().status,

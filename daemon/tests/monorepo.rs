@@ -31,6 +31,7 @@ use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 use ralphus_daemon::scheduler::execute_squad;
 use ralphus_daemon::store::{SquadState, Store};
+use ralphus_daemon::store_lock::StoreMutex;
 
 // ── Helpers shared by both test levels ───────────────────────────────────────
 
@@ -173,18 +174,14 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done,
         "squad must complete"
     );
@@ -226,18 +223,14 @@ fn two_subprojects_cells_get_independent_addenda() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done
     );
 
@@ -271,12 +264,8 @@ fn no_subprojects_no_injection() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
@@ -402,16 +391,16 @@ fn full_monorepo_flow_with_subproject_cells() {
 
     // 2) Submit and run the tasks. Cells are command-only, so they succeed
     //    instantly without a real model.
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         g.insert_squad(&file, Some("monorepo-ticket"), false)
             .unwrap()
     };
     let ok_runner = SubprocessRunner::new(&runner_cmd);
     execute_squad(&store, &ok_runner, &squad_id);
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done,
         "both cells must succeed"
     );
@@ -419,19 +408,13 @@ fn full_monorepo_flow_with_subproject_cells() {
     // 3) Derive the review: both worktrees are one project (same git root) →
     //    one guardian with two branches.
     let ids = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         derive_reviews(&g, &squad_id, &file).expect("derive ok")
     };
     assert_eq!(ids.len(), 1, "one git root → one review");
     let gid = ids[0].clone();
     assert_eq!(
-        store
-            .lock()
-            .unwrap()
-            .get_guardian(&gid)
-            .unwrap()
-            .branches
-            .len(),
+        store.lock().get_guardian(&gid).unwrap().branches.len(),
         2,
         "two branches in the review"
     );
@@ -440,7 +423,7 @@ fn full_monorepo_flow_with_subproject_cells() {
     //    packages/alpha/lib.rs; the live ollama agent must resolve it.
     run_merge(&store, &ok_runner, &gid);
 
-    let view = store.lock().unwrap().get_guardian(&gid).unwrap();
+    let view = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
 
     let combined = view

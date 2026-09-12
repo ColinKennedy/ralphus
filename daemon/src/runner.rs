@@ -7,14 +7,17 @@
 //! testable with an in-process fake.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancelToken;
 use crate::procreg::ProcRegistry;
-use crate::store::{CellRow, NodeState, Store};
+#[cfg(test)]
+use crate::store::Store;
+use crate::store::{CellRow, NodeState};
 use crate::tmux::Tmux;
 
 /// Prefix the runner subprocess writes to stderr before a JSON-encoded
@@ -925,7 +928,7 @@ pub struct SubprocessRunner {
     registry: Option<ProcRegistry>,
     /// When set, `RALPHUS_EVENT:` marker lines on the child's stderr are
     /// parsed and forwarded into Cartographer (RAL-98).
-    cartographer: Option<Arc<Mutex<Store>>>,
+    cartographer: Option<crate::store_lock::StoreHandle>,
     /// When set, a per-cell detach token is registered for the lifetime of
     /// each tmux-wrapped attempt so an HTTP handler can request a clean
     /// mid-task detach (RAL-288 Stage 6) via the same registry, without
@@ -968,7 +971,7 @@ impl SubprocessRunner {
     /// Attach a store handle so `RALPHUS_EVENT:` marker lines on the child's
     /// stderr are forwarded into Cartographer (RAL-98).
     #[must_use]
-    pub fn with_cartographer(mut self, store: Arc<Mutex<Store>>) -> Self {
+    pub fn with_cartographer(mut self, store: crate::store_lock::StoreHandle) -> Self {
         self.cartographer = Some(store);
         self
     }
@@ -2060,7 +2063,7 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(guard) = store.lock() else { return };
+        let guard = store.lock();
         crate::cartographer::Note::new("runner")
             .squad(&spec.squad_id)
             .cell(&spec.cell_id)
@@ -2083,7 +2086,7 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(mut guard) = store.lock() else { return };
+        let mut guard = store.lock();
         guard.note_live_activity(session_name, crate::store::now_ms());
     }
 
@@ -2098,7 +2101,7 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(mut guard) = store.lock() else { return };
+        let mut guard = store.lock();
         guard.clear_live_activity(session_name);
         guard.clear_stall_escalated(session_name);
     }
@@ -2129,7 +2132,7 @@ impl SubprocessRunner {
             return;
         };
         let threshold_ms = threshold.as_millis() as i64;
-        let Ok(mut guard) = store.lock() else { return };
+        let mut guard = store.lock();
         // `None` (no pane growth observed yet this attempt) falls back to
         // when this attempt started, not epoch 0 -- otherwise a cell that
         // simply hasn't produced its first line of output yet would appear
@@ -2188,7 +2191,7 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(guard) = store.lock() else { return };
+        let guard = store.lock();
         let path = crate::terminal_log::attempt_path(session_name, attempt);
         crate::cartographer::Note::new("runner")
             .squad(&spec.squad_id)
@@ -2225,7 +2228,7 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let Ok(guard) = store.lock() else { return };
+        let guard = store.lock();
         crate::cartographer::Note::new("runner")
             .level(level)
             .squad(&spec.squad_id)
@@ -2298,7 +2301,7 @@ impl SubprocessRunner {
 /// locally (see `SubprocessRunner::run_via_tmux`'s auto-reattach retry) can
 /// pick it up without a second JSON parse.
 pub(crate) fn forward_runner_event(
-    cartographer: Option<&Arc<Mutex<Store>>>,
+    cartographer: Option<&crate::store_lock::StoreHandle>,
     squad_id: &str,
     cell_id: &str,
     task: &str,
@@ -2326,9 +2329,7 @@ pub(crate) fn forward_runner_event(
         .as_deref()
         .and_then(|s| s.parse().ok())
         .unwrap_or(crate::logging::LogLevel::INFO);
-    let Ok(guard) = store.lock() else {
-        return ForwardedEvent::default();
-    };
+    let guard = store.lock();
     // RAL-102 follow-up: as soon as the runner reports the agent's session id
     // — the claude-code backend's `stream-json` init event, codex's
     // `thread.started`, pi's equivalent — persist it immediately rather than
@@ -2848,8 +2849,10 @@ mod tests {
 
     #[test]
     fn check_stall_escalation_fires_once_past_threshold_and_not_before() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        insert_squad_for_stall_test(&store.lock().unwrap(), "squad-000000000001");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        insert_squad_for_stall_test(&store.lock(), "squad-000000000001");
         let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
         let spec = stall_test_spec();
         let session_name = "ralphus_test_stall_session";
@@ -2862,10 +2865,9 @@ mod tests {
         runner.check_stall_escalation(&spec, session_name, attempt_started_ms, zero_threshold);
         runner.check_stall_escalation(&spec, session_name, attempt_started_ms, zero_threshold);
 
-        let client_id = store.lock().unwrap().register_mailbox_client().unwrap();
+        let client_id = store.lock().register_mailbox_client().unwrap();
         let messages = store
             .lock()
-            .unwrap()
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert_eq!(
@@ -2889,12 +2891,10 @@ mod tests {
         let fresh_activity_ms = attempt_started_ms - 1;
         store
             .lock()
-            .unwrap()
             .note_live_activity(session_name, fresh_activity_ms);
         runner.check_stall_escalation(&spec, session_name, attempt_started_ms, zero_threshold);
         let messages_after = store
             .lock()
-            .unwrap()
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert_eq!(
@@ -2906,7 +2906,9 @@ mod tests {
 
     #[test]
     fn check_stall_escalation_is_a_noop_below_threshold() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
         let spec = stall_test_spec();
         let attempt_started_ms = crate::store::now_ms();
@@ -2918,10 +2920,9 @@ mod tests {
             Duration::from_secs(600),
         );
 
-        let client_id = store.lock().unwrap().register_mailbox_client().unwrap();
+        let client_id = store.lock().register_mailbox_client().unwrap();
         let messages = store
             .lock()
-            .unwrap()
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert!(messages.is_empty());
@@ -3266,7 +3267,9 @@ mod tests {
         // `RALPHUS_EVENT:` line they see — exercised directly here rather
         // than via a raw stderr pipe reader, which no longer exists now that
         // every spec (prompt and command alike) runs tmux-wrapped (RAL-151).
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         forward_runner_event(
             Some(&store),
             "run-1",
@@ -3279,7 +3282,6 @@ mod tests {
 
         let page = store
             .lock()
-            .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
             .unwrap();
         assert_eq!(
@@ -3300,7 +3302,9 @@ mod tests {
         crate::redact::with_registry_lock(|| {
             crate::redact::clear_for_tests();
             crate::redact::register("phase7-event-secret");
-            let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+            let store = Arc::new(crate::store_lock::StoreMutex::new(
+                Store::open_in_memory().unwrap(),
+            ));
             forward_runner_event(
                 Some(&store),
                 "run-1",
@@ -3317,7 +3321,6 @@ mod tests {
             );
             let page = store
                 .lock()
-                .unwrap()
                 .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
                 .unwrap();
             let rendered = format!("{:?}", page.rows);
@@ -3339,12 +3342,15 @@ cwd = "/repo"
 prompt = "make it build"
 "#;
 
-    fn store_with_one_cell() -> (Arc<Mutex<Store>>, String) {
+    fn store_with_one_cell() -> (crate::store_lock::StoreHandle, String) {
         let mut store = Store::open_in_memory().unwrap();
         let file: ralphus_core::schema::TaskFile =
             toml::from_str(LIVE_CAPTURE_SAMPLE).expect("valid toml");
         let squad_id = store.insert_squad(&file, None, false).unwrap();
-        (Arc::new(Mutex::new(store)), squad_id)
+        (
+            Arc::new(crate::store_lock::StoreMutex::new(store)),
+            squad_id,
+        )
     }
 
     /// Every CLI-agent backend names its own event source (`claude-code`,
@@ -3377,11 +3383,7 @@ prompt = "make it build"
                 Some(sid.as_str()),
                 "{source}: the id must be handed back for the reattach retry"
             );
-            let (_, _, persisted) = store
-                .lock()
-                .unwrap()
-                .get_cell_agent_resume(&squad_id, 0, 0)
-                .unwrap();
+            let (_, _, persisted) = store.lock().get_cell_agent_resume(&squad_id, 0, 0).unwrap();
             assert_eq!(
                 persisted.as_deref(),
                 Some(sid.as_str()),
@@ -3429,7 +3431,7 @@ prompt = "make it build"
                 }),
                 "{source}: the snapshot the cost cap reads must be returned"
             );
-            let squad = store.lock().unwrap().get_squad(&squad_id).unwrap();
+            let squad = store.lock().get_squad(&squad_id).unwrap();
             let cell = &squad.tasks[0].cells[0];
             assert_eq!(cell.tokens_in, tokens_in, "{source}: tokens_in persisted");
             assert_eq!(cell.tokens_out, 7, "{source}: tokens_out persisted");
@@ -3482,7 +3484,6 @@ prompt = "make it build"
 
         let page = store
             .lock()
-            .unwrap()
             .cartographer_query(&crate::cartographer::CartographerFilter::recent(50))
             .unwrap();
         let messages: Vec<&str> = page.rows.iter().map(|r| r.message.as_str()).collect();
@@ -4567,7 +4568,7 @@ prompt = "make it build"
             program: "python".to_string(),
             args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
             registry: None,
-            cartographer: Some(Arc::new(Mutex::new(store))),
+            cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
@@ -4704,7 +4705,7 @@ prompt = "make it build"
             program: "python".to_string(),
             args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
             registry: None,
-            cartographer: Some(Arc::new(Mutex::new(store))),
+            cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();

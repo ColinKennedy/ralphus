@@ -25,8 +25,9 @@
 //! must not pay for a capability they do not use.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+#[cfg(test)]
 use crate::store::Store;
 
 /// A working directory together with the machine it lives on.
@@ -43,7 +44,7 @@ pub struct Workspace {
     /// Needed only to resolve a remote machine's provider. `None` for a local
     /// workspace, which never consults the registry — keeping the local path
     /// free of any dependency it does not use.
-    store: Option<Arc<Mutex<Store>>>,
+    store: Option<crate::store_lock::StoreHandle>,
 }
 
 impl std::fmt::Debug for Workspace {
@@ -95,13 +96,12 @@ impl Workspace {
     /// for an answer that never moves.
     #[must_use]
     pub fn for_guardian(
-        store: &Arc<Mutex<Store>>,
+        store: &crate::store_lock::StoreHandle,
         guardian_id: &str,
         root: impl Into<PathBuf>,
     ) -> Self {
         let machine = store
             .lock()
-            .expect("poisoned")
             .get_guardian(guardian_id)
             .ok()
             .and_then(|g| g.machine);
@@ -111,7 +111,7 @@ impl Workspace {
     /// Attach the store handle a remote workspace needs to resolve its
     /// provider. A no-op in effect for a local workspace, which never looks.
     #[must_use]
-    pub fn with_store(mut self, store: Arc<Mutex<Store>>) -> Self {
+    pub fn with_store(mut self, store: crate::store_lock::StoreHandle) -> Self {
         self.store = Some(store);
         self
     }
@@ -342,7 +342,7 @@ impl Workspace {
             ));
         };
         let provider = {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::remote_runner::provider_from_store(&guard, machine)?.ok_or_else(|| {
                 format!("machine \"{machine}\" resolved to the local host unexpectedly")
             })?
@@ -474,7 +474,9 @@ mod tests {
 
     #[test]
     fn a_remote_workspace_with_an_unregistered_machine_fails_rather_than_running_locally() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ws = Workspace::on("/repo", Some("ghostfarm:A")).with_store(store);
         let err = ws.git(&["status"]).expect_err("must not run locally");
         assert!(err.contains("ghostfarm"), "{err}");
@@ -507,10 +509,11 @@ echo {json}
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -554,10 +557,11 @@ echo {json}
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -601,10 +605,11 @@ echo {json}
             &dir,
             r#"{"ok":true,"protocol_version":1,"outcome":"deferred","reason":"still in use","retry_at_ms":99}"#,
         );
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "ib",
                 "",
@@ -628,7 +633,9 @@ echo {json}
 
     #[test]
     fn retire_worktree_on_an_unregistered_remote_machine_fails_rather_than_running_locally() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ws = Workspace::on("/remote/repo", Some("ghostfarm:A")).with_store(store);
         match ws.retire_worktree("/remote/repo/worktrees/feat") {
             crate::remote_runner::RetirementOutcome::Failed { error } => {

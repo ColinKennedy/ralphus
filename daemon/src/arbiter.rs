@@ -27,7 +27,8 @@
 //! Unresolved`] -- see that type's doc comment for the full three-state
 //! model.
 
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 
 use crate::chat_client::{self, ChatMessage};
 use crate::config::ArbiterConfig;
@@ -186,13 +187,13 @@ fn parse_classification_reply<'a>(
 /// caller.
 #[must_use]
 pub fn classify(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     arbiter: &Arbiter,
     squad_id: &str,
     cell_id: &str,
     cell_context: &str,
 ) -> Vec<String> {
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let types = guard.list_triage_types().unwrap_or_default();
     let candidates: Vec<&TriageTypeView> = types
         .iter()
@@ -235,7 +236,7 @@ pub fn classify(
     ) {
         Ok(v) => v,
         Err(e) => {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             return note_and_return(
                 &guard,
                 squad_id,
@@ -250,7 +251,7 @@ pub fn classify(
         arbiter.model.as_deref().unwrap_or_default(),
         usage,
     );
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.record_arbiter_cost(
         "classification",
         usage.tokens_in as i64,
@@ -339,7 +340,7 @@ fn parse_subproject_reply(reply: &str, candidates: &[String]) -> Vec<String> {
 /// dropped.
 #[must_use]
 pub fn infer_subprojects(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     arbiter: &Arbiter,
     squad_id: &str,
     cell_id: &str,
@@ -350,7 +351,7 @@ pub fn infer_subprojects(
         return None;
     }
     {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if over_budget(&guard, arbiter) {
             crate::cartographer::Note::new("arbiter")
                 .squad(squad_id)
@@ -377,7 +378,7 @@ pub fn infer_subprojects(
     ) {
         Ok(v) => v,
         Err(e) => {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("arbiter")
                 .squad(squad_id)
                 .cell(cell_id)
@@ -394,7 +395,7 @@ pub fn infer_subprojects(
         arbiter.model.as_deref().unwrap_or_default(),
         usage,
     );
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.record_arbiter_cost(
         "subproject_inference",
         usage.tokens_in as i64,
@@ -499,7 +500,7 @@ pub struct PendingSubprojectResolution {
 /// once they're classified is safe. A no-op when `pending`,
 /// `pending_subprojects`, and `has_triage` all call for nothing.
 pub fn spawn_triage_followup(
-    store_handle: Arc<Mutex<Store>>,
+    store_handle: crate::store_lock::StoreHandle,
     squad_id: String,
     file: ralphus_core::schema::TaskFile,
     pending: Vec<PendingClassification>,
@@ -513,13 +514,13 @@ pub fn spawn_triage_followup(
         let arbiter = Arbiter::current();
         for p in &pending {
             let types = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
-            let guard = store_handle.lock().expect("store mutex poisoned");
+            let guard = store_handle.lock();
             let _ = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types);
         }
         for p in &pending_subprojects {
             resolve_pending_subprojects(&store_handle, &arbiter, &squad_id, p);
         }
-        let guard = store_handle.lock().expect("store mutex poisoned");
+        let guard = store_handle.lock();
         if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file) {
             crate::rlog!(
                 WARNING,
@@ -544,7 +545,7 @@ pub fn spawn_triage_followup(
 /// `ralphus:` worktree placeholder, or the project's `.ralphus.toml`
 /// configures no `[monorepo] subprojects` at all.
 fn resolve_pending_subprojects(
-    store_handle: &Arc<Mutex<Store>>,
+    store_handle: &crate::store_lock::StoreHandle,
     arbiter: &Arbiter,
     squad_id: &str,
     p: &PendingSubprojectResolution,
@@ -569,7 +570,7 @@ fn resolve_pending_subprojects(
     ) else {
         return;
     };
-    let guard = store_handle.lock().expect("store mutex poisoned");
+    let guard = store_handle.lock();
     let _ = guard.set_cell_subprojects(squad_id, p.task_idx, p.idx, &matched, true);
 }
 
@@ -796,12 +797,12 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_with_no_registered_types() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // A fresh store also seeds `DEFAULT_TRIAGE_TYPES` (RAL-318) alongside
         // the built-in `unclassified` type -- deregister those to exercise
         // the "no candidates at all" fallback this test targets.
         for (name, ..) in crate::triage::DEFAULT_TRIAGE_TYPES {
-            s.lock().unwrap().deregister_triage_type(name).unwrap();
+            s.lock().deregister_triage_type(name).unwrap();
         }
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
@@ -816,9 +817,8 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_when_over_budget() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         s.lock()
-            .unwrap()
             .register_triage_type("security", "Security", "sensitive changes")
             .unwrap();
         let arbiter = Arbiter {
@@ -827,7 +827,6 @@ mod tests {
             maximum_budget_usd: Some(0.0),
         };
         s.lock()
-            .unwrap()
             .record_arbiter_cost("classification", 1, 1, 0.0001)
             .unwrap();
         assert_eq!(
@@ -838,9 +837,8 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_for_unsupported_backend() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         s.lock()
-            .unwrap()
             .register_triage_type("security", "Security", "sensitive changes")
             .unwrap();
         let arbiter = Arbiter {
@@ -930,7 +928,7 @@ mod tests {
 
     #[test]
     fn infer_subprojects_returns_none_with_no_candidates_or_empty_context() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
             model: None,
@@ -954,14 +952,13 @@ mod tests {
 
     #[test]
     fn infer_subprojects_returns_none_when_over_budget() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
             model: None,
             maximum_budget_usd: Some(0.0),
         };
         s.lock()
-            .unwrap()
             .record_arbiter_cost("classification", 1, 1, 0.0001)
             .unwrap();
         assert!(
@@ -980,7 +977,7 @@ mod tests {
 
     #[test]
     fn infer_subprojects_returns_none_for_unsupported_backend() {
-        let s = Arc::new(Mutex::new(store()));
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "claude-code".to_string(), // not headlessly callable
             model: None,

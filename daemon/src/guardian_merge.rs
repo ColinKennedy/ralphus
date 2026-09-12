@@ -37,6 +37,7 @@ use crate::guardian::{
 use crate::runner::{Runner, RunnerSpec};
 use crate::scheduler::Semaphore;
 use crate::server::Reply;
+#[cfg(test)]
 use crate::store::Store;
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
@@ -947,7 +948,7 @@ fn detect_rebase_step_content_loss(wt: &Workspace) -> Option<Vec<String>> {
 /// `REBASE_HEAD` still names the commit-in-flight right up until
 /// [`advance_rebase`] is called and stops being checkable afterward.
 fn guard_against_rebase_step_content_loss(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch: &str,
     wt: &Workspace,
@@ -966,7 +967,7 @@ fn guard_against_rebase_step_content_loss(
          rebase_head={rebase_head:?} lost={lost:?}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "guardian",
@@ -1126,8 +1127,11 @@ fn resolve_resolver_agent(
 /// [`drive_rebase`]'s clean (no-conflict) path can also resolve it, without
 /// paying for the (possibly LLM-backed) quality-bar synthesis unless a proof
 /// call actually ends up running -- see [`proof_extras`].
-fn resolver_backend(store: &Arc<Mutex<Store>>, id: &str) -> Result<ResolvedResolverAgent, String> {
-    let guard = store.lock().expect("poisoned");
+fn resolver_backend(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+) -> Result<ResolvedResolverAgent, String> {
+    let guard = store.lock();
     let g = guard.get_guardian(id).map_err(|e| e.to_string())?;
     drop(guard);
     resolve_resolver_agent(
@@ -1165,13 +1169,12 @@ fn preflight_resolver_agent(
 /// Degrades to an empty map for an unknown branch rather than failing the
 /// merge — the same posture every other guardian read here takes.
 fn branch_env(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
 ) -> std::collections::BTreeMap<String, String> {
     store
         .lock()
-        .expect("poisoned")
         .resolve_guardian_branch_env(id, branch_id)
         .unwrap_or_default()
 }
@@ -1183,7 +1186,7 @@ fn branch_env(
 /// invoke an LLM call -- under RAL-168's "nothing"/"final_branch" scopes (or
 /// "each_branch" with auto-clean-skip), most branches never call this at all.
 fn proof_extras(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch: &str,
     branch_id: &str,
@@ -1195,7 +1198,7 @@ fn proof_extras(
         synthesize_proof_instructions(store, id, branch, branch_id, runner, resolved, cancel);
     let ghost_uri = crate::ghost::review_uri(id, Some(branch_id));
     let ghost_prefix = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard
             .get_ghost(&ghost_uri)
             .ok()
@@ -1229,8 +1232,8 @@ impl ProofGate {
     /// combining the guardian-level `effective_proof_scope`/
     /// `effective_proof_skip_auto_clean` with whether this particular
     /// branch is the last one in the stack.
-    fn resolve(store: &Arc<Mutex<Store>>, id: &str, is_final_branch: bool) -> Self {
-        let guard = store.lock().expect("poisoned");
+    fn resolve(store: &crate::store_lock::StoreHandle, id: &str, is_final_branch: bool) -> Self {
+        let guard = store.lock();
         let g = guard.get_guardian(id).ok();
         ProofGate {
             scope: g
@@ -1290,13 +1293,13 @@ fn final_branch_id(branches: &[crate::guardian::OrderedBranch]) -> Option<&str> 
 /// callers should stop making further resolver/prover calls and fail the
 /// guardian/branch, using the returned error message.
 fn record_guardian_call_cost(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: Option<&str>,
     kind: &str,
     result: &crate::runner::RunnerResult,
 ) -> std::result::Result<(), String> {
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     let attempt = guard.guardian_current_attempt(id).unwrap_or(0);
     let _ = guard.record_guardian_cost(
         id,
@@ -1353,7 +1356,7 @@ fn record_guardian_call_cost(
 /// Significant decisions are written to the guardian event log so they surface
 /// in the Reviews UI under the affected branch.
 fn synthesize_proof_instructions(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch: &str,
     branch_id: &str,
@@ -1362,17 +1365,13 @@ fn synthesize_proof_instructions(
     cancel: &CancelToken,
 ) -> String {
     let log = |msg: &str| {
-        let _ = store.lock().expect("poisoned").log_event(
-            None,
-            Some(id),
-            "guardian",
-            Some(branch),
-            msg,
-        );
+        let _ = store
+            .lock()
+            .log_event(None, Some(id), "guardian", Some(branch), msg);
     };
 
     let (explicit_checks, git_root, review_machine, proof_scope_is_nothing) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let checks = guard.guardian_checks(id).unwrap_or_default();
         let guardian = guard.get_guardian(id).ok();
         let root = guardian
@@ -1395,7 +1394,7 @@ fn synthesize_proof_instructions(
     }
 
     let (cell_proofs, task_proofs) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         match guard.proof_steps_for_review_branch(id, branch) {
             Ok(Some((sv, tv, _))) => (sv, tv),
             _ => (vec![], vec![]),
@@ -1567,9 +1566,9 @@ fn synthesize_proof_instructions(
 /// resolved" entries' style. Deliberately does NOT touch guardian/branch
 /// status or run any destructive git operation -- see the checkpoints' own
 /// comments for why.
-fn log_merge_cancelled(store: &Arc<Mutex<Store>>, id: &str) {
+fn log_merge_cancelled(store: &crate::store_lock::StoreHandle, id: &str) {
     crate::rlog!(INFO, "ralphus [guardian] review {id} merge cancelled");
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::INFO,
         source: "guardian",
@@ -1591,7 +1590,7 @@ fn log_merge_cancelled(store: &Arc<Mutex<Store>>, id: &str) {
 /// it, then runs (or skips, per `gate`) the dedicated final-proof pass.
 #[allow(clippy::too_many_arguments)]
 fn finish_branch_resolved(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     branch: &str,
@@ -1605,7 +1604,7 @@ fn finish_branch_resolved(
     last_session_id: Option<String>,
 ) -> std::result::Result<(Option<String>, String), String> {
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
         let _ = guard.set_branch_conflicts(id, branch_id, Some(found), Some(0), Some(committed));
     }
@@ -1614,7 +1613,7 @@ fn finish_branch_resolved(
         "ralphus [guardian] review {id} conflicts resolved branch={branch:?} committed={committed}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -1675,7 +1674,7 @@ const MAX_ATTEMPTS_PER_COMMIT: u32 = 2;
 /// worktree look clean/finished as if nothing had failed, so this is the last
 /// chance to record what was actually still broken.
 fn give_up_on_stuck_commit(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch: &str,
     wt: &Workspace,
@@ -1709,7 +1708,7 @@ fn give_up_on_stuck_commit(
          afterward even though it is not"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "guardian",
@@ -1752,7 +1751,7 @@ fn give_up_on_stuck_commit(
 /// rebase from completing -- see [`run_final_proof`]'s doc comment).
 #[allow(clippy::too_many_arguments)]
 fn resolve_conflicts_with_agent(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     runner: &dyn Runner,
@@ -1798,7 +1797,7 @@ fn resolve_conflicts_with_agent(
          agent={agent:?} model={model:?}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(0));
         let _ = guard.set_branch_conflicts(id, branch_id, Some(found), Some(0), Some(0));
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -1894,7 +1893,7 @@ fn resolve_conflicts_with_agent(
             );
             committed += i64::try_from(files.len()).unwrap_or(0);
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
                 let _ = guard.set_branch_conflicts(
                     id,
@@ -1932,7 +1931,7 @@ fn resolve_conflicts_with_agent(
         // an earlier iteration just published via `guard.upsert_ghost` below,
         // instead of a stale pre-loop snapshot.
         let ghost_prefix = {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             guard
                 .get_ghost(&ghost_uri)
                 .ok()
@@ -2053,7 +2052,7 @@ fn resolve_conflicts_with_agent(
                 if let Ok(raw) = std::fs::read_to_string(&sid_path_clone) {
                     let sid = raw.trim();
                     if !sid.is_empty() {
-                        let guard = store_clone.lock().expect("poisoned");
+                        let guard = store_clone.lock();
                         let _ = guard.set_branch_resolver_session_id(&id_str, &branch_id_str, sid);
                         break;
                     }
@@ -2085,7 +2084,7 @@ fn resolve_conflicts_with_agent(
                 let remaining =
                     i64::try_from(count_markers(&marker_wt, &marker_files)).unwrap_or(i64::MAX);
                 let fixed = markers_before.saturating_sub(remaining).max(0);
-                let guard = marker_store.lock().expect("poisoned");
+                let guard = marker_store.lock();
                 let _ = guard.set_guardian_conflicts(
                     &marker_id,
                     Some(found),
@@ -2105,10 +2104,7 @@ fn resolve_conflicts_with_agent(
         // RAL-259: the resolver agent is actually beginning to run — stamp the
         // branch's Live-View start time (COALESCE so the fix pass, fired first
         // within this attempt, wins over the final-proof call that may follow).
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .stamp_branch_started_at(id, branch_id);
+        let _ = store.lock().stamp_branch_started_at(id, branch_id);
         let result = runner.run_cancellable(&spec, cancel);
 
         stop.store(true, Ordering::Relaxed);
@@ -2142,7 +2138,7 @@ fn resolve_conflicts_with_agent(
                 "ralphus [guardian] review {id} conflicts failed branch={branch:?}: {err}"
             );
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
                     source: "guardian",
@@ -2170,7 +2166,7 @@ fn resolve_conflicts_with_agent(
         if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
             if !ghost_text.is_empty() {
                 let revision = crate::ghost::current_revision(&wt.root().to_string_lossy());
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 if guard
                     .upsert_ghost(
                         &ghost_uri,
@@ -2205,7 +2201,7 @@ fn resolve_conflicts_with_agent(
         if stage_done {
             committed += markers_before;
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
                 let _ = guard.set_branch_conflicts(
                     id,
@@ -2220,7 +2216,7 @@ fn resolve_conflicts_with_agent(
                 "ralphus [guardian] review {id} stage-done signal received branch={branch:?}"
             );
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "guardian",
@@ -2250,7 +2246,7 @@ fn resolve_conflicts_with_agent(
         // Fixed = hunks the agent cleared in the working tree, not yet staged.
         let fixed = markers_before.saturating_sub(remaining);
         {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.set_guardian_conflicts(id, Some(found), Some(fixed), Some(committed));
             let _ = guard.set_branch_conflicts(
                 id,
@@ -2273,7 +2269,7 @@ fn resolve_conflicts_with_agent(
                  remaining={remaining} files={files:?}"
             );
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::WARNING,
                     source: "guardian",
@@ -2315,7 +2311,7 @@ fn resolve_conflicts_with_agent(
         // All hunks in this batch are now staged; accumulate them as committed.
         committed += markers_before;
         {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.set_guardian_conflicts(id, Some(found), Some(0), Some(committed));
             let _ =
                 guard.set_branch_conflicts(id, branch_id, Some(found), Some(0), Some(committed));
@@ -2358,7 +2354,7 @@ fn resolve_conflicts_with_agent(
 /// RAL-149.
 #[allow(clippy::too_many_arguments)]
 fn run_final_proof(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     runner: &dyn Runner,
@@ -2372,7 +2368,7 @@ fn run_final_proof(
     let agent = &resolved.backend;
     let model = &resolved.model;
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_branch_status(id, branch_id, MergeStatus::ProofPending, None);
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
@@ -2454,10 +2450,7 @@ fn run_final_proof(
     // branch's Live-View start time. COALESCE means a branch that already
     // started a fix pass keeps that (earlier) start; one that went straight to
     // proof (clean rebase) gets stamped here.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .stamp_branch_started_at(id, branch_id);
+    let _ = store.lock().stamp_branch_started_at(id, branch_id);
     let result = runner.run_cancellable(&spec, cancel);
     // RAL-193: not fatal here -- per this function's own doc comment, the
     // proof call never blocks the rebase from completing, so a budget overrun is
@@ -2470,7 +2463,7 @@ fn run_final_proof(
         "ralphus [guardian] review {id} final proof done branch={branch:?} passed={passed}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: if passed {
                 crate::logging::LogLevel::INFO
@@ -2516,7 +2509,7 @@ fn run_final_proof(
 /// just that the agent said so. No note when `checks` is empty (nothing was
 /// actually validated) or `skip_auto_build` is set.
 fn run_commit_checks(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     wt: &Workspace,
@@ -2524,7 +2517,7 @@ fn run_commit_checks(
     cancel: &CancelToken,
 ) -> std::result::Result<(), String> {
     let (skip_auto_build, checks) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         (
             guard.guardian_skip_auto_build(id).unwrap_or(false),
             guard.guardian_checks(id).unwrap_or_default(),
@@ -2552,7 +2545,7 @@ fn run_commit_checks(
         let uri = crate::ghost::review_uri(id, Some(branch_id));
         let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
         let revision = crate::ghost::current_revision(&wt_str);
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         if guard
             .upsert_ghost(
                 &uri,
@@ -2595,11 +2588,11 @@ fn run_commit_checks(
 /// what makes a worktree already on disk get found again by a later restack
 /// or feedback pass instead of silently retargeted at the wrong branch.
 fn branch_short_names(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     project: Option<&str>,
 ) -> std::collections::HashMap<String, String> {
-    let guardian = store.lock().expect("poisoned").get_guardian(id).ok();
+    let guardian = store.lock().get_guardian(id).ok();
     let git_root = guardian
         .as_ref()
         .map(|g| g.git_root.clone())
@@ -2646,7 +2639,7 @@ fn branch_wt_dir(
 /// of this loop rather than calling this helper.
 #[allow(clippy::too_many_arguments)]
 fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     root: &Workspace,
@@ -2664,7 +2657,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // the last lease claims the (coalesced) request itself, so this call
     // returns without spinning.
     {
-        let mut guard = store.lock().expect("poisoned");
+        let mut guard = store.lock();
         guard.request_guardian_restack(id, from_position);
         crate::cartographer::Note::new("guardian")
             .guardian(id)
@@ -2674,16 +2667,12 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
                 serde_json::json!({"from_position": from_position}),
             );
     }
-    let Some(from_position) = store
-        .lock()
-        .expect("poisoned")
-        .try_claim_guardian_restack(id)
-    else {
+    let Some(from_position) = store.lock().try_claim_guardian_restack(id) else {
         set_status(
             GuardianStatus::InReview,
             Some("restack queued: waiting for branch actioning"),
         );
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         crate::cartographer::Note::new("guardian")
             .guardian(id)
             .emit(
@@ -2709,18 +2698,12 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // `checks_state` drops out of "ready" for the whole restack, instead of
     // showing the previous build's commands as current until
     // `generate_manual_commands` overwrites them at the end.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .clear_guardian_manual_commands(id);
+    let _ = store.lock().clear_guardian_manual_commands(id);
     // RAL-193: this restack is its own re-merge attempt -- a distinct
     // resolver/prover cost bucket from whatever attempt preceded it,
     // whether triggered by routed reviewer feedback or a detected manual
     // push (both call this, not `run_merge`).
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .bump_guardian_merge_attempt(id);
+    let _ = store.lock().bump_guardian_merge_attempt(id);
     let base_sha = match resolve_base(root, base_branch) {
         Ok(s) => s,
         Err(e) => {
@@ -2731,11 +2714,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             return;
         }
     };
-    let branches = store
-        .lock()
-        .expect("poisoned")
-        .guardian_branches(id)
-        .unwrap_or_default();
+    let branches = store.lock().guardian_branches(id).unwrap_or_default();
     // RAL-211: short worktree-directory names, computed once for this pass --
     // see `branch_short_names`'s doc comment for why this must stay
     // consistent with every other call site's computation for the same
@@ -2745,7 +2724,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // per-project during the re-stack. `guardian_branches` returns no project, so
     // build the map from the full guardian view.
     let (squash_set, proj_by_branch) = {
-        let g = store.lock().expect("poisoned").get_guardian(id).ok();
+        let g = store.lock().get_guardian(id).ok();
         let squash_set: std::collections::HashSet<String> = g
             .as_ref()
             .map(|g| g.squash_projects.iter().cloned().collect())
@@ -2780,12 +2759,9 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         let squash = proj_by_branch
             .get(&ob.branch)
             .is_some_and(|p| squash_set.contains(p));
-        let _ = store.lock().expect("poisoned").set_branch_status(
-            id,
-            &ob.id,
-            MergeStatus::InProgress,
-            None,
-        );
+        let _ = store
+            .lock()
+            .set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
         let rev = match claim_branch_review_ref(
             store,
             root,
@@ -2808,10 +2784,7 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
             return;
         }
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_branch_review(id, &ob.id, &rev, &wt_j_str);
+        let _ = store.lock().set_branch_review(id, &ob.id, &rev, &wt_j_str);
         let gate = ProofGate::resolve(store, id, Some(&ob.id) == final_id.as_ref());
         if stack_pick(
             store, runner, id, &ob.id, &ob.branch, &base_sha, &prev_ref, &rev, &wt_j, squash,
@@ -2860,12 +2833,12 @@ fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
 /// (success, early return, or panic unwind) without each call site having to
 /// remember to call [`Store::finish_guardian_restack`] itself.
 struct GuardianRestackClaim {
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     guardian_id: String,
 }
 
 impl GuardianRestackClaim {
-    fn new(store: Arc<Mutex<Store>>, guardian_id: &str) -> Self {
+    fn new(store: crate::store_lock::StoreHandle, guardian_id: &str) -> Self {
         Self {
             store,
             guardian_id: guardian_id.to_string(),
@@ -2875,10 +2848,7 @@ impl GuardianRestackClaim {
 
 impl Drop for GuardianRestackClaim {
     fn drop(&mut self) {
-        self.store
-            .lock()
-            .expect("poisoned")
-            .finish_guardian_restack(&self.guardian_id);
+        self.store.lock().finish_guardian_restack(&self.guardian_id);
     }
 }
 
@@ -2967,15 +2937,11 @@ pub(crate) fn combined_review_ref_of(guardian: &crate::guardian::GuardianView) -
 /// [`claim_combined_review_ref`] for the merge paths that hold `id` rather
 /// than an already-loaded [`crate::guardian::GuardianView`].
 fn claim_combined_review_ref_by_id(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Workspace,
     id: &str,
 ) -> std::result::Result<String, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     claim_combined_review_ref(store, root, &guardian)
 }
 
@@ -2987,11 +2953,11 @@ fn claim_combined_review_ref_by_id(
 /// `git_root` only -- there is exactly one combined branch, and it lives
 /// there.
 fn claimed_review_branches(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     project: Option<&str>,
 ) -> Vec<String> {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
         return Vec::new();
     };
     let mut names: Vec<String> = guardian
@@ -3045,7 +3011,7 @@ static REVIEW_BRANCH_CLAIM_LOCK: Mutex<()> = Mutex::new(());
 /// Callers must hold [`REVIEW_BRANCH_CLAIM_LOCK`] across this *and* the write
 /// that records the result.
 fn unique_review_branch_name(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Workspace,
     project_root: &str,
     base: &str,
@@ -3060,7 +3026,6 @@ fn unique_review_branch_name(
         // attempts and the caller fails the branch loudly.
         store
             .lock()
-            .expect("poisoned")
             .review_branch_name_taken(project_root, candidate, except)
             .unwrap_or(true)
     })
@@ -3081,7 +3046,7 @@ fn unique_review_branch_name(
 /// anything.
 #[allow(clippy::too_many_arguments)]
 fn claim_branch_review_ref(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Workspace,
     guardian_id: &str,
     project_root: &str,
@@ -3109,14 +3074,13 @@ fn claim_branch_review_ref(
     )?;
     store
         .lock()
-        .expect("poisoned")
         .set_branch_review_branch_name(guardian_id, branch_id, &name)
         .map_err(|e| e.to_string())?;
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {guardian_id} branch {branch_id} review branch named {name}"
     );
-    let _ = store.lock().expect("poisoned").log_event(
+    let _ = store.lock().log_event(
         None,
         Some(guardian_id),
         "guardian",
@@ -3129,7 +3093,7 @@ fn claim_branch_review_ref(
 /// [`claim_branch_review_ref`] for a combined-worktree review's single shared
 /// branch, named from the review's own name rather than any one task branch.
 fn claim_combined_review_ref(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Workspace,
     guardian: &crate::guardian::GuardianView,
 ) -> std::result::Result<String, String> {
@@ -3150,7 +3114,6 @@ fn claim_combined_review_ref(
     let name = unique_review_branch_name(store, root, &guardian.git_root, &base, None)?;
     store
         .lock()
-        .expect("poisoned")
         .set_guardian_review_branch_name(&guardian.id, &name)
         .map_err(|e| e.to_string())?;
     crate::rlog!(
@@ -3158,7 +3121,7 @@ fn claim_combined_review_ref(
         "ralphus [guardian] review {} combined review branch named {name}",
         guardian.id
     );
-    let _ = store.lock().expect("poisoned").log_event(
+    let _ = store.lock().log_event(
         None,
         Some(&guardian.id),
         "guardian",
@@ -3184,7 +3147,7 @@ fn claim_combined_review_ref(
 /// every worktree/branch/carry-ref here (before the next `run_merge` even
 /// starts) forces that rebuild to fall back to its from-scratch path and
 /// re-derive every remaining branch purely from its own feature-branch tip.
-pub fn purge_worktrees(store: &Arc<Mutex<Store>>, git_root: &str, id: &str) {
+pub fn purge_worktrees(store: &crate::store_lock::StoreHandle, git_root: &str, id: &str) {
     let num = id.replace("guardian-", "");
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
     let wt_base = root.at(worktree_dir(git_root, id));
@@ -3206,7 +3169,7 @@ pub fn purge_worktrees(store: &Arc<Mutex<Store>>, git_root: &str, id: &str) {
 /// a settings change (or an explicit cancel-and-restart) actually stop this
 /// merge instead of only flipping a DB column underneath it.
 pub fn start_merge(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
     sem: Arc<Semaphore>,
@@ -3257,12 +3220,12 @@ pub(crate) enum StartMergeError {
 /// naming the wait in the log is what turns "the button did nothing for
 /// twenty seconds" into a locatable cause.
 fn lock_timed<'a>(
-    store: &'a Arc<Mutex<Store>>,
+    store: &'a crate::store_lock::StoreHandle,
     id: &str,
     what: &str,
-) -> std::sync::MutexGuard<'a, Store> {
+) -> crate::store_lock::StoreGuard<'a> {
     let waiting = std::time::Instant::now();
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let waited_ms = waiting.elapsed().as_millis();
     if waited_ms >= KICKOFF_SLOW_LOCK_MS {
         // ralphus[ignore-rlog-pair]: internal lock-wait perf diagnostic, not a queryable domain event
@@ -3286,7 +3249,7 @@ fn lock_timed<'a>(
 const KICKOFF_SLOW_LOCK_MS: u128 = 250;
 
 pub(crate) fn kickoff_merge(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
     sem: Arc<Semaphore>,
@@ -3311,7 +3274,7 @@ pub(crate) fn kickoff_merge(
     // status unchanged) falls straight through to the normal path.
     if crate::pr::check_pr_merges(&store, id) {
         let now_approved = matches!(
-            store.lock().expect("store mutex poisoned").get_guardian(id),
+            store.lock().get_guardian(id),
             Ok(g) if g.status.as_str() == GuardianStatus::Approved.as_str()
         );
         if now_approved {
@@ -3330,7 +3293,7 @@ pub(crate) fn kickoff_merge(
     // commits (e.g. a fast-forward merge outside any tracked PR) has
     // nothing left to rebuild either.
     let guardian_snapshot = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard.get_guardian(id).ok()
     };
     if let Some(guardian_snapshot) = guardian_snapshot {
@@ -3494,7 +3457,7 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
 /// Windows, [`crate::tmux::Tmux::kill_session`] also closes the confined job
 /// object, terminating the pane's entire process tree rather than merely
 /// removing the tmux session name.
-fn kill_guardian_agent_sessions(store: &Arc<Mutex<Store>>, id: &str) {
+fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
     let prefix = format!("ralphus_guardian-{id}_");
     let count = crate::tmux::Tmux::resolve()
         .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
@@ -3506,7 +3469,7 @@ fn kill_guardian_agent_sessions(store: &Arc<Mutex<Store>>, id: &str) {
         INFO,
         "ralphus [guardian] review {id} stopped {count} active agent session(s)"
     );
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::INFO,
         source: "guardian",
@@ -3552,7 +3515,7 @@ pub fn stop_merge_worker_for_cancel(cancellations: &Cancellations, id: &str) {
 /// older thread was still rebasing in. Mirrors `server::restart_run`'s
 /// cancel → wait → reset → restart shape exactly.
 pub fn restart_guardian_merge(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     cancellations: Cancellations,
     runner: Arc<dyn Runner>,
     id: &str,
@@ -3562,11 +3525,7 @@ pub fn restart_guardian_merge(
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
     wait_for_merge_worker_stop(&cancellations, &key);
-    if let Err(e) = store
-        .lock()
-        .expect("store mutex poisoned")
-        .reset_guardian_to_collecting(id)
-    {
+    if let Err(e) = store.lock().reset_guardian_to_collecting(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
     start_merge(store, runner, id, sem, cancellations)
@@ -3593,24 +3552,16 @@ pub fn restart_guardian_merge(
 /// reopen call, a task completing at the same moment) can't double-run the
 /// staged pass.
 pub fn reopen_cancelled_guardian_merge(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Reply {
-    if let Err(e) = store
-        .lock()
-        .expect("store mutex poisoned")
-        .reopen_cancelled_guardian(id)
-    {
+    if let Err(e) = store.lock().reopen_cancelled_guardian(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
-    let claimed = store
-        .lock()
-        .expect("store mutex poisoned")
-        .claim_guardian_merge(id)
-        .unwrap_or(false);
+    let claimed = store.lock().claim_guardian_merge(id).unwrap_or(false);
     if !claimed {
         // Lost the claim to a concurrent trigger (e.g. a task completing at
         // the same instant) -- that other caller's pass covers this reopen.
@@ -3638,7 +3589,7 @@ pub fn reopen_cancelled_guardian_merge(
 /// on `status='merging'`, so a merge that actually completed before the wait
 /// gave up is left in `in_review` rather than mis-labelled.
 pub fn stop_guardian_merge(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     cancellations: Cancellations,
     id: &str,
 ) -> Reply {
@@ -3646,11 +3597,7 @@ pub fn stop_guardian_merge(
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
     wait_for_merge_worker_stop(&cancellations, &key);
-    match store
-        .lock()
-        .expect("store mutex poisoned")
-        .stop_guardian_merge(id)
-    {
+    match store.lock().stop_guardian_merge(id) {
         Ok(status) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
             crate::rlog!(
@@ -3673,14 +3620,14 @@ pub fn stop_guardian_merge(
 /// spawns a background worker (gated by `sem`, same global concurrency cap
 /// as merges/cells) and returns `202` immediately.
 pub fn start_resolve_input(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     guardian_id: &str,
     input_name: &str,
     sem: Arc<Semaphore>,
 ) -> Reply {
     let guardian = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard.get_guardian(guardian_id)
     };
     let guardian = match guardian {
@@ -3718,7 +3665,6 @@ pub fn start_resolve_input(
 
     let claimed = match store
         .lock()
-        .expect("store mutex poisoned")
         .claim_guardian_input_resolution(guardian_id, input_name)
     {
         Ok(c) => c,
@@ -3755,7 +3701,7 @@ pub fn start_resolve_input(
 /// when absent). `submitted_by` is the resolved authenticated/default
 /// requester and is never taken from request data.
 pub fn start_feedback(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
     branch_id: &str,
@@ -3764,7 +3710,7 @@ pub fn start_feedback(
     submitted_by: Option<String>,
 ) -> Reply {
     let guardian = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         guard.get_guardian(id)
     };
     let guardian = match guardian {
@@ -3788,9 +3734,8 @@ pub fn start_feedback(
     // progress (or, worse, completed) once this newer request lands.
     let _ = store
         .lock()
-        .expect("poisoned")
         .supersede_pending_branch_feedback(id, branch_id);
-    let message_seq = match store.lock().expect("poisoned").add_guardian_message(
+    let message_seq = match store.lock().add_guardian_message(
         id,
         "reviewer",
         &feedback,
@@ -3833,13 +3778,13 @@ pub fn start_feedback(
 /// `run_feedback` spawns separately. Best-effort: any failure here is logged
 /// and swallowed rather than failing the feedback-application flow.
 fn record_feedback_reply(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     feature: &str,
     feedback: &str,
 ) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -3894,7 +3839,7 @@ fn record_feedback_reply(
             return;
         }
     };
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     let _ = guard.add_guardian_message(
         id,
         "guardian",
@@ -3908,7 +3853,7 @@ fn record_feedback_reply(
 
 /// [`run_merge`] with no way to stop early -- for tests and any caller with no
 /// live [`CancelToken`] to hand it (`CancelToken::never()` never trips).
-pub fn run_merge(store: &Arc<Mutex<Store>>, runner: &dyn Runner, id: &str) {
+pub fn run_merge(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, id: &str) {
     run_merge_cancellable(store, runner, id, &CancelToken::never());
 }
 
@@ -3959,12 +3904,12 @@ enum StagedPassOutcome {
 /// incremental in this design: they fall back to the legacy all-or-nothing
 /// `run_merge_cancellable`, once every enabled branch's cells are done.
 pub fn run_merge_staged(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     cancel: &CancelToken,
 ) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -3974,21 +3919,16 @@ pub fn run_merge_staged(
         // legacy merge, but only once every enabled branch's cells are done
         // (the only input it can build); otherwise stay collecting for now.
         if !all_enabled_branches_terminal(store, id) {
-            let _ = store.lock().expect("poisoned").set_guardian_status(
-                id,
-                GuardianStatus::Collecting,
-                None,
-            );
+            let _ = store
+                .lock()
+                .set_guardian_status(id, GuardianStatus::Collecting, None);
         } else {
             run_merge_cancellable(store, runner, id, cancel);
         }
         return;
     }
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
+        let _ = store.lock().set_guardian_status(id, s, detail);
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -4010,7 +3950,7 @@ pub fn run_merge_staged(
     }
     set_status(GuardianStatus::Merging, None);
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         // RAL-103/RAL-27: clear the previous build's manual-check commands and
         // conflict bookkeeping up front so the board never shows a stale
         // "checks ready" state or leftover conflict progress while the staged
@@ -4025,7 +3965,7 @@ pub fn run_merge_staged(
         "ralphus [guardian] review {id} staged merge executing (incremental stack rebase)"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -4057,10 +3997,7 @@ pub fn run_merge_staged(
                 if all_enabled_branches_terminal(store, id) {
                     // Whole stack is rebased — finalize now, exactly once.
                     if built_any_total {
-                        let _ = store
-                            .lock()
-                            .expect("poisoned")
-                            .bump_guardian_merge_attempt(id);
+                        let _ = store.lock().bump_guardian_merge_attempt(id);
                     }
                     finish_staged_merge(store, runner, id, cancel, &set_status);
                     return;
@@ -4081,8 +4018,8 @@ pub fn run_merge_staged(
 /// Every enabled branch across every project of `id` is in a terminal
 /// (rebase-complete) state — `done` or `conflict_resolved`. This is the gate
 /// for the `InReview` finalize and for the shared-worktree fallback.
-fn all_enabled_branches_terminal(store: &Arc<Mutex<Store>>, id: &str) -> bool {
-    let Ok(g) = store.lock().expect("poisoned").get_guardian(id) else {
+fn all_enabled_branches_terminal(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Ok(g) = store.lock().get_guardian(id) else {
         return false;
     };
     g.branches.iter().filter(|b| b.enabled).all(|b| {
@@ -4095,8 +4032,8 @@ fn all_enabled_branches_terminal(store: &Arc<Mutex<Store>>, id: &str) -> bool {
 /// `conflict_resolved`) is in the `ready` state — i.e. another staged pass
 /// would build at least one branch immediately. Used to coalesce a branch that
 /// became `ready` mid-pass.
-fn next_not_built_is_ready(store: &Arc<Mutex<Store>>, id: &str) -> bool {
-    let Ok(g) = store.lock().expect("poisoned").get_guardian(id) else {
+fn next_not_built_is_ready(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Ok(g) = store.lock().get_guardian(id) else {
         return false;
     };
     let mut branches: Vec<_> = g.branches.iter().filter(|b| b.enabled).collect();
@@ -4166,12 +4103,12 @@ fn signature_has_branch_config(signature: &str, branch_signature: &str) -> bool 
 /// signature so the next pass can resume.
 #[allow(clippy::too_many_arguments)]
 fn staged_merge_pass(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     cancel: &CancelToken,
 ) -> StagedPassOutcome {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return StagedPassOutcome::Ok { built_any: false },
     };
@@ -4194,10 +4131,7 @@ fn staged_merge_pass(
     }
 
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, d);
+        let _ = store.lock().set_guardian_status(id, s, d);
     };
 
     // Resolve every project's base commit up front; if any base is unresolvable
@@ -4230,11 +4164,7 @@ fn staged_merge_pass(
         .collect();
     let current_sig = staged_build_signature(&project_order, &base_shas, &enabled_branches);
     let branch_sig = staged_branch_signature(&enabled_branches);
-    let stored_sig = store
-        .lock()
-        .expect("poisoned")
-        .guardian_build_signature(id)
-        .unwrap_or(None);
+    let stored_sig = store.lock().guardian_build_signature(id).unwrap_or(None);
     // Resume only when the recorded config/base matches the current one; a
     // mismatch (base moved, branch reordered/added/removed/enabled/disabled)
     // forces a rebuild of the previously-`Done` prefix so a stale tip is never
@@ -4323,12 +4253,9 @@ fn staged_merge_pass(
             if bv.merge_status == MergeStatus::Pending.as_str() {
                 break;
             }
-            let _ = store.lock().expect("poisoned").set_branch_status(
-                id,
-                &bv.id,
-                MergeStatus::InProgress,
-                None,
-            );
+            let _ = store
+                .lock()
+                .set_branch_status(id, &bv.id, MergeStatus::InProgress, None);
             if let Err(e) = fetch_branch_for_remote_cell(store, id, bv) {
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 return StagedPassOutcome::Failed;
@@ -4362,10 +4289,7 @@ fn staged_merge_pass(
                 fail_branch(store, id, &bv.id, &bv.branch, &e, &set_status);
                 return StagedPassOutcome::Failed;
             }
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .set_branch_review(id, &bv.id, &rev, &wt_str);
+            let _ = store.lock().set_branch_review(id, &bv.id, &rev, &wt_str);
             let gate = ProofGate::resolve(store, id, Some(&bv.id) == final_id.as_ref());
             if cancel.is_cancelled() {
                 return StagedPassOutcome::Cancelled;
@@ -4412,7 +4336,7 @@ fn staged_merge_pass(
     // make the maintenance sweep believe the rolled-back review was current
     // and suppress a later retry.
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         for (proj, sha) in &base_shas {
             let _ = guard.set_guardian_project_base_commit(id, proj, sha);
         }
@@ -4458,13 +4382,13 @@ fn staged_resume_point(
 /// tail of [`run_merge_cancellable`].
 #[allow(clippy::too_many_arguments)]
 fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     cancel: &CancelToken,
     set_status: &F,
 ) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -4531,7 +4455,6 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
                 };
                 let _ = store
                     .lock()
-                    .expect("poisoned")
                     .set_guardian_project_base_commit(id, proj, &sha);
                 sha
             }
@@ -4605,12 +4528,12 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
 /// `cleanup_review_worktrees` pass above) already handles cleaning up
 /// whatever this pass left behind.
 pub fn run_merge_cancellable(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     cancel: &CancelToken,
 ) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -4618,10 +4541,7 @@ pub fn run_merge_cancellable(
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
     // cumulative total across every attempt this review has gone through.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .bump_guardian_merge_attempt(id);
+    let _ = store.lock().bump_guardian_merge_attempt(id);
     // RAL-185 D5: the review's machine, resolved once. Every workspace below is
     // derived from this one, so a path can never lose track of which host it
     // belongs to on the way down.
@@ -4634,7 +4554,7 @@ pub fn run_merge_cancellable(
         guardian.branches.iter().filter(|b| b.enabled).count()
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -4654,10 +4574,7 @@ pub fn run_merge_cancellable(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
+        let _ = store.lock().set_guardian_status(id, s, detail);
     };
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
@@ -4679,7 +4596,7 @@ pub fn run_merge_cancellable(
     }
     set_status(GuardianStatus::Merging, None);
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         // RAL-103: the change summary is deliberately NOT cleared here -- the
         // last computed summary (preliminary or final) stays visible until
         // a debounced `generate_final_summary` (RAL-208) eventually overwrites
@@ -4693,7 +4610,7 @@ pub fn run_merge_cancellable(
     // Partition branches by their effective project root, preserving position order
     // within each project and preserving the order in which projects first appear.
     let branches = {
-        let g = store.lock().expect("poisoned");
+        let g = store.lock();
         g.get_guardian(id)
             .unwrap_or_else(|_| guardian.clone())
             .branches
@@ -4715,7 +4632,7 @@ pub fn run_merge_cancellable(
     // the new merge is in progress. Done before the per-branch loop so the reset
     // is as close to atomic with the first git operation as SQLite allows.
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.reset_all_enabled_branches_to_pending(id);
     }
 
@@ -4723,10 +4640,7 @@ pub fn run_merge_cancellable(
     // rows stay in the DB. Reset them to Pending so stale review-branch/worktree
     // fields from a prior build do not linger after cleanup.
     for ob in branches.iter().filter(|b| !b.enabled) {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .reset_branch_to_pending(id, &ob.id);
+        let _ = store.lock().reset_branch_to_pending(id, &ob.id);
     }
     let branches: Vec<_> = branches.into_iter().filter(|b| b.enabled).collect();
 
@@ -4842,7 +4756,6 @@ pub fn run_merge_cancellable(
         };
         let _ = store
             .lock()
-            .expect("poisoned")
             .set_guardian_project_base_commit(id, proj, &base_sha);
 
         if let Err(e) = preflight_worktree_budget(&root, &wt_base, &base_sha) {
@@ -4881,7 +4794,6 @@ pub fn run_merge_cancellable(
             // On failure, set_status was already called inside run_merge_shared.
             let cur_status = store
                 .lock()
-                .expect("poisoned")
                 .get_guardian(id)
                 .map(|g| g.status)
                 .unwrap_or_default();
@@ -4890,7 +4802,6 @@ pub fn run_merge_cancellable(
             }
             let combined_str = store
                 .lock()
-                .expect("poisoned")
                 .get_guardian(id)
                 .ok()
                 .and_then(|g| g.combined_worktree)
@@ -4918,12 +4829,9 @@ pub fn run_merge_cancellable(
                 log_merge_cancelled(store, id);
                 return;
             }
-            let _ = store.lock().expect("poisoned").set_branch_status(
-                id,
-                &ob.id,
-                MergeStatus::InProgress,
-                None,
-            );
+            let _ = store
+                .lock()
+                .set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
             // RAL-185 Phase 3b: a branch whose cell ran on another machine
             // has its commits over there, not here -- pull them in before the
             // stack tries to use them.
@@ -4971,10 +4879,7 @@ pub fn run_merge_cancellable(
                 }
                 _ => base_sha.clone(),
             };
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .set_branch_review(id, &ob.id, &rev, &wt_str);
+            let _ = store.lock().set_branch_review(id, &ob.id, &rev, &wt_str);
             let gate = ProofGate::resolve(
                 store,
                 id,
@@ -5081,7 +4986,7 @@ pub fn run_merge_cancellable(
 /// so per-branch review feedback lands there too.
 #[allow(clippy::too_many_arguments)]
 fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     root: &Workspace,
@@ -5111,12 +5016,9 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
             log_merge_cancelled(store, id);
             return;
         }
-        let _ = store.lock().expect("poisoned").set_branch_status(
-            id,
-            &ob.id,
-            MergeStatus::InProgress,
-            None,
-        );
+        let _ = store
+            .lock()
+            .set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
         // Every branch shares the one combined worktree/branch; record it now so
         // the UI can show the expand row and feedback widget even if this branch fails.
         //
@@ -5125,12 +5027,9 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         // this path keeps deriving each PR's alias from the convention exactly
         // as it did before -- `resolve_pr_alias` sees `None` for the readable
         // name and takes its separated path regardless of `separate_pr_branch`.
-        let _ = store.lock().expect("poisoned").set_branch_review(
-            id,
-            &ob.id,
-            &combined_branch,
-            &wt_str,
-        );
+        let _ = store
+            .lock()
+            .set_branch_review(id, &ob.id, &combined_branch, &wt_str);
         // Detach at the feature tip and rebase its own commits onto the current
         // combined head; then advance the combined branch to the result.
         if let Err(e) = wt.git(&["checkout", "--detach", &ob.branch]) {
@@ -5212,7 +5111,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         return;
     }
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
@@ -5297,7 +5196,7 @@ pub struct FeedbackOutcome {
 /// agent that gives up without editing anything still reports `Done` today).
 #[allow(clippy::too_many_arguments)]
 pub fn run_feedback(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     branch_id: &str,
@@ -5314,11 +5213,10 @@ pub fn run_feedback(
         if let Some(seq) = message_seq {
             let _ = store
                 .lock()
-                .expect("poisoned")
                 .set_message_action_status(seq, FeedbackActionStatus::Failed);
         }
     };
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => {
             fail_message();
@@ -5339,7 +5237,6 @@ pub fn run_feedback(
     // normally. Cleared at every real exit point below.
     let _ = store
         .lock()
-        .expect("poisoned")
         .set_branch_pending_feedback(id, branch_id, feedback);
     // Stack-order math (downstream filtering) below is legitimately
     // position-based; resolve it once here from the addressed branch_id.
@@ -5353,12 +5250,12 @@ pub fn run_feedback(
     // lease it implicitly held off.
     let lease_owner = format!("feedback:{branch_id}");
     loop {
-        let acquired = store
-            .lock()
-            .expect("poisoned")
-            .try_acquire_guardian_worktree_lease(id, branch_id, &lease_owner);
+        let acquired =
+            store
+                .lock()
+                .try_acquire_guardian_worktree_lease(id, branch_id, &lease_owner);
         if acquired {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
@@ -5370,10 +5267,7 @@ pub fn run_feedback(
             break;
         }
         if cancel.is_cancelled() {
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .clear_branch_pending_feedback(id, branch_id);
+            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
             fail_message();
             return FeedbackOutcome::default();
         }
@@ -5384,7 +5278,7 @@ pub fn run_feedback(
         "ralphus [guardian] review {id} feedback applying position={position}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -5401,10 +5295,7 @@ pub fn run_feedback(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
+        let _ = store.lock().set_guardian_status(id, s, detail);
     };
 
     // Resolve this branch's effective project root (RAL-29: may differ from primary).
@@ -5418,12 +5309,8 @@ pub fn run_feedback(
     let Some(wt_str) = branch.worktree.clone() else {
         let _ = store
             .lock()
-            .expect("poisoned")
             .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .clear_branch_pending_feedback(id, branch_id);
+        let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
         set_status(
             GuardianStatus::MergeFailed,
             Some("no review worktree yet; run the merge first"),
@@ -5468,12 +5355,8 @@ pub fn run_feedback(
         Err(message) => {
             let _ = store
                 .lock()
-                .expect("poisoned")
                 .release_guardian_worktree_lease(id, branch_id, &lease_owner);
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .clear_branch_pending_feedback(id, branch_id);
+            let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
             set_status(
                 GuardianStatus::MergeFailed,
                 Some(&format!("unresolvable resolver agent: {message}")),
@@ -5488,7 +5371,7 @@ pub fn run_feedback(
     // feedback was received/being worked. Must be set here, not earlier --
     // the two failure exits above never touched the branch's status, so
     // there's nothing to unwind if they fire.
-    let _ = store.lock().expect("poisoned").set_branch_status(
+    let _ = store.lock().set_branch_status(
         id,
         branch_id,
         MergeStatus::Actioning,
@@ -5682,12 +5565,9 @@ pub fn run_feedback(
         }
         (MergeStatus::Done, msg)
     };
-    let _ = store.lock().expect("poisoned").set_branch_status(
-        id,
-        branch_id,
-        branch_status,
-        Some(&detail),
-    );
+    let _ = store
+        .lock()
+        .set_branch_status(id, branch_id, branch_status, Some(&detail));
     // RAL-380: resolve the reviewer message this run was acting on to a
     // terminal status matching the branch outcome above -- two checkmarks on
     // `Done`, the failed indicator on `Failed`. `set_message_action_status`
@@ -5698,19 +5578,13 @@ pub fn run_feedback(
         } else {
             FeedbackActionStatus::Done
         };
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_message_action_status(seq, message_status);
+        let _ = store.lock().set_message_action_status(seq, message_status);
     }
     // RAL-375: this is a real completion (success or a legitimate failure),
     // not a crash -- clear the durable pending-feedback record set at the
     // top of this function so startup recovery doesn't try to reapply
     // feedback that already ran to completion.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .clear_branch_pending_feedback(id, branch_id);
+    let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
     // RAL-<new>: a feedback revision can push a real new commit onto the
     // branch's review ref, so it needs the same auto-submit hook every other
     // route to a terminal status fires via `promote_branch_terminal` --
@@ -5741,7 +5615,7 @@ pub fn run_feedback(
         "ralphus [guardian] review {id} feedback done position={position} no_commit={no_commit} committed={committed}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -5772,10 +5646,9 @@ pub fn run_feedback(
     {
         let released = store
             .lock()
-            .expect("poisoned")
             .release_guardian_worktree_lease(id, branch_id, &lease_owner);
         if released {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
@@ -5801,7 +5674,7 @@ pub fn run_feedback(
     // its own lease) simply leaves the request queued rather than racing
     // this restack against that branch's in-flight edit.
     {
-        let mut guard = store.lock().expect("poisoned");
+        let mut guard = store.lock();
         guard.request_guardian_restack(id, position);
         crate::cartographer::Note::new("guardian")
             .guardian(id)
@@ -5811,11 +5684,7 @@ pub fn run_feedback(
                 serde_json::json!({"from_position": position}),
             );
     }
-    let Some(restack_position) = store
-        .lock()
-        .expect("poisoned")
-        .try_claim_guardian_restack(id)
-    else {
+    let Some(restack_position) = store.lock().try_claim_guardian_restack(id) else {
         set_status(
             GuardianStatus::InReview,
             Some("restack queued: waiting for concurrent branch actioning"),
@@ -5839,10 +5708,7 @@ pub fn run_feedback(
     // for the downstream restack below, instead of showing the previous
     // build's commands as current until `generate_manual_commands` overwrites
     // them at the end.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .clear_guardian_manual_commands(id);
+    let _ = store.lock().clear_guardian_manual_commands(id);
 
     // Re-stack only the downstream branches in the SAME project (cross-project
     // rebasing is impossible). Snapshot the base commit once for consistency.
@@ -5858,7 +5724,6 @@ pub fn run_feedback(
     };
     let all_branches = store
         .lock()
-        .expect("poisoned")
         .get_guardian(id)
         .map(|g| g.branches)
         .unwrap_or_default();
@@ -5891,12 +5756,9 @@ pub fn run_feedback(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| review_ref_of(id, branch));
     for ob in &downstream {
-        let _ = store.lock().expect("poisoned").set_branch_status(
-            id,
-            &ob.id,
-            MergeStatus::InProgress,
-            None,
-        );
+        let _ = store
+            .lock()
+            .set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
         let rev = match claim_branch_review_ref(
             store,
             &root,
@@ -5921,10 +5783,7 @@ pub fn run_feedback(
             fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
             return outcome;
         }
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_branch_review(id, &ob.id, &rev, &wt_j_str);
+        let _ = store.lock().set_branch_review(id, &ob.id, &rev, &wt_j_str);
         let gate = ProofGate::resolve(
             store,
             id,
@@ -6005,7 +5864,7 @@ pub fn run_feedback(
 /// anonymous `FETCH_HEAD`, `merge-base --is-ancestor` for the no-op check,
 /// then a normal rebase), never a same-named self-rebase.
 pub fn pull_pr_commits(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     branch_id: &str,
@@ -6013,11 +5872,7 @@ pub fn pull_pr_commits(
     alias: &str,
     last_synced_sha: Option<&str>,
 ) -> std::result::Result<bool, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let branch = guardian
         .branches
         .iter()
@@ -6067,7 +5922,7 @@ pub fn pull_pr_commits(
     };
 
     let claimed = {
-        let g = store.lock().expect("poisoned");
+        let g = store.lock();
         matches!(g.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
             && g.set_guardian_status(
                 id,
@@ -6088,7 +5943,7 @@ pub fn pull_pr_commits(
          from={remote}/{alias} fetched={fetched}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "pr",
@@ -6110,10 +5965,7 @@ pub fn pull_pr_commits(
     }
 
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
+        let _ = store.lock().set_guardian_status(id, s, detail);
     };
     let final_branch_id: Option<String> = guardian
         .branches
@@ -6255,12 +6107,12 @@ impl Drop for InFlightClaim {
 /// branch has shifted. Each spawned worker acquires a slot from `sem` only if
 /// it actually decides to rebuild, so this never blocks unnecessarily.
 pub fn review_maintenance(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     sem: &Arc<Semaphore>,
     cancellations: &Cancellations,
 ) {
     let straggler_ids: Vec<String> = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.guardians_with_ready_stragglers().unwrap_or_default()
     };
     for id in straggler_ids {
@@ -6288,7 +6140,7 @@ pub fn review_maintenance(
     }
 
     let candidates: Vec<(String, String)> = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard
             .list_guardians()
             .unwrap_or_default()
@@ -6359,7 +6211,7 @@ pub fn review_maintenance(
                     .scope("guardian")
                     .guardian(&id)
                     .emit(
-                        &store.lock().expect("poisoned"),
+                        &store.lock(),
                         "automatic PR commit sync failed",
                         serde_json::json!({"error": e}),
                     );
@@ -6399,14 +6251,14 @@ pub fn review_maintenance(
 /// and the newly-ready straggler is appended. Returns whether a reopen actually
 /// happened.
 pub fn reopen_straggler(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     sem: &Semaphore,
     cancel: &CancelToken,
 ) -> bool {
     let claimed = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         // Only reopen if there was actually a straggler to promote — otherwise
         // this would reopen (and rebuild) every in_review/merge_failed guardian
         // on every maintenance sweep for no reason.
@@ -6430,7 +6282,7 @@ pub fn reopen_straggler(
 /// are skipped. Each branch's ref is resolved in its own project root so
 /// multi-project guardians (RAL-29) are handled correctly.
 fn current_review_heads(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian: &crate::guardian::GuardianView,
 ) -> Vec<(i64, String, String)> {
     let mut out = Vec::new();
@@ -6457,13 +6309,13 @@ fn current_review_heads(
 /// build, base-shift rebuild, feedback, and manual-push restack) so that only a
 /// *reviewer's* subsequent move of a review-branch ref reads as a manual push —
 /// never the daemon's own write.
-fn snapshot_review_heads(store: &Arc<Mutex<Store>>, id: &str) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+fn snapshot_review_heads(store: &crate::store_lock::StoreHandle, id: &str) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
     for (_position, branch_id, sha) in current_review_heads(store, &guardian) {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_branch_review_head(id, &branch_id, &sha);
     }
 }
@@ -6485,12 +6337,12 @@ fn snapshot_review_heads(store: &Arc<Mutex<Store>>, id: &str) {
 /// branch. The shared-worktree path (CCTL-156) has no per-branch worktrees to
 /// watch and is skipped (baseline only). Returns whether a restack ran.
 pub fn rebase_on_manual_push(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     sem: &Semaphore,
 ) -> bool {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
     };
@@ -6509,12 +6361,11 @@ pub fn rebase_on_manual_push(
     for (position, branch_id, current) in current_review_heads(store, &guardian) {
         let stored = store
             .lock()
-            .expect("poisoned")
             .get_branch_review_head(id, &branch_id)
             .unwrap_or(None);
         match stored {
             None => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.set_branch_review_head(id, &branch_id, &current);
             }
             Some(prev) if prev == current => {}
@@ -6525,7 +6376,7 @@ pub fn rebase_on_manual_push(
                      old={prev} new={current}"
                 );
                 {
-                    let guard = store.lock().expect("poisoned");
+                    let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                         level: crate::logging::LogLevel::INFO,
                         source: "guardian",
@@ -6551,7 +6402,7 @@ pub fn rebase_on_manual_push(
     // Claim the review (in_review → merging) under one lock so a concurrent
     // maintenance pass or an explicit merge request cannot also start rebuilding it.
     let claimed = {
-        let g = store.lock().expect("poisoned");
+        let g = store.lock();
         matches!(g.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
             && g.set_guardian_status(
                 id,
@@ -6573,17 +6424,14 @@ pub fn rebase_on_manual_push(
     let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
     let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, detail);
+        let _ = store.lock().set_guardian_status(id, s, detail);
     };
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} rebasing downstream after manual push from_position={from_position}"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -6660,7 +6508,7 @@ fn project_already_in_base(
 /// was otherwise detected. `false` when there are no projects, or any
 /// project's current base can't even be resolved.
 fn guardian_base_already_has_every_branch(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     guardian: &crate::guardian::GuardianView,
 ) -> bool {
@@ -6682,14 +6530,14 @@ fn guardian_base_already_has_every_branch(
 /// periodic sweep and a manual "Merge / rebase" trigger log/approve
 /// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
 /// legal transition); returns whether it approved.
-fn approve_base_already_landed(store: &Arc<Mutex<Store>>, id: &str) -> bool {
-    let approved = store.lock().expect("poisoned").approve_guardian(id).is_ok();
+fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let approved = store.lock().approve_guardian(id).is_ok();
     if approved {
         crate::rlog!(
             INFO,
             "ralphus [guardian] review {id} approved: base branch already contains every branch's commits"
         );
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
@@ -6716,13 +6564,13 @@ fn approve_base_already_landed(store: &Arc<Mutex<Store>>, id: &str) -> bool {
 /// just recorded (no rebuild) so an existing review is not rebuilt merely because
 /// the per-project column was previously unset.
 pub fn rebuild_on_base_shift(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     sem: &Semaphore,
     cancel: &CancelToken,
 ) -> bool {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
     };
@@ -6763,7 +6611,6 @@ pub fn rebuild_on_base_shift(
                 // No baseline for this project yet — record it without rebuilding.
                 let _ = store
                     .lock()
-                    .expect("poisoned")
                     .set_guardian_project_base_commit(id, proj, &current);
                 all_have_baseline = false;
             }
@@ -6812,7 +6659,7 @@ pub fn rebuild_on_base_shift(
         shift_detail.join(", ")
     );
     let claimed = {
-        let g = store.lock().expect("poisoned");
+        let g = store.lock();
         matches!(g.get_guardian(id), Ok(gv) if matches!(gv.status.as_str(), "in_review" | "merge_failed"))
             && g.set_guardian_status(id, GuardianStatus::Merging, Some(&detail))
                 .is_ok()
@@ -6833,7 +6680,7 @@ pub fn rebuild_on_base_shift(
 /// failed and returns `Err`.
 #[allow(clippy::too_many_arguments)]
 fn stack_pick(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     branch_id: &str,
@@ -6847,10 +6694,7 @@ fn stack_pick(
     cancel: &CancelToken,
 ) -> std::result::Result<(), ()> {
     let set_status = |s: GuardianStatus, d: Option<&str>| {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_status(id, s, d);
+        let _ = store.lock().set_guardian_status(id, s, d);
     };
     match drive_rebase(
         store,
@@ -6917,7 +6761,7 @@ fn stack_pick(
 /// `None` when explicit checks ran and passed, or nothing ran at all (no checks,
 /// no review/project auto_build configured).
 fn finalize_review(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     root: &Workspace,
     wt_base: &Workspace,
@@ -6943,7 +6787,7 @@ fn finalize_review(
 /// review-declared auto_build is deliberately NOT an `Err` -- see the inline
 /// comment on that tier below.
 fn final_checks(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     root: &Workspace,
@@ -6951,7 +6795,7 @@ fn final_checks(
     cancel: &CancelToken,
 ) -> std::result::Result<Option<String>, String> {
     let (skip_auto_build, checks, auto_build, env) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         (
             guard.guardian_skip_auto_build(id).unwrap_or(false),
             guard.guardian_checks(id).unwrap_or_default(),
@@ -7031,7 +6875,7 @@ fn final_checks(
 /// no runnable step (defensive; `core::validate` should never allow this).
 #[allow(clippy::too_many_arguments)]
 fn run_review_auto_build(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     root: &Workspace,
@@ -7045,8 +6889,9 @@ fn run_review_auto_build(
             .at(combined_str)
             .run_command_with_env(cmd, env, cancel)
             .0;
-        let _ = store.lock().expect("poisoned").cartographer_log(
-            crate::cartographer::CartographerEntry {
+        let _ = store
+            .lock()
+            .cartographer_log(crate::cartographer::CartographerEntry {
                 level: if ok {
                     crate::logging::LogLevel::INFO
                 } else {
@@ -7066,10 +6911,9 @@ fn run_review_auto_build(
                 log_path: None,
                 payload: serde_json::json!({"command": cmd}),
                 admin_only: false,
-            },
-        );
+            });
         if !ok {
-            let _ = store.lock().expect("poisoned").set_guardian_notice(
+            let _ = store.lock().set_guardian_notice(
                 id,
                 "auto_build_failed",
                 &format!(
@@ -7089,7 +6933,7 @@ fn run_review_auto_build(
     let prompt = def.prompt.as_deref()?;
     let cwd = combined_str.to_string();
     let (stored_agent, stored_model) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let g = guard.get_guardian(id).ok();
         (
             g.as_ref().and_then(|g| g.resolver_agent.clone()),
@@ -7103,7 +6947,7 @@ fn run_review_auto_build(
     ) {
         Ok(r) => r,
         Err(message) => {
-            let _ = store.lock().expect("poisoned").set_guardian_notice(
+            let _ = store.lock().set_guardian_notice(
                 id,
                 "auto_build_failed",
                 &format!(
@@ -7151,33 +6995,31 @@ fn run_review_auto_build(
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
     let ok = result.is_done();
-    let _ =
-        store
-            .lock()
-            .expect("poisoned")
-            .cartographer_log(crate::cartographer::CartographerEntry {
-                level: if ok {
-                    crate::logging::LogLevel::INFO
-                } else {
-                    crate::logging::LogLevel::WARNING
-                },
-                source: "guardian",
-                message: if ok {
-                    "review auto_build (agent) succeeded"
-                } else {
-                    "review auto_build (agent) failed"
-                },
-                scope: Some("guardian"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"summary": result.summary}),
-                admin_only: false,
-            });
+    let _ = store
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            source: "guardian",
+            message: if ok {
+                "review auto_build (agent) succeeded"
+            } else {
+                "review auto_build (agent) failed"
+            },
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"summary": result.summary}),
+            admin_only: false,
+        });
     if !ok {
-        let _ = store.lock().expect("poisoned").set_guardian_notice(
+        let _ = store.lock().set_guardian_notice(
             id,
             "auto_build_failed",
             &format!(
@@ -7222,7 +7064,7 @@ fn run_review_auto_build(
 /// contributes nothing — but a genuinely stale non-empty push is not detected
 /// today.
 fn fetch_branch_for_remote_cell(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     branch: &crate::guardian::BranchView,
 ) -> std::result::Result<(), String> {
@@ -7234,11 +7076,7 @@ fn fetch_branch_for_remote_cell(
     else {
         return Ok(());
     };
-    let review = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(guardian_id)
-        .ok();
+    let review = store.lock().get_guardian(guardian_id).ok();
     let root = branch
         .project
         .clone()
@@ -7255,7 +7093,7 @@ fn fetch_branch_for_remote_cell(
     let remote =
         crate::forge::resolve_remote_name(root, base_branch, &crate::config::resolve_forge(root));
     let vcs = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         crate::vcs::for_project_root(&guard, root)?
     };
 
@@ -7274,7 +7112,7 @@ fn fetch_branch_for_remote_cell(
         "ralphus [guardian] review {guardian_id} fetched remote-produced branch {} from {remote} at {sha}",
         branch.branch
     );
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     crate::cartographer::Note::new("guardian")
         .guardian(guardian_id)
         .scope("guardian")
@@ -7323,7 +7161,7 @@ fn fetch_branch_for_remote_cell(
 /// any other outcome (a bad ref, git missing) leaves the flag alone and
 /// reports `false` rather than guessing a review into failure.
 fn note_if_branch_is_empty(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     branch_id: &str,
     branch: &str,
@@ -7334,7 +7172,7 @@ fn note_if_branch_is_empty(
     // registered as something other than git, and this check runs on every
     // review (see `crate::vcs`).
     let vcs = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         match crate::vcs::for_project_root(&guard, root.root()) {
             Ok(v) => v,
             Err(e) => {
@@ -7353,7 +7191,7 @@ fn note_if_branch_is_empty(
         Err(_) => return false,
     };
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_branch_empty(guardian_id, branch_id, is_empty);
     }
     if !is_empty {
@@ -7363,7 +7201,7 @@ fn note_if_branch_is_empty(
         ERROR,
         "ralphus [guardian] review {guardian_id} branch {branch} is empty — it adds no changes over the branch beneath it"
     );
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     crate::cartographer::Note::new("guardian")
         .guardian(guardian_id)
         .scope("guardian")
@@ -7383,7 +7221,7 @@ fn note_if_branch_is_empty(
 /// (Re)create the stable, read-only combined worktree at `prev_ref`, pointing at
 /// the `review` branch (the head of the full stacked review).
 fn rebuild_combined(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Workspace,
     wt_base: &Workspace,
     id: &str,
@@ -7394,7 +7232,7 @@ fn rebuild_combined(
     let combined_str = combined_wt.root().to_string_lossy().to_string();
     worktree_add_or_reset(root, &combined_branch, &combined_wt, prev_ref)?;
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
         let _ = guard.set_guardian_combined_worktree(id, &combined_str);
     }
@@ -7409,12 +7247,8 @@ fn rebuild_combined(
 ///
 /// Best-effort: a write failure here must never fail the review itself, so
 /// errors are swallowed rather than propagated.
-fn regenerate_readme(store: &Arc<Mutex<Store>>, root: &Workspace) {
-    let guardians = store
-        .lock()
-        .expect("poisoned")
-        .list_guardians()
-        .unwrap_or_default();
+fn regenerate_readme(store: &crate::store_lock::StoreHandle, root: &Workspace) {
+    let guardians = store.lock().list_guardians().unwrap_or_default();
     let mut mappings: Vec<(String, String)> = Vec::new();
     for gv in guardians
         .iter()
@@ -7610,13 +7444,13 @@ fn terminal_worktree_claim(kind: &str, state: &str) -> bool {
 ///
 /// Called only from the scheduler's daily interval. Git and filesystem work
 /// happen without holding the store mutex; each short snapshot/update does.
-pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
+pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
     // RAL-386: loaded once per sweep, not per worktree -- an operator's
     // static opt-out is a config file read, not a store round trip, and the
     // set of configured machines cannot change mid-sweep.
     let machine_targets = crate::machine_targets::load_machine_targets().unwrap_or_default();
     let (records, claims) = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let records = match guard.guardian_worktree_records() {
             Ok(records) => records,
             Err(error) => {
@@ -7687,7 +7521,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                 && !terminal_worktree_claim(&claim.kind, &claim.state)
         });
         if let Some(claim) = active_claim {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             if guard
                 .claim_ark_notification("guardian-worktree", &key)
                 .unwrap_or(false)
@@ -7730,7 +7564,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
             if crate::machine_targets::find_by_machine(&machine_targets, machine_uri)
                 .is_some_and(|t| t.retirement_opt_out)
             {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.record_guardian_worktree_retirement(
                     &record.guardian_id,
                     &record.path,
@@ -7760,7 +7594,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         // defers; the removal itself happens on the next sweep that still
         // finds it eligible and unclaimed.
         {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             if guard
                 .claim_ark_notification("guardian-worktree-eligible", &key)
                 .unwrap_or(false)
@@ -7796,7 +7630,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         // `Workspace::retire_worktree`.
         match root.retire_worktree(&record.path) {
             crate::remote_runner::RetirementOutcome::Removed => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.clear_guardian_worktree_path(&record.path);
                 // RAL-385: the path columns above are now NULL, so the durable
                 // retirement record is the only trace that this worktree ever
@@ -7823,7 +7657,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                 retry_at_ms,
                 reason,
             } => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.record_guardian_worktree_retirement(
                     &record.guardian_id,
                     &record.path,
@@ -7843,7 +7677,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     );
             }
             crate::remote_runner::RetirementOutcome::OptedOut { reason } => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.record_guardian_worktree_retirement(
                     &record.guardian_id,
                     &record.path,
@@ -7872,7 +7706,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
                     "ralphus [guardian] could not retire worktree {}: {error}",
                     record.path
                 );
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.record_guardian_worktree_retirement(
                     &record.guardian_id,
                     &record.path,
@@ -8108,7 +7942,7 @@ pub(crate) fn worktree_retirement_view(
 /// RAL-389 defers the push and forge work to the durable debounce sweep, so
 /// this transition never blocks on network round trips.
 fn promote_branch_terminal(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     status: MergeStatus,
@@ -8116,7 +7950,7 @@ fn promote_branch_terminal(
     session_id: Option<&str>,
 ) {
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_branch_status(id, branch_id, status, detail);
         if let Some(sid) = session_id {
             let _ = guard.set_branch_resolver_session_id(id, branch_id, sid);
@@ -8127,19 +7961,16 @@ fn promote_branch_terminal(
 
 /// Mark a branch failed and the guardian merge-failed with a reason.
 fn fail_branch<F: Fn(GuardianStatus, Option<&str>)>(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     branch: &str,
     err: &str,
     set_status: &F,
 ) {
-    let _ = store.lock().expect("poisoned").set_branch_status(
-        id,
-        branch_id,
-        MergeStatus::Failed,
-        Some(err),
-    );
+    let _ = store
+        .lock()
+        .set_branch_status(id, branch_id, MergeStatus::Failed, Some(err));
     set_status(
         GuardianStatus::MergeFailed,
         Some(&format!("branch {branch}: {err}")),
@@ -8268,7 +8099,7 @@ pub(crate) fn collect_base_fetch_targets(
 /// - Anything else is a purely local branch with no remote to fetch from,
 ///   and is left untouched.
 fn fetch_base_branch(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     target: &BaseFetchTarget,
 ) -> std::result::Result<(), String> {
     let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
@@ -8307,9 +8138,9 @@ static BASE_FETCH_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
 /// one cheap store read; each fetch is spawned onto its own thread (mirroring
 /// `pr::poll_forge_reorders`) so one slow/unreachable remote never blocks
 /// this call or, transitively, the scheduler's own hot loop.
-pub fn poll_base_branch_freshness_once(store: &Arc<Mutex<Store>>) {
+pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     let inputs: Vec<GuardianBaseFetchInfo> = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard
             .list_guardians()
             .unwrap_or_default()
@@ -8343,7 +8174,7 @@ pub fn poll_base_branch_freshness_once(store: &Arc<Mutex<Store>>) {
                     target.base_branch,
                     target.root.display()
                 );
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 crate::cartographer::Note::new("guardian")
                     .scope("guardian")
                     .level(crate::logging::LogLevel::DEBUG)
@@ -8385,7 +8216,7 @@ pub(crate) fn resolve_base(
 /// the rebase when it cannot be completed.
 #[allow(clippy::too_many_arguments)]
 fn drive_rebase(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: &str,
     runner: &dyn Runner,
@@ -8407,10 +8238,7 @@ fn drive_rebase(
     // `Store::stamp_branch_started_at`'s COALESCE, fired at each actual
     // resolver/proof session start below). Left NULL if no resolver ever runs
     // for this branch.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .clear_branch_started_at(id, branch_id);
+    let _ = store.lock().clear_branch_started_at(id, branch_id);
     // Dirty-worktree guard: wait out a concurrent `run_feedback` pass still
     // holding this branch's worktree lease (see the `worktree lease`
     // glossary entry), then -- if the worktree is still dirty once the lease
@@ -8423,12 +8251,9 @@ fn drive_rebase(
     // its lease dirty.
     let mut rescued_orphaned_edits = false;
     loop {
-        let owner = store
-            .lock()
-            .expect("poisoned")
-            .guardian_worktree_lease_owner(id, branch_id);
+        let owner = store.lock().guardian_worktree_lease_owner(id, branch_id);
         if let Some(owner) = owner {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
@@ -8459,7 +8284,7 @@ fn drive_rebase(
             "ralphus [guardian] review {id} branch={feature:?} rescue commit created sha={}",
             sha.trim()
         );
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "guardian",
@@ -8563,7 +8388,7 @@ fn drive_rebase(
                         "ralphus [guardian] review {id} rerere-autoupdate fast-path \
                          branch={feature:?} (staged by rerere, no agent needed)"
                     );
-                    let guard = store.lock().expect("poisoned");
+                    let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                         level: crate::logging::LogLevel::INFO,
                         source: "guardian",
@@ -8702,7 +8527,7 @@ fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
 /// blocked on the store mutex for the duration of one `git log` per branch.
 /// Called from a [`crate::summary_worker::SummaryQueue`] background worker,
 /// never inline on a request or scheduler thread.
-pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str) {
+pub(crate) fn recompute_preliminary_summary(store: &crate::store_lock::StoreHandle, id: &str) {
     struct Candidate {
         branch: String,
         /// The ref this branch's stacked review commits live on -- resolved
@@ -8726,7 +8551,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
         reported: bool,
     }
     let (git_root, base_branch, base_commits, has_final_summary, candidates) = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let Ok(guardian) = guard.get_guardian(id) else {
             return;
         };
@@ -8872,7 +8697,7 @@ pub(crate) fn recompute_preliminary_summary(store: &Arc<Mutex<Store>>, id: &str)
     }
     // No agent/model recorded — this is plain git-log formatting, not an LLM
     // call, which distinguishes a preliminary summary from a final one.
-    let guard = store.lock().expect("store mutex poisoned");
+    let guard = store.lock();
     let _ = guard.set_guardian_summary(id, &sections.join("\n\n"), None, None);
 }
 
@@ -8907,20 +8732,15 @@ fn branch_summary_label(branch: &str) -> String {
 /// then request the LLM summary that supersedes it.
 /// [`Store::claim_final_summary_repair`] bounds this to one attempt per
 /// guardian per daemon process.
-fn repair_missing_final_summary(store: &Arc<Mutex<Store>>, id: &str) {
+fn repair_missing_final_summary(store: &crate::store_lock::StoreHandle, id: &str) {
     let needs_repair = store
         .lock()
-        .expect("poisoned")
         .get_guardian(id)
         .is_ok_and(|g| g.summary_agent.is_none());
     if !needs_repair {
         return;
     }
-    if !store
-        .lock()
-        .expect("poisoned")
-        .claim_final_summary_repair(id)
-    {
+    if !store.lock().claim_final_summary_repair(id) {
         return;
     }
     crate::rlog!(
@@ -8928,7 +8748,7 @@ fn repair_missing_final_summary(store: &Arc<Mutex<Store>>, id: &str) {
         "ralphus [guardian] review {id} has no agent-authored change summary: recomputing"
     );
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         crate::cartographer::Note::new("guardian")
             .guardian(id)
             .scope("guardian")
@@ -8974,8 +8794,8 @@ fn enabled_branch_signature(branches: &[crate::guardian::BranchView]) -> String 
 /// currently stored was generated, and otherwise (re)starts the debounce
 /// window that [`sweep_pending_summaries`] waits out before actually calling
 /// the LLM.
-pub(crate) fn queue_final_summary_regen(store: &Arc<Mutex<Store>>, id: &str) {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+pub(crate) fn queue_final_summary_regen(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
     let signature = enabled_branch_signature(&guardian.branches);
@@ -8985,12 +8805,9 @@ pub(crate) fn queue_final_summary_regen(store: &Arc<Mutex<Store>>, id: &str) {
     // summary is already up to date. That is the whole handoff this call
     // exists to perform once the stack has finished rebuilding -- force it.
     let force = guardian.summary_agent.is_none();
-    store.lock().expect("poisoned").request_final_summary(
-        id,
-        &signature,
-        crate::store::now_ms(),
-        force,
-    );
+    store
+        .lock()
+        .request_final_summary(id, &signature, crate::store::now_ms(), force);
 }
 
 /// RAL-208: fire the LLM change-summary call for every guardian whose
@@ -9002,10 +8819,9 @@ pub(crate) fn queue_final_summary_regen(store: &Arc<Mutex<Store>>, id: &str) {
 /// concurrency cap every other LLM call shares -- to actually run the
 /// (potentially slow) LLM call, so the scheduler tick that called this never
 /// blocks on one.
-pub fn sweep_pending_summaries(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) {
+pub fn sweep_pending_summaries(store: &crate::store_lock::StoreHandle, sem: &Arc<Semaphore>) {
     let due = store
         .lock()
-        .expect("poisoned")
         .take_due_final_summary_requests(crate::store::now_ms(), FINAL_SUMMARY_DEBOUNCE_MS);
     for (id, signature) in due {
         let store = Arc::clone(store);
@@ -9049,12 +8865,12 @@ pub fn sweep_pending_summaries(store: &Arc<Mutex<Store>>, sem: &Arc<Semaphore>) 
 /// its ticket id when the branch name starts with one, else the branch name
 /// itself -- and the agent is instructed to use that exact label per bullet.
 fn generate_final_summary(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     signature: &str,
 ) {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
     if guardian.status != GuardianStatus::InReview.as_str() {
@@ -9222,7 +9038,7 @@ fn generate_final_summary(
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
     if result.is_done() && !result.summary.trim().is_empty() {
         // RAL-88: record which resolved agent/model produced this summary.
-        let mut guard = store.lock().expect("poisoned");
+        let mut guard = store.lock();
         let _ =
             guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
         guard.mark_final_summary_generated(id, signature);
@@ -9383,7 +9199,7 @@ fn manual_commands_prompt(tail: &str) -> String {
 /// crash.
 #[allow(clippy::too_many_arguments)]
 fn generate_manual_commands(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     root: &Workspace,
@@ -9435,7 +9251,7 @@ fn generate_manual_commands(
         let stored_agent;
         let stored_model;
         {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let g = guard.get_guardian(id).ok();
             stored_agent = g.as_ref().and_then(|g| g.resolver_agent.clone());
             stored_model = g.and_then(|g| g.resolver_model.clone());
@@ -9452,7 +9268,7 @@ fn generate_manual_commands(
                     .guardian(id)
                     .scope("guardian")
                     .emit(
-                        &store.lock().expect("poisoned"),
+                        &store.lock(),
                         format!(
                             "review {id} manual-commands generation: unresolvable \
                              resolver agent: {message}"
@@ -9519,7 +9335,7 @@ fn generate_manual_commands(
             if let Ok(raw) = std::fs::read_to_string(&sid_path_clone) {
                 let sid = raw.trim();
                 if !sid.is_empty() {
-                    let guard = store_clone.lock().expect("poisoned");
+                    let guard = store_clone.lock();
                     let _ = guard.set_guardian_manual_commands_session_id(&id_str, sid);
                     break;
                 }
@@ -9531,10 +9347,7 @@ fn generate_manual_commands(
     // RAL-259: the manual-checks generation agent is beginning to run — stamp
     // the guardian-level Live-View start time (plain overwrite, so a
     // regeneration always shows the latest generation's start).
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .stamp_guardian_manual_checks_started_at(id);
+    let _ = store.lock().stamp_guardian_manual_checks_started_at(id);
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
 
@@ -9544,7 +9357,6 @@ fn generate_manual_commands(
     if let Some(sid) = result.agent_session_id.as_deref() {
         let _ = store
             .lock()
-            .expect("poisoned")
             .set_guardian_manual_commands_session_id(id, sid);
     }
 
@@ -9556,10 +9368,12 @@ fn generate_manual_commands(
 
     if !commands.is_empty() {
         // RAL-88: record which resolved agent/model produced these commands.
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .set_guardian_manual_commands(id, &commands, Some(agent.as_str()), model.as_deref());
+        let _ = store.lock().set_guardian_manual_commands(
+            id,
+            &commands,
+            Some(agent.as_str()),
+            model.as_deref(),
+        );
     }
 }
 
@@ -9586,20 +9400,20 @@ fn resolve_input_prompt(command: &str, input: &CheckInput) -> String {
 /// permanently-stuck spinner; on success also folds the value into
 /// [`Store::merge_guardian_input_values`] so it becomes the new default.
 pub(crate) fn resolve_check_input(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     guardian_id: &str,
     command: &str,
     input: &CheckInput,
 ) {
     let Some((cwd, stored_agent, stored_model, machine)) = ({
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.get_guardian(guardian_id).ok().map(|g| {
             let cwd = g.combined_worktree.clone().unwrap_or(g.git_root.clone());
             (cwd, g.resolver_agent, g.resolver_model, g.machine)
         })
     }) else {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
         return;
     };
@@ -9616,7 +9430,7 @@ pub(crate) fn resolve_check_input(
                 "ralphus [guardian] review {guardian_id} check-input resolution: \
                  unresolvable resolver agent: {message}"
             );
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
             return;
         }
@@ -9659,7 +9473,7 @@ pub(crate) fn resolve_check_input(
 
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, guardian_id, None, "check_input", &result);
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     if !result.is_done() || result.summary.trim().is_empty() {
         let _ = guard.set_guardian_input_resolution_failed(guardian_id, &input.name);
         return;
@@ -10248,18 +10062,16 @@ mod tests {
 
     #[test]
     fn record_guardian_call_cost_records_line_item_and_updates_view_totals() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = store
-            .lock()
-            .unwrap()
-            .create_guardian("r", "main", "/repo")
-            .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
         let result = fake_result(100, 40, 0.01);
 
         let outcome = record_guardian_call_cost(&store, &id, None, "resolve_conflict", &result);
         assert!(outcome.is_ok(), "{outcome:?}");
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(g.cumulative_tokens_in, 100);
         assert_eq!(g.cumulative_tokens_out, 40);
         assert!((g.cumulative_cost_usd - 0.01).abs() < 1e-9);
@@ -10269,12 +10081,10 @@ mod tests {
 
     #[test]
     fn record_guardian_call_cost_without_a_cap_never_errors() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = store
-            .lock()
-            .unwrap()
-            .create_guardian("r", "main", "/repo")
-            .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
         let expensive = fake_result(1_000_000, 1_000_000, 500.0);
         assert!(
             record_guardian_call_cost(&store, &id, None, "resolve_conflict", &expensive).is_ok()
@@ -10283,15 +10093,12 @@ mod tests {
 
     #[test]
     fn record_guardian_call_cost_errors_once_cumulative_exceeds_cap() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = store
-            .lock()
-            .unwrap()
-            .create_guardian("r", "main", "/repo")
-            .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_maximum_budget_usd(&id, Some(0.05))
             .unwrap();
 
@@ -10307,23 +10114,17 @@ mod tests {
 
         // Both calls were still recorded despite the second exceeding the cap --
         // the caller decides whether/how to stop, this function only reports it.
-        let (_, _, cumulative) = store.lock().unwrap().guardian_cost_total(&id).unwrap();
+        let (_, _, cumulative) = store.lock().guardian_cost_total(&id).unwrap();
         assert!((cumulative - 0.07).abs() < 1e-9);
     }
 
     #[test]
     fn record_guardian_call_cost_attributes_to_current_merge_attempt() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = store
-            .lock()
-            .unwrap()
-            .create_guardian("r", "main", "/repo")
-            .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .bump_guardian_merge_attempt(&id)
-            .unwrap(); // attempt 1
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
+        store.lock().bump_guardian_merge_attempt(&id).unwrap(); // attempt 1
         record_guardian_call_cost(
             &store,
             &id,
@@ -10332,11 +10133,7 @@ mod tests {
             &fake_result(10, 5, 0.01),
         )
         .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .bump_guardian_merge_attempt(&id)
-            .unwrap(); // attempt 2
+        store.lock().bump_guardian_merge_attempt(&id).unwrap(); // attempt 2
         record_guardian_call_cost(
             &store,
             &id,
@@ -10346,7 +10143,7 @@ mod tests {
         )
         .unwrap();
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(g.merge_attempt, 2);
         assert_eq!(g.attempt_tokens_in, 20); // attempt 2 only
         assert_eq!(g.attempt_tokens_out, 8);
@@ -10465,8 +10262,10 @@ mod tests {
 
     #[test]
     fn start_resolve_input_success_records_ready_and_new_default() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = guardian_with_port_input(&store.lock().unwrap());
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = guardian_with_port_input(&store.lock());
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -10476,14 +10275,14 @@ mod tests {
         // The background thread runs synchronously fast enough in tests
         // (FixedValueRunner does no real I/O), but poll briefly for
         // robustness against scheduling jitter.
-        let mut g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let mut g = store.lock().get_guardian(&id).unwrap();
         for _ in 0..50 {
             if g.input_resolutions.get("port").map(|r| r.status.as_str()) != Some("resolving") {
                 break;
             }
             drop(g);
             std::thread::sleep(std::time::Duration::from_millis(20));
-            g = store.lock().unwrap().get_guardian(&id).unwrap();
+            g = store.lock().get_guardian(&id).unwrap();
         }
 
         assert_eq!(g.input_resolutions["port"].status, "ready");
@@ -10493,8 +10292,10 @@ mod tests {
 
     #[test]
     fn start_resolve_input_unknown_input_is_400() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = guardian_with_port_input(&store.lock().unwrap());
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = guardian_with_port_input(&store.lock());
         let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("9001"));
         let sem = Arc::new(Semaphore::new(4));
 
@@ -10505,13 +10306,14 @@ mod tests {
 
     #[test]
     fn start_resolve_input_concurrent_duplicate_is_409() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = guardian_with_port_input(&store.lock().unwrap());
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = guardian_with_port_input(&store.lock());
         // Pre-claim, simulating a resolution already in flight from a
         // concurrent request.
         store
             .lock()
-            .unwrap()
             .claim_guardian_input_resolution(&id, "port")
             .unwrap();
 
@@ -10574,9 +10376,11 @@ mod tests {
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "--message", "advance base"]);
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -10605,7 +10409,6 @@ mod tests {
         assert_eq!(
             store
                 .lock()
-                .unwrap()
                 .get_guardian(&id)
                 .unwrap()
                 .base_commits
@@ -11128,25 +10931,19 @@ mod tests {
 
     #[test]
     fn branch_short_names_are_stable_across_unchanged_store_reads() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let id = store
-            .lock()
-            .unwrap()
-            .create_guardian("r", "main", "/repo")
-            .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
         for branch in [
             "improve-wasd-alpha",
             "improve-wasd-beta",
             "improve-wasd-gamma",
         ] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&id, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&id, branch).unwrap();
         }
 
-        let ordered = store.lock().unwrap().get_guardian(&id).unwrap().branches;
+        let ordered = store.lock().get_guardian(&id).unwrap().branches;
         assert_eq!(
             ordered
                 .iter()
@@ -11170,11 +10967,13 @@ mod tests {
     #[test]
     fn stale_worktree_retirement_removes_safe_and_alerts_for_unsafe() {
         let (base, repo, _feature_worktree) = make_repo("retire-stale");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
 
         let make_review = |name: &str, branch: &str, status: &str| {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian(name, "main", &repo.to_string_lossy())
                 .unwrap();
@@ -11213,7 +11012,7 @@ mod tests {
 
         let (safe_id, safe_wt) = make_review("safe", "safe", "deployed");
         let (unsafe_id, unsafe_wt) = make_review("unsafe", "unsafe", "in_review");
-        let client = store.lock().unwrap().register_mailbox_client().unwrap();
+        let client = store.lock().register_mailbox_client().unwrap();
 
         retire_stale_worktrees(&store);
 
@@ -11228,7 +11027,7 @@ mod tests {
             unsafe_wt.exists(),
             "active review worktree must be retained"
         );
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let messages = guard
             .mailbox_messages_for_client(&client, true, None)
             .unwrap();
@@ -11265,7 +11064,6 @@ mod tests {
         assert_eq!(
             store
                 .lock()
-                .unwrap()
                 .mailbox_messages_for_client(&client, true, None)
                 .unwrap()
                 .len(),
@@ -11279,7 +11077,7 @@ mod tests {
         // while the retained unsafe one reads as claimed by the review that
         // still owns it.
         {
-            let view = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+            let view = worktree_retirement_view(&store.lock()).unwrap();
             let safe = view
                 .entries
                 .iter()
@@ -11316,10 +11114,12 @@ mod tests {
         // mailbox client -- that is the whole point of tagging it with the
         // review's entity_uri rather than just logging it.
         let (base, repo, _feature_worktree) = make_repo("retire-watch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let id = guard
             .create_guardian("watched", "main", &repo.to_string_lossy())
             .unwrap();
@@ -11364,7 +11164,7 @@ mod tests {
 
         retire_stale_worktrees(&store);
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let watcher_messages = guard
             .personal_mailbox_messages_for_user("colin", true, None)
             .unwrap();
@@ -11388,27 +11188,27 @@ mod tests {
 
     #[test]
     fn worktree_retirement_view_classifies_every_lifecycle_state() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let old = crate::store::now_ms() - WORKTREE_RETIREMENT_AGE_MS - 1;
         let recent = crate::store::now_ms() - 1000;
 
         // Scheduled: recent activity, no retirement record.
         let scheduled_id = store
             .lock()
-            .unwrap()
             .create_guardian("scheduled", "main", "/r")
             .unwrap();
         // Eligible: old and terminal, so its review claim is not blocking.
         let eligible_id = store
             .lock()
-            .unwrap()
             .create_guardian("eligible", "main", "/r")
             .unwrap();
         for (id, status, updated) in [
             (&scheduled_id, "deployed", recent),
             (&eligible_id, "deployed", old),
         ] {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.add_guardian_branch(id, "b").unwrap();
             let branch_id = guard.get_guardian(id).unwrap().branches[0].id.clone();
             guard
@@ -11423,7 +11223,7 @@ mod tests {
                 .unwrap();
         }
 
-        let view = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        let view = worktree_retirement_view(&store.lock()).unwrap();
         assert_eq!(view.age_threshold_days, 30);
         let state_of = |id: &str, v: &WorktreeRetirementView| {
             v.entries
@@ -11447,7 +11247,6 @@ mod tests {
         // Failed: a recorded refusal wins over the derived live state.
         store
             .lock()
-            .unwrap()
             .record_guardian_worktree_retirement(
                 &eligible_id,
                 &format!("C:/r/{eligible_id}/wt"),
@@ -11458,7 +11257,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let view2 = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        let view2 = worktree_retirement_view(&store.lock()).unwrap();
         let failed_entry = view2
             .entries
             .iter()
@@ -11470,7 +11269,7 @@ mod tests {
         // Retired: after the path row is cleared, the durable record keeps
         // the entry visible as history (with the review's display name).
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let path = format!("C:/r/{eligible_id}/wt");
             guard.clear_guardian_worktree_path(&path).unwrap();
             guard
@@ -11485,7 +11284,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let view3 = worktree_retirement_view(&store.lock().unwrap()).unwrap();
+        let view3 = worktree_retirement_view(&store.lock()).unwrap();
         let retired_entry = view3
             .entries
             .iter()
@@ -11848,23 +11647,18 @@ mod tests {
         // file.
         std::fs::write(wt.join("blocker.txt"), "stale agent output\n").unwrap();
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let guardian_id = store
             .lock()
-            .unwrap()
             .create_guardian("test", "main", repo.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .add_guardian_branch(&guardian_id, "feature/a")
             .unwrap();
-        let branch_id = store
-            .lock()
-            .unwrap()
-            .get_guardian(&guardian_id)
-            .unwrap()
-            .branches[0]
+        let branch_id = store.lock().get_guardian(&guardian_id).unwrap().branches[0]
             .id
             .clone();
 
@@ -11955,9 +11749,11 @@ mod tests {
         // host. With no provider program actually present, the merge must fail
         // *trying to reach the machine*, never by quietly succeeding locally.
         let (base, repo, _fwt) = make_repo("remote-review-dispatch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -11978,7 +11774,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g.status, "merge_failed",
             "an unreachable machine must fail the merge, not silently run it here"
@@ -11996,9 +11792,11 @@ mod tests {
     fn a_review_left_local_still_merges_normally() {
         // Regression guard: the gate must be inert for every existing review.
         let (base, repo, _fwt) = make_repo("local-review-ok");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12010,7 +11808,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_ne!(
             g.status, "merge_failed",
             "a local review must not be caught by the remote gate: {:?}",
@@ -12026,9 +11824,11 @@ mod tests {
         // never the legacy `.ralphus_guardian/<full-id>/...` layout, and must
         // regenerate `.git/.ralphus/README.md` documenting the mapping.
         let (base, repo, _fwt) = make_repo("short-layout-e2e");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12038,7 +11838,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(g.status, "in_review", "{:?}", g.detail);
 
         let short_id = crate::short_paths::guardian_short_id(&id);
@@ -12077,9 +11877,11 @@ mod tests {
         // task branch, not `guardian/<id>/wt-<branch>`, and the name is
         // persisted so a later rebuild reuses it rather than re-resolving.
         let (base, repo, _fwt) = make_repo("readable-review-branch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12089,7 +11891,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(g.status, "in_review", "{:?}", g.detail);
         assert_eq!(
             g.branches[0].review_branch_name.as_deref(),
@@ -12118,7 +11920,7 @@ mod tests {
 
         // Rebuilding reuses the same name -- no walk to `-2`.
         run_merge(&store, runner.as_ref(), &id);
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g.branches[0].review_branch_name.as_deref(),
             Some("feature/a-review")
@@ -12137,9 +11939,11 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12149,7 +11953,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        let gv = store.lock().get_guardian(&id).unwrap();
         assert_eq!(gv.status, "in_review", "{:?}", gv.detail);
         assert_eq!(
             gv.branches[0].review_branch_name.as_deref(),
@@ -12169,9 +11973,11 @@ mod tests {
     #[test]
     fn a_combined_review_branch_is_named_from_the_reviews_own_name() {
         let (base, repo, _fwt) = make_repo("readable-combined-review-branch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("RAL-378 Readable Branches", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12181,7 +11987,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        let gv = store.lock().get_guardian(&id).unwrap();
         assert_eq!(gv.status, "in_review", "{:?}", gv.detail);
         assert_eq!(
             gv.review_branch.as_deref(),
@@ -12190,11 +11996,10 @@ mod tests {
         // Renaming the review afterwards must not move the branch.
         store
             .lock()
-            .unwrap()
             .rename_guardian(&id, "Something Else Entirely")
             .unwrap();
         run_merge(&store, runner.as_ref(), &id);
-        let gv = store.lock().unwrap().get_guardian(&id).unwrap();
+        let gv = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             gv.review_branch_name.as_deref(),
             Some("ral-378-readable-branches-review")
@@ -12209,9 +12014,11 @@ mod tests {
         // must not block or be migrated by a fresh merge under the
         // `.ralphus/g/g<n>` layout.
         let (base, repo, _fwt) = make_repo("old-layout-coexist-guardian");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12225,7 +12032,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g.status, "in_review",
             "an old-layout leftover must not block a new merge: {:?}",
@@ -12265,9 +12072,11 @@ mod tests {
             pad_len += 40;
         };
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12277,7 +12086,7 @@ mod tests {
         let runner: Arc<dyn Runner> = Arc::new(CapturingRunner::new());
         run_merge(&store, runner.as_ref(), &id);
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g.status, "in_review",
             "a repo root in the pre-RAL-211 failure zone must still merge successfully: {:?}",
@@ -12293,16 +12102,18 @@ mod tests {
         // bridge must be completely inert for it -- including in a repo with
         // no remote configured at all, where a fetch would fail.
         let (base, repo, _fwt) = make_repo("fetch-local");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
         };
-        let b = store.lock().unwrap().get_guardian(&id).unwrap().branches[0].clone();
+        let b = store.lock().get_guardian(&id).unwrap().branches[0].clone();
         assert!(b.source_cell_machine.is_none());
         assert!(
             fetch_branch_for_remote_cell(&store, &id, &b).is_ok(),
@@ -12319,16 +12130,18 @@ mod tests {
         // Failing here beats an opaque `worktree add` error -- or, when a
         // previous squad *did* push, silently stacking that stale revision.
         let (base, repo, _fwt) = make_repo("fetch-never-pushed");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
         };
-        let mut b = store.lock().unwrap().get_guardian(&id).unwrap().branches[0].clone();
+        let mut b = store.lock().get_guardian(&id).unwrap().branches[0].clone();
         b.source_cell_machine = Some("incredibuild:A".to_string());
         // `make_repo` configures no remote, so the fetch cannot succeed --
         // exactly what an unpushed branch looks like from here.
@@ -12356,16 +12169,18 @@ mod tests {
         // fallback. "claude-code" is resolvable but unsupported, so this is
         // deterministic and network-free regardless of whether
         // ANTHROPIC_API_KEY is set in the environment.
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let g = store.lock().unwrap();
+            let g = store.lock();
             let id = g.create_guardian("r", "main", "/repo").unwrap();
             g.add_guardian_branch(&id, "feature/a").unwrap();
             g.set_guardian_resolver(&id, Some("claude-code"), None)
                 .unwrap();
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
         record_feedback_reply(
@@ -12377,7 +12192,6 @@ mod tests {
         );
         let msgs = store
             .lock()
-            .unwrap()
             .guardian_branch_messages(&id, &branch_id)
             .unwrap();
         assert!(
@@ -12393,16 +12207,18 @@ mod tests {
         // merges cleanly, and the review reaches `in_review` looking healthy
         // while containing none of that task's work.
         let (base, repo, _fwt) = make_repo("empty-branch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/empty").unwrap();
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
 
@@ -12420,7 +12236,7 @@ mod tests {
             "an empty branch must report true so the caller can fail the merge"
         );
         assert!(
-            store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
+            store.lock().get_guardian(&id).unwrap().branches[0].is_empty,
             "a branch with no diff over its base must be flagged empty"
         );
 
@@ -12430,16 +12246,18 @@ mod tests {
     #[test]
     fn note_if_branch_is_empty_leaves_a_real_branch_alone() {
         let (base, repo, fwt) = make_repo("nonempty-branch");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
         // `make_repo` already committed a real change on `feature/a` in `fwt`.
@@ -12453,7 +12271,7 @@ mod tests {
             "main",
         );
         assert!(
-            !store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
+            !store.lock().get_guardian(&id).unwrap().branches[0].is_empty,
             "a branch carrying real commits must not be flagged"
         );
 
@@ -12483,16 +12301,18 @@ mod tests {
         // branch's work (directly or via a prior guardian run).
         g(&repo, &["merge", "--no-edit", "feature/a"]);
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
 
@@ -12511,7 +12331,7 @@ mod tests {
              empty when checked against the boundary it was actually built from"
         );
         assert!(
-            !store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
+            !store.lock().get_guardian(&id).unwrap().branches[0].is_empty,
             "must not flag a branch that committed real work, even if that \
              work is now also present further up the current base"
         );
@@ -12524,21 +12344,22 @@ mod tests {
         // An unknown ref makes `git diff` exit with neither 0 nor 1. Recording
         // "not empty" there would be a guess dressed up as a fact.
         let (base, repo, _fwt) = make_repo("unknown-ref");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .set_branch_empty(&id, &branch_id, true)
             .unwrap();
         assert!(
@@ -12553,7 +12374,7 @@ mod tests {
             "an unanswerable diff must never fail a review on a guess"
         );
         assert!(
-            store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
+            store.lock().get_guardian(&id).unwrap().branches[0].is_empty,
             "an unanswerable diff must leave the existing flag untouched"
         );
 
@@ -12563,9 +12384,11 @@ mod tests {
     #[test]
     fn recompute_preliminary_summary_uses_task_worktree_git_log_not_llm() {
         let (base, repo, fwt) = make_repo("prelim");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12573,7 +12396,7 @@ mod tests {
             insert_done_cell(&guard, "squad-1", &fwt, "feature/a");
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
 
@@ -12582,7 +12405,6 @@ mod tests {
         assert!(
             store
                 .lock()
-                .unwrap()
                 .get_guardian(&id)
                 .unwrap()
                 .change_summary
@@ -12593,11 +12415,10 @@ mod tests {
         // per-branch, independent of any sibling) and recompute.
         store
             .lock()
-            .unwrap()
             .set_branch_status(&id, &branch_id, MergeStatus::Ready, None)
             .unwrap();
         recompute_preliminary_summary(&store, &id);
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         let summary = g.change_summary.expect("preliminary summary computed");
         assert!(summary.contains("feature/a:"), "summary: {summary:?}");
         assert!(summary.contains("feature"), "summary: {summary:?}");
@@ -12610,7 +12431,7 @@ mod tests {
         // it is no longer this function's concern -- a no-op leaves whatever
         // `generate_final_summary` last wrote untouched.
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .set_branch_review(
                     &id,
@@ -12624,7 +12445,7 @@ mod tests {
                 .unwrap();
         }
         recompute_preliminary_summary(&store, &id);
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g.change_summary.as_deref(),
             Some("final summary from the agent")
@@ -12685,9 +12506,11 @@ mod tests {
         g(&cwt, &["add", "."]);
         g(&cwt, &["commit", "--message", "commit-c-only"]);
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12701,7 +12524,6 @@ mod tests {
         };
         let branch_ids: Vec<String> = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .branches
@@ -12709,7 +12531,7 @@ mod tests {
             .map(|b| b.id.clone())
             .collect();
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             for branch_id in &branch_ids {
                 guard
                     .set_branch_status(&id, branch_id, MergeStatus::Ready, None)
@@ -12718,7 +12540,7 @@ mod tests {
         }
 
         recompute_preliminary_summary(&store, &id);
-        let g_row = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g_row = store.lock().get_guardian(&id).unwrap();
         let summary = g_row.change_summary.expect("preliminary summary computed");
 
         // Each commit subject appears exactly once across the whole summary
@@ -12778,9 +12600,11 @@ mod tests {
         g(&bwt, &["add", "."]);
         g(&bwt, &["commit", "--message", "commit-b-only"]);
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12795,7 +12619,6 @@ mod tests {
         };
         let branch_ids: Vec<String> = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .branches
@@ -12808,7 +12631,7 @@ mod tests {
         let review_ref = format!("guardian/{id}/wt-feature/a");
         g(&repo, &["update-ref", &review_ref, "feature/a"]);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .set_branch_review(&id, &branch_ids[0], &review_ref, "/some/review/wt")
                 .unwrap();
@@ -12822,7 +12645,6 @@ mod tests {
         recompute_preliminary_summary(&store, &id);
         let summary = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .change_summary
@@ -12867,9 +12689,11 @@ mod tests {
             prev = name.to_string();
         }
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12880,7 +12704,7 @@ mod tests {
             id
         };
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             for b in &guard.get_guardian(&id).unwrap().branches {
                 guard
                     .set_branch_status(&id, &b.id, MergeStatus::Ready, None)
@@ -12894,7 +12718,6 @@ mod tests {
         recompute_preliminary_summary(&store, &id);
         let summary = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .change_summary
@@ -12951,9 +12774,11 @@ mod tests {
         g(&bwt, &["add", "."]);
         g(&bwt, &["commit", "--message", "commit-b-only"]);
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -12971,7 +12796,6 @@ mod tests {
         };
         let branch_ids: Vec<String> = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .branches
@@ -12982,7 +12806,7 @@ mod tests {
         let review_ref = format!("guardian/{id}/wt-feature/a");
         g(&repo, &["update-ref", &review_ref, "feature/a"]);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .set_branch_review(&id, &branch_ids[0], &review_ref, "/some/review/wt")
                 .unwrap();
@@ -12996,7 +12820,6 @@ mod tests {
         recompute_preliminary_summary(&store, &id);
         let summary = store
             .lock()
-            .unwrap()
             .get_guardian(&id)
             .unwrap()
             .change_summary
@@ -13023,9 +12846,11 @@ mod tests {
     #[test]
     fn recompute_preliminary_summary_never_downgrades_a_final_summary() {
         let (base, repo, awt) = make_repo("prelim-no-downgrade");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -13033,11 +12858,11 @@ mod tests {
             insert_done_cell(&guard, "squad-a", &awt, "feature/a");
             id
         };
-        let branch_id = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
             .id
             .clone();
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .set_branch_status(&id, &branch_id, MergeStatus::Ready, None)
                 .unwrap();
@@ -13055,7 +12880,7 @@ mod tests {
         }
 
         recompute_preliminary_summary(&store, &id);
-        let g_row = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g_row = store.lock().get_guardian(&id).unwrap();
         assert_eq!(
             g_row.change_summary.as_deref(),
             Some("final summary from the agent")
@@ -13067,9 +12892,11 @@ mod tests {
 
     #[test]
     fn recompute_preliminary_summary_is_noop_with_no_ready_branches() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard.create_guardian("r", "main", "/repo").unwrap();
             guard.add_guardian_branch(&id, "feature/a").unwrap();
             id
@@ -13079,7 +12906,6 @@ mod tests {
         assert!(
             store
                 .lock()
-                .unwrap()
                 .get_guardian(&id)
                 .unwrap()
                 .change_summary
@@ -13148,14 +12974,14 @@ mod tests {
     /// worktree creation leaves behind) pointing at `tip`. Returns the
     /// guardian id.
     fn setup_final_summary_guardian(
-        store: &Arc<Mutex<Store>>,
+        store: &crate::store_lock::StoreHandle,
         repo: &Path,
         base_sha: &str,
         branch: &str,
         tip: &str,
     ) -> String {
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", repo.to_str().unwrap())
                 .unwrap();
@@ -13191,7 +13017,9 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
         let runner = CapturingRunner::new();
 
@@ -13222,7 +13050,9 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
         let runner = CapturingRunner::new();
 
@@ -13247,7 +13077,9 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         // The branch's own review-worktree ref points at feature/a's real
         // tip -- only the guardian branch's *name* is ticket-shaped, so this
         // isolates label substitution from git-log resolution.
@@ -13284,25 +13116,25 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
         let runner = CapturingRunner::new();
 
         generate_final_summary(&store, &runner, &id, "sig-1");
 
-        let g = store.lock().unwrap().get_guardian(&id).unwrap();
+        let g = store.lock().get_guardian(&id).unwrap();
         assert_eq!(g.change_summary.as_deref(), Some("captured"));
 
         // A second request for the SAME signature is now recognised as
         // already-satisfied and stays a no-op.
         store
             .lock()
-            .unwrap()
             .request_final_summary(&id, "sig-1", crate::store::now_ms(), false);
         assert!(
             store
                 .lock()
-                .unwrap()
                 .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
                 .is_empty()
         );
@@ -13389,9 +13221,11 @@ mod tests {
     #[test]
     fn final_checks_runs_local_checks_and_surfaces_a_failure() {
         let (base, repo, _fwt) = make_repo("finalchecks-remote-off");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
@@ -13423,14 +13257,16 @@ mod tests {
     #[test]
     fn final_checks_runs_check_gates_under_this_reviews_build_env_override() {
         let (base, repo, _fwt) = make_repo("finalchecks-buildenv");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let check_cmd = if cfg!(windows) {
             "if not \"%RAL203_BUILD_VAR%\"==\"expected\" exit 1"
         } else {
             "test \"$RAL203_BUILD_VAR\" = expected"
         };
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
@@ -13478,9 +13314,11 @@ mod tests {
             format!("[review]\nauto_build = {build_cmd:?}\n"),
         )
         .unwrap();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
@@ -13528,9 +13366,11 @@ mod tests {
             "[review]\nauto_build = \"exit 1\"\n",
         )
         .unwrap();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
@@ -13605,9 +13445,11 @@ mod tests {
     #[test]
     fn final_checks_review_auto_build_agent_failure_is_advisory_not_err() {
         let (base, repo, _fwt) = make_repo("finalchecks-review-autobuild-agent-fail");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let id = guard
                 .create_guardian("r", "main", &repo.to_string_lossy())
                 .unwrap();
@@ -13645,7 +13487,7 @@ mod tests {
             "expected the failure to be reflected in the note: {note}"
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         let view = guard.get_guardian(&id).unwrap();
         assert_eq!(view.notice_kind.as_deref(), Some("auto_build_failed"));
         assert!(

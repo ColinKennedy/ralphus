@@ -1316,7 +1316,10 @@ fn stack_base_for(
 /// best-effort PATCHes the forge PR's base too — a forge call failing for one
 /// PR is logged and does not stop the others from being resynced. Returns the
 /// number of PRs whose `base_ref` changed locally.
-pub fn resync_pr_bases(store: &Arc<Mutex<Store>>, id: &str) -> std::result::Result<usize, String> {
+pub fn resync_pr_bases(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+) -> std::result::Result<usize, String> {
     resync_pr_bases_inner(store, id, false)
 }
 
@@ -1384,7 +1387,7 @@ impl PrRepoRouting {
 /// the excluded remote and writing back the exact value the next detection
 /// pass would flag as drifted again).
 fn forge_parent_remote_name(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
@@ -1396,23 +1399,17 @@ fn forge_parent_remote_name(
 /// unless the caller has a more specific `root`/project path for a
 /// multi-project branch, e.g. [`check_pr_merges`]'s per-branch resolution).
 fn resolve_pr_repo_routing(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
 ) -> PrRepoRouting {
     let project_name = store
         .lock()
-        .expect("poisoned")
         .project_name_for_path(root.to_str().unwrap_or_default());
-    let fork = project_name.as_deref().and_then(|p| {
-        store
-            .lock()
-            .expect("poisoned")
-            .resolve_fork(p, "")
-            .ok()
-            .flatten()
-    });
+    let fork = project_name
+        .as_deref()
+        .and_then(|p| store.lock().resolve_fork(p, "").ok().flatten());
     let Some(fork) = fork else {
         let parent_remote_name = crate::forge::resolve_remote_name(root, base_branch, forge_cfg);
         return PrRepoRouting {
@@ -1450,16 +1447,12 @@ fn resolve_pr_repo_routing(
 /// no registered fork, in which case the caller's existing inference is
 /// unchanged.
 pub(crate) fn resolve_feedback_fork_remote(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Path,
 ) -> Option<String> {
-    let project_name = store
-        .lock()
-        .expect("poisoned")
-        .project_name_for_path(root.to_str()?)?;
+    let project_name = store.lock().project_name_for_path(root.to_str()?)?;
     let fork = store
         .lock()
-        .expect("poisoned")
         .resolve_fork(&project_name, "")
         .ok()
         .flatten()?;
@@ -1468,15 +1461,11 @@ pub(crate) fn resolve_feedback_fork_remote(
 }
 
 fn resync_pr_bases_inner(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     require_forge_success: bool,
 ) -> std::result::Result<usize, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
@@ -1484,7 +1473,6 @@ fn resync_pr_bases_inner(
 
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     let by_branch = open_prs_by_branch(&prs);
@@ -1538,7 +1526,7 @@ fn resync_pr_bases_inner(
                 pr.base_ref
             );
             if !require_forge_success {
-                let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                let _ = store.lock().update_pull_request_ex(
                     &pr.id,
                     None,
                     None,
@@ -1568,7 +1556,7 @@ fn resync_pr_bases_inner(
                 let forge_base_matches = if require_forge_success {
                     match c.get_pull_request_base_state(num) {
                         Ok(state) if state.base == new_base => {
-                            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                            let _ = store.lock().update_pull_request_ex(
                                 &pr.id,
                                 None,
                                 None,
@@ -1606,7 +1594,7 @@ fn resync_pr_bases_inner(
                     // a genuine forge-side retarget apart from a PATCH that
                     // silently failed here and never landed.
                     Ok(()) => {
-                        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                        let _ = store.lock().update_pull_request_ex(
                             &pr.id,
                             None,
                             None,
@@ -1661,7 +1649,7 @@ fn resync_pr_bases_inner(
             match repoint_stacked_prs(store, id, c, &ordered_pr_numbers, &blocked_by_stack) {
                 Ok(()) if require_forge_success => {
                     for (pr_id, _, new_base) in &blocked_by_stack {
-                        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                        let _ = store.lock().update_pull_request_ex(
                             pr_id,
                             None,
                             None,
@@ -1701,7 +1689,7 @@ fn is_forge_not_found(err: &str) -> bool {
 }
 
 fn create_and_record_native_stack(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     client: &crate::forge::ForgeClient,
     ordered_pr_numbers: &[i64],
@@ -1711,7 +1699,6 @@ fn create_and_record_native_stack(
     };
     store
         .lock()
-        .expect("poisoned")
         .set_guardian_forge_stack_number(id, stack.number)
         .map_err(|e| e.to_string())?;
     Ok(Some(stack.number))
@@ -1732,7 +1719,7 @@ fn create_and_record_native_stack(
 /// still attempted, since the local `base_ref` records have already been
 /// updated and a forge that disagrees is reconciled on the next resync.
 fn repoint_stacked_prs(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     client: &crate::forge::ForgeClient,
     ordered_pr_numbers: &[i64],
@@ -1740,7 +1727,6 @@ fn repoint_stacked_prs(
 ) -> std::result::Result<(), String> {
     let recorded = store
         .lock()
-        .expect("poisoned")
         .get_guardian_forge_stack_number(id)
         .ok()
         .flatten();
@@ -1766,7 +1752,6 @@ fn repoint_stacked_prs(
     }
     store
         .lock()
-        .expect("poisoned")
         .clear_guardian_forge_stack_number(id)
         .map_err(|e| e.to_string())?;
     let mut errors = Vec::new();
@@ -1832,7 +1817,7 @@ static RESYNCING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new
 /// for an older background resync of this same review to finish, then owns
 /// the same claim so stale and fresh PATCH calls cannot overlap.
 pub fn resync_pr_bases_synchronously(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<usize, String> {
     for _ in 0..3_000 {
@@ -1850,7 +1835,7 @@ pub fn resync_pr_bases_synchronously(
 /// so the reorder's own HTTP response is not held up by the forge network
 /// calls this makes. A no-op (logged, not queued) if a resync for this
 /// guardian is already running -- see [`RESYNCING`].
-pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
+pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
     let sid = id.to_string();
     {
         let mut inflight = RESYNCING.lock().expect("poisoned");
@@ -1867,7 +1852,7 @@ pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
         RESYNCING.lock().expect("poisoned").remove(&sid);
         match result {
             Ok(n) if n > 0 => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "pr",
@@ -1918,13 +1903,12 @@ pub fn start_resync_pr_bases(store: Arc<Mutex<Store>>, id: &str) {
 /// [`refresh_open_prs`]'s "assume still open" fallback. Returns whether
 /// anything changed (approved, or a PR was dropped) -- callers use this to
 /// know the guardian's status may no longer be what they last read.
-pub fn check_pr_merges(store: &Arc<Mutex<Store>>, id: &str) -> bool {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
         return false;
     };
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
     if prs.is_empty() {
@@ -2020,7 +2004,7 @@ pub fn check_pr_merges(store: &Arc<Mutex<Store>>, id: &str) -> bool {
 /// last poll -- the next call (this function is invoked on every
 /// [`check_pr_merges`] poll) picks up any remaining promotion.
 fn maybe_promote_fork_root(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     guardian: &GuardianView,
     freshly_merged: &[PullRequestView],
@@ -2084,7 +2068,6 @@ fn maybe_promote_fork_root(
     };
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
     // Walk forward from the merged root's position to the first enabled
@@ -2170,7 +2153,7 @@ fn maybe_promote_fork_root(
             successor_pr.id
         );
     }
-    let new_id = store.lock().expect("poisoned").create_pull_request_ex(
+    let new_id = store.lock().create_pull_request_ex(
         id,
         Some(successor_branch.id.as_str()),
         route.client.kind().as_str(),
@@ -2183,7 +2166,7 @@ fn maybe_promote_fork_root(
         Some(&created.url),
         successor_pr.stack_id.as_deref(),
     );
-    let _ = store.lock().expect("poisoned").update_pull_request_ex(
+    let _ = store.lock().update_pull_request_ex(
         &successor_pr.id,
         None,
         None,
@@ -2195,17 +2178,14 @@ fn maybe_promote_fork_root(
     );
     match &new_id {
         Ok(new_id) => {
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .set_pr_superseded_by(&successor_pr.id, new_id);
+            let _ = store.lock().set_pr_superseded_by(&successor_pr.id, new_id);
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} promoted pr={} (old) -> {new_id} (new, number={})",
                 successor_pr.id,
                 created.number
             );
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
@@ -2241,7 +2221,7 @@ fn maybe_promote_fork_root(
 /// needing a real git remote for [`crate::forge::resolve_remote`] to resolve.
 #[cfg(test)]
 fn apply_pr_merge_check(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     prs: &[PullRequestView],
     client: &crate::forge::ForgeClient,
@@ -2255,7 +2235,7 @@ fn apply_pr_merge_check(
 }
 
 fn poll_pr_merge_state(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
     client: &crate::forge::ForgeClient,
@@ -2266,7 +2246,7 @@ fn poll_pr_merge_state(
     };
     match client.get_pull_request_state(number) {
         Ok(state) if state != "open" => {
-            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+            let _ = store.lock().update_pull_request_ex(
                 &pr.id,
                 None,
                 None,
@@ -2286,7 +2266,7 @@ fn poll_pr_merge_state(
 }
 
 fn log_pr_merge_check_failure(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
     error: &str,
@@ -2296,7 +2276,7 @@ fn log_pr_merge_check_failure(
         "ralphus [pr] review {id} pr {} merge check failed, assuming not merged: {error}",
         pr.id
     );
-    let guard = store.lock().expect("poisoned");
+    let guard = store.lock();
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::WARNING,
         source: "pr",
@@ -2316,17 +2296,16 @@ fn log_pr_merge_check_failure(
 /// the store. This is shared by forge polling and explicit merge notifications,
 /// which may record every PR as merged before the maintenance sweep runs.
 fn settle_pr_merge_states(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     freshly_merged: &[PullRequestView],
 ) -> bool {
-    let current_guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let current_guardian = match store.lock().get_guardian(id) {
         Ok(guardian) => guardian,
         Err(_) => return false,
     };
     let current_prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
 
@@ -2352,13 +2331,13 @@ fn settle_pr_merge_states(
         if !all_merged {
             return false;
         }
-        let approved = store.lock().expect("poisoned").approve_guardian(id).is_ok();
+        let approved = store.lock().approve_guardian(id).is_ok();
         if approved {
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} approved: every linked pr has merged"
             );
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
@@ -2386,7 +2365,7 @@ fn settle_pr_merge_states(
     // had) a rebase/feedback pass of its own in flight. Drop the stale PR
     // row(s) rather than force a status change out from under it.
     for pr in freshly_merged {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.drop_pull_request(
             &pr.id,
             "linked pr merged out-of-band while review was mid-flight",
@@ -2418,7 +2397,7 @@ fn settle_pr_merge_states(
             current_guardian.status,
         );
     }
-    let _ = store.lock().expect("poisoned").set_guardian_notice(
+    let _ = store.lock().set_guardian_notice(
         id,
         "pr_merged_mid_flight",
         "A linked pull request merged on the forge while this review had a merge/feedback pass \
@@ -2449,8 +2428,8 @@ fn settle_pr_merge_states(
 /// Best-effort per PR: one push failing (most likely `guard_against_clobber`
 /// tripping because a reviewer pushed directly to the PR branch) is logged and
 /// does not stop the others.
-pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(id) else {
+pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
     if guardian.status.as_str() != "in_review" {
@@ -2458,7 +2437,6 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
     }
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
     let open_prs: Vec<_> = prs.iter().filter(|p| p.state == "open").collect();
@@ -2518,7 +2496,7 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
             );
             continue;
         }
-        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+        let _ = store.lock().update_pull_request_ex(
             &pr.id,
             None,
             None,
@@ -2529,7 +2507,7 @@ pub fn sync_open_pr_branches(store: &Arc<Mutex<Store>>, id: &str) {
             None,
         );
         {
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
@@ -2581,14 +2559,10 @@ pub struct ForgeStackDrift {
 }
 
 pub fn detect_forge_reorder(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<Option<ForgeStackDrift>, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: a fork-mode review's PRs may be split across two repositories,
@@ -2599,7 +2573,6 @@ pub fn detect_forge_reorder(
 
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     let by_branch = open_prs_by_branch(&prs);
@@ -2716,8 +2689,8 @@ fn reconstruct_forge_chain(
 /// `rebuild_on_base_shift` use for their own triggers -- `in_review` is the
 /// only claimable state, since a reorder only makes sense once a stack is
 /// actually built and has open PRs to compare against.
-fn claim_guardian_for_forge_reorder(store: &Arc<Mutex<Store>>, id: &str) -> bool {
-    let guard = store.lock().expect("poisoned");
+fn claim_guardian_for_forge_reorder(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let guard = store.lock();
     matches!(guard.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
         && guard
             .set_guardian_status(
@@ -2745,7 +2718,7 @@ fn claim_guardian_for_forge_reorder(store: &Arc<Mutex<Store>>, id: &str) -> bool
 /// silently other than the usual Cartographer log. Returns whether a reorder
 /// was detected and applied.
 pub fn check_and_apply_forge_reorder(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     sem: &crate::scheduler::Semaphore,
@@ -2759,7 +2732,7 @@ pub fn check_and_apply_forge_reorder(
                 WARNING,
                 "ralphus [pr] review {id} forge reorder check failed: {e}"
             );
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("pr")
                 .guardian(id)
                 .scope("guardian")
@@ -2804,7 +2777,7 @@ pub fn check_and_apply_forge_reorder(
         drift.order_changed
     );
     let (root, base_branch, forge_cfg) = {
-        let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+        let guardian = match store.lock().get_guardian(id) {
             Ok(g) => g,
             Err(e) => {
                 crate::rlog!(
@@ -2821,7 +2794,7 @@ pub fn check_and_apply_forge_reorder(
     let remote_name = forge_parent_remote_name(store, &root, &base_branch, &forge_cfg);
     let local_base = qualify_forge_base(&base_branch, &remote_name, &drift.base);
     {
-        let mut guard = store.lock().expect("poisoned");
+        let mut guard = store.lock();
         let base_applied = if drift.base_changed {
             match guard.set_guardian_base_branch_if_newer(id, &local_base, drift.base_changed_at_ms)
             {
@@ -2891,12 +2864,12 @@ pub fn check_and_apply_forge_reorder(
 /// deliberately do not also call it -- see the comment in `guardian_reorder`
 /// (`daemon/src/server.rs`) on why that would race their own base PATCHes.
 pub fn poll_forge_reorders(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     sem: &Arc<crate::scheduler::Semaphore>,
     cancellations: &crate::cancel::Cancellations,
 ) {
     let ids: Vec<String> = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard
             .list_guardians()
             .unwrap_or_default()
@@ -3013,14 +2986,10 @@ fn branches_skipped_by_drift<'a>(
 /// pushed to the forge) against the new order. Returns the number of PRs
 /// pulled into ralphus's order.
 pub fn poll_pr_base_drift(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
 ) -> std::result::Result<usize, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: resolve both candidate clients so each PR's base-drift check
@@ -3030,7 +2999,6 @@ pub fn poll_pr_base_drift(
 
     let prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     let by_branch = open_prs_by_branch(&prs);
@@ -3094,11 +3062,9 @@ pub fn poll_pr_base_drift(
                 skipped.id,
                 pr.id
             );
-            let _ = store.lock().expect("poisoned").set_branch_enabled_by_name(
-                id,
-                &skipped.branch,
-                false,
-            );
+            let _ = store
+                .lock()
+                .set_branch_enabled_by_name(id, &skipped.branch, false);
         }
 
         // ralphus[ignore-rlog-pair]: per-PR drift-detection detail; the batch summary in poll_pr_base_drift_once records the structured workflow outcome
@@ -3108,7 +3074,7 @@ pub fn poll_pr_base_drift(
             pr.id,
             pr.base_ref
         );
-        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+        let _ = store.lock().update_pull_request_ex(
             &pr.id,
             None,
             None,
@@ -3136,12 +3102,8 @@ pub fn poll_pr_base_drift(
 /// forge calls for a review that was never submitted" requirement) since
 /// [`Store::guardian_ids_with_open_pull_requests`] only returns guardians
 /// that already have one.
-fn poll_pr_base_drift_once(store: &Arc<Mutex<Store>>) {
-    let ids = match store
-        .lock()
-        .expect("poisoned")
-        .guardian_ids_with_open_pull_requests()
-    {
+fn poll_pr_base_drift_once(store: &crate::store_lock::StoreHandle) {
+    let ids = match store.lock().guardian_ids_with_open_pull_requests() {
         Ok(ids) => ids,
         Err(e) => {
             crate::rlog!(
@@ -3154,7 +3116,7 @@ fn poll_pr_base_drift_once(store: &Arc<Mutex<Store>>) {
     for id in ids {
         match poll_pr_base_drift(store, &id) {
             Ok(n) if n > 0 => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "pr",
@@ -3187,7 +3149,7 @@ const PR_BASE_DRIFT_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 
 /// Spawn the background loop that periodically calls
 /// [`poll_pr_base_drift_once`] for as long as the daemon runs (RAL-279).
-pub fn spawn_pr_base_drift_poller(store: Arc<Mutex<Store>>) {
+pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(PR_BASE_DRIFT_POLL_INTERVAL);
@@ -3222,22 +3184,18 @@ struct ForkRouting {
 /// fork registered" -- both mean "byte-identical non-fork routing" to the
 /// caller.
 fn resolve_fork_routing(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     root: &Path,
     guardian: &GuardianView,
     forge_cfg: &crate::config::ForgeConfig,
     user: &str,
 ) -> std::result::Result<Option<ForkRouting>, String> {
-    let project_name = store
-        .lock()
-        .expect("poisoned")
-        .project_name_for_path(&guardian.git_root);
+    let project_name = store.lock().project_name_for_path(&guardian.git_root);
     let Some(project_name) = project_name else {
         return Ok(None);
     };
     let fork = store
         .lock()
-        .expect("poisoned")
         .resolve_fork(&project_name, user)
         .map_err(|e| e.to_string())?;
     let Some(fork) = fork else {
@@ -3411,7 +3369,7 @@ fn preflight_fork_relationship(routing: &ForkRouting, allow_unlinked: bool) -> F
 /// plus a hard error where applicable -- shared by every submission entry
 /// point so the pre-flight always runs before the first push.
 fn run_fork_preflight(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     id: &str,
     routing: &ForkRouting,
     allow_unlinked_fork: bool,
@@ -3424,8 +3382,9 @@ fn run_fork_preflight(
         }
         ForkPreflight::UnlinkedOverridden(msg) => {
             crate::rlog!(WARNING, "ralphus [pr] review {id} {msg}");
-            let _ = store.lock().expect("poisoned").cartographer_log(
-                crate::cartographer::CartographerEntry {
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::WARNING,
                     source: "pr",
                     message: "fork submission proceeded without a confirmed relationship",
@@ -3437,8 +3396,7 @@ fn run_fork_preflight(
                     log_path: None,
                     payload: serde_json::json!({"fork_url": routing.fork.fork_url}),
                     admin_only: false,
-                },
-            );
+                });
             Ok(())
         }
         ForkPreflight::Blocked(msg) => Err(format!("review {id}: {msg}")),
@@ -3472,7 +3430,7 @@ fn run_fork_preflight(
 /// unlinked trace.
 #[allow(clippy::too_many_arguments)]
 pub fn submit_pull_requests(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     requests: Vec<PrRequest>,
@@ -3530,7 +3488,7 @@ pub fn submit_pull_requests(
 /// or (GitHub cross-repo root) the parent.
 #[allow(clippy::too_many_arguments)]
 fn submit_stacked_branch_pr(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     client: &crate::forge::ForgeClient,
     id: &str,
@@ -3587,7 +3545,6 @@ fn submit_stacked_branch_pr(
     } else {
         store
             .lock()
-            .expect("poisoned")
             .resolve_unique_pr_alias(
                 client.kind().as_str(),
                 client.repo_label(),
@@ -3684,7 +3641,6 @@ fn submit_stacked_branch_pr(
         };
     let row_id = store
         .lock()
-        .expect("poisoned")
         .create_pull_request_ex(
             id,
             Some(branch_id),
@@ -3700,7 +3656,7 @@ fn submit_stacked_branch_pr(
         )
         .map_err(|e| e.to_string())?;
     if let Some(sha) = &pushed_sha {
-        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+        let _ = store.lock().update_pull_request_ex(
             &row_id,
             None,
             None,
@@ -3712,7 +3668,7 @@ fn submit_stacked_branch_pr(
         );
     }
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "pr",
@@ -3754,11 +3710,9 @@ fn submit_stacked_branch_pr(
     // funnels through, so clearing it here covers all of them uniformly.
     let _ = store
         .lock()
-        .expect("poisoned")
         .set_branch_auto_submit_error(id, branch_id, None);
     store
         .lock()
-        .expect("poisoned")
         .get_pull_request(&row_id)
         .map_err(|e| e.to_string())
 }
@@ -3843,7 +3797,7 @@ fn decide_stack_action(
 /// mistaken for "confirmed closed" and duplicates a PR that's actually
 /// still fine.
 fn refresh_open_prs<'a>(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     client: &crate::forge::ForgeClient,
     open_by_branch: HashMap<&'a str, &'a PullRequestView>,
 ) -> HashMap<&'a str, &'a PullRequestView> {
@@ -3863,7 +3817,7 @@ fn refresh_open_prs<'a>(
                         pr.id,
                         pr.branch_id
                     );
-                    let _ = store.lock().expect("poisoned").update_pull_request_ex(
+                    let _ = store.lock().update_pull_request_ex(
                         &pr.id,
                         None,
                         None,
@@ -3909,7 +3863,7 @@ fn refresh_open_prs<'a>(
 /// comment.
 #[allow(clippy::too_many_arguments)]
 fn submit_stack_for_guardian(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     client: &crate::forge::ForgeClient,
     id: &str,
@@ -3989,7 +3943,7 @@ fn submit_stack_for_guardian(
 /// store rather than trusting a caller-held list, since branch creation may
 /// have just written new rows this same call.
 fn reconcile_native_pr_stack(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     client: &crate::forge::ForgeClient,
     id: &str,
     ordered_enabled: &[&BranchView],
@@ -3998,7 +3952,6 @@ fn reconcile_native_pr_stack(
 ) -> std::result::Result<(), String> {
     let existing_prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     let already_open = refresh_open_prs(store, client, open_prs_by_branch(&existing_prs));
@@ -4026,7 +3979,7 @@ fn reconcile_native_pr_stack(
     // submission paths that funnel through this function.
     sync_open_pr_branches(store, id);
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "pr",
@@ -4069,7 +4022,6 @@ fn reconcile_native_pr_stack(
 
     let recorded = store
         .lock()
-        .expect("poisoned")
         .get_guardian_forge_stack_number(id)
         .map_err(|e| e.to_string())?;
     let recorded = match recorded {
@@ -4078,7 +4030,6 @@ fn reconcile_native_pr_stack(
             Ok(None) => {
                 store
                     .lock()
-                    .expect("poisoned")
                     .clear_guardian_forge_stack_number(id)
                     .map_err(|e| e.to_string())?;
                 crate::rlog!(
@@ -4120,10 +4071,7 @@ fn reconcile_native_pr_stack(
         } => {
             if let Err(e) = client.add_to_stack(stack_number, &missing_ordered) {
                 if is_forge_not_found(&e) {
-                    let clear_result = store
-                        .lock()
-                        .expect("poisoned")
-                        .clear_guardian_forge_stack_number(id);
+                    let clear_result = store.lock().clear_guardian_forge_stack_number(id);
                     if let Err(clear_error) = clear_result {
                         // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                         crate::rlog!(
@@ -4166,7 +4114,6 @@ fn reconcile_native_pr_stack(
             Ok(()) => {
                 store
                     .lock()
-                    .expect("poisoned")
                     .clear_guardian_forge_stack_number(id)
                     .map_err(|e| e.to_string())?;
                 match create_and_record_native_stack(store, id, client, &all_ordered) {
@@ -4220,15 +4167,11 @@ fn reconcile_native_pr_stack(
 /// `submit_stacked_branch_pr`'s precondition, so it is simply excluded from
 /// consideration here rather than aborting the branches that ARE ready.
 fn auto_submit_terminal_branches(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: this is a daemon-internal poller, not a per-request submit --
@@ -4279,14 +4222,12 @@ fn auto_submit_terminal_branches(
 
     let existing_prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     let mut alias_by_branch = open_alias_by_branch(&existing_prs);
 
     let stack_id = store
         .lock()
-        .expect("poisoned")
         .next_id("guardian_pr_stack_seq", "prstack")
         .map_err(|e| e.to_string())?;
 
@@ -4323,12 +4264,12 @@ fn auto_submit_terminal_branches(
 /// branch was submitted; they do not prove that its forge-side base and
 /// GitHub-native stack membership still match the review.
 pub fn maybe_auto_submit_branch(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     branch_id: &str,
 ) {
-    let guardian = match store.lock().expect("poisoned").get_guardian(id) {
+    let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -4345,7 +4286,6 @@ pub fn maybe_auto_submit_branch(
         Ok(_) => {
             let _ = store
                 .lock()
-                .expect("poisoned")
                 .set_branch_auto_submit_error(id, branch_id, None);
         }
         Err(e) => {
@@ -4355,7 +4295,6 @@ pub fn maybe_auto_submit_branch(
             );
             let _ = store
                 .lock()
-                .expect("poisoned")
                 .set_branch_auto_submit_error(id, branch_id, Some(&e));
         }
     }
@@ -4367,17 +4306,17 @@ const AUTO_SUBMIT_DEBOUNCE_MS: i64 = 400;
 
 /// Queue a guardian for asynchronous PR-stack submission. The durable row is
 /// guardian-scoped; the worker reads the terminal branches fresh when it runs.
-pub(crate) fn schedule_auto_submit_branch(store: &Arc<Mutex<Store>>, id: &str, branch_id: &str) {
-    if let Err(e) = store
-        .lock()
-        .expect("poisoned")
-        .request_auto_submit_branch(id, now_ms())
-    {
+pub(crate) fn schedule_auto_submit_branch(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+) {
+    if let Err(e) = store.lock().request_auto_submit_branch(id, now_ms()) {
         crate::rlog!(
             WARNING,
             "ralphus [pr] review {id} branch {branch_id} failed to queue auto-submit request: {e}"
         );
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "pr",
@@ -4402,10 +4341,9 @@ static AUTO_SUBMIT_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
 /// Claim due requests and process each guardian on its own background thread.
 /// Every enabled terminal branch receives the normal stack-aware submission
 /// path, preserving the review's linear PR/MR chain.
-pub fn sweep_pending_pr_auto_submits_once(store: &Arc<Mutex<Store>>) {
+pub fn sweep_pending_pr_auto_submits_once(store: &crate::store_lock::StoreHandle) {
     let due = match store
         .lock()
-        .expect("poisoned")
         .take_due_auto_submits(now_ms(), AUTO_SUBMIT_DEBOUNCE_MS)
     {
         Ok(due) => due,
@@ -4420,16 +4358,13 @@ pub fn sweep_pending_pr_auto_submits_once(store: &Arc<Mutex<Store>>) {
     for id in due {
         let Some(claim) = guardian_merge::InFlightClaim::acquire(&AUTO_SUBMIT_IN_FLIGHT, &id)
         else {
-            let _ = store
-                .lock()
-                .expect("poisoned")
-                .request_auto_submit_branch(&id, now_ms());
+            let _ = store.lock().request_auto_submit_branch(&id, now_ms());
             continue;
         };
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            let branch_ids: Vec<String> = match store.lock().expect("poisoned").get_guardian(&id) {
+            let branch_ids: Vec<String> = match store.lock().get_guardian(&id) {
                 Ok(g) => g
                     .branches
                     .iter()
@@ -4450,8 +4385,8 @@ pub fn sweep_pending_pr_auto_submits_once(store: &Arc<Mutex<Store>>) {
 
 /// Re-queue eligible terminal branches at startup, closing the crash window
 /// between their terminal-status update and durable request insertion.
-pub fn recover_pending_auto_submits_on_startup(store: &Arc<Mutex<Store>>) {
-    let guard = store.lock().expect("poisoned");
+pub fn recover_pending_auto_submits_on_startup(store: &crate::store_lock::StoreHandle) {
+    let guard = store.lock();
     let guardians = match guard.list_guardians() {
         Ok(guardians) => guardians,
         Err(e) => {
@@ -4491,7 +4426,7 @@ pub fn recover_pending_auto_submits_on_startup(store: &Arc<Mutex<Store>>) {
 
 #[allow(clippy::too_many_arguments)]
 fn submit_pull_requests_inner(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
     requests: Vec<PrRequest>,
@@ -4499,11 +4434,7 @@ fn submit_pull_requests_inner(
     user: &str,
     allow_unlinked_fork: bool,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let fork_routing = resolve_fork_routing(store, &root, &guardian, &forge_cfg, user)?;
@@ -4541,7 +4472,6 @@ fn submit_pull_requests_inner(
 
     let existing_prs = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
     // Seeded from *every* already-open PR, not just what's in `requests` --
@@ -4576,7 +4506,6 @@ fn submit_pull_requests_inner(
     // submission's sibling branches are queryable as one group later.
     let stack_id = store
         .lock()
-        .expect("poisoned")
         .next_id("guardian_pr_stack_seq", "prstack")
         .map_err(|e| e.to_string())?;
 
@@ -4743,17 +4672,15 @@ pub struct PrSyncStatus {
 /// (`branch_id = None`) compares against the guardian's combined review
 /// branch; a stacked PR compares against its own branch's review branch.
 pub fn compute_sync_status(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     pr_id: &str,
 ) -> std::result::Result<PrSyncStatus, String> {
     let pr = store
         .lock()
-        .expect("poisoned")
         .get_pull_request(pr_id)
         .map_err(|e| e.to_string())?;
     let guardian = store
         .lock()
-        .expect("poisoned")
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
@@ -4847,18 +4774,16 @@ pub fn compute_sync_status(
 /// convention for the same case. Returns `Ok(false)` when the PR branch had
 /// nothing new to pull.
 pub fn pull_pr_commits(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
 ) -> std::result::Result<bool, String> {
     let pr = store
         .lock()
-        .expect("poisoned")
         .get_pull_request(pr_id)
         .map_err(|e| e.to_string())?;
     let guardian = store
         .lock()
-        .expect("poisoned")
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let branch_id = match &pr.branch_id {
@@ -4893,7 +4818,6 @@ pub fn pull_pr_commits(
 
     let updated = store
         .lock()
-        .expect("poisoned")
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let local_ref = if pr.branch_id.is_some() {
@@ -4909,7 +4833,7 @@ pub fn pull_pr_commits(
 
     push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
     if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-        let _ = store.lock().expect("poisoned").update_pull_request_ex(
+        let _ = store.lock().update_pull_request_ex(
             pr_id,
             None,
             None,
@@ -4921,7 +4845,7 @@ pub fn pull_pr_commits(
         );
     }
     {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "pr",
@@ -4952,15 +4876,11 @@ pub fn pull_pr_commits(
 /// Returns how many PR branches supplied commits. An idle review with no
 /// remote changes only performs the inexpensive fetch-and-compare checks.
 pub fn sync_remote_pr_commits(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
 ) -> std::result::Result<usize, String> {
-    let guardian = store
-        .lock()
-        .expect("poisoned")
-        .get_guardian(id)
-        .map_err(|e| e.to_string())?;
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     if guardian.status.as_str() != "in_review" {
         return Ok(0);
     }
@@ -4972,7 +4892,6 @@ pub fn sync_remote_pr_commits(
         .collect();
     let mut pr_ids: Vec<_> = store
         .lock()
-        .expect("poisoned")
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -5001,12 +4920,12 @@ pub fn sync_remote_pr_commits(
 
 /// Kick off [`pull_pr_commits`] in the background; returns immediately.
 pub fn start_pull_pr_commits(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     pr_id: &str,
 ) -> Reply {
     let pr = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.get_pull_request(pr_id)
     };
     let guardian_id = match pr {
@@ -5017,7 +4936,7 @@ pub fn start_pull_pr_commits(
     std::thread::spawn(
         move || match pull_pr_commits(&store, runner.as_ref(), &pid) {
             Ok(pulled) => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "pr",
@@ -5038,7 +4957,7 @@ pub fn start_pull_pr_commits(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] pull-from-pr failed pr={pid}: {e}");
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
                     source: "pr",
@@ -5086,7 +5005,7 @@ pub fn start_pull_pr_commits(
 /// unlinked traces — only the PR-specific steps around it (the forge comment
 /// fetch and the push-back) are covered here.
 pub fn action_pr_feedback(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
 ) -> std::result::Result<usize, String> {
@@ -5113,18 +5032,16 @@ pub fn action_pr_feedback(
 }
 
 fn action_pr_feedback_inner(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
 ) -> std::result::Result<usize, String> {
     let pr = store
         .lock()
-        .expect("poisoned")
         .get_pull_request(pr_id)
         .map_err(|e| e.to_string())?;
     let guardian = store
         .lock()
-        .expect("poisoned")
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
@@ -5147,7 +5064,6 @@ fn action_pr_feedback_inner(
     let comments = client.list_pr_comments(pr_number)?;
     let already = store
         .lock()
-        .expect("poisoned")
         .actioned_pr_comment_ids(pr_id)
         .map_err(|e| e.to_string())?;
     let fresh: Vec<_> = comments
@@ -5210,10 +5126,7 @@ fn action_pr_feedback_inner(
     );
 
     for c in &fresh {
-        let _ = store
-            .lock()
-            .expect("poisoned")
-            .mark_pr_comment_actioned(pr_id, &c.external_id);
+        let _ = store.lock().mark_pr_comment_actioned(pr_id, &c.external_id);
     }
 
     if pr.branch_id.is_some() {
@@ -5222,7 +5135,7 @@ fn action_pr_feedback_inner(
         // rather than re-pushing (and re-guarding-against-clobber) the
         // identical ref a second time.
         if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
-            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+            let _ = store.lock().update_pull_request_ex(
                 pr_id,
                 None,
                 None,
@@ -5241,7 +5154,6 @@ fn action_pr_feedback_inner(
         // the topmost enabled one) -- push it back separately, as before.
         let updated = store
             .lock()
-            .expect("poisoned")
             .get_guardian(&pr.guardian_id)
             .map_err(|e| e.to_string())?;
         let local_ref = updated
@@ -5263,7 +5175,7 @@ fn action_pr_feedback_inner(
         );
         push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
         if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-            let _ = store.lock().expect("poisoned").update_pull_request_ex(
+            let _ = store.lock().update_pull_request_ex(
                 pr_id,
                 None,
                 None,
@@ -5301,7 +5213,7 @@ fn error_reply(status: u16, code: &str, message: &str) -> Reply {
 /// forge calls and `git push`es happen off the request thread since they are
 /// both networked and potentially slow.
 pub fn start_submit_pull_requests(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
     requests: Vec<PrRequest>,
@@ -5312,7 +5224,7 @@ pub fn start_submit_pull_requests(
         return error_reply(400, "bad_request", "requests must not be empty");
     }
     let guardian = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.get_guardian(id)
     };
     if let Err(e) = guardian {
@@ -5329,7 +5241,7 @@ pub fn start_submit_pull_requests(
             allow_unlinked_fork,
         ) {
             Ok(prs) => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "pr",
@@ -5346,7 +5258,7 @@ pub fn start_submit_pull_requests(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] review {sid} submit failed: {e}");
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
                     source: "pr",
@@ -5368,12 +5280,12 @@ pub fn start_submit_pull_requests(
 
 /// Kick off actioning a PR's feedback in the background; returns immediately.
 pub fn start_action_pr_feedback(
-    store: Arc<Mutex<Store>>,
+    store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     pr_id: &str,
 ) -> Reply {
     let pr = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.get_pull_request(pr_id)
     };
     let guardian_id = match pr {
@@ -5384,7 +5296,7 @@ pub fn start_action_pr_feedback(
     std::thread::spawn(
         move || match action_pr_feedback(&store, runner.as_ref(), &pid) {
             Ok(n) => {
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "pr",
@@ -5401,7 +5313,7 @@ pub fn start_action_pr_feedback(
             }
             Err(e) => {
                 crate::rlog!(ERROR, "ralphus [pr] feedback action failed pr={pid}: {e}");
-                let guard = store.lock().expect("poisoned");
+                let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::ERROR,
                     source: "pr",
@@ -5512,7 +5424,13 @@ mod tests {
         tag: &str,
         write_base: impl FnOnce(&Path),
         write_review: impl FnOnce(&Path),
-    ) -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String, String) {
+    ) -> (
+        PathBuf,
+        PathBuf,
+        crate::store_lock::StoreHandle,
+        String,
+        String,
+    ) {
         let root = tmp_dir(&format!("{tag}-root"));
         let remote_dir = tmp_dir(&format!("{tag}-remote"));
 
@@ -5568,7 +5486,7 @@ mod tests {
         (
             root,
             remote_dir,
-            Arc::new(Mutex::new(s)),
+            Arc::new(crate::store_lock::StoreMutex::new(s)),
             pr_id,
             review_oid.to_string(),
         )
@@ -5968,7 +5886,7 @@ mod tests {
     /// Common fixture for the `compute_sync_status` tests: a repo with a
     /// `review-branch` pushed to a bare remote as `pr-y`, and a guardian/PR
     /// row pointing at it.
-    fn sync_status_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
+    fn sync_status_fixture() -> (PathBuf, PathBuf, crate::store_lock::StoreHandle, String) {
         let (root, remote_dir, store, pr_id, _review_sha) = review_fixture(
             "sync",
             |root| gwrite(root, "base.txt", "base\n"),
@@ -5980,7 +5898,7 @@ mod tests {
     /// [`sync_status_fixture`], plus recording `last_pushed_sha` the way a
     /// real push through this daemon would -- most RAL-190 rebase-drift
     /// tests need a real fork point on record, not just matching SHAs.
-    fn synced_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
+    fn synced_fixture() -> (PathBuf, PathBuf, crate::store_lock::StoreHandle, String) {
         let (root, remote_dir, store, pr_id) = sync_status_fixture();
         let sha = git2::Repository::open(&root)
             .unwrap()
@@ -5989,7 +5907,7 @@ mod tests {
             .id()
             .to_string();
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .update_pull_request_ex(
                     &pr_id,
@@ -6016,7 +5934,7 @@ mod tests {
     /// same line of a shared file that a base-advance commit can also touch
     /// -- so a caller can force a real rebase conflict on demand, on either
     /// the worktree or the PR side, via [`rebase_with_conflict`].
-    fn conflict_fixture() -> (PathBuf, PathBuf, Arc<Mutex<Store>>, String) {
+    fn conflict_fixture() -> (PathBuf, PathBuf, crate::store_lock::StoreHandle, String) {
         let (root, remote_dir, store, pr_id, sha) = review_fixture(
             "sync-conflict",
             |root| gwrite(root, "shared.txt", "line1\nline2\nline3\n"),
@@ -6024,7 +5942,6 @@ mod tests {
         );
         store
             .lock()
-            .unwrap()
             .update_pull_request_ex(&pr_id, None, None, None, None, None, Some(Some(&sha)), None)
             .unwrap();
         (root, remote_dir, store, pr_id)
@@ -6463,7 +6380,7 @@ mod tests {
         let s = store();
         let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
         s.set_guardian_forge_stack_number(&gid, 42).unwrap();
-        let store = Arc::new(Mutex::new(s));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
         let client = crate::forge::ForgeClient::new(
             crate::forge::ForgeKind::GitHub,
             format!("http://{addr}"),
@@ -6498,11 +6415,7 @@ mod tests {
         );
         assert_eq!(created_payload["pull_requests"], serde_json::json!([7, 8]));
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian_forge_stack_number(&gid)
-                .unwrap(),
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
             Some(99),
             "the rebuilt stack's number must replace the dissolved one"
         );
@@ -6530,7 +6443,7 @@ mod tests {
         let s = store();
         let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
         s.set_guardian_forge_stack_number(&gid, 42).unwrap();
-        let store = Arc::new(Mutex::new(s));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
         let client = crate::forge::ForgeClient::new(
             crate::forge::ForgeKind::GitHub,
             format!("http://{addr}"),
@@ -6547,11 +6460,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian_forge_stack_number(&gid)
-                .unwrap(),
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
             None,
             "a dissolved stack must not remain recorded when rebuilding it fails"
         );
@@ -6562,7 +6471,7 @@ mod tests {
     fn repoint_stacked_prs_does_nothing_without_a_recorded_stack() {
         let s = store();
         let gid = s.create_guardian("demo", "main", "/tmp/root").unwrap();
-        let store = Arc::new(Mutex::new(s));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
         // An unreachable base URL: reaching the forge at all would be a bug,
         // since there is no recorded stack to dissolve.
         let client = crate::forge::ForgeClient::new(
@@ -6582,11 +6491,7 @@ mod tests {
         assert!(result.is_err());
 
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian_forge_stack_number(&gid)
-                .unwrap(),
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
             None
         );
     }
@@ -6597,7 +6502,7 @@ mod tests {
     fn sync_remote_pr_commits_pulls_a_reviewer_push_before_a_rebase() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
         let (guardian_id, branch_id) = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             let pr = guard.get_pull_request(&pr_id).unwrap();
             (pr.guardian_id, pr.branch_id.unwrap())
         };
@@ -6607,7 +6512,6 @@ mod tests {
         // checkout and make that checkout the review branch.
         store
             .lock()
-            .unwrap()
             .set_branch_review(
                 &guardian_id,
                 &branch_id,
@@ -6651,12 +6555,7 @@ mod tests {
     #[test]
     fn sync_open_pr_branches_pushes_a_worktree_tip_that_moved_locally() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store
-            .lock()
-            .unwrap()
-            .get_pull_request(&pr_id)
-            .unwrap()
-            .guardian_id;
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
 
         // The review-branch worktree tip gains a commit in place (e.g. a
         // conflict resolution), with nothing pushed to the remote yet.
@@ -6669,7 +6568,7 @@ mod tests {
 
         sync_open_pr_branches(&store, &gid);
 
-        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(pr.last_pushed_sha.as_deref(), Some(new_local_sha.as_str()));
         let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
         assert_eq!(remote_sha, new_local_sha);
@@ -6685,12 +6584,7 @@ mod tests {
     #[test]
     fn sync_open_pr_branches_pushes_a_branch_the_base_shift_restacked() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store
-            .lock()
-            .unwrap()
-            .get_pull_request(&pr_id)
-            .unwrap()
-            .guardian_id;
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
         let pre_restack = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
 
         // The base branch moves, then the review branch is replayed onto it --
@@ -6718,7 +6612,7 @@ mod tests {
 
         sync_open_pr_branches(&store, &gid);
 
-        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(pr.last_pushed_sha.as_deref(), Some(restacked.as_str()));
         let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
         assert_eq!(remote_sha, restacked);
@@ -6730,15 +6624,9 @@ mod tests {
     #[test]
     fn sync_open_pr_branches_leaves_a_review_that_is_still_merging_alone() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store
-            .lock()
-            .unwrap()
-            .get_pull_request(&pr_id)
-            .unwrap()
-            .guardian_id;
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::Merging, None)
             .unwrap();
         let remote_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
@@ -6763,17 +6651,12 @@ mod tests {
     #[test]
     fn sync_open_pr_branches_is_a_noop_when_nothing_changed() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store
-            .lock()
-            .unwrap()
-            .get_pull_request(&pr_id)
-            .unwrap()
-            .guardian_id;
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
         let remote_sha_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
 
         sync_open_pr_branches(&store, &gid);
 
-        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(
             pr.last_pushed_sha.as_deref(),
             Some(remote_sha_before.as_str())
@@ -6788,12 +6671,7 @@ mod tests {
     #[test]
     fn sync_open_pr_branches_skips_a_pr_a_reviewer_pushed_directly_to() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store
-            .lock()
-            .unwrap()
-            .get_pull_request(&pr_id)
-            .unwrap()
-            .guardian_id;
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
         let remote = remote_dir.to_str().unwrap();
 
         // Reviewer pushes directly to the PR branch -- a commit the worktree
@@ -6825,7 +6703,7 @@ mod tests {
 
         // Push refused (would clobber the reviewer's commit) -- last_pushed_sha
         // and the remote branch are both left untouched.
-        let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_ne!(
             pr.last_pushed_sha.as_deref(),
             Some(g(&root, &["rev-parse", "review-branch"]).trim())
@@ -6840,18 +6718,16 @@ mod tests {
 
     #[test]
     fn resync_pr_bases_updates_downstream_after_reorder() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         for b in ["a", "b", "c"] {
-            store.lock().unwrap().add_guardian_branch(&gid, b).unwrap();
+            store.lock().add_guardian_branch(&gid, b).unwrap();
         }
         let ids: Vec<String> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -6862,7 +6738,6 @@ mod tests {
         // Original stack order a -> b -> c: each PR's base is the one before it.
         let pr_a = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[0]),
@@ -6878,7 +6753,6 @@ mod tests {
             .unwrap();
         let pr_b = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[1]),
@@ -6894,7 +6768,6 @@ mod tests {
             .unwrap();
         let pr_c = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[2]),
@@ -6912,7 +6785,6 @@ mod tests {
         // Reorder to c, a, b.
         store
             .lock()
-            .unwrap()
             .reorder_guardian_branches(&gid, &["c".into(), "a".into(), "b".into()])
             .unwrap();
 
@@ -6920,7 +6792,7 @@ mod tests {
         // c now leads the stack (base -> guardian's own base branch); a now
         // follows c; b is still right after a, so its base is unchanged.
         assert_eq!(changed, 2);
-        let s = store.lock().unwrap();
+        let s = store.lock();
         assert_eq!(s.get_pull_request(&pr_c).unwrap().base_ref, "main");
         assert_eq!(s.get_pull_request(&pr_a).unwrap().base_ref, "c");
         assert_eq!(s.get_pull_request(&pr_b).unwrap().base_ref, "a");
@@ -7013,22 +6885,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root.to_str().unwrap())
             .unwrap();
         for branch in ["a", "b", "c"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -7045,7 +6911,6 @@ mod tests {
         {
             store
                 .lock()
-                .unwrap()
                 .create_pull_request(
                     &gid,
                     Some(&ids[idx]),
@@ -7077,11 +6942,7 @@ mod tests {
                 vec!["release"]
             }
         );
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             rows.iter()
                 .map(|pr| pr.base_ref.as_str())
@@ -7246,46 +7107,36 @@ mod tests {
 
     #[test]
     fn claim_guardian_for_forge_reorder_only_succeeds_from_in_review() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         // Freshly created guardians start out `collecting`, not `in_review`.
         assert!(!claim_guardian_for_forge_reorder(&store, &gid));
         assert_eq!(
-            store.lock().unwrap().get_guardian(&gid).unwrap().status,
+            store.lock().get_guardian(&gid).unwrap().status,
             "collecting"
         );
 
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, crate::guardian::GuardianStatus::InReview, None)
             .unwrap();
         assert!(claim_guardian_for_forge_reorder(&store, &gid));
-        assert_eq!(
-            store.lock().unwrap().get_guardian(&gid).unwrap().status,
-            "merging"
-        );
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merging");
         // Already claimed -- a second attempt loses the race.
         assert!(!claim_guardian_for_forge_reorder(&store, &gid));
     }
 
     #[test]
     fn detect_forge_reorder_is_a_noop_with_fewer_than_two_stacked_prs() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .add_guardian_branch(&gid, "a")
-            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
         // No open PRs at all yet -- nothing to compare against the forge.
         assert_eq!(detect_forge_reorder(&store, &gid).unwrap(), None);
     }
@@ -7373,15 +7224,13 @@ mod tests {
         )
         .unwrap();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         store
             .lock()
-            .unwrap()
             .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .upsert_project_fork(
                 "demo",
                 "",
@@ -7393,19 +7242,13 @@ mod tests {
 
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "alt/main", root_dir.to_str().unwrap())
             .unwrap();
         for branch in ["a", "b"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -7414,7 +7257,6 @@ mod tests {
             .collect();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[0]),
@@ -7430,7 +7272,6 @@ mod tests {
             .unwrap();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[1]),
@@ -7461,7 +7302,6 @@ mod tests {
         assert!(
             store
                 .lock()
-                .unwrap()
                 .set_guardian_base_branch_if_newer(&gid, &local_base, drift.base_changed_at_ms)
                 .unwrap(),
             "the newer-than check must accept this apply"
@@ -7481,17 +7321,12 @@ mod tests {
 
     #[test]
     fn poll_pr_base_drift_is_a_noop_for_a_review_with_no_submitted_prs() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .add_guardian_branch(&gid, "a")
-            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
         assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
     }
 
@@ -7501,23 +7336,17 @@ mod tests {
         // fails to read a remote from it -- same fixture other resync_pr_bases
         // tests above use to exercise the local-bookkeeping-only path without
         // any network access.
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
-        store
-            .lock()
-            .unwrap()
-            .add_guardian_branch(&gid, "a")
-            .unwrap();
-        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&branch_id),
@@ -7729,15 +7558,13 @@ mod tests {
             .unwrap();
         });
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         let pr_id = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some("branch-000000000001"),
@@ -7758,11 +7585,7 @@ mod tests {
             "acme/widget".to_string(),
             Some("tok".to_string()),
         );
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let by_branch = open_prs_by_branch(&prs);
         assert_eq!(
             by_branch.len(),
@@ -7776,7 +7599,7 @@ mod tests {
             "a PR closed on the forge must not count as still open"
         );
 
-        let updated = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let updated = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(
             updated.state, "closed",
             "the local row must be corrected to match forge reality"
@@ -7797,20 +7620,17 @@ mod tests {
             .unwrap();
         });
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         let pr_id = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some("branch-000000000001"),
@@ -7831,18 +7651,14 @@ mod tests {
             "acme/widget".to_string(),
             Some("tok".to_string()),
         );
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
         assert!(changed, "every linked pr merging must report a change");
 
-        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "approved");
-        let updated_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let updated_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(updated_pr.state, "merged");
 
         handle.join().unwrap();
@@ -7850,20 +7666,17 @@ mod tests {
 
     #[test]
     fn check_pr_merges_approves_when_all_merges_were_already_recorded() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         let pr_id = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some("branch-000000000001"),
@@ -7879,7 +7692,6 @@ mod tests {
             .unwrap();
         store
             .lock()
-            .unwrap()
             .update_pull_request(&pr_id, None, None, None, Some("merged"))
             .unwrap();
 
@@ -7889,17 +7701,10 @@ mod tests {
             "acme/widget".to_string(),
             None,
         );
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         assert!(apply_pr_merge_check(&store, &gid, &prs, &client));
-        assert_eq!(
-            store.lock().unwrap().get_guardian(&gid).unwrap().status,
-            "approved"
-        );
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
     }
 
     #[test]
@@ -7915,21 +7720,18 @@ mod tests {
             .unwrap();
         });
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         // A rebase/feedback pass owns this review's worktrees right now.
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::Merging, None)
             .unwrap();
         let pr_id = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some("branch-000000000001"),
@@ -7950,16 +7752,12 @@ mod tests {
             "acme/widget".to_string(),
             Some("tok".to_string()),
         );
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
         assert!(changed, "an out-of-band merge must still report a change");
 
-        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(
             updated_guardian.status.as_str(),
             "merging",
@@ -7969,7 +7767,7 @@ mod tests {
             updated_guardian.notice_kind.as_deref(),
             Some("pr_merged_mid_flight")
         );
-        let dropped_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let dropped_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(
             dropped_pr.state, "dropped",
             "the stale pr row must be soft-deleted, not removed"
@@ -7984,20 +7782,17 @@ mod tests {
 
     #[test]
     fn check_pr_merges_is_fail_safe_when_the_forge_call_fails() {
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         let pr_id = store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some("branch-000000000001"),
@@ -8020,11 +7815,7 @@ mod tests {
             "acme/widget".to_string(),
             None,
         );
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
         assert!(
@@ -8032,9 +7823,9 @@ mod tests {
             "an unreachable forge must never be mistaken for a merged pr"
         );
 
-        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "in_review");
-        let updated_pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+        let updated_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(updated_pr.state, "open");
     }
 
@@ -8044,7 +7835,7 @@ mod tests {
     /// two-branch guardian (`a` = root, `b` = its successor) whose PR rows
     /// already reflect the pre-promotion state (root open at the parent,
     /// successor open at the fork, based on the root's alias).
-    fn fork_promotion_fixture(addr: &str) -> (Arc<Mutex<Store>>, String, PathBuf) {
+    fn fork_promotion_fixture(addr: &str) -> (crate::store_lock::StoreHandle, String, PathBuf) {
         let root_dir = tmp_dir("promotion");
         g(&root_dir, &["init"]);
         g(
@@ -8073,15 +7864,13 @@ mod tests {
         )
         .unwrap();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         store
             .lock()
-            .unwrap()
             .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .upsert_project_fork(
                 "demo",
                 "",
@@ -8093,24 +7882,17 @@ mod tests {
 
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root_dir.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         for branch in ["a", "b"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -8120,7 +7902,6 @@ mod tests {
 
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[0]),
@@ -8136,7 +7917,6 @@ mod tests {
             .unwrap();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[1]),
@@ -8215,11 +7995,7 @@ mod tests {
         let (store, gid, root_dir) = fork_promotion_fixture(&addr);
         check_pr_merges(&store, &gid);
 
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let root_row = rows.iter().find(|p| p.pr_number == Some(10)).unwrap();
         assert_eq!(root_row.state, "merged");
         let old_successor = rows.iter().find(|p| p.pr_number == Some(20)).unwrap();
@@ -8235,7 +8011,7 @@ mod tests {
 
         // The stack isn't fully merged yet (the promoted branch is still
         // open) -- the review must stay `in_review`, not jump to `approved`.
-        let updated_guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "in_review");
 
         handle.join().unwrap();
@@ -8270,11 +8046,7 @@ mod tests {
         // Simulate the successor already having been reconciled (by a human,
         // or a forge feature this ticket doesn't yet trust) directly against
         // the parent, still under its own original PR number.
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let successor_id = rows
             .iter()
             .find(|p| p.pr_number == Some(20))
@@ -8287,7 +8059,6 @@ mod tests {
         // only caller would be this test.
         store
             .lock()
-            .unwrap()
             .conn
             .execute(
                 "UPDATE guardian_pull_requests SET repo='acme/widget' WHERE id=?1",
@@ -8297,11 +8068,7 @@ mod tests {
 
         check_pr_merges(&store, &gid);
 
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(rows.len(), 2, "no new pr row should have been created");
         let successor = rows.iter().find(|p| p.pr_number == Some(20)).unwrap();
         assert_eq!(successor.state, "open");
@@ -8353,27 +8120,20 @@ mod tests {
             ),
         )
         .unwrap();
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root_dir.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         for branch in ["a", "b"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -8382,7 +8142,6 @@ mod tests {
             .collect();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[0]),
@@ -8398,7 +8157,6 @@ mod tests {
             .unwrap();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[1]),
@@ -8415,11 +8173,7 @@ mod tests {
 
         check_pr_merges(&store, &gid);
 
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             rows.len(),
             2,
@@ -8499,14 +8253,9 @@ mod tests {
         });
 
         let (store, gid, root_dir) = fork_promotion_fixture(&addr);
-        store
-            .lock()
-            .unwrap()
-            .add_guardian_branch(&gid, "c")
-            .unwrap();
+        store.lock().add_guardian_branch(&gid, "c").unwrap();
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -8515,7 +8264,6 @@ mod tests {
             .collect();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[2]),
@@ -8532,11 +8280,7 @@ mod tests {
 
         check_pr_merges(&store, &gid);
 
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             rows.iter().find(|p| p.pr_number == Some(10)).unwrap().state,
             "merged"
@@ -8657,15 +8401,13 @@ mod tests {
         )
         .unwrap();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         store
             .lock()
-            .unwrap()
             .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .upsert_project_fork(
                 "demo",
                 "",
@@ -8677,24 +8419,17 @@ mod tests {
 
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root_dir.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
         for branch in ["a", "b"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -8705,7 +8440,6 @@ mod tests {
         // per the routing asymmetry -- `repo` is the fork's encoded path.
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[0]),
@@ -8721,7 +8455,6 @@ mod tests {
             .unwrap();
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&ids[1]),
@@ -8738,11 +8471,7 @@ mod tests {
 
         check_pr_merges(&store, &gid);
 
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             rows.iter().find(|p| p.pr_number == Some(10)).unwrap().state,
             "merged"
@@ -8849,22 +8578,16 @@ mod tests {
         crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
             .unwrap();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root_dir.to_str().unwrap())
             .unwrap();
         for branch in ["a", "b", "c"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -8874,7 +8597,6 @@ mod tests {
         for (branch_id, review_branch) in ids.iter().zip(["review/a", "review/b", "review/c"]) {
             store
                 .lock()
-                .unwrap()
                 .set_branch_review(&gid, branch_id, review_branch, "wt")
                 .unwrap();
         }
@@ -8907,7 +8629,7 @@ mod tests {
             parent_project_id: None,
         };
 
-        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
         let mut ordered_enabled: Vec<&BranchView> =
             guardian.branches.iter().filter(|b| b.enabled).collect();
         ordered_enabled.sort_by_key(|b| b.position);
@@ -8965,11 +8687,7 @@ mod tests {
 
         // Three-branch base chaining: root -> the guardian's own base
         // branch, each successor -> the preceding branch's own alias.
-        let rows = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let base_of = |alias: &str| {
             rows.iter()
                 .find(|p| p.branch_alias == alias)
@@ -9088,22 +8806,16 @@ mod tests {
             &["remote", "add", "origin", origin_bare.to_str().unwrap()],
         );
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "release", root_dir.to_str().unwrap())
             .unwrap();
         for branch in ["a", "b"] {
-            store
-                .lock()
-                .unwrap()
-                .add_guardian_branch(&gid, branch)
-                .unwrap();
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
         }
         let ids: Vec<_> = store
             .lock()
-            .unwrap()
             .get_guardian(&gid)
             .unwrap()
             .branches
@@ -9113,7 +8825,6 @@ mod tests {
         for (branch_id, review_branch) in ids.iter().zip(["review/a", "review/b"]) {
             store
                 .lock()
-                .unwrap()
                 .set_branch_review(&gid, branch_id, review_branch, "wt")
                 .unwrap();
         }
@@ -9126,7 +8837,7 @@ mod tests {
         );
         let runner = NoopRunner;
 
-        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
         let mut ordered_enabled: Vec<&BranchView> =
             guardian.branches.iter().filter(|b| b.enabled).collect();
         ordered_enabled.sort_by_key(|b| b.position);
@@ -9137,11 +8848,7 @@ mod tests {
         // an explicit `branch_id: Some` request: create the PR, then
         // reconcile the native stack.
         for branch in &ordered_enabled {
-            let existing_prs = store
-                .lock()
-                .unwrap()
-                .list_pull_requests_for_guardian(&gid)
-                .unwrap();
+            let existing_prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
             let mut alias_by_branch = open_alias_by_branch(&existing_prs);
             let req = PrRequest {
                 branch_id: Some(branch.id.clone()),
@@ -9174,11 +8881,7 @@ mod tests {
         }
 
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .get_guardian_forge_stack_number(&gid)
-                .unwrap(),
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
             Some(77),
             "the second per-branch submission must have registered the native stack"
         );
@@ -9262,28 +8965,24 @@ mod tests {
         g(&clone_dir, &["push", "origin", "pr-y"]);
         let reviewer_sha = g(&clone_dir, &["rev-parse", "pr-y"]).trim().to_string();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", root.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .add_guardian_branch(&gid, "review-branch")
             .unwrap();
-        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_guardian_status(&gid, GuardianStatus::InReview, None)
             .unwrap();
 
@@ -9294,7 +8993,7 @@ mod tests {
             Some("tok".to_string()),
         );
         let runner = NoopRunner;
-        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let branch = ordered_enabled[0];
         let mut alias_by_branch = HashMap::new();
@@ -9401,23 +9100,20 @@ mod tests {
         // follows it is under test here.
         g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", root.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .add_guardian_branch(&gid, "review-branch")
             .unwrap();
-        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
 
@@ -9428,7 +9124,7 @@ mod tests {
             Some("tok".to_string()),
         );
         let runner = NoopRunner;
-        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let branch = ordered_enabled[0];
         let mut alias_by_branch = HashMap::new();
@@ -9519,23 +9215,20 @@ mod tests {
         git2::Repository::init_bare(&remote_dir).unwrap();
         repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
 
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", root.to_str().unwrap())
             .unwrap();
         store
             .lock()
-            .unwrap()
             .add_guardian_branch(&gid, "review-branch")
             .unwrap();
-        let branch_id = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
             .unwrap();
         // Simulate an earlier failed auto-submit attempt that left its
@@ -9543,7 +9236,6 @@ mod tests {
         // fixed by hand.
         store
             .lock()
-            .unwrap()
             .set_branch_auto_submit_error(&gid, &branch_id, Some("earlier failure"))
             .unwrap();
 
@@ -9554,7 +9246,7 @@ mod tests {
             Some("tok".to_string()),
         );
         let runner = NoopRunner;
-        let guardian = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let branch = ordered_enabled[0];
         let mut alias_by_branch = HashMap::new();
@@ -9586,7 +9278,7 @@ mod tests {
         )
         .unwrap();
 
-        let after = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let after = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(
             after.branches[0].auto_submit_error, None,
             "a successful submission must clear the stale auto-submit-error marker, \
@@ -10076,38 +9768,30 @@ mod tests {
     /// Set up a guardian with one enabled, `done` branch whose review ref is
     /// `feature/x`, returning `(guardian_id, branch_id, feature/x's tip sha)`.
     fn setup_terminal_branch(
-        store: &Arc<Mutex<Store>>,
+        store: &crate::store_lock::StoreHandle,
         root: &Path,
         auto_submit: bool,
     ) -> (String, String, String) {
         let gid = store
             .lock()
-            .unwrap()
             .create_guardian("demo", "main", root.to_str().unwrap())
             .unwrap();
         if auto_submit {
             store
                 .lock()
-                .unwrap()
                 .set_guardian_auto_submit_pr_stack(&gid, Some(true))
                 .unwrap();
         }
-        store
-            .lock()
-            .unwrap()
-            .add_guardian_branch(&gid, "feature/x")
-            .unwrap();
-        let bid = store.lock().unwrap().get_guardian(&gid).unwrap().branches[0]
+        store.lock().add_guardian_branch(&gid, "feature/x").unwrap();
+        let bid = store.lock().get_guardian(&gid).unwrap().branches[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .set_branch_review(&gid, &bid, "feature/x", "")
             .unwrap();
         store
             .lock()
-            .unwrap()
             .set_branch_status(&gid, &bid, crate::guardian::MergeStatus::Done, None)
             .unwrap();
         let tip = g(root, &["rev-parse", "feature/x"]).trim().to_string();
@@ -10117,23 +9801,18 @@ mod tests {
     #[test]
     fn startup_recovery_queues_terminal_auto_submit_guardian() {
         let root = setup_auto_submit_repo("recovery-queues");
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let (id, _branch_id, _tip) = setup_terminal_branch(&store, &root, true);
         assert!(
             store
                 .lock()
-                .unwrap()
                 .take_due_auto_submits(i64::MAX / 2, 0)
                 .unwrap()
                 .is_empty()
         );
         recover_pending_auto_submits_on_startup(&store);
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .take_due_auto_submits(i64::MAX / 2, 0)
-                .unwrap(),
+            store.lock().take_due_auto_submits(i64::MAX / 2, 0).unwrap(),
             vec![id]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -10142,13 +9821,12 @@ mod tests {
     #[test]
     fn startup_recovery_ignores_guardian_with_auto_submit_off() {
         let root = setup_auto_submit_repo("recovery-ignores-off");
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         setup_terminal_branch(&store, &root, false);
         recover_pending_auto_submits_on_startup(&store);
         assert!(
             store
                 .lock()
-                .unwrap()
                 .take_due_auto_submits(i64::MAX / 2, 0)
                 .unwrap()
                 .is_empty()
@@ -10159,20 +9837,16 @@ mod tests {
     #[test]
     fn maybe_auto_submit_branch_is_noop_when_effective_option_is_off() {
         let root = setup_auto_submit_repo("auto-submit-off");
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // effective_auto_submit_pr_stack defaults to false (no override, no
         // registered project default) -- left untouched deliberately.
         let (gid, bid, _tip) = setup_terminal_branch(&store, &root, false);
 
         maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
 
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert!(prs.is_empty(), "auto-submit must be a no-op when disabled");
-        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let gv = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(
             gv.branches
                 .iter()
@@ -10188,7 +9862,7 @@ mod tests {
     #[test]
     fn maybe_auto_submit_branch_reconciles_even_when_its_pr_sha_is_current() {
         let root = setup_auto_submit_repo("auto-submit-covered");
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let (gid, bid, tip) = setup_terminal_branch(&store, &root, true);
 
         // Simulate a PR already open for this exact branch state (whether
@@ -10197,7 +9871,6 @@ mod tests {
         // branch's current tip exactly.
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&bid),
@@ -10211,16 +9884,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        let existing_id = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap()[0]
+        let existing_id = store.lock().list_pull_requests_for_guardian(&gid).unwrap()[0]
             .id
             .clone();
         store
             .lock()
-            .unwrap()
             .update_pull_request_ex(
                 &existing_id,
                 None,
@@ -10238,17 +9906,13 @@ mod tests {
         // shared reconciliation path and report that it could not do so.
         maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
 
-        let prs = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap();
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             prs.len(),
             1,
             "must not create a second pr for the same branch state"
         );
-        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let gv = store.lock().get_guardian(&gid).unwrap();
         assert!(
             gv.branches
                 .iter()
@@ -10266,7 +9930,7 @@ mod tests {
     fn maybe_auto_submit_branch_records_error_on_forge_resolution_failure_without_touching_branch_status()
      {
         let root = setup_auto_submit_repo("auto-submit-fail");
-        let store = Arc::new(Mutex::new(store()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // No git remote configured -- `resolve_remote` fails fast (no
         // network attempted, no hang) with "could not read remote 'origin'".
         let (gid, bid, _tip) = setup_terminal_branch(&store, &root, true);
@@ -10277,7 +9941,7 @@ mod tests {
         // blocking error: the branch's own terminal status (already
         // recorded by the caller before this side effect ever runs) and the
         // guardian's overall status are both untouched.
-        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let gv = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(gv.status, "collecting");
         let branch = gv.branches.iter().find(|b| b.id == bid).unwrap();
         assert_eq!(branch.merge_status, "done");
@@ -10288,7 +9952,6 @@ mod tests {
         assert!(
             store
                 .lock()
-                .unwrap()
                 .list_pull_requests_for_guardian(&gid)
                 .unwrap()
                 .is_empty(),
@@ -10300,7 +9963,6 @@ mod tests {
         // shared reconciliation.
         store
             .lock()
-            .unwrap()
             .create_pull_request(
                 &gid,
                 Some(&bid),
@@ -10314,17 +9976,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        let pr_id = store
-            .lock()
-            .unwrap()
-            .list_pull_requests_for_guardian(&gid)
-            .unwrap()[0]
+        let pr_id = store.lock().list_pull_requests_for_guardian(&gid).unwrap()[0]
             .id
             .clone();
         let tip = g(&root, &["rev-parse", "feature/x"]).trim().to_string();
         store
             .lock()
-            .unwrap()
             .update_pull_request_ex(
                 &pr_id,
                 None,
@@ -10338,7 +9995,7 @@ mod tests {
             .unwrap();
 
         maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
-        let gv = store.lock().unwrap().get_guardian(&gid).unwrap();
+        let gv = store.lock().get_guardian(&gid).unwrap();
         assert!(
             gv.branches
                 .iter()
