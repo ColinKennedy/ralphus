@@ -418,6 +418,188 @@ impl Store {
     }
 }
 
+// ── Per-cell resolved subproject(s) (RAL-346) ───────────────────────────────
+
+/// A squad's resolved subproject(s) by `(task_idx, idx)`, each paired with
+/// whether that cell's row set was Arbiter-inferred -- the map shape
+/// [`Store::subprojects_by_cell`] returns and `Store::cells_by_task` consumes.
+pub type CellSubprojectsMap = std::collections::HashMap<(i64, i64), (Vec<String>, bool)>;
+
+/// The three-state resolution of a cell's monorepo subproject membership
+/// (RAL-346). Distinct from the pre-existing `CellDef.subprojects` TOML
+/// field, which only scopes a *single cell's own edits* to certain
+/// directories via a system-prompt addendum (see `crate::runner`'s
+/// `subproject_system_prompt_addendum`) -- this is a *keying/pooling*
+/// dimension used to uniquify Triage pools by `(project, subproject)` rather
+/// than just `(project)`, so unrelated work landing in different corners of
+/// a monorepo doesn't get lumped into the same auto-review threshold. See
+/// `docs/glossary.md`'s "subproject" entry for the full distinction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubprojectResolution {
+    /// The cell's project is not configured as a monorepo at all -- no
+    /// `[monorepo] subprojects` entries (see
+    /// `crate::config::MonorepoConfig::is_monorepo`). The default, and
+    /// permanent, state for a single-project repo.
+    NotApplicable,
+    /// The project IS a monorepo, but nothing has resolved this cell's
+    /// subproject(s) yet (the Arbiter's async inference step hasn't run, or
+    /// it ran and found no match in the cell's description). Never written
+    /// as an empty `Resolved` list -- this is the explicit "nothing to see
+    /// yet" state instead (per RAL-346's binding decision).
+    Unresolved,
+    /// A concrete, non-empty set of subproject identifiers, either
+    /// human-declared (seeded from a non-empty `CellDef.subprojects` at
+    /// submit time, `inferred = false`) or Arbiter-inferred (matched from
+    /// the cell's description against the project's configured candidate
+    /// list, `inferred = true`). The board UI uses `inferred` to show its
+    /// "Arbiter set this" badge.
+    Resolved {
+        subprojects: Vec<String>,
+        inferred: bool,
+    },
+}
+
+impl Store {
+    /// Persist the resolved subproject(s) for one cell (RAL-346) -- either
+    /// seeded from the cell's own manual `CellDef.subprojects` at submit
+    /// time (`inferred = false`), or written by the Arbiter's async
+    /// description-matching inference call (`inferred = true`). Replaces
+    /// (delete-then-insert) any prior rows for this cell, mirroring
+    /// [`Store::set_cell_triage_types`]. `subprojects` must be non-empty --
+    /// callers represent "nothing resolved" by simply not calling this at
+    /// all (see [`SubprojectResolution::Unresolved`]), never by writing an
+    /// empty list.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_cell_subprojects(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        subprojects: &[String],
+        inferred: bool,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "DELETE FROM cell_subprojects WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        for subproject in subprojects {
+            self.conn.execute(
+                "INSERT INTO cell_subprojects(squad_id, task_idx, idx, subproject, inferred, created_at_ms)
+                 VALUES(?,?,?,?,?,?)",
+                params![squad_id, task_idx, idx, subproject, inferred, now_ms()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every cell's resolved subproject(s) for a squad, grouped by
+    /// `(task_idx, idx)` -- the bulk counterpart to
+    /// [`Self::get_cell_subprojects_raw`], used by `Store::cells_by_task` so
+    /// a `CellView` can show its RAL-346 subproject state (and the board's
+    /// "Arbiter set this" badge) without a per-cell query. A cell absent
+    /// from the map has no recorded row (`Unresolved`/`NotApplicable`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn subprojects_by_cell(&self, squad_id: &str) -> StoreResult<CellSubprojectsMap> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_idx, idx, subproject, inferred FROM cell_subprojects
+             WHERE squad_id=? ORDER BY task_idx, idx, subproject",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut map: std::collections::HashMap<(i64, i64), (Vec<String>, bool)> =
+            std::collections::HashMap::new();
+        for (task_idx, idx, subproject, inferred) in rows {
+            let entry = map
+                .entry((task_idx, idx))
+                .or_insert_with(|| (Vec::new(), inferred));
+            entry.0.push(subproject);
+        }
+        Ok(map)
+    }
+
+    /// The raw resolved subproject row(s) for one cell, if any have been
+    /// recorded -- `(subprojects, inferred)`, alphabetical by subproject
+    /// name. `None` means no row exists yet (the cell's resolution is
+    /// [`SubprojectResolution::Unresolved`] or
+    /// [`SubprojectResolution::NotApplicable`], distinguished by
+    /// [`resolve_cell_subprojects`] via the project's own config, not stored
+    /// here). Every row for one cell shares the same `inferred` flag (written
+    /// atomically by [`Store::set_cell_subprojects`]), so the first row's
+    /// value is authoritative.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn get_cell_subprojects_raw(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> StoreResult<Option<(Vec<String>, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT subproject, inferred FROM cell_subprojects
+             WHERE squad_id=? AND task_idx=? AND idx=? ORDER BY subproject",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id, task_idx, idx], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let inferred = rows[0].1;
+        let subprojects = rows.into_iter().map(|(s, _)| s).collect();
+        Ok(Some((subprojects, inferred)))
+    }
+}
+
+/// Resolve a cell's full three-state [`SubprojectResolution`] (RAL-346): an
+/// already-recorded row wins outright (human-declared or Arbiter-inferred,
+/// whichever was written); absent that, the outcome depends solely on
+/// whether `project_root`'s own `.ralphus.toml` configures `[monorepo]
+/// subprojects` at all (see `crate::config::load_monorepo_config`) --
+/// configured means [`SubprojectResolution::Unresolved`] (a monorepo cell the
+/// Arbiter hasn't matched, or found no match for), unconfigured means
+/// [`SubprojectResolution::NotApplicable`] (a plain single-project repo,
+/// keeping today's pre-RAL-346 behavior exactly as-is).
+///
+/// # Errors
+/// Propagates any SQLite failure.
+pub fn resolve_cell_subprojects(
+    store: &Store,
+    squad_id: &str,
+    task_idx: i64,
+    idx: i64,
+    project_root: &Path,
+) -> StoreResult<SubprojectResolution> {
+    if let Some((subprojects, inferred)) =
+        store.get_cell_subprojects_raw(squad_id, task_idx, idx)?
+    {
+        return Ok(SubprojectResolution::Resolved {
+            subprojects,
+            inferred,
+        });
+    }
+    if crate::config::load_monorepo_config(project_root).is_monorepo() {
+        Ok(SubprojectResolution::Unresolved)
+    } else {
+        Ok(SubprojectResolution::NotApplicable)
+    }
+}
+
 // ── Pool key resolution ─────────────────────────────────────────────────────
 
 /// Best-effort canonical form of a filesystem path for pool-key comparison:
@@ -479,6 +661,97 @@ pub fn resolve_pool_key_input(store: &Store, raw: &str) -> String {
         Ok(Some(p)) => pool_key_for_path(store, Path::new(&p.path)),
         _ => pool_key_for_path(store, Path::new(raw)),
     }
+}
+
+/// Separator joining a base project pool key to a subproject identifier
+/// (RAL-346), e.g. `"myproj::core"`. Chosen because [`normalize_path_key`]'s
+/// output is always forward-slash separated and a registered project's own
+/// `name` is a plain identifier -- neither ever legitimately contains `::`
+/// -- so a subproject-composite key can never collide with a plain project
+/// key by accident.
+const SUBPROJECT_KEY_SEPARATOR: &str = "::";
+
+/// Build the composite pool key for `base_project_key` (whatever
+/// [`pool_key_for_path`] resolved) and one `subproject` identifier.
+#[must_use]
+pub fn subproject_pool_key(base_project_key: &str, subproject: &str) -> String {
+    format!("{base_project_key}{SUBPROJECT_KEY_SEPARATOR}{subproject}")
+}
+
+/// Split a pool key apart into its base project key and subproject
+/// component, if it was built by [`subproject_pool_key`]. `None` for a plain
+/// (non-composite) project key.
+#[must_use]
+pub fn split_subproject_pool_key(key: &str) -> Option<(&str, &str)> {
+    key.split_once(SUBPROJECT_KEY_SEPARATOR)
+}
+
+/// The base project key component of a pool key -- what
+/// `Store::get_project`/`reviews::apply_project_review_defaults` need to
+/// resolve the *real* registered project, since a subproject is never
+/// itself separately registered. A no-op for a plain (non-composite) key.
+#[must_use]
+pub fn base_project_key(key: &str) -> &str {
+    split_subproject_pool_key(key).map_or(key, |(base, _)| base)
+}
+
+/// The pool key(s) one Triage-opted-in cell belongs to (RAL-346), given its
+/// worktree root `path` and its already-resolved [`SubprojectResolution`].
+///
+/// A cell resolved to one-or-more concrete subprojects pools into every one
+/// of their composite `(base_project, subproject)` keys independently --
+/// mirroring how a cell resolved to more than one Triage type already pools
+/// into every one of *those* types' pools independently (see this module's
+/// doc comment) -- which is exactly what gives two cells a "shared impact"
+/// overlap test rather than requiring an exact-set match: cell A in `{core,
+/// utils}` and cell B in `{utils, steam}` both land in the `utils` pool,
+/// even though their sets differ.
+///
+/// [`SubprojectResolution::Unresolved`] and
+/// [`SubprojectResolution::NotApplicable`] both fall back to the single
+/// plain `pool_key_for_path` key unchanged -- this is what keeps a
+/// single-project repo's keying identical to its pre-RAL-346 behavior, and
+/// keeps a monorepo cell the Arbiter hasn't gotten to yet from being
+/// mis-bucketed into a subproject pool it was never actually confirmed to
+/// belong to.
+#[must_use]
+pub fn pool_keys_for_cell(
+    store: &Store,
+    path: &Path,
+    resolution: &SubprojectResolution,
+) -> Vec<String> {
+    let base = pool_key_for_path(store, path);
+    match resolution {
+        SubprojectResolution::Resolved { subprojects, .. } if !subprojects.is_empty() => {
+            subprojects
+                .iter()
+                .map(|sp| subproject_pool_key(&base, sp))
+                .collect()
+        }
+        _ => vec![base],
+    }
+}
+
+/// Every pool key sharing `base_project`'s namespace for `triage_type`
+/// (RAL-346): the plain `base_project` key itself, plus every
+/// `base_project::subproject` composite key -- i.e. every pool a cell
+/// belonging to this project could currently be sitting in, regardless of
+/// whether the Arbiter ever resolved a subproject for it. Used by the
+/// Arbiter's cron straggler sweep (`run_schedule_tick`) so a schedule
+/// registered against a project's plain base key still reaches straggler
+/// work sitting in per-subproject pools that never individually hit their
+/// own count threshold -- e.g. one bug fix each in `core`, `utils`, and
+/// `steam`, none alone reaching "every 2 bugs".
+#[must_use]
+pub fn project_pool_keys(store: &Store, base_project: &str, triage_type: &str) -> Vec<String> {
+    let prefix = subproject_pool_key(base_project, "");
+    store
+        .triage_pool_keys()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(p, t)| t == triage_type && (p == base_project || p.starts_with(&prefix)))
+        .map(|(p, _)| p)
+        .collect()
 }
 
 // ── Pool ─────────────────────────────────────────────────────────────────────
@@ -961,11 +1234,17 @@ pub fn advance_schedule(
 /// `Duration`-based maintenance blocks. Steps every configured schedule
 /// entry forward by whatever cron occurrences have passed since it was last
 /// checked (see [`advance_schedule`]) and, for any that just crossed a
-/// qualifying `every_n`th occurrence, drains that `(project, triage_type)`
-/// pool into a fresh review -- racing safely against a concurrent
-/// submission's own count-threshold check (both ultimately call
-/// [`crate::reviews::create_review_from_triage_pool`], which no-ops on an
-/// already-empty pool).
+/// qualifying `every_n`th occurrence, sweeps every pool key sharing that
+/// schedule's project namespace into a fresh review (RAL-346's straggler
+/// sweep -- see [`crate::reviews::create_review_from_triage_project_sweep`]):
+/// the schedule's own exact `(project, triage_type)` pool plus every
+/// `project::subproject` composite pool for the same `triage_type`, so
+/// straggler work sitting in a per-subproject pool that never hit its own
+/// count threshold still gets collected on this independent cron, exactly
+/// like a plain single-project pool always has. Races safely against a
+/// concurrent submission's own count-threshold check (both ultimately drain
+/// through `Store::drain_triage_pool`, which no-ops on an already-empty
+/// pool).
 pub fn run_schedule_tick(store: &std::sync::Arc<std::sync::Mutex<Store>>) {
     let now = now_ms();
     let schedules = {
@@ -986,7 +1265,7 @@ pub fn run_schedule_tick(store: &std::sync::Arc<std::sync::Mutex<Store>>) {
         let guard = store.lock().expect("store mutex poisoned");
         let _ = guard.advance_triage_schedule(sched.id, count, last);
         if fired {
-            match crate::reviews::create_review_from_triage_pool(
+            match crate::reviews::create_review_from_triage_project_sweep(
                 &guard,
                 &sched.project,
                 &sched.triage_type,
@@ -1498,6 +1777,57 @@ mod tests {
         assert!(schedules[0].last_checked_ms.is_some());
     }
 
+    /// RAL-346: a cron schedule registered against a project's plain base
+    /// key must still find and elevate straggler work sitting in per-
+    /// subproject pools that never individually hit their own count
+    /// threshold -- the whole point of the Arbiter's independent cron sweep.
+    #[test]
+    fn run_schedule_tick_straggler_sweep_elevates_stragglers_across_subproject_pools() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        {
+            let guard = store.lock().unwrap();
+            // One straggler each in the plain pool and two subproject pools,
+            // none of which individually reached any count threshold.
+            guard
+                .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
+                .unwrap();
+            guard
+                .record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
+                .unwrap();
+            guard
+                .record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
+                .unwrap();
+            // A different project's pool must never be swept in.
+            guard
+                .record_triage_pool_cell("other", "bug", "squad-4", 0, 0, "b4", "main")
+                .unwrap();
+            guard
+                .add_triage_schedule("proj", "bug", "* * * * * *", now_ms() - 5_000, 1)
+                .unwrap();
+        }
+        run_schedule_tick(&store);
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.triage_pool_count("proj", "bug").unwrap(), 0);
+        assert_eq!(guard.triage_pool_count("proj::core", "bug").unwrap(), 0);
+        assert_eq!(guard.triage_pool_count("proj::utils", "bug").unwrap(), 0);
+        assert_eq!(
+            guard.triage_pool_count("other", "bug").unwrap(),
+            1,
+            "a different project's pool must be untouched by this project's sweep"
+        );
+        let guardians = guard.list_guardians().unwrap();
+        assert_eq!(
+            guardians.len(),
+            1,
+            "every subproject straggler must be combined into a single review"
+        );
+        assert_eq!(
+            guardians[0].origin,
+            crate::guardian::GUARDIAN_ORIGIN_ARBITER
+        );
+        assert_eq!(guardians[0].branches.len(), 3);
+    }
+
     #[test]
     fn run_schedule_tick_does_not_fire_a_not_yet_due_schedule() {
         let store = std::sync::Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
@@ -1643,5 +1973,204 @@ mod tests {
         let file: TaskFile = toml::from_str(src).unwrap();
         s.insert_squad(&file, None, false).unwrap();
         assert!(s.triage_candidates().unwrap().is_empty());
+    }
+
+    // ── RAL-346: subproject resolution + subproject-aware pool keying ──────
+
+    /// Writes a `.ralphus.toml` with `[monorepo] subprojects = [...]` into a
+    /// real temp directory, so `crate::config::load_monorepo_config` (which
+    /// walks the real filesystem) sees it as a configured monorepo.
+    fn monorepo_dir(label: &str, subprojects: &[&str]) -> std::path::PathBuf {
+        let dir = real_tempdir(label);
+        let list = subprojects
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            format!("[monorepo]\nsubprojects = [{list}]\n"),
+        )
+        .expect("write .ralphus.toml");
+        dir
+    }
+
+    #[test]
+    fn resolve_cell_subprojects_is_not_applicable_for_a_plain_single_project_repo() {
+        let mut s = store();
+        let dir = real_tempdir("resolve-not-applicable");
+        let file: TaskFile =
+            toml::from_str("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n")
+                .unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        assert_eq!(
+            resolve_cell_subprojects(&s, &squad_id, 0, 0, &dir).unwrap(),
+            SubprojectResolution::NotApplicable
+        );
+    }
+
+    #[test]
+    fn resolve_cell_subprojects_is_unresolved_for_a_monorepo_cell_with_no_recorded_row() {
+        let mut s = store();
+        let dir = monorepo_dir("resolve-unresolved", &["core", "utils"]);
+        let file: TaskFile =
+            toml::from_str("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n")
+                .unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        assert_eq!(
+            resolve_cell_subprojects(&s, &squad_id, 0, 0, &dir).unwrap(),
+            SubprojectResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn resolve_cell_subprojects_reports_a_recorded_row_regardless_of_monorepo_config() {
+        let mut s = store();
+        let dir = real_tempdir("resolve-recorded");
+        let file: TaskFile =
+            toml::from_str("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n")
+                .unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        s.set_cell_subprojects(&squad_id, 0, 0, &["core".to_string()], false)
+            .unwrap();
+        assert_eq!(
+            resolve_cell_subprojects(&s, &squad_id, 0, 0, &dir).unwrap(),
+            SubprojectResolution::Resolved {
+                subprojects: vec!["core".to_string()],
+                inferred: false,
+            }
+        );
+    }
+
+    #[test]
+    fn set_cell_subprojects_replaces_prior_rows() {
+        let s = store();
+        s.set_cell_subprojects("squad-1", 0, 0, &["core".to_string()], false)
+            .unwrap();
+        s.set_cell_subprojects(
+            "squad-1",
+            0,
+            0,
+            &["utils".to_string(), "steam".to_string()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_cell_subprojects_raw("squad-1", 0, 0).unwrap(),
+            Some((vec!["steam".to_string(), "utils".to_string()], true))
+        );
+    }
+
+    #[test]
+    fn pool_keys_for_cell_falls_back_to_the_plain_project_key_when_not_applicable_or_unresolved() {
+        let s = store();
+        let dir = real_tempdir("pool-keys-fallback");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        assert_eq!(
+            pool_keys_for_cell(&s, &dir, &SubprojectResolution::NotApplicable),
+            vec!["proj".to_string()]
+        );
+        assert_eq!(
+            pool_keys_for_cell(&s, &dir, &SubprojectResolution::Unresolved),
+            vec!["proj".to_string()]
+        );
+    }
+
+    #[test]
+    fn pool_keys_for_cell_builds_one_composite_key_per_resolved_subproject() {
+        let s = store();
+        let dir = real_tempdir("pool-keys-composite");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        let resolution = SubprojectResolution::Resolved {
+            subprojects: vec!["core".to_string(), "utils".to_string()],
+            inferred: true,
+        };
+        let mut keys = pool_keys_for_cell(&s, &dir, &resolution);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["proj::core".to_string(), "proj::utils".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_cells_with_overlapping_subprojects_share_a_pool_key() {
+        let s = store();
+        let dir = real_tempdir("pool-keys-overlap");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        let cell_a = SubprojectResolution::Resolved {
+            subprojects: vec!["core".to_string(), "utils".to_string()],
+            inferred: false,
+        };
+        let cell_b = SubprojectResolution::Resolved {
+            subprojects: vec!["utils".to_string(), "steam".to_string()],
+            inferred: false,
+        };
+        let keys_a = pool_keys_for_cell(&s, &dir, &cell_a);
+        let keys_b = pool_keys_for_cell(&s, &dir, &cell_b);
+        // "shared impact" overlap, not exact-set equality: both share the
+        // "utils" pool even though their subproject sets differ.
+        assert!(keys_a.contains(&"proj::utils".to_string()));
+        assert!(keys_b.contains(&"proj::utils".to_string()));
+    }
+
+    #[test]
+    fn two_cells_with_disjoint_subprojects_never_share_a_pool_key() {
+        let s = store();
+        let dir = real_tempdir("pool-keys-disjoint");
+        s.register_project("proj", "", dir.to_str().unwrap(), "git")
+            .unwrap();
+        let cell_a = SubprojectResolution::Resolved {
+            subprojects: vec!["core".to_string()],
+            inferred: false,
+        };
+        let cell_b = SubprojectResolution::Resolved {
+            subprojects: vec!["steam".to_string()],
+            inferred: false,
+        };
+        let keys_a = pool_keys_for_cell(&s, &dir, &cell_a);
+        let keys_b = pool_keys_for_cell(&s, &dir, &cell_b);
+        assert!(keys_a.iter().all(|k| !keys_b.contains(k)));
+    }
+
+    #[test]
+    fn base_project_key_strips_the_subproject_suffix() {
+        assert_eq!(base_project_key("proj::core"), "proj");
+        assert_eq!(base_project_key("proj"), "proj");
+        assert_eq!(
+            split_subproject_pool_key("proj::core"),
+            Some(("proj", "core"))
+        );
+        assert_eq!(split_subproject_pool_key("proj"), None);
+    }
+
+    #[test]
+    fn project_pool_keys_enumerates_the_plain_key_and_every_subproject_key() {
+        let s = store();
+        s.record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
+            .unwrap();
+        // A different project must never leak in.
+        s.record_triage_pool_cell("other", "bug", "squad-4", 0, 0, "b4", "main")
+            .unwrap();
+        // A different triage type under the same project must never leak in.
+        s.record_triage_pool_cell("proj::core", "feature", "squad-5", 0, 0, "b5", "main")
+            .unwrap();
+        let mut keys = project_pool_keys(&s, "proj", "bug");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "proj".to_string(),
+                "proj::core".to_string(),
+                "proj::utils".to_string(),
+            ]
+        );
     }
 }

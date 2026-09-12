@@ -584,6 +584,58 @@ impl ArbiterConfig {
     }
 }
 
+/// A project's known monorepo subproject identifiers (`[monorepo]` table,
+/// RAL-346) -- an explicit, user-provided hint rather than an auto-detected
+/// directory scan (per this ticket's Out-of-Scope note: "perfect
+/// auto-detection" is not required). An empty (or absent) list means the
+/// project is not a monorepo at all -- see `crate::triage::SubprojectResolution`'s
+/// `NotApplicable` variant, which this gates. A non-empty list both (a)
+/// marks the project as a monorepo for that gate, and (b) supplies the
+/// candidate names the Arbiter's subproject-inference call
+/// (`crate::arbiter::infer_subprojects`) matches a cell's description
+/// against when the cell declared no manual `CellDef.subprojects` of its
+/// own. Deliberately project-only (no global-config layering, unlike
+/// [`ReviewConfig`]/[`ForgeConfig`]/etc.): a monorepo's subproject names are
+/// inherently specific to that one repository, so a global default would
+/// never make sense to inherit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct MonorepoConfig {
+    #[serde(default)]
+    pub subprojects: Vec<String>,
+}
+
+impl MonorepoConfig {
+    /// Whether this project is configured as a monorepo at all -- `true`
+    /// exactly when `subprojects` is non-empty.
+    #[must_use]
+    pub fn is_monorepo(&self) -> bool {
+        !self.subprojects.is_empty()
+    }
+}
+
+/// Parse a `MonorepoConfig` from the given TOML text; the default (not a
+/// monorepo) when the `[monorepo]` table is absent.
+#[must_use]
+pub fn monorepo_from_toml_str(s: &str) -> MonorepoConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .monorepo
+        .unwrap_or_default()
+}
+
+/// Load the known-subprojects config for the project reached by walking up
+/// from `start` to the nearest `.ralphus.toml` (see [`find_project_config`]).
+/// No global-config layering -- see [`MonorepoConfig`]'s doc comment for why.
+/// Absent/unreadable/malformed config resolves to "not a monorepo", matching
+/// this file's "malformed config never blocks" rule.
+#[must_use]
+pub fn load_monorepo_config(start: &Path) -> MonorepoConfig {
+    find_project_config(start)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| monorepo_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
 /// no model override, unbounded budget) when the `[arbiter]` table is absent.
 #[must_use]
@@ -1613,6 +1665,8 @@ struct ConfigFile {
     #[serde(default)]
     arbiter: Option<ArbiterConfig>,
     #[serde(default)]
+    monorepo: Option<MonorepoConfig>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -2366,6 +2420,36 @@ mod tests {
             arbiter_from_toml_str("[review]\nskip_worktrees = true\n"),
             ArbiterConfig::default()
         );
+    }
+
+    // ── monorepo (RAL-346) ──────────────────────────────────────────────────
+
+    #[test]
+    fn monorepo_config_unset_is_not_a_monorepo() {
+        let c = MonorepoConfig::default();
+        assert!(c.subprojects.is_empty());
+        assert!(!c.is_monorepo());
+    }
+
+    #[test]
+    fn parse_monorepo_config() {
+        let c = monorepo_from_toml_str("[monorepo]\nsubprojects = [\"core\", \"utils\"]\n");
+        assert_eq!(c.subprojects, vec!["core".to_string(), "utils".to_string()]);
+        assert!(c.is_monorepo());
+    }
+
+    #[test]
+    fn monorepo_config_absent_table_is_default() {
+        assert_eq!(
+            monorepo_from_toml_str("[arbiter]\nagent = \"claude\"\n"),
+            MonorepoConfig::default()
+        );
+    }
+
+    #[test]
+    fn monorepo_config_empty_subprojects_list_is_not_a_monorepo() {
+        let c = monorepo_from_toml_str("[monorepo]\nsubprojects = []\n");
+        assert!(!c.is_monorepo());
     }
 
     // ── summary_format (RAL-124) ──────────────────────────────────────────

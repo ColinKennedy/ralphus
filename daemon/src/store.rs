@@ -379,6 +379,20 @@ pub struct CellView {
     /// has).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triage_types: Vec<String>,
+    /// This cell's resolved monorepo subproject(s) (RAL-346), alphabetical,
+    /// if any have been resolved -- empty when `Unresolved` (a monorepo
+    /// cell the Arbiter hasn't matched yet, or found no match for) or
+    /// `NotApplicable` (a plain single-project repo). See
+    /// `crate::triage::SubprojectResolution`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subprojects: Vec<String>,
+    /// Whether `subprojects` was written by the Arbiter's async inference
+    /// step (`true`) rather than seeded from the cell's own manually-declared
+    /// `CellDef.subprojects` (`false`) -- the board's purple "Arbiter set
+    /// this" badge only shows when this is `true`. Meaningless when
+    /// `subprojects` is empty.
+    #[serde(default)]
+    pub subprojects_inferred: bool,
     /// Resumable CLI-agent cell/thread id (for `claude --resume`/`codex
     /// resume`), captured from the owning backend's output. `None` for other
     /// agents or cells that have not yet completed.
@@ -1539,6 +1553,27 @@ impl Store {
                 triage_type   TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, idx, triage_type)
+            );
+            -- RAL-346: a cell's resolved monorepo subproject(s) -- either
+            -- seeded from the cell's own manually-declared `CellDef.subprojects`
+            -- TOML field (`inferred = 0`), or written by the Arbiter's async
+            -- description-matching inference call (`inferred = 1`) when that
+            -- field was left empty. Absence of any row for a cell means its
+            -- subproject resolution is still `Unresolved` (the project is a
+            -- monorepo but nothing has matched yet) or `NotApplicable` (the
+            -- project isn't configured as a monorepo at all) -- distinguished
+            -- at read time from the project's own `[monorepo]` config, not
+            -- stored here (see `crate::triage::SubprojectResolution`). One row
+            -- per (cell, subproject): a cell can resolve to more than one
+            -- subproject at once, mirroring `triage_cell_types`.
+            CREATE TABLE IF NOT EXISTS cell_subprojects (
+                squad_id      TEXT NOT NULL,
+                task_idx      INTEGER NOT NULL,
+                idx           INTEGER NOT NULL,
+                subproject    TEXT NOT NULL,
+                inferred      INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, idx, subproject)
             );
             -- RAL-318: cells pending a pooled Triage review, keyed by
             -- (project, triage_type). Drained (deleted) the moment a pool's
@@ -3565,8 +3600,14 @@ impl Store {
         // slow enough to stall restart/status-flip requests queued behind it.
         let proofs_by_scope = self.proofs_by_scope(&id)?;
         let triage_by_cell = self.triage_types_by_cell(&id)?;
-        let mut cells_by_task =
-            self.cells_by_task(&id, &review_by_branch, &proofs_by_scope, &triage_by_cell)?;
+        let subprojects_by_cell = self.subprojects_by_cell(&id)?;
+        let mut cells_by_task = self.cells_by_task(
+            &id,
+            &review_by_branch,
+            &proofs_by_scope,
+            &triage_by_cell,
+            &subprojects_by_cell,
+        )?;
         let mut tasks = Vec::with_capacity(task_rows.len());
         for (
             t_idx,
@@ -3657,6 +3698,7 @@ impl Store {
         review_by_branch: &HashMap<(i64, i64), Vec<SquadReviewRef>>,
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
         triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
+        subprojects_by_cell: &crate::triage::CellSubprojectsMap,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
@@ -3671,6 +3713,10 @@ impl Store {
                     .cloned()
                     .unwrap_or_default();
                 let triage_types = triage_by_cell
+                    .get(&(task_idx, idx))
+                    .cloned()
+                    .unwrap_or_default();
+                let (subprojects, subprojects_inferred) = subprojects_by_cell
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
@@ -3695,6 +3741,8 @@ impl Store {
                         proof: Vec::new(),
                         reviews,
                         triage_types,
+                        subprojects,
+                        subprojects_inferred,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
                         maximum_budget_usd: r.get::<_, Option<f64>>(18)?,
                         env_overrides: from_json_map(&r.get::<_, String>(19)?),

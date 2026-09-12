@@ -818,6 +818,28 @@
           `</div>`;
       }
       /**
+       * Renders a badge (RAL-346) for a cell whose monorepo subproject(s)
+       * were inferred by the Arbiter's async description-matching step,
+       * rather than seeded from the cell's own manually-declared
+       * `subprojects` TOML field. Reuses the exact same purple `--arbiter`
+       * provenance badge style as the Reviews tab's "auto-created review"
+       * badge (`originBadge` in `65-reviews.js`) rather than inventing a new
+       * one, since this is the same "the Arbiter made this, not a human"
+       * signal, just attached to a different field. Empty string when
+       * `s.subprojects` is empty, or when it's non-empty but
+       * `s.subprojects_inferred` is false (human-declared via `CellDef.
+       * subprojects` -- no badge needed, matching `originBadge`'s own
+       * "explicit" -> no badge rule).
+       * @param {CellView} s
+       * @returns {string}
+       */
+      function subprojectBadge(s) {
+        const subprojects = s.subprojects || [];
+        if (!subprojects.length || !s.subprojects_inferred) return "";
+        const list = subprojects.join(", ");
+        return ` <span class="badge" style="color:var(--arbiter);border-color:var(--arbiter);font-size:11px" data-tip="The Arbiter automatically inferred this cell's monorepo subproject(s) -- ${esc(list)} -- from its description, since it declared no manual 'subprojects' of its own.\nUsed to key this cell's Triage pool by (project, subproject) rather than just project, so unrelated work in other subprojects doesn't share its auto-review threshold.">⚙ ${esc(list)}</span>`;
+      }
+      /**
        * Renders the cell-level details pane.
        * @param {SquadView} r
        * @param {TaskView} t
@@ -881,7 +903,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${outOfDateBadge(s.env_out_of_date)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>

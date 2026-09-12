@@ -3816,6 +3816,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
     // Review" submission (the Simple tab's default) as slow as that call --
     // see `crate::arbiter::classify`'s doc comment.
     let mut pending_classifications = Vec::new();
+    let mut pending_subprojects = Vec::new();
     let mut has_triage = false;
     for (task_idx, task) in file.task.iter().enumerate() {
         for (idx, cell) in task.cell.iter().enumerate() {
@@ -3847,6 +3848,32 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
                 });
             } else {
                 let _ = store.set_cell_triage_types(&squad_id, task_idx, idx, &inline_types);
+            }
+            // RAL-346: seed this cell's subproject resolution from its own
+            // manually-declared `CellDef.subprojects` when non-empty -- a
+            // plain store write, no LLM/git call needed, so it happens right
+            // here rather than being deferred. A cell that declared none is
+            // queued for the Arbiter's async inference step instead (see
+            // `crate::arbiter::spawn_triage_followup`), which needs no
+            // synchronous validation here since a miss just leaves it
+            // `Unresolved`.
+            if cell.subprojects.is_empty() {
+                let cell_id = cell.id.clone().unwrap_or_else(|| format!("cell-{idx}"));
+                let context = cell
+                    .prompt
+                    .clone()
+                    .or_else(|| cell.command.clone())
+                    .unwrap_or_default();
+                pending_subprojects.push(crate::arbiter::PendingSubprojectResolution {
+                    task_idx,
+                    idx,
+                    cell_id,
+                    cwd: cell.cwd.clone(),
+                    context,
+                });
+            } else {
+                let _ =
+                    store.set_cell_subprojects(&squad_id, task_idx, idx, &cell.subprojects, false);
             }
         }
     }
@@ -3881,6 +3908,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         squad_id.clone(),
         file.clone(),
         pending_classifications,
+        pending_subprojects,
         has_triage,
     );
     let state = if req.hold {
