@@ -641,19 +641,34 @@
        * @returns {{traceparent: string}}
        */
       const traceHeaders = () => ({ traceparent: newTraceparent() });
+      // RALPHUS-POST-DEL:BEGIN
       /**
-       * POSTs JSON to the daemon API with a fresh trace header.
+       * POSTs JSON to the daemon API with a fresh trace header. A squad-scoped
+       * mutation (cancel, restart, retry, set-status, edit, ...) invalidates
+       * the shared `/api/tasks` in-flight request (RAL-406) first, so the
+       * `tick()` refresh callers almost always issue right after can't land
+       * pre-mutation data by piggybacking on a request sent before this
+       * mutation committed server-side.
        * @param {string} path
        * @param {*} [body]
        * @returns {Promise<Response>}
        */
-      const post = (path, body) => fetch(path, { method: "POST", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
+      const post = (path, body) => {
+        if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        return fetch(path, { method: "POST", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
+      };
       /**
-       * Sends a DELETE to the daemon API with a fresh trace header.
+       * Sends a DELETE to the daemon API with a fresh trace header. Same
+       * squad-mutation invalidation as `post` above (RAL-406) -- covers
+       * squad deletion.
        * @param {string} path
        * @returns {Promise<Response>}
        */
-      const del = (path) => fetch(path, { method: "DELETE", headers: traceHeaders() });
+      const del = (path) => {
+        if (path.startsWith("/api/squads/")) invalidateTasksFetch();
+        return fetch(path, { method: "DELETE", headers: traceHeaders() });
+      };
+      // RALPHUS-POST-DEL:END
       // copy-to-clipboard: a small button carrying its payload in data-copy.
       /**
        * Renders a copy-to-clipboard button carrying its payload in `data-copy`.
