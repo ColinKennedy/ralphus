@@ -249,6 +249,8 @@
       let squads = [];
       let gotoSearchQuery = "";
       let gotoSearchSelected = 0;
+      /** Whether the go-to search overlay's own "show hidden" checkbox (RAL-365) is on -- independent of the Squads-tab sidebar's `filters.showHidden`. Reset to `false` every time the overlay opens. */
+      let gotoSearchShowHidden = false;
       /** @type {GuardianView[]} */
       let guardians = [];
       /** @type {ResourceEntry[]} */

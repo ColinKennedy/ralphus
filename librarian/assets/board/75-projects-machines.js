@@ -1071,6 +1071,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
           if (tasksResp.ok) {
             const t = await tasksResp.json();
             hiddenSquadNames = new Map((t.squads || []).map((/** @type {SquadView} */ s) => [s.id, s.label || s.id]));
+            hiddenTaskNames = new Map(
+              (t.squads || []).flatMap((/** @type {SquadView} */ s) =>
+                (s.tasks || []).map((/** @type {TaskView} */ task, idx) => [`${s.id}:${idx}`, task.name])),
+            );
           }
           if (guardiansResp.ok) {
             const g = await guardiansResp.json();
@@ -1100,12 +1104,17 @@ Work submitted against it will fail — fix the machine or deregister the provid
       }
       /**
        * The display name for one hidden item, falling back to its raw id when its
-       * owning squad/review hasn't loaded (or no longer resolves a name).
+       * owning squad/review/task hasn't loaded (or no longer resolves a name).
        * @param {HiddenItem} h
        * @returns {string}
        */
       function hiddenItemName(h) {
         if (h.kind === "squad") return hiddenSquadNames.get(h.squad_id || "") || h.squad_id || "";
+        if (h.kind === "task") {
+          const squadName = hiddenSquadNames.get(h.squad_id || "") || h.squad_id || "";
+          const taskName = hiddenTaskNames.get(`${h.squad_id}:${h.task_idx}`) || `task ${h.task_idx}`;
+          return `${squadName} > ${taskName}`;
+        }
         return hiddenGuardianNames.get(h.guardian_id || "") || h.guardian_id || "";
       }
       /**
@@ -1116,7 +1125,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         return hiddenItems.filter((h) => {
           if (!hiddenFilters.type.has(h.kind)) return false;
           if (!hiddenFilters.q) return true;
-          const id = h.kind === "squad" ? (h.squad_id || "") : (h.guardian_id || "");
+          const id = h.kind === "review" ? (h.guardian_id || "") : (h.squad_id || "");
           return id.toLowerCase().includes(hiddenFilters.q) || hiddenItemName(h).toLowerCase().includes(hiddenFilters.q);
         });
       }
@@ -1126,10 +1135,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {string}
        */
       function hiddenItemRowHtml(h) {
-        const id = (h.kind === "squad" ? h.squad_id : h.guardian_id) || "";
+        const id = h.kind === "task" ? `${h.squad_id}:${h.task_idx}` : (h.kind === "squad" ? h.squad_id : h.guardian_id) || "";
         const whose = prefsViewingAs ? `${prefsViewingAs}'s` : "your own";
+        const typeLabel = h.kind === "squad" ? "Squad" : h.kind === "task" ? "Task" : "Review";
         return `<tr>
-            <td>${h.kind === "squad" ? "Squad" : "Review"}</td>
+            <td>${typeLabel}</td>
             <td><span class="proj-name">${esc(hiddenItemName(h))}</span></td>
             <td style="color:var(--muted)">${fmtProjCreated(h.hidden_at_ms)}</td>
             <td><button class="btn" data-click="unhidePrefItem" data-kind="${esc(h.kind)}" data-id="${esc(id)}" data-tip="Re-enable this ${h.kind} in ${esc(whose)} views.\nOnly affects ${esc(whose)} view — nobody else's visibility changes.">Unhide</button></td>
@@ -1172,6 +1182,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         /** @type {HTMLInputElement} */ (byId("hidden-filter")).value = hiddenFilters.q;
         /** @type {HTMLInputElement} */ (byId("hidden-filter-squad")).checked = hiddenFilters.type.has("squad");
         /** @type {HTMLInputElement} */ (byId("hidden-filter-review")).checked = hiddenFilters.type.has("review");
+        /** @type {HTMLInputElement} */ (byId("hidden-filter-task")).checked = hiddenFilters.type.has("task");
         const el = byId("hidden-items");
         if (hiddenError) {
           el.innerHTML = `<div class="empty" style="color:var(--failed)">${esc(hiddenError)}</div>`;
@@ -1188,14 +1199,23 @@ Work submitted against it will fail — fix the machine or deregister the provid
         el.innerHTML = table;
       }
       /**
-       * Re-enables one hidden squad/review for the current (or visited,
-       * RAL-332) user.
+       * Re-enables one hidden squad/review/task (RAL-365) for the current
+       * (or visited, RAL-332) user. `id` for `kind === "task"` is
+       * `"<squadId>:<taskIdx>"`, matching `hiddenItemRowHtml`'s encoding.
        * @param {string} kind
        * @param {string} id
        * @returns {Promise<void>}
        */
       async function unhidePrefItem(kind, id) {
-        const path = kind === "squad" ? `/api/hidden/squads/${encodeURIComponent(id)}` : `/api/hidden/reviews/${encodeURIComponent(id)}`;
+        let path;
+        if (kind === "squad") {
+          path = `/api/hidden/squads/${encodeURIComponent(id)}`;
+        } else if (kind === "task") {
+          const [squadId, taskIdx] = id.split(":");
+          path = `/api/hidden/tasks/${encodeURIComponent(squadId)}/${encodeURIComponent(taskIdx)}`;
+        } else {
+          path = `/api/hidden/reviews/${encodeURIComponent(id)}`;
+        }
         try {
           const r = await fetch(path, { method: "DELETE", headers: prefsUserHeaders() });
           hiddenError = r.ok ? "" : await responseError(r, "unhide failed");

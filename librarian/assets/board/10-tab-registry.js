@@ -172,9 +172,9 @@
       let secretEnvNames = [];
       /** Message from the last failed add/rename/remove, shown inline above the table. */
       let secretEnvNameError = "";
-      // ---- Preferences tab (RAL-329: per-user hidden squads/reviews, built on RAL-328) ----
-      /** The two `HiddenItem.kind` values. */
-      const HIDDEN_KINDS = ["squad", "review"];
+      // ---- Preferences tab (RAL-329: per-user hidden squads/reviews, built on RAL-328; RAL-365 adds tasks) ----
+      /** The three `HiddenItem.kind` values. */
+      const HIDDEN_KINDS = ["squad", "review", "task"];
       /**
        * @returns {{q: string, type: Set<string>}}
        */
@@ -199,6 +199,8 @@
       let mailboxHistory = [];
       /** Message from the last failed message-history load, shown inline above the table. */
       let mailboxHistoryError = "";
+      /** @type {Map<string, string>} "<squadId>:<taskIdx>" -> task name, from the last `GET /api/tasks` (RAL-365). */
+      let hiddenTaskNames = new Map();
       /** @type {Map<string, AgentOptionsCacheEntry>} cwd -> agents + default fetched from GET /api/agents, cached for the page's lifetime. */
       const agentOptionsByCwd = new Map();
       // ---- Admin gating (RAL-332) ----
@@ -244,12 +246,16 @@
         /** @type {GotoSearchResult[]} */
         const out = [];
         squads.forEach((squad) => {
-          // RAL-331: a hidden squad's tasks are excluded from go-to search
-          // by default too, same "hidden unless specifically surfaced" rule
-          // as the sidebar.
-          if (hiddenSquadIds.has(squad.id) && !filters.showHidden && squad.id !== revealedSquadId) return;
+          // RAL-331/RAL-365: a hidden squad's tasks, and any individually
+          // hidden task, are excluded from go-to search by default too --
+          // same "hidden unless specifically surfaced" rule as the sidebar,
+          // gated by the overlay's own checkbox rather than the Squads
+          // tab's `filters.showHidden`.
+          const squadHidden = hiddenSquadIds.has(squad.id) && squad.id !== revealedSquadId;
+          if (squadHidden && !gotoSearchShowHidden) return;
           squad.tasks.forEach((task, taskIdx) => {
             if (needle && !task.name.toLowerCase().includes(needle)) return;
+            if (!squadHidden && hiddenTaskKeys.has(`${squad.id}:${taskIdx}`) && !gotoSearchShowHidden) return;
             out.push({
               squadId: squad.id,
               taskIdx,
@@ -277,10 +283,14 @@
       function openGotoSearch() {
         gotoSearchQuery = "";
         gotoSearchSelected = 0;
+        gotoSearchShowHidden = false;
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
             <h2>Go To Task</h2>
             <input type="text" id="goto-search-input" class="goto-search-input" placeholder="search tasks across every squad…" oninput="gotoSearchInput(this.value)" onkeydown="gotoSearchInputKeydown(event)" data-tip="Filter every task by substring match on task name.\nWho/when: use this when you know part of a task's name and want the owning squad shown beside it.\nArrow keys move the selection · Enter opens it." />
+            <label style="display:flex;align-items:center;gap:6px;margin:8px 0 0" data-tip="Include tasks you've explicitly hidden and tasks belonging to a squad you've hidden.\nIndependent of the Squads tab's own 'show hidden' toggle -- resets every time this window opens.">
+              <input type="checkbox" id="goto-search-show-hidden" onchange="gotoSearchToggleShowHidden(this.checked)"> show hidden
+            </label>
             <div id="goto-search-summary" class="goto-search-summary"></div>
             <div id="goto-search-list" class="goto-search-list" data-tip="Matching tasks across every squad, shown as squad-id > task-name so duplicate names stay unambiguous.\nClick once to select a row; double-click or press Enter to open it."></div>
             <div class="btn-row">
@@ -318,6 +328,17 @@
        */
       function gotoSearchInput(value) {
         gotoSearchQuery = value;
+        gotoSearchSelected = 0;
+        renderGotoSearchResults();
+      }
+      /**
+       * Toggles the go-to search overlay's own "show hidden" checkbox
+       * (RAL-365) and re-renders its result list.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function gotoSearchToggleShowHidden(checked) {
+        gotoSearchShowHidden = checked;
         gotoSearchSelected = 0;
         renderGotoSearchResults();
       }
@@ -381,7 +402,7 @@
        * @property {string} sort - one of TASK_TAB_SORTS
        * @property {number} dir - 1 (asc) or -1 (desc)
        * @property {Set<string>} status
-       * @property {boolean} showHidden - include tasks belonging to hidden squads
+       * @property {boolean} showHidden - include explicitly-hidden tasks and tasks of hidden squads (RAL-331/RAL-365)
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
        */
@@ -413,8 +434,10 @@
       let ttSel = new Set();
       /** @type {string|null} anchor key for shift-range multi-selection among the Tasks tab's currently visible/filtered rows (RAL-350), mirrors `anchorId`/`guardianAnchorId`. */
       let ttSelAnchor = null;
-      /** @type {string[]} squad ids scoped by the currently open Tasks-tab row meatball menu's Hide/Unhide action (RAL-350) -- one or every squad among the selected, currently-visible rows. */
+      /** @type {string[]} squad ids scoped by the currently open Tasks-tab row meatball menu's Hide/Unhide squad action (RAL-350) -- one or every squad among the selected, currently-visible rows. */
       let _ttRowMenuSquadIds = [];
+      /** @type {{squadId: string, taskIdx: number}[]} the tasks scoped by the currently open Tasks-tab row meatball menu's Hide/Unhide task action (RAL-365) -- one or every selected, currently-visible row. */
+      let _ttRowMenuTaskRefs = [];
       /** @type {TaskTabFilters} */
       let taskTabFilters = defaultTaskTabFilters();
       /** @type {Set<string>} `"<squadId>:<taskIdx>"` keys of expanded Tasks-tab rows (RAL-362 §4) */
@@ -916,19 +939,32 @@
       }
       /**
        * Whether a built row survives the toolbar's filters (RAL-362 §2):
-       * name substring, status set, hidden-squad inclusion, and "needs me".
+       * name substring, status set, hidden-squad/hidden-task inclusion
+       * (RAL-365), and "needs me".
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @param {Set<string>} hiddenSquadIds
        * @param {Set<string>} needsMeKeys
+       * @param {Set<string>} [hiddenTaskKeys]
        * @returns {boolean}
        */
-      function ttRowMatchesFilters(row, filters, hiddenSquadIds, needsMeKeys) {
+      function ttRowMatchesFilters(row, filters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys) {
         if (filters.q && !row.name.toLowerCase().includes(filters.q)) return false;
         if (!filters.status.has(row.state)) return false;
-        if (!filters.showHidden && hiddenSquadIds.has(row.squadId)) return false;
+        if (!filters.showHidden && (hiddenSquadIds.has(row.squadId) || (hiddenTaskKeys && hiddenTaskKeys.has(row.key)))) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
         return true;
+      }
+      /**
+       * Whether a row is hidden (explicitly, or via its owning squad) --
+       * used to draw the 🙈 marker once "show hidden" reveals it (RAL-365).
+       * @param {TtRow} row
+       * @param {Set<string>} hiddenSquadIds
+       * @param {Set<string>} hiddenTaskKeys
+       * @returns {boolean}
+       */
+      function ttRowIsHidden(row, hiddenSquadIds, hiddenTaskKeys) {
+        return hiddenSquadIds.has(row.squadId) || hiddenTaskKeys.has(row.key);
       }
       /**
        * Aggregates the Tokens/Cache/Cost columns across a group of rows, for
