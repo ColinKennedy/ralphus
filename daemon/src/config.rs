@@ -1422,7 +1422,7 @@ pub const DEFAULT_TEMPLATE_NAME: &str = "hello-world";
 pub fn default_template() -> TemplateDef {
     TemplateDef {
         name: DEFAULT_TEMPLATE_NAME.to_string(),
-        label: Some("Hello World".to_string()),
+        label: Some("(Built-in)".to_string()),
         description: Some(
             "Minimal one-shot task: run a prompt as-is, no extra context.".to_string(),
         ),

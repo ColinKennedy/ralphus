@@ -30,8 +30,10 @@ where one exists.
 | GET | `/api/config/templates` | [Simple task form's template picker](#get-apiconfigtemplates) (RAL-297) |
 | GET | `/api/agents/catalog` | [Cwd-independent agent+model catalog](#get-apiagentscatalog) (RAL-297) |
 | GET | `/api/projects/{name}/branches` | [Local+remote branch names for a git project](#get-apiprojectsnamebranches) (RAL-297) |
+| POST | `/api/projects/{name}/default-branch/autofix` | [Set origin/HEAD via `git remote set-head origin --auto`](#post-apiprojectsnamedefault-branchautofix) |
 | POST | `/api/generate` | [Kick off a Simple-form generation step](#post-apigenerate) (RAL-297) |
 | GET | `/api/generate/{id}` | [Poll a generation job](#get-apigenerateid) (RAL-297) |
+| POST | `/api/generate/{id}/cancel` | [Kill a generation job's agent subprocess](#post-apigenerateidcancel) (RAL-297) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated; `?entity=` accepts an [entity URI](#entity-uris-ral-155) |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
 | POST | `/api/events/ticket` | [Mint a short-lived SSE ticket](#post-apieventsticket-ral-222) |
@@ -544,6 +546,23 @@ longer resolves; `404` if no project is registered under that exact name.
 { "branches": ["main", "origin/staging"] }
 ```
 
+### `POST /api/projects/{name}/default-branch/autofix`
+Runs `git remote set-head origin --auto` in a registered git project's path
+and reports the branch it resolved to -- the one-click fix for the
+`?upstream=<<default>>` failure `daemon/src/worktrees.rs`'s `default_branch()`
+raises when the project has no `refs/remotes/origin/HEAD` symref (a repo not
+created via a plain `git clone`, e.g. `git init` + `git remote add`). Always
+targets the remote literally named `origin`; admin-gated like the other
+project-mutating endpoints.
+
+```json
+{ "branch": "main" }
+```
+`400 bad_request` if the project isn't a git project; `400 autofix_failed` if
+the `git remote set-head` call itself fails (e.g. no `origin` remote, or
+`origin` was never fetched so it has no local remote-tracking branch to point
+at); `404` if no project is registered under that exact name.
+
 ### `GET /api/agents`
 List the agents selectable for a project -- built-in backends plus whatever
 `.ralphus.toml` custom `[agent.profiles.*]` entries apply there (see the
@@ -615,24 +634,25 @@ zero valid templates are configured and `templates` is just the built-in
 in that case.
 
 ```json
-{ "templates": [{ "name": "hello-world", "label": "Hello World", "description": "...", "fields": [], "prompt_template": "{prompt}" }],
+{ "templates": [{ "name": "hello-world", "label": "(Built-in)", "description": "...", "fields": [], "prompt_template": "{prompt}" }],
   "default_new_task_tab": "simple", "using_fallback": true }
 ```
 
 ### `POST /api/generate`
 Kicks off one "generation step" (RAL-297: the Simple form's opt-in
-"Generate Proofs"/"Generate Manual Checks" buttons) on a background thread
-and returns `202` immediately with a job id -- a single one-shot LLM call
-whose prompt asks for a short structured JSON list, never blocking on the
-call itself (see `crate::generation`'s module doc comment for why: every
-mutating request runs on the daemon's accept loop one at a time, so a
-multi-second/minute blocking call there would stall every other write).
+"Generate Proofs"/"Generate Manual Checks"/"Generate Auto-Build Steps"
+buttons) on a background thread and returns `202` immediately with a job id
+-- a single one-shot LLM call whose prompt asks for a short structured JSON
+list, never blocking on the call itself (see `crate::generation`'s module
+doc comment for why: every mutating request runs on the daemon's accept
+loop one at a time, so a multi-second/minute blocking call there would
+stall every other write).
 
 Request:
 ```json
 { "kind": "proof_steps", "cwd": "C:/repo", "agent": "claude-code", "model": "sonnet", "prompt_context": "Add a login form" }
 ```
-`kind` is `"proof_steps"` or `"manual_checks"`. Response `202`:
+`kind` is `"proof_steps"`, `"manual_checks"`, or `"auto_build_steps"`. Response `202`:
 ```json
 { "id": "gen-..." }
 ```
@@ -646,6 +666,12 @@ Poll a generation job started by `POST /api/generate`.
 { "status": "error", "message": "..." }
 ```
 `404` if `id` names no job this daemon process has ever started.
+
+### `POST /api/generate/{id}/cancel`
+Kills the agent subprocess backing generation job `id`, if it's still
+running -- registered under the same `Cancellations` registry a squad's own
+cells use, so this really does stop the process rather than just abandon
+polling it. Always `202`, even if `id` already finished or never existed.
 
 ### Admin flag and admin-only endpoints (RAL-332)
 

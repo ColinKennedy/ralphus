@@ -7,6 +7,14 @@
       // other two tabs use.
       let ntTab = "simple";
       /**
+       * Whether the New Task modal is the thing currently mounted into
+       * `#modal-root` -- tracked so a Simple-tab generation call that's
+       * still in flight when the user cancels doesn't pop the modal back
+       * open (or land on the confirm step) once it resolves; see
+       * `submitTaskSimple`'s guarded `renderNewTaskModal()` call.
+       */
+      let ntModalOpen = false;
+      /**
        * @typedef {object} NtFile
        * @property {string} name
        * @property {number} size
@@ -18,17 +26,20 @@
       let ntPasteToml = "";   // paste tab: preserved across tab switches
       let ntLabel = "";       // paste tab: optional squad label
       /**
-       * Opens the New Task modal. The Simple tab's form state persists
-       * in-memory across opens (e.g. after Cancel) so re-opening doesn't
-       * lose the agent/model/project selection; it's only reset after a
-       * successful submit (see `submitTaskSimple`).
+       * Opens the New Task modal. The Simple tab's form is reset to its
+       * defaults on every open, carrying forward only the fields worth
+       * remembering across submissions -- see `ntSimpleResetKeepingProjectFields`.
        * @returns {void}
        */
       function openNewTask() {
         ntTab = ntConfigDefaultTab; ntFiles = []; ntPasteToml = ""; ntLabel = "";
-        if (!ntSimple) ntSimpleReset();
+        ntSimpleResetKeepingProjectFields();
+        ntModalOpen = true;
         renderNewTaskModal();
         loadNtSimpleConfig();
+        if (!projects.length) {
+          pollProjects().then(() => { if (ntTab === "simple") renderNewTaskModal(); });
+        }
       }
       /**
        * Renders the New Task modal (Simple, Files, or Paste tab).
@@ -68,10 +79,30 @@
         renderNewTaskModal();
       }
       /**
-       * Closes whichever modal is currently open.
+       * Closes whichever modal is currently open. If it was the New Task
+       * modal with a Simple-tab generation call still in flight, that call's
+       * agent subprocess is killed too (`ntCancelActiveGenerations`) --
+       * Cancel means cancel, not just "stop showing me this."
        * @returns {void}
        */
-      function closeModal() { byId("modal-root").innerHTML = ""; }
+      function closeModal() {
+        if (ntModalOpen && ntTab === "simple" && ntSimple.activeGenerationIds.length) ntCancelActiveGenerations();
+        byId("modal-root").innerHTML = "";
+        ntModalOpen = false;
+      }
+      /**
+       * Fires `POST /api/generate/{id}/cancel` for every generation job
+       * `ntRunGenerationStep` currently has in flight, killing each one's
+       * agent subprocess, and clears the tracking list. Fire-and-forget --
+       * the modal is already closing, so there's nothing left to update on
+       * the response.
+       * @returns {void}
+       */
+      function ntCancelActiveGenerations() {
+        const ids = ntSimple.activeGenerationIds;
+        ntSimple.activeGenerationIds = [];
+        ids.forEach((id) => { post(`/api/generate/${id}/cancel`).catch(() => {}); });
+      }
 
       // ---------- new task modal: Simple tab (RAL-297) ----------
       // A deterministic, template-driven form: the five fixed base fields
@@ -79,8 +110,13 @@
       // fields the selected [[templates]] entry declares. Building the
       // submitted TOML is pure string substitution — no LLM call — except
       // the explicit, opt-in "Generate proof steps"/"Generate manual
-      // checks" buttons, which call POST /api/generate.
+      // checks"/"Generate auto-build steps" buttons, which call
+      // POST /api/generate.
       const NT_INPUT_STYLE = "width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px;margin-top:2px";
+      // Suggests the ROSE shape (Reproduction, Observations, Solutions
+      // considered, Expected result) without forcing it -- a free-text
+      // hint for what makes a prompt easy for an agent to act on.
+      const NT_PROMPT_PLACEHOLDER = "e.g. Reproduction: what leads to this&#10;Observations: what you've seen&#10;Solutions considered: what's been tried&#10;Expected result: what should happen instead";
       /**
        * @typedef {object} NtTemplateField
        * @property {string} name
@@ -124,6 +160,15 @@
        * @property {string} value
        */
       /**
+       * The Simple tab's review combo box: `"explicit"` shows and submits a
+       * hand-authored `[[review]]` block (manual checks + auto-build steps
+       * editable up front); `"auto"` opts the work cell into Triage
+       * (`triage = true`, no `triage_type` -- the Arbiter classifies it) so
+       * the daemon pools and auto-creates a review later; `"none"` requests
+       * no review at all.
+       * @typedef {"explicit"|"auto"|"none"} NtReviewMode
+       */
+      /**
        * @typedef {object} NtSimpleState
        * @property {string} templateName
        * @property {string} prompt
@@ -133,12 +178,25 @@
        * @property {string} project
        * @property {string} upstreamBranch
        * @property {boolean} proofs
-       * @property {boolean} addReview
+       * @property {NtReviewMode} reviewMode
        * @property {boolean} generateManualChecks
+       * @property {boolean} skipAutoBuild
+       * @property {boolean} generateAutoBuild
        * @property {NtListItem[]} proofItems
        * @property {NtListItem[]} checkItems
+       * @property {NtListItem[]} buildItems
        * @property {boolean} generating
        * @property {boolean} confirmStep
+       * @property {NtFieldError[]} fieldErrors Set by the last failed submit
+       *   attempt so the form can show each error inline next to its field;
+       *   empty until then, and reset on every open/successful submit like
+       *   every other non-carried-forward field.
+       * @property {string[]} activeGenerationIds `POST /api/generate` job
+       *   ids currently in flight (populated by `ntRunGenerationStep`,
+       *   drained as each resolves) -- if the New Task modal is cancelled
+       *   while any remain, `closeModal` fires `POST /api/generate/{id}/cancel`
+       *   for each so the underlying agent subprocess is actually killed,
+       *   not just abandoned.
        */
       /** @type {NtSimpleState} */
       let ntSimple;
@@ -150,15 +208,42 @@
         return {
           templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
           prompt: "", fieldValues: {}, agent: ntAgentCatalogDefault, model: "",
-          project: "", upstreamBranch: "", proofs: true, addReview: true, generateManualChecks: true,
-          proofItems: [], checkItems: [], generating: false, confirmStep: false,
+          project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
+          skipAutoBuild: true, generateAutoBuild: true,
+          proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
+          fieldErrors: [], activeGenerationIds: [],
         };
       }
       /**
-       * Resets the Simple tab's form state (called from `openNewTask`).
+       * Fully resets the Simple tab's form state to `ntFreshSimpleState()`.
        * @returns {void}
        */
       function ntSimpleReset() { ntSimple = ntFreshSimpleState(); }
+      /**
+       * Resets the Simple tab to its defaults, but carries forward
+       * `templateName`/`agent`/`model`/`project`/`upstreamBranch` from the
+       * current state first -- the only fields worth remembering across
+       * submissions. Everything else (prompt, review mode, the proofs/
+       * manual-checks/auto-build generation choices and their item lists,
+       * the generating/confirm-step view state, ...) resets to a known
+       * default every time: called both when the modal (re)opens
+       * (`openNewTask`) and right after a successful submit
+       * (`submitTaskSimple`), so neither a cancelled submission's leftover
+       * generated items nor a completed one's leak into the next,
+       * unrelated task.
+       * @returns {void}
+       */
+      function ntSimpleResetKeepingProjectFields() {
+        const prev = ntSimple;
+        ntSimpleReset();
+        if (prev) {
+          ntSimple.templateName = prev.templateName;
+          ntSimple.agent = prev.agent;
+          ntSimple.model = prev.model;
+          ntSimple.project = prev.project;
+          ntSimple.upstreamBranch = prev.upstreamBranch;
+        }
+      }
       /**
        * Loads the Simple tab's template list and agent catalog, then
        * re-renders if the modal is still open on the Simple tab. Never
@@ -202,7 +287,7 @@
 
       /** @type {NtTemplate} */
       const NT_FALLBACK_TEMPLATE = {
-        name: "hello-world", label: "Hello World (Built-in)",
+        name: "hello-world", label: "(Built-in)",
         description: "Minimal one-shot task: run a prompt as-is, no extra context.",
         fields: [], prompt_template: "{prompt}",
       };
@@ -232,25 +317,37 @@
         return text;
       }
       /**
+       * One field-level validation failure: `field` is a stable key the form
+       * uses to show the message inline next to the offending field --
+       * `"prompt"`, `"agent"`, `"project"`, or `"field:<templateFieldName>"`
+       * for a template's own supplementary field.
+       * @typedef {object} NtFieldError
+       * @property {string} field
+       * @property {string} message
+       */
+      /**
        * Client-side field validation (type/required) against a resolved
        * template -- separate from the daemon's own TOML validator, which
-       * only ever sees the already-assembled TOML.
+       * only ever sees the already-assembled TOML. Structured (rather than
+       * plain message strings) so the form can show each error inline next
+       * to its field, not just in the shared error panel.
        * @param {NtSimpleState} state
        * @param {NtTemplate} template
-       * @returns {string[]} error messages; empty when valid
+       * @returns {NtFieldError[]} empty when valid
        */
       function ntValidateSimpleFields(state, template) {
-        /** @type {string[]} */
+        /** @type {NtFieldError[]} */
         const errors = [];
-        if (!state.prompt.trim()) errors.push("Prompt is required.");
+        if (!state.prompt.trim()) errors.push({ field: "prompt", message: "Prompt is required." });
         (template.fields || []).forEach((f) => {
           const v = (state.fieldValues[f.name] || "").trim();
           const label = f.label || f.name;
-          if (f.required && !v) errors.push(`"${label}" is required.`);
-          if (v && f.type === "number" && Number.isNaN(Number(v))) errors.push(`"${label}" must be a number.`);
+          const field = `field:${f.name}`;
+          if (f.required && !v) errors.push({ field, message: `"${label}" is required.` });
+          if (v && f.type === "number" && Number.isNaN(Number(v))) errors.push({ field, message: `"${label}" must be a number.` });
         });
-        if (!state.agent) errors.push("Agent is required.");
-        if (!state.project) errors.push("Project is required.");
+        if (!state.agent) errors.push({ field: "agent", message: "Agent is required." });
+        if (!state.project) errors.push({ field: "project", message: "Project is required." });
         return errors;
       }
       /**
@@ -297,15 +394,19 @@
       }
       /**
        * Which `/api/generate` kinds a submit click should launch, per the
-       * proofs/review/generate-manual-checks checkboxes.
+       * proofs/generate-manual-checks/generate-auto-build-steps checkboxes.
+       * Manual checks and auto-build steps only ever plan when
+       * `reviewMode` is `"explicit"` -- Auto Review and No Review never
+       * show (or submit) a hand-authored `[[review]]` block at all.
        * @param {NtSimpleState} state
-       * @returns {("proof_steps"|"manual_checks")[]}
+       * @returns {("proof_steps"|"manual_checks"|"auto_build_steps")[]}
        */
       function ntPlannedGenerationKinds(state) {
-        /** @type {("proof_steps"|"manual_checks")[]} */
+        /** @type {("proof_steps"|"manual_checks"|"auto_build_steps")[]} */
         const kinds = [];
         if (state.proofs) kinds.push("proof_steps");
-        if (state.addReview && state.generateManualChecks) kinds.push("manual_checks");
+        if (state.reviewMode === "explicit" && state.generateManualChecks) kinds.push("manual_checks");
+        if (state.reviewMode === "explicit" && !state.skipAutoBuild && state.generateAutoBuild) kinds.push("auto_build_steps");
         return kinds;
       }
       /**
@@ -326,6 +427,20 @@
        * @returns {string}
        */
       function ntResolveDefaultTab(payload) { return (payload && payload.default_new_task_tab) || "simple"; }
+      /**
+       * Sanitizes a Simple-tab squad label for `POST /api/squads`: truncates
+       * to 60 chars, strips the one character the daemon actually rejects a
+       * label for (a comma -- squad labels are split on `,` for multi-name
+       * filtering, see `reject_label_with_comma` in `daemon/src/server.rs`),
+       * then trims. Returns `null` when nothing meaningful survives, so the
+       * daemon falls back to showing the squad id instead of an empty label.
+       * @param {string} prompt
+       * @returns {string|null}
+       */
+      function ntSanitizeSquadLabel(prompt) {
+        const cleaned = prompt.slice(0, 60).replace(/,/g, "").trim();
+        return cleaned || null;
+      }
       // RALPHUS-SIMPLE-TAB:END
       // `ntSimple`'s initial value is assigned here, after the marked region
       // above, rather than at its `let` declaration near `ntFreshSimpleState`.
@@ -359,7 +474,7 @@
        * Client-side field validation (type/required), run before generation
        * and before final submission -- separate from the daemon's own TOML
        * validator, which only ever sees the already-assembled TOML.
-       * @returns {string[]} error messages; empty when valid
+       * @returns {NtFieldError[]} empty when valid
        */
       function ntSimpleValidateFields() { return ntValidateSimpleFields(ntSimple, ntSelectedTemplate()); }
       /**
@@ -442,8 +557,13 @@
        * Assembles the Simple tab's task TOML: a project-scoped placeholder
        * worktree `cwd`, a `work` cell (template-substituted prompt, agent,
        * model, optional proof steps) and a `finalize` cell -- mirroring
-       * `ralphus task show-tutor`'s recommended per-branch layout -- plus an
-       * optional `[[review]]` with optional manual-check actions.
+       * `ralphus task show-tutor`'s recommended per-branch layout. Per
+       * `reviewMode`: `"explicit"` sets `review = "<<ralphus:new-review/
+       * simple>>"` on the work cell and emits a `[[review]]` block (with
+       * `skip_auto_build`/`[[review.auto_build]]` and manual-check
+       * `[[review.action]]` entries); `"auto"` sets `triage = true` on the
+       * work cell instead, with no `[[review]]` block (the daemon's Arbiter
+       * pools and auto-creates the review later); `"none"` sets neither.
        * @returns {string}
        */
       function ntSimpleBuildToml() {
@@ -453,7 +573,7 @@
         // encoding `upstream` here would corrupt the `<<default>>` sentinel
         // into a literal (and invalid) branch name, so it's embedded as-is.
         const upstream = ntSimple.upstreamBranch.trim() || "<<default>>";
-        const cwd = `ralphus:new-worktree/${branch}?upstream=${upstream}`;
+        const cwd = `<<ralphus:new-worktree/${branch}?upstream=${upstream}>>`;
         const prompt = ntSimpleEffectivePrompt();
         /** @type {string[]} */
         const lines = [];
@@ -466,7 +586,8 @@
         lines.push(`agent = ${tomlStr(ntSimple.agent)}`);
         if (ntSimple.model.trim()) lines.push(`model = ${tomlStr(ntSimple.model.trim())}`);
         lines.push(`cwd = ${tomlStr(cwd)}`);
-        if (ntSimple.addReview) lines.push('review = "<<ralphus:new-review/simple>>"');
+        if (ntSimple.reviewMode === "explicit") lines.push('review = "<<ralphus:new-review/simple>>"');
+        if (ntSimple.reviewMode === "auto") lines.push("triage = true");
         const workPrompt = ntPushSystemPromptOrInline(lines, ntSimple.agent, NT_NO_COMMIT_SYSTEM_PROMPT, prompt);
         lines.push(`prompt = ${tomlStr(workPrompt)}`);
         ntSimple.proofItems.filter((it) => it.value.trim()).forEach((it) => {
@@ -487,10 +608,20 @@
           lines.push('system_prompt_position = "append"');
         }
         lines.push(`prompt = ${tomlStr(NT_FINALIZE_TEXT)}`);
-        if (ntSimple.addReview) {
+        if (ntSimple.reviewMode === "explicit") {
           lines.push("");
           lines.push("[[review]]");
           lines.push('id = "ralphus:new-review/simple"');
+          const buildSteps = ntSimple.buildItems.filter((it) => it.value.trim());
+          if (ntSimple.skipAutoBuild) {
+            lines.push("skip_auto_build = true");
+          } else {
+            buildSteps.forEach((it) => {
+              lines.push("");
+              lines.push("[[review.auto_build]]");
+              lines.push(`command = ${tomlStr(it.value.trim())}`);
+            });
+          }
           ntSimple.checkItems.filter((it) => it.value.trim()).forEach((it) => {
             lines.push("");
             lines.push("[[review.action]]");
@@ -501,36 +632,37 @@
         return `${lines.join("\n")}\n`;
       }
       // ---------- generic editable-list-widget primitive (RAL-297) ----------
-      // Reused as-is for both proof steps and manual checks -- the only
-      // difference between the two call sites is the placeholder/tooltip
-      // copy passed in `opts`, never the widget's own markup or behavior.
+      // Reused as-is for proof steps, manual checks, and auto-build steps --
+      // the only differences between the three call sites are the
+      // placeholder/tooltip copy and the `singleField` flag passed in
+      // `opts`, never the widget's own markup or behavior.
       /**
        * The state key backing a given list kind.
-       * @param {"proofs"|"checks"} kind
-       * @returns {"proofItems"|"checkItems"}
+       * @param {"proofs"|"checks"|"builds"} kind
+       * @returns {"proofItems"|"checkItems"|"buildItems"}
        */
-      function ntListKey(kind) { return kind === "proofs" ? "proofItems" : "checkItems"; }
+      function ntListKey(kind) { return kind === "proofs" ? "proofItems" : kind === "checks" ? "checkItems" : "buildItems"; }
       /**
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @returns {NtListItem[]}
        */
       function ntListRef(kind) { return ntSimple[ntListKey(kind)]; }
       /**
        * Adds an empty row to the given list and re-renders.
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @returns {void}
        */
       function ntListAdd(kind) { ntSimple[ntListKey(kind)] = ntListInsertRow(ntListRef(kind)); renderNewTaskModal(); }
       /**
        * Removes row `i` from the given list and re-renders.
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @param {number} i
        * @returns {void}
        */
       function ntListRemove(kind, i) { ntSimple[ntListKey(kind)] = ntListRemoveRow(ntListRef(kind), i); renderNewTaskModal(); }
       /**
        * Swaps row `i` with its neighbor `i + delta` and re-renders.
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @param {number} i
        * @param {number} delta
        * @returns {void}
@@ -539,7 +671,7 @@
       /**
        * Edits one field of row `i` in the given list (no re-render needed --
        * plain text input, same pattern as the Files tab's inline textarea).
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @param {number} i
        * @param {"label"|"value"} field
        * @param {string} value
@@ -548,25 +680,29 @@
       function ntListEdit(kind, i, field, value) { ntSimple[ntListKey(kind)] = ntListEditRow(ntListRef(kind), i, field, value); }
       /**
        * @typedef {object} NtListWidgetOpts
-       * @property {string} labelPlaceholder
+       * @property {string} [labelPlaceholder] Unused when `singleField` is true.
        * @property {string} valuePlaceholder
        * @property {string} addLabel
-       * @property {string} labelTip
+       * @property {string} [labelTip] Unused when `singleField` is true.
        * @property {string} valueTip
+       * @property {boolean} [singleField] When true, renders only the value
+       *   column (full width) -- used for auto-build steps, which have no
+       *   `label`-equivalent field in `AutoBuildDef` (unlike a proof step's
+       *   `id` or a manual check's button label).
        */
       /**
        * Renders a generic editable list of `{label, value}` rows: add,
        * remove, reorder (via up/down buttons rather than drag-and-drop, to
        * keep the widget's state trivially serializable), and edit-in-place.
        * @param {NtListItem[]} items
-       * @param {"proofs"|"checks"} kind
+       * @param {"proofs"|"checks"|"builds"} kind
        * @param {NtListWidgetOpts} opts
        * @returns {string}
        */
       function ntListWidgetHtml(items, kind, opts) {
         const rows = items.map((it, i) => `
           <div class="row" style="gap:4px;margin-bottom:4px">
-            <input style="flex:1" value="${esc(it.label)}" placeholder="${esc(opts.labelPlaceholder)}" oninput="ntListEdit('${kind}', ${i}, 'label', this.value)" data-tip="${esc(opts.labelTip)}">
+            ${opts.singleField ? "" : `<input style="flex:1" value="${esc(it.label)}" placeholder="${esc(opts.labelPlaceholder)}" oninput="ntListEdit('${kind}', ${i}, 'label', this.value)" data-tip="${esc(opts.labelTip)}">`}
             <input style="flex:2" value="${esc(it.value)}" placeholder="${esc(opts.valuePlaceholder)}" oninput="ntListEdit('${kind}', ${i}, 'value', this.value)" data-tip="${esc(opts.valueTip)}">
             <button class="btn" style="padding:1px 6px" ${i === 0 ? "disabled" : ""} onclick="ntListMove('${kind}', ${i}, -1)" data-tip="Move this row up.">▲</button>
             <button class="btn" style="padding:1px 6px" ${i === items.length - 1 ? "disabled" : ""} onclick="ntListMove('${kind}', ${i}, 1)" data-tip="Move this row down.">▼</button>
@@ -578,14 +714,22 @@
       /**
        * Kicks off one opt-in generation step (`POST /api/generate`) and
        * polls `GET /api/generate/{id}` until it resolves. Reused as-is for
-       * both "Generate proof steps" and "Generate manual checks" -- only
-       * `kind` differs between the two call sites.
-       * @param {"proof_steps"|"manual_checks"} kind
+       * "Generate proof steps", "Generate manual checks", and "Generate
+       * auto-build steps" -- only `kind` differs between the call sites.
+       *
+       * Tracks the job id in `ntSimple.activeGenerationIds` while it's in
+       * flight (removed in `finally`, regardless of outcome) so `closeModal`
+       * can kill its agent subprocess via `POST /api/generate/{id}/cancel`
+       * if the New Task modal is dismissed before this resolves -- "Cancel"
+       * must actually stop the agent, not just abandon the poll.
+       * @param {"proof_steps"|"manual_checks"|"auto_build_steps"} kind
        * @returns {Promise<NtListItem[]|null>} the proposed items, or null on any failure (never throws)
        */
       async function ntRunGenerationStep(kind) {
         const project = projects.find((p) => p.name === ntSimple.project);
         const cwd = project ? project.path : ".";
+        /** @type {string|null} */
+        let id = null;
         try {
           const startResp = await fetch("/api/generate", {
             method: "POST",
@@ -596,7 +740,9 @@
             }),
           });
           if (!startResp.ok) return null;
-          const { id } = await startResp.json();
+          ({ id } = await startResp.json());
+          if (!id) return null;
+          ntSimple.activeGenerationIds.push(id);
           for (let i = 0; i < 80; i++) {
             await new Promise((resolve) => setTimeout(resolve, 1500));
             const poll = await fetch(`/api/generate/${id}`);
@@ -606,7 +752,65 @@
             if (job.status === "error") return null;
           }
           return null;
-        } catch (e) { return null; }
+        } catch (e) { return null; } finally {
+          if (id) ntSimple.activeGenerationIds = ntSimple.activeGenerationIds.filter((activeId) => activeId !== id);
+        }
+      }
+      /**
+       * The message from `ntSimple.fieldErrors` for `field`, or `""` if that
+       * field has no outstanding error (including before the first submit
+       * attempt, when the list is always empty).
+       * @param {string} field
+       * @returns {string}
+       */
+      function ntFieldErrorText(field) {
+        const e = ntSimple.fieldErrors.find((fe) => fe.field === field);
+        return e ? e.message : "";
+      }
+      /**
+       * Renders `field`'s inline error message (if any) as a small red line,
+       * meant to sit directly under that field's input. Tagged with
+       * `data-field-error` so `ntClearFieldErrorInline` can remove it
+       * without a full re-render.
+       * @param {string} field
+       * @returns {string}
+       */
+      function ntFieldErrorHtml(field) {
+        const msg = ntFieldErrorText(field);
+        return msg ? `<div class="verr" data-field-error="${esc(field)}" style="margin:2px 0 0">${esc(msg)}</div>` : "";
+      }
+      /**
+       * Drops `field`'s entry from `ntSimple.fieldErrors`, if any -- called
+       * whenever the user changes a field that previously failed validation,
+       * so a fixed field doesn't keep showing a stale error until the next
+       * submit attempt.
+       * @param {string} field
+       * @returns {void}
+       */
+      function ntClearFieldError(field) {
+        ntSimple.fieldErrors = ntSimple.fieldErrors.filter((fe) => fe.field !== field);
+      }
+      /**
+       * Same as `ntClearFieldError`, but for a field whose input doesn't
+       * re-render on every keystroke (the prompt textarea, a template's own
+       * text field) -- typing there must still make a shown error disappear
+       * immediately, so this also edits the DOM directly: drops the `.err`
+       * border class from `el` and removes its sibling error message (found
+       * by `data-field-error`, written by `ntFieldErrorHtml`) rather than
+       * waiting for the next full render.
+       * @param {string} field
+       * @param {HTMLElement} el
+       * @returns {void}
+       */
+      function ntClearFieldErrorInline(field, el) {
+        ntClearFieldError(field);
+        el.classList.remove("err");
+        // The error message renders as a sibling *after* the field's own
+        // <label> (see ntFieldErrorHtml's call sites), not nested inside
+        // it, so this looks it up from the document rather than el's own
+        // parent.
+        const errDiv = document.querySelector(`[data-field-error="${field}"]`);
+        if (errDiv) errDiv.remove();
       }
       /**
        * Renders the Simple tab's form -- the template picker, prompt,
@@ -617,7 +821,11 @@
        */
       function ntSimpleTabHtml() {
         if (ntSimple.generating) {
-          return `<p style="color:var(--muted);font-size:13px">Generating${ntSimple.proofs ? " proof steps" : ""}${ntSimple.addReview && ntSimple.generateManualChecks ? (ntSimple.proofs ? " and manual checks" : " manual checks") : ""}… this calls the selected agent, so it may take a little while.</p>`;
+          const parts = [];
+          if (ntSimple.proofs) parts.push("proof steps");
+          if (ntSimple.reviewMode === "explicit" && !ntSimple.skipAutoBuild && ntSimple.generateAutoBuild) parts.push("auto-build steps");
+          if (ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks) parts.push("manual checks");
+          return `<p style="color:var(--muted);font-size:13px">Generating ${parts.join(" and ")}… this calls the selected agent, so it may take a little while.</p>`;
         }
         if (ntSimple.confirmStep) {
           const proofsSection = ntSimple.proofs
@@ -627,14 +835,21 @@
                 labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs.",
               })}`
             : "";
-          const checksSection = ntSimple.addReview && ntSimple.generateManualChecks
+          const checksSection = ntSimple.reviewMode === "explicit" && ntSimple.generateManualChecks
             ? `<h4 style="margin:10px 0 4px">Manual checks</h4>${ntListWidgetHtml(ntSimple.checkItems, "checks", {
                 labelPlaceholder: "label", valuePlaceholder: "what to check",
                 addLabel: "Add a manual check button reviewers will see on this review.",
                 labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try.",
               })}`
             : "";
-          return `<p style="color:var(--muted);font-size:13px">Review the generated items below — edit or remove any you don't want — then submit.</p>${proofsSection}${checksSection}`;
+          const buildsSection = ntSimple.reviewMode === "explicit" && !ntSimple.skipAutoBuild && ntSimple.generateAutoBuild
+            ? `<h4 style="margin:10px 0 4px">Auto-build steps</h4>${ntListWidgetHtml(ntSimple.buildItems, "builds", {
+                singleField: true, valuePlaceholder: "shell command",
+                addLabel: "Add a build command run when this review's branches merge.",
+                valueTip: "The shell command this build step runs.",
+              })}`
+            : "";
+          return `<p style="color:var(--muted);font-size:13px">Review the generated items below — edit or remove any you don't want — then submit.</p>${proofsSection}${buildsSection}${checksSection}`;
         }
         const templates = ntTemplates.length ? ntTemplates : [NT_FALLBACK_TEMPLATE];
         const t = ntSelectedTemplate();
@@ -642,8 +857,8 @@
         const fieldRows = (t.fields || []).map((f) => `
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="${esc(f.label || f.name)}${f.required ? " (required)" : " (optional)"} — a supplementary field for the &quot;${esc(t.label || t.name)}&quot; template, substituted into the generated prompt.">
             ${esc(f.label || f.name)}${f.required ? " *" : ""}
-            <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.fieldValues[f.name] || "")}" oninput="ntSimple.fieldValues[${JSON.stringify(f.name)}]=this.value">
-          </label>`).join("");
+            <input class="${ntFieldErrorText(`field:${f.name}`) ? "err" : ""}" style="${NT_INPUT_STYLE}" value="${esc(ntSimple.fieldValues[f.name] || "")}" oninput="ntSimple.fieldValues[${JSON.stringify(f.name)}]=this.value;ntClearFieldErrorInline(${JSON.stringify(`field:${f.name}`)}, this)">
+          </label>${ntFieldErrorHtml(`field:${f.name}`)}`).join("");
         const catalog = ntAgentCatalog.length ? ntAgentCatalog : NT_FALLBACK_AGENTS;
         const sortedCatalog = [...catalog].sort((a, b) => a.id.localeCompare(b.id));
         const agentOptions = sortedCatalog.map((a) => `<option value="${esc(a.id)}" ${a.id === ntSimple.agent ? "selected" : ""}>${esc(a.id)}${a.id === ntAgentCatalogDefault ? " (default)" : ""}</option>`).join("");
@@ -653,7 +868,7 @@
         const selectedProject = projects.find((p) => p.name === ntSimple.project);
         const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
         return `
-          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in \\&quot;Hello World (Built-in)\\&quot; template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
+          <label style="display:block;font-size:12px;color:var(--muted)" data-tip="${ntTemplatesFallback ? "No [[templates]] are configured in .ralphus.toml — using the built-in default template. See docs/simple-task-templates.md to define your own." : "Choose a template — see docs/simple-task-templates.md for the schema. Templates are defined under [[templates]] in .ralphus.toml."}">
             Template
             <select style="${NT_INPUT_STYLE}" ${ntTemplatesFallback ? "disabled" : ""} onchange="ntSimple.templateName=this.value;ntSimple.fieldValues={};renderNewTaskModal()">${templateOptions}</select>
           </label>
@@ -661,12 +876,14 @@
           ${fieldRows}
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="The instruction the work cell's agent runs. Combined with the selected template's supplementary fields, if any.">
             Prompt
-            <textarea style="${NT_INPUT_STYLE};height:90px" oninput="ntSimple.prompt=this.value">${esc(ntSimple.prompt)}</textarea>
+            <textarea class="${ntFieldErrorText("prompt") ? "err" : ""}" style="${NT_INPUT_STYLE};height:90px" placeholder="${NT_PROMPT_PLACEHOLDER}" oninput="ntSimple.prompt=this.value;ntClearFieldErrorInline('prompt', this)">${esc(ntSimple.prompt)}</textarea>
           </label>
-          <div class="row" style="gap:8px;margin-top:8px">
+          ${ntFieldErrorHtml("prompt")}
+          <div class="row" style="gap:8px;margin-top:8px;align-items:flex-start">
             <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which agent backend runs the work cell. Independent of the chosen project — not scoped to any particular worktree.">
               Agent
-              <select style="${NT_INPUT_STYLE}" onchange="ntSimple.agent=this.value;ntSimple.model='';renderNewTaskModal()">${agentOptions}</select>
+              <select class="${ntFieldErrorText("agent") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.agent=this.value;ntSimple.model='';ntClearFieldError('agent');renderNewTaskModal()">${agentOptions}</select>
+              ${ntFieldErrorHtml("agent")}
             </label>
             <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The model to use. Choices are scoped to the selected agent when known, but you can type any model name — an unsupported value fails at submit time, not as you type.">
               Model
@@ -674,31 +891,50 @@
               <datalist id="nt-model-list">${modelDatalist}</datalist>
             </label>
           </div>
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="Which registered project the work runs against. The task always runs in a fresh worktree branch for this project — never the project's raw checkout directly.">
-            Project
-            <select style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
-          </label>
-          ${showUpstream ? `
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:8px" data-tip="The branch the fresh worktree starts from. Leave blank to use the project's default branch. Checked against the project's real branches when you submit.">
-            Upstream branch (optional)
-            <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamBranch)}" oninput="ntSimple.upstreamBranch=this.value" placeholder="(project default)">
-          </label>` : ""}
+          <div class="row" style="gap:8px;margin-top:8px;align-items:flex-start">
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which registered project the work runs against. The task always runs in a fresh worktree branch for this project — never the project's raw checkout directly.">
+              Project
+              <select class="${ntFieldErrorText("project") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;ntClearFieldError('project');renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
+              ${ntFieldErrorHtml("project")}
+            </label>
+            ${showUpstream ? `
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The branch the fresh worktree starts from. Leave blank to use the project's default branch. Checked against the project's real branches when you submit.">
+              Upstream branch (optional)
+              <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamBranch)}" oninput="ntSimple.upstreamBranch=this.value" placeholder="(project default)">
+            </label>` : ""}
+          </div>
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose proof step(s) — commands that must pass — against this project's codebase before you submit, shown to you for edit/removal first. You can also add proof steps by hand regardless of this checkbox.">
             <input type="checkbox" ${ntSimple.proofs ? "checked" : ""} onchange="ntSimple.proofs=this.checked;renderNewTaskModal()"> Generate proof steps
           </label>
           ${ntSimple.proofItems.length
             ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.proofItems, "proofs", { labelPlaceholder: "id", valuePlaceholder: "shell command", addLabel: "Add a proof step by hand.", labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs." })}</div>`
             : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('proofs')" data-tip="Add a proof step by hand, without generating one.">+ Add a proof step by hand</button>`}
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, generates a [[review]] block for this task so it shows up in the Reviews tab for approval.">
-            <input type="checkbox" ${ntSimple.addReview ? "checked" : ""} onchange="ntSimple.addReview=this.checked;renderNewTaskModal()"> Add a review
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure manual checks and auto-build steps now.\n&quot;No Review&quot; skips review entirely.">
+            Review
+            <select style="${NT_INPUT_STYLE}" onchange="ntSimple.reviewMode=this.value;renderNewTaskModal()">
+              <option value="auto" ${ntSimple.reviewMode === "auto" ? "selected" : ""}>Auto Review</option>
+              <option value="explicit" ${ntSimple.reviewMode === "explicit" ? "selected" : ""}>Add a Review</option>
+              <option value="none" ${ntSimple.reviewMode === "none" ? "selected" : ""}>No Review</option>
+            </select>
           </label>
-          ${ntSimple.addReview ? `
-          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px;margin-left:16px" data-tip="When checked, the selected agent/model is asked to propose manual check button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add manual checks by hand regardless of this checkbox.">
+          ${ntSimple.reviewMode === "explicit" ? `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Every review must say how (or whether) it builds. Checked (the default) means this review deliberately has no build step (skip_auto_build = true). Uncheck to generate or hand-author build command(s) run when this review's branches merge instead.">
+            <input type="checkbox" ${ntSimple.skipAutoBuild ? "checked" : ""} onchange="ntSimple.skipAutoBuild=this.checked;renderNewTaskModal()"> Skip auto-build
+          </label>
+          ${!ntSimple.skipAutoBuild ? `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px" data-tip="When checked, the selected agent/model is asked to propose build/compile command(s) to run automatically when this review's branches merge, shown to you for edit/removal first. You can also add auto-build steps by hand regardless of this checkbox.">
+            <input type="checkbox" ${ntSimple.generateAutoBuild ? "checked" : ""} onchange="ntSimple.generateAutoBuild=this.checked;renderNewTaskModal()"> Generate auto-build steps
+          </label>
+          ${ntSimple.buildItems.length
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.buildItems, "builds", { singleField: true, valuePlaceholder: "shell command", addLabel: "Add an auto-build step by hand.", valueTip: "The shell command this build step runs when the review's branches merge." })}</div>`
+            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('builds')" data-tip="Add an auto-build step by hand, without generating one.">+ Add an auto-build step by hand</button>`}
+          ` : ""}
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose manual check button(s) reviewers can run against this project's codebase before you submit, shown to you for edit/removal first. You can also add manual checks by hand regardless of this checkbox.">
             <input type="checkbox" ${ntSimple.generateManualChecks ? "checked" : ""} onchange="ntSimple.generateManualChecks=this.checked;renderNewTaskModal()"> Generate manual checks
           </label>
           ${ntSimple.checkItems.length
-            ? `<div style="margin-top:6px;margin-left:16px">${ntListWidgetHtml(ntSimple.checkItems, "checks", { labelPlaceholder: "label", valuePlaceholder: "what to check", addLabel: "Add a manual check by hand.", labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try." })}</div>`
-            : `<button class="btn" style="margin-top:6px;margin-left:16px" onclick="ntListAdd('checks')" data-tip="Add a manual check by hand, without generating one.">+ Add a manual check by hand</button>`}
+            ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.checkItems, "checks", { labelPlaceholder: "label", valuePlaceholder: "what to check", addLabel: "Add a manual check by hand.", labelTip: "The manual check's button label.", valueTip: "What a reviewer should check or try." })}</div>`
+            : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('checks')" data-tip="Add a manual check by hand, without generating one.">+ Add a manual check by hand</button>`}
           ` : ""}`;
       }
       /**
@@ -707,13 +943,25 @@
        * (concurrently when more than one is enabled) and shows the confirm
        * step instead of submitting; a second click (now `confirmStep`)
        * assembles the TOML and submits.
+       *
+       * Field errors (prompt/agent/project/template fields) render two ways:
+       * inline, next to each offending field (via `ntSimple.fieldErrors` +
+       * `ntFieldErrorHtml`, read by `ntSimpleTabHtml` on the `renderNewTaskModal()`
+       * call below), and as a single generic pointer in the shared `#nt-err`
+       * panel -- re-fetched fresh afterward since that render just replaced
+       * the DOM node the earlier `byId("nt-err")` reference pointed at.
        * @returns {Promise<void>}
        */
       async function submitTaskSimple() {
-        const errEl = byId("nt-err");
-        errEl.innerHTML = "";
+        byId("nt-err").innerHTML = "";
         const fieldErrors = ntSimpleValidateFields();
-        if (fieldErrors.length) { errEl.innerHTML = fieldErrors.map((e) => esc(e)).join("<br>"); return; }
+        ntSimple.fieldErrors = fieldErrors;
+        if (fieldErrors.length) {
+          renderNewTaskModal();
+          byId("nt-err").textContent = "Errors prevented submission — please fix before continuing.";
+          return;
+        }
+        const errEl = byId("nt-err");
         const upstreamError = await ntSimpleValidateUpstream();
         if (upstreamError) { errEl.textContent = upstreamError; return; }
 
@@ -729,10 +977,16 @@
           if (kinds.includes("manual_checks")) {
             jobs.push(ntRunGenerationStep("manual_checks").then((items) => { if (items) ntSimple.checkItems = ntSimple.checkItems.concat(items); }));
           }
+          if (kinds.includes("auto_build_steps")) {
+            jobs.push(ntRunGenerationStep("auto_build_steps").then((items) => { if (items) ntSimple.buildItems = ntSimple.buildItems.concat(items); }));
+          }
           await Promise.all(jobs);
           ntSimple.generating = false;
           ntSimple.confirmStep = true;
-          renderNewTaskModal();
+          // The modal may have been cancelled while these jobs were still
+          // running (they poll for up to 120s) -- only pop it back open on
+          // the confirm step if it's still the thing on screen.
+          if (ntModalOpen && ntTab === "simple") renderNewTaskModal();
           return;
         }
 
@@ -742,9 +996,23 @@
           errEl.innerHTML = (v.errors || []).map((e) => `line ${e.line ?? "?"}: ${esc(e.message)}`).join("<br>") || "validation failed";
           return;
         }
-        const resp = await fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label: ntSimple.prompt.slice(0, 60) || null }) });
+        /** @type {(label: string|null) => Promise<Response>} */
+        const postSquad = (label) => fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label }) });
+        let resp = await postSquad(ntSanitizeSquadLabel(ntSimple.prompt));
+        if (!resp.ok) {
+          const b = await resp.json().catch(() => ({}));
+          // The label is sanitized above, but if the daemon still rejects
+          // it for some reason not anticipated here, fall back to no label
+          // at all (the squad id shows instead) rather than blocking submission.
+          if (b.error && b.error.code === "invalid_label") {
+            resp = await postSquad(null);
+          } else {
+            errEl.textContent = (b.error && b.error.message) || "submit failed";
+            return;
+          }
+        }
         if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
-        ntSimpleReset();
+        ntSimpleResetKeepingProjectFields();
         closeModal(); tick();
       }
 

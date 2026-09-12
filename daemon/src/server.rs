@@ -680,6 +680,11 @@ fn route_for_user(
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
         ("GET", ["api", "projects", name, "branches"]) => project_branches(daemon, name),
+        ("POST", ["api", "projects", name, "default-branch", "autofix"]) => {
+            admin_gated(daemon, user_header, || {
+                project_autofix_default_branch(daemon, name)
+            })
+        }
         // RAL-338: fork registration. Reads open to every caller (matches the
         // `projects` pattern above); mutations admin-gated like
         // `register_project`. `GET /api/project-forks` is the unscoped list
@@ -887,6 +892,7 @@ fn route_for_user(
         // RAL-297: Simple task form's opt-in "generation step" primitive.
         ("POST", ["api", "generate"]) => generate_start(daemon, body),
         ("GET", ["api", "generate", id]) => generate_status(daemon, id),
+        ("POST", ["api", "generate", id, "cancel"]) => generate_cancel(daemon, id),
         ("POST", ["api", "clear"]) => clear_all(daemon, body),
         ("GET", ["api", "queue"]) => queue(daemon),
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
@@ -3576,15 +3582,82 @@ fn project_branches(daemon: &Daemon, name: &str) -> Reply {
 }
 
 #[derive(Serialize)]
+struct ProjectAutofixDefaultBranchResponse {
+    branch: String,
+}
+
+/// `POST /api/projects/{name}/default-branch/autofix`: the one-click "Fix"
+/// action for the `?upstream=<<default>>` error surfaced by
+/// `daemon/src/worktrees.rs::default_branch` when a registered project has
+/// no `refs/remotes/origin/HEAD` symref (a repo that was never `git clone`d,
+/// e.g. `git init` + `git remote add`). Runs `git remote set-head origin
+/// --auto` in the project's path — same command the error message already
+/// tells the user to run by hand — then reports the branch it resolved to.
+/// Always targets `origin` specifically, never a fallback remote: `origin`
+/// is what `default_branch()` tries first and what the vast majority of
+/// projects actually use, and a one-click action needs one unambiguous
+/// remote to act on rather than guessing among several.
+fn project_autofix_default_branch(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_project(name) {
+        Ok(Some(p)) if p.vcs == "git" => {
+            let root = std::path::Path::new(&p.path);
+            if let Err(e) =
+                crate::guardian_merge::git(root, &["remote", "set-head", "origin", "--auto"])
+            {
+                return error(
+                    400,
+                    "autofix_failed",
+                    &format!("`git remote set-head origin --auto` failed: {e}"),
+                    vec![],
+                );
+            }
+            match crate::guardian_merge::git(
+                root,
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            ) {
+                Ok(out) => {
+                    let branch = out.trim().trim_start_matches("origin/").to_string();
+                    json(200, &ProjectAutofixDefaultBranchResponse { branch })
+                }
+                Err(e) => error(
+                    500,
+                    "autofix_failed",
+                    &format!("set-head succeeded but re-reading it failed: {e}"),
+                    vec![],
+                ),
+            }
+        }
+        Ok(Some(_)) => error(
+            400,
+            "bad_request",
+            &format!("project \"{name}\" is not a git project"),
+            vec![],
+        ),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("project \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Serialize)]
 struct GenerateStartResponse {
     id: String,
 }
 
 /// `POST /api/generate` (RAL-297): kicks off one "generation step" (Simple
-/// form's opt-in "Generate Proofs"/"Generate Manual Checks") on a background
-/// thread and returns `202` immediately with a job id -- see
-/// `crate::generation`'s module doc comment for why this can't block the
-/// accept loop. Poll `GET /api/generate/{id}` for the result.
+/// form's opt-in "Generate Proofs"/"Generate Manual Checks"/"Generate
+/// Auto-Build Steps") on a background thread and returns `202` immediately
+/// with a job id -- see `crate::generation`'s module doc comment for why
+/// this can't block the accept loop. Poll `GET /api/generate/{id}` for the
+/// result, or `POST /api/generate/{id}/cancel` to kill it (`generate_cancel`).
+/// A cancel token for `id` is registered in the daemon's shared
+/// `Cancellations` registry -- the same one `crate::scheduler` registers a
+/// squad's cells under -- for the lifetime of the background thread, so
+/// cancelling a generation job really does kill its agent subprocess.
 fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     let req: crate::generation::GenerateRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -3601,15 +3674,19 @@ fn generate_start(daemon: &Daemon, body: &str) -> Reply {
         return error(
             400,
             "bad_request",
-            "kind must be \"proof_steps\" or \"manual_checks\"",
+            "kind must be \"proof_steps\", \"manual_checks\", or \"auto_build_steps\"",
             vec![],
         );
     }
     let id = daemon.generation_jobs.start();
     let jobs = daemon.generation_jobs.clone();
     let job_id = id.clone();
+    let cancellations = daemon.cancellations_handle();
+    let cancel_id = id.clone();
     std::thread::spawn(move || {
-        let result = crate::generation::run_generation(&req);
+        let token = cancellations.register(&cancel_id);
+        let result = crate::generation::run_generation(&req, &token);
+        cancellations.remove(&cancel_id);
         jobs.finish(&job_id, result);
     });
     json(202, &GenerateStartResponse { id })
@@ -3622,6 +3699,20 @@ fn generate_status(daemon: &Daemon, id: &str) -> Reply {
         Some(job) => json(200, &job),
         None => error(404, "not_found", "no such generation job", vec![]),
     }
+}
+
+/// `POST /api/generate/{id}/cancel`: kills the agent subprocess backing
+/// generation job `id`, if it is still running -- "Cancel" in the New Task
+/// modal really does mean cancel, including a "Generate proof steps"/
+/// "Generate manual checks"/"Generate auto-build steps" call still in
+/// flight. Mirrors `cancel`'s (`POST /api/squads/{id}/cancel`) use of the
+/// same `Cancellations` registry. Always `202`, even for a job that already
+/// finished or never existed -- either way there is nothing left to stop,
+/// and the board fires this best-effort on modal close without checking the
+/// job's current status first.
+fn generate_cancel(daemon: &Daemon, id: &str) -> Reply {
+    daemon.cancellations_handle().cancel(id);
+    json(202, &serde_json::json!({}))
 }
 
 fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
@@ -3713,18 +3804,25 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         Ok(id) => id,
         Err(e) => return store_error(&e),
     };
-    // RAL-318: classify every Triage-opted-in cell exactly once, before it
-    // reaches the pool -- either its own inline `triage_type` (already
-    // validated as registered above), or a fresh Arbiter classification.
-    // Single-attempt, no retry: `arbiter::classify` itself falls back to
-    // `unclassified` on any failure, so this never blocks or slows down
-    // submission beyond one headless LLM call per un-typed Triage cell.
-    let arbiter = crate::arbiter::Arbiter::current();
+    // RAL-318: resolve every Triage-opted-in cell's type before it reaches
+    // the pool. A cell with its own inline `triage_type` (already validated
+    // as registered above) resolves for free, right here -- just a store
+    // write, no git or LLM call. A cell with none needs a real Arbiter
+    // classification call, which is NOT run here -- it's deferred, along
+    // with Triage pooling itself (see below), to a background thread
+    // (`crate::arbiter::spawn_triage_followup`, spawned below, once this
+    // squad can no longer be rolled back) instead, since running a live,
+    // sometimes multi-second LLM round-trip inline would make every "Auto
+    // Review" submission (the Simple tab's default) as slow as that call --
+    // see `crate::arbiter::classify`'s doc comment.
+    let mut pending_classifications = Vec::new();
+    let mut has_triage = false;
     for (task_idx, task) in file.task.iter().enumerate() {
         for (idx, cell) in task.cell.iter().enumerate() {
             if !cell.triage {
                 continue;
             }
+            has_triage = true;
             let (task_idx, idx) = (task_idx as i64, idx as i64);
             let inline_types: Vec<String> = cell
                 .triage_type
@@ -3734,18 +3832,22 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .collect();
-            let resolved_types = if inline_types.is_empty() {
+            if inline_types.is_empty() {
                 let cell_id = cell.id.clone().unwrap_or_else(|| format!("cell-{idx}"));
                 let context = cell
                     .prompt
                     .clone()
                     .or_else(|| cell.command.clone())
                     .unwrap_or_default();
-                crate::arbiter::classify(&store, &arbiter, &squad_id, &cell_id, &context)
+                pending_classifications.push(crate::arbiter::PendingClassification {
+                    task_idx,
+                    idx,
+                    cell_id,
+                    context,
+                });
             } else {
-                inline_types
-            };
-            let _ = store.set_cell_triage_types(&squad_id, task_idx, idx, &resolved_types);
+                let _ = store.set_cell_triage_types(&squad_id, task_idx, idx, &inline_types);
+            }
         }
     }
 
@@ -3755,14 +3857,32 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         let _ = store.delete_squad(&squad_id);
         return error(400, "review_preflight_failed", &e.message, vec![]);
     }
-    // RAL-318: pool every Triage-opted-in cell and fire any pool whose count
-    // threshold this submission just reached. Failures here mirror
-    // `derive_reviews`'s rollback -- Triage pooling shares the same worktree/
-    // upstream preconditions.
-    if let Err(e) = crate::reviews::derive_triage_pools(&store, &squad_id, &file) {
-        let _ = store.delete_squad(&squad_id);
-        return error(400, "review_preflight_failed", &e.message, vec![]);
-    }
+    // RAL-318: Triage pooling -- and the worktree placeholder resolution
+    // (a real, sometimes multi-second `git worktree add`, see
+    // `worktrees::resolve_placeholders`'s doc comment) `derive_triage_pools`
+    // does to get there -- is NOT run here. It used to run synchronously at
+    // this point for any already-typed (inline `triage_type`) cell, which
+    // meant a plain "Auto Review" submission (the Simple tab's default: one
+    // `triage = true` cell, no inline type) still paid that same
+    // worktree-creation cost inline even though its classification was
+    // already deferred. It's handed off, for every Triage-opted cell
+    // regardless of typed/pending, to the same background thread as
+    // classification (`spawn_triage_followup` below) instead. A preflight
+    // failure there (bad worktree, no upstream) no longer rolls this squad
+    // back -- it's logged (rlog + a Cartographer note, see
+    // `spawn_triage_followup`) rather than rejecting the submit, the same
+    // posture `crate::arbiter::classify` already takes toward its own
+    // failures (fall back rather than block).
+    // The squad is committed past this point (no more rollback paths below),
+    // so it's now safe to hand Triage classification/pooling off to the
+    // background follow-up thread.
+    crate::arbiter::spawn_triage_followup(
+        daemon.store_handle(),
+        squad_id.clone(),
+        file.clone(),
+        pending_classifications,
+        has_triage,
+    );
     let state = if req.hold {
         SquadState::Queued
     } else {
@@ -13504,6 +13624,62 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     fn project_branches_route_unregistered_name_is_404() {
         let d = daemon();
         let r = route(&d, "GET", "/api/projects/nope/branches", "");
+        assert_eq!(r.status, 404);
+        assert!(r.body.contains("not_found"));
+    }
+
+    #[test]
+    fn project_autofix_default_branch_route_sets_origin_head_and_reports_the_branch() {
+        let d = daemon();
+        let upstream = tmp_git_repo("autofix-upstream");
+        let repo = tmp_git_repo("autofix-clone");
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", "origin", &upstream.to_string_lossy()])
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success());
+        // `git remote set-head --auto` only re-points the local
+        // refs/remotes/origin/HEAD symref onto an already-known
+        // remote-tracking branch -- it doesn't fetch content -- so the test
+        // repo needs one real `fetch` first, exactly as a normal `git clone`
+        // (which does both) leaves a repo in.
+        let status = std::process::Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&repo)
+            .status()
+            .expect("git");
+        assert!(status.success());
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(&d, "POST", "/api/projects/proj/default-branch/autofix", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"branch\":\"main\""), "{}", r.body);
+    }
+
+    #[test]
+    fn project_autofix_default_branch_route_fails_clearly_with_no_origin_remote() {
+        let d = daemon();
+        let repo = tmp_git_repo("autofix-no-remote");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(&d, "POST", "/api/projects/proj/default-branch/autofix", "");
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("autofix_failed"), "{}", r.body);
+    }
+
+    #[test]
+    fn project_autofix_default_branch_route_unregistered_name_is_404() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/projects/nope/default-branch/autofix", "");
         assert_eq!(r.status, 404);
         assert!(r.body.contains("not_found"));
     }
