@@ -257,6 +257,14 @@ selection/linked-movement cue (`--accent`/`--teal`); `--arbiter` exists only
 because no existing role fit this new concept (see "Adding a new UI element"
 below).
 
+The same role, and the exact same badge markup, also marks a cell whose
+monorepo **subproject** (RAL-346, see `docs/glossary.md`) was inferred by the
+Arbiter's async description-matching step rather than seeded from the cell's
+own manually-declared `subprojects` TOML field — it's the identical
+provenance signal ("the Arbiter made this, not a human"), just attached to a
+different field, so it reuses `--arbiter` rather than adding a second
+purple-ish variable for what is semantically the same concept.
+
 ### Inherited resolved value — italic text only (no new color)
 A detail-pane field whose displayed value is a resolved fallback from a parent
 scope (for example, a cell `agent` inherited from its task, or a proof

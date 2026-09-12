@@ -14,6 +14,18 @@
 //! error, or an unparseable/unrecognized reply all permanently assign
 //! [`UNCLASSIFIED_TYPE`] rather than retrying. This module owns that
 //! decision; storage of the result lives in `crate::triage`.
+//!
+//! RAL-346 adds a second, independent Arbiter responsibility:
+//! [`infer_subprojects`] matches a cell's description against its project's
+//! configured monorepo subprojects (`crate::config::MonorepoConfig`, seeded
+//! only when the cell declared no manual `CellDef.subprojects` of its own),
+//! so Triage pools can key by `(project, subproject)` rather than just
+//! `(project)`. It shares this module's classification posture (single
+//! attempt, no retry) and the same `[arbiter] maximum_budget_usd` cap, but
+//! unlike classification's `UNCLASSIFIED_TYPE` fallback, a failed/no-match
+//! inference simply leaves the cell [`crate::triage::SubprojectResolution::
+//! Unresolved`] -- see that type's doc comment for the full three-state
+//! model.
 
 use std::sync::{Arc, Mutex};
 
@@ -261,6 +273,159 @@ pub fn classify(
     note_and_return(&guard, squad_id, cell_id, &names, &detail)
 }
 
+/// Build the subproject-inference system prompt listing every candidate
+/// subproject identifier (RAL-346). Mirrors [`classification_system_prompt`]'s
+/// shape; a subproject has no label/description the way a `TriageTypeView`
+/// does (`crate::config::MonorepoConfig` is a plain name list), so the
+/// candidate list is just the bare names.
+fn subproject_inference_system_prompt(candidates: &[String]) -> String {
+    let list = candidates
+        .iter()
+        .map(|s| format!("- {s}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are the Arbiter, a router that matches a unit of work's description against the \
+         following known subprojects of a monorepo, based on its content. A unit of work may \
+         genuinely touch more than one subproject at once -- name every one that applies. If \
+         none of the subprojects plausibly apply, reply with exactly the single word NONE. \
+         Otherwise reply with ONLY a comma-separated list of the matching subproject name(s) and \
+         nothing else -- no punctuation beyond the commas, no explanation, no surrounding \
+         quotes.\n\n{list}"
+    )
+}
+
+/// Parse the Arbiter's subproject-inference reply against the candidate
+/// names: a comma-separated list, each matched exact (case-insensitive,
+/// after trimming whitespace/quotes/trailing punctuation) -- the same
+/// matching rules as [`parse_classification_reply`], generalized to plain
+/// `&str` candidates since a subproject carries no label/description.
+/// Unrecognized/empty entries (including the literal `NONE` sentinel) are
+/// dropped; duplicates collapsed, first-seen order kept.
+fn parse_subproject_reply(reply: &str, candidates: &[String]) -> Vec<String> {
+    let mut matched: Vec<String> = Vec::new();
+    for piece in reply.split(',') {
+        let picked = piece
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c.is_whitespace());
+        if picked.is_empty() || picked.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        if let Some(c) = candidates.iter().find(|c| c.eq_ignore_ascii_case(picked)) {
+            if !matched.iter().any(|m| m == c) {
+                matched.push(c.clone());
+            }
+        }
+    }
+    matched
+}
+
+/// The Arbiter's async subproject-inference step (RAL-346): match
+/// `cell_context` (the cell's own prompt/description) against
+/// `candidates` (a project's configured `[monorepo] subprojects` list) and
+/// return every one the Arbiter judges applicable. Single attempt, no
+/// retry -- mirroring [`classify`]'s posture -- but unlike `classify` there
+/// is no `UNCLASSIFIED_TYPE`-style permanent fallback sentinel: any failure
+/// (over budget, unsupported backend, provider error, no match found)
+/// simply returns `None`, leaving the cell's resolution
+/// [`crate::triage::SubprojectResolution::Unresolved`] rather than writing
+/// anything -- per this ticket's binding decision to default to "leave
+/// Unresolved" rather than invent a value. Shares the same
+/// `[arbiter] maximum_budget_usd` cap as `classify` (RAL-346: "the same
+/// subsystem doing more work, not a separate budget line").
+///
+/// Locks `store` only for the brief reads/writes around the real work,
+/// exactly like `classify` -- the live LLM call itself runs with the lock
+/// dropped.
+#[must_use]
+pub fn infer_subprojects(
+    store: &Arc<Mutex<Store>>,
+    arbiter: &Arbiter,
+    squad_id: &str,
+    cell_id: &str,
+    cell_context: &str,
+    candidates: &[String],
+) -> Option<Vec<String>> {
+    if candidates.is_empty() || cell_context.trim().is_empty() {
+        return None;
+    }
+    {
+        let guard = store.lock().expect("store mutex poisoned");
+        if over_budget(&guard, arbiter) {
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(cell_id)
+                .emit(
+                    &guard,
+                    "Arbiter subproject inference skipped: maximum_budget_usd cap already reached",
+                    serde_json::json!({}),
+                );
+            return None;
+        }
+    }
+    let system = subproject_inference_system_prompt(candidates);
+    let messages = [ChatMessage {
+        role: "user",
+        content: cell_context.to_string(),
+        image: None,
+    }];
+    let (reply, usage) = match chat_client::call_direct_with_usage(
+        &arbiter.agent,
+        arbiter.model.as_deref(),
+        &system,
+        &messages,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let guard = store.lock().expect("store mutex poisoned");
+            crate::cartographer::Note::new("arbiter")
+                .squad(squad_id)
+                .cell(cell_id)
+                .emit(
+                    &guard,
+                    format!("Arbiter subproject inference call failed: {e}"),
+                    serde_json::json!({}),
+                );
+            return None;
+        }
+    };
+    let cost = estimate_cost_usd(
+        &arbiter.agent,
+        arbiter.model.as_deref().unwrap_or_default(),
+        usage,
+    );
+    let guard = store.lock().expect("store mutex poisoned");
+    let _ = guard.record_arbiter_cost(
+        "subproject_inference",
+        usage.tokens_in as i64,
+        usage.tokens_out as i64,
+        cost,
+    );
+    let matched = parse_subproject_reply(&reply, candidates);
+    if matched.is_empty() {
+        crate::cartographer::Note::new("arbiter")
+            .squad(squad_id)
+            .cell(cell_id)
+            .emit(
+                &guard,
+                format!(
+                    "Arbiter found no subproject match in reply {reply:?}; cell stays unresolved"
+                ),
+                serde_json::json!({}),
+            );
+        return None;
+    }
+    crate::cartographer::Note::new("arbiter")
+        .squad(squad_id)
+        .cell(cell_id)
+        .emit(
+            &guard,
+            format!("Arbiter inferred subproject(s) [{}]", matched.join(", ")),
+            serde_json::json!({ "subprojects": matched }),
+        );
+    Some(matched)
+}
+
 /// One Triage-opted-in cell that had no inline `triage_type` at submit time,
 /// so it still needs an Arbiter classification call -- collected by `submit`
 /// during its synchronous validation pass, classified later by
@@ -272,14 +437,41 @@ pub struct PendingClassification {
     pub context: String,
 }
 
-/// Classifies every `pending` cell, then (whenever `has_triage` -- i.e. this
+/// One Triage-opted-in cell that declared no manual `CellDef.subprojects` at
+/// submit time, so it still needs the Arbiter's async subproject-inference
+/// step (RAL-346) -- collected by `submit` during its synchronous validation
+/// pass (mirroring [`PendingClassification`]), resolved later by
+/// [`spawn_triage_followup`]. A cell whose `CellDef.subprojects` *was*
+/// non-empty never becomes one of these -- `submit` seeds its resolution
+/// directly (`Store::set_cell_subprojects`, `inferred = false`), no LLM call
+/// needed.
+pub struct PendingSubprojectResolution {
+    pub task_idx: i64,
+    pub idx: i64,
+    pub cell_id: String,
+    /// The cell's declared `cwd`, used to locate its project's
+    /// `.ralphus.toml` (`crate::config::load_monorepo_config`). `None`, or a
+    /// `ralphus:`-prefixed worktree placeholder not yet materialized into a
+    /// real path, both leave this cell `Unresolved` -- resolving a
+    /// placeholder here would duplicate `derive_triage_pools`' own worktree
+    /// materialization pass just to find out whether the project is even a
+    /// monorepo, so this simpler, synchronous-friendly signal is used
+    /// instead; a cell whose only `cwd` is a placeholder simply stays
+    /// `Unresolved` and its keying falls back to the plain project key,
+    /// same as any other not-yet-resolved monorepo cell.
+    pub cwd: Option<String>,
+    pub context: String,
+}
+
+/// Classifies every `pending` cell, resolves every `pending_subprojects`
+/// cell's RAL-346 subproject state, then (whenever `has_triage` -- i.e. this
 /// submission has at least one Triage-opted-in cell at all, typed or not)
 /// runs [`crate::reviews::derive_triage_pools`] for `squad_id`, all on one
 /// background thread. Spawned from `submit` right after its HTTP response is
-/// built, so neither the classification calls (one real, sometimes
-/// multi-second LLM round-trip per un-typed cell) nor `derive_triage_pools`
-/// itself (which resolves each cell's worktree placeholder -- a real,
-/// sometimes multi-second `git worktree add` against a large repo, see
+/// built, so neither the classification/inference calls (one real, sometimes
+/// multi-second LLM round-trip each) nor `derive_triage_pools` itself (which
+/// resolves each cell's worktree placeholder -- a real, sometimes
+/// multi-second `git worktree add` against a large repo, see
 /// `worktrees::resolve_placeholders`'s doc comment) ever hold up that
 /// response. This used to run `derive_triage_pools` synchronously in
 /// `submit` for any already-typed (inline `triage_type`) cell, which made
@@ -289,21 +481,32 @@ pub struct PendingClassification {
 /// submission; moving it here as well fixes that for every case, not just
 /// the classification one.
 ///
+/// The subproject-inference pass runs strictly before `derive_triage_pools`
+/// so its result (if any) is already persisted (`Store::set_cell_subprojects`)
+/// by the time pool keys are computed -- but a cell for which it finds no
+/// match, or can't even attempt (no real `cwd` yet, see
+/// [`PendingSubprojectResolution::cwd`]'s doc comment), simply stays
+/// `Unresolved` and `derive_triage_pools` falls back to the plain
+/// project-name key for it, exactly as if this step hadn't run at all
+/// (RAL-346: "a cell must not be blocked from being picked up for work if
+/// the Arbiter step hasn't finished yet").
+///
 /// Mirrors `crate::generation`'s jobs never blocking on `POST
 /// /api/generate`, and the store-handle-in-a-thread shape `crate::pr::
 /// start_resync_pr_bases` uses. `derive_triage_pools` already tolerates a
 /// cell with no resolved type yet (see its doc comment) by skipping it, so
 /// leaving these cells un-pooled at submit time and re-running pooling here
-/// once they're classified is safe. A no-op when neither `pending` nor
-/// `has_triage` calls for anything.
+/// once they're classified is safe. A no-op when `pending`,
+/// `pending_subprojects`, and `has_triage` all call for nothing.
 pub fn spawn_triage_followup(
     store_handle: Arc<Mutex<Store>>,
     squad_id: String,
     file: ralphus_core::schema::TaskFile,
     pending: Vec<PendingClassification>,
+    pending_subprojects: Vec<PendingSubprojectResolution>,
     has_triage: bool,
 ) {
-    if pending.is_empty() && !has_triage {
+    if pending.is_empty() && pending_subprojects.is_empty() && !has_triage {
         return;
     }
     std::thread::spawn(move || {
@@ -312,6 +515,9 @@ pub fn spawn_triage_followup(
             let types = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
             let guard = store_handle.lock().expect("store mutex poisoned");
             let _ = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types);
+        }
+        for p in &pending_subprojects {
+            resolve_pending_subprojects(&store_handle, &arbiter, &squad_id, p);
         }
         let guard = store_handle.lock().expect("store mutex poisoned");
         if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file) {
@@ -329,6 +535,42 @@ pub fn spawn_triage_followup(
                 );
         }
     });
+}
+
+/// One `pending_subprojects` cell's worth of [`spawn_triage_followup`]'s
+/// work (RAL-346): decide whether its project is even a monorepo, and if
+/// so, run [`infer_subprojects`] and persist a match. A no-op (leaving the
+/// cell `Unresolved`) when `cwd` is absent, is an unmaterialized
+/// `ralphus:` worktree placeholder, or the project's `.ralphus.toml`
+/// configures no `[monorepo] subprojects` at all.
+fn resolve_pending_subprojects(
+    store_handle: &Arc<Mutex<Store>>,
+    arbiter: &Arbiter,
+    squad_id: &str,
+    p: &PendingSubprojectResolution,
+) {
+    let Some(cwd) = p.cwd.as_deref() else {
+        return;
+    };
+    if cwd.starts_with("ralphus:") {
+        return;
+    }
+    let monorepo = crate::config::load_monorepo_config(std::path::Path::new(cwd));
+    if !monorepo.is_monorepo() {
+        return;
+    }
+    let Some(matched) = infer_subprojects(
+        store_handle,
+        arbiter,
+        squad_id,
+        &p.cell_id,
+        &p.context,
+        &monorepo.subprojects,
+    ) else {
+        return;
+    };
+    let guard = store_handle.lock().expect("store mutex poisoned");
+    let _ = guard.set_cell_subprojects(squad_id, p.task_idx, p.idx, &matched, true);
 }
 
 fn note_and_return(
@@ -653,5 +895,107 @@ mod tests {
             tokens_out: 1_000_000,
         };
         assert!(estimate_cost_usd("claude", "claude-haiku-4-5", usage) > 0.0);
+    }
+
+    // ── RAL-346: subproject inference ───────────────────────────────────────
+
+    #[test]
+    fn parse_subproject_reply_matches_case_insensitively_and_trims() {
+        let candidates = vec!["core".to_string(), "utils".to_string()];
+        assert_eq!(
+            parse_subproject_reply("Core", &candidates),
+            vec!["core".to_string()]
+        );
+        assert_eq!(
+            parse_subproject_reply("  \"UTILS\".\n", &candidates),
+            vec!["utils".to_string()]
+        );
+        assert!(parse_subproject_reply("not-a-subproject", &candidates).is_empty());
+    }
+
+    #[test]
+    fn parse_subproject_reply_matches_multiple_and_drops_the_none_sentinel() {
+        let candidates = vec!["core".to_string(), "utils".to_string(), "steam".to_string()];
+        assert_eq!(
+            parse_subproject_reply(" core, utils ", &candidates),
+            vec!["core".to_string(), "utils".to_string()]
+        );
+        assert!(parse_subproject_reply("NONE", &candidates).is_empty());
+        // Unrecognized entries dropped, duplicates collapsed.
+        assert_eq!(
+            parse_subproject_reply("core, nope, core", &candidates),
+            vec!["core".to_string()]
+        );
+    }
+
+    #[test]
+    fn infer_subprojects_returns_none_with_no_candidates_or_empty_context() {
+        let s = Arc::new(Mutex::new(store()));
+        let arbiter = Arbiter {
+            agent: "ollama".to_string(),
+            model: None,
+            maximum_budget_usd: None,
+        };
+        assert!(
+            infer_subprojects(&s, &arbiter, "squad-1", "cell-1", "do some work", &[]).is_none()
+        );
+        assert!(
+            infer_subprojects(
+                &s,
+                &arbiter,
+                "squad-1",
+                "cell-1",
+                "   ",
+                &["core".to_string()]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn infer_subprojects_returns_none_when_over_budget() {
+        let s = Arc::new(Mutex::new(store()));
+        let arbiter = Arbiter {
+            agent: "ollama".to_string(),
+            model: None,
+            maximum_budget_usd: Some(0.0),
+        };
+        s.lock()
+            .unwrap()
+            .record_arbiter_cost("classification", 1, 1, 0.0001)
+            .unwrap();
+        assert!(
+            infer_subprojects(
+                &s,
+                &arbiter,
+                "squad-1",
+                "cell-1",
+                "fix the core module",
+                &["core".to_string()]
+            )
+            .is_none(),
+            "over the shared Arbiter budget cap must skip the call, not spend further"
+        );
+    }
+
+    #[test]
+    fn infer_subprojects_returns_none_for_unsupported_backend() {
+        let s = Arc::new(Mutex::new(store()));
+        let arbiter = Arbiter {
+            agent: "claude-code".to_string(), // not headlessly callable
+            model: None,
+            maximum_budget_usd: None,
+        };
+        assert!(
+            infer_subprojects(
+                &s,
+                &arbiter,
+                "squad-1",
+                "cell-1",
+                "fix the core module",
+                &["core".to_string()]
+            )
+            .is_none()
+        );
     }
 }

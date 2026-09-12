@@ -1358,41 +1358,62 @@ pub fn derive_triage_pools(
         store
             .set_cell_review_branch(squad_id, row.task_idx, row.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
+        // RAL-346: resolve this cell's monorepo subproject state (already
+        // written, whether human-declared or Arbiter-inferred, by the
+        // submit-time/background steps that ran before this) so its pool
+        // key(s) can include a subproject dimension when applicable --
+        // NotApplicable/Unresolved both fall back to the plain
+        // project-name key unchanged, keeping a single-project repo's
+        // keying identical to its pre-RAL-346 behavior.
+        let subproject_resolution = crate::triage::resolve_cell_subprojects(
+            store,
+            squad_id,
+            row.task_idx,
+            row.idx,
+            &project,
+        )
+        .map_err(|e| ReviewError::new(e.to_string()))?;
         // RAL-318 Bug 3 fix: resolve to the registered project's stable name
         // when one's path matches this worktree root, rather than the raw
         // git-reported path -- keeps this key in agreement with whatever
         // `resolve_pool_key_input` computes for a threshold set against the
         // same project by name (`crate::server`'s pool/schedule handlers).
-        let project_str = crate::triage::pool_key_for_path(store, &project);
+        let pool_keys = crate::triage::pool_keys_for_cell(store, &project, &subproject_resolution);
         // A cell resolved to more than one type (inline `triage_type` list,
         // or a multi-type Arbiter classification) is pooled into every one
         // of its types' `(project, triage_type)` pools independently --
         // draining one pool never removes it from the others, since each is
-        // its own row in `triage_pool_cells`.
-        for triage_type in &triage_types {
-            store
-                .record_triage_pool_cell(
-                    &project_str,
-                    triage_type,
-                    squad_id,
-                    row.task_idx,
-                    row.idx,
-                    &branch,
-                    &upstream,
-                )
-                .map_err(|e| ReviewError::new(e.to_string()))?;
-            crate::cartographer::Note::new("arbiter")
-                .squad(squad_id)
-                .cell(&row.cell_id)
-                .emit(
-                    store,
-                    format!(
-                        "cell \"{}\" pooled for Triage type {triage_type:?}",
-                        row.cell_id
-                    ),
-                    serde_json::json!({"project": project_str, "triage_type": triage_type}),
-                );
-            touched_keys.insert((project_str.clone(), triage_type.clone()));
+        // its own row in `triage_pool_cells`. A cell resolved to more than
+        // one subproject (RAL-346) is likewise pooled into every one of
+        // `pool_keys`' composite keys independently -- the cross product of
+        // pool keys x triage types is what gives two cells a "shared impact"
+        // overlap test rather than requiring an exact-set match.
+        for pool_key in &pool_keys {
+            for triage_type in &triage_types {
+                store
+                    .record_triage_pool_cell(
+                        pool_key,
+                        triage_type,
+                        squad_id,
+                        row.task_idx,
+                        row.idx,
+                        &branch,
+                        &upstream,
+                    )
+                    .map_err(|e| ReviewError::new(e.to_string()))?;
+                crate::cartographer::Note::new("arbiter")
+                    .squad(squad_id)
+                    .cell(&row.cell_id)
+                    .emit(
+                        store,
+                        format!(
+                            "cell \"{}\" pooled for Triage type {triage_type:?}",
+                            row.cell_id
+                        ),
+                        serde_json::json!({"project": pool_key, "triage_type": triage_type}),
+                    );
+                touched_keys.insert((pool_key.clone(), triage_type.clone()));
+            }
         }
     }
 
@@ -1448,6 +1469,11 @@ pub fn derive_triage_pools(
 /// Returns `None` when the pool was already empty by the time this drained it
 /// -- not an error, just "someone else already fired it".
 ///
+/// `project` may be a plain project key or a RAL-346 `base::subproject`
+/// composite key -- either way the guardian's `git_root`/project identity
+/// resolves off [`crate::triage::base_project_key`], since a subproject is
+/// never itself a separately registered project.
+///
 /// # Errors
 /// Returns [`ReviewError`] on any store failure while creating the guardian
 /// or attaching its branches.
@@ -1459,6 +1485,55 @@ pub(crate) fn create_review_from_triage_pool(
     let drained = store
         .drain_triage_pool(project, triage_type)
         .map_err(|e| ReviewError::new(e.to_string()))?;
+    build_review_from_drained_pool(store, project, triage_type, drained)
+}
+
+/// RAL-346: the Arbiter's cron straggler sweep. Unlike
+/// [`create_review_from_triage_pool`] (which fires exactly one pool key --
+/// the coherent, threshold-driven unit of work), this drains *every* pool
+/// key sharing `base_project`'s namespace for `triage_type` (the plain
+/// `base_project` key plus every `base_project::subproject` composite key --
+/// see [`crate::triage::project_pool_keys`]) and combines them into one
+/// review, so straggler work sitting in per-subproject pools that never hit
+/// their own count threshold (e.g. one bug fix each in `core`, `utils`, and
+/// `steam`) doesn't get stranded indefinitely just because a schedule was
+/// only ever registered against the project's plain base key. Called by
+/// [`crate::triage::run_schedule_tick`] instead of
+/// [`create_review_from_triage_pool`] when a configured cron schedule fires.
+/// Returns `None` when every matching pool was already empty.
+///
+/// # Errors
+/// Returns [`ReviewError`] on any store failure while creating the guardian
+/// or attaching its branches.
+pub(crate) fn create_review_from_triage_project_sweep(
+    store: &Store,
+    base_project: &str,
+    triage_type: &str,
+) -> std::result::Result<Option<String>, ReviewError> {
+    let keys = crate::triage::project_pool_keys(store, base_project, triage_type);
+    let mut drained = Vec::new();
+    for key in &keys {
+        drained.extend(
+            store
+                .drain_triage_pool(key, triage_type)
+                .map_err(|e| ReviewError::new(e.to_string()))?,
+        );
+    }
+    build_review_from_drained_pool(store, base_project, triage_type, drained)
+}
+
+/// Shared tail of [`create_review_from_triage_pool`]/
+/// [`create_review_from_triage_project_sweep`]: filter out any cell whose
+/// proof has definitively failed, and -- if anything viable remains -- build
+/// one fresh review guardian from it. `pool_key` is used only for logging
+/// (the Cartographer note and its payload); the *real* project identity
+/// always resolves off [`crate::triage::base_project_key`].
+fn build_review_from_drained_pool(
+    store: &Store,
+    pool_key: &str,
+    triage_type: &str,
+    drained: Vec<crate::triage::TriagePoolCellRow>,
+) -> std::result::Result<Option<String>, ReviewError> {
     // Defense in depth: `drain_triage_pool` already excludes a failed cell,
     // but a failed cell must never reach a review under any circumstance
     // (RAL-318 bug 2), so re-check here too in case some future code path
@@ -1481,13 +1556,23 @@ pub(crate) fn create_review_from_triage_pool(
         .first()
         .map(|c| c.upstream.clone())
         .unwrap_or_else(|| "main".to_string());
+    let base_project = crate::triage::base_project_key(pool_key);
     let registered_project = store
-        .get_project(project)
+        .get_project(base_project)
         .map_err(|e| ReviewError::new(e.to_string()))?;
-    let project_root = registered_project
-        .as_ref()
-        .map_or_else(|| project.to_string(), |registered| registered.path.clone());
-    let name = format!("triage-{triage_type}");
+    let project_root = registered_project.as_ref().map_or_else(
+        || base_project.to_string(),
+        |registered| registered.path.clone(),
+    );
+    // RAL-346: fold the subproject component (if any) into the review's
+    // display name so an operator can tell a `core`-only auto-review apart
+    // from a `utils`-only one at a glance, and a slash-separated subproject
+    // path (`CellDef.subprojects`-style, e.g. `"packages/foo"`) doesn't
+    // collide with the branch-naming conventions a plain `/` would imply.
+    let name = match crate::triage::split_subproject_pool_key(pool_key) {
+        Some((_, subproject)) => format!("triage-{triage_type}-{}", subproject.replace('/', "-")),
+        None => format!("triage-{triage_type}"),
+    };
     let gid = store
         .create_guardian_keyed(
             &name,
@@ -1520,11 +1605,11 @@ pub(crate) fn create_review_from_triage_pool(
         .emit(
             store,
             format!(
-            "Triage pool ({project}, {triage_type}) fired -> created review {gid} from {} cell(s)",
-            drained.len()
-        ),
+                "Triage pool ({pool_key}, {triage_type}) fired -> created review {gid} from {} cell(s)",
+                drained.len()
+            ),
             serde_json::json!({
-                "project": project,
+                "project": pool_key,
                 "triage_type": triage_type,
                 "cell_count": drained.len(),
             }),
@@ -3323,6 +3408,149 @@ print(json.dumps(result))
         assert_eq!(
             store.triage_pool_count(&project, "investigation").unwrap(),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-346: two cells resolved to overlapping (not identical) subproject
+    /// sets share the composite pool their overlap falls in, while a third,
+    /// disjoint cell lands in its own separate pool -- the "shared impact"
+    /// overlap test rather than exact-set equality.
+    #[test]
+    fn derive_triage_pools_keys_by_subproject_when_resolved() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[monorepo]\nsubprojects = [\"core\", \"utils\", \"steam\"]\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.register_triage_type("bug", "Bug", "").unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+
+        let src = task_file_toml(&root, "bug");
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+
+        let squad_a = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_a, 0, 0, &["bug".to_string()])
+            .unwrap();
+        store
+            .set_cell_subprojects(&squad_a, 0, 0, &["core".to_string()], false)
+            .unwrap();
+        assert!(
+            derive_triage_pools(&store, &squad_a, &file)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.triage_pool_keys().unwrap(),
+            vec![("proj::core".to_string(), "bug".to_string())]
+        );
+
+        // An overlapping-but-not-identical set ({core, utils} vs {core})
+        // still shares the "core" pool.
+        let squad_b = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_b, 0, 0, &["bug".to_string()])
+            .unwrap();
+        store
+            .set_cell_subprojects(
+                &squad_b,
+                0,
+                0,
+                &["core".to_string(), "utils".to_string()],
+                true,
+            )
+            .unwrap();
+        assert!(
+            derive_triage_pools(&store, &squad_b, &file)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.triage_pool_count("proj::core", "bug").unwrap(),
+            2,
+            "overlapping subprojects must share the 'core' pool"
+        );
+        assert_eq!(store.triage_pool_count("proj::utils", "bug").unwrap(), 1);
+
+        // A disjoint set ({steam}) never lands in the "core" pool.
+        let squad_c = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_c, 0, 0, &["bug".to_string()])
+            .unwrap();
+        store
+            .set_cell_subprojects(&squad_c, 0, 0, &["steam".to_string()], false)
+            .unwrap();
+        assert!(
+            derive_triage_pools(&store, &squad_c, &file)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.triage_pool_count("proj::steam", "bug").unwrap(), 1);
+        assert_eq!(
+            store.triage_pool_count("proj::core", "bug").unwrap(),
+            2,
+            "a disjoint subproject cell must not land in the 'core' pool"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-346: a monorepo cell whose subproject hasn't been resolved yet
+    /// (no manual declaration, Arbiter inference hasn't run/matched) falls
+    /// back to the plain project-name key -- same as a plain single-project
+    /// repo -- rather than being mis-bucketed or blocked from pooling.
+    #[test]
+    fn derive_triage_pools_falls_back_to_the_plain_key_for_an_unresolved_monorepo_cell() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "feature"]);
+        git(&root, &["branch", "--set-upstream-to", "main"]);
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[monorepo]\nsubprojects = [\"core\", \"utils\"]\n",
+        )
+        .unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.register_triage_type("bug", "Bug", "").unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+
+        let src = task_file_toml(&root, "bug");
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_triage_types(&squad_id, 0, 0, &["bug".to_string()])
+            .unwrap();
+        // No `set_cell_subprojects` call -- this cell's resolution stays
+        // `Unresolved` even though the project IS configured as a monorepo.
+
+        assert!(
+            derive_triage_pools(&store, &squad_id, &file)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.triage_pool_keys().unwrap(),
+            vec![("proj".to_string(), "bug".to_string())],
+            "an unresolved monorepo cell must fall back to the plain project key"
         );
 
         let _ = std::fs::remove_dir_all(&root);
