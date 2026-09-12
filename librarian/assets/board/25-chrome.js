@@ -1158,6 +1158,11 @@
           const resp = await fetch(`/api/squads/${squadId}/cells/${ti}/${si}/resume-automation`, {method:'POST', headers: traceHeaders()});
           if (resp.ok) {
             showInfoToast('Resuming automation on this cell.');
+            // RAL-406: this bypasses the `post()` helper's automatic
+            // invalidation (it's a raw fetch, not `post()`), so invalidate
+            // the shared `/api/tasks` in-flight request by hand before the
+            // tick() refresh below.
+            invalidateTasksFetch();
             tick();
           } else {
             const e = await resp.json().catch(() => ({}));
