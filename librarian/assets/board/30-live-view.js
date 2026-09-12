@@ -431,6 +431,8 @@
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
+      /** The mid-run, per-turn usage snapshot's message name. Matches runner/src/cartographer.rs::LIVE_USAGE_MESSAGE — the one usage event whose numbers are a live estimate, superseded by the cell's own "llm done"/"proof-llm done" event once the run finishes. */
+      const LIVE_USAGE_MESSAGE = "live usage";
       /** Max chars scanned for a CSI sequence's final byte before giving up. Matches daemon/src/terminal_log.rs::MAX_CSI_SEQUENCE_LEN. */
       const MAX_CSI_SEQUENCE_LEN = 32;
       /** Widest column a rendered line will pad out to. Matches daemon/src/terminal_log.rs::MAX_RENDERED_LINE_COLS. */
@@ -545,6 +547,15 @@
        * `formatDebugEvent`'s `source: message` tone, with a compact
        * usage/session-id detail when the payload carries one. Malformed JSON
        * falls back to the raw payload rather than throwing.
+       *
+       * A `LIVE_USAGE_MESSAGE` event's numbers are tagged `(est.)`: they come
+       * from `claude_code_backend::estimate_cost_usd`'s deliberately
+       * conservative single-rate approximation (it feeds the RAL-161 cost-cap
+       * kill switch and prices cache tokens at the full input rate), and the
+       * per-turn `tokens_out` it reports can itself be a not-yet-final
+       * snapshot straight from Claude Code's own stream. The cell's own
+       * "llm done"/"proof-llm done" event carries the authoritative final
+       * tally instead — a different `message`, so it never gets the tag.
        * @param {string} payloadJson
        * @returns {string}
        */
@@ -558,7 +569,8 @@
         if (typeof p.cost_usd === "number") {
           const tin = typeof p.tokens_in === "number" ? p.tokens_in : 0;
           const tout = typeof p.tokens_out === "number" ? p.tokens_out : 0;
-          detail = ` — in ${tin} / out ${tout} tok · $${p.cost_usd.toFixed(4)}`;
+          const estTag = message === LIVE_USAGE_MESSAGE ? " (est.)" : "";
+          detail = ` — in ${tin} / out ${tout} tok · $${p.cost_usd.toFixed(4)}${estTag}`;
         } else if (typeof p.agent_session_id === "string") {
           detail = ` — session ${p.agent_session_id}`;
         }
