@@ -31,6 +31,7 @@ const {
   ntPlannedGenerationKinds,
   ntSimpleSubmitAction,
   ntResolveDefaultTab,
+  ntSanitizeSquadLabel,
 } = simpleTab;
 
 /** A minimal valid NtSimpleState, overridable per test. */
@@ -44,10 +45,13 @@ function freshState(overrides = {}) {
     project: "demo",
     upstreamBranch: "",
     proofs: false,
-    addReview: false,
+    reviewMode: "none",
     generateManualChecks: false,
+    skipAutoBuild: true,
+    generateAutoBuild: false,
     proofItems: [],
     checkItems: [],
+    buildItems: [],
     generating: false,
     confirmStep: false,
     ...overrides,
@@ -116,27 +120,30 @@ test("ntBuildEffectivePrompt falls back to a bare {prompt} template when none is
 });
 
 // ---------- form field validation ----------
+// Errors are structured ({field, message}), not plain strings, so the form
+// can show each one inline next to its offending field (in addition to the
+// shared error panel's generic "fix before continuing" message).
 
 test("a valid state with the fallback template produces no errors", () => {
   const state = freshState();
   assert.deepEqual(ntValidateSimpleFields(state, NT_FALLBACK_TEMPLATE), []);
 });
 
-test("an empty prompt is rejected", () => {
+test("an empty prompt is rejected and keyed to the prompt field", () => {
   const state = freshState({ prompt: "   " });
   const errors = ntValidateSimpleFields(state, NT_FALLBACK_TEMPLATE);
-  assert.ok(errors.some((e) => /prompt is required/i.test(e)));
+  assert.ok(errors.some((e) => e.field === "prompt" && /prompt is required/i.test(e.message)));
 });
 
-test("a missing agent or project is rejected", () => {
-  assert.ok(ntValidateSimpleFields(freshState({ agent: "" }), NT_FALLBACK_TEMPLATE).some((e) => /agent is required/i.test(e)));
-  assert.ok(ntValidateSimpleFields(freshState({ project: "" }), NT_FALLBACK_TEMPLATE).some((e) => /project is required/i.test(e)));
+test("a missing agent or project is rejected and keyed to its own field", () => {
+  assert.ok(ntValidateSimpleFields(freshState({ agent: "" }), NT_FALLBACK_TEMPLATE).some((e) => e.field === "agent" && /agent is required/i.test(e.message)));
+  assert.ok(ntValidateSimpleFields(freshState({ project: "" }), NT_FALLBACK_TEMPLATE).some((e) => e.field === "project" && /project is required/i.test(e.message)));
 });
 
-test("a required template field with no value is rejected by its label", () => {
+test("a required template field with no value is rejected by its label and keyed to field:<name>", () => {
   const template = { fields: [{ name: "ticket", label: "Ticket ID", required: true }] };
   const errors = ntValidateSimpleFields(freshState({ fieldValues: {} }), template);
-  assert.ok(errors.some((e) => e.includes('"Ticket ID" is required.')));
+  assert.ok(errors.some((e) => e.field === "field:ticket" && e.message.includes('"Ticket ID" is required.')));
 });
 
 test("an optional template field with no value passes", () => {
@@ -147,7 +154,7 @@ test("an optional template field with no value passes", () => {
 test("a non-numeric value for a number-typed field is rejected", () => {
   const template = { fields: [{ name: "count", label: "Count", type: "number", required: false }] };
   const errors = ntValidateSimpleFields(freshState({ fieldValues: { count: "not-a-number" } }), template);
-  assert.ok(errors.some((e) => e.includes('"Count" must be a number.')));
+  assert.ok(errors.some((e) => e.field === "field:count" && e.message.includes('"Count" must be a number.')));
 });
 
 test("a numeric value for a number-typed field passes", () => {
@@ -159,6 +166,7 @@ test("every base-field error is reported at once, not just the first", () => {
   const state = freshState({ prompt: "", agent: "", project: "" });
   const errors = ntValidateSimpleFields(state, NT_FALLBACK_TEMPLATE);
   assert.equal(errors.length, 3);
+  assert.deepEqual(new Set(errors.map((e) => e.field)), new Set(["prompt", "agent", "project"]));
 });
 
 // ---------- generic editable-list-widget primitive ----------
@@ -207,15 +215,25 @@ test("ntPlannedGenerationKinds includes proof_steps when the Proofs checkbox is 
   assert.deepEqual(ntPlannedGenerationKinds(freshState({ proofs: true })), ["proof_steps"]);
 });
 
-test("ntPlannedGenerationKinds only includes manual_checks when review and the checkbox are both set", () => {
-  assert.deepEqual(ntPlannedGenerationKinds(freshState({ addReview: false, generateManualChecks: true })), [], "generateManualChecks alone (no review) must not plan a job");
-  assert.deepEqual(ntPlannedGenerationKinds(freshState({ addReview: true, generateManualChecks: true })), ["manual_checks"]);
+test("ntPlannedGenerationKinds only includes manual_checks when reviewMode is explicit and the checkbox is set", () => {
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "auto", generateManualChecks: true })), [], "generateManualChecks alone (not an explicit review) must not plan a job");
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "none", generateManualChecks: true })), [], "generateManualChecks under No Review must not plan a job");
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", generateManualChecks: true })), ["manual_checks"]);
 });
 
-test("ntPlannedGenerationKinds includes both kinds when everything is opted in", () => {
+test("ntPlannedGenerationKinds only includes auto_build_steps when reviewMode is explicit, auto-build isn't skipped, and the checkbox is set", () => {
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", skipAutoBuild: true, generateAutoBuild: true })), [], "generateAutoBuild while skipped must not plan a job");
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "auto", skipAutoBuild: false, generateAutoBuild: true })), [], "generateAutoBuild outside an explicit review must not plan a job");
+  assert.deepEqual(ntPlannedGenerationKinds(freshState({ reviewMode: "explicit", skipAutoBuild: false, generateAutoBuild: true })), ["auto_build_steps"]);
+});
+
+test("ntPlannedGenerationKinds includes every kind when everything is opted in", () => {
   assert.deepEqual(
-    ntPlannedGenerationKinds(freshState({ proofs: true, addReview: true, generateManualChecks: true })),
-    ["proof_steps", "manual_checks"],
+    ntPlannedGenerationKinds(freshState({
+      proofs: true, reviewMode: "explicit", generateManualChecks: true,
+      skipAutoBuild: false, generateAutoBuild: true,
+    })),
+    ["proof_steps", "manual_checks", "auto_build_steps"],
   );
 });
 
@@ -227,7 +245,7 @@ test("submit goes straight to build-and-submit when no generation is opted in", 
 
 test("the first submit click with generation opted in blocks on generate-then-confirm", () => {
   assert.equal(ntSimpleSubmitAction(freshState({ proofs: true })), "generate");
-  assert.equal(ntSimpleSubmitAction(freshState({ addReview: true, generateManualChecks: true })), "generate");
+  assert.equal(ntSimpleSubmitAction(freshState({ reviewMode: "explicit", generateManualChecks: true })), "generate");
 });
 
 test("a second submit click, now past confirmStep, proceeds to build-and-submit", () => {
@@ -256,8 +274,172 @@ test("submitTaskSimple shows the generating notice before awaiting the generatio
   const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
   const generatingAt = fn.indexOf("ntSimple.generating = true;");
-  const renderAt = fn.indexOf("renderNewTaskModal();");
+  // The field-error branch also calls renderNewTaskModal(), earlier in the
+  // function -- search for the one after ntSimple.generating = true.
+  const renderAt = fn.indexOf("renderNewTaskModal();", generatingAt);
   const awaitAt = fn.indexOf("await Promise.all(jobs);");
   assert.ok(generatingAt > -1 && renderAt > -1 && awaitAt > -1, "submitTaskSimple shape changed");
   assert.ok(generatingAt < renderAt && renderAt < awaitAt, "the generating state must be shown before the jobs are awaited");
+});
+
+test("submitTaskSimple stores field errors and re-renders (for the inline messages) before showing the generic panel message", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  const storeAt = fn.indexOf("ntSimple.fieldErrors = fieldErrors;");
+  const renderAt = fn.indexOf("renderNewTaskModal();");
+  const panelAt = fn.indexOf("Errors prevented submission");
+  assert.ok(storeAt > -1 && renderAt > -1 && panelAt > -1, "submitTaskSimple shape changed");
+  assert.ok(storeAt < renderAt && renderAt < panelAt, "field errors must be stored and rendered inline before the generic panel message is set");
+});
+
+// ---------- squad label sanitization ----------
+// The daemon rejects a squad label containing a comma (it's split on ","
+// for multi-name filtering -- see reject_label_with_comma in
+// daemon/src/server.rs). ntSanitizeSquadLabel strips that up front so a
+// prompt like `Add a file, each line say "blah"` doesn't fail submission.
+
+test("ntSanitizeSquadLabel strips commas", () => {
+  assert.equal(ntSanitizeSquadLabel('Add a file, each line say "blah". 5'), 'Add a file each line say "blah". 5');
+});
+
+test("ntSanitizeSquadLabel truncates to 60 chars before trimming", () => {
+  const long = "a".repeat(70);
+  assert.equal(ntSanitizeSquadLabel(long), "a".repeat(60));
+});
+
+test("ntSanitizeSquadLabel trims surrounding whitespace left behind by stripping", () => {
+  assert.equal(ntSanitizeSquadLabel("hello, "), "hello");
+  assert.equal(ntSanitizeSquadLabel(", hello"), "hello");
+});
+
+test("ntSanitizeSquadLabel returns null when nothing meaningful survives", () => {
+  assert.equal(ntSanitizeSquadLabel(""), null);
+  assert.equal(ntSanitizeSquadLabel("   "), null);
+  assert.equal(ntSanitizeSquadLabel(",,,"), null);
+});
+
+test("ntSanitizeSquadLabel passes an ordinary prompt through unchanged (aside from truncation)", () => {
+  assert.equal(ntSanitizeSquadLabel("fix the login bug"), "fix the login bug");
+});
+
+test("submitTaskSimple sanitizes the label before submitting, and retries with no label on an invalid_label response", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSanitizeSquadLabel\(ntSimple\.prompt\)/, "the label sent to the daemon must be sanitized first");
+  const invalidLabelAt = fn.indexOf('"invalid_label"');
+  const retryAt = fn.indexOf("postSquad(null)");
+  assert.ok(invalidLabelAt > -1 && retryAt > -1, "submitTaskSimple must retry with no label on an invalid_label response");
+  assert.ok(invalidLabelAt < retryAt, "the invalid_label check must gate the no-label retry");
+});
+
+// ---------- New Task modal reopen/resubmit resets the form to defaults ----------
+// Only templateName/agent/model/project/upstreamBranch carry forward across
+// a New Task modal open (e.g. after Cancel) or a successful submit -- every
+// other field (prompt, review mode, the proofs/manual-checks/auto-build
+// generation choices and their item lists, the generating/confirm-step view
+// state) must reset to its default every time, so neither a cancelled
+// submission's leftover generated items nor a completed one's leak into the
+// next, unrelated task.
+
+test("ntSimpleResetKeepingProjectFields carries forward exactly the five remembered fields", () => {
+  const body = boardSource.slice(boardSource.indexOf("function ntSimpleResetKeepingProjectFields()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimpleReset\(\);/, "must fully reset before restoring the remembered fields");
+  for (const field of ["templateName", "agent", "model", "project", "upstreamBranch"]) {
+    assert.match(fn, new RegExp(`ntSimple\\.${field}\\s*=\\s*prev\\.${field}`), `must carry forward ${field}`);
+  }
+  // Fields that must NOT be carried forward -- they should reset to
+  // ntFreshSimpleState()'s defaults, never copied from `prev`.
+  for (const field of ["prompt", "reviewMode", "proofs", "generateManualChecks", "skipAutoBuild", "generateAutoBuild", "proofItems", "checkItems", "buildItems", "generating", "confirmStep"]) {
+    assert.doesNotMatch(fn, new RegExp(`ntSimple\\.${field}\\s*=\\s*prev\\.${field}`), `must NOT carry forward ${field}`);
+  }
+});
+
+test("openNewTask resets the Simple tab via ntSimpleResetKeepingProjectFields, not a bare full reset", () => {
+  const body = boardSource.slice(boardSource.indexOf("function openNewTask()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimpleResetKeepingProjectFields\(\);/, "openNewTask must use the carry-forward reset");
+  assert.doesNotMatch(fn, /\bntSimpleReset\(\);/, "openNewTask must not call the bare full reset directly");
+});
+
+test("a successful submitTaskSimple resets via ntSimpleResetKeepingProjectFields, not a bare full reset", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimpleResetKeepingProjectFields\(\);/, "submitTaskSimple must use the carry-forward reset on success");
+  assert.doesNotMatch(fn, /\bntSimpleReset\(\);/, "submitTaskSimple must not call the bare full reset directly");
+});
+
+test("submitTaskSimple's post-generation render is guarded so a cancelled modal doesn't pop back open", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  const awaitAt = fn.indexOf("await Promise.all(jobs);");
+  const guardedRenderAt = fn.indexOf("if (ntModalOpen && ntTab ===");
+  assert.ok(awaitAt > -1 && guardedRenderAt > -1, "submitTaskSimple shape changed");
+  assert.ok(awaitAt < guardedRenderAt, "the render after awaiting generation jobs must be guarded on ntModalOpen");
+});
+
+// ---------- Cancel actually kills an in-flight generation call ----------
+// "Cancel" must stop the agent subprocess a "Generate proof steps"/"Generate
+// manual checks"/"Generate auto-build steps" call spawned, not just abandon
+// the poll and let it keep running server-side.
+
+test("ntRunGenerationStep tracks its job id in activeGenerationIds while in flight, and always untracks it in a finally block", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function ntRunGenerationStep("));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimple\.activeGenerationIds\.push\(id\)/, "must track the job id once it's known");
+  assert.match(fn, /finally\s*{[\s\S]*ntSimple\.activeGenerationIds\s*=\s*ntSimple\.activeGenerationIds\.filter/, "must untrack the job id in a finally block, regardless of outcome");
+});
+
+test("closeModal cancels every active generation job when the New Task modal (Simple tab) closes mid-generation", () => {
+  const body = boardSource.slice(boardSource.indexOf("function closeModal()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntModalOpen && ntTab === "simple" && ntSimple\.activeGenerationIds\.length/, "closeModal must only act when the Simple tab has generations in flight");
+  assert.match(fn, /ntCancelActiveGenerations\(\)/, "closeModal must cancel the active generations");
+});
+
+test("ntCancelActiveGenerations posts a cancel request per active job id and clears the tracking list", () => {
+  const body = boardSource.slice(boardSource.indexOf("function ntCancelActiveGenerations()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimple\.activeGenerationIds\s*=\s*\[\]/, "must clear the tracking list");
+  assert.match(fn, /post\(`\/api\/generate\/\$\{id\}\/cancel`\)/, "must POST /api/generate/{id}/cancel for each active job");
+});
+
+// ---------- inline field errors clear when the field is fixed ----------
+// A field that failed validation must stop showing its error as soon as the
+// user changes it, not linger until the next submit attempt.
+
+test("the Agent and Project selects clear their own field error on change", () => {
+  assert.match(boardSource, /onchange="ntSimple\.agent=this\.value;ntSimple\.model='';ntClearFieldError\('agent'\);renderNewTaskModal\(\)"/, "Agent's onchange must clear its field error");
+  assert.match(boardSource, /onchange="ntSimple\.project=this\.value;ntClearFieldError\('project'\);renderNewTaskModal\(\)"/, "Project's onchange must clear its field error");
+});
+
+test("the prompt textarea and a template field clear their error inline (no full re-render) on input", () => {
+  assert.match(boardSource, /oninput="ntSimple\.prompt=this\.value;ntClearFieldErrorInline\('prompt', this\)"/, "the prompt textarea must clear its error inline as the user types");
+  assert.match(boardSource, /ntClearFieldErrorInline\(\$\{JSON\.stringify\(`field:\$\{f\.name\}`\)\}, this\)/, "a template field must clear its error inline as the user types");
+});
+
+test("ntClearFieldErrorInline removes both the .err class and the field's error message element", () => {
+  const body = boardSource.slice(boardSource.indexOf("function ntClearFieldErrorInline("));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntClearFieldError\(field\)/, "must also drop the field from ntSimple.fieldErrors");
+  assert.match(fn, /el\.classList\.remove\("err"\)/, "must remove the red-border class from the field itself");
+  assert.match(fn, /data-field-error/, "must locate and remove the field's error message element");
+});
+
+// ---------- Agent/Model and Project/Upstream rows stay top-aligned ----------
+// .row's shared CSS default is `align-items: center`, which vertically
+// centers each column by its own height -- fine when both columns are the
+// same height, but an inline field error only grows ONE column (Agent's or
+// Project's), which then pushes its shorter sibling (Model/Upstream branch)
+// down out of alignment with it. These two rows override align-items so the
+// widgets stay level regardless of which column has an error.
+
+test("the Agent/Model and Project/Upstream rows override align-items to flex-start", () => {
+  const agentRowAt = boardSource.indexOf('data-tip="Which agent backend runs the work cell.');
+  const agentRowStart = boardSource.lastIndexOf('<div class="row"', agentRowAt);
+  assert.match(boardSource.slice(agentRowStart, agentRowAt), /align-items:flex-start/, "the Agent/Model row must top-align its columns");
+
+  const projectRowAt = boardSource.indexOf('data-tip="Which registered project the work runs against.');
+  const projectRowStart = boardSource.lastIndexOf('<div class="row"', projectRowAt);
+  assert.match(boardSource.slice(projectRowStart, projectRowAt), /align-items:flex-start/, "the Project/Upstream row must top-align its columns");
 });

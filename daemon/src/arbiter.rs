@@ -15,6 +15,8 @@
 //! [`UNCLASSIFIED_TYPE`] rather than retrying. This module owns that
 //! decision; storage of the result lives in `crate::triage`.
 
+use std::sync::{Arc, Mutex};
+
 use crate::chat_client::{self, ChatMessage};
 use crate::config::ArbiterConfig;
 use crate::store::Store;
@@ -161,31 +163,41 @@ fn parse_classification_reply<'a>(
 /// `crate::ark`'s `Note::new("ark")` call as the template for the `Note`
 /// itself, but (unlike an Ark sweep, which isn't scoped to any one entity)
 /// attaching the affected cell, since a classification always is.
+///
+/// Takes the shared store handle rather than an already-held `&Store`, and
+/// locks it only for the brief reads/writes around the real work -- the
+/// live, sometimes multi-second `chat_client` call runs with the lock
+/// dropped, mirroring `guardian_merge::resolver_backend`'s
+/// lock-read-drop-then-call shape. Holding the daemon's single store mutex
+/// across that network call would stall every other store user (the
+/// scheduler, every other API request) for its whole duration, not just the
+/// caller.
 #[must_use]
 pub fn classify(
-    store: &Store,
+    store: &Arc<Mutex<Store>>,
     arbiter: &Arbiter,
     squad_id: &str,
     cell_id: &str,
     cell_context: &str,
 ) -> Vec<String> {
-    let types = store.list_triage_types().unwrap_or_default();
+    let guard = store.lock().expect("store mutex poisoned");
+    let types = guard.list_triage_types().unwrap_or_default();
     let candidates: Vec<&TriageTypeView> = types
         .iter()
         .filter(|t| t.name != UNCLASSIFIED_TYPE)
         .collect();
     if candidates.is_empty() {
         return note_and_return(
-            store,
+            &guard,
             squad_id,
             cell_id,
             &[UNCLASSIFIED_TYPE.to_string()],
             "no registered triage types",
         );
     }
-    if over_budget(store, arbiter) {
+    if over_budget(&guard, arbiter) {
         return note_and_return(
-            store,
+            &guard,
             squad_id,
             cell_id,
             &[UNCLASSIFIED_TYPE.to_string()],
@@ -193,6 +205,11 @@ pub fn classify(
         );
     }
     let system = classification_system_prompt(&candidates);
+    // `candidates` borrows `types`; both are local to this locked scope, so
+    // clone the (tiny) view list out before dropping the guard.
+    let candidate_views: Vec<TriageTypeView> = candidates.into_iter().cloned().collect();
+    drop(guard);
+
     let messages = [ChatMessage {
         role: "user",
         content: cell_context.to_string(),
@@ -206,8 +223,9 @@ pub fn classify(
     ) {
         Ok(v) => v,
         Err(e) => {
+            let guard = store.lock().expect("store mutex poisoned");
             return note_and_return(
-                store,
+                &guard,
                 squad_id,
                 cell_id,
                 &[UNCLASSIFIED_TYPE.to_string()],
@@ -220,16 +238,18 @@ pub fn classify(
         arbiter.model.as_deref().unwrap_or_default(),
         usage,
     );
-    let _ = store.record_arbiter_cost(
+    let guard = store.lock().expect("store mutex poisoned");
+    let _ = guard.record_arbiter_cost(
         "classification",
         usage.tokens_in as i64,
         usage.tokens_out as i64,
         cost,
     );
-    let matched = parse_classification_reply(&reply, &candidates);
+    let candidate_refs: Vec<&TriageTypeView> = candidate_views.iter().collect();
+    let matched = parse_classification_reply(&reply, &candidate_refs);
     if matched.is_empty() {
         return note_and_return(
-            store,
+            &guard,
             squad_id,
             cell_id,
             &[UNCLASSIFIED_TYPE.to_string()],
@@ -238,7 +258,77 @@ pub fn classify(
     }
     let names: Vec<String> = matched.into_iter().map(|t| t.name.clone()).collect();
     let detail = format!("classified as [{}]", names.join(", "));
-    note_and_return(store, squad_id, cell_id, &names, &detail)
+    note_and_return(&guard, squad_id, cell_id, &names, &detail)
+}
+
+/// One Triage-opted-in cell that had no inline `triage_type` at submit time,
+/// so it still needs an Arbiter classification call -- collected by `submit`
+/// during its synchronous validation pass, classified later by
+/// [`spawn_triage_followup`].
+pub struct PendingClassification {
+    pub task_idx: i64,
+    pub idx: i64,
+    pub cell_id: String,
+    pub context: String,
+}
+
+/// Classifies every `pending` cell, then (whenever `has_triage` -- i.e. this
+/// submission has at least one Triage-opted-in cell at all, typed or not)
+/// runs [`crate::reviews::derive_triage_pools`] for `squad_id`, all on one
+/// background thread. Spawned from `submit` right after its HTTP response is
+/// built, so neither the classification calls (one real, sometimes
+/// multi-second LLM round-trip per un-typed cell) nor `derive_triage_pools`
+/// itself (which resolves each cell's worktree placeholder -- a real,
+/// sometimes multi-second `git worktree add` against a large repo, see
+/// `worktrees::resolve_placeholders`'s doc comment) ever hold up that
+/// response. This used to run `derive_triage_pools` synchronously in
+/// `submit` for any already-typed (inline `triage_type`) cell, which made
+/// the Simple tab's "Auto Review" default -- `triage = true`, no inline
+/// type, so pooling still ran synchronously even before classification was
+/// deferred here -- pay that same worktree-creation cost on every single
+/// submission; moving it here as well fixes that for every case, not just
+/// the classification one.
+///
+/// Mirrors `crate::generation`'s jobs never blocking on `POST
+/// /api/generate`, and the store-handle-in-a-thread shape `crate::pr::
+/// start_resync_pr_bases` uses. `derive_triage_pools` already tolerates a
+/// cell with no resolved type yet (see its doc comment) by skipping it, so
+/// leaving these cells un-pooled at submit time and re-running pooling here
+/// once they're classified is safe. A no-op when neither `pending` nor
+/// `has_triage` calls for anything.
+pub fn spawn_triage_followup(
+    store_handle: Arc<Mutex<Store>>,
+    squad_id: String,
+    file: ralphus_core::schema::TaskFile,
+    pending: Vec<PendingClassification>,
+    has_triage: bool,
+) {
+    if pending.is_empty() && !has_triage {
+        return;
+    }
+    std::thread::spawn(move || {
+        let arbiter = Arbiter::current();
+        for p in &pending {
+            let types = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
+            let guard = store_handle.lock().expect("store mutex poisoned");
+            let _ = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types);
+        }
+        let guard = store_handle.lock().expect("store mutex poisoned");
+        if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [arbiter] background triage pooling for squad {squad_id} failed: {}",
+                e.message
+            );
+            crate::cartographer::Note::new("arbiter")
+                .squad(&squad_id)
+                .emit(
+                    &guard,
+                    format!("background triage pooling failed: {}", e.message),
+                    serde_json::json!({ "error": e.message }),
+                );
+        }
+    });
 }
 
 fn note_and_return(
@@ -464,12 +554,12 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_with_no_registered_types() {
-        let s = store();
+        let s = Arc::new(Mutex::new(store()));
         // A fresh store also seeds `DEFAULT_TRIAGE_TYPES` (RAL-318) alongside
         // the built-in `unclassified` type -- deregister those to exercise
         // the "no candidates at all" fallback this test targets.
         for (name, ..) in crate::triage::DEFAULT_TRIAGE_TYPES {
-            s.deregister_triage_type(name).unwrap();
+            s.lock().unwrap().deregister_triage_type(name).unwrap();
         }
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
@@ -484,15 +574,19 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_when_over_budget() {
-        let s = store();
-        s.register_triage_type("security", "Security", "sensitive changes")
+        let s = Arc::new(Mutex::new(store()));
+        s.lock()
+            .unwrap()
+            .register_triage_type("security", "Security", "sensitive changes")
             .unwrap();
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
             model: None,
             maximum_budget_usd: Some(0.0),
         };
-        s.record_arbiter_cost("classification", 1, 1, 0.0001)
+        s.lock()
+            .unwrap()
+            .record_arbiter_cost("classification", 1, 1, 0.0001)
             .unwrap();
         assert_eq!(
             classify(&s, &arbiter, "squad-1", "cell-1", "do some work"),
@@ -502,8 +596,10 @@ mod tests {
 
     #[test]
     fn classify_falls_back_to_unclassified_for_unsupported_backend() {
-        let s = store();
-        s.register_triage_type("security", "Security", "sensitive changes")
+        let s = Arc::new(Mutex::new(store()));
+        s.lock()
+            .unwrap()
+            .register_triage_type("security", "Security", "sensitive changes")
             .unwrap();
         let arbiter = Arbiter {
             agent: "claude-code".to_string(), // not headlessly callable

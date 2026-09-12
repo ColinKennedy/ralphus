@@ -1,5 +1,6 @@
 //! RAL-297: background "generation step" jobs backing the Simple task
-//! form's opt-in "Generate Proofs" / "Generate Manual Checks" buttons.
+//! form's opt-in "Generate Proofs" / "Generate Manual Checks" / "Generate
+//! Auto-Build Steps" buttons.
 //!
 //! Each is a single one-shot LLM call (reusing `crate::runner`'s
 //! `Runner`/`RunnerSpec` plumbing exactly as `crate::pr::synthesize_pr_text`
@@ -18,12 +19,20 @@
 //! can take would stall every other write (submit, cancel, activate, ...)
 //! for that whole window. This module follows the same pattern as
 //! `crate::server::guardian_resolve_input`.
+//!
+//! `POST /api/generate/{id}/cancel` really does kill the in-flight agent
+//! subprocess, not just tell the board to stop caring about the result: the
+//! background thread registers a [`crate::cancel::CancelToken`] for the job
+//! id in the daemon's shared `Cancellations` registry (the exact mechanism
+//! `crate::scheduler` uses for a squad's own cells) before calling
+//! [`run_generation`], and the cancel endpoint trips that same token.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::CancelToken;
 use crate::runner::{Runner, RunnerSpec, SubprocessRunner};
 
 /// One proposed proof step or manual check, generic enough for the board's
@@ -96,7 +105,8 @@ impl GenerationJobs {
 /// agent/model/cwd/context to run it against.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenerateRequest {
-    /// `"proof_steps"` or `"manual_checks"` -- see [`GenerationKind`].
+    /// `"proof_steps"`, `"manual_checks"`, or `"auto_build_steps"` -- see
+    /// [`GenerationKind`].
     pub kind: String,
     pub cwd: String,
     pub agent: String,
@@ -108,12 +118,13 @@ pub struct GenerateRequest {
     pub prompt_context: String,
 }
 
-/// The two generation-step flavors the Simple form offers. Both share the
-/// same JSON-list prompt/parse machinery; only the wording differs.
+/// The generation-step flavors the Simple form offers. All share the same
+/// JSON-list prompt/parse machinery; only the wording differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationKind {
     ProofSteps,
     ManualChecks,
+    AutoBuildSteps,
 }
 
 impl GenerationKind {
@@ -122,6 +133,7 @@ impl GenerationKind {
         match s {
             "proof_steps" => Some(Self::ProofSteps),
             "manual_checks" => Some(Self::ManualChecks),
+            "auto_build_steps" => Some(Self::AutoBuildSteps),
             _ => None,
         }
     }
@@ -138,6 +150,10 @@ impl GenerationKind {
             Self::ManualChecks => {
                 "each item's \"value\" must be a short instruction describing something a \
                  human reviewer should manually check or try"
+            }
+            Self::AutoBuildSteps => {
+                "each item's \"value\" must be a single shell command that builds/compiles \
+                 the change (run automatically when this review's branches merge)"
             }
         }
     }
@@ -185,12 +201,22 @@ pub fn parse_generated_items(text: &str) -> Option<Vec<GeneratedItem>> {
 /// Run one generation call synchronously (called from a background thread
 /// spawned by the `POST /api/generate` handler -- never call this directly
 /// from an HTTP handler on the accept loop, see the module doc comment).
+/// `cancel` is the token registered for this job's id in `server::
+/// generate_start`; `POST /api/generate/{id}/cancel` trips it, and
+/// `run_cancellable` polls it and kills the agent subprocess -- the same
+/// mechanism (`crate::cancel`) a squad's own cell cancellation uses. A
+/// tripped token surfaces here as an ordinary `RunnerResult::failure
+/// ("cancelled")`, which the `!result.is_done()` branch below turns into a
+/// `GenerationJob::Error` like any other failure -- no separate "cancelled"
+/// status is needed since the board never renders a generation job's result
+/// once its owning New Task modal has been closed.
 #[must_use]
-pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
+pub fn run_generation(req: &GenerateRequest, cancel: &CancelToken) -> GenerationJob {
     let Some(kind) = GenerationKind::parse(&req.kind) else {
         return GenerationJob::Error {
             message: format!(
-                "unknown generation kind \"{}\" (expected \"proof_steps\" or \"manual_checks\")",
+                "unknown generation kind \"{}\" (expected \"proof_steps\", \"manual_checks\", \
+                 or \"auto_build_steps\")",
                 req.kind
             ),
         };
@@ -227,7 +253,7 @@ pub fn run_generation(req: &GenerateRequest) -> GenerationJob {
         allow_personal_memory: false,
     };
     let runner = SubprocessRunner::from_env();
-    let result = runner.run(&spec);
+    let result = runner.run_cancellable(&spec, cancel);
     if !result.is_done() {
         return GenerationJob::Error {
             message: result
@@ -281,6 +307,10 @@ mod tests {
             GenerationKind::parse("manual_checks"),
             Some(GenerationKind::ManualChecks)
         );
+        assert_eq!(
+            GenerationKind::parse("auto_build_steps"),
+            Some(GenerationKind::AutoBuildSteps)
+        );
         assert_eq!(GenerationKind::parse("bogus"), None);
     }
 
@@ -293,7 +323,7 @@ mod tests {
             model: None,
             prompt_context: "do the thing".to_string(),
         };
-        match run_generation(&req) {
+        match run_generation(&req, &CancelToken::never()) {
             GenerationJob::Error { message } => {
                 assert!(message.contains("unknown generation kind"))
             }

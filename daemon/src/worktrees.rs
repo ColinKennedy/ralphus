@@ -389,9 +389,9 @@ fn default_branch(root: &Path) -> Result<String, String> {
         }
     }
     Err(format!(
-        "could not resolve \"?upstream=<<default>>\" in {}: no remote HEAD symbolic ref \
-         (refs/remotes/<remote>/HEAD) exists — set one (e.g. `git remote set-head origin \
-         --auto`) or use a literal \"?upstream=<branch>\" value instead",
+        "no default branch found. Fix: run `git remote set-head origin --auto` in {} \
+         (needed to resolve \"?upstream=<<default>>\"), or type a literal branch name in \
+         the upstream field instead",
         root.display()
     ))
 }
@@ -1565,7 +1565,7 @@ mod tests {
         let err = resolve_upstream(&repo, "<<default>>")
             .expect_err("no remote HEAD must be a hard error, not a guess");
         assert!(
-            err.contains("<<default>>") && err.contains("no remote HEAD"),
+            err.contains("<<default>>") && err.contains("git remote set-head origin --auto"),
             "{err}"
         );
     }
