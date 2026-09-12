@@ -9,10 +9,16 @@
 //! well-formed result back over a file-based side channel (see
 //! `crate::runner::SubprocessRunner::run_via_tmux`).
 //!
-//! Binary resolution priority (RAL-102 Q4): an explicit [`TMUX_CMD_ENV`]
-//! override, then whatever `tmux` resolves to on `PATH`, then an embedded
-//! fallback binary (see [`embedded`] — Windows-only today, gated behind the
-//! `embedded-tmux` feature since no verified binary is bundled yet).
+//! Binary resolution priority (RAL-102 Q4, reordered by RAL-347): an explicit
+//! [`TMUX_CMD_ENV`] override, then the embedded build vendored from the
+//! `vendor/psmux` git submodule (see [`embedded`] — Windows-only today, gated
+//! behind the `embedded-tmux` feature), then whatever `tmux` resolves to on
+//! `PATH` as a last resort. The embedded build is checked *before* `PATH` on
+//! purpose: it's compiled from a pinned, known-good source tree shipped in
+//! this repo, whereas a `PATH` hit could be anything a machine happens to
+//! have installed under that name — closing that supply-chain gap is the
+//! whole point of RAL-347. `RALPHUS_TMUX_CMD` remains the explicit, deliberate
+//! way to opt back into an external binary.
 //!
 //! ## Process-tree confinement on cancel (RAL-321, Windows-only)
 //!
@@ -670,16 +676,25 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 /// module doc comment.
 ///
 /// # Errors
-/// Returns an error when no override is set, nothing named `tmux` is on
-/// `PATH`, and no embedded fallback is available in this build.
+/// Returns an error when no override is set, this build has no embedded
+/// fallback, and nothing named `tmux` is on `PATH`.
 pub fn resolve_tmux_program() -> Result<String, TmuxError> {
     if let Ok(cmd) = std::env::var(TMUX_CMD_ENV) {
         return Ok(cmd);
     }
+    if let Ok(path) = embedded::extract() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     if find_on_path("tmux").is_some() {
         return Ok("tmux".to_string());
     }
-    embedded::extract().map(|p| p.to_string_lossy().into_owned())
+    Err(TmuxError(
+        "no tmux-compatible binary found: this build has no embedded psmux (rebuild with \
+         --features ralphus-daemon/embedded-tmux, see docs/tmux-embedding.md), nothing named \
+         `tmux` is on PATH, and RALPHUS_TMUX_CMD is unset. Install tmux/psmux and put it on \
+         PATH, or set RALPHUS_TMUX_CMD to its full path."
+            .to_string(),
+    ))
 }
 
 /// Session-name-keyed registry of the Windows Job Objects
@@ -1577,20 +1592,27 @@ pub fn watch_for_exit(pid: u32) -> std::sync::mpsc::Receiver<ProcessExit> {
 }
 
 /// Embedding a `tmux`-compatible binary into the daemon executable so users
-/// never need to install it themselves (RAL-102 AC).
+/// never need to install it themselves (RAL-102 AC), and so the daemon
+/// doesn't have to trust whatever binary a machine happens to have on `PATH`
+/// under the name `tmux` (RAL-347).
 ///
-/// Windows lands first per the ticket, but no verified binary is bundled in
-/// this build yet — the ticket itself calls out that the specific Windows
-/// tmux build needs to be sourced deliberately (its `respawn-pane` gap alone
-/// proves it isn't a drop-in of upstream tmux) and its licensing/static-vs-
-/// dynamic linkage confirmed before distribution. Embedding is therefore
-/// gated behind the `embedded-tmux` Cargo feature (default off): flip it on
-/// only after placing a verified binary at
-/// `daemon/assets/tmux/windows/tmux.exe` (see
-/// `daemon/assets/tmux/windows/README.md` and `docs/tmux-embedding.md`) and
-/// rebuilding. Without the feature (or on a platform with no embedded asset
-/// yet), [`extract`] returns a clear error telling the operator to install
-/// tmux or set [`TMUX_CMD_ENV`] — resolution never panics or silently no-ops.
+/// Windows lands first per the ticket. The embedded binary is built from the
+/// `vendor/psmux` git submodule (pinned to a specific upstream commit, see
+/// `.gitmodules`) via `scripts/build-vendored-tmux.ps1`, never checked into
+/// the repo as a binary — only the *source* is vendored, which is also why
+/// licensing isn't a redistribution concern here (whatever license the
+/// submodule's pinned commit carries applies to that source, not to a binary
+/// this repo ships). Embedding is gated behind the `embedded-tmux` Cargo
+/// feature (default off, so a plain `cargo build` never needs the submodule
+/// built): enable it after running `scripts/build-vendored-tmux.ps1`, which
+/// populates `daemon/assets/tmux/windows/tmux.exe` (see
+/// `daemon/assets/tmux/windows/README.md` and `docs/tmux-embedding.md`), and
+/// rebuilding. `scripts/build-release.cmd` does both by default (opt out via
+/// `RALPHUS_SKIP_VENDORED_TMUX=1`), which is how release/GitHub-release
+/// bundles ship it out of the box. Without the feature (or on a platform with
+/// no embedded asset yet), [`extract`] returns a clear error rather than
+/// panicking or silently no-opping, and [`super::resolve_tmux_program`] falls
+/// through to `PATH`/[`TMUX_CMD_ENV`].
 mod embedded {
     use super::TmuxError;
     use std::path::PathBuf;
@@ -1614,10 +1636,10 @@ mod embedded {
     #[cfg(not(all(target_os = "windows", feature = "embedded-tmux")))]
     pub fn extract() -> Result<PathBuf, TmuxError> {
         Err(TmuxError(
-            "tmux was not found on PATH, and this build has no embedded tmux binary \
-             (RAL-102: embedding is gated behind the `embedded-tmux` feature and requires a \
-             verified binary at daemon/assets/tmux/<platform>/ — see docs/tmux-embedding.md). \
-             Install tmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path."
+            "this build has no embedded tmux binary (RAL-347: embedding is gated behind the \
+             `embedded-tmux` feature and requires a build of the vendor/psmux submodule at \
+             daemon/assets/tmux/<platform>/ — run scripts/build-vendored-tmux.ps1, see \
+             docs/tmux-embedding.md). Falling through to PATH / RALPHUS_TMUX_CMD."
                 .to_string(),
         ))
     }

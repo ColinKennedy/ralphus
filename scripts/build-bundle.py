@@ -152,6 +152,7 @@ def bundle_readme(
     dirty: bool,
     dirty_list: list[str],
     docs: list[str],
+    tmux_version_substring: str,
 ) -> str:
     dirty_block = "clean"
     if dirty:
@@ -183,7 +184,9 @@ def bundle_readme(
         - bin/
           ralphus-daemon.exe, ralphus-librarian.exe, ralphus.exe, and ralphus-runner.exe.
         - tmux/
-          psmux 3.3.7 plus its LICENSE and upstream README.
+          {tmux_version_substring}, built from the vendored vendor/psmux git submodule
+          (RAL-347) -- not a separately installed/downloaded binary -- plus its LICENSE
+          and upstream README.
         - docs/
           User-facing references copied from this repo:
         {docs_block}
@@ -208,7 +211,11 @@ def bundle_readme(
         ---------------
         - If the launcher reports a missing file, keep the extracted folder layout intact; the executables and tmux binary are resolved relative to this folder.
         - If the daemon does not come up, check logs\\daemon.log first, then try bin\\ralphus-daemon.exe serve --port 7890 manually from this folder.
-        - If tmux behavior looks wrong, run tmux\\tmux.exe -V and confirm it reports psmux 3.3.7.
+        - If tmux behavior looks wrong, run tmux\\tmux.exe -V and confirm it reports {tmux_version_substring}.
+        - The bundled tmux/tmux.exe is the vendored, in-repo psmux build. Pointing
+          RALPHUS_TMUX_CMD at a different, externally installed tmux/psmux is possible but
+          discouraged: an untrusted or tampered external binary can see everything a task
+          session does, including model API keys (see docs/dependencies.md).
         """
     )
 
@@ -284,19 +291,17 @@ def assemble_bundle(
         copy_file(src, bundle_root / src.name)
 
     tmux_manifest = manifest["tmux"]["windows"]
-    package_dir = Path(os.path.expandvars(str(tmux_manifest["package_dir"])))
-    tmux_exe = package_dir / str(tmux_manifest["exe"])
-    tmux_license = package_dir / str(tmux_manifest["license"])
-    tmux_readme = package_dir / str(tmux_manifest["readme"])
+    tmux_exe = root / str(tmux_manifest["exe"])
+    tmux_license = root / str(tmux_manifest["license"])
+    tmux_readme = root / str(tmux_manifest["readme"])
     for required in (tmux_exe, tmux_license, tmux_readme):
         if not required.is_file():
-            raise FileNotFoundError(f"required tmux asset missing: {required}")
+            raise FileNotFoundError(
+                f"required tmux asset missing: {required} -- run "
+                "scripts/build-vendored-tmux.ps1 (scripts/build-release.cmd does this by "
+                "default unless RALPHUS_SKIP_VENDORED_TMUX=1) before assembling a bundle"
+            )
     actual_hash = sha256_file(tmux_exe)
-    expected_hash = str(tmux_manifest["sha256"]).upper()
-    if actual_hash != expected_hash:
-        raise RuntimeError(
-            f"tmux checksum mismatch: expected {expected_hash}, found {actual_hash}"
-        )
     version_text = read_version(tmux_exe)
     expected_version = str(tmux_manifest["version_substring"])
     if expected_version not in version_text:
@@ -311,6 +316,10 @@ def assemble_bundle(
     branch = git_output(root, "rev-parse", "--abbrev-ref", "HEAD")
     dirty_list = dirty_paths(root)
     built_at = time.strftime("%Y-%m-%d %H:%M:%S %z")
+    try:
+        vendor_psmux_commit = git_output(root, "-C", "vendor/psmux", "rev-parse", "HEAD")
+    except subprocess.CalledProcessError:
+        vendor_psmux_commit = None
     provenance = {
         "bundle_name": bundle_name,
         "built_at": built_at,
@@ -323,6 +332,7 @@ def assemble_bundle(
             "path": str(tmux_exe),
             "sha256": actual_hash,
             "version": version_text,
+            "vendor_psmux_submodule_commit": vendor_psmux_commit,
         },
         "manifest": manifest,
     }
@@ -334,6 +344,7 @@ def assemble_bundle(
         dirty=bool(dirty_list),
         dirty_list=dirty_list,
         docs=list(manifest["bundle"]["docs"]),
+        tmux_version_substring=expected_version,
     )
     (bundle_root / "README.txt").write_text(readme, encoding="utf-8")
     (bundle_root / "PROVENANCE.json").write_text(
@@ -353,7 +364,7 @@ def zip_bundle(stage_root: Path, bundle_root_name: str, zip_path: Path) -> None:
             zf.write(path, path.relative_to(stage_root))
 
 
-def smoke_test(zip_path: Path) -> None:
+def smoke_test(zip_path: Path, *, tmux_version_substring: str) -> None:
     print_step("smoke test")
     with tempfile.TemporaryDirectory(prefix="ralphus-bundle-smoke-") as tmp:
         temp_root = Path(tmp)
@@ -391,7 +402,7 @@ def smoke_test(zip_path: Path) -> None:
             wait_http(f"http://127.0.0.1:{librarian_port}/", timeout_sec=30.0)
 
             tmux_version = read_version(bundle_root / "tmux" / "tmux.exe")
-            if "psmux 3.3.7" not in tmux_version:
+            if tmux_version_substring not in tmux_version:
                 raise RuntimeError(f"unexpected bundled tmux version: {tmux_version}")
 
             cli = bundle_root / "bin" / "ralphus.exe"
@@ -474,7 +485,10 @@ def main() -> int:
     checksum_path.write_text(f"{checksum}  {zip_path.name}\n", encoding="ascii")
 
     if not args.skip_smoke_test:
-        smoke_test(zip_path)
+        smoke_test(
+            zip_path,
+            tmux_version_substring=str(manifest["tmux"]["windows"]["version_substring"]),
+        )
 
     if not args.keep_stage:
         shutil.rmtree(stage_root)

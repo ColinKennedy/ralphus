@@ -82,12 +82,19 @@ with the live Ralphus stack, while nextest launches each test in a separate
 process, so the crate's in-process `LIVE_TMUX_TEST_LOCK` cannot isolate a normal
 local run from either source of contention.
 
-The per-PR `psmux-integration` job in `.github/workflows/ci.yml` downloads a
-checksum-pinned psmux release, gives it a job-private `PSMUX_DATA_DIR`, and runs
-the ignored `live_tmux_*` tests serially. `.github/workflows/psmux-stress.yml`
-runs the same tests concurrently on a schedule or manual dispatch. This keeps
-the default local suite hermetic while preserving both reliable compatibility
-coverage and an explicit shared-server stress signal.
+The per-PR `psmux-integration` job in `.github/workflows/ci.yml` builds the
+vendored `vendor/psmux` git submodule (RAL-347, pinned to `v3.3.8`) from
+source, gives it a job-private `PSMUX_DATA_DIR`, and runs the ignored
+`live_tmux_*` tests serially against that build. `.github/workflows/psmux-stress.yml`
+runs the same tests concurrently, against the same vendored build, on a
+schedule or manual dispatch. This keeps the default local suite hermetic
+while preserving both reliable compatibility coverage and an explicit
+shared-server stress signal. `psmux-integration` additionally has one
+narrowly-scoped extra step that downloads a separate, non-vendorized `v3.3.8`
+release and re-runs a single fast `live_tmux_*` test with `RALPHUS_TMUX_CMD`
+pointed at it, proving that override path still works — see
+`docs/dependencies.md` for why relying on that path day-to-day is
+discouraged.
 
 When adding a test that touches the real binary on Windows:
 

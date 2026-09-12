@@ -1,0 +1,78 @@
+name: release
+
+# Builds a distributable ralphus bundle (scripts/build-bundle.py) and
+# publishes it to a GitHub Release. The bundle always includes the vendorized
+# psmux build (vendor/psmux git submodule, RAL-347) -- build-release.cmd
+# builds it by default -- so a release download works out of the box without
+# a separate tmux/psmux install. RALPHUS_TMUX_CMD remains available for users
+# who want to point at a different binary; see docs/dependencies.md for why
+# that's discouraged.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to check out and publish (defaults to the pushed tag for tag-triggered runs)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build release bundle and publish GitHub release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            vendor/psmux -> target
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ inputs.tag }}'
+          if (-not $tag) { $tag = '${{ github.ref_name }}' }
+          if (-not $tag) { throw 'no tag resolved: pass workflow_dispatch input `tag`, or trigger via a tag push' }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      # Runs scripts/build-release.cmd (which builds the vendored psmux
+      # submodule and links it in via --features embedded-tmux by default),
+      # assembles the bundle per scripts/bundle-manifest.toml, zips it,
+      # checksums it, and smoke-tests the extracted bundle end to end.
+      - name: Build release bundle
+        run: python scripts/build-bundle.py --output-dir bundle-dist --bundle-name ralphus-${{ steps.tag.outputs.tag }}
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $zip = Get-ChildItem -Path bundle-dist -Filter '*.zip' | Select-Object -First 1
+          $sha = Get-ChildItem -Path bundle-dist -Filter '*.sha256' | Select-Object -First 1
+          if (-not $zip -or -not $sha) { throw 'build-bundle.py did not produce a zip/sha256 pair' }
+          $exists = $true
+          try { gh release view $tag | Out-Null } catch { $exists = $false }
+          if ($exists) {
+            gh release upload $tag $zip.FullName $sha.FullName --clobber
+          } else {
+            gh release create $tag $zip.FullName $sha.FullName --title $tag --generate-notes
+          }

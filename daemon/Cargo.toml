@@ -20,9 +20,12 @@ workspace = true
 [features]
 secure-dist = ["ralphus-auth/secure-dist"]
 # Bundles a tmux-compatible binary via `include_bytes!` so users never need to
-# install tmux themselves (RAL-102). Off by default: no verified binary is
-# checked in yet — see daemon/assets/tmux/windows/README.md and
-# docs/tmux-embedding.md before enabling.
+# install tmux themselves, and so the daemon prefers a known-good build over
+# whatever happens to be named `tmux` on PATH (RAL-102, supply-chain
+# hardening in RAL-347). Off by default so a plain `cargo build` never needs
+# the vendor/psmux submodule built -- run scripts/build-vendored-tmux.ps1 to
+# populate daemon/assets/tmux/windows/tmux.exe before enabling. See
+# docs/tmux-embedding.md.
 embedded-tmux = []
 
 [dependencies]
