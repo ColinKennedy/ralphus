@@ -1287,6 +1287,9 @@ fn route_for_user(
             guardian_list_pr_stacks(daemon, id)
         }
         ("GET", ["api", "pull-requests"]) => pr_find(daemon, query),
+        // RAL-362: must precede the generic `pr_id` arm below -- "index" would
+        // otherwise be captured as a (nonexistent) PR id.
+        ("GET", ["api", "pull-requests", "index"]) => pr_index_list(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
@@ -1295,6 +1298,7 @@ fn route_for_user(
         }
         ("GET", ["api", "pull-requests", pr_id, "sync-status"]) => pr_sync_status(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id, "pull-from-pr"]) => pr_pull_from_pr(daemon, pr_id),
+        ("POST", ["api", "pull-requests", pr_id, "refresh-ci"]) => pr_refresh_ci(daemon, pr_id),
         _ => error(
             404,
             "not_found",
@@ -10421,6 +10425,18 @@ fn pr_get(daemon: &Daemon, pr_id: &str) -> Reply {
     }
 }
 
+/// Flat, single-query index of every PR row across every guardian (RAL-362),
+/// each annotated with the squad/task/cell its branch was most recently
+/// submitted from -- backs the board's Tasks tab PR badge lane (RAL-402:
+/// including each open PR's last-polled `ci_status`), which needs every
+/// open PR's source task in one request rather than one lookup per row.
+fn pr_index_list(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_pull_requests_index() {
+        Ok(rows) => json(200, &rows),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Look up the ralphus PR row for a given forge PR/MR (PR → worktree
 /// direction): `GET /api/pull-requests?forge=github&repo=acme%2Fwidget&pr_number=42`.
 fn pr_find(daemon: &Daemon, query: &str) -> Reply {
@@ -10566,6 +10582,51 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
     crate::pr::start_pull_pr_commits(daemon.store_handle(), runner, pr_id)
+}
+
+/// Live-poll the forge for this PR's current CI/mergeability status on
+/// demand (RAL-402) -- a complement to `ci_watch::poll_open_pr_ci_status`'s
+/// standing, per-guardian-throttled poll, not a replacement for it: lets the
+/// board refresh a single PR's badge color immediately (e.g. from the Tasks
+/// tab's "Check PR" action) instead of waiting for the next standing-poll
+/// tick. Persists the result the same way the standing poll does
+/// (`Store::set_pr_ci_status`), so it's also picked up by the next
+/// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
+/// go through the same `ForgeClient::check_pr_ci_status`.
+fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
+    let store = daemon.lock();
+    let pr = match store.get_pull_request(pr_id) {
+        Ok(pr) => pr,
+        Err(e) => return store_error(&e),
+    };
+    let guardian = match store.get_guardian(&pr.guardian_id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let Some(pr_number) = pr.pr_number else {
+        return error(409, "no_pr_number", "PR has no recorded number yet", vec![]);
+    };
+    let root = Path::new(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(root);
+    let client = match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
+        Ok(c) => c,
+        Err(e) => return error(502, "forge_error", &e, vec![]),
+    };
+    let state = match client.check_pr_ci_status(pr_number) {
+        Ok(s) => s,
+        Err(e) => return error(502, "forge_error", &e, vec![]),
+    };
+    let job_url = match &state {
+        crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
+        _ => None,
+    };
+    if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
+        return store_error(&e);
+    }
+    match store.get_pull_request(pr_id) {
+        Ok(pr) => json(200, &pr),
+        Err(e) => store_error(&e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -20279,6 +20340,92 @@ command = "true"
             "",
         );
         assert_eq!(r.status, 409);
+    }
+
+    #[test]
+    fn pr_index_lists_every_pr_row_with_ci_status() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(42),
+                Some("https://github.com/acme/widget/pull/42"),
+            )
+            .unwrap();
+        d.lock().set_pr_ci_status(&pr_id, "passing", None).unwrap();
+
+        let r = route(&d, "GET", "/api/pull-requests/index", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains(&pr_id));
+        assert!(r.body.contains("\"ci_status\":\"passing\""));
+    }
+
+    #[test]
+    fn pr_index_does_not_shadow_a_pr_id_lookup() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(42),
+                Some("https://github.com/acme/widget/pull/42"),
+            )
+            .unwrap();
+        let r = route(&d, "GET", &format!("/api/pull-requests/{pr_id}"), "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains(&pr_id));
+    }
+
+    #[test]
+    fn refresh_ci_missing_number_is_conflict() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "a",
+                "main",
+                "T",
+                "D",
+                None,
+                None,
+            )
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{pr_id}/refresh-ci"),
+            "",
+        );
+        assert_eq!(r.status, 409);
+    }
+
+    #[test]
+    fn refresh_ci_missing_pr_is_404() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/pull-requests/pr-999/refresh-ci", "");
+        assert_eq!(r.status, 404);
     }
 
     #[test]

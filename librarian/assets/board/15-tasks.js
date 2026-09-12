@@ -726,7 +726,7 @@
         renderTaskDetailsPane();
       }
       /**
-       * Runs the on-demand PR drift (git) + un-actioned-feedback (forge API) check for the selected task's picked PR (RAL-362 §5/§6) -- one PR, user-initiated, never part of the row predicate.
+       * Runs the on-demand PR drift (git) + un-actioned-feedback (forge API) check for the selected task's picked PR (RAL-362 §5/§6) -- one PR, user-initiated, never part of the row predicate. Also refreshes the PR's CI status (RAL-402) when it's still `open`.
        * @param {string} squadId
        * @param {number} taskIdx
        * @returns {Promise<void>}
@@ -744,6 +744,18 @@
           if (pr.pr_number != null) {
             const res = await fetch(`/api/pull-requests/${pr.id}/comments`);
             if (res.ok) comments = await res.json();
+          }
+          // RAL-402: on-demand CI-status refresh, complementing the daemon's
+          // standing poll (`ci_watch::poll_open_pr_ci_status`) rather than
+          // replacing it -- lets "Check PR" show the badge's true color right
+          // away instead of waiting for the next poll tick. Best-effort: an
+          // unnumbered PR or an unreachable forge must not fail the rest of
+          // the check, which already has its own git-drift/comments result.
+          if (pr.state === "open" && pr.pr_number != null) {
+            try {
+              const ciRes = await fetch(`/api/pull-requests/${pr.id}/refresh-ci`, { method: "POST" });
+              if (ciRes.ok) await pollTasksTab();
+            } catch (e) { /* best-effort */ }
           }
           taskTabPrCheckResult = { loading: false, sync: prSyncStatus[pr.id], comments };
         } catch (e) {
@@ -868,7 +880,7 @@
         else html += taskProof.map((v) => `<div class="kv-row">${sdot(v.state)}<span class="k">${esc(v.id || v.kind)}</span><span class="v">${pill(v.state)}</span></div>`).join("");
         if (row.prPick) {
           html += `<h4 style="margin:14px 0 6px">PR check</h4>`;
-          html += `<button class="btn" onclick="ttRunPrCheck('${esc(row.squadId)}',${row.taskIdx})" data-tip="On-demand only: fetches live drift (a git fetch) and un-actioned feedback (one forge API call) for this task's earliest PR.\nNot part of &quot;needs me&quot; or polled automatically -- at board scale that would be one round-trip per PR per refresh.">Check drift &amp; feedback</button>`;
+          html += `<button class="btn" onclick="ttRunPrCheck('${esc(row.squadId)}',${row.taskIdx})" data-tip="On-demand only: fetches live drift (a git fetch), un-actioned feedback, and (while open) CI status -- three forge/git calls -- for this task's earliest PR.\nNot part of &quot;needs me&quot; or polled automatically -- at board scale that would be one round-trip per PR per refresh.">Check drift, feedback &amp; CI</button>`;
           if (taskTabPrCheckFor && taskTabPrCheckFor.squadId === row.squadId && taskTabPrCheckFor.taskIdx === row.taskIdx && taskTabPrCheckResult) {
             const res = taskTabPrCheckResult;
             if (res.loading) html += `<div class="meta">Checking…</div>`;

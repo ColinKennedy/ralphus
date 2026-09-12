@@ -74,6 +74,46 @@ test("PR badge behavior is unchanged (inline onclick, opens the forge) and the a
   assert.match(approvedNoPr, /pr-placeholder/);
 });
 
+// ---------- PR CI/CD status coloring (RAL-402) ----------
+
+test("an open PR's badge is colored by its polled CI status, not the flat in-flight accent", () => {
+  const { ttReviewPrBadgesHtml } = makeBadgeRenderer();
+  const colorOf = (ci_status) => {
+    const html = ttReviewPrBadgesHtml(null, {
+      pr: { pr_url: "https://forge/x/42", pr_number: 42, state: "open", forge: "gh", repo: "x", ci_status },
+      count: 1,
+    });
+    const m = html.match(/style="color:([^;]+);/);
+    assert.ok(m, `no color found in badge html: ${html}`);
+    return m[1];
+  };
+  assert.equal(colorOf("failing"), "--failed");
+  assert.equal(colorOf("passing"), "--done");
+  assert.equal(colorOf("pending"), "--pending");
+  // no CI status polled yet (e.g. brand-new PR) -- flat in-flight accent, not red/green/grey.
+  assert.equal(colorOf(null), "--accent");
+});
+
+test("CI status is moot once a PR is no longer open -- lifecycle coloring wins", () => {
+  const { ttReviewPrBadgesHtml } = makeBadgeRenderer();
+  const html = ttReviewPrBadgesHtml(null, {
+    pr: { pr_url: "https://forge/x/42", pr_number: 42, state: "merged", forge: "gh", repo: "x", ci_status: "failing" },
+    count: 1,
+  });
+  const m = html.match(/style="color:([^;]+);/);
+  assert.ok(m, `no color found in badge html: ${html}`);
+  assert.equal(m[1], "--done");
+});
+
+test("the PR badge tooltip surfaces the polled CI status for an open PR", () => {
+  const { ttReviewPrBadgesHtml } = makeBadgeRenderer();
+  const html = ttReviewPrBadgesHtml(null, {
+    pr: { pr_url: "https://forge/x/42", pr_number: 42, state: "open", forge: "gh", repo: "x", ci_status: "failing" },
+    count: 1,
+  });
+  assert.match(html, /CI: failing/);
+});
+
 // ---------- click-engine wiring ----------
 
 test("gotoReview navigation stops propagation so the task row's ttSelectTask doesn't also fire", () => {

@@ -197,6 +197,7 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}/action-feedback` | [Pull un-actioned feedback](#post-apipull-requestspr_idaction-feedback) into the worktree |
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
+| POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
 | Method | Path | What |
@@ -2109,10 +2110,20 @@ been deleted, or the branch was added manually):
     "updated_at_ms": 1700000001000,
     "source_squad_id": "sq-1",
     "source_task_idx": 0,
-    "source_cell_idx": 2
+    "source_cell_idx": 2,
+    "ci_status": "passing"
   }
 ]
 ```
+`ci_status` (RAL-402) is `"passing"`/`"failing"`/`"pending"`, or `null` if this
+PR's CI has never been polled yet (e.g. it was just submitted). Only
+meaningful while `state` is `"open"` — once a PR is merged/closed/dropped its
+CI status is moot and the board reverts to coloring the badge by lifecycle
+state. Kept fresh by `ci_watch::poll_open_pr_ci_status`'s standing poll (at
+most once every two minutes per guardian) and by
+`POST .../refresh-ci` (below) for an immediate, on-demand refresh of one PR.
+Identical for GitHub- and GitLab-backed PRs — both resolve through the same
+`ForgeClient::check_pr_ci_status`.
 
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
@@ -2179,6 +2190,17 @@ reflected on the PR branch, e.g. right after resolving feedback — the board
 should offer "Push to PR", which submitting/action-feedback already do
 automatically). Both can be `false` and `in_sync` `true` when they match
 exactly. `502` if the guardian/PR can't be resolved.
+
+### `POST /api/pull-requests/{pr_id}/refresh-ci`
+Live-polls the forge for this one PR's current CI/mergeability status
+(RAL-402) via the same `ForgeClient::check_pr_ci_status` the standing poll
+uses, persists the result, and returns the updated PR row. A complement to
+that poll (`ci_watch::poll_open_pr_ci_status`, throttled to once every two
+minutes per guardian), not a replacement for it — lets the board refresh a
+single PR's badge immediately (e.g. the Tasks tab's "Check PR" action)
+instead of waiting for the next standing-poll tick. `409` if the PR has no
+recorded number yet; `502` on a forge API error. Identical behavior for
+GitHub and GitLab.
 
 ### `POST /api/pull-requests/{pr_id}/pull-from-pr`
 Fetch the PR branch's commits and rebase them into the owning review
