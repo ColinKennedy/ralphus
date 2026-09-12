@@ -29,3 +29,32 @@ The **Detail** column adapts to the state: the blocking claim for
 optional retry hint) for **deferred**, the decline reason for
 **opted_out**, the eligible-at time for **scheduled**/**eligible**, or the
 removal time for **retired**.
+
+## Transcript and pane-snapshot retirement (RAL-348)
+
+When a worktree actually retires (the **retired** state above), the daemon
+also deletes every pane-snapshot and terminal-log transcript file under
+`~/.ralphus` left behind by any cell or proof session that ever ran with
+that worktree as its working directory — across every attempt and restart,
+for the entire lifetime of the worktree. This piggybacks on the sweep
+described above rather than running on its own timer: a worktree only
+reaches **retired** once every claim against it is terminal, so this never
+touches a transcript or snapshot still tied to live or recent squad, task,
+or cell state.
+
+There is no separate retention policy or configuration surface for
+transcripts/pane-snapshots — they inherit whatever worktree-retirement
+policy already applies to the project (age threshold, per-machine
+opt-out, etc.). A project with no worktree-retirement override simply has
+no override for this either.
+
+This deletes outright; it does not archive. Local worktree pruning is safe
+to do unconditionally because the branch/commits still live on the remote,
+but transcripts and pane snapshots have no such backup today. Archiving
+them somewhere before deletion is a deliberately deferred future
+improvement, not an oversight.
+
+(`.log`/`.raw` terminal-log files are also independently aged out by
+`TerminalLogConfig`'s own retention-days/max-files cap on the regular
+scheduler tick, regardless of worktree state — that pre-existing scheme is
+unrelated to and unaffected by this section.)

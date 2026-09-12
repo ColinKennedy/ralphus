@@ -642,16 +642,13 @@ pub(crate) struct WorktreeClaim {
     pub state: String,
 }
 
-/// One persisted cell or proof step whose `cwd` names a worktree, with
-/// exactly the fields `crate::tmux::session_name` needs to recompute the
-/// tmux session (and therefore pane-snapshot/terminal-log) name it ran
-/// under. Used by `crate::worktree_transcript_retirement` (RAL-348) to find
-/// every session that ever ran in a worktree that has just been retired.
-// `crate::worktree_transcript_retirement` doesn't exist yet -- this struct
-// and `Store::worktree_session_owners` are the store-layer half of RAL-348,
-// landing ahead of the retirement module that will call them. Remove this
-// once that module exists and calls `worktree_session_owners`.
-#[allow(dead_code)]
+/// One persisted cell or proof session whose `cwd` may belong to a
+/// worktree, carrying enough identity to reconstruct the
+/// tmux/pane-snapshot/terminal-log session name that session used (see
+/// `tmux::session_name`). Used by
+/// `crate::worktree_transcript_retirement::retire_session_artifacts_for_worktree`
+/// to find every transcript/pane snapshot a retiring worktree's cells and
+/// proofs ever produced, across every attempt and restart (RAL-348).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorktreeSessionOwner {
     pub squad_id: String,
@@ -4705,34 +4702,24 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Every persisted cell and proof step whose `cwd` names a worktree, with
-    /// enough identity (squad id, owning task's name, session id) to
-    /// recompute `crate::tmux::session_name` for it. A proof step's session
-    /// id mirrors the `proof-{scope}-{idx}` cell id `scheduler::run_proofs`
-    /// actually runs it under; a proof always runs "where its owning
-    /// cell/task does" (RAL-185), so it reuses that cell's `cwd` here too.
-    ///
-    /// Deliberately returns every row rather than filtering by a specific
-    /// `cwd` in SQL: `crate::worktree_transcript_retirement` matches paths
-    /// via `guardian_merge::normalized_worktree_path`, the same
-    /// canonicalizing comparison `retire_stale_worktrees` itself uses to
-    /// dedupe/match worktree paths, so the comparison needs to happen in Rust
-    /// on both sides either way.
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    // Not called yet -- `crate::worktree_transcript_retirement` (RAL-348),
-    // this method's caller, doesn't exist yet. Remove this once it does.
-    #[allow(dead_code)]
+<<<<<<< HEAD
+    /// Every cell/proof session whose persisted `cwd` can name a worktree,
+    /// unfiltered by which one -- the path-equality check against a specific
+    /// worktree happens in Rust via `guardian_merge::normalized_worktree_path`,
+    /// the same canonicalizing comparison `retire_stale_worktrees` itself
+    /// uses, so a symlink or differently-cased path still matches. Proof
+    /// session ids are synthesized as `proof-{scope}-{idx}` to match what
+    /// `scheduler::run_proofs` actually runs them under; proof cwd selection
+    /// mirrors `worktree_claims` above. Used by
+    /// `worktree_transcript_retirement` (RAL-348).
     pub(crate) fn worktree_session_owners(&self) -> Result<Vec<WorktreeSessionOwner>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.squad_id, t.name, c.sid, c.cwd
              FROM cells c JOIN tasks t ON t.squad_id=c.squad_id AND t.idx=c.task_idx
-             WHERE c.cwd IS NOT NULL
+             WHERE c.cwd IS NOT NULL AND c.sid IS NOT NULL
              UNION ALL
              SELECT p.squad_id, t.name, 'proof-' || p.scope || '-' || p.idx, c.cwd
-             FROM proofs p
-             JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+             FROM proofs p JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
               AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
                    (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
                      WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
