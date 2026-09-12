@@ -142,6 +142,7 @@
        * @type {{[key: string]: string}}
        */
       const TT_COLUMN_TIPS = {
+        sel: "Select tasks for bulk actions (RAL-350). Click a box to select that task; shift-click to select a range. This header box selects/deselects every task currently shown by the filter.\nThe selection persists even if a later filter hides some selected rows -- a bulk action (the row meatball, ⋮) then applies only to what's still visible.",
         star: "Watched status (RAL-362 §5). Click a row's star to watch/unwatch its task.\nA task covered by a watch on its whole squad shows a distinct inherited-watch glyph.",
         name: "Task name. Click the row to select it; the chevron (when present) expands its cells.",
         squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
@@ -159,6 +160,9 @@
        * @returns {string}
        */
       function ttHeadCellHtml(c) {
+        if (c.key === "sel") {
+          return `<div class="tt-head-cell" data-tip="${esc(TT_COLUMN_TIPS.sel)}"><input type="checkbox" class="tt-sel-all" onclick="event.stopPropagation();ttToggleSelectAllVisible(this.checked)" data-tip="${esc(TT_COLUMN_TIPS.sel)}"></div>`;
+        }
         const isSort = taskTabFilters.sort === c.key;
         const label = c.sortable
           ? `<span onclick="ttSetSort('${c.key}')" style="cursor:pointer">${esc(c.label)}</span>`
@@ -239,7 +243,10 @@
         menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
       }
-      /** Closes the open column meatball menu, if any. @returns {void} */
+      /**
+       * Closes the open column meatball menu, if any.
+       * @returns {void}
+       */
       function ttCloseColMenu() { const m = document.getElementById("tt-col-menu"); if (m) m.remove(); }
       document.addEventListener("click", ttCloseColMenu);
       /**
@@ -310,7 +317,10 @@
         taskTabColWidths[key] = Math.max(min, startW + (e.clientX - startX));
         document.documentElement.style.setProperty("--tt-grid", taskTabGridTemplate(TASK_TAB_COLUMNS, taskTabHiddenCols, taskTabColWidths));
       }
-      /** Ends the active column-resize drag and persists the final width. @returns {void} */
+      /**
+       * Ends the active column-resize drag and persists the final width.
+       * @returns {void}
+       */
       function onTtColResizeUp() {
         if (!ttColResizeDrag) return;
         document.querySelectorAll(".tt-col-resize.dragging").forEach((el) => el.classList.remove("dragging"));
@@ -334,6 +344,14 @@
           const el = /** @type {HTMLElement} */ (el0);
           el.addEventListener("mousedown", (/** @type {MouseEvent} */ e) => onTtColResizeDown(e));
         });
+        // Reflects the "some but not all visible rows selected" state -- HTML has
+        // no attribute for it, so it's set as a DOM property after the checkbox exists.
+        const selAll = /** @type {HTMLInputElement|null} */ (head.querySelector(".tt-sel-all"));
+        if (selAll) {
+          const { checked, indeterminate } = ttSelectAllState();
+          selAll.checked = checked;
+          selAll.indeterminate = indeterminate;
+        }
       }
       /**
        * Renders one column's cell wrapper, or "" when that column is currently hidden (so the emitted grid-cell count matches the header's).
@@ -348,6 +366,85 @@
         const align = forceAlign || (col && col.align === "right" ? "right" : "left");
         return `<div class="tt-cell ${align === "right" ? "align-right" : ""}">${html}</div>`;
       }
+      // RALPHUS-TT-MULTISELECT:BEGIN
+      /**
+       * The `TtRow.key`s of every task row in the current filtered/sorted/
+       * grouped display list, in display order (RAL-350) -- "visible" for the
+       * double-filter rule: a bulk action or the header select-all/none only
+       * ever reaches rows in this list, never rows the underlying `ttSel`
+       * remembers but a filter is currently hiding.
+       * @returns {string[]}
+       */
+      function ttVisibleTaskKeys() {
+        return ttDisplayItems.filter((it) => it.type === "task").map((it) => /** @type {TtRow} */ (it.row).key);
+      }
+      /**
+       * The header select-all checkbox's checked/indeterminate state, derived
+       * from how many of the currently visible task rows are in `ttSel`.
+       * @returns {{checked: boolean, indeterminate: boolean}}
+       */
+      function ttSelectAllState() {
+        const keys = ttVisibleTaskKeys();
+        if (!keys.length) return { checked: false, indeterminate: false };
+        const n = keys.filter((k) => ttSel.has(k)).length;
+        return { checked: n === keys.length, indeterminate: n > 0 && n < keys.length };
+      }
+      /**
+       * Selects or deselects every currently visible task row at once (the
+       * header checkbox) -- never touches a selected row the current filter
+       * is hiding (RAL-350's double filter).
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function ttToggleSelectAllVisible(checked) {
+        for (const k of ttVisibleTaskKeys()) { if (checked) ttSel.add(k); else ttSel.delete(k); }
+        ttSelAnchor = null;
+        renderTasksTab();
+      }
+      /**
+       * Handles a click on one row's own selection checkbox: plain click
+       * toggles just that row and becomes the new shift-range anchor;
+       * shift-click selects the range between the anchor and this row among
+       * the currently visible task rows (RAL-350, mirrors `onSquadClick`).
+       * @param {MouseEvent} e
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @returns {void}
+       */
+      function ttToggleRowSel(e, squadId, taskIdx) {
+        const key = `${squadId}:${taskIdx}`;
+        if (e.shiftKey && ttSelAnchor) {
+          const vis = ttVisibleTaskKeys();
+          const a = vis.indexOf(ttSelAnchor), b = vis.indexOf(key);
+          if (a >= 0 && b >= 0) {
+            const lo = Math.min(a, b), hi = Math.max(a, b);
+            for (let i = lo; i <= hi; i++) ttSel.add(vis[i]);
+          } else if (ttSel.has(key)) { ttSel.delete(key); } else { ttSel.add(key); }
+        } else {
+          if (ttSel.has(key)) ttSel.delete(key); else ttSel.add(key);
+          ttSelAnchor = key;
+        }
+        renderTasksTab();
+      }
+      /**
+       * Resolves the row set a Tasks-tab bulk action (the row meatball menu)
+       * should apply to (RAL-350): every selected row that's also currently
+       * visible, when the clicked row is part of a multi-row selection;
+       * otherwise just the clicked row alone, same as before multi-select
+       * existed. This is the double-filter rule -- a filter narrows what a
+       * bulk action reaches without ever mutating `ttSel` itself.
+       * @param {string} key
+       * @returns {TtRow[]}
+       */
+      function ttVisibleSelectedRows(key) {
+        if (!ttSel.has(key) || ttSel.size <= 1) {
+          const row = ttAllRows.find((r) => r.key === key);
+          return row ? [row] : [];
+        }
+        const visibleKeys = new Set(ttVisibleTaskKeys());
+        return ttAllRows.filter((r) => ttSel.has(r.key) && visibleKeys.has(r.key));
+      }
+      // RALPHUS-TT-MULTISELECT:END
       /**
        * Renders the squad chip: the squad's OWN state pip (never a roll-up of this row) plus its label.
        * @param {TtRow} row
@@ -468,10 +565,12 @@
       function ttTaskRowHtml(row, top) {
         const hasCells = row.cells.length > 0;
         const expanded = taskTabExpanded.has(row.key);
-        const selected = taskTabSel.kind === "task" && taskTabSel.squadId === row.squadId && taskTabSel.taskIdx === row.taskIdx;
+        const multiSelected = ttSel.has(row.key);
+        const selected = (taskTabSel.kind === "task" && taskTabSel.squadId === row.squadId && taskTabSel.taskIdx === row.taskIdx) || multiSelected;
         const chevron = hasCells
           ? `<span class="tt-chevron ${expanded ? "expanded" : ""}" onclick="event.stopPropagation();ttToggleExpand('${esc(row.key)}')" data-tip="Expand to show this task's cells.">▶</span>`
           : `<span class="tt-chevron hidden-chevron">▶</span>`;
+        const selCb = `<input type="checkbox" class="tt-row-sel" ${multiSelected ? "checked" : ""} onclick="event.stopPropagation();ttToggleRowSel(event,'${esc(row.squadId)}',${row.taskIdx})" data-tip="Select this task for bulk actions -- the row meatball (⋮) then applies to every selected task.\nShift-click to select a range.">`;
         const starCls = row.watch.watched ? `watched ${row.watch.inherited ? "inherited" : ""}` : "";
         const starTip = !row.watch.watched
           ? "Not watched. Click to watch — \"needs me\" only ever surfaces watched work."
@@ -481,6 +580,7 @@
         const star = `<span class="tt-star ${starCls}" onclick="event.stopPropagation();ttToggleWatch('${esc(row.squadId)}',${row.taskIdx})" data-tip="${esc(starTip)}">${row.watch.inherited ? "◆" : "★"}</span>`;
         const needsDot = row.needsMe ? `<span style="color:var(--accent)" data-tip="${esc(row.needsMeReason || "")}">●</span>` : "";
         return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
+          + ttColCell("sel", selCb)
           + ttColCell("star", star)
           + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
           + ttColCell("squad", ttSquadChipHtml(row))
@@ -490,7 +590,11 @@
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
           + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
-          + ttColCell("meatball", `<span class="tt-meatball" onclick="event.stopPropagation();ttOpenRowMenu(event,'${esc(row.squadId)}',${row.taskIdx})" data-tip="Task actions (restart, set status, stop, hide its squad) — the only place task actions live on this tab.">⋯</span>`)
+          + ttColCell("meatball", (() => {
+            const menuRowCount = multiSelected && ttSel.size > 1 ? ttVisibleSelectedRows(row.key).length : 1;
+            const tip = `Task actions (restart, set status, stop, hide its squad) — the only place task actions live on this tab.${menuRowCount > 1 ? ` Applies to all ${menuRowCount} currently visible selected tasks (RAL-350).` : ""}`;
+            return `<span class="tt-meatball" onclick="event.stopPropagation();ttOpenRowMenu(event,'${esc(row.squadId)}',${row.taskIdx})" data-tip="${esc(tip)}">⋯</span>`;
+          })())
           + `</div>`;
       }
       /**
@@ -507,6 +611,7 @@
         const proofPips = (cell.proof || []).map((v) => `<span data-tip="${esc(v.kind)}: ${esc(v.state)}">${sdot(v.state)}</span>`).join("") || `<span class="tt-cells-count">–</span>`;
         const branch = cell.reviews && cell.reviews.length ? cell.reviews.map((r) => esc(r.branch || "")).filter(Boolean).join(", ") : "–";
         return `<div class="tt-row tt-cell-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="event.stopPropagation();ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${cellIdx})">`
+          + ttColCell("sel", "")
           + ttColCell("star", "")
           + ttColCell("name", `<span class="tt-name-cell" style="padding-left:20px">${sdot(cell.state)}<span class="tt-name-text" data-tip="${esc(cell.name || cell.id)}">${esc(cell.name || cell.id)}</span></span>`)
           + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent)} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent)}</span>`)
@@ -541,6 +646,7 @@
           ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
           : `${formatted} across all ${groupRows.length} tasks in this squad.`;
         return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
+          + ttColCell("sel", "")
           + ttColCell("star", "")
           + ttColCell("name", `<span class="tt-group-label" onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Squad ${esc(label)} — click to open on the Squads tab.">${sdot(squadState)} ${esc(label)} <span style="color:var(--muted);font-weight:400">(${groupRows.length})</span></span>`)
           + ttColCell("squad", "")
@@ -590,12 +696,18 @@
         if (taskTabExpanded.has(key)) taskTabExpanded.delete(key); else taskTabExpanded.add(key);
         renderTasksTab();
       }
-      /** Expands every currently-filtered task row that has cells. @returns {void} */
+      /**
+       * Expands every currently-filtered task row that has cells.
+       * @returns {void}
+       */
       function ttExpandAll() {
         for (const item of ttDisplayItems) if (item.type === "task" && /** @type {TtRow} */ (item.row).cells.length) taskTabExpanded.add(/** @type {TtRow} */ (item.row).key);
         renderTasksTab();
       }
-      /** Collapses every currently-filtered task row. @returns {void} */
+      /**
+       * Collapses every currently-filtered task row.
+       * @returns {void}
+       */
       function ttCollapseAll() {
         for (const item of ttDisplayItems) if (item.type === "task") taskTabExpanded.delete(/** @type {TtRow} */ (item.row).key);
         renderTasksTab();
@@ -752,7 +864,16 @@
         renderTaskDetailsPane();
       }
       /**
-       * Opens the row meatball menu (RAL-362 §3: "the only place task actions live") -- reuses the Squads tab's own task graph-node menu (restart/stop/status/solo) verbatim, plus Tasks-tab-only shortcuts (open on Squads tab, hide/unhide the squad).
+       * Opens the row meatball menu (RAL-362 §3: "the only place task actions
+       * live") -- reuses the Squads tab's own task graph-node menu
+       * (restart/stop/status/solo) verbatim, plus Tasks-tab-only shortcuts
+       * (open on Squads tab, hide/unhide the squad). RAL-350: when the
+       * clicked row is part of the current multi-selection, every action
+       * (including the graph-node menu's own restart/stop/status/solo)
+       * applies to every selected row still visible under the current
+       * filter (`ttVisibleSelectedRows`) instead of just this one --
+       * except "Open in Squads tab", which stays single-target only and is
+       * shown disabled with an explanatory tooltip rather than hidden.
        * @param {MouseEvent} e
        * @param {string} squadId
        * @param {number} taskIdx
@@ -760,29 +881,49 @@
        */
       function ttOpenRowMenu(e, squadId, taskIdx) {
         ttCloseColMenu();
-        const item = graphNodeItem(squadId, "task", taskIdx, -1, -1);
-        if (!item) return;
-        openGraphNodeMenu(e, [item]);
+        const key = `${squadId}:${taskIdx}`;
+        const rows = ttVisibleSelectedRows(key);
+        if (!rows.length) return;
+        const items = /** @type {GraphNodeSelectionItem[]} */ (rows.map((r) => graphNodeItem(r.squadId, "task", r.taskIdx, -1, -1)).filter(Boolean));
+        if (!items.length) return;
+        openGraphNodeMenu(e, items);
         const menu = document.getElementById("graph-node-menu");
         if (!menu) return;
-        const hideRow = hiddenSquadIds.has(squadId)
-          ? `<div onclick="ttHideSquad('${esc(squadId)}',false)" data-tip="Re-enable this task's squad in your own view (Squads tab).">🙉 Unhide squad</div>`
-          : `<div onclick="ttHideSquad('${esc(squadId)}',true)" data-tip="Hide this task's whole squad from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide squad</div>`;
-        menu.insertAdjacentHTML("beforeend", `<div class="ctx-sep"></div><div onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Open this task on the Squads tab, where the full dependency graph and every task action live.">↗ Open in Squads tab</div>${hideRow}`);
+        const multi = rows.length > 1;
+        _ttRowMenuSquadIds = [...new Set(rows.map((r) => r.squadId))];
+        const openRow = multi
+          ? `<span data-tip="Open in Squads tab is single-target only -- it can't jump to more than one task's place in the dependency graph at once. Select just this one task to use it.">`
+            + `<div style="opacity:.5;cursor:not-allowed;pointer-events:none">↗ Open in Squads tab</div></span>`
+          : `<div onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Open this task on the Squads tab, where the full dependency graph and every task action live.">↗ Open in Squads tab</div>`;
+        const squadWord = _ttRowMenuSquadIds.length === 1 ? "squad" : "squads";
+        const hideRow = multi
+          ? `<div onclick="ttHideSquads(true)" data-tip="Hide the ${squadWord} of all ${rows.length} selected tasks from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide ${_ttRowMenuSquadIds.length} ${squadWord}</div>`
+            + `<div onclick="ttHideSquads(false)" data-tip="Re-enable the ${squadWord} of all ${rows.length} selected tasks in your own view.">🙉 Unhide ${_ttRowMenuSquadIds.length} ${squadWord}</div>`
+          : hiddenSquadIds.has(squadId)
+            ? `<div onclick="ttHideSquads(false)" data-tip="Re-enable this task's squad in your own view (Squads tab).">🙉 Unhide squad</div>`
+            : `<div onclick="ttHideSquads(true)" data-tip="Hide this task's whole squad from your own view.\nHiding is squad-level only -- there is no per-task hiding yet.">🙈 Hide squad</div>`;
+        menu.insertAdjacentHTML("beforeend", `<div class="ctx-sep"></div>${openRow}${hideRow}`);
       }
       /**
-       * Hides/unhides a task's whole squad from the Tasks tab's row meatball (hiding is squad-level only, RAL-331).
-       * @param {string} squadId
+       * Hides/unhides every squad captured by the currently open Tasks-tab
+       * row meatball menu (`_ttRowMenuSquadIds`, RAL-350) -- one squad for a
+       * single-row menu, or the deduplicated squads of every selected,
+       * visible row for a multi-row menu. Hiding stays squad-level only
+       * (RAL-331); there is no per-task hiding.
        * @param {boolean} hide
        * @returns {Promise<void>}
        */
-      async function ttHideSquad(squadId, hide) {
+      async function ttHideSquads(hide) {
         ttCloseColMenu();
         closeGraphMenu();
-        let resp;
-        try { resp = await (hide ? post(`/api/hidden/squads/${squadId}`) : del(`/api/hidden/squads/${squadId}`)); } catch (e) { alert("daemon unreachable"); return; }
-        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
-        if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
+        const squadIds = _ttRowMenuSquadIds;
+        if (!squadIds.length) return;
+        for (const squadId of squadIds) {
+          let resp;
+          try { resp = await (hide ? post(`/api/hidden/squads/${squadId}`) : del(`/api/hidden/squads/${squadId}`)); } catch (e) { alert("daemon unreachable"); return; }
+          if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+          if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
+        }
         renderTasksTab();
       }
       // RALPHUS-TT-SCROLL-SELECTION:BEGIN

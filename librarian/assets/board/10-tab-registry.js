@@ -175,7 +175,9 @@
       // ---- Preferences tab (RAL-329: per-user hidden squads/reviews, built on RAL-328) ----
       /** The two `HiddenItem.kind` values. */
       const HIDDEN_KINDS = ["squad", "review"];
-      /** @returns {{q: string, type: Set<string>}} */
+      /**
+       * @returns {{q: string, type: Set<string>}}
+       */
       function defaultHiddenFilters() { return { q: "", type: new Set(HIDDEN_KINDS) }; }
       /** @type {HiddenItem[]} */
       let hiddenItems = [];
@@ -396,6 +398,19 @@
        */
       /** @type {TaskTabSel} what's shown in the Tasks tab's details pane */
       let taskTabSel = { kind: null, squadId: null, taskIdx: -1, cellIdx: -1 };
+      /**
+       * RAL-350: the Tasks tab's row multi-selection -- `"<squadId>:<taskIdx>"`
+       * keys, independent of `taskTabSel` (the details-pane single selection)
+       * and of the current view filter. A filter never mutates this set; it
+       * only narrows which of these keys a bulk action (the row meatball menu)
+       * reaches at the moment it's invoked -- see `ttVisibleSelectedRows`.
+       * @type {Set<string>}
+       */
+      let ttSel = new Set();
+      /** @type {string|null} anchor key for shift-range multi-selection among the Tasks tab's currently visible/filtered rows (RAL-350), mirrors `anchorId`/`guardianAnchorId`. */
+      let ttSelAnchor = null;
+      /** @type {string[]} squad ids scoped by the currently open Tasks-tab row meatball menu's Hide/Unhide action (RAL-350) -- one or every squad among the selected, currently-visible rows. */
+      let _ttRowMenuSquadIds = [];
       /** @type {TaskTabFilters} */
       let taskTabFilters = defaultTaskTabFilters();
       /** @type {Set<string>} `"<squadId>:<taskIdx>"` keys of expanded Tasks-tab rows (RAL-362 §4) */
@@ -420,6 +435,7 @@
        */
       /** @type {TaskTabColumn[]} */
       const TASK_TAB_COLUMNS = [
+        { key: "sel", label: "", width: 26, min: 26, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
         { key: "star", label: "", width: 24, min: 24, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
         { key: "name", label: "Task", width: 320, min: 160, flex: true, sortable: true, hideable: false, groupable: false, align: "left" },
         { key: "squad", label: "Squad", width: 150, min: 90, flex: false, sortable: true, hideable: false, groupable: true, align: "left" },
