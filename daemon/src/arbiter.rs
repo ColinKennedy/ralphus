@@ -29,6 +29,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use std::sync::{Arc, Mutex};
+
 use crate::chat_client::{self, ChatMessage};
 use crate::config::ArbiterConfig;
 use crate::store::Store;
@@ -425,7 +427,6 @@ pub fn infer_subprojects(
         );
     Some(matched)
 }
-
 /// One Triage-opted-in cell that had no inline `triage_type` at submit time,
 /// so it still needs an Arbiter classification call -- collected by `submit`
 /// during its synchronous validation pass, classified later by
