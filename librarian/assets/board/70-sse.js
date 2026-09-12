@@ -96,22 +96,52 @@
        */
       let tasksFetchInFlight = null;
       /**
+       * Bumped every time a new in-flight `/api/tasks` request is minted (or
+       * discarded via `invalidateTasksFetch`, RAL-406) -- each request's own
+       * cleanup compares against this to tell whether it still owns
+       * `tasksFetchInFlight` before clearing it, so a slow, already-superseded
+       * request settling late can't clobber a newer request's in-flight slot.
+       */
+      let tasksFetchGeneration = 0;
+      /**
        * Fetches and parses `/api/tasks`, reusing the current in-flight
        * request if one is already running instead of starting a duplicate.
        * @returns {Promise<any>}
        */
       function fetchTasksShared() {
         if (!tasksFetchInFlight) {
+          const gen = ++tasksFetchGeneration;
           tasksFetchInFlight = (async () => {
             try {
               return await (await fetch("/api/tasks")).json();
             } finally {
-              tasksFetchInFlight = null;
+              // Only clear the slot if it's still this request's -- a
+              // slow request that `invalidateTasksFetch` (RAL-406) already
+              // discarded, settling after a newer request has since claimed
+              // the slot, must not drop that newer request's own reference
+              // and force a redundant extra fetch.
+              if (tasksFetchGeneration === gen) tasksFetchInFlight = null;
             }
           })();
         }
         return tasksFetchInFlight;
       }
+      /**
+       * Discards the current in-flight `/api/tasks` request (if any) so the
+       * next `fetchTasksShared` caller issues a brand-new one instead of
+       * piggybacking on it (RAL-406). A squad/task/cell mutation (cancel,
+       * restart, retry, set-status, delete, ...) can finish committing
+       * server-side while an `/api/tasks` request sent *before* the mutation
+       * is still in flight -- without this, the post-mutation `tick()`'s
+       * poll would share that stale in-flight request via `fetchTasksShared`
+       * and render pre-mutation status, which then looks "stuck" until some
+       * unrelated later poll (e.g. a tab switch) finally issues a fresh one.
+       * Does not abort the stale request itself -- it may still be relied on
+       * by a caller that started before the mutation -- it only stops new
+       * callers from reusing it.
+       * @returns {void}
+       */
+      function invalidateTasksFetch() { tasksFetchInFlight = null; }
       // RALPHUS-TASKS-POLL-SEQ:END
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
