@@ -119,12 +119,18 @@ pub struct GenerateRequest {
 }
 
 /// The generation-step flavors the Simple form offers. All share the same
-/// JSON-list prompt/parse machinery; only the wording differs.
+/// JSON-list prompt/parse machinery; only the wording differs. `TaskName`
+/// (RAL-398) is the odd one out -- it isn't a Simple-form checklist button,
+/// it backs the Simple tab's automatic task/squad naming fallback (see
+/// `crate::server::suggest_task_name`) for a prompt with no ticket-id-shaped
+/// token to name the task after -- but it reuses the exact same one-item
+/// `GeneratedItem{label, value}` shape rather than inventing a new job type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationKind {
     ProofSteps,
     ManualChecks,
     AutoBuildSteps,
+    TaskName,
 }
 
 impl GenerationKind {
@@ -134,6 +140,7 @@ impl GenerationKind {
             "proof_steps" => Some(Self::ProofSteps),
             "manual_checks" => Some(Self::ManualChecks),
             "auto_build_steps" => Some(Self::AutoBuildSteps),
+            "task_name" => Some(Self::TaskName),
             _ => None,
         }
     }
@@ -155,6 +162,11 @@ impl GenerationKind {
                 "each item's \"value\" must be a single shell command that builds/compiles \
                  the change (run automatically when this review's branches merge)"
             }
+            Self::TaskName => {
+                "the array must contain exactly one item; its \"value\" must be a short \
+                 kebab-case slug (3-6 words, lowercase, hyphen-separated, no punctuation, \
+                 no ticket ids) summarizing the work, safe to use as a git branch name"
+            }
         }
     }
 }
@@ -165,6 +177,21 @@ impl GenerationKind {
 /// already proven to work against small local models.
 #[must_use]
 fn generation_prompt(kind: GenerationKind, prompt_context: &str) -> (String, String) {
+    if kind == GenerationKind::TaskName {
+        let system_prompt = "You invent a short, memorable name for a software task from its \
+                              description. Respond with ONLY valid JSON, no markdown fences, \
+                              no prose."
+            .to_string();
+        let user_prompt = format!(
+            "A task is about to run with this prompt:\n\n{prompt_context}\n\nPropose exactly \
+             one name for it. Return ONLY a JSON array of the form \
+             [{{\"label\": \"...\", \"value\": \"...\"}}] -- no markdown fences, no \
+             explanation, no other text. {desc}. \"label\" must be a short, human-readable \
+             title-case version of the same name (a few words).",
+            desc = kind.describe()
+        );
+        return (system_prompt, user_prompt);
+    }
     let system_prompt = "You propose short, concrete checklist items for a software task. \
                           Respond with ONLY valid JSON, no markdown fences, no prose."
         .to_string();
@@ -196,6 +223,34 @@ pub fn parse_generated_items(text: &str) -> Option<Vec<GeneratedItem>> {
         return None;
     }
     serde_json::from_str::<Vec<GeneratedItem>>(&text[start..=end]).ok()
+}
+
+/// Sanitizes a `TaskName` generation result's `value` into a name safe to
+/// store as a task's `name` (and use as part of a git branch): lowercased,
+/// runs of anything other than `[a-z0-9]` collapsed to a single `-`, and
+/// leading/trailing `-` trimmed. Capped at 60 chars so a model that ignores
+/// the "3-6 words" instruction can't produce an unwieldy name. Empty input
+/// (or input that sanitizes to nothing, e.g. all punctuation) returns
+/// `None` so the caller can fall back to its own placeholder instead of
+/// storing an empty task name.
+#[must_use]
+pub fn slugify_task_name(s: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_dash = true; // suppresses a leading '-'
+    for ch in s.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug.truncate(60);
+    if slug.is_empty() { None } else { Some(slug) }
 }
 
 /// Run one generation call synchronously (called from a background thread
@@ -311,7 +366,36 @@ mod tests {
             GenerationKind::parse("auto_build_steps"),
             Some(GenerationKind::AutoBuildSteps)
         );
+        assert_eq!(
+            GenerationKind::parse("task_name"),
+            Some(GenerationKind::TaskName)
+        );
         assert_eq!(GenerationKind::parse("bogus"), None);
+    }
+
+    #[test]
+    fn slugify_task_name_lowercases_and_collapses_punctuation() {
+        assert_eq!(
+            slugify_task_name("Add Retry Logic To Upload Client!"),
+            Some("add-retry-logic-to-upload-client".to_string())
+        );
+        assert_eq!(
+            slugify_task_name("  --Leading/trailing junk--  "),
+            Some("leading-trailing-junk".to_string())
+        );
+    }
+
+    #[test]
+    fn slugify_task_name_rejects_all_punctuation() {
+        assert_eq!(slugify_task_name("!!!"), None);
+        assert_eq!(slugify_task_name(""), None);
+    }
+
+    #[test]
+    fn slugify_task_name_caps_length() {
+        let long = "word ".repeat(30);
+        let slug = slugify_task_name(&long).unwrap();
+        assert!(slug.len() <= 60, "expected <=60 chars, got {}", slug.len());
     }
 
     #[test]
