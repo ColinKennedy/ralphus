@@ -97,6 +97,74 @@ test("a single normal poll still updates squads and the updated-clock label (no 
   assert.equal(poll.els.conn.className, "dot on");
 });
 
+// ---------- invalidateTasksFetch: RAL-406 stale-status-after-mutation race ----------
+//
+// The dedup above (fetchTasksShared) has a sharp edge: a poll that began
+// *before* a mutation (e.g. cancelling a squad) can still be in flight when
+// the mutation commits server-side. Without invalidation, the mutation's
+// own post-commit tick()/pollTasks() call shares that same pre-mutation
+// in-flight request via fetchTasksShared() instead of firing a fresh one --
+// so even the "latest ticket" caller ends up rendering pre-mutation status,
+// and it stays stuck until some unrelated later poll (e.g. a tab switch)
+// finally issues a fresh request. See post()/del() in 20-util.js (RAL-406)
+// for the call sites that invoke invalidateTasksFetch() on every
+// squad-scoped mutation.
+
+test("invalidateTasksFetch: a poll started after a squad mutation gets its own fresh /api/tasks request instead of piggybacking on the pre-mutation one (RAL-406)", async () => {
+  const poll = makeTasksPoll();
+  // Some poll already in flight (the 60s reconciliation tick, an SSE
+  // refresh, ...) when the user cancels a squad.
+  const stalePromise = poll.pollTasks(); // ticket 1
+  assert.equal(poll.pendingFetches.length, 1);
+
+  // The cancel mutation invalidates the shared in-flight request the moment
+  // it commits server-side, then the post-cancel tick() polls again.
+  poll.invalidateTasksFetch();
+  const freshPromise = poll.pollTasks(); // ticket 2
+  assert.equal(poll.pendingFetches.length, 2, "the post-mutation poll must not share the pre-mutation in-flight request");
+
+  // The fresh, post-mutation request resolves first with the correct
+  // "cancelled" status; the stale pre-mutation one resolves after with the
+  // old "running" status but must lose regardless of arrival order.
+  resolveJson(poll.pendingFetches[1], { daemon: { running: 0, max_concurrent: 2 }, squads: [{ id: "s-1", state: "cancelled" }] });
+  await freshPromise;
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "s-1", state: "running" }] });
+  await stalePromise;
+
+  assert.deepEqual(poll.state().squads, [{ id: "s-1", state: "cancelled" }], "the fresh post-mutation data must win, not the stale pre-mutation response");
+});
+
+test("invalidateTasksFetch: a no-op when nothing is in flight -- the next poll behaves normally", async () => {
+  const poll = makeTasksPoll();
+  poll.invalidateTasksFetch();
+  const promise = poll.pollTasks();
+  assert.equal(poll.pendingFetches.length, 1);
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 0 }, squads: [{ id: "s-1" }] });
+  await promise;
+  assert.deepEqual(poll.state().squads, [{ id: "s-1" }]);
+});
+
+test("invalidateTasksFetch: does not clobber a newer in-flight request that already replaced the stale one before it settles", async () => {
+  const poll = makeTasksPoll();
+  const stalePromise = poll.pollTasks(); // ticket 1, request A
+  poll.invalidateTasksFetch();
+  const freshPromise = poll.pollTasks(); // ticket 2, request B -- distinct from A
+
+  // Resolve the stale request A now -- its own fetchTasksShared cleanup
+  // must not evict request B's still-in-flight slot.
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "s-1", state: "running" }] });
+  await stalePromise;
+
+  // A third caller arriving now (before B settles) must still share B, not
+  // fire a redundant third request.
+  const thirdPromise = poll.pollTasks(); // ticket 3, shares request B
+  assert.equal(poll.pendingFetches.length, 2, "request A settling must not force a spurious third fetch while B is still in flight");
+
+  resolveJson(poll.pendingFetches[1], { daemon: { running: 0, max_concurrent: 2 }, squads: [{ id: "s-1", state: "cancelled" }] });
+  await Promise.all([freshPromise, thirdPromise]);
+  assert.deepEqual(poll.state().squads, [{ id: "s-1", state: "cancelled" }]);
+});
+
 // ---------- pollWhoAmI: its own ticket ----------
 
 test("pollWhoAmI: a stale non-admin response completing after a fresher admin one does not revert currentUserIsAdmin", async () => {
