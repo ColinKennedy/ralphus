@@ -114,6 +114,19 @@ pub struct PullRequestView {
     /// itself. Kept rather than deleted so the closed PR's discussion stays
     /// visible in [`PrStackView`] history (this ticket's Q3.3).
     pub superseded_by: Option<String>,
+    /// RAL-395: the last polled CI/CD status -- `"pending"`, `"passing"`, or
+    /// `"failing"` (mirrors [`crate::forge::PrCiState::as_str`]). `None` for
+    /// a PR never polled yet.
+    pub ci_status: Option<String>,
+    /// RAL-395: the failing job's forge URL from the most recent `Failing`
+    /// poll. `None` when the last poll wasn't failing, or failed with no job
+    /// URL (e.g. a forge-verdict merge conflict).
+    pub ci_failure_job_url: Option<String>,
+    /// RAL-395: when auto-fix was last dispatched for the *current* failing
+    /// CI state on this PR -- caps auto-fix at a single attempt per failure.
+    /// `None` if never attempted for the current failure (or the PR isn't
+    /// currently failing).
+    pub auto_fix_attempted_at_ms: Option<i64>,
 }
 
 /// One past "submit a stack" call for a review (RAL-302): every PR row that
@@ -188,6 +201,8 @@ pub struct PrIndexRow {
     pub source_squad_id: Option<String>,
     pub source_task_idx: Option<i64>,
     pub source_cell_idx: Option<i64>,
+    /// RAL-395: see [`PullRequestView::ci_status`].
+    pub ci_status: Option<String>,
 }
 
 struct PrRow {
@@ -210,6 +225,9 @@ struct PrRow {
     stack_id: Option<String>,
     dropped_reason: Option<String>,
     superseded_by: Option<String>,
+    ci_status: Option<String>,
+    ci_failure_job_url: Option<String>,
+    auto_fix_attempted_at_ms: Option<i64>,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -234,11 +252,14 @@ impl From<PrRow> for PullRequestView {
             stack_id: r.stack_id,
             dropped_reason: r.dropped_reason,
             superseded_by: r.superseded_by,
+            ci_status: r.ci_status,
+            ci_failure_job_url: r.ci_failure_job_url,
+            auto_fix_attempted_at_ms: r.auto_fix_attempted_at_ms,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -261,6 +282,9 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         stack_id: r.get(16)?,
         dropped_reason: r.get(17)?,
         superseded_by: r.get(18)?,
+        ci_status: r.get(19)?,
+        ci_failure_job_url: r.get(20)?,
+        auto_fix_attempted_at_ms: r.get(21)?,
     })
 }
 
@@ -422,7 +446,8 @@ impl Store {
                     pr.created_at_ms, pr.updated_at_ms,
                     s.squad_id AS source_squad_id,
                     s.task_idx AS source_task_idx,
-                    s.idx AS source_cell_idx
+                    s.idx AS source_cell_idx,
+                    pr.ci_status
              FROM guardian_pull_requests pr
              LEFT JOIN guardian_branches gb ON gb.id = pr.branch_id
              LEFT JOIN cells s ON s.rowid = (
@@ -449,6 +474,7 @@ impl Store {
                     source_squad_id: r.get(11)?,
                     source_task_idx: r.get(12)?,
                     source_cell_idx: r.get(13)?,
+                    ci_status: r.get(14)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -705,6 +731,46 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests SET superseded_by=?, updated_at_ms=? WHERE id=?",
             params![superseded_by, now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Record the result of the most recent CI/CD poll for this PR (RAL-395)
+    /// -- `status` is one of `"pending"`/`"passing"`/`"failing"` (mirrors
+    /// [`crate::forge::PrCiState::as_str`]). `job_url` is the failing job's
+    /// forge URL when `status == "failing"` and one exists, `None`
+    /// otherwise. Clears `auto_fix_attempted_at_ms` whenever the status is
+    /// anything other than `"failing"`, so a *new* failure (after a passing
+    /// or pending interval) gets a fresh auto-fix attempt rather than being
+    /// permanently capped by a stale marker from a prior failure.
+    pub fn set_pr_ci_status(&self, id: &str, status: &str, job_url: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests
+             SET ci_status=?, ci_failure_job_url=?, updated_at_ms=?,
+                 auto_fix_attempted_at_ms = CASE WHEN ?='failing' THEN auto_fix_attempted_at_ms ELSE NULL END
+             WHERE id=?",
+            params![status, job_url, now_ms(), status, id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Mark that auto-fix has just been dispatched for this PR's *current*
+    /// failing CI state (RAL-395) -- caps auto-fix at a single attempt per
+    /// failure (interview Q5). Cleared automatically by
+    /// [`Self::set_pr_ci_status`] the next time the PR is observed as
+    /// anything other than `"failing"`.
+    pub fn mark_pr_auto_fix_attempted(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=?, updated_at_ms=? WHERE id=?",
+            params![now_ms(), now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -5139,6 +5205,7 @@ fn action_pr_feedback_inner(
         // RAL-380: this feedback is synthesized from several forge comments,
         // not one stored "reviewer" message -- there is nothing to mark.
         None,
+        false,
         &crate::cancel::CancelToken::never(),
     );
 

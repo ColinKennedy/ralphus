@@ -326,6 +326,43 @@ impl Runner for NamedFeedbackRunner {
     }
 }
 
+/// A fake resolver agent for `dispatch_pr_auto_fix` (RAL-395): writes a
+/// named file into the worktree it is given and reports a passing
+/// `RALPHUS_PROOF` verdict, counting invocations so a test can assert the
+/// single-attempt cap actually prevented a second dispatch.
+struct AutoFixRunner {
+    calls: AtomicU32,
+}
+impl AutoFixRunner {
+    fn new() -> Self {
+        Self {
+            calls: AtomicU32::new(0),
+        }
+    }
+}
+impl Runner for AutoFixRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let _ = std::fs::write(PathBuf::from(&spec.cwd).join("fix.txt"), "fixed\n");
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "fixed\nRALPHUS_PROOF: PASS".into(),
+            error: None,
+            proofed: Some(true),
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
 fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String) {
     let root = temp_repo();
     init_repo(&root);
@@ -886,6 +923,7 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
         &bid0,
         "add a note file",
         None,
+        false,
         &CancelToken::never(),
     );
 
@@ -916,6 +954,252 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let review = view.review_branch.unwrap();
     let files = git(&root, &["ls-tree", "-r", "--name-only", &review]);
     assert!(files.contains("note.txt") && files.contains("a.txt") && files.contains("b.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-395: `dispatch_pr_auto_fix` is not a different, stack-breaking code
+/// path from a human feedback round -- it funnels into the same
+/// `run_feedback`, so an auto-fix commit must fold into the review's linear
+/// stack and restack the downstream branch exactly like
+/// `feedback_edits_review_worktree_and_restacks_downstream` above. Also
+/// proves the single-attempt cap: a second dispatch against the now-stamped
+/// PR is a no-op.
+#[test]
+fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .unwrap()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(7),
+            Some("https://github.com/acme/w/pull/7"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+
+    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'build' failed".to_string(),
+        job_url: None,
+        log_text: None,
+    };
+    let runner = AutoFixRunner::new();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+
+    let calls_after_first = runner.calls.load(Ordering::Relaxed);
+    assert!(calls_after_first > 0, "the resolver agent must have run");
+    let pr_after = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    assert!(
+        pr_after.auto_fix_attempted_at_ms.is_some(),
+        "single-attempt marker must be stamped"
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let sha0 = git(&root, &["rev-parse", &rev0]).trim().to_string();
+    let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(files0.contains("fix.txt"), "auto-fix commit on branch 0");
+
+    // The downstream branch was restacked on top of branch 0's new commit,
+    // so it carries the fix plus both features' own content.
+    let rev1 = view.branches[1].review_branch.clone().unwrap();
+    let files1 = git(&root, &["ls-tree", "-r", "--name-only", &rev1]);
+    assert!(
+        files1.contains("fix.txt") && files1.contains("a.txt") && files1.contains("b.txt"),
+        "branch b should be restacked on top of the auto-fix commit: {files1}"
+    );
+
+    let page = store
+        .lock()
+        .unwrap()
+        .cartographer_query(&CartographerFilter {
+            guardian_id: Some(id.clone()),
+            ..CartographerFilter::recent(10)
+        })
+        .unwrap();
+    assert!(
+        page.rows
+            .iter()
+            .any(|r| r.message.contains("auto-fix succeeded")),
+        "expected a Cartographer entry recording the auto-fix's own proof verdict"
+    );
+
+    // A second poll tick against the now-stamped PR is a no-op.
+    let guardian2 = store.lock().unwrap().get_guardian(&id).unwrap();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian2, &pr_after, &failure,
+    );
+    assert_eq!(
+        runner.calls.load(Ordering::Relaxed),
+        calls_after_first,
+        "a second dispatch against an already-attempted PR must not run the agent again"
+    );
+    let rev0_again = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .review_branch
+        .clone()
+        .unwrap();
+    let sha0_again = git(&root, &["rev-parse", &rev0_again]).trim().to_string();
+    assert_eq!(
+        sha0, sha0_again,
+        "no new commit from the no-op second dispatch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-395: when the forge supplies a raw CI failure log, `dispatch_pr_auto_fix`
+/// writes it into the failing branch's own worktree (not just a summary in
+/// the prompt) -- and still folds its fix into the stack exactly as the
+/// no-log case above.
+#[test]
+fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/b"]);
+    write(&root, "b.txt", "from b\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add b"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        g.add_guardian_branch(&id, "feature/b").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .unwrap()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(9),
+            Some("https://github.com/acme/w/pull/9"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_auto_fix_prompt_template(
+            &id,
+            Some("Fix this: <<prompt>> (see {insert URL here})"),
+        )
+        .unwrap();
+
+    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    let worktree = guardian.branches[0].worktree.clone().expect("worktree");
+    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'test' failed".to_string(),
+        job_url: None,
+        log_text: Some("line1\nline2\nline3\n".to_string()),
+    };
+    let runner = AutoFixRunner::new();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+
+    let log_path = Path::new(&worktree).join(".ralphus-ci-failure.log");
+    let log_contents = std::fs::read_to_string(&log_path).expect("ci failure log written");
+    assert_eq!(log_contents, "line1\nline2\nline3\n");
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(files0.contains("fix.txt"), "auto-fix commit on branch 0");
+    let rev1 = view.branches[1].review_branch.clone().unwrap();
+    let files1 = git(&root, &["ls-tree", "-r", "--name-only", &rev1]);
+    assert!(
+        files1.contains("fix.txt") && files1.contains("a.txt") && files1.contains("b.txt"),
+        "branch b should be restacked on top of the auto-fix commit: {files1}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);
@@ -988,6 +1272,7 @@ fn run_feedback_marks_its_reviewer_message_done_on_success() {
         &bid0,
         "add a note file",
         Some(seq),
+        false,
         &CancelToken::never(),
     );
 
@@ -1052,6 +1337,7 @@ fn run_feedback_marks_its_reviewer_message_failed_on_agent_error() {
         &bid0,
         "please fix",
         Some(seq),
+        false,
         &CancelToken::never(),
     );
 
@@ -1151,6 +1437,7 @@ fn interrupted_feedback_is_reapplied_on_simulated_restart_recovery() {
             &branch_id,
             &feedback,
             None,
+            false,
             &CancelToken::never(),
         );
     }
@@ -1247,6 +1534,7 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         &bid0,
         "add a note file",
         None,
+        false,
         &CancelToken::never(),
     );
 
@@ -1419,6 +1707,7 @@ fn restack_after_feedback_recovers_guardian_status_from_a_racing_merge_failed() 
         &bid0,
         "add a note file",
         None,
+        false,
         &CancelToken::never(),
     );
 
@@ -1553,6 +1842,7 @@ fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
         &bid0,
         "tighten up the error messages",
         None,
+        false,
         &CancelToken::never(),
     );
 
@@ -3614,6 +3904,7 @@ fn no_commit_feedback_skips_commit_and_leaves_dirty_worktree() {
         &bid0,
         "add a note file, don't commit",
         None,
+        false,
         &CancelToken::never(),
     );
 
@@ -3670,6 +3961,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &bid0,
         "add note1, don't commit",
         None,
+        false,
         &CancelToken::never(),
     );
     assert!(
@@ -3685,6 +3977,7 @@ fn subsequent_normal_feedback_commits_only_agent_changes_not_prior_no_commit_lef
         &bid0,
         "add note2",
         None,
+        false,
         &CancelToken::never(),
     );
 

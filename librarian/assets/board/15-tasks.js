@@ -414,10 +414,11 @@
         }
         if (prPick) {
           const pr = prPick.pr;
-          const color = cvar(TT_PR_COLORS[pr.state] || "--muted");
+          const color = cvar(ttPrColorVar(pr));
           const label = pr.pr_number ? `#${pr.pr_number}` : "PR";
           const extra = prPick.count > 1 ? ` +${prPick.count - 1}` : "";
-          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge.">${esc(label)}${extra}</span>`);
+          const ciNote = pr.state === "open" && pr.ci_status ? ` (CI: ${esc(pr.ci_status)})` : "";
+          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge.">${esc(label)}${extra}</span>`);
         } else if (reviewBadge && (reviewBadge.review.status === "approved" || reviewBadge.review.status === "merging")) {
           parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
         }
@@ -833,7 +834,7 @@
           const branchRows = r.branches.map((b) => {
             const pr = row.prs.find((p) => p.branch_alias === b);
             const badge = pr
-              ? `<span class="tt-badge pr-badge" style="color:${cvar(TT_PR_COLORS[pr.state] || "--muted")};border-color:${cvar(TT_PR_COLORS[pr.state] || "--muted")}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
+              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
               : (r.status === "approved" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Approved/merging with no PR submitted yet.">no PR</span>` : "");
             return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
           }).join("");

@@ -128,6 +128,21 @@ rather than an error — the fix is one click ("Pull PR commits"), not a
 failure requiring investigation, so it deliberately does not reuse
 `--failed`/`--danger` red either.
 
+### PR CI/CD status — `--done`/`--failed`/`--pending` (RAL-395)
+The Reviews panel's PR card/link (`librarian/assets/board/65-reviews.js`) and
+the Tasks tab's PR chip (`librarian/assets/board/15-tasks.js`,
+`10-tab-registry.js`) both color an **open** PR by its last-polled CI/CD
+status instead of the flat "in-flight" `--accent` a PR's lifecycle state
+alone would otherwise get: `--done` (green) for `passing`, `--failed` (red)
+for `failing`, `--pending` (grey) for a status not yet known. This reuses the
+same three status roles already documented above for `done`/`failed`/
+`pending` entity states — CI/CD pass/fail/pending is the same concept
+("did the work verify"), just scoped to a PR's remote checks instead of a
+cell/task/proof — so no new color was added. Once a PR is no longer `open`
+(merged/closed/dropped), its CI status is moot and the badge reverts to the
+existing PR-lifecycle coloring (`--accent`/`--done`/`--cancelled`/`--failed`)
+documented for `TT_PR_COLORS`/`PR_STATE_COLORS`.
+
 ### Log severity — Cartographer only (RAL-98)
 Cartographer's event table (the global log, a squad's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity

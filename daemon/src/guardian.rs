@@ -583,6 +583,19 @@ pub struct GuardianView {
     /// on (RAL-185). `None` means the daemon's own host — every pre-RAL-185
     /// review, and any review that never declared one.
     pub machine: Option<String>,
+    /// RAL-395: whether this review automatically dispatches its agent to
+    /// fix a failing PR/MR CI status. `None` means unset -- filled in at
+    /// creation time from the project's `.ralphus.toml [review]
+    /// auto_fix_pr_errors` default (`reviews::apply_project_review_defaults`,
+    /// same layering as [`Self::machine`]), else resolves to `false` at
+    /// dispatch time.
+    pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: this review's own override of the auto-fix prompt template.
+    /// `None` means unset -- filled in at creation time from the project's
+    /// `.ralphus.toml [review] auto_fix_prompt_template` default (same
+    /// layering as [`Self::auto_fix_pr_errors`]), else resolves to
+    /// `crate::config::DEFAULT_AUTO_FIX_PROMPT_TEMPLATE` at dispatch time.
+    pub auto_fix_prompt_template: Option<String>,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
     /// future non-git review kinds (see CCTL-112). Existing/derived reviews are
@@ -2361,6 +2374,49 @@ impl Store {
         }
     }
 
+    /// Set this review's own override for whether it auto-dispatches its
+    /// agent to fix a failing PR/MR CI status (RAL-395). `None` inherits the
+    /// project/global default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_auto_fix_pr_errors(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET auto_fix_pr_errors=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own override of the auto-fix prompt template
+    /// (RAL-395). `None` inherits the project/global default. Callers must
+    /// validate the `<<prompt>>` placeholder is present before calling this
+    /// (`ralphus_core::validate::auto_fix_template_has_placeholder`) --
+    /// mirrors `proof_scope`'s pattern of relying on offline validation
+    /// rather than re-checking the value here.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_auto_fix_prompt_template(
+        &self,
+        id: &str,
+        template: Option<&str>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET auto_fix_prompt_template=?, updated_at_ms=? WHERE id=?",
+            params![template, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// RAL-378: record the readable name claimed for this review's *combined*
     /// worktree branch. Written once, at the first combined build; see
     /// [`GuardianView::review_branch_name`] for why it is never recomputed.
@@ -3530,7 +3586,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3544,7 +3600,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3646,6 +3702,8 @@ impl Store {
             readable_review_branch: r.get::<_, i64>(50)? != 0,
             review_branch_name: r.get(51)?,
             project: r.get(52)?,
+            auto_fix_pr_errors: r.get::<_, Option<i64>>(53)?.map(|v| v != 0),
+            auto_fix_prompt_template: r.get(54)?,
         })
     }
 
@@ -4022,6 +4080,8 @@ impl Store {
             proof_scope: row.proof_scope,
             proof_skip_auto_clean: row.proof_skip_auto_clean,
             machine: row.machine,
+            auto_fix_pr_errors: row.auto_fix_pr_errors,
+            auto_fix_prompt_template: row.auto_fix_prompt_template,
             effective_proof_scope,
             effective_proof_skip_auto_clean,
             skip_base_updates: row.skip_base_updates,
@@ -4432,6 +4492,13 @@ struct GuardianRow {
     /// unlike the `Option`-typed overrides above, `None` here never means
     /// "inherit the project config default".
     auto_build_json: Option<String>,
+    /// RAL-395: per-review override for whether this review auto-dispatches
+    /// its agent to fix a failing PR/MR CI status. `None` inherits the
+    /// project/global default.
+    auto_fix_pr_errors: Option<bool>,
+    /// RAL-395: this review's own override of the auto-fix prompt template.
+    /// `None` inherits the project/global default.
+    auto_fix_prompt_template: Option<String>,
 }
 
 #[cfg(test)]

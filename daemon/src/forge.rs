@@ -159,6 +159,20 @@ pub enum PrCiState {
     Failing(PrFailure),
 }
 
+impl PrCiState {
+    /// The stored/API string -- `"pending"`/`"passing"`/`"failing"` (RAL-395:
+    /// persisted on `guardian_pull_requests.ci_status` so the board can read
+    /// a PR's last-polled CI state without a live forge call).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Passing => "passing",
+            Self::Failing(_) => "failing",
+        }
+    }
+}
+
 /// A created pull/merge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPr {

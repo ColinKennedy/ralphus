@@ -3813,6 +3813,7 @@ pub fn start_feedback(
             &bid,
             &feedback,
             Some(message_seq),
+            false,
             &CancelToken::never(),
         );
         crate::rlog!(
@@ -5259,6 +5260,14 @@ pub struct FeedbackOutcome {
     pub pushed: bool,
     /// The pushed sha, when `pushed` (equal to `sha`).
     pub pushed_sha: Option<String>,
+    /// RAL-395: the `RALPHUS_PROOF: PASS`/`FAIL` verdict of the resolver
+    /// agent's own run, when `require_proof` was requested -- `None` when it
+    /// wasn't (this call's `branch_status`/`committed`/`pushed` are the only
+    /// signal in that case, same as before this field existed). Fail-closed
+    /// like every other `RunnerResult::proof_passed` consumer: `Some(false)`
+    /// covers both an explicit `RALPHUS_PROOF: FAIL` and an agent run that
+    /// errored or reported no verdict at all.
+    pub proof_passed: Option<bool>,
 }
 
 /// Apply reviewer `feedback` to one branch's review worktree (via the agent);
@@ -5276,6 +5285,17 @@ pub struct FeedbackOutcome {
 /// PR-comment-aggregation caller (`pr::action_pr_feedback_inner`), which
 /// synthesizes its feedback text from several forge comments rather than one
 /// stored message.
+///
+/// `require_proof` (RAL-395) makes the resolver agent's own edit pass a Proof
+/// step (`RunnerSpec::proof`), so its reply is expected to end with
+/// `RALPHUS_PROOF: PASS`/`FAIL` -- the verdict comes back in
+/// [`FeedbackOutcome::proof_passed`]. Every existing caller (human PR-comment
+/// feedback) passes `false`, preserving today's plain "did it commit/push
+/// without erroring" signal; only the auto-fix dispatcher
+/// (`dispatch_pr_auto_fix`) requests `true`, since it must gate specifically
+/// on the agent's own verdict rather than "committed without erroring" (an
+/// agent that gives up without editing anything still reports `Done` today).
+#[allow(clippy::too_many_arguments)]
 pub fn run_feedback(
     store: &Arc<Mutex<Store>>,
     runner: &dyn Runner,
@@ -5283,6 +5303,7 @@ pub fn run_feedback(
     branch_id: &str,
     feedback: &str,
     message_seq: Option<i64>,
+    require_proof: bool,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
     // RAL-380: mark the reviewer message this call was invoked for as
@@ -5494,7 +5515,7 @@ pub fn run_feedback(
         maximum_context: None,
         auto_compact_threshold: None,
         maximum_tool_output_tokens: None,
-        proof: false,
+        proof: require_proof,
         trace_context: None,
         resume_agent_session_id: None,
         assigned_agent_session_id: None,
@@ -5534,6 +5555,10 @@ pub fn run_feedback(
     };
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    // RAL-395: computed from this same run, before any of the commit/push
+    // logic below touches `result` -- `require_proof=false` callers get
+    // `None`, unchanged from before this field existed.
+    let proof_passed = require_proof.then(|| result.proof_passed());
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
     let committed = !dirty.trim().is_empty() && !no_commit;
     let mut proof_note: Option<String> = None;
@@ -5709,6 +5734,7 @@ pub fn run_feedback(
         sha,
         pushed,
         pushed_sha,
+        proof_passed,
     };
     crate::rlog!(
         INFO,
@@ -6316,6 +6342,13 @@ pub fn review_maintenance(
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
             crate::pr::check_pr_merges(&store, &id);
+            // RAL-395: standing CI-status poll (self-throttled per guardian,
+            // see `ci_watch::STANDING_POLL_INTERVAL`) -- persists the result
+            // for the board and dispatches auto-fix on a fresh failure when
+            // the guardian opted in. Placed alongside `check_pr_merges` since
+            // both are cheap, best-effort per-guardian forge checks that
+            // never block the rebuild/rebase work below.
+            crate::ci_watch::poll_open_pr_ci_status(&store, runner.as_ref(), &id);
             // Pull remote PR commits before considering a local base shift or
             // manual worktree push. This keeps the review's source of truth
             // current and prevents a later branch sync from treating remote

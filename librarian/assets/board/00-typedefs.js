@@ -270,6 +270,8 @@
        * @property {string|null} [review_branch_name] - RAL-378: the sticky readable name claimed for this review's combined worktree branch, derived from its name at the first combined build.
        * @property {boolean|null} [auto_submit_pr_stack] - RAL-317: this review's own override for whether the PR stack is auto-submitted/grown as each branch reaches a terminal merge state, or null to inherit the project/global default. Stamped from the project's effective value at review creation.
        * @property {boolean} [effective_auto_submit_pr_stack] - RAL-317: auto_submit_pr_stack resolved against the project/global default -- what the per-branch auto-submit trigger actually gates on.
+       * @property {boolean|null} [auto_fix_pr_errors] - RAL-395: this review's own override for whether the resolver agent is auto-dispatched to fix this review's PR when its CI checks go red, or null to inherit the project/global default. No `effective_` counterpart is exposed yet -- callers read this raw value.
+       * @property {string|null} [auto_fix_prompt_template] - RAL-395: this review's own prompt template for that auto-fix dispatch, with `<<prompt>>` replaced by the failing branch's own Cell prompts, or null to inherit the project default. Non-empty values must contain the literal `<<prompt>>` placeholder -- enforced server-side.
        * @property {string} [origin] - RAL-318: provenance of this review -- "explicit" (an authored [[review]] block, or any other pre-existing creation path -- the default/normal case) or "arbiter" (created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired).
        */
       /**
@@ -293,6 +295,8 @@
        * @property {string|null} [last_pushed_sha]
        * @property {string|null} [stack_id]
        * @property {string|null} [dropped_reason]
+       * @property {string|null} [ci_status] - RAL-395: "pending" | "passing" | "failing", from the last standing CI/CD poll. null if never polled.
+       * @property {string|null} [ci_failure_job_url] - RAL-395: the failing job's forge URL, when `ci_status === "failing"` and the forge gave one.
        */
       /**
        * One past "submit a stack" call for a review (RAL-302): every PR row
@@ -326,6 +330,7 @@
        * @property {string|null} [source_squad_id]
        * @property {number|null} [source_task_idx]
        * @property {number|null} [source_cell_idx]
+       * @property {string|null} [ci_status] - RAL-395: "pending" | "passing" | "failing", from the last standing CI/CD poll. null if never polled.
        */
       /**
        * Live drift check between a PR's remote branch and its owning review

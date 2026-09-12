@@ -59,6 +59,10 @@
        * @property {boolean} originalMatchPrBranchName
        * @property {boolean} autoSubmitPrStack
        * @property {boolean} originalAutoSubmitPrStack
+       * @property {boolean} autoFixPrErrors
+       * @property {boolean} originalAutoFixPrErrors
+       * @property {string} autoFixPromptTemplate
+       * @property {string} originalAutoFixPromptTemplate
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
@@ -75,6 +79,8 @@
       let reviewEditDraft = null;
 
       const REVIEW_EDIT_INPUT_STYLE = "background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px";
+      const REVIEW_EDIT_TEXTAREA_STYLE = "width:100%;box-sizing:border-box;resize:vertical;font-family:inherit;font-size:12px;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px";
+      const AUTO_FIX_PROMPT_TEMPLATE_TIP = "Prompt handed to the resolver agent when 'auto-fix PR errors' fires, with the literal <<prompt>> placeholder replaced by the failing branch's own Cell prompts. Must contain <<prompt>> or Save is rejected. Leave blank to inherit the project default. Applies on Save.";
 
       /**
        * Builds an env-override scope's draft rows from its currently-saved
@@ -118,6 +124,8 @@
         const separatePrBranch = !!g.effective_separate_pr_branch;
         const matchPrBranchName = !!g.effective_match_pr_branch_name;
         const autoSubmitPrStack = !!g.effective_auto_submit_pr_stack;
+        const autoFixPrErrors = !!g.auto_fix_pr_errors;
+        const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
         return {
           gid: g.id,
           name: g.name,
@@ -136,6 +144,8 @@
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
+          autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
+          autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           squash,
           originalSquashOn: squashOn.slice(),
           projects,
@@ -267,6 +277,18 @@
        * @returns {void}
        */
       function onEditAutoSubmitPrStack(checked) { if (reviewEditDraft) reviewEditDraft.autoSubmitPrStack = checked; }
+      /**
+       * Stages the auto-fix-PR-errors flag.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditAutoFixPrErrors(checked) { if (reviewEditDraft) reviewEditDraft.autoFixPrErrors = checked; }
+      /**
+       * Stages the auto-fix prompt template. Empty resets to the project default.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditAutoFixPromptTemplate(value) { if (reviewEditDraft) reviewEditDraft.autoFixPromptTemplate = value; }
       /**
        * Stages one git project's squash toggle.
        * @param {string} project
@@ -451,6 +473,12 @@
               <input type="checkbox" ${draft.matchPrBranchName ? "checked" : ""} ${draft.separatePrBranch ? "" : "disabled"} onchange="onEditMatchPrBranchName(this.checked)">match worktree branch name</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing. Applies on Save.">
               <input type="checkbox" ${draft.autoSubmitPrStack ? "checked" : ""} onchange="onEditAutoSubmitPrStack(this.checked)">auto-submit PR stack</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically dispatch the resolver agent to fix this review's PR when its CI checks go red. Applies on Save.">
+              <input type="checkbox" ${draft.autoFixPrErrors ? "checked" : ""} onchange="onEditAutoFixPrErrors(this.checked)">auto-fix PR errors</label>
+            <div style="margin-top:8px">
+              <label for="auto-fix-prompt-template-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">auto-fix prompt template</label>
+              <textarea id="auto-fix-prompt-template-input" rows="4" style="${REVIEW_EDIT_TEXTAREA_STYLE}" placeholder="inherits project default" oninput="onEditAutoFixPromptTemplate(this.value)" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">${esc(draft.autoFixPromptTemplate)}</textarea>
+            </div>
             <h3 class="section">environment overrides</h3>
             ${buildEnvSection}
             ${manualChecksEnvSection}
@@ -522,6 +550,8 @@
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
+        if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
+        if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {
           body.squash_projects = squashOn;

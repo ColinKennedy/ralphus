@@ -743,6 +743,25 @@
       /** RAL-362 §3: PR-state color roles, reusing existing status hues (docs/colors.md) rather than inventing new ones -- "open" reads as in-flight/awaiting-action like `in_review`, "merged" like `done`, "closed" like `cancelled`, "dropped" like `failed` (the review determined the branch couldn't be carried). */
       /** @type {{[state: string]: string}} */
       const TT_PR_COLORS = { open: "--accent", merged: "--done", closed: "--cancelled", dropped: "--failed" };
+      /** RAL-395: CI/CD status color roles for an *open* PR, reusing the same status hues `docs/colors.md` already documents for `done`/`failed`/`pending` rather than inventing new ones -- see the "PR CI/CD status" subsection there. */
+      /** @type {{[status: string]: string}} */
+      const TT_PR_CI_COLORS = { passing: "--done", failing: "--failed", pending: "--pending" };
+      /**
+       * The color role for a PR chip/badge (RAL-395): once a PR is no longer
+       * `open` (merged/closed/dropped), its CI status is moot -- keep
+       * `TT_PR_COLORS`' lifecycle coloring. While `open`, prefer the polled
+       * CI status (a distinct color for failing vs. passing vs. not-yet-known)
+       * over the flat "in-flight" accent color, so a reviewer sees red/green
+       * without opening the PR.
+       * @param {{state: string, ci_status?: string|null}} pr
+       * @returns {string}
+       */
+      function ttPrColorVar(pr) {
+        if (pr.state === "open" && pr.ci_status) {
+          return TT_PR_CI_COLORS[pr.ci_status] || TT_PR_COLORS.open;
+        }
+        return TT_PR_COLORS[pr.state] || "--muted";
+      }
       /**
        * The task-level entity URI a squad/task watch is filed under (RAL-362
        * §5), matching `crate::entity_uri::EntityUri`'s `Display` grammar.
