@@ -213,6 +213,25 @@
       .toast.info { border-color: var(--accent); }
       .toast.warn { border-color: var(--toast-warn); }
       .toast-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      /* RAL-401: persistent personal-mailbox inbox widget. Collapsed to one
+         summary line until expanded, sitting where the old fire-and-forget
+         toasts used to; unlike a toast it never disappears on its own -- a
+         message stays until dismissed (drained) or the tab reloads emptied
+         the unread count. */
+      .mailbox-widget { position: fixed; right: 16px; bottom: 16px; z-index: 100; width: 340px; max-width: calc(100vw - 32px); background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.4); font-size: 12px; color: var(--text); }
+      .mailbox-widget-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; }
+      .mailbox-widget-summary { font-weight: 500; }
+      .mailbox-widget-toggle { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 2px 8px; cursor: pointer; line-height: 1.4; }
+      .mailbox-widget-list { max-height: 380px; overflow-y: auto; border-top: 1px solid var(--border); padding: 8px 12px; display: flex; flex-direction: column; gap: 8px; }
+      .mailbox-msg { position: relative; background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 6px; padding: 8px 26px 8px 10px; white-space: pre-line; word-break: break-word; }
+      .mailbox-msg.p-urgent { border-left-color: var(--failed); }
+      .mailbox-msg.p-high { border-left-color: var(--warn); }
+      .mailbox-msg.read { opacity: .6; }
+      .mailbox-msg-meta { display: flex; gap: 8px; color: var(--muted); font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .02em; }
+      .mailbox-msg-dismiss { position: absolute; top: 4px; right: 4px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 6px; }
+      .mailbox-msg-dismiss:hover { color: var(--text); }
+      .mailbox-widget-history-toggle { display: block; width: 100%; margin: 2px 0; background: none; border: none; color: var(--accent); cursor: pointer; font-size: 11px; padding: 4px 0; text-align: left; }
+      .mailbox-history-table td { white-space: pre-line; word-break: break-word; }
       .edit-form label { display: block; font-size: 12px; color: var(--muted); margin-top: 8px; }
       .edit-form input, .edit-form textarea, .edit-form select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 8px; margin-top: 3px; }
       .btn { border: 1px solid var(--border); background: var(--panel-2); color: var(--text); border-radius: 6px; padding: 5px 12px; }

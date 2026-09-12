@@ -193,6 +193,10 @@
       let hiddenSquadNames = new Map();
       /** @type {Map<string, string>} guardian id -> display name, from the last `GET /api/guardians`. */
       let hiddenGuardianNames = new Map();
+      /** @type {MailboxMessageView[]} full personal-mailbox history (RAL-401), including already-read messages, for the Preferences tab's Message history section. */
+      let mailboxHistory = [];
+      /** Message from the last failed message-history load, shown inline above the table. */
+      let mailboxHistoryError = "";
       /** @type {Map<string, AgentOptionsCacheEntry>} cwd -> agents + default fetched from GET /api/agents, cached for the page's lifetime. */
       const agentOptionsByCwd = new Map();
       // ---- Admin gating (RAL-332) ----

@@ -518,6 +518,25 @@
        * @property {number} created_at_ms
        */
       /**
+       * One mailbox message as shown to the acting user (RAL-241/RAL-320),
+       * from `GET /api/mailbox/personal/messages`. `read` reflects that
+       * user's own drain state (RAL-401's dismiss), not a global property of
+       * the message -- another watcher of the same entity has independent
+       * read state over the same row.
+       * @typedef {object} MailboxMessageView
+       * @property {string} id
+       * @property {"urgent"|"high"|"normal"} priority
+       * @property {string} message
+       * @property {string|null} squad_id
+       * @property {string|null} task
+       * @property {string|null} cell_id
+       * @property {number} created_at_ms
+       * @property {boolean} read
+       * @property {string|null} entity_uri
+       * @property {string|null} event_kind
+       * @property {string|null} category
+       */
+      /**
        * A registered fork row (RAL-338): the writable repository a project's
        * review branches are pushed to when the user named by `user` can't
        * push directly to the project's own repository. `user === ""` is the
