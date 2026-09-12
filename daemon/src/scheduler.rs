@@ -1,10 +1,12 @@
 //! The scheduler: turns Pending squads into real work.
 //!
-//! A single scheduler thread polls the store; each `tick` claims up to the
-//! available concurrency slots of ready squads, marks each Running, and hands it
-//! to a worker thread. The worker executes the squad's cells via the [`Runner`]
-//! (the subprocess wait happens *outside* the store lock, so many squads progress
-//! concurrently), records each result, and finalizes task/squad states.
+//! A single scheduler thread polls the store; each `tick` claims every ready
+//! squad and hands it to a worker thread, which stays `Pending` (RAL-405)
+//! through setup — worktree placeholder resolution, dependency planning —
+//! only flipping to `Running` once it actually starts dispatching a cell. The
+//! worker executes the squad's cells via the [`Runner`] (the subprocess wait
+//! happens *outside* the store lock, so many squads progress concurrently),
+//! records each result, and finalizes task/squad states.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -564,16 +566,13 @@ pub fn tick(
         return;
     }
     let to_start = claim_ready(store, cancellations);
-    for squad_id in to_start {
+    for (squad_id, token) in to_start {
         let store = Arc::clone(store);
         let runner = Arc::clone(runner);
         let sem = Arc::clone(sem);
         let cancellations = cancellations.clone();
         let summary_queue = Arc::clone(summary_queue);
         std::thread::spawn(move || {
-            // Register a cancel token so a user `cancel` can stop this worker
-            // (and its subprocess); drop it once the squad is done.
-            let token = cancellations.register(&squad_id);
             execute_squad_inner(
                 &store,
                 runner.as_ref(),
@@ -588,10 +587,21 @@ pub fn tick(
     }
 }
 
-/// Under the lock: mark every ready squad Running (so the next tick won't re-claim
-/// it) and return the claimed ids. Readiness — Pending with cross-squad deps Done
-/// — is decided by [`Store::list_ready`]; the concurrency cap is enforced later,
-/// per cell, by the shared [`Semaphore`].
+/// Under the lock: claim every ready squad by registering its cancel token
+/// (so the next tick won't re-claim it) and return the claimed ids alongside
+/// their tokens. Readiness — Pending with cross-squad deps Done — is decided
+/// by [`Store::list_ready`]; the concurrency cap is enforced later, per cell,
+/// by the shared [`Semaphore`].
+///
+/// RAL-405: claiming no longer flips the squad to `Running` — that would make
+/// it visibly "running" while its worker is still doing setup (worktree
+/// placeholder resolution, etc.) with no cell actually executing yet. The
+/// squad stays `Pending` until [`execute_squad_inner`]'s dispatch loop
+/// actually starts a cell. Registering the cancel token here (rather than
+/// inside the spawned worker thread, as before) is what now prevents a
+/// double-claim on the next tick — [`Cancellations::register`] is a cheap,
+/// synchronous bookkeeping call, safe to do while still holding the store
+/// lock, and `tick` only ever runs one call at a time (RAL-405).
 ///
 /// A squad whose worker is still registered (`cancellations.is_active`) is
 /// skipped even if the store shows it `Pending` — a targeted restart
@@ -604,7 +614,10 @@ pub fn tick(
 /// unconditional cancel-and-wait dance existed to prevent. Deferring is
 /// safe: once the live worker finishes and removes its token, the next tick
 /// claims the squad fresh and picks up whatever was reset in the meantime.
-fn claim_ready(store: &Arc<Mutex<Store>>, cancellations: &Cancellations) -> Vec<String> {
+fn claim_ready(
+    store: &Arc<Mutex<Store>>,
+    cancellations: &Cancellations,
+) -> Vec<(String, CancelToken)> {
     let guard = store.lock().expect("store mutex poisoned");
     let ready = guard.list_ready().unwrap_or_default();
     let mut claimed = Vec::new();
@@ -612,36 +625,32 @@ fn claim_ready(store: &Arc<Mutex<Store>>, cancellations: &Cancellations) -> Vec<
         if cancellations.is_active(&squad_id) {
             continue;
         }
-        if guard
-            .set_squad_state(&squad_id, SquadState::Running)
-            .is_ok()
-        {
-            // A short-lived span for the claim itself (RAL-96) — continues the
-            // trace persisted at submit time, if any. Cell/proof execution
-            // get their own spans later, once the worker thread starts.
-            let trace_context = guard.squad_trace_context(&squad_id).unwrap_or_default();
-            let cx = otel::context_from_traceparent(trace_context.as_deref());
-            let _span = otel::start_span("scheduler.claim_ready", &cx, SpanKind::Internal);
-            _span.set_attribute("squad_id", squad_id.clone());
-            crate::rlog!(
-                INFO,
-                "ralphus [scheduler] squad {squad_id} claimed → running"
-            );
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::INFO,
-                source: "scheduler",
-                message: "squad claimed → running",
-                scope: Some("squad"),
-                squad_id: Some(&squad_id),
-                guardian_id: None,
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({}),
-                admin_only: false,
-            });
-            claimed.push(squad_id);
-        }
+        // Register up front, under the same store lock the readiness check
+        // ran under, so no other tick can observe this squad as both
+        // `Pending` and not-yet-active and claim it a second time.
+        let token = cancellations.register(&squad_id);
+        // A short-lived span for the claim itself (RAL-96) — continues the
+        // trace persisted at submit time, if any. Cell/proof execution
+        // get their own spans later, once the worker thread starts.
+        let trace_context = guard.squad_trace_context(&squad_id).unwrap_or_default();
+        let cx = otel::context_from_traceparent(trace_context.as_deref());
+        let _span = otel::start_span("scheduler.claim_ready", &cx, SpanKind::Internal);
+        _span.set_attribute("squad_id", squad_id.clone());
+        crate::rlog!(INFO, "ralphus [scheduler] squad {squad_id} claimed");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "scheduler",
+            message: "squad claimed",
+            scope: Some("squad"),
+            squad_id: Some(&squad_id),
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({}),
+            admin_only: false,
+        });
+        claimed.push((squad_id, token));
     }
     claimed
 }
@@ -804,9 +813,10 @@ fn execute_squad_inner(
         cancelled_task_set,
     ) = {
         let guard = store.lock().expect("store mutex poisoned");
-        // Mark Running up front so the finalization guard (which leaves an
-        // edit-reset squad Pending) has a Running baseline to compare against.
-        let _ = guard.set_squad_state(squad_id, SquadState::Running);
+        // RAL-405: no longer marked Running here — this runs before worktree
+        // placeholder resolution below, which must not visibly present as
+        // "running" either. The squad only becomes Running once the dispatch
+        // loop actually starts a cell (see `squad_marked_running` below).
         (
             guard.cells_of(squad_id).unwrap_or_default(),
             guard.tasks_of(squad_id).unwrap_or_default(),
@@ -967,6 +977,18 @@ fn execute_squad_inner(
     // explicitly cancelled to Done (RAL-185).
     let mut finalized: HashSet<i64> = cancelled_tasks.clone();
 
+    // RAL-405: whether this dispatcher has actually flipped the squad to
+    // `Running` yet — deferred until the moment a cell (or its proof) is
+    // first about to execute, rather than at claim time, so setup work
+    // (worktree resolution above, and anything before the first dispatch)
+    // never visibly presents as `running`. Read (not written) by the final
+    // guard after the loop below, so it must live outside the scope — but
+    // every write to it happens on this same dispatcher thread, either
+    // before `scope.spawn`-ing the first proof-only worker or inside the
+    // dispatch loop before `scope.spawn`-ing the first cell/finalizer, never
+    // from within a spawned worker itself.
+    let mut squad_marked_running = false;
+
     // Dispatcher loop: each pass launches every cell whose prerequisites are
     // all Done and fails every cell whose prerequisite failed, and launches a
     // per-task finalizer the moment a task's cells are all terminal — until
@@ -982,6 +1004,13 @@ fn execute_squad_inner(
         // have pending proofs (restart_cell_proof or crash recovery). They
         // start as Running in progress so the dispatcher won't re-dispatch the
         // cell body; after proofs finish they transition to Done/Failed.
+        if !proof_only_indices.is_empty() && !squad_marked_running {
+            squad_marked_running = true;
+            let _ = store
+                .lock()
+                .expect("store mutex poisoned")
+                .set_squad_state(squad_id, SquadState::Running);
+        }
         for &i in &proof_only_indices {
             scope.spawn(move || {
                 run_proof_only_worker(
@@ -1094,10 +1123,12 @@ fn execute_squad_inner(
                     // non-empty here therefore only ever means "a scoped
                     // restart flipped the squad row under a worker that was
                     // deliberately left alive" — safe to reconcile back to
-                    // `Running`, the same way the initial claim seeds it
-                    // (`execute_squad_inner`'s "Mark Running up front").
+                    // `Running`: this worker is about to redispatch the
+                    // reclaimed cells/proofs, so a cell really is about to
+                    // execute again (RAL-405).
                     if !reclaimed_tasks.is_empty() {
                         let _ = guard.set_squad_state(squad_id, SquadState::Running);
+                        squad_marked_running = true;
                     }
                     let reclaimed_cells: Vec<usize> = reclaimed_tasks
                         .iter()
@@ -1332,6 +1363,19 @@ fn execute_squad_inner(
                 }
             }
 
+            // RAL-405: the squad only becomes visibly `Running` the moment a
+            // cell is actually about to execute (or a task finalizer is about
+            // to run its proofs) — not at claim time, and not while setup
+            // work above (placeholder resolution, dependency planning) was
+            // still in progress.
+            if (!to_dispatch.is_empty() || !to_finalize.is_empty()) && !squad_marked_running {
+                squad_marked_running = true;
+                let _ = store
+                    .lock()
+                    .expect("store mutex poisoned")
+                    .set_squad_state(squad_id, SquadState::Running);
+            }
+
             // Record cells blocked by a failed prerequisite (store writes
             // happen without the progress lock held; the failure flag was set
             // above under the lock).
@@ -1448,9 +1492,14 @@ fn execute_squad_inner(
     let any_detached = progress.status.contains(&CellState::Detached);
 
     let guard = store.lock().expect("store mutex poisoned");
-    // If an edit reset this squad to Pending mid-flight, don't clobber it with a
-    // terminal state — leave it Pending so it re-runs with the new values.
-    if !matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
+    // If an edit reset this squad to Pending mid-flight after we had already
+    // marked it Running, don't clobber it with a terminal state — leave it
+    // Pending so it re-runs with the new values. A squad this dispatcher
+    // never actually marked Running (RAL-405: every cell was already
+    // terminal, so nothing was ever dispatched) has no such "genuinely
+    // running" baseline to compare against and is safe to finalize straight
+    // through regardless of its current (still-Pending) row.
+    if squad_marked_running && !matches!(guard.squad_state(squad_id), Ok(SquadState::Running)) {
         return;
     }
     if any_detached {
@@ -4393,7 +4442,19 @@ mod tests {
         let (store, id) = store_with(ONE_CELL);
         // Claiming is no longer rationed by a squad-count limit; every ready squad
         // is claimed and the semaphore bounds concurrency per cell instead.
-        assert_eq!(claim_ready(&store, &Cancellations::new()), vec![id.clone()]);
+        let claimed_ids: Vec<String> = claim_ready(&store, &Cancellations::new())
+            .into_iter()
+            .map(|(id, _token)| id)
+            .collect();
+        assert_eq!(claimed_ids, vec![id.clone()]);
+        // RAL-405: claiming registers the cancel token to prevent a double-claim,
+        // but must not flip the squad to Running -- that only happens once a
+        // cell actually starts executing.
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Pending,
+            "claiming alone must not present the squad as running"
+        );
         let page = store
             .lock()
             .unwrap()
@@ -4409,6 +4470,51 @@ mod tests {
             "claiming a squad should emit a Cartographer record: {:?}",
             page.rows
         );
+    }
+
+    /// RAL-405: claiming a squad (and the setup work that follows -- worktree
+    /// placeholder resolution, dependency planning) must not present it as
+    /// `Running` in the meantime; only once a cell is actually dispatched
+    /// does the squad flip. Uses [`BlockingRunner`] (defined below) to hold
+    /// the cell in flight long enough to observe the transition.
+    #[test]
+    fn squad_becomes_running_only_once_a_cell_actually_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (store, id) = store_with(ONE_CELL);
+        let started = Arc::new(AtomicBool::new(false));
+        let runner: Arc<dyn Runner> = Arc::new(BlockingRunner {
+            started: Arc::clone(&started),
+        });
+        let token = CancelToken::new();
+
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Pending
+        );
+
+        let worker = {
+            let (store, runner, token, id) = (
+                Arc::clone(&store),
+                Arc::clone(&runner),
+                token.clone(),
+                id.clone(),
+            );
+            std::thread::spawn(move || {
+                execute_squad_with(&store, runner.as_ref(), &id, &token, &Cancellations::new())
+            })
+        };
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            store.lock().unwrap().squad_state(&id).unwrap(),
+            SquadState::Running,
+            "once a cell is actually executing the squad must show Running"
+        );
+
+        token.cancel();
+        worker.join().unwrap();
     }
 
     #[test]
