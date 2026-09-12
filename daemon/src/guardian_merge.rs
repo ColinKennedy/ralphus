@@ -7581,7 +7581,7 @@ fn cleanup_review_worktrees(
 /// accumulation in a daemon that runs for months.
 pub(crate) const WORKTREE_RETIREMENT_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
-fn normalized_worktree_path(path: &Path) -> String {
+pub(crate) fn normalized_worktree_path(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
@@ -7656,6 +7656,25 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
             records_by_path.insert(key, record);
         }
     }
+    // `normalized path -> every claim at that path`, built once (O(claims))
+    // instead of the `claims.iter().find(...)` linear scan this loop used to
+    // run per stale candidate.
+    let mut claims_by_path: HashMap<String, Vec<&crate::store::WorktreeClaim>> = HashMap::new();
+    for claim in &claims {
+        claims_by_path
+            .entry(normalized_worktree_path(Path::new(&claim.path)))
+            .or_default()
+            .push(claim);
+    }
+    // `git worktree list --porcelain` root -> its normalized registered
+    // paths, populated once per distinct project root the first time a
+    // candidate needs it, and reused for every later candidate sharing that
+    // root. Previously this ran fresh for EVERY stale candidate just to
+    // confirm that one path is still registered -- O(candidates * worktree
+    // count) `git` subprocess calls on a project whose total worktree count
+    // (this repo has accumulated 638) already makes a single such call take
+    // several seconds.
+    let mut registered_by_root: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for (key, record) in records_by_path {
         if record.last_activity_ms > cutoff {
             continue;
@@ -7673,18 +7692,27 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         ) {
             continue;
         }
-        let registered = root
-            .git(&["worktree", "list", "--porcelain"])
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .any(|path| normalized_worktree_path(Path::new(path.trim())) == key);
+        let root_key = root.root().to_path_buf();
+        if !registered_by_root.contains_key(&root_key) {
+            let listed = root
+                .git(&["worktree", "list", "--porcelain"])
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .map(|path| normalized_worktree_path(Path::new(path.trim())))
+                .collect();
+            registered_by_root.insert(root_key.clone(), listed);
+        }
+        let registered = registered_by_root
+            .get(&root_key)
+            .is_some_and(|paths| paths.contains(&key));
         if !registered {
             continue;
         }
-        let active_claim = claims.iter().find(|claim| {
-            normalized_worktree_path(Path::new(&claim.path)) == key
-                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        let active_claim = claims_by_path.get(&key).and_then(|at_path| {
+            at_path
+                .iter()
+                .find(|claim| !terminal_worktree_claim(&claim.kind, &claim.state))
         });
         if let Some(claim) = active_claim {
             let guard = store.lock().expect("poisoned");
@@ -7971,6 +7999,17 @@ pub(crate) fn worktree_retirement_view(
     // the last branch's worktree, so one path commonly has two rows; the
     // newest activity wins. Keyed on the normalized path, matching how
     // retirement dedups and how claims are matched.
+    //
+    // `normalized_worktree_path` calls `std::fs::canonicalize` -- a real
+    // filesystem syscall -- so every path below is normalized exactly once
+    // (here, and in the two index-building loops just after) and reused via
+    // `records_by_path`'s own keys, `retirements_by_key`, and
+    // `claims_by_path`. The previous version recomputed it inside a linear
+    // `.find()` over the *entire* retirements/claims list for every single
+    // record -- O(records * (retirements + claims)) syscalls -- which is
+    // what made this view take well over a minute, freezing every other
+    // endpoint meanwhile (this runs under the daemon's global store lock),
+    // once this project accumulated a few hundred worktrees of history.
     let mut records_by_path: HashMap<String, crate::store::GuardianWorktreeRecord> = HashMap::new();
     for record in records {
         let key = normalized_worktree_path(Path::new(&record.path));
@@ -7985,9 +8024,37 @@ pub(crate) fn worktree_retirement_view(
         }
     }
 
+    // `(guardian_id, normalized path) -> first non-"retired" retirement row`
+    // -- one O(retirements) pass, preserving `.find()`'s original
+    // first-match-wins semantics via `entry(...).or_insert(...)`.
+    let mut retirements_by_key: HashMap<
+        (String, String),
+        &crate::store::GuardianWorktreeRetirementRecord,
+    > = HashMap::new();
+    for r in &retirements {
+        if r.status == "retired" {
+            continue;
+        }
+        let key = (
+            r.guardian_id.clone(),
+            normalized_worktree_path(Path::new(&r.path)),
+        );
+        retirements_by_key.entry(key).or_insert(r);
+    }
+
+    // `normalized path -> every claim at that path`, so the per-entry
+    // "first non-terminal claim" lookup below scans only that path's
+    // (typically tiny) claim list instead of every claim in the project.
+    let mut claims_by_path: HashMap<String, Vec<&crate::store::WorktreeClaim>> = HashMap::new();
+    for claim in &claims {
+        claims_by_path
+            .entry(normalized_worktree_path(Path::new(&claim.path)))
+            .or_default()
+            .push(claim);
+    }
+
     let mut entries = Vec::with_capacity(records_by_path.len());
-    for record in records_by_path.values() {
-        let key = normalized_worktree_path(Path::new(&record.path));
+    for (key, record) in &records_by_path {
         let eligible_at_ms = record
             .last_activity_ms
             .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
@@ -7995,14 +8062,11 @@ pub(crate) fn worktree_retirement_view(
         // this exact (guardian, path) pair wins over the derived live states
         // -- it is the newest fact the sweep recorded, and it stays until an
         // attempt succeeds (RAL-386 widened this beyond just `failed`).
-        let pending = retirements.iter().find(|r| {
-            r.guardian_id == record.guardian_id
-                && r.status != "retired"
-                && normalized_worktree_path(Path::new(&r.path)) == key
-        });
-        let active_claim = claims.iter().find(|claim| {
-            normalized_worktree_path(Path::new(&claim.path)) == key
-                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        let pending = retirements_by_key.get(&(record.guardian_id.clone(), key.clone()));
+        let active_claim = claims_by_path.get(key).and_then(|at_path| {
+            at_path
+                .iter()
+                .find(|claim| !terminal_worktree_claim(&claim.kind, &claim.state))
         });
         let (state, claim_kind, claim_owner, claim_state, error, last_attempt_ms, retry_at_ms) =
             if let Some(p) = pending {

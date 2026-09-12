@@ -303,6 +303,18 @@ at runtime, so there is still exactly one place this color is defined.
   **and** to the `[data-theme="light"]` block. If a single hue works on both
   backgrounds (as the status colors do), define it once in `:root`.
 
+## Resize handles — hit-area sizing
+
+Resize handles (column headers, detail pane splitters, etc.) use `--accent` for
+their hover/drag highlight. Target a **12px-wide hit area** minimum, which can
+exceed the visual bar width — a wider invisible hit-area than visible bar is an
+acceptable, common UI pattern that improves usability without visual clutter.
+This matches the reference implementation in the Task Detail pane
+(`librarian/assets/board.css`'s `.splitter` and `.tt-col-resize`). When adding
+or resizing a handle elsewhere, match the reference and use `right: 0; width: 12px;`
+or similar to ensure the full hit-area is reachable and not clipped by parent
+`overflow: hidden`.
+
 ## Adding a new UI element — checklist
 
 1. Is there an existing semantic role above that fits? Use its variable.

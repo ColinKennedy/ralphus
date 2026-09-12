@@ -261,6 +261,111 @@ fn registered_project_task_records_project_identity_on_its_review() {
 }
 
 #[test]
+fn declared_review_upstream_resolves_against_the_registered_projects_remote() {
+    // RAL-<pending>: a `[[review]] upstream = "staging"` declared directly on
+    // the review must resolve against the registered project's remote
+    // "staging" -- exactly as a cell's own bare `?upstream=staging` already
+    // does (`resolve_registered_remote_upstream`) -- never against whatever a
+    // same-named local branch in the shared checkout happens to contain. The
+    // shared checkout below has its own local "staging" that diverged from
+    // the remote's and was never pushed, standing in for ordinary concurrent
+    // dev work on that checkout.
+    let base = temp_base("review-upstream-remote");
+    let remote = base.join("remote.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-b", "main"]);
+
+    let seed = base.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    init_repo(&seed);
+    std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-m", "base"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "origin", "main"]);
+    git(&seed, &["checkout", "-b", "staging"]);
+    std::fs::write(seed.join("staging-only.txt"), "staging content\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-m", "staging work"]);
+    git(&seed, &["push", "origin", "staging"]);
+
+    let project_path = base.join("clone");
+    git(
+        &base,
+        &[
+            "clone",
+            remote.to_str().unwrap(),
+            project_path.to_str().unwrap(),
+        ],
+    );
+    // The shared checkout's own "staging" -- diverged from the remote's,
+    // never pushed. If the review's declared upstream resolved against this
+    // instead of the remote, the merge base would be wrong.
+    git(&project_path, &["checkout", "-b", "staging", "main"]);
+    std::fs::write(project_path.join("unrelated.txt"), "local dev work\n").unwrap();
+    git(&project_path, &["add", "."]);
+    git(&project_path, &["commit", "-m", "local unrelated work"]);
+    git(&project_path, &["checkout", "main"]);
+
+    let wt = base.join("wt-feature-x");
+    git(
+        &project_path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature-x",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let cwd = wt.to_string_lossy().replace('\\', "/");
+
+    let sentinel = cell_review_sentinel("remote-upstream-review");
+    let toml = format!(
+        "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+         [[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\nreview=\"{sentinel}\"\n\
+         [[review]]\nid=\"remote-upstream-review\"\nupstream=\"staging\"\nskip_auto_build=true\n"
+    );
+    let file: TaskFile = toml::from_str(&toml).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .register_project_with_clone_url_ex(
+            "proj",
+            "",
+            &project_path.to_string_lossy(),
+            "git",
+            Some(remote.to_str().unwrap()),
+            None,
+        )
+        .unwrap();
+    let squad_id = store.insert_squad(&file, None, false).unwrap();
+
+    let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
+    let guardian = store.get_guardian(&guardian_id).unwrap();
+
+    assert_eq!(
+        guardian.base_branch, "origin/staging",
+        "a declared upstream on a registered remote project must resolve to the remote's \
+         tracking ref, not the shared checkout's own same-named local branch"
+    );
+    let log = git(&project_path, &["log", "--format=%s", "origin/staging"]);
+    assert!(
+        log.contains("staging work"),
+        "resolved base branch must be the remote's staging: {log}"
+    );
+    assert!(
+        !log.contains("local unrelated work"),
+        "resolved base branch must not be the shared checkout's local staging: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn declared_review_settings_override_project_defaults() {
     let base = temp_base("review-settings-precedence");
     let cwd = repo_with_worktree(&base, "feature/settings");

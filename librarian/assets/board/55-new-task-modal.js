@@ -595,7 +595,8 @@
       // show-tutor`'s recommended work+finalize layout (cli/src/tutor.rs)
       // so a Simple submission's generated cells match what that tutorial
       // teaches a user to write by hand.
-      const NT_NO_COMMIT_SYSTEM_PROMPT = "Do NOT commit and do NOT push under any circumstances.";
+      const NT_NO_COMMIT_SYSTEM_PROMPT =
+        "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree.";
       const NT_FINALIZE_TEXT = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists.";
       // Mirrors `core::schema::agent_supports_system_prompt` -- the daemon's
       // TOML validator hard-rejects `system_prompt`/`system_prompt_position`

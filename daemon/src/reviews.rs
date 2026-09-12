@@ -16,7 +16,7 @@ use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key
 
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
-use crate::store::{CellRow, Store, TaskRow};
+use crate::store::{CellRow, ProjectView, Store, TaskRow};
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
 
@@ -544,6 +544,96 @@ pub fn derive_reviews(
     squad_id: &str,
     file: &TaskFile,
 ) -> std::result::Result<Vec<String>, ReviewError> {
+    derive_reviews_with_prefetch(store, squad_id, file, &HashMap::new())
+}
+
+/// Every `(registered project, bare upstream)` pair this submission's cell
+/// cwd worktree placeholders AND its `[[review]]` blocks' own declared
+/// `upstream` fields would need a live `git fetch` for -- the union of
+/// [`crate::worktrees::collect_remote_upstream_prefetch_targets`] (cell
+/// cwds) and this function's own scan of each review's declared `upstream`
+/// (the case [`derive_reviews_with_prefetch`]'s own resolution branch below
+/// otherwise fetches for), deduped so a target named both ways is only
+/// fetched once.
+///
+/// Read-only over `store`, cheap (no git subprocess), and safe to call under
+/// a lock. The caller's job: call this under a lock, drop the lock, run the
+/// actual `git fetch` for each result with no lock held at all (call
+/// [`crate::worktrees::resolve_registered_remote_upstream`] directly), then
+/// call [`derive_reviews_with_prefetch`] with the results keyed by
+/// `(project.name.clone(), upstream)`. See
+/// [`crate::worktrees::resolve_placeholders_with_prefetch`]'s doc comment
+/// for why: without this, `derive_reviews`'s own live fetch runs while its
+/// caller (`server::submit`) holds the daemon's single global
+/// `Mutex<Store>` for the entire submit request, so a slow or dead remote
+/// freezes the whole HTTP API for as long as the fetch takes.
+#[must_use]
+pub fn collect_remote_upstream_prefetch_targets(
+    store: &Store,
+    file: &TaskFile,
+) -> Vec<(ProjectView, String)> {
+    let (cells, tasks, cell_info) = rows_from_file(file);
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = crate::worktrees::collect_remote_upstream_prefetch_targets(store, &cells, &tasks);
+    out.retain(|(project, upstream)| seen.insert((project.name.clone(), upstream.clone())));
+
+    let review_map: HashMap<&str, &ReviewDef> = file
+        .review
+        .iter()
+        .filter_map(|rv| rv.id.as_deref().map(|id| (id, rv)))
+        .collect();
+    let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
+    for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
+        let Some(rev_id) = rev_id_opt else { continue };
+        let Some(upstream) = review_map
+            .get(rev_id)
+            .copied()
+            .and_then(|r| r.upstream.as_deref())
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        // `ReviewDef.upstream` never supports a `<<...>>` sentinel (unlike a
+        // cell's own `?upstream=`) -- only the already-explicit-remote form
+        // (`contains('/')`) needs skipping here, matching
+        // `resolve_registered_remote_upstream`'s own no-op check.
+        if upstream.contains('/') {
+            continue;
+        }
+        let Some(project_name) = tasks_by_idx
+            .get(&cells[pos].task_idx)
+            .and_then(|t| t.project.as_deref())
+        else {
+            continue;
+        };
+        if !seen.insert((project_name.to_string(), upstream.to_string())) {
+            continue;
+        }
+        let Ok(Some(project)) = store.resolve_project(project_name) else {
+            continue;
+        };
+        if project.clone_url.is_none() {
+            continue;
+        }
+        out.push((project, upstream.to_string()));
+    }
+    out
+}
+
+/// Like [`derive_reviews`], but `prefetched_upstreams` supplies
+/// `(registered project name, bare upstream) -> "<remote>/<branch>"`
+/// results the caller already fetched OUTSIDE any store lock -- see
+/// [`collect_remote_upstream_prefetch_targets`]'s doc comment for how to
+/// build this map, and why. A cache miss falls back to fetching live, right
+/// where the fetch used to happen unconditionally, so correctness never
+/// depends on this cache being complete.
+pub fn derive_reviews_with_prefetch(
+    store: &Store,
+    squad_id: &str,
+    file: &TaskFile,
+    prefetched_upstreams: &HashMap<(String, String), String>,
+) -> std::result::Result<Vec<String>, ReviewError> {
     if file.review.is_empty() {
         return Ok(Vec::new());
     }
@@ -560,8 +650,15 @@ pub fn derive_reviews(
     // this preflight needs a real worktree path *now* to run git against it.
     // Resolving here (persisted via `Store::set_cell_cwd`, same as the
     // scheduler's resolution) means a restarted squad never re-resolves it.
-    crate::worktrees::resolve_placeholders(store, squad_id, &mut cells, &tasks, &Context::new())
-        .map_err(ReviewError::new)?;
+    crate::worktrees::resolve_placeholders_with_prefetch(
+        store,
+        squad_id,
+        &mut cells,
+        &tasks,
+        prefetched_upstreams,
+        &Context::new(),
+    )
+    .map_err(ReviewError::new)?;
 
     // Topological rank per cell position (for branch ordering).
     let execution = plan::plan(&cells, &tasks).map_err(ReviewError::new)?;
@@ -635,7 +732,38 @@ pub fn derive_reviews(
             // A declared upstream wins; otherwise infer it from the worktree's
             // own git upstream, exactly as an all-local review always has.
             let upstream = match declared_upstream.clone() {
-                Some(b) => b,
+                // A review's declared `upstream` is the submitter's literal
+                // text -- unlike a cell's own `?upstream=`, it never passes
+                // through `resolve_placeholders`/`ensure_worktree`, so a bare
+                // name here needs the same registered-project-resolves-
+                // against-its-remote treatment those give a cell's cwd
+                // placeholder (see `resolve_registered_remote_upstream`'s doc
+                // comment): otherwise it silently falls back to whatever
+                // locally-named branch the shared checkout happens to have on
+                // disk right now, instead of that remote's actual branch.
+                Some(b) => {
+                    let registered_project = tasks_by_idx
+                        .get(&cells[pos].task_idx)
+                        .copied()
+                        .flatten()
+                        .and_then(|task| task.project.as_deref())
+                        .and_then(|name| store.resolve_project(name).ok().flatten());
+                    match registered_project {
+                        // Prefer an already-fetched result from
+                        // `prefetched_upstreams` (computed by the caller
+                        // OUTSIDE the store lock this whole function runs
+                        // under) over fetching live right here -- see
+                        // `derive_reviews_with_prefetch`'s doc comment.
+                        Some(pv) => match prefetched_upstreams.get(&(pv.name.clone(), b.clone())) {
+                            Some(resolved) => resolved.clone(),
+                            None => crate::worktrees::resolve_registered_remote_upstream(
+                                &project, &pv, &b,
+                            )
+                            .map_err(ReviewError::new)?,
+                        },
+                        None => b,
+                    }
+                }
                 None => worktree_upstream(cwd_path).map_err(|_| {
                     ReviewError::new(format!(
                         "{cwd}: review upstream requires a git upstream tracking branch for \

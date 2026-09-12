@@ -643,7 +643,7 @@ Guardian exists to surface, and is almost never what you want.
       id                     = "work"
       agent                  = "{<insert recommended agent here>}"  # see "Agent selection" above
       cwd                    = "<<ralphus:new-worktree/RAL-X?upstream=DEV-1234-add_payment_system>>"
-      system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+      system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
       system_prompt_position = "append"
       prompt                 = "{<ticket text>}"
 
@@ -819,7 +819,7 @@ project = "my-project"            # both cells' worktree materializes under this
   agent                  = "claude-code"  # claude-code/claude-cli/codex/codex-cli/pi all support system_prompt (see field reference above)
   cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
   review                 = "<<ralphus:new-review/ral-batch>>"
-  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
   system_prompt_position = "append"
   prompt                 = "{<the RAL-2 ticket text, pasted verbatim>}"
 
@@ -830,12 +830,12 @@ project = "my-project"            # both cells' worktree materializes under this
     [[task.cell.proof]]
     id                     = "fmt"
     prompt                 = "Run cargo fmt --all; re-run up to 3x or fail. No commit/push."
-    system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
     system_prompt_position = "append"
     [[task.cell.proof]]
     id                     = "test"
     prompt                 = "Run cargo test; fix and re-run up to 3x, else fail. No commit/push."
-    system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
     system_prompt_position = "append"
 
   # finalize: AI stages the relevant source files, commits, and pushes (depends on work).
@@ -865,7 +865,7 @@ depends_on = ["ral-2"]
   cwd                    = "<<ralphus:new-worktree/ral-3?upstream=origin/main>>"
   upstream               = "<<task:ral-2>>"
   review                 = "<<ralphus:new-review/ral-batch>>"  # same key folds into same review
-  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
   system_prompt_position = "append"
   prompt                 = "{<the RAL-3 ticket text, pasted verbatim>}"
 

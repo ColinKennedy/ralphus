@@ -3805,6 +3805,46 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         }
     }
 
+    // RAL-<pending>: fetch every registered-remote project's bare
+    // `?upstream=`/declared review `upstream` BEFORE taking the long-held
+    // lock below -- `git fetch` is a real network call (bounded to
+    // `GIT_TIMEOUT`, but that's still up to a minute against a dead
+    // remote), and the daemon's single global `Mutex<Store>` must never be
+    // held for that long: `store` below stays locked for the rest of this
+    // submit, including `derive_reviews`, so every other request (every
+    // board read, every other squad's dispatch) would otherwise queue
+    // behind this one submission for as long as the fetch takes. See
+    // `crate::worktrees::resolve_placeholders_with_prefetch`'s doc comment
+    // for the full picture, including why a miss here still resolves
+    // correctly (just not for free).
+    let prefetched_upstreams = {
+        let guard = daemon.lock();
+        let targets = crate::reviews::collect_remote_upstream_prefetch_targets(&guard, &file);
+        drop(guard);
+        let mut resolved = std::collections::HashMap::new();
+        for (project, upstream) in targets {
+            match crate::worktrees::resolve_registered_remote_upstream(
+                std::path::Path::new(&project.path),
+                &project,
+                &upstream,
+            ) {
+                Ok(remote_upstream) => {
+                    resolved.insert((project.name.clone(), upstream), remote_upstream);
+                }
+                // Not fatal here -- the locked pass below retries the same
+                // fetch live and surfaces the real error through the normal
+                // validation-failure path if it's still broken.
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [submit] could not prefetch \"?upstream={upstream}\" for project \
+                     \"{}\": {e}",
+                    project.name
+                ),
+            }
+        }
+        resolved
+    };
+
     let mut store = daemon.lock();
     let squad_id = match store.insert_squad(&file, req.label.as_deref(), req.hold) {
         Ok(id) => id,
@@ -3886,7 +3926,12 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
 
     // Derive per-project review guardians. A preflight failure (bad worktree, no
     // upstream for a `<<upstream>>` base) rolls the squad back and rejects the submit.
-    if let Err(e) = crate::reviews::derive_reviews(&store, &squad_id, &file) {
+    if let Err(e) = crate::reviews::derive_reviews_with_prefetch(
+        &store,
+        &squad_id,
+        &file,
+        &prefetched_upstreams,
+    ) {
         let _ = store.delete_squad(&squad_id);
         return error(400, "review_preflight_failed", &e.message, vec![]);
     }
@@ -12191,6 +12236,25 @@ fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecisio
 /// the global `Mutex<Store>` low.
 const READ_WORKERS: usize = 12;
 
+/// How many mutating (non-`GET`) requests the daemon answers concurrently.
+///
+/// Exactly 1, deliberately: mutating handlers must stay totally ordered
+/// (see [`ReadPool`]'s doc comment on why GETs alone get real concurrency),
+/// so this exists only to get them OFF the accept loop, never to
+/// parallelize them -- [`ReadPool`] with one worker gives exactly that: a
+/// single dedicated thread draining requests strictly in arrival order,
+/// same as the accept loop answering them inline used to.
+///
+/// Without this, a mutating handler that takes real wall-clock time --
+/// e.g. `POST /api/squads` fetching a registered project's remote upstream
+/// (`resolve_registered_remote_upstream`'s `git fetch`, RAL-<pending>) --
+/// blocks the accept loop from ever calling `Server::recv()` again for
+/// that whole duration. `Server::recv()` is also how brand-new connections
+/// get noticed at all (GETs dispatched to `ReadPool` only need the accept
+/// loop free to accept THEM in the first place), so one slow mutation used
+/// to freeze the *entire* HTTP API, not just other mutations.
+const WRITE_WORKERS: usize = 1;
+
 /// Handler wall time at or above which a request is logged as slow.
 ///
 /// One second is well past anything the API is expected to take -- the
@@ -12357,6 +12421,7 @@ enum HttpLoopEnd {
 
 fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
     let read_pool = ReadPool::new(daemon, READ_WORKERS);
+    let write_pool = ReadPool::new(daemon, WRITE_WORKERS);
     loop {
         let mut request = match server.recv() {
             Ok(r) => r,
@@ -12474,9 +12539,19 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             cors,
             accepted_at: Instant::now(),
         };
-        // Read-only requests go to the pool so a slow one cannot stall the
-        // accept loop; everything that mutates state is answered right here,
-        // keeping mutating requests totally ordered. See `ReadPool`.
+        // Read-only requests go to `read_pool` (real concurrency, see
+        // `ReadPool`'s doc comment); mutating requests go to `write_pool`
+        // (exactly one worker, so they stay totally ordered exactly like
+        // answering them inline used to -- see `WRITE_WORKERS`'s doc
+        // comment for why they still can't run on the accept loop itself).
+        //
+        // `POST /api/daemon/shutdown` is the one exception, answered inline
+        // as before: this loop's very next statement polls
+        // `daemon.shutdown_requested()` to decide whether to keep serving,
+        // which only works if the flag it sets has already been set by the
+        // time that poll runs -- true when the accept loop itself just ran
+        // the handler, not guaranteed if a `write_pool` worker is still
+        // mid-flight on a separate thread.
         if pending.method == "GET" {
             // `dispatch` only hands the request back if every worker thread
             // is gone (they all panicked); answering it inline then is
@@ -12484,8 +12559,12 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             if let Some(returned) = read_pool.dispatch(pending) {
                 answer_request(daemon, returned);
             }
-        } else {
+        } else if pending.method == "POST"
+            && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
+        {
             answer_request(daemon, pending);
+        } else if let Some(returned) = write_pool.dispatch(pending) {
+            answer_request(daemon, returned);
         }
         // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
         // Breaking here — rather than calling `server.unblock()` — is

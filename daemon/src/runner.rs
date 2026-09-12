@@ -334,7 +334,11 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      Never ask a clarifying question, never stop to present a plan for \
      confirmation, and never pause waiting for input. Make the most \
      reasonable judgment call yourself and continue until the task is \
-     complete.";
+     complete. Your working directory for this cell is fixed for the entire \
+     session — never `cd` to, read, or write any path outside it, even one \
+     that looks related or more familiar (such as this repository's main \
+     checkout); every file edit and git operation must happen inside the \
+     working directory you were given.";
 
 fn combine_system_prompts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     let combined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n");

@@ -846,6 +846,44 @@ fn execute_squad_inner(
             guard.cancelled_tasks(squad_id).unwrap_or_default(),
         )
     };
+    // RAL-<pending>: fetch every registered-remote project's bare `?upstream=`
+    // BEFORE taking the store lock that guards placeholder resolution below --
+    // `git fetch` is a real network call (bounded to `GIT_TIMEOUT`, but that's
+    // still up to a minute against a dead remote), and the daemon's single
+    // global `Mutex<Store>` must never be held for that long: every other
+    // request (every board read, every other squad's dispatch) queues behind
+    // it meanwhile. `collect_remote_upstream_prefetch_targets` only reads the
+    // store (cheap); the actual fetches run with no lock held at all. See
+    // `resolve_placeholders_with_prefetch`'s doc comment for the full picture,
+    // including why a miss here still resolves correctly (just not for free).
+    let prefetched_upstreams = {
+        let guard = store.lock().expect("store mutex poisoned");
+        let targets =
+            crate::worktrees::collect_remote_upstream_prefetch_targets(&guard, &cells, &tasks);
+        drop(guard);
+        let mut resolved = HashMap::new();
+        for (project, upstream) in targets {
+            match crate::worktrees::resolve_registered_remote_upstream(
+                Path::new(&project.path),
+                &project,
+                &upstream,
+            ) {
+                Ok(remote_upstream) => {
+                    resolved.insert((project.name.clone(), upstream), remote_upstream);
+                }
+                // Not fatal here -- the locked pass below retries the same
+                // fetch live and surfaces the real error through the normal
+                // squad-failure path if it's still broken.
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [scheduler] squad {squad_id} could not prefetch \
+                     \"?upstream={upstream}\" for project \"{}\": {e}",
+                    project.name
+                ),
+            }
+        }
+        resolved
+    };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
     // placeholder repeated across cells/tasks materializes exactly one
     // worktree, and the resolved real path is persisted immediately, so a
@@ -854,11 +892,12 @@ fn execute_squad_inner(
     // submit) fails the whole squad cleanly rather than panicking mid-dispatch.
     {
         let guard = store.lock().expect("store mutex poisoned");
-        let result = crate::worktrees::resolve_placeholders(
+        let result = crate::worktrees::resolve_placeholders_with_prefetch(
             &guard,
             squad_id,
             &mut cells,
             &tasks,
+            &prefetched_upstreams,
             &_squad_span.cx,
         );
         drop(guard);
@@ -1899,6 +1938,20 @@ fn run_cell_worker(
                     // targets (that's only read by remote worktree
                     // provisioning) -- empty is correct here, not a stub.
                     targets: &std::collections::BTreeMap::new(),
+                    // No prefetch pass covers env-override placeholders (a
+                    // rarer case than a cell's own cwd) -- an unresolved
+                    // registered-remote bare upstream here falls back to a
+                    // live fetch under this lock, same as before this cache
+                    // existed. See `resolve_placeholders_with_prefetch`'s doc
+                    // comment for the cwd case this doesn't cover.
+                    prefetched_upstreams: &std::collections::HashMap::new(),
+                    // Env-override placeholder expansion isn't a per-squad,
+                    // multi-cell loop the way `resolve_placeholders` is --
+                    // each call here is its own one-off, so there is nothing
+                    // to share a snapshot across. A fresh, empty cache is
+                    // correct, not a stub (see
+                    // `PlaceholderContext::on_disk_worktrees`'s doc comment).
+                    on_disk_worktrees: &std::cell::RefCell::new(std::collections::HashMap::new()),
                 },
                 &merged,
             )
@@ -2551,11 +2604,46 @@ fn run_task_finalizer(
     }
     // A cell (or cell-proof) failure already condemns the task; skip the
     // task-level proofs in that case, matching the old batch behaviour.
-    let already_failed = progress
-        .lock()
-        .expect("progress mutex poisoned")
-        .failed
-        .contains(&task_idx);
+    //
+    // `progress.failed` is a same-run, in-memory latch: `run_cell_worker`
+    // sets it the instant a cell body or cell-proof first fails and nothing
+    // ever re-derives it from storage afterward. Left unchecked, a manual
+    // `cell set-status`/`proof set-status ... done` override made after that
+    // failure -- but before this finalizer happens to run -- was silently
+    // discarded: the task was condemned from the stale flag alone, even
+    // though the operator had already corrected the underlying row. Re-check
+    // every cell under this task against its *current* effective state (the
+    // same proof-aware fold `effective_state_for_cell` already gives Triage)
+    // before trusting the cached flag, and un-latch it once every cell has
+    // been manually cleared, so a later dependent check in this same run
+    // sees the correction too.
+    let already_failed = {
+        let latched = progress
+            .lock()
+            .expect("progress mutex poisoned")
+            .failed
+            .contains(&task_idx);
+        if latched {
+            let guard = store.lock().expect("store mutex poisoned");
+            let still_failed = cells.iter().filter(|s| s.task_idx == task_idx).any(|s| {
+                matches!(
+                    guard.effective_state_for_cell(squad_id, task_idx, s.idx),
+                    Ok(Some(state)) if state == "failed"
+                )
+            });
+            drop(guard);
+            if !still_failed {
+                progress
+                    .lock()
+                    .expect("progress mutex poisoned")
+                    .failed
+                    .remove(&task_idx);
+            }
+            still_failed
+        } else {
+            false
+        }
+    };
     let mut failed = already_failed;
     if !failed {
         let task_cell = cells.iter().find(|s| s.task_idx == task_idx);
@@ -3265,6 +3353,16 @@ fn run_proofs(
                         // See the sibling call site above: env-override
                         // placeholder expansion never reads machine targets.
                         targets: &std::collections::BTreeMap::new(),
+                        // See the sibling call site above: no prefetch pass
+                        // covers env-override placeholders; a miss here falls
+                        // back to a live fetch under this lock, unchanged
+                        // from before this cache existed.
+                        prefetched_upstreams: &std::collections::HashMap::new(),
+                        // See the sibling call site above: no per-squad loop
+                        // to share a snapshot across here either.
+                        on_disk_worktrees: &std::cell::RefCell::new(
+                            std::collections::HashMap::new(),
+                        ),
                     },
                     &merged,
                 )

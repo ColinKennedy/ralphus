@@ -642,6 +642,24 @@ pub(crate) struct WorktreeClaim {
     pub state: String,
 }
 
+/// One persisted cell or proof step whose `cwd` names a worktree, with
+/// exactly the fields `crate::tmux::session_name` needs to recompute the
+/// tmux session (and therefore pane-snapshot/terminal-log) name it ran
+/// under. Used by `crate::worktree_transcript_retirement` (RAL-348) to find
+/// every session that ever ran in a worktree that has just been retired.
+// `crate::worktree_transcript_retirement` doesn't exist yet -- this struct
+// and `Store::worktree_session_owners` are the store-layer half of RAL-348,
+// landing ahead of the retirement module that will call them. Remove this
+// once that module exists and calls `worktree_session_owners`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeSessionOwner {
+    pub squad_id: String,
+    pub task_name: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
 /// One review-worktree path and the timestamp of its owner's last activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuardianWorktreeRecord {
@@ -4529,6 +4547,52 @@ impl Store {
                     owner: r.get(1)?,
                     path: r.get(2)?,
                     state: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every persisted cell and proof step whose `cwd` names a worktree, with
+    /// enough identity (squad id, owning task's name, session id) to
+    /// recompute `crate::tmux::session_name` for it. A proof step's session
+    /// id mirrors the `proof-{scope}-{idx}` cell id `scheduler::run_proofs`
+    /// actually runs it under; a proof always runs "where its owning
+    /// cell/task does" (RAL-185), so it reuses that cell's `cwd` here too.
+    ///
+    /// Deliberately returns every row rather than filtering by a specific
+    /// `cwd` in SQL: `crate::worktree_transcript_retirement` matches paths
+    /// via `guardian_merge::normalized_worktree_path`, the same
+    /// canonicalizing comparison `retire_stale_worktrees` itself uses to
+    /// dedupe/match worktree paths, so the comparison needs to happen in Rust
+    /// on both sides either way.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    // Not called yet -- `crate::worktree_transcript_retirement` (RAL-348),
+    // this method's caller, doesn't exist yet. Remove this once it does.
+    #[allow(dead_code)]
+    pub(crate) fn worktree_session_owners(&self) -> Result<Vec<WorktreeSessionOwner>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.squad_id, t.name, c.sid, c.cwd
+             FROM cells c JOIN tasks t ON t.squad_id=c.squad_id AND t.idx=c.task_idx
+             WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT p.squad_id, t.name, 'proof-' || p.scope || '-' || p.idx, c.cwd
+             FROM proofs p
+             JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
+                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
+                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
+             JOIN tasks t ON t.squad_id=p.squad_id AND t.idx=p.task_idx
+             WHERE c.cwd IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(WorktreeSessionOwner {
+                    squad_id: r.get(0)?,
+                    task_name: r.get(1)?,
+                    session_id: r.get(2)?,
+                    cwd: r.get(3)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
