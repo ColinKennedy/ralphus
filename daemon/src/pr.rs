@@ -3333,7 +3333,7 @@ fn fork_aware_route(
         }
         crate::forge::ForgeKind::GitHub => Ok(crate::forge::PrRoute {
             client: routing.fork_client.clone(),
-            head: alias.to_string(),
+            head: routing.fork_client.same_repo_head(alias),
             base: computed_base.to_string(),
             target_project_id: None,
             repo: routing.fork_client.repo_label().to_string(),
@@ -3635,7 +3635,7 @@ fn submit_stacked_branch_pr(
         Some(routing) => fork_aware_route(routing, &alias, &base, base_branch_name)?,
         None => crate::forge::PrRoute {
             client: client.clone(),
-            head: alias.clone(),
+            head: client.same_repo_head(&alias),
             base: base.clone(),
             target_project_id: None,
             repo: client.repo_label().to_string(),
@@ -8819,14 +8819,18 @@ mod tests {
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
 
-            // Branch b: fork-internal PR based on a's own alias.
+            // Branch b: fork-internal PR based on a's own alias. Still a
+            // same-repo (alice/widget) head, but GitHub's `head` filter
+            // silently ignores a bare branch name (see
+            // `ForgeClient::same_repo_head`), so even a fork-internal head
+            // must carry the fork's own `owner:` prefix.
             let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
-            assert_eq!(payload["head"], serde_json::json!("b-alias"));
+            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
 
             // Branch c: fork-internal PR based on b's own alias.
             let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
-            assert_eq!(payload["head"], serde_json::json!("c-alias"));
+            assert_eq!(payload["head"], serde_json::json!("alice:c-alias"));
             assert_eq!(payload["base"], serde_json::json!("b-alias"));
         });
 

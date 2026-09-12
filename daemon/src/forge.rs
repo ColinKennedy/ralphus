@@ -272,6 +272,26 @@ impl ForgeClient {
         &self.repo_path
     }
 
+    /// The `head` value to use when this client's own repo owns both the
+    /// branch and the PR/MR -- i.e. everywhere except the GitHub cross-repo
+    /// fork root, which already builds its own `owner:branch` head from the
+    /// fork's registered owner. GitHub's `pulls` list endpoint silently
+    /// ignores a bare branch name in its `head` filter (it returns every
+    /// open PR unfiltered instead of erroring or matching nothing), so a
+    /// same-repo GitHub head must still carry the `owner:` prefix or
+    /// [`Self::find_open_pull_request`] adopts an unrelated open PR;
+    /// GitLab's `source_branch` filter has no such requirement.
+    #[must_use]
+    pub fn same_repo_head(&self, alias: &str) -> String {
+        match self.kind {
+            ForgeKind::GitHub => {
+                let owner = self.repo_path.split('/').next().unwrap_or(&self.repo_path);
+                format!("{owner}:{alias}")
+            }
+            ForgeKind::GitLab => alias.to_string(),
+        }
+    }
+
     fn require_token(&self) -> Result<&str, String> {
         #[cfg(test)]
         if self.token.is_none() && self.api_base.starts_with("http://127.0.0.1:") {
@@ -2697,6 +2717,69 @@ mod tests {
             .expect("must find the open MR the mock server reports");
         assert_eq!(found.number, 9);
         assert_eq!(found.base, "main");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn same_repo_head_prefixes_github_with_the_repos_own_owner() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "http://x".to_string(),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.same_repo_head("my-branch"), "acme:my-branch");
+    }
+
+    #[test]
+    fn same_repo_head_leaves_gitlab_head_bare() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "http://x".to_string(),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.same_repo_head("my-branch"), "my-branch");
+    }
+
+    #[test]
+    fn find_open_pull_request_with_a_bare_github_head_would_match_any_open_pr() {
+        // Regression guard for the bug this module's `same_repo_head` fixes:
+        // GitHub's documented `head` filter silently returns every open PR,
+        // unfiltered, when given a bare branch name instead of `owner:branch`
+        // -- it does NOT error and does NOT scope to the named branch. Any
+        // caller building a same-repo GitHub head must go through
+        // `same_repo_head`, never pass a bare branch name directly, or a
+        // "does a PR already exist for this branch" check silently adopts an
+        // unrelated open PR. This test pins that raw (buggy-if-relied-on)
+        // server behavior so a regression in `same_repo_head`'s callers is
+        // caught even though this call site itself is intentionally bare.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/repos/acme/widget/pulls");
+            assert!(query.contains("head=totally-unrelated-branch"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"number":2,"html_url":"http://x/2","base":{"ref":"staging"},"title":"unrelated","body":"unrelated"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let found = client
+            .find_open_pull_request("totally-unrelated-branch")
+            .unwrap()
+            .expect("bare head is ignored server-side and returns the unfiltered list");
+        assert_eq!(found.number, 2);
         handle.join().unwrap();
     }
 
