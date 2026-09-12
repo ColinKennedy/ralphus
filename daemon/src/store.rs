@@ -15058,4 +15058,5 @@ prompt = "do b"
         assert_eq!(squads[0].generation_cost.as_ref().map(|g| g.count), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }
