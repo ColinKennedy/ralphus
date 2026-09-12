@@ -101,6 +101,16 @@ test("formats a usage event with a compact token/cost detail", () => {
   assert.ok(out.includes("$0.1234"));
 });
 
+test("tags a 'live usage' event's numbers as an estimate", () => {
+  const out = formatInlineTapeEvent('{"source":"claude-code","message":"live usage","payload":{"tokens_in":2,"tokens_out":3,"cost_usd":0.1172}}');
+  assert.ok(out.includes("(est.)"), "the mid-run snapshot must read as an estimate");
+});
+
+test("does not tag the cell's final 'llm done' usage as an estimate", () => {
+  const out = formatInlineTapeEvent('{"source":"runner","message":"llm done","payload":{"tokens_in":2,"tokens_out":13,"cost_usd":0.0663}}');
+  assert.ok(!out.includes("(est.)"), "the authoritative final tally is not an estimate");
+});
+
 test("formats a session-id event", () => {
   const out = formatInlineTapeEvent('{"source":"claude-code","message":"session","payload":{"agent_session_id":"sess-123"}}');
   assert.ok(out.includes("session sess-123"));
