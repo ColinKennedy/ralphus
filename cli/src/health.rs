@@ -494,6 +494,29 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
     )
 }
 
+/// Surfaces `[daemon] opentelemetry = false` in `check health`. This is a
+/// deliberate config choice, not a problem to flag, so it's reported at
+/// `pass` severity -- the point is just confirming the setting took effect,
+/// not warning about it.
+fn check_opentelemetry(cwd: &Path) -> CheckResult {
+    let config = crate::config::load_config(cwd, true);
+    if config.daemon.opentelemetry {
+        return CheckResult::new("daemon-opentelemetry", PASS, "enabled");
+    }
+    let src = config
+        .provenance
+        .iter()
+        .find(|(k, _)| *k == "daemon.opentelemetry")
+        .and_then(|(_, v)| v.as_ref())
+        .map(|p| format!(" (from {})", p.display()))
+        .unwrap_or_default();
+    CheckResult::new(
+        "daemon-opentelemetry",
+        PASS,
+        format!("OpenTelemetry has been disabled{src}"),
+    )
+}
+
 /// Reads `[live_view]` as a raw TOML table from `path`, if the file exists,
 /// parses, and declares that table -- used by
 /// [`check_tool_arg_truncate_chars`] instead of `ralphus_daemon::config`'s
@@ -991,6 +1014,7 @@ pub fn run_checks(
     results.push(check_nvidia_smi());
     results.push(check_config(cwd));
     results.push(check_max_concurrent(cwd));
+    results.push(check_opentelemetry(cwd));
     results.push(check_tool_arg_truncate_chars(cwd));
     results.push(check_thrash_max_compactions(cwd));
     results.push(check_thrash_min_turn_gap(cwd));
