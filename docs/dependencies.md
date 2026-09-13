@@ -50,13 +50,31 @@ version constraint is currently known to matter.
 
 ### tmux / psmux
 
-**Windows requires psmux 3.3.6 or later.** `daemon/src/tmux.rs` resolves a
-`tmux`-named binary on `PATH` (or `RALPHUS_TMUX_CMD` if set — see
-`docs/tmux-embedding.md`) for every agent-kind cell/proof run (RAL-102).
-On Windows this is [psmux](https://github.com/psmux/psmux), a native
-Windows tmux alternative — not real tmux, and not a drop-in (see
-`docs/tmux-embedding.md`'s "Why embedding isn't done yet" for the known
-`respawn-pane` gap this project already works around).
+> ⚠️ **Security: prefer the vendored build; avoid a separately installed
+> system tmux/psmux.** A task/proof session's entire terminal — everything an
+> agent reads and writes, including model API keys — flows through whatever
+> binary answers to `tmux` at runtime. A build with `--features
+> ralphus-daemon/embedded-tmux` (see `docs/tmux-embedding.md`) uses a build
+> compiled in CI/release from this repo's pinned `vendor/psmux` git submodule
+> (RAL-347) instead of trusting an arbitrary binary a machine happens to have
+> installed under that name. Relying on a WinGet/Scoop/PATH-installed psmux
+> instead is supported (`RALPHUS_TMUX_CMD`, or simply having `tmux` on
+> `PATH`) but **discouraged**: that binary isn't pinned or reviewed by this
+> repo, and a compromised or tampered copy can see everything a session does.
+> Only reach for it if you have a specific reason to (e.g. you maintain your
+> own trusted psmux build, or you're on a platform without a vendored build
+> yet).
+
+**Windows requires psmux 3.3.8 or later** (3.3.6 fixed a session-loss crash,
+but 3.3.7 has a `pipe-pane` regression this project depends on — see below).
+`daemon/src/tmux.rs` resolves, in order: `RALPHUS_TMUX_CMD` if set, then the
+embedded/vendored build if this binary was built with `--features
+ralphus-daemon/embedded-tmux`, then a `tmux`-named binary on `PATH` — see
+`docs/tmux-embedding.md`. On Windows this is
+[psmux](https://github.com/psmux/psmux), a native Windows tmux alternative —
+not real tmux, and not a drop-in (see `docs/tmux-embedding.md`'s "Why
+`respawn-pane` is worked around" for the known gap this project already works
+around).
 
 psmux **3.3.5 and earlier have a real, reproducible bug** where a live tmux
 session can silently disappear mid-run — the backing OS process exits (or
@@ -72,10 +90,16 @@ rapid new-session (atomic claim)`, `fix: eliminate residual warm session
 loss (double-create on slow claim)`). See `PSMUX_CRASH_NOTES.local.md` for
 the full investigation (not committed — local working notes).
 
+If you're building with `--features ralphus-daemon/embedded-tmux` (the
+recommended, vendored path — see the warning above and
+`docs/tmux-embedding.md`), none of the below applies: the embedded build is
+already pinned to `v3.3.8`. The following is only for the discouraged
+`PATH`/`RALPHUS_TMUX_CMD` path.
+
 Check your version:
 
 ```bash
-tmux -V   # must print "tmux 3.3.6" or later
+tmux -V   # must print "psmux 3.3.8" or later
 ```
 
 Upgrade via winget (the package is `marlocarlo.psmux`, aliased to `tmux`/

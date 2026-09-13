@@ -1,0 +1,3 @@
+[submodule "vendor/psmux"]
+	path = vendor/psmux
+	url = https://github.com/psmux/psmux.git

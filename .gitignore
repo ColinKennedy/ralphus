@@ -45,3 +45,8 @@ ralphus.lic
 
 # Build artifacts
 bundle-dist/
+
+# Vendored psmux (RAL-347) build output — scripts/build-vendored-tmux.ps1
+# writes here from the vendor/psmux git submodule; only the submodule's
+# pinned source is committed, never the built binary.
+/daemon/assets/tmux/windows/tmux.exe
