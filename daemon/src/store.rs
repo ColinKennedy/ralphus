@@ -5202,6 +5202,9 @@ fn insert_proof(
     } else {
         ("unknown", String::new())
     };
+    // RAL-290: a proof step's own `agent` wins over the owning cell's/task's
+    // resolved backend passed in by the caller.
+    let agent = v.agent.as_deref().unwrap_or(agent);
     let timeout_sec = resolve_timeout_sec(v.timeout_minutes, task.timeout_minutes);
     let budget_tokens = resolve_budget(v.budget_tokens, task.budget_tokens);
     let maximum_tool_output_tokens = match owning_cell {
@@ -5370,19 +5373,53 @@ pub struct TaskEdit<'a> {
     pub model: Option<Option<&'a str>>,
 }
 
-/// Editable proof step definition fields. A proof step has no separate
-/// `agent` selector (it always runs under its owning cell's/task's resolved
-/// agent program -- see `core::schema::ProofStep`'s doc comment), so `model`
-/// is the only editable field. Same nullable-field semantics as
-/// [`CellEdit::model`].
+/// Editable proof step definition fields (RAL-290). `agent`/`model` use the
+/// same nullable-field semantics as [`CellEdit::agent`]/[`CellEdit::model`]:
+/// `proofs.agent` is `NOT NULL` (defaults to the owning cell's/task's
+/// resolved backend at submit time -- see `core::schema::ProofStep::agent`),
+/// so like [`CellEdit::agent`] it only has the "untouched" (`None`) and
+/// "set" (`Some(v)`) states, never "clear".
 #[derive(Debug, Clone)]
 pub struct ProofEdit<'a> {
+    /// Backend override.
+    pub agent: Option<&'a str>,
     /// Model override (meaningful for `prompt`-kind steps).
     pub model: Option<Option<&'a str>>,
+    /// The step's new body when the caller supplies one of
+    /// `command`/`prompt`/`brain` -- whichever they give replaces the
+    /// stored `kind`/`spec` pair outright, since a proof step is exactly one
+    /// of the three (see `core::validate`'s one-of rule). `None` leaves
+    /// `kind`/`spec` untouched.
+    pub body: Option<ProofBody<'a>>,
     /// Per-step cap on a single tool-call output, in tokens (RAL-333).
     /// Gated on the step's own `agent` by the caller, the same way
     /// [`CellEdit::maximum_tool_output_tokens`] is gated on the cell's.
     pub maximum_tool_output_tokens: Option<Option<i64>>,
+}
+
+/// The (kind, spec) pair a proof edit's `command`/`prompt`/`brain` field
+/// resolves to -- see [`ProofEdit::body`].
+#[derive(Debug, Clone, Copy)]
+pub enum ProofBody<'a> {
+    Command(&'a str),
+    Brain(&'a str),
+    Prompt(&'a str),
+}
+
+impl<'a> ProofBody<'a> {
+    fn kind(&self) -> &'static str {
+        match self {
+            ProofBody::Command(_) => "command",
+            ProofBody::Brain(_) => "brain",
+            ProofBody::Prompt(_) => "prompt",
+        }
+    }
+
+    fn spec(&self) -> &'a str {
+        match *self {
+            ProofBody::Command(s) | ProofBody::Brain(s) | ProofBody::Prompt(s) => s,
+        }
+    }
 }
 
 /// A task's identity and dependencies, for scheduling.
@@ -5996,18 +6033,41 @@ impl Store {
         idx: i64,
         edit: &ProofEdit<'_>,
     ) -> Result<()> {
+        let agent_touched = edit.agent.is_some();
         let model_touched = edit.model.is_some();
         let model_value = edit.model.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
+        // Whichever of command/prompt/brain the caller supplied (if any)
+        // replaces `kind`/`spec` outright -- mirrors `insert_proof`'s
+        // derivation, including recomputing `effective_system_prompt` only
+        // for the "prompt" kind.
+        let body_touched = edit.body.is_some();
+        let kind_value = edit.body.as_ref().map(ProofBody::kind);
+        let spec_value = edit.body.as_ref().map(ProofBody::spec);
+        let effective_system_prompt_value = match edit.body {
+            Some(ProofBody::Prompt(_)) => Some(effective_proof_system_prompt(None)),
+            Some(ProofBody::Command(_) | ProofBody::Brain(_)) => None,
+            None => None,
+        };
         let n = self.conn.execute(
             "UPDATE proofs SET
+                agent = CASE WHEN :agent_touched THEN :agent ELSE agent END,
                 model = CASE WHEN :model_touched THEN :model ELSE model END,
+                kind = CASE WHEN :body_touched THEN :kind ELSE kind END,
+                spec = CASE WHEN :body_touched THEN :spec ELSE spec END,
+                effective_system_prompt = CASE WHEN :body_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
                 maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND scope=:scope AND cell_idx=:cell_idx AND idx=:idx",
             named_params! {
+                ":agent_touched": agent_touched,
+                ":agent": edit.agent,
                 ":model_touched": model_touched,
                 ":model": model_value,
+                ":body_touched": body_touched,
+                ":kind": kind_value,
+                ":spec": spec_value,
+                ":effective_system_prompt": effective_system_prompt_value,
                 ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
                 ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,

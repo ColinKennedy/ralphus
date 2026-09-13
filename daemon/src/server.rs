@@ -5451,6 +5451,8 @@ struct EditBody {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
+    brain: Option<String>,
+    #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
     maximum_tool_output_tokens: Option<String>,
@@ -5540,7 +5542,7 @@ fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
 }
 
 /// Edit a squad's label, a task's name/project/model, a cell's fields, or a
-/// proof step's model.
+/// proof step's agent/model/command/prompt/brain (RAL-290).
 ///
 /// A `squad` edit (the label only) is purely cosmetic -- it isn't tied to any
 /// node in the dependency graph or to the content executed, so it does not
@@ -5707,25 +5709,46 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
-            // A proof step carries its own agent, so it is gated on that
-            // rather than on the owning cell's -- see the `"cell"` arm.
+            // A proof step carries its own agent (RAL-290), so it is gated
+            // on the *effective* one -- the `agent` in this same request if
+            // given, else the stored one -- rather than on the owning
+            // cell's. Same shape as the `"cell"` arm's `system_prompt`/
+            // `maximum_tool_output_tokens` gating.
+            let new_agent = non_empty(req.agent.as_ref());
             if let Some(Some(_)) = maximum_tool_output_tokens {
-                let agent = match daemon.lock().get_proof_agent(
-                    id,
-                    req.task_idx,
-                    &req.proof_scope,
-                    req.cell_idx,
-                    req.proof_idx,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => return store_error(&e),
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_proof_agent(
+                        id,
+                        req.task_idx,
+                        &req.proof_scope,
+                        req.cell_idx,
+                        req.proof_idx,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
                 };
-                if let Some(reply) = reject_unsupported_maximum_tool_output_tokens(&agent) {
+                if let Some(reply) = reject_unsupported_maximum_tool_output_tokens(&effective_agent)
+                {
                     return reply;
                 }
             }
+            // Keep command/prompt/brain a strict one-of: whichever the
+            // caller supplies replaces the step's (kind, spec) pair
+            // outright -- extends the cell edit's prompt XOR command rule
+            // to three kinds. Precedence (command, then brain, then prompt)
+            // mirrors `insert_proof`'s own kind derivation.
+            let body = req
+                .command
+                .as_deref()
+                .map(crate::store::ProofBody::Command)
+                .or_else(|| req.brain.as_deref().map(crate::store::ProofBody::Brain))
+                .or_else(|| req.prompt.as_deref().map(crate::store::ProofBody::Prompt));
             let edit = crate::store::ProofEdit {
+                agent: new_agent,
                 model: nullable_field_edit(req.model.as_ref()),
+                body,
                 maximum_tool_output_tokens,
             };
             if let Err(e) = daemon.lock().edit_proof_fields(
@@ -15846,9 +15869,9 @@ agent=\"claude-code\"
 
     #[test]
     fn edit_proof_maximum_tool_output_tokens_set_and_clear() {
-        // A proof step has no `agent` key of its own (not in `PROOF_KEYS`) --
-        // `proofs.agent` is populated from the owning cell/task at submit, and
-        // that stored value is what the cap is gated on (RAL-333).
+        // `proofs.agent` is populated from the owning cell/task at submit
+        // when the step declares no `agent` of its own (RAL-290), and that
+        // stored value is what the cap is gated on (RAL-333).
         const ONE_CELL: &str = "[[task]]
 name=\"t\"
 [[task.cell]]
@@ -15924,6 +15947,97 @@ command=\"check\"
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"model\":\"gpt-5\""), "{}", r.body);
         assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_agent_overrides_the_owning_cells_resolved_backend() {
+        // RAL-290: a proof step's own `agent` wins over the owning cell's.
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        assert!(
+            route(&d, "GET", "/api/squads/squad-000000000001", "")
+                .body
+                .contains("\"agent\":\"claude\""),
+            "the proof step should start out inheriting the cell's default agent"
+        );
+
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "agent": "codex",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"agent\":\"codex\""), "{}", r.body);
+        assert!(r.body.contains("\"state\":\"pending\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_command_prompt_brain_stay_one_of_only_when_explicitly_supplied() {
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+
+        // Supplying `prompt` alone switches the step's kind/spec to prompt.
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "prompt": "check it over",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"kind\":\"prompt\""), "{}", r.body);
+        assert!(r.body.contains("\"spec\":\"check it over\""), "{}", r.body);
+
+        // Supplying `brain` alone switches it again.
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "brain": "think it over",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"kind\":\"brain\""), "{}", r.body);
+        assert!(r.body.contains("\"spec\":\"think it over\""), "{}", r.body);
+
+        // Omitting all three leaves the step's kind/spec exactly as they were.
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "model": "gpt-5",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"kind\":\"brain\""), "{}", r.body);
+        assert!(r.body.contains("\"spec\":\"think it over\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_maximum_tool_output_tokens_accepted_with_supporting_agent_in_same_call() {
+        // No stored `agent` -- resolves to the default "claude", which
+        // cannot deliver the cap -- but supplying a supporting `agent` in
+        // this same edit request gates on *that* one instead (mirrors the
+        // cell edit's equivalent same-call gating).
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        let body = serde_json::json!({
+            "kind": "proof", "task_idx": 0, "proof_scope": "cell", "cell_idx": 0,
+            "proof_idx": 0, "agent": "codex", "maximum_tool_output_tokens": "8000",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"agent\":\"codex\""), "{}", r.body);
+        assert!(
+            r.body.contains("\"maximum_tool_output_tokens\":8000"),
+            "{}",
+            r.body
+        );
     }
 
     #[test]

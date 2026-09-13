@@ -1379,8 +1379,15 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     node(
         "edit",
         &["selector [str]"],
-        &["--maximum-tool-output-tokens [tokens]", "--model [name]"],
-        "Edit a proof step's model/tool-output-cap overrides.",
+        &[
+            "--agent [name]",
+            "--brain [text]",
+            "--command [cmd]",
+            "--maximum-tool-output-tokens [tokens]",
+            "--model [name]",
+            "--prompt [text]",
+        ],
+        "Edit a proof step's agent/model/command/prompt/brain overrides.",
         false,
         false,
         &[],

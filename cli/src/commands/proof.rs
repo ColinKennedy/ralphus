@@ -24,7 +24,11 @@ pub enum ProofCommand {
     },
     Edit {
         selector: String,
+        agent: Option<String>,
         model: Option<String>,
+        command: Option<String>,
+        prompt: Option<String>,
+        brain: Option<String>,
         maximum_tool_output_tokens: Option<String>,
     },
     /// RAL-324: read-only listing of this proof step's resolved environment.
@@ -53,14 +57,22 @@ pub fn parse(args: &[String]) -> ProofCommand {
         }
         Some("restart") => with_selector(scanner, |selector| ProofCommand::Restart { selector }),
         Some("edit") => {
+            let agent = scanner.take_value("--agent").ok().flatten();
             let model = scanner.take_value("--model").ok().flatten();
+            let command = scanner.take_value("--command").ok().flatten();
+            let prompt = scanner.take_value("--prompt").ok().flatten();
+            let brain = scanner.take_value("--brain").ok().flatten();
             let maximum_tool_output_tokens = scanner
                 .take_value("--maximum-tool-output-tokens")
                 .ok()
                 .flatten();
             with_selector(scanner, |selector| ProofCommand::Edit {
                 selector,
+                agent,
                 model,
+                command,
+                prompt,
+                brain,
                 maximum_tool_output_tokens,
             })
         }
@@ -179,7 +191,11 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
         }),
         ProofCommand::Edit {
             selector,
+            agent,
             model,
+            command,
+            prompt,
+            brain,
             maximum_tool_output_tokens,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "proof")?;
@@ -189,7 +205,11 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
                 &resolved.proof_scope,
                 resolved.cell_idx,
                 resolved.proof_idx,
+                agent.as_deref(),
                 model.as_deref(),
+                command.as_deref(),
+                prompt.as_deref(),
+                brain.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
@@ -274,11 +294,19 @@ mod tests {
         match parse(&v(&["edit", "squad-1/build/proof/0", "--model", "gpt-5"])) {
             ProofCommand::Edit {
                 selector,
+                agent,
                 model,
+                command,
+                prompt,
+                brain,
                 maximum_tool_output_tokens,
             } => {
                 assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(agent, None);
                 assert_eq!(model.as_deref(), Some("gpt-5"));
+                assert_eq!(command, None);
+                assert_eq!(prompt, None);
+                assert_eq!(brain, None);
                 assert_eq!(maximum_tool_output_tokens, None);
             }
             other => panic!("unexpected: {other:?}"),
@@ -297,10 +325,66 @@ mod tests {
                 selector,
                 model,
                 maximum_tool_output_tokens,
+                ..
             } => {
                 assert_eq!(selector, "squad-1/build/proof/0");
                 assert_eq!(model, None);
                 assert_eq!(maximum_tool_output_tokens.as_deref(), Some("8000"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_agent_flag() {
+        match parse(&v(&["edit", "squad-1/build/proof/0", "--agent", "codex"])) {
+            ProofCommand::Edit {
+                selector, agent, ..
+            } => {
+                assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(agent.as_deref(), Some("codex"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_command_flag() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/proof/0",
+            "--command",
+            "cargo test",
+        ])) {
+            ProofCommand::Edit {
+                selector, command, ..
+            } => {
+                assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(command.as_deref(), Some("cargo test"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_prompt_and_brain_flags() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/proof/0",
+            "--prompt",
+            "check it",
+            "--brain",
+            "think it over",
+        ])) {
+            ProofCommand::Edit {
+                selector,
+                prompt,
+                brain,
+                ..
+            } => {
+                assert_eq!(selector, "squad-1/build/proof/0");
+                assert_eq!(prompt.as_deref(), Some("check it"));
+                assert_eq!(brain.as_deref(), Some("think it over"));
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -269,6 +269,7 @@ const PROOF_KEYS: &[&str] = &[
     "command",
     "brain",
     "prompt",
+    "agent",
     "model",
     "machine",
     "system_prompt",
@@ -1111,8 +1112,9 @@ fn check_maximum_context(
 /// Mirrors [`check_maximum_context`]'s shape, including the same
 /// `core`-can-only-classify-[`RESERVED_AGENT_NAMES`] deferral to the daemon
 /// for a custom `[agent.profiles.*]` entry. Used for task, cell, and proof
-/// tables alike -- a proof step has no `agent` field of its own, so callers
-/// pass the step's already-resolved effective agent as `task_agent`.
+/// tables alike -- `table.get("agent")` picks up a proof step's own
+/// override (RAL-290) automatically before falling back to `task_agent`,
+/// the caller-supplied effective (cell-or-task) agent.
 fn check_maximum_tool_output_tokens(
     ctx: &mut Ctx,
     table: &toml::Table,
@@ -1858,6 +1860,7 @@ fn validate_proof_array(
             continue;
         };
         unknown_keys(ctx, table, PROOF_KEYS, &vpath, None);
+        check_type(ctx, table, "agent", Ty::Str, &vpath, None);
         check_machine(ctx, table, &vpath, None);
         // RAL-191: a proof step carries its own `environment`, validated with
         // exactly the same key/value rules as a task's or cell's.
@@ -2555,6 +2558,59 @@ command = "cargo build"
                 .errors
                 .iter()
                 .any(|e| e.kind == ErrorKind::ConflictingKeys)
+        );
+    }
+
+    #[test]
+    fn proof_agent_is_a_known_key_and_must_be_a_string() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task.cell.proof]]\nprompt=\"check\"\nagent=\"codex\"\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors.iter().any(|e| e.kind == ErrorKind::UnknownKey),
+            "{:?}",
+            r.errors
+        );
+
+        let wrong_type = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task.cell.proof]]\nprompt=\"check\"\nagent=5\n";
+        let r = validate_toml(wrong_type);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.path.ends_with(".agent")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_own_agent_overrides_the_owning_cells_for_maximum_tool_output_tokens_gating() {
+        // The owning cell's agent (the default "claude") can't deliver the
+        // cap, but the proof step declares its own supporting `agent`
+        // (RAL-290), so it must not be rejected.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task.cell.proof]]\nprompt=\"check\"\nagent=\"codex\"\nmaximum_tool_output_tokens=8000\n";
+        let r = validate_toml(src);
+        assert!(
+            !r.errors
+                .iter()
+                .any(|e| e.path.ends_with(".maximum_tool_output_tokens")),
+            "{:?}",
+            r.errors
+        );
+
+        // Without the proof-level `agent` override, the owning cell's
+        // default agent is still what gates it, and is rejected.
+        let rejected = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                    [[task.cell.proof]]\nprompt=\"check\"\nmaximum_tool_output_tokens=8000\n";
+        let r = validate_toml(rejected);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.path.ends_with(".maximum_tool_output_tokens")),
+            "{:?}",
+            r.errors
         );
     }
 

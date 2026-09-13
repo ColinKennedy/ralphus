@@ -1047,16 +1047,20 @@ other keys are read:
 | `squad` | — | `label` |
 | `task` | `task_idx` | `name`, `project`, `model` |
 | `cell` | `task_idx`, `cell_idx` | `cwd`, `agent`, `model`, `prompt`, `command`, `auto_compact_threshold`, `maximum_tool_output_tokens`, `system_prompt` |
-| `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `model`, `maximum_tool_output_tokens` |
+| `proof` | `task_idx`, `proof_scope`, `cell_idx`, `proof_idx` | `agent`, `model`, `command`, `prompt`, `brain`, `maximum_tool_output_tokens` |
 
 Every editable key is optional and uses the same three-state convention: the
 key **absent** leaves the field untouched, present-but-empty (`""`) **clears**
 it back to NULL, and present-and-non-empty **sets** it. There is no way to
 distinguish "set to empty string" from "clear" — clearing is the meaning.
 
-`prompt` and `command` stay mutually exclusive: whichever of the two the
-caller supplies wins and clears the other; supplying neither leaves both
-as they were.
+For `kind: "cell"`, `prompt` and `command` stay mutually exclusive: whichever
+of the two the caller supplies wins and clears the other; supplying neither
+leaves both as they were. For `kind: "proof"`, `command`/`prompt`/`brain` are
+a three-way version of the same rule: whichever one the caller supplies
+replaces the step's stored kind/body outright (precedence when more than one
+is somehow present in the same request: `command`, then `brain`, then
+`prompt`); supplying none leaves the step's kind/body as it was.
 
 `auto_compact_threshold` and `maximum_tool_output_tokens` are integers and must
 be **positive** — `0` and negatives are rejected with `400`, mirroring
@@ -1068,12 +1072,13 @@ likewise a `400`.
 that would run the node has no delivery mechanism for it (RAL-333) — accepted
 only for `claude-code`/`claude-cli`, `codex`/`codex-cli` and `pi`. A cell is
 gated on its effective agent (the `agent` in this same request if given, else
-the stored one); a proof step is gated on its stored `agent`, which a task file
-cannot set directly -- `[[task.cell.proof]]` has no `agent` key, so the column
-is populated from the owning cell/task at submit time, and a later
-`kind: "cell"` edit of `agent` does not rewrite it. A custom
-`[agent.profiles.*]` name is deferred rather than rejected, the same way `core`
-defers it. Clearing the field needs no such check.
+the stored one); a proof step is gated the same way, on *its own* effective
+agent (the `agent` in this same request if given, else its stored one) rather
+than the owning cell's/task's, since a proof step carries its own backend
+(RAL-290; `[[task.cell.proof]]`'s `agent` key falls back to the owning
+cell's/task's resolved agent when unset, exactly like `model`). A custom
+`[agent.profiles.*]` name is deferred rather than rejected, the same way
+`core` defers it. Clearing the field needs no such check.
 
 Editing resets execution state, scoped as narrowly as the edited node allows:
 a `squad` label edit touches nothing, a `task` edit resets the whole squad to

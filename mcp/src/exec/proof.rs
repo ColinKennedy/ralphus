@@ -54,7 +54,11 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
         }
         ProofCommand::Edit {
             selector,
+            agent,
             model,
+            command,
+            prompt,
+            brain,
             maximum_tool_output_tokens,
         } => {
             let resolved = proof::resolve_scoped(client, &selector, "proof")?;
@@ -64,7 +68,11 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
                 &resolved.proof_scope,
                 resolved.cell_idx,
                 resolved.proof_idx,
+                agent.as_deref(),
                 model.as_deref(),
+                command.as_deref(),
+                prompt.as_deref(),
+                brain.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
             )?)
         }

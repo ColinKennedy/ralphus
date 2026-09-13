@@ -211,6 +211,7 @@ aborts the remaining batch).
 | `proof show <selector>` | Proof step detail (kind, state, spec, output) |
 | `proof set-status <selector> <state>` | Override a proof step's status |
 | `proof restart <selector>` | Restart a proof step (dispatches to the task- or cell-scoped restart endpoint) |
+| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--brain] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/brain/tool-output-cap overrides |
 
 ## review
 
@@ -613,7 +614,7 @@ use; see `READ_ONLY_NOTE`.
         - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
     - proof  {Inspect and act on proof steps.}
-        - edit selector [uri] --maximum-tool-output-tokens [tokens] --model [name]  {Edit a proof step's model/tool-output-cap overrides.}
+        - edit selector [uri] --agent [name] --brain [text] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt/brain overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - restart selector [uri]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [uri] state [str]  {Manually override a proof step's status.}
