@@ -783,6 +783,17 @@ impl ForgeClient {
     /// (`"blocked"`/`"behind"`), neither of which this poll can act on
     /// itself; a genuinely failing required check still surfaces via the
     /// check-runs scan below regardless of `mergeable_state`.
+    ///
+    /// After check-runs all report `completed`, this also consults the
+    /// legacy combined-status endpoint (`.../commits/{sha}/status`) as a
+    /// belt-and-suspenders check for the older commit-status API -- but that
+    /// endpoint's `state` defaults to `"pending"` whenever the commit has
+    /// zero legacy statuses at all (`total_count: 0`), which is the normal
+    /// case for any repo (like this one) whose CI reports exclusively
+    /// through the Checks API. That default must be told apart from a real
+    /// in-flight legacy status (`total_count > 0`) -- conflating them once
+    /// made every such PR report `Pending` forever, no matter how green its
+    /// check-runs were.
     fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
         let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
@@ -870,7 +881,22 @@ impl ForgeClient {
                 log_text: None,
             }));
         }
-        if status["state"].as_str() == Some("pending") {
+        // GitHub's combined-status endpoint defaults `state` to `"pending"`
+        // whenever the commit has zero legacy commit statuses at all
+        // (`total_count: 0`, `statuses: []`) -- this is GitHub's documented
+        // behavior for that endpoint, not a transient/in-flight signal. A repo
+        // whose CI reports exclusively through the Checks API (as this one
+        // does: every job above comes back as a check-run, never a legacy
+        // status) will *always* get `total_count: 0` here, so treating that
+        // default the same as a real pending status made every such PR stick
+        // at `Pending` forever -- the check-runs gate above had already
+        // confirmed everything completed, but this fallthrough overrode it on
+        // every poll. Only an actual pending legacy status (`total_count > 0`)
+        // should hold up the verdict; zero statuses means there is nothing
+        // more to check, so fall through to `Passing`.
+        if status["total_count"].as_i64().unwrap_or(0) > 0
+            && status["state"].as_str() == Some("pending")
+        {
             return Ok(PrCiState::Pending);
         }
 
@@ -3899,6 +3925,91 @@ mod tests {
             Some("tok".to_string()),
         );
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_passing_when_there_are_zero_legacy_statuses() {
+        // Regression test for a real false-permanently-pending bug: a repo
+        // whose CI reports exclusively through the Checks API (no legacy
+        // commit statuses ever set) gets `{"state": "pending", "total_count":
+        // 0}` from the combined-status endpoint forever, even after every
+        // check-run has completed successfully. That default must not be
+        // mistaken for a real in-flight legacy status.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "pending", "total_count": 0, "statuses": []}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_pending_when_a_legacy_status_is_actually_pending() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"check_runs": []}"#).with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "pending", "total_count": 1, "statuses": [{"state": "pending", "context": "legacy-ci"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
         handle.join().unwrap();
     }
 

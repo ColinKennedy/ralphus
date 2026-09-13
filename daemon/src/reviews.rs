@@ -158,6 +158,23 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
     Ok(())
 }
 
+/// Make `baseline` the durable no-new-commits comparison point for the branch
+/// checked out at `cwd`. A cell rebased onto an upstream task inherits that
+/// task's commits, so its own task finalizer must compare against the rebased
+/// upstream rather than the worktree's original creation base.
+pub(crate) fn set_worktree_commit_baseline(
+    cwd: &Path,
+    baseline: &str,
+) -> std::result::Result<(), String> {
+    let branch = worktree_branch(cwd)?;
+    git(cwd, &["rev-parse", "--verify", baseline])?;
+    git(
+        cwd,
+        &["config", &format!("ralphus.{branch}.baseline"), baseline],
+    )
+    .map(|_| ())
+}
+
 /// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
 pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, String> {
     git(
@@ -621,6 +638,89 @@ pub fn collect_remote_upstream_prefetch_targets(
     out
 }
 
+/// Order cells for review-branch `position` assignment: a deterministic
+/// topological sort like [`plan::topo_order`], but tie-broken to put
+/// standalone/short dependency chains ahead of long ones instead of always
+/// preferring the lowest cell index.
+///
+/// This exists as its own pass — not a change to [`plan::topo_order`] itself
+/// — because that function's order also drives real execution scheduling
+/// (`scheduler.rs`, several `store.rs` call sites); changing its tie-break
+/// would reorder which cells the scheduler actually dispatches first. Branch
+/// *position* only matters here, for how a review's stacked rebase
+/// (`guardian_merge.rs`) processes branches: that rebase walks branches
+/// strictly in position order and stops a project's build at the first
+/// not-yet-done branch, so a long multi-stage chain sitting in the middle of
+/// the list blocks every unrelated, already-ready branch behind it. Moving
+/// long chains toward the back — while still respecting every dependency
+/// edge — lets the rebase make progress on independent branches instead of
+/// stalling behind the slowest chain.
+///
+/// `deps[i]` lists cell `i`'s prerequisite positions (as in
+/// [`plan::ExecutionPlan::deps`]); `topo` is any valid topological order of
+/// the same positions (e.g. [`plan::ExecutionPlan::order`]), used only to
+/// drive the two linear DP passes below in a safe order.
+///
+/// Algorithm: compute each cell's "chain weight" — the length of the
+/// longest dependency chain running through it, counting both its ancestors
+/// and its descendants once each (a standalone cell has weight 1; a cell in
+/// the middle of a straight 4-cell chain has weight 4). Then run the same
+/// Kahn's-algorithm topological sort as [`plan::topo_order`], but at each
+/// step choose the ready cell with the *smallest* chain weight instead of
+/// the lowest index (ties still break on index, so the result stays fully
+/// deterministic).
+fn review_branch_order(deps: &[Vec<usize>], topo: &[usize]) -> Vec<usize> {
+    let n = deps.len();
+
+    // Longest chain ending at `i` (1 + the longest chain ending at any of
+    // its prerequisites). `topo` guarantees every prerequisite of `i` is
+    // visited before `i` itself.
+    let mut ending_at = vec![1usize; n];
+    for &i in topo {
+        if let Some(longest_prereq) = deps[i].iter().map(|&d| ending_at[d]).max() {
+            ending_at[i] = longest_prereq + 1;
+        }
+    }
+
+    // Longest chain starting at `i` (1 + the longest chain starting at any
+    // of its dependents) — the mirror image, computed by walking `topo` in
+    // reverse over the reversed edges.
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, prereqs) in deps.iter().enumerate() {
+        for &d in prereqs {
+            dependents[d].push(i);
+        }
+    }
+    let mut starting_at = vec![1usize; n];
+    for &i in topo.iter().rev() {
+        if let Some(longest_dependent) = dependents[i].iter().map(|&j| starting_at[j]).max() {
+            starting_at[i] = longest_dependent + 1;
+        }
+    }
+
+    // `i` itself is counted in both passes, so subtract 1 to avoid double-counting.
+    let weight: Vec<usize> = (0..n).map(|i| ending_at[i] + starting_at[i] - 1).collect();
+
+    let mut order = Vec::with_capacity(n);
+    let mut done = vec![false; n];
+    while order.len() < n {
+        let next = (0..n)
+            .filter(|&i| !done[i] && deps[i].iter().all(|&d| done[d]))
+            .min_by_key(|&i| (weight[i], i));
+        match next {
+            Some(i) => {
+                done[i] = true;
+                order.push(i);
+            }
+            // `deps` already produced a valid `topo` via `plan()`, so every
+            // remaining cell always has a ready prerequisite-satisfied
+            // choice here.
+            None => unreachable!("deps already passed a topological sort in plan()"),
+        }
+    }
+    order
+}
+
 /// Like [`derive_reviews`], but `prefetched_upstreams` supplies
 /// `(registered project name, bare upstream) -> "<remote>/<branch>"`
 /// results the caller already fetched OUTSIDE any store lock -- see
@@ -660,10 +760,13 @@ pub fn derive_reviews_with_prefetch(
     )
     .map_err(ReviewError::new)?;
 
-    // Topological rank per cell position (for branch ordering).
+    // Topological rank per cell position (for branch ordering) — see
+    // `review_branch_order`'s doc comment for why this is a separate pass
+    // from the execution plan's own scheduling order.
     let execution = plan::plan(&cells, &tasks).map_err(ReviewError::new)?;
+    let review_order = review_branch_order(&execution.deps, &execution.order);
     let mut rank = vec![0usize; cells.len()];
-    for (r, &pos) in execution.order.iter().enumerate() {
+    for (r, &pos) in review_order.iter().enumerate() {
         rank[pos] = r;
     }
 
@@ -2116,6 +2219,7 @@ pub fn repair_triage_pool_keys(store: &Store) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2123,11 +2227,12 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, rebase_onto, repair_arbiter_review_project_roots,
+        derive_triage_pools, plan, rebase_onto, repair_arbiter_review_project_roots,
         repair_review_project_identities, repair_triage_pool_keys, require_auto_build_declaration,
-        workspace_has_commits_ahead_of_upstream, workspace_head_is_ancestor_of_upstream,
+        review_branch_order, set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
+        workspace_head_is_ancestor_of_upstream,
     };
-    use crate::store::Store;
+    use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -2146,6 +2251,133 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    // ── `review_branch_order` (RAL sprint batch 2026-09-11 review reordering) ──
+
+    fn plan_cell(task_idx: i64) -> CellRow {
+        CellRow {
+            task_idx,
+            idx: 0,
+            task_name: format!("task{task_idx}"),
+            cell_id: "work".to_string(),
+            cwd: Some(".".to_string()),
+            subprojects: vec![],
+            prompt: None,
+            command: Some("do".to_string()),
+            agent: "claude".to_string(),
+            model: None,
+            system_prompt: None,
+            system_prompt_position: None,
+            depends_on: vec![],
+            timeout_sec: None,
+            budget_tokens: None,
+            maximum_budget_usd: None,
+            maximum_context: None,
+            auto_compact_threshold: None,
+            maximum_tool_output_tokens: None,
+            upstream: None,
+            machine: None,
+            share_session: false,
+        }
+    }
+
+    fn plan_task(idx: i64, deps: &[&str]) -> TaskRow {
+        TaskRow {
+            idx,
+            name: format!("task{idx}"),
+            project: None,
+            depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
+            soloed: false,
+        }
+    }
+
+    /// Reproduces guardian-000000000085 / squad-000000000133 exactly (13
+    /// tasks, one cell each): three independent chains of different
+    /// lengths — `ral-406`→`ral-401` (2), `ral-349`→`ral-350`→`ral-365`→
+    /// `ral-345` (4), `ral-393`→`ral-392` (2) — plus five standalone tasks
+    /// (`ral-403`, `ral-405`, `ral-402`, `ral-347`, `ral-348`), submitted in
+    /// this exact interleaved order. `plan::topo_order`'s lowest-index
+    /// tie-break reproduces plain submission order here — `403, 405, 406,
+    /// 401, 349, 350, 365, 345, 402, 347, 348, 393, 392` — which is what
+    /// the review actually shipped with: the 4-stage chain sits at
+    /// positions 4-7 and blocks the stacked rebase from reaching the four
+    /// already-ready standalone/short-chain branches behind it.
+    ///
+    /// `review_branch_order` must produce a *different*, still fully valid,
+    /// topological order: standalone tasks and the two 2-stage chains
+    /// bubble to the front, and the 4-stage chain — the long pole — sinks
+    /// to the very back.
+    #[test]
+    fn review_branch_order_defers_the_longest_chain_past_shorter_and_standalone_tasks() {
+        // Task index ↔ real name, for readability below:
+        // 0 ral-403   1 ral-405   2 ral-406   3 ral-401   4 ral-349
+        // 5 ral-350   6 ral-365   7 ral-345   8 ral-402   9 ral-347
+        // 10 ral-348  11 ral-393  12 ral-392
+        let tasks = vec![
+            plan_task(0, &[]),
+            plan_task(1, &[]),
+            plan_task(2, &[]),
+            plan_task(3, &["task2"]),
+            plan_task(4, &[]),
+            plan_task(5, &["task4"]),
+            plan_task(6, &["task5"]),
+            plan_task(7, &["task6"]),
+            plan_task(8, &[]),
+            plan_task(9, &[]),
+            plan_task(10, &[]),
+            plan_task(11, &[]),
+            plan_task(12, &["task11"]),
+        ];
+        let cells: Vec<CellRow> = (0..13).map(plan_cell).collect();
+
+        let execution = plan::plan(&cells, &tasks).expect("acyclic plan");
+        // Confirm the premise: plain `topo_order` really does reproduce
+        // submission order for this graph, so the improvement below isn't
+        // an artifact of a mismatched fixture.
+        assert_eq!(
+            execution.order,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "fixture must reproduce the observed review's plain scheduling order"
+        );
+
+        let order = review_branch_order(&execution.deps, &execution.order);
+
+        // Standalone tasks and both 2-stage chains come first (in their
+        // original relative order); the 4-stage chain is deferred entirely
+        // to the back, in its required internal order.
+        assert_eq!(
+            order,
+            vec![0, 1, 8, 9, 10, 2, 3, 11, 12, 4, 5, 6, 7],
+            "ral-403,405,402,347,348, ral-406,401, ral-393,392, ral-349,350,365,345"
+        );
+
+        // Every dependency edge must still be respected regardless of the
+        // new tie-break: a task's position must come after all its deps'.
+        let position: HashMap<usize, usize> =
+            order.iter().enumerate().map(|(pos, &i)| (i, pos)).collect();
+        for (i, prereqs) in execution.deps.iter().enumerate() {
+            for &dep in prereqs {
+                assert!(
+                    position[&dep] < position[&i],
+                    "cell {dep} must be positioned before dependent cell {i}"
+                );
+            }
+        }
+
+        // The long chain's own internal order must still hold: 349 < 350 < 365 < 345.
+        let pos_of = |task_idx: usize| position[&task_idx];
+        assert!(pos_of(4) < pos_of(5));
+        assert!(pos_of(5) < pos_of(6));
+        assert!(pos_of(6) < pos_of(7));
+
+        // Deterministic: re-running on the same input always gives the same answer.
+        for _ in 0..20 {
+            assert_eq!(
+                review_branch_order(&execution.deps, &execution.order),
+                order
+            );
+        }
     }
 
     fn temp_repo() -> PathBuf {
@@ -2686,6 +2918,36 @@ mod tests {
         assert!(workspace_has_commits_ahead_of_upstream(&Workspace::local(
             root.clone()
         )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dependency_rebase_baseline_excludes_inherited_commits_from_task_progress() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        git(&root, &["checkout", "-b", "upstream"]);
+        std::fs::write(root.join("upstream.txt"), "inherited\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "upstream work"]);
+        git(&root, &["checkout", "-b", "child", "main"]);
+
+        rebase_onto(&root, "upstream").unwrap();
+        set_worktree_commit_baseline(&root, "upstream").unwrap();
+        assert!(
+            !workspace_has_commits_ahead_of_upstream(&Workspace::local(root.clone())),
+            "inherited upstream commits must not satisfy the child's no-commits guard"
+        );
+
+        std::fs::write(root.join("child.txt"), "child work\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "child work"]);
+        assert!(
+            workspace_has_commits_ahead_of_upstream(&Workspace::local(root.clone())),
+            "the child's own commit must satisfy the no-commits guard"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

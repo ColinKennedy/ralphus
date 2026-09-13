@@ -160,8 +160,8 @@
         else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
         else if (tab === "worktree-retirement") { await updateCounter(); await pollWorktreeRetirements(); }
         else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
-        else if (tab === "tasks") { await updateCounter(); await pollTasksTab(); }
-        else await pollTasks();
+        else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
+        else { await ensureProjectsLoadedForFilters(); await pollTasks(); }
         await refreshBanner();
       }
 
@@ -194,6 +194,11 @@
        * @returns {Promise<void>}
        */
       async function applySseRefresh(kinds, guardianIds) {
+        if (tab === "tasks") {
+          await pollTasksTab();
+          await refreshBanner();
+          return;
+        }
         await updateCounter();
         if (tab === "reviews" && kinds.has("guardian")) {
           await pollReviews();
@@ -206,8 +211,6 @@
           await pollCartographer();
         } else if (tab === "squads" && kinds.has("squad")) {
           await pollTasks();
-        } else if (tab === "tasks" && kinds.has("squad")) {
-          await pollTasksTab();
         }
         await refreshBanner();
       }
@@ -545,4 +548,3 @@
         } catch (e) { byId("conn").className = "dot off"; }
       }
       // RALPHUS-REVIEW-POLL:END
-

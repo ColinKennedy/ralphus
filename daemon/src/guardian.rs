@@ -508,8 +508,10 @@ pub struct MessageView {
     pub image: Option<String>,
     /// RAL-379: the registered user this feedback is attributed to -- the
     /// only identity the UI shows. Defaults to `submitted_by` when a caller
-    /// doesn't name one explicitly. `None` for a "guardian"-role message and
-    /// for any row predating this field.
+    /// doesn't name one explicitly. Also used by an automated feedback
+    /// source (e.g. `ci_watch::AUTO_FIX_AUTHOR`, RAL-395) to identify itself
+    /// as the poster instead of a person. `None` for a "guardian"-role
+    /// message and for any row predating this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     /// RAL-379: the authenticated/default requester who actually submitted
@@ -3078,6 +3080,13 @@ impl Store {
     }
 
     /// Set a branch's merge status (and optional detail).
+    ///
+    /// Starting a fresh rebase attempt (`MergeStatus::InProgress`) also clears
+    /// any stale `auto_submit_error` badge from a previous merge/rebase pass:
+    /// that error described conditions (a sibling branch disabled, a PR
+    /// already linked, etc.) which this new pass is about to re-evaluate from
+    /// scratch, so a leftover failure message would misrepresent the current
+    /// attempt (RAL-401 follow-up).
     pub fn set_branch_status(
         &self,
         guardian_id: &str,
@@ -3085,10 +3094,17 @@ impl Store {
         status: MergeStatus,
         detail: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE guardian_branches SET merge_status=?, detail=? WHERE guardian_id=? AND id=?",
-            params![status.as_str(), detail, guardian_id, branch_id],
-        )?;
+        if status == MergeStatus::InProgress {
+            self.conn.execute(
+                "UPDATE guardian_branches SET merge_status=?, detail=?, auto_submit_error=NULL WHERE guardian_id=? AND id=?",
+                params![status.as_str(), detail, guardian_id, branch_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE guardian_branches SET merge_status=?, detail=? WHERE guardian_id=? AND id=?",
+                params![status.as_str(), detail, guardian_id, branch_id],
+            )?;
+        }
         let msg = match detail {
             Some(d) => format!("branch → {} ({d})", status.as_str()),
             None => format!("branch → {}", status.as_str()),
@@ -6429,6 +6445,46 @@ mod tests {
             after_second.moved_from_guardian_id.as_deref(),
             Some(a.as_str())
         );
+    }
+
+    #[test]
+    fn set_branch_status_in_progress_clears_stale_auto_submit_error() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        store
+            .set_branch_auto_submit_error(&id, &bid, Some("stale failure from a prior pass"))
+            .unwrap();
+
+        // A fresh rebase pass picking this branch back up should wipe the
+        // old badge, even though this call only touches merge_status/detail.
+        store
+            .set_branch_status(&id, &bid, MergeStatus::InProgress, None)
+            .unwrap();
+
+        let branch = &store.get_guardian(&id).unwrap().branches[0];
+        assert_eq!(branch.merge_status, MergeStatus::InProgress.as_str());
+        assert_eq!(branch.auto_submit_error, None);
+    }
+
+    #[test]
+    fn set_branch_status_leaves_auto_submit_error_alone_for_other_transitions() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "a").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+        store
+            .set_branch_auto_submit_error(&id, &bid, Some("still applies"))
+            .unwrap();
+
+        store
+            .set_branch_status(&id, &bid, MergeStatus::Ready, None)
+            .unwrap();
+
+        let branch = &store.get_guardian(&id).unwrap().branches[0];
+        assert_eq!(branch.merge_status, MergeStatus::Ready.as_str());
+        assert_eq!(branch.auto_submit_error.as_deref(), Some("still applies"));
     }
 
     #[test]

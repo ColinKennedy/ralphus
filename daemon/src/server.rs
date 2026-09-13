@@ -602,6 +602,146 @@ struct Board {
     squads: Vec<crate::store::SquadView>,
 }
 
+/// The compact board representation used exclusively by the flat Tasks tab.
+/// It excludes prompt and proof text the table never renders.
+#[derive(Serialize)]
+struct TaskIndexBoard {
+    daemon: DaemonStatus,
+    squads: Vec<TaskIndexSquad>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexSquad {
+    id: String,
+    label: Option<String>,
+    state: String,
+    tasks: Vec<TaskIndexTask>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexTask {
+    name: String,
+    project: String,
+    agent: Option<String>,
+    model: Option<String>,
+    state: String,
+    error: Option<String>,
+    cells: Vec<TaskIndexCell>,
+    proof: Vec<TaskIndexProof>,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexCell {
+    id: String,
+    name: Option<String>,
+    agent: String,
+    model: Option<String>,
+    state: String,
+    tokens_in: i64,
+    tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    compaction_input_tokens: i64,
+    compaction_count: i64,
+    cost_usd: f64,
+    cost_is_estimated: bool,
+    error: Option<String>,
+    proof: Vec<TaskIndexProof>,
+    reviews: Vec<crate::store::SquadReviewRef>,
+    triage_types: Vec<String>,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexProof {
+    id: Option<String>,
+    kind: String,
+    state: String,
+    tokens_in: i64,
+    tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    compaction_input_tokens: i64,
+    compaction_count: i64,
+    cost_usd: f64,
+    cost_is_estimated: bool,
+}
+
+impl From<crate::store::ProofView> for TaskIndexProof {
+    fn from(value: crate::store::ProofView) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            state: value.state,
+            tokens_in: value.tokens_in,
+            tokens_out: value.tokens_out,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            compaction_input_tokens: value.compaction_input_tokens,
+            compaction_count: value.compaction_count,
+            cost_usd: value.cost_usd,
+            cost_is_estimated: value.cost_is_estimated,
+        }
+    }
+}
+
+impl From<crate::store::CellView> for TaskIndexCell {
+    fn from(value: crate::store::CellView) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            agent: value.agent,
+            model: value.model,
+            state: value.state,
+            tokens_in: value.tokens_in,
+            tokens_out: value.tokens_out,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            compaction_input_tokens: value.compaction_input_tokens,
+            compaction_count: value.compaction_count,
+            cost_usd: value.cost_usd,
+            cost_is_estimated: value.cost_is_estimated,
+            error: value.error,
+            proof: value.proof.into_iter().map(Into::into).collect(),
+            reviews: value.reviews,
+            triage_types: value.triage_types,
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+impl From<crate::store::TaskView> for TaskIndexTask {
+    fn from(value: crate::store::TaskView) -> Self {
+        Self {
+            name: value.name,
+            project: value.project,
+            agent: value.agent,
+            model: value.model,
+            state: value.state,
+            error: value.error,
+            cells: value.cells.into_iter().map(Into::into).collect(),
+            proof: value.proof.into_iter().map(Into::into).collect(),
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+impl From<crate::store::SquadView> for TaskIndexSquad {
+    fn from(value: crate::store::SquadView) -> Self {
+        Self {
+            id: value.id,
+            label: value.label,
+            state: value.state,
+            tasks: value.tasks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ResourcesResponse {
     resources: Vec<crate::resources::ResourceRow>,
@@ -667,6 +807,7 @@ fn route_for_user(
         // like every other route.
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
         ("GET", ["api", "tasks"]) => board(daemon, query),
+        ("GET", ["api", "task-index"]) => task_index(daemon),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
         // for every user, not just admins. Only the mutating registration
@@ -1293,6 +1434,7 @@ fn route_for_user(
             guardian_list_pr_stacks(daemon, id)
         }
         ("GET", ["api", "pull-requests"]) => pr_find(daemon, query),
+        ("GET", ["api", "pull-requests", "index"]) => pr_index(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
@@ -1500,6 +1642,48 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
         }
         Err(e) => store_error(&e),
     }
+}
+
+/// Compact cross-squad task data for the Tasks tab, with stage timings that
+/// separate store-lock contention, view construction, and serialization.
+fn task_index(daemon: &Daemon) -> Reply {
+    let lock_started = Instant::now();
+    let store = daemon.lock();
+    let lock_wait_ms = lock_started.elapsed().as_millis();
+    let view_started = Instant::now();
+    let squads = match store.list_squads() {
+        Ok(squads) => squads,
+        Err(e) => return store_error(&e),
+    };
+    let view_ms = view_started.elapsed().as_millis();
+    let running = daemon.sem.in_use();
+    let running_reviews = store
+        .merging_guardians()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name)| RunningReviewItem { id, name })
+        .collect();
+    drop(store);
+    let response = TaskIndexBoard {
+        daemon: DaemonStatus {
+            running,
+            max_concurrent: daemon.max_concurrent,
+            running_reviews,
+            downtime_active: crate::config::scheduler_in_downtime(),
+        },
+        squads: squads.into_iter().map(Into::into).collect(),
+    };
+    let serialize_started = Instant::now();
+    let reply = json(200, &response);
+    crate::rlog!(
+        INFO,
+        "ralphus [performance] task-index lock_wait={}ms view={}ms serialize={}ms bytes={}",
+        lock_wait_ms,
+        view_ms,
+        serialize_started.elapsed().as_millis(),
+        reply.body.len()
+    );
+    reply
 }
 
 /// Per-task resource usage for every running cell with a live subprocess
@@ -9480,10 +9664,40 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
         let _ = store.reconcile_squad_cancellation(id);
     }
-    match store.get_squad(id) {
+    let reply = match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
+    };
+    // A manual `done` override on a task/cell/proof step is invisible to the
+    // scheduler's own task-completion path (`run_task_finalizer`'s
+    // `try_start_ready_reviews_for_task` call) for the same RAL-315 reason
+    // the cancellation reconcile above exists: this request happens outside
+    // that loop entirely. Without this, a review branch fed by the
+    // just-fixed cell only got promoted to `ready` once the periodic
+    // maintenance sweep's straggler pass eventually noticed -- not
+    // immediately, the way a natural completion does. `store` must be
+    // dropped first: `try_start_ready_reviews_for_task` locks the same
+    // mutex itself.
+    if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
+        drop(store);
+        let store_handle = daemon.store_handle();
+        let cells = store_handle
+            .lock()
+            .expect("store mutex poisoned")
+            .cells_of(id);
+        if let Ok(cells) = cells {
+            crate::scheduler::try_start_ready_reviews_for_task(
+                &store_handle,
+                id,
+                &cells,
+                req.task_idx,
+                &daemon.semaphore_handle(),
+                &daemon.summary_queue_handle(),
+                &daemon.cancellations_handle(),
+            );
+        }
     }
+    reply
 }
 
 // ── Queue (RAL Queue) ────────────────────────────────────────────────────────
@@ -10585,6 +10799,14 @@ fn guardian_list_pr_stacks(daemon: &Daemon, id: &str) -> Reply {
 fn pr_get(daemon: &Daemon, pr_id: &str) -> Reply {
     match daemon.lock().get_pull_request(pr_id) {
         Ok(pr) => json(200, &pr),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Compact PR/MR rows keyed back to their source task for the Tasks tab.
+fn pr_index(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_pull_requests_index() {
+        Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
 }
@@ -13236,6 +13458,21 @@ mod tests {
         assert!(board.body.contains("\"running\":0"));
     }
 
+    #[test]
+    fn task_index_omits_authored_and_captured_text() {
+        let d = daemon();
+        let body = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"private prompt\"\n[[task.cell.proof]]\ncommand=\"private proof\"\n";
+        let submitted = route(&d, "POST", "/api/squads", &submit_body(body));
+        assert_eq!(submitted.status, 201, "{}", submitted.body);
+
+        let index = route(&d, "GET", "/api/task-index", "");
+        assert_eq!(index.status, 200, "{}", index.body);
+        assert!(index.body.contains("\"name\":\"t\""));
+        assert!(!index.body.contains("private prompt"));
+        assert!(!index.body.contains("private proof"));
+        assert!(!index.body.contains("\"system_prompt\""));
+    }
+
     // ── Project registry (RAL-100) ───────────────────────────────────────────
 
     static PROJ_TEST_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -14447,6 +14684,61 @@ machine=\"incredibuild:B\"
         );
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("spans two machines"), "{}", r.body);
+    }
+
+    #[test]
+    fn manual_cell_done_override_promotes_a_ready_review_branch_immediately() {
+        // RAL-<new>: a manual `set-status` (RAL-74) bypasses the scheduler's
+        // own task-completion path entirely, so before this fix a review
+        // branch fed by the just-fixed cell only got promoted to `ready`
+        // once the periodic maintenance sweep's straggler pass eventually
+        // noticed -- not immediately, the way a natural completion does.
+        let d = daemon();
+        let repo = tmp_git_repo("manual-done-review-ready");
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+                    [[review]]\nid=\"r\"\nskip_auto_build=true\n";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap().to_string();
+
+        let gid = d.lock().guardians_for_squad(&squad_id).unwrap()[0].clone();
+        assert_eq!(
+            d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending",
+            "branch must not already be ready before the cell finishes"
+        );
+
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "done"
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/set-status"),
+            &body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        assert_eq!(
+            d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+            "ready",
+            "a manual cell `done` override must promote the review branch \
+             immediately, not only once the periodic maintenance sweep \
+             eventually notices"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -20529,6 +20821,32 @@ command = "true"
         assert_eq!(updated.status, 200);
         assert!(updated.body.contains("\"pr_number\":43"));
         assert!(updated.body.contains("\"state\":\"closed\""));
+    }
+
+    #[test]
+    fn pr_index_lists_recorded_pull_requests() {
+        let d = daemon();
+        let guardian_id = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &guardian_id,
+                None,
+                "github",
+                "acme/widget",
+                "feature/task-index",
+                "main",
+                "Task index",
+                "",
+                Some(42),
+                Some("https://github.com/acme/widget/pull/42"),
+            )
+            .unwrap();
+
+        let reply = route(&d, "GET", "/api/pull-requests/index", "");
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(reply.body.contains(&pr_id));
+        assert!(reply.body.contains("\"pr_number\":42"));
     }
 
     #[test]

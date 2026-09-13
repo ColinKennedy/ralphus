@@ -143,17 +143,25 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// shows the change immediately) or the basis a separate PR branch was built
 /// from (whose own rebase is a different, already-existing concern).
 ///
-/// `fork_remote` (RAL-338): when `Some`, always pushes there, ignoring
-/// `@{upstream}`/`remote.pushDefault` entirely -- the project has a
-/// registered fork, and every review branch lives there regardless of what a
-/// prior `git push -u` may have set `@{upstream}` to (a stray push can
-/// rewrite it and cause the fork remote to be mistaken for the parent's; see
-/// this ticket's Risks section). When `None` (no registered fork), behavior
-/// is unchanged: the branch's already-configured upstream (`@{u}`) when one
-/// exists, else the git default remote (`remote.pushDefault`, else
-/// `"origin"`), pushing to a same-named remote branch and setting upstream
-/// tracking on that first push so later feedback pushes on this branch
-/// naturally follow `@{u}` from then on.
+/// `explicit_remote`: when `Some`, always pushes there, ignoring
+/// `@{upstream}`/`remote.pushDefault` entirely. The caller resolves this
+/// itself -- either the project's registered fork remote (RAL-338: every
+/// review branch lives there regardless of what a prior `git push -u` may
+/// have set `@{upstream}` to, since a stray push can rewrite it and cause the
+/// fork remote to be mistaken for the parent's; see that ticket's Risks
+/// section), or, lacking a registered fork, the same base-branch-aware
+/// resolution (`forge::resolve_remote_name`) the initial PR-stack push
+/// already uses (RAL-<new>: a repo whose base branch lives on a non-`origin`
+/// remote has no `@{u}` to infer from until a feedback push has already
+/// succeeded once through this very function, so relying on inference alone
+/// left the very first feedback push with nothing to go on but a hardcoded
+/// `"origin"` that may not exist). When `None` (should not normally happen
+/// given the caller always resolves one of the two), falls back to the
+/// branch's already-configured upstream (`@{u}`) when one exists, else the
+/// git default remote (`remote.pushDefault`, else `"origin"`), pushing to a
+/// same-named remote branch and setting upstream tracking on that first push
+/// so later feedback pushes on this branch naturally follow `@{u}` from then
+/// on.
 ///
 /// `force`: pass `false` when the local commit was `--amend`ed onto history
 /// the remote already has an older version of (the previous push already
@@ -168,10 +176,10 @@ pub(crate) fn push_feedback_branch(
     wt: &Workspace,
     local_branch: &str,
     force: bool,
-    fork_remote: Option<&str>,
+    explicit_remote: Option<&str>,
 ) -> std::result::Result<String, String> {
-    let (remote, remote_branch) = if let Some(fork_remote) = fork_remote {
-        (fork_remote.to_string(), local_branch.to_string())
+    let (remote, remote_branch) = if let Some(explicit_remote) = explicit_remote {
+        (explicit_remote.to_string(), local_branch.to_string())
     } else {
         match wt.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
             Ok(upstream) => {
@@ -5162,7 +5170,22 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         return;
                     }
                 }
-                let nothing = contributed_nothing(&wt, &combined_branch, "HEAD");
+                let nothing = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
+                if nothing {
+                    let _ = store
+                        .lock()
+                        .expect("poisoned")
+                        .set_branch_empty(id, &ob.id, true);
+                    fail_branch(
+                        store,
+                        id,
+                        &ob.id,
+                        &ob.branch,
+                        "review worktree has no changes over the branch beneath it after rebase; a review branch must contribute at least one commit",
+                        set_status,
+                    );
+                    return;
+                }
                 if let Err(e) = wt.git(&["checkout", "-B", &combined_branch, "HEAD"]) {
                     fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
                     return;
@@ -5619,9 +5642,31 @@ pub fn run_feedback(
         // RAL-338: resolve the fork remote explicitly, if this branch's
         // project has one registered, rather than letting
         // `push_feedback_branch` infer it through `@{upstream}`.
-        let fork_remote =
-            crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project));
-        match push_feedback_branch(&wt, &review_branch, !squash, fork_remote.as_deref()) {
+        //
+        // RAL-<new>: when there's no registered fork, fall back to the same
+        // base-branch-aware resolution the initial PR-stack push already
+        // uses (`forge::resolve_remote_name`) instead of leaving it to
+        // `push_feedback_branch`'s own `@{u}`/`remote.pushDefault` inference.
+        // That inference only succeeds once *this* function has itself
+        // pushed the branch before (its own prior call sets `@{u}` via
+        // `--set-upstream`) -- a review branch whose only prior push was the
+        // initial PR-stack push (which never sets `@{u}`) has neither, and a
+        // repo whose base branch lives on a non-`origin` remote (e.g.
+        // `alt/staging`) then falls through to a hardcoded `"origin"` that
+        // may not exist at all, silently failing every feedback push
+        // (human-submitted or RAL-395 auto-fix) until one succeeds by luck.
+        let push_remote =
+            crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project)).or_else(
+                || {
+                    let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
+                    Some(crate::forge::resolve_remote_name(
+                        Path::new(&branch_project),
+                        &base,
+                        &forge_cfg,
+                    ))
+                },
+            );
+        match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
             Ok(sha) => {
                 pushed = true;
                 pushed_sha = Some(sha);
@@ -6866,6 +6911,25 @@ fn stack_pick(
         cancel,
     ) {
         Ok((outcome, session_id)) => {
+            // Readiness only says the source cell has finished. Once the
+            // rebase produces this review ref, it must still contribute a
+            // diff over its predecessor before it can become terminal or
+            // queue a PR.
+            if review_ref_has_no_changes(wt, newbase, rev) {
+                let _ = store
+                    .lock()
+                    .expect("poisoned")
+                    .set_branch_empty(id, branch_id, true);
+                fail_branch(
+                    store,
+                    id,
+                    branch_id,
+                    feature_branch,
+                    "review worktree has no changes over the branch beneath it after rebase; a review branch must contribute at least one commit",
+                    &set_status,
+                );
+                return Err(());
+            }
             let (status, detail): (MergeStatus, Option<String>) = match outcome {
                 RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
                 // RAL-168: proofed but no conflict occurred -- still `Done`.
@@ -6874,7 +6938,7 @@ fn stack_pick(
                     MergeStatus::Done,
                     // Surface a branch that added nothing over the base rather than
                     // reporting a silent, work-free "done".
-                    contributed_nothing(wt, newbase, rev)
+                    review_ref_has_no_changes(wt, newbase, rev)
                         .then(|| "no new commits over base (already merged?)".to_string()),
                 ),
             };
@@ -8586,7 +8650,7 @@ fn drive_rebase(
             // rebased cleanly -- not just one whose conflicts the agent
             // resolved -- as long as it actually contributed real changes (a
             // true no-op always skips the proof call, no setting needed).
-            let nothing = contributed_nothing(wt, newbase, branch_arg);
+            let nothing = review_ref_has_no_changes(wt, newbase, branch_arg);
             if nothing || !gate.allows_for_clean_branch() {
                 return Ok((RebaseOutcome::Clean, None));
             }
@@ -8715,10 +8779,8 @@ fn squash_review_commits(
     Ok(())
 }
 
-/// Whether a just-built review branch (`rev`) contributed no commits over
-/// `newbase` — i.e. all of the feature's changes were already present. Returned
-/// as a branch detail so a silently-empty stack entry is surfaced, not hidden.
-fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
+/// Whether a just-built review branch (`rev`) has no commits over `newbase`.
+fn review_ref_has_no_changes(wt: &Workspace, newbase: &str, rev: &str) -> bool {
     let range = format!("{newbase}..{rev}");
     wt.git(&["rev-list", "--count", &range])
         .ok()
@@ -12486,6 +12548,23 @@ mod tests {
         assert!(
             store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
             "a branch with no diff over its base must be flagged empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn review_ref_with_no_diff_is_not_terminal_work() {
+        let (base, repo, _fwt) = make_repo("resolved-empty-review-ref");
+        let wt = Workspace::local(&repo);
+
+        assert!(
+            review_ref_has_no_changes(&wt, "main", "main"),
+            "a review ref equal to its predecessor has no PRable diff"
+        );
+        assert!(
+            !review_ref_has_no_changes(&wt, "main", "feature/a"),
+            "a review ref with commits remains terminal work"
         );
 
         let _ = std::fs::remove_dir_all(&base);

@@ -1580,6 +1580,12 @@ fn try_upstream_rebase(
         );
         return None;
     }
+    if let Err(e) = crate::reviews::set_worktree_commit_baseline(b_cwd, &a_branch) {
+        return Some(format!(
+            "upstream rebase: could not record '{a_branch}' as the commit baseline for '{}': {e}",
+            b_cwd.display()
+        ));
+    }
 
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
@@ -2617,6 +2623,18 @@ fn run_task_finalizer(
     // before trusting the cached flag, and un-latch it once every cell has
     // been manually cleared, so a later dependent check in this same run
     // sees the correction too.
+    //
+    // Require every cell's effective state to be exactly `done` AND none of
+    // its cell-scope proofs to be `cancelled`, not merely "effective state
+    // isn't `failed`": `effective_cell_state` deliberately folds a
+    // `cancelled` proof step into a `done`-reading cell (so a user's
+    // intentional Queue skip doesn't paint the board red), but `run_proofs`
+    // itself treats a cancelled step as a hard failure regardless (see its
+    // `current_state == "cancelled"` branch, which forces `all_ok = false`
+    // without even incrementing `steps_run`) -- so a cancelled proof step
+    // must still block this re-check from clearing the latch, the same way
+    // it still fails the task on the first pass, even though the owning
+    // cell's cosmetic effective state already reads `done`.
     let already_failed = {
         let latched = progress
             .lock()
@@ -2625,21 +2643,26 @@ fn run_task_finalizer(
             .contains(&task_idx);
         if latched {
             let guard = store.lock().expect("store mutex poisoned");
-            let still_failed = cells.iter().filter(|s| s.task_idx == task_idx).any(|s| {
-                matches!(
+            let all_done = cells.iter().filter(|s| s.task_idx == task_idx).all(|s| {
+                let effective_done = matches!(
                     guard.effective_state_for_cell(squad_id, task_idx, s.idx),
-                    Ok(Some(state)) if state == "failed"
-                )
+                    Ok(Some(state)) if state == "done"
+                );
+                let no_cancelled_proof = guard
+                    .cell_proof_states(squad_id, task_idx, s.idx)
+                    .map(|states| !states.iter().any(|st| st == "cancelled"))
+                    .unwrap_or(false);
+                effective_done && no_cancelled_proof
             });
             drop(guard);
-            if !still_failed {
+            if all_done {
                 progress
                     .lock()
                     .expect("progress mutex poisoned")
                     .failed
                     .remove(&task_idx);
             }
-            still_failed
+            !all_done
         } else {
             false
         }
@@ -3044,8 +3067,20 @@ fn guardian_blocking_tasks(cells: &[crate::store::CellRow], git_root: &str) -> H
 /// — not every blocking task finished. When the completed task's branch isn't
 /// yet buildable (an earlier branch is still `pending`), the staged merge
 /// no-ops back to `Collecting` and a later completion re-triggers it.
+///
+/// `pub(crate)` (rather than private) so `server.rs`'s manual `set_status`
+/// handler (RAL-74) can call it too: a human marking a cell/proof `done` by
+/// hand bypasses this module's own task-finalizer path entirely, so without
+/// an explicit call here that override would only surface on the review
+/// board once the periodic maintenance sweep's straggler pass eventually
+/// noticed the now-done cell — not immediately, the way a natural
+/// completion promotes it. `mark_ready_branches_with_done_cells`'s own
+/// "every contributing cell already done" guard makes this safe to call
+/// speculatively after any single cell/proof edit, not just a genuine task
+/// completion: it simply promotes nothing when the task isn't actually done
+/// yet.
 #[allow(clippy::too_many_arguments)]
-fn try_start_ready_reviews_for_task(
+pub(crate) fn try_start_ready_reviews_for_task(
     store: &Arc<Mutex<Store>>,
     squad_id: &str,
     cells: &[crate::store::CellRow],
@@ -4463,6 +4498,129 @@ mod tests {
             "done",
             "un-soloing resumes the paused sibling"
         );
+    }
+
+    /// A cell-scope proof failure latches `task_idx` into `Progress.failed`
+    /// the instant `run_cell_worker` observes it -- entirely in memory,
+    /// never re-derived from storage. If an operator manually corrects the
+    /// failing proof's stored state afterward (`ralphus proof set-status ...
+    /// done`) before this task's own finalizer happens to run -- a real
+    /// window, since sibling tasks/cells elsewhere in the same squad can
+    /// still be executing for minutes -- the finalizer must honor that
+    /// correction instead of blindly trusting the stale latch it cached
+    /// before the fix landed. Drives the DB directly to the exact
+    /// mid-squad-execution snapshot this covers (squad still `Running`,
+    /// cell body done, cell-proof failed) rather than running a real squad
+    /// to completion, since that would leave nothing else keeping the squad
+    /// `Running` and mask the bug behind an unrelated guard. Regression for
+    /// the bug reported against squad-000000000133's `ral-401`.
+    #[test]
+    fn task_finalizer_respects_a_manual_proof_override_over_a_stale_failure_latch() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do work\"\n\
+                     [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
+        let (store, id) = store_with(toml);
+        {
+            let guard = store.lock().unwrap();
+            guard.set_squad_state(&id, SquadState::Running).unwrap();
+            guard.set_task_state(&id, 0, NodeState::Running).unwrap();
+            guard.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+            guard
+                .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Failed)
+                .unwrap();
+        }
+
+        // The operator manually clears the failing proof step after the fact.
+        store
+            .lock()
+            .unwrap()
+            .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
+            .unwrap();
+
+        // Re-run the finalizer directly, carrying the exact stale in-memory
+        // latch a real dispatcher would still hold for the rest of that run
+        // even after the DB fix -- this is the scenario the fix must cover.
+        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        let progress = Mutex::new(Progress {
+            status: vec![CellState::Done],
+            summaries: vec![None],
+            failed: HashSet::from([0i64]),
+            task_finalized: HashSet::new(),
+        });
+        let sem = Arc::new(Semaphore::new(4));
+        let summary_queue = crate::summary_worker::SummaryQueue::new();
+        run_task_finalizer(
+            &store,
+            &FakeRunner { fail_on: None },
+            &id,
+            &CancelToken::never(),
+            &cells,
+            &progress,
+            0,
+            &sem,
+            &summary_queue,
+            None,
+            &Cancellations::new(),
+        );
+
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.get_squad(&id).unwrap().tasks[0].state,
+            "done",
+            "a manual proof override must be respected instead of the stale in-memory failure latch"
+        );
+        assert!(
+            !progress.lock().unwrap().failed.contains(&0),
+            "the stale latch must be cleared once every cell is confirmed no longer failing"
+        );
+    }
+
+    /// Without the fix, the finalizer trusts the stale `Progress.failed`
+    /// latch unconditionally -- this pins that old behavior's mirror image
+    /// so a future regression that reintroduces the bug (e.g. someone
+    /// "simplifying" the re-check away) is caught even if the fixed test
+    /// above is weakened. Same setup as
+    /// `task_finalizer_respects_a_manual_proof_override_over_a_stale_failure_latch`,
+    /// but the proof is left failing -- the task must stay failed.
+    #[test]
+    fn task_finalizer_still_fails_the_task_when_the_proof_was_never_corrected() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do work\"\n\
+                     [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
+        let (store, id) = store_with(toml);
+        {
+            let guard = store.lock().unwrap();
+            guard.set_squad_state(&id, SquadState::Running).unwrap();
+            guard.set_task_state(&id, 0, NodeState::Running).unwrap();
+            guard.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+            guard
+                .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Failed)
+                .unwrap();
+        }
+
+        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        let progress = Mutex::new(Progress {
+            status: vec![CellState::Done],
+            summaries: vec![None],
+            failed: HashSet::from([0i64]),
+            task_finalized: HashSet::new(),
+        });
+        let sem = Arc::new(Semaphore::new(4));
+        let summary_queue = crate::summary_worker::SummaryQueue::new();
+        run_task_finalizer(
+            &store,
+            &FakeRunner { fail_on: None },
+            &id,
+            &CancelToken::never(),
+            &cells,
+            &progress,
+            0,
+            &sem,
+            &summary_queue,
+            None,
+            &Cancellations::new(),
+        );
+
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
     }
 
     #[test]

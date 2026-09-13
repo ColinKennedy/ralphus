@@ -2126,6 +2126,26 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER",
             "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER",
             "ALTER TABLE cells ADD COLUMN finished_at_ms INTEGER",
+            // Backfill for rows cancelled before `cancel_unfinished_nodes`
+            // stamped `finished_at_ms`: a task/cell left `cancelled` with a
+            // NULL `finished_at_ms` reads as still-running to the board (the
+            // details pane and the Tasks tab both treat a null
+            // `finished_at_ms` as "still live" and recompute the duration
+            // against the current time on every render). Backfill each such
+            // row from its own squad's `finished_at_ms` -- the moment the
+            // whole squad was cancelled is the moment its still-unfinished
+            // children effectively stopped too -- falling back to "now" for
+            // the rare row whose squad itself has no `finished_at_ms` (e.g.
+            // a squad cancelled before that column existed). Matches zero
+            // rows (a no-op) once every historical row has been repaired.
+            "UPDATE tasks SET finished_at_ms = COALESCE(
+                 (SELECT finished_at_ms FROM squads WHERE squads.id = tasks.squad_id),
+                 CAST(strftime('%s','now') AS INTEGER) * 1000
+             ) WHERE state='cancelled' AND finished_at_ms IS NULL",
+            "UPDATE cells SET finished_at_ms = COALESCE(
+                 (SELECT finished_at_ms FROM squads WHERE squads.id = cells.squad_id),
+                 CAST(strftime('%s','now') AS INTEGER) * 1000
+             ) WHERE state='cancelled' AND finished_at_ms IS NULL",
             // RAL-259: when a review branch's conflict-resolver agent (fix pass
             // or final-proof call) most recently began running, so the Review
             // Live View can show both when work began and how long it's been
@@ -3027,12 +3047,29 @@ impl Store {
     /// it will not re-run any node this flips.
     fn cancel_unfinished_nodes(&self, squad_id: &str) -> Result<()> {
         const UNFINISHED: &str = "('pending','running','failed')";
-        for table in ["cells", "tasks", "proofs"] {
+        let now = now_ms();
+        // `cells`/`tasks` also stamp `finished_at_ms` here, same as
+        // `set_cell_state`/`set_task_state` do on any other transition into a
+        // terminal state. Without it, a node that was `running` at cancel
+        // time keeps `finished_at_ms` NULL forever, and the board's "time
+        // running" display (which treats a null `finished_at_ms` as
+        // still-live) keeps counting it up in the running color even though
+        // it's cancelled and will never run again. `proofs` has no
+        // started_at_ms/finished_at_ms columns.
+        for table in ["cells", "tasks"] {
             self.conn.execute(
-                &format!("UPDATE {table} SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"),
-                params![squad_id],
+                &format!(
+                    "UPDATE {table} SET state='cancelled', finished_at_ms=? WHERE squad_id=? AND state IN {UNFINISHED}"
+                ),
+                params![now, squad_id],
             )?;
         }
+        self.conn.execute(
+            &format!(
+                "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"
+            ),
+            params![squad_id],
+        )?;
         Ok(())
     }
 
@@ -3366,6 +3403,33 @@ impl Store {
             &raw,
             proof_states.iter().map(String::as_str),
         )))
+    }
+
+    /// Raw (unfolded) states of every cell-scope proof step belonging to one
+    /// cell. Unlike [`Self::effective_state_for_cell`] -- which deliberately
+    /// treats a `cancelled` proof step as compatible with a `done` cell so
+    /// an operator's intentional Queue skip doesn't paint the board red --
+    /// a caller deciding whether a task *genuinely* finished with no
+    /// failures needs the true pass/fail semantics `run_proofs` itself
+    /// applies: a cancelled step forces the owning task Failed the same as
+    /// an outright failure does (see `run_proofs`'s `current_state ==
+    /// "cancelled"` branch), while an `ignored` one is a true no-op. Callers
+    /// wanting that stricter check should treat any `"cancelled"` entry
+    /// here as still-blocking regardless of what the effective cell state
+    /// reports.
+    pub(crate) fn cell_proof_states(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+        )?;
+        let states = stmt
+            .query_map(params![squad_id, task_idx, idx], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(states)
     }
 
     /// Current state of one task, or `None` if it doesn't exist. Same purpose
@@ -9801,6 +9865,77 @@ name = "empty"
         assert_eq!(squad.tasks[0].state, "cancelled");
         // …but the cell that already completed keeps its real outcome.
         assert_eq!(squad.tasks[0].cells[0].state, "done");
+    }
+
+    #[test]
+    fn cancel_stamps_finished_at_ms_on_nodes_it_flips_to_cancelled() {
+        // Regression: `cancel_unfinished_nodes` used to flip state via a raw
+        // bulk UPDATE that never touched `finished_at_ms`, so a task/cell
+        // that was genuinely `running` at cancel time was left with
+        // `finished_at_ms` NULL forever — and the board's "time running"
+        // display treats a null `finished_at_ms` as still-live, so a
+        // cancelled node kept counting up in the running color.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].state, "cancelled");
+        assert!(squad.tasks[0].finished_at_ms.is_some());
+        assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn init_schema_backfills_finished_at_ms_on_legacy_cancelled_rows() {
+        // Regression: a task/cell cancelled before the
+        // `cancel_stamps_finished_at_ms_on_nodes_it_flips_to_cancelled` fix
+        // shipped is stuck with `state='cancelled'` and `finished_at_ms`
+        // NULL forever unless a schema migration backfills it -- the write
+        // path fix alone only prevents *new* occurrences, it doesn't repair
+        // rows already sitting in the database.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        // Simulate the pre-fix bug directly: flip to `cancelled` without
+        // stamping `finished_at_ms`, the way the old raw bulk UPDATE did.
+        store
+            .conn
+            .execute(
+                "UPDATE squads SET state='cancelled', finished_at_ms=? WHERE id=?",
+                params![777_i64, id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET state='cancelled' WHERE squad_id=?",
+                params![id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET state='cancelled' WHERE squad_id=?",
+                params![id],
+            )
+            .unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].finished_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_none());
+
+        // Re-running schema init is what every daemon startup does; the
+        // backfill UPDATE it carries should repair the legacy rows in place.
+        store.init_schema().unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].finished_at_ms, Some(777));
+        assert_eq!(squad.tasks[0].cells[0].finished_at_ms, Some(777));
     }
 
     #[test]

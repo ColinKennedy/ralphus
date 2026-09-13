@@ -293,9 +293,9 @@ test("ttCompareRows sorts squad by label, falling back to task index within the 
   assert.ok(ttCompareRows(a, b, "squad") > 0);
 });
 
-test("ttRowMatchesFilters applies the name filter, status set, hidden-squad exclusion, and needs-me together", () => {
-  const row = { key: "s1:0", name: "Fix bug", state: "running", squadId: "s1" };
-  const filters = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false };
+test("ttRowMatchesFilters applies the name filter, status set, hidden-squad exclusion, needs-me, and project set together", () => {
+  const row = { key: "s1:0", name: "Fix bug", state: "running", squadId: "s1", task: { project: "acme" } };
+  const filters = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, project: new Set() };
   assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...filters, q: "nope" }, new Set(), new Set()), false);
   assert.equal(ttRowMatchesFilters(row, { ...filters, status: new Set(["done"]) }, new Set(), new Set()), false);
@@ -303,6 +303,9 @@ test("ttRowMatchesFilters applies the name filter, status set, hidden-squad excl
   assert.equal(ttRowMatchesFilters(row, { ...filters, showHidden: true }, new Set(["s1"]), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...filters, needsMe: true }, new Set(), new Set()), false);
   assert.equal(ttRowMatchesFilters(row, { ...filters, needsMe: true }, new Set(), new Set(["s1:0"])), true);
+  // RAL-345: an empty project set means "no filter"; a non-empty one is an inclusion check.
+  assert.equal(ttRowMatchesFilters(row, { ...filters, project: new Set(["acme"]) }, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...filters, project: new Set(["other"]) }, new Set(), new Set()), false);
 });
 
 test("ttGroupAggregate sums usage only across the rows passed in (post-filter scoping)", () => {

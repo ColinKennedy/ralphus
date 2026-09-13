@@ -25,6 +25,7 @@ where one exists.
 | GET | `/api/daemon` | [Health/version probe](#get-apidaemon) |
 | POST | `/api/daemon/shutdown` | [Kill every spawned process and exit](#post-apidaemonshutdown) (`ralphus-daemon stop`) |
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
+| GET | `/api/task-index` | Compact cross-squad data for the flat Tasks tab |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
 | GET | `/api/config/live-view` | [Live View "Show Debug Messages" default](#get-apiconfiglive-view-ral-232) (RAL-232) |
 | GET | `/api/config/templates` | [Simple task form's template picker](#get-apiconfigtemplates) (RAL-297) |
@@ -1833,7 +1834,10 @@ is the registered user this feedback is attributed to — the only identity
 the board shows. `submitted_by` is the resolved authenticated/default
 requester who actually made the request; kept for audit/provenance only and
 never shown in the UI, and still just caller-claimed via `X-Ralphus-User`
-until RAL-252 makes authentication authoritative.
+until RAL-252 makes authentication authoritative. `action_status` (RAL-380,
+also omitted when unset) is `received`/`done`/`failed`/`superseded` — the
+source of a "reviewer"-role bubble's checkmark, set once `run_feedback`
+finishes acting on that message.
 
 Populated by `POST .../branches/{branch_id}/feedback`, body
 `{ "feedback": "...", "author"?: "alice" }`. `feedback` must be non-empty
@@ -1848,6 +1852,15 @@ follows in the background (`role: "guardian"`), generated via
 `chat_client::call_direct`. The board shows this thread only once a branch's
 detail view is expanded and it has at least one message — otherwise it shows
 a "No feedback yet" placeholder pointing at the `feedback` command above.
+
+The auto-fix dispatch a standing CI-status poll triggers when a guardian has
+opted into `auto_fix_pr_errors` (RAL-395, see the PR endpoints below) posts
+its own `role: "reviewer"` message into this same thread, attributed to
+`author: "PR Auto-Fix"` (`submitted_by: "system:ci-watch-auto-fix"`) instead
+of a person — this is the only way to tell an automated CI-fix round apart
+from one a human reviewer typed themselves. Its `action_status` resolves to
+`done`/`failed` from the resolver's own `RALPHUS_PROOF` verdict, exactly like
+a human-submitted round.
 
 ### `POST /api/guardians/{id}/pull-requests`
 Submit one or more PRs/MRs for a review (RAL-117). Body:
@@ -2310,6 +2323,15 @@ task-level values submitted in TOML, before cell inheritance is applied.
 These are distinct from each `CellView`'s resolved `agent`/`model` fields;
 the board uses the raw task values to explain whether a cell's displayed
 resolved value came from the task or was set explicitly on the cell.
+
+### `GET /api/task-index`
+
+Compact cross-squad data for the flat Tasks tab. It has the same `daemon` and
+`squads` nesting needed by that table, but omits authored prompts, commands,
+system prompts, proof specifications, captured proof output, and configuration
+fields the table never renders. This keeps a historical board from repeatedly
+transferring multi-megabyte text blobs on tab entry. It is read-only and has no
+query parameters.
 
 `started_at_ms` (RAL-210) is epoch-ms local-machine time of the moment this
 cell most recently transitioned to `running`; omitted from the JSON
