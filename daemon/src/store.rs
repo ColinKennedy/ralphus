@@ -3886,10 +3886,44 @@ impl Store {
         })
     }
 
-    /// The reviews (guardians) derived from a squad, oldest first.
+    /// The reviews (guardians) derived from a squad, oldest first (RAL-392: made
+    /// cell-derived rather than a plain `guardians.squad_id=?` lookup).
+    ///
+    /// A guardian's `squad_id` column is single-valued -- set once, at
+    /// creation time, by whichever submission first minted it -- so a plain
+    /// `WHERE squad_id=?` filter can never surface a review on any *other*
+    /// squad whose cell was later linked into it (e.g. a second squad's cell
+    /// sharing a `ralphus:new-review/<key>` link, or a branch manually linked
+    /// after the fact via `Self::link_review_cell`). Joining through `cells`
+    /// instead -- symmetric to `guardian::collecting_guardians_for_cells`,
+    /// which solves the identical mirror-image problem (which guardians a
+    /// squad's cells feed into, from the guardian's side) -- means every
+    /// squad with a contributing cell sees the review, regardless of which
+    /// squad's submission created the guardian row.
+    ///
+    /// Prefers each cell's direct `review_guardian_id` (RAL-314, set at
+    /// submit time or by `Self::link_review_cell`) so two unrelated squads'
+    /// cells that happen to record the identical branch *string* are never
+    /// conflated; falls back to the `cells.review_branch = guardian_branches.branch`
+    /// string join for a pre-RAL-314 row. No status filter -- a squad's
+    /// review list has always included terminal (approved/deployed/cancelled)
+    /// reviews too.
     fn reviews_for_squad(&self, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, status, origin FROM guardians WHERE squad_id=? ORDER BY created_at_ms, id",
+            "SELECT DISTINCT g.id, g.name, g.status, g.origin FROM guardians g
+             JOIN cells s ON (
+                 s.review_guardian_id = g.id
+                 OR (
+                     s.review_guardian_id IS NULL
+                     AND s.review_branch IS NOT NULL
+                     AND EXISTS (
+                         SELECT 1 FROM guardian_branches gb
+                         WHERE gb.guardian_id = g.id AND gb.branch = s.review_branch
+                     )
+                 )
+             )
+             WHERE s.squad_id = ?
+             ORDER BY g.created_at_ms, g.id",
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
@@ -12205,6 +12239,56 @@ command = "y"
         assert_eq!(cell.reviews.len(), 1);
         assert_eq!(cell.reviews[0].id, gid);
         assert_eq!(cell.reviews[0].name, "Shared review");
+    }
+
+    #[test]
+    fn reviews_for_squad_is_cell_derived_not_squad_id_derived() {
+        // RAL-392: `guardians.squad_id` is single-valued (set once, by
+        // whichever squad's submission created the row), so a squad whose
+        // cell later links into a guardian created by a *different* squad --
+        // exactly `link_review_cell`'s manual-attach scenario -- must still
+        // see that review in its own `squad show`, driven by the cell join
+        // rather than the guardian's own `squad_id` column.
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_a = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let gid = store
+            .create_guardian_for_squad("Shared review", "main", "/repo", Some(&squad_a))
+            .unwrap();
+        store.add_guardian_branch(&gid, "feature/b").unwrap();
+        // Mirrors what a real submission's `derive_reviews` always does in
+        // the same call that creates the guardian: link the contributing
+        // cell back to it (RAL-314).
+        store
+            .set_cell_review_branch(&squad_a, 0, 0, "feature/b")
+            .unwrap();
+        store
+            .set_cell_review_guardian(&squad_a, 0, 0, &gid)
+            .unwrap();
+
+        // squad_a created the guardian, so it must still see it (regression
+        // guard for the existing submit-time-linked path).
+        let view_a = store.get_squad(&squad_a).unwrap();
+        assert_eq!(view_a.reviews.len(), 1);
+        assert_eq!(view_a.reviews[0].id, gid);
+
+        let squad_b = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
+        store
+            .set_cell_review_branch(&squad_b, 0, 0, "feature/b")
+            .unwrap();
+        store
+            .set_cell_review_guardian(&squad_b, 0, 0, &gid)
+            .unwrap();
+
+        // squad_b never created this guardian (`guardians.squad_id` still
+        // points at squad_a), but its own cell now feeds the same review --
+        // both squads must see it (multi-squad case).
+        let view_b = store.get_squad(&squad_b).unwrap();
+        assert_eq!(view_b.reviews.len(), 1);
+        assert_eq!(view_b.reviews[0].id, gid);
     }
 
     #[test]
