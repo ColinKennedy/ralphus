@@ -56,6 +56,14 @@ to point at an alternate binary name or path. `git` must be resolvable on
 `ralphus check health`'s repo-detection probe (`cli/src/health.rs`). No
 version constraint is currently known to matter.
 
+`ralphus check health`'s `git` check (Harness section) only treats a missing
+binary as a hard `fail` when at least one registered project actually uses
+`vcs = "git"` (or project state can't be determined at all, e.g. the daemon
+is unreachable) — RAL-415. A project registered with a non-Git `vcs` kind
+skips its own git-repo-validity check too (reported `SKIP`, not `FAIL`),
+since only `git` is actually implemented as a `Vcs` adapter today
+(`daemon/src/vcs.rs`).
+
 ### tmux / psmux
 
 > ⚠️ **Security: prefer the vendored build; avoid a separately installed
@@ -132,6 +140,13 @@ no corresponding `tmux ls` session and kill them.
 
 **tmux (macOS / Linux)** — real upstream tmux, no known version constraint.
 
+`ralphus check health`'s Harness section (`cli/src/health.rs`'s `check_tmux`,
+RAL-415) resolves tmux/psmux the same way the daemon does
+(`ralphus_daemon::tmux::resolve_tmux_program_with_source`) and reports both
+the resolved binary and which resolution source won (`RALPHUS_TMUX_CMD`
+override, embedded vendored build, or `PATH`) — a missing binary is a hard
+`fail`, since every live cell session depends on it.
+
 ### Agent backend CLIs — some are subprocesses, some are HTTP, know which is which
 
 `core/src/schema.rs`'s `RESERVED_AGENT_NAMES` lists every built-in agent
@@ -160,6 +175,10 @@ token env var (`[forge].token_env`, e.g. `RALPHUS_GITHUB_TOKEN`/
 cached from a prior interactive `gh auth login` / `glab auth login`. Neither
 binary is required: any failure (not installed, not logged in, unexpected
 output) is treated as "no token from this source," not an error.
+`ralphus check health`'s Harness section (`cli/src/health.rs`'s `check_gh`/
+`check_glab`, RAL-415) probes for both on `PATH` and always reports `pass`
+either way, explaining this fallback role in the detail text — a missing
+`gh`/`glab` never fails `check health`.
 
 ### OS-integration binaries — best-effort, platform-gated
 

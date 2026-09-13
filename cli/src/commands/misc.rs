@@ -1122,7 +1122,10 @@ pub struct CheckArgs {
     /// RAL-355 Phase 9: also check every configured `[machine.targets.*]`
     /// entry's health.
     pub all_remotes: bool,
-    pub json: bool,
+    /// RAL-415: also perform a live, cost-incurring completion round-trip
+    /// against the configured Arbiter agent/model (`check_arbiter`). Off by
+    /// default -- every other check here is reachability/config-shape only.
+    pub enable_live_agent_check: bool,
 }
 
 pub fn parse_check(scanner: &mut Scanner) -> super::Command {
@@ -1134,90 +1137,140 @@ pub fn parse_check(scanner: &mut Scanner) -> super::Command {
     });
     let enable_developer_checks = inner.take_bool("--enable-developer-checks");
     let all_remotes = inner.take_bool("--all-remotes");
-    let json = inner.take_bool("--json");
+    let enable_live_agent_check = inner.take_bool("--enable-live-agent-check");
     super::Command::Check(CheckArgs {
         enable_developer_checks,
         all_remotes,
-        json,
+        enable_live_agent_check,
     })
 }
 
-pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
-    let symbol = |s: &str| match s {
+/// `[OK  ]`/`[WARN]`/`[FAIL]`/`[SKIP]` column for one check's human-readable
+/// line -- fixed-width so the `name: detail` text lines up across a section.
+fn check_symbol(status: &str) -> &'static str {
+    match status {
         "pass" => "OK  ",
         "warn" => "WARN",
         "fail" => "FAIL",
-        _ => "?",
-    };
+        "skip" => "SKIP",
+        _ => "?   ",
+    }
+}
+
+/// Renders `check health`'s human-readable output: one indented `Core:`/
+/// `Harness:`/`Machine:` section per [`crate::health::CheckResult::section`]
+/// present in `results` (RAL-415 -- empty sections are omitted, matching the
+/// prior Core/Developer/Remote-targets precedent), each check's observation
+/// line followed by an indented `impact: ...; remediation: ...` line and,
+/// when present, an indented `source: ...` provenance line. Pulled out as
+/// its own pure function (rather than inlined in [`cmd_check`]) specifically
+/// so a fixed [`crate::health::CheckResult`] fixture can assert on the exact
+/// rendered text -- a durable layout/indentation snapshot.
+fn render_health_human(
+    results: &[crate::health::CheckResult],
+    file_issues: &[crate::config::ConfigFileIssues],
+    failed: usize,
+) -> String {
+    let mut out = String::new();
+    for (section, title) in [
+        (crate::health::CORE, "Core"),
+        (crate::health::HARNESS, "Harness"),
+        (crate::health::MACHINE, "Machine"),
+    ] {
+        let section_results: Vec<_> = results.iter().filter(|r| r.section == section).collect();
+        if section_results.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{title}:\n"));
+        for r in section_results {
+            out.push_str(&format!(
+                "  [{}] {}: {}\n",
+                check_symbol(r.status),
+                r.name,
+                r.detail
+            ));
+            out.push_str(&format!(
+                "        impact: {}; remediation: {}\n",
+                r.impact, r.remediation
+            ));
+            if let Some(p) = &r.provenance {
+                out.push_str(&format!("        source: {p}\n"));
+            }
+        }
+    }
+
+    if !file_issues.is_empty() {
+        out.push_str("\nConfiguration file issues:\n");
+        for fi in file_issues {
+            out.push_str(&format!("  {}  ({})\n", fi.path.display(), fi.label));
+            if let Some(syn) = &fi.syntax_error {
+                out.push_str(&format!("    - TOML syntax error: {syn}\n"));
+            }
+            for issue in &fi.issues {
+                out.push_str(&format!("    - {issue}\n"));
+            }
+        }
+    }
+
+    if failed > 0 {
+        out.push_str(&format!("\n{failed} check(s) failed.\n"));
+    }
+    out
+}
+
+/// Renders `check health --json`'s machine-readable payload: every
+/// [`crate::health::CheckResult`] verbatim (so `section`/`status`/`detail`/
+/// `impact`/`remediation`/`provenance` are always present and consistently
+/// named), plus `file_issues` and the overall `failed` count.
+fn render_health_json(
+    results: &[crate::health::CheckResult],
+    file_issues: &[crate::config::ConfigFileIssues],
+    failed: usize,
+) -> String {
+    #[derive(serde::Serialize)]
+    struct FileIssueJson {
+        path: String,
+        label: String,
+        syntax_error: Option<String>,
+        issues: Vec<String>,
+    }
+    let payload = serde_json::json!({
+        "checks": results,
+        "file_issues": file_issues.iter().map(|fi| FileIssueJson {
+            path: fi.path.display().to_string(),
+            label: fi.label.clone(),
+            syntax_error: fi.syntax_error.clone(),
+            issues: fi.issues.clone(),
+        }).collect::<Vec<_>>(),
+        "failed": failed,
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_default()
+}
+
+pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let results = crate::health::run_checks(
         &opts.daemon_url,
         &cwd,
         args.enable_developer_checks,
         args.all_remotes,
+        args.enable_live_agent_check,
     );
     let file_issues = crate::config::validate_config_files(&cwd, true);
     let failed = results.iter().filter(|r| r.is_fail()).count() + file_issues.len();
 
-    if args.json {
-        #[derive(serde::Serialize)]
-        struct FileIssueJson {
-            path: String,
-            label: String,
-            syntax_error: Option<String>,
-            issues: Vec<String>,
-        }
-        let payload = serde_json::json!({
-            "checks": results,
-            "file_issues": file_issues.iter().map(|fi| FileIssueJson {
-                path: fi.path.display().to_string(),
-                label: fi.label.clone(),
-                syntax_error: fi.syntax_error.clone(),
-                issues: fi.issues.clone(),
-            }).collect::<Vec<_>>(),
-            "failed": failed,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-        return if failed > 0 { 1 } else { 0 };
-    }
-
-    for (section, title) in [
-        (crate::health::CORE, "Core"),
-        (crate::health::DEVELOPER, "Developer"),
-        (crate::health::REMOTE, "Remote targets"),
-    ] {
-        let section_results: Vec<_> = results.iter().filter(|r| r.section == section).collect();
-        if section_results.is_empty() {
-            continue;
-        }
-        println!("{title}:");
-        for r in section_results {
-            println!("  [{}] {}: {}", symbol(r.status), r.name, r.detail);
-        }
-    }
-
-    if !file_issues.is_empty() {
-        println!("\nConfiguration file issues:");
-        for fi in &file_issues {
-            println!("  {}  ({})", fi.path.display(), fi.label);
-            if let Some(syn) = &fi.syntax_error {
-                println!("    - TOML syntax error: {syn}");
-            }
-            for issue in &fi.issues {
-                println!("    - {issue}");
-            }
-        }
-    }
-
-    if failed > 0 {
-        println!("\n{failed} check(s) failed.");
-        1
+    // `opts.json`, not a per-subcommand flag: `args::extract_global_opts`
+    // strips every literal `--json` token out of argv before `parse_check`
+    // ever sees it (the same global-flag convention every other command
+    // uses), so branching on anything else here would make `ralphus check
+    // health --json` silently fall through to human output.
+    if opts.json {
+        println!("{}", render_health_json(&results, &file_issues, failed));
     } else {
-        0
+        print!("{}", render_health_human(&results, &file_issues, failed));
     }
+
+    if failed > 0 { 1 } else { 0 }
 }
 
 // ---- completion / configuration / initialize --------------------------------
@@ -1352,21 +1405,176 @@ mod tests {
         };
         assert!(!args.enable_developer_checks);
         assert!(!args.all_remotes);
-        assert!(!args.json);
+        assert!(!args.enable_live_agent_check);
     }
 
     #[test]
-    fn parse_check_reads_all_remotes_and_json() {
+    fn parse_check_reads_all_remotes_and_live_agent_check() {
         let cmd = parse_check(&mut Scanner::new(&[
             "health".to_string(),
             "--all-remotes".to_string(),
-            "--json".to_string(),
+            "--enable-live-agent-check".to_string(),
         ]));
         let super::super::Command::Check(args) = cmd else {
             panic!("expected Command::Check");
         };
         assert!(args.all_remotes);
-        assert!(args.json);
+        assert!(args.enable_live_agent_check);
+    }
+
+    // ── check health rendering (RAL-415) ───────────────────────────────────
+
+    fn fixture_health_results() -> Vec<crate::health::CheckResult> {
+        vec![
+            crate::health::CheckResult {
+                name: "daemon".to_string(),
+                status: "pass",
+                detail: "reachable (ralphus-daemon 1.2.3)".to_string(),
+                section: crate::health::CORE,
+                impact: "The CLI can submit and monitor tasks.".to_string(),
+                remediation: "No action needed.".to_string(),
+                provenance: None,
+            },
+            crate::health::CheckResult {
+                name: "config".to_string(),
+                status: "fail",
+                detail: "task.maximum_timeout_seconds is -5; must be >= 0 (0 = unbounded, positive = seconds)".to_string(),
+                section: crate::health::CORE,
+                impact: "Every subprocess timeout computation is undefined with a negative cap; task execution behavior becomes unreliable.".to_string(),
+                remediation: "Set task.maximum_timeout_seconds to 0 (unbounded) or a positive number of seconds.".to_string(),
+                provenance: Some("/repo/.ralphus.toml".to_string()),
+            },
+            crate::health::CheckResult {
+                name: "git".to_string(),
+                status: "skip",
+                detail: "not found on PATH, but no registered project uses Git".to_string(),
+                section: crate::health::HARNESS,
+                impact: "None today -- every registered project's vcs kind is non-Git.".to_string(),
+                remediation: "If you register a Git-based project later, install git and re-run this check.".to_string(),
+                provenance: None,
+            },
+            crate::health::CheckResult {
+                name: "tmux".to_string(),
+                status: "fail",
+                detail: "no tmux-compatible binary found".to_string(),
+                section: crate::health::HARNESS,
+                impact: "Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.".to_string(),
+                remediation: "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path.".to_string(),
+                provenance: None,
+            },
+            crate::health::CheckResult {
+                name: "nvidia-smi".to_string(),
+                status: "warn",
+                detail: "not found on PATH".to_string(),
+                section: crate::health::MACHINE,
+                impact: "The resource view's GPU column shows N/A instead of live usage; nothing else is affected.".to_string(),
+                remediation: "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.".to_string(),
+                provenance: None,
+            },
+        ]
+    }
+
+    fn fixture_file_issues() -> Vec<crate::config::ConfigFileIssues> {
+        vec![crate::config::ConfigFileIssues {
+            path: std::path::PathBuf::from("/repo/.ralphus.toml"),
+            label: "local".to_string(),
+            syntax_error: Some("unexpected token".to_string()),
+            issues: Vec::new(),
+        }]
+    }
+
+    /// Durable output fixture (RAL-415): a fixed [`CheckResult`]/file-issue
+    /// set rendered through the exact function `cmd_check` uses, asserted
+    /// against a hardcoded expected string covering section grouping
+    /// (Core/Harness/Machine), indentation, every status symbol (including
+    /// `SKIP`), the impact/remediation explanation line, and the
+    /// `source:` provenance line.
+    #[test]
+    fn render_health_human_matches_snapshot() {
+        let results = fixture_health_results();
+        let file_issues = fixture_file_issues();
+        let failed = results.iter().filter(|r| r.is_fail()).count() + file_issues.len();
+        let rendered = render_health_human(&results, &file_issues, failed);
+
+        let expected = "\
+Core:
+  [OK  ] daemon: reachable (ralphus-daemon 1.2.3)
+        impact: The CLI can submit and monitor tasks.; remediation: No action needed.
+  [FAIL] config: task.maximum_timeout_seconds is -5; must be >= 0 (0 = unbounded, positive = seconds)
+        impact: Every subprocess timeout computation is undefined with a negative cap; task execution behavior becomes unreliable.; remediation: Set task.maximum_timeout_seconds to 0 (unbounded) or a positive number of seconds.
+        source: /repo/.ralphus.toml
+Harness:
+  [SKIP] git: not found on PATH, but no registered project uses Git
+        impact: None today -- every registered project's vcs kind is non-Git.; remediation: If you register a Git-based project later, install git and re-run this check.
+  [FAIL] tmux: no tmux-compatible binary found
+        impact: Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.; remediation: Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path.
+Machine:
+  [WARN] nvidia-smi: not found on PATH
+        impact: The resource view's GPU column shows N/A instead of live usage; nothing else is affected.; remediation: Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.
+
+Configuration file issues:
+  /repo/.ralphus.toml  (local)
+    - TOML syntax error: unexpected token
+
+3 check(s) failed.
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn render_health_human_omits_empty_sections() {
+        let results = vec![crate::health::CheckResult {
+            name: "daemon".to_string(),
+            status: "pass",
+            detail: "reachable".to_string(),
+            section: crate::health::CORE,
+            impact: "impact".to_string(),
+            remediation: "No action needed.".to_string(),
+            provenance: None,
+        }];
+        let rendered = render_health_human(&results, &[], 0);
+        assert!(rendered.contains("Core:"));
+        assert!(!rendered.contains("Harness:"));
+        assert!(!rendered.contains("Machine:"));
+        assert!(!rendered.contains("check(s) failed"));
+    }
+
+    /// Machine-readable consistency (RAL-415): every check's `section`,
+    /// `status`, `detail`/`impact`/`remediation`, and (when present)
+    /// `provenance` survive the JSON round-trip under consistent field
+    /// names, and `failed`/`file_issues` are present alongside `checks`.
+    #[test]
+    fn render_health_json_round_trips_grouping_status_and_provenance() {
+        let results = fixture_health_results();
+        let file_issues = fixture_file_issues();
+        let failed = results.iter().filter(|r| r.is_fail()).count() + file_issues.len();
+        let rendered = render_health_json(&results, &file_issues, failed);
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(parsed["failed"], 3);
+        let checks = parsed["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 5);
+
+        let config_check = checks.iter().find(|c| c["name"] == "config").unwrap();
+        assert_eq!(config_check["section"], "core");
+        assert_eq!(config_check["status"], "fail");
+        assert_eq!(config_check["provenance"], "/repo/.ralphus.toml");
+        assert!(config_check["impact"].as_str().unwrap().contains("timeout"));
+        assert!(
+            config_check["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("Set task.maximum_timeout_seconds")
+        );
+
+        let git_check = checks.iter().find(|c| c["name"] == "git").unwrap();
+        assert_eq!(git_check["section"], "harness");
+        assert_eq!(git_check["status"], "skip");
+        assert!(git_check["provenance"].is_null());
+
+        let file_issue = parsed["file_issues"].as_array().unwrap();
+        assert_eq!(file_issue.len(), 1);
+        assert_eq!(file_issue[0]["path"], "/repo/.ralphus.toml");
     }
 
     #[test]
