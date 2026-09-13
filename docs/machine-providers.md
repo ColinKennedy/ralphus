@@ -29,6 +29,10 @@ provider's business.
 > even on a remote review (build-config resolution, the empty-branch VCS
 > check, and a couple of local-fs reads around rebase-state detection).
 
+> **Platform support:** Linux and Windows daemon hosts are fully supported.
+> macOS as a daemon host is **experimental** (RAL-398) — see "Platform
+> support" in `docs/dependencies.md`.
+
 ## The `machine` value
 
 | Form | Meaning |
