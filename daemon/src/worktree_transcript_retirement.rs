@@ -51,6 +51,7 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
     let owners = match store.worktree_session_owners() {
         Ok(owners) => owners,
         Err(error) => {
+            // ralphus[ignore-rlog-pair]: store operation failed, cannot emit Cartographer note from error path
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] could not list session owners while retiring transcripts for worktree {worktree_path}: {error}"
