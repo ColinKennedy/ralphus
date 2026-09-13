@@ -175,6 +175,7 @@ const TASK_KEYS: &[&str] = &[
     "max_retries",
     "priority",
     "timeout_minutes",
+    "maximum_timeout_seconds",
     "depends_on",
     "environment",
     "no_commit_required",
@@ -203,6 +204,7 @@ const CELL_KEYS: &[&str] = &[
     "auto_compact_threshold",
     "maximum_tool_output_tokens",
     "timeout_minutes",
+    "maximum_timeout_seconds",
     "priority",
     "environment",
     "proof",
@@ -278,6 +280,7 @@ const PROOF_KEYS: &[&str] = &[
     "arguments",
     "budget_tokens",
     "timeout_minutes",
+    "maximum_timeout_seconds",
     "requires_approval",
     "restart_on",
     "environment",
@@ -538,6 +541,19 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
+        // RAL-308: only a type check for now. Whether a negative or zero
+        // value should be rejected (and what zero should mean) is a pending
+        // product decision -- see the field's doc comment in
+        // `ralphus_core::schema::TaskDef::maximum_timeout_seconds` -- so no
+        // `check_positive_number` call has been added here yet.
+        check_type(
+            ctx,
+            table,
+            "maximum_timeout_seconds",
+            Ty::Int,
+            &path,
+            header,
+        );
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
@@ -772,6 +788,16 @@ fn validate_cells(
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
         check_maximum_tool_output_tokens(ctx, table, task_agent, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
+        // RAL-308: see the matching comment in `validate_tasks` -- the
+        // range-validation policy for this field is still pending.
+        check_type(
+            ctx,
+            table,
+            "maximum_timeout_seconds",
+            Ty::Int,
+            &path,
+            header,
+        );
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment(ctx, table, &path, header);
@@ -1894,6 +1920,9 @@ fn validate_proof_array(
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &vpath, None);
+        // RAL-308: see the matching comment in `validate_tasks` -- the
+        // range-validation policy for this field is still pending.
+        check_type(ctx, table, "maximum_timeout_seconds", Ty::Int, &vpath, None);
         check_type(
             ctx,
             table,
@@ -2095,6 +2124,59 @@ command = "cargo build"
     fn good_file_passes() {
         let r = validate_toml(GOOD);
         assert!(r.is_ok(), "expected ok, got {:?}", r.errors);
+    }
+
+    // ── RAL-308: maximum_timeout_seconds ────────────────────────────────────
+
+    #[test]
+    fn maximum_timeout_seconds_accepted_as_integer_at_all_three_scopes() {
+        let src = r#"
+[[task]]
+name = "build"
+maximum_timeout_seconds = 3600
+[[task.cell]]
+cwd = "/repo"
+prompt = "make it build"
+maximum_timeout_seconds = 1800
+[[task.cell.proof]]
+command = "cargo build"
+maximum_timeout_seconds = 60
+"#;
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "expected ok, got {:?}", r.errors);
+    }
+
+    #[test]
+    fn maximum_timeout_seconds_wrong_type_reports_line() {
+        let src = r#"
+[[task]]
+name = "build"
+maximum_timeout_seconds = "soon"
+[[task.cell]]
+cwd = "/repo"
+prompt = "make it build"
+"#;
+        let r = validate_toml(src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| {
+                e.kind == ErrorKind::WrongType && e.message.contains("maximum_timeout_seconds")
+            })
+            .expect("wrong-type error for maximum_timeout_seconds");
+        assert_eq!(e.line, Some(4));
+    }
+
+    #[test]
+    fn maximum_timeout_seconds_unknown_at_unrelated_scope_still_flagged() {
+        // Sanity check that the key list additions didn't accidentally widen
+        // scope -- an unrelated top-level key is still rejected.
+        let src = "[[task]]\nname=\"t\"\nmaximum_timeout_secondss = 1\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownKey
+                && e.message.contains("maximum_timeout_secondss"))
+        );
     }
 
     #[test]

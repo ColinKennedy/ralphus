@@ -77,6 +77,15 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                starting nudge, not a hard guarantee.
  timeout_minutes integer       Default wall-clock timeout (minutes) for cells
                                and proof steps; each may override its own.
+ maximum_timeout_seconds integer  Hard maximum runtime, in seconds, for this
+                                whole task -- cumulative across every one of
+                                its cells and proof steps (both task-scope and
+                                cell-scope). Independent of `timeout_minutes`
+                                above: both caps are enforced at once, and
+                                exceeding either one kills the run and records
+                                its own distinct failure. See the cell/proof
+                                field of the same name below for the narrower
+                                scopes.
  depends_on     array<string>  Tasks this task waits on (see formats below)
  environment    table<string,  Environment variables for every cell's spawned
                  string>       subprocess, e.g.
@@ -232,6 +241,14 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         the [[task]] field reference above. ~80000 is a
                                         reasonable starting point.
  timeout_minutes         integer        Per-cell wall-clock timeout (falls back to task)
+ maximum_timeout_seconds integer        Hard maximum runtime, in seconds, for this
+                                        cell -- cumulative across the cell itself and
+                                        its own cell-scope proof steps. Does NOT fall
+                                        back to the task's `maximum_timeout_seconds`;
+                                        the two are independent, separately-enforced
+                                        budgets (the task's covers every cell/proof
+                                        under it, this one covers just this cell and
+                                        its proofs).
  priority                integer        Initial Queue priority hint (lower = runs sooner);
                                         seeds this cell's starting Queue position.
  depends_on              array<string>  Cells that must finish first (see formats below)
@@ -541,6 +558,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                    it fails the proof step
  timeout_minutes    integer        Wall-clock timeout for the proof step (falls
                                    back to the task `timeout_minutes`)
+ maximum_timeout_seconds integer   Hard maximum runtime, in seconds, for this
+                                   proof step alone. A proof step has no
+                                   descendants, so this is a simple self-only
+                                   cap -- it does NOT fall back to the owning
+                                   cell's/task's `maximum_timeout_seconds`,
+                                   which are separate, independently-enforced
+                                   budgets that still apply on top of this one.
  requires_approval  boolean        Pause for human sign-off (planned)
  restart_on         array<string>  Re-run this task when a referenced proof
                                    step fires. Grammar:

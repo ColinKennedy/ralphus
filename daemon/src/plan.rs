@@ -240,6 +240,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         }
     }
 

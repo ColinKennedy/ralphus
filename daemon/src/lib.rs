@@ -16,6 +16,7 @@ pub mod channel;
 pub mod chat_client;
 pub mod ci_watch;
 pub mod config;
+pub mod cpu_stall;
 pub mod entity_uri;
 pub mod env_view;
 pub mod events;
