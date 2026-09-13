@@ -44,6 +44,66 @@ fn temp_repo() -> PathBuf {
     dir
 }
 
+/// Simulates `run_commit_step`'s dedicated commit-step agent (RAL-<new>):
+/// `run_feedback` now issues a *second* runner call, cell-id-suffixed
+/// `-commit`, after the main resolver edit -- its real job is to stage only
+/// the genuine part of a diff and commit it, unless the reviewer's own
+/// request explicitly asked it not to (RAL-52). None of this file's fixtures
+/// produce build-artifact junk to filter out, so the fake here just stages
+/// and commits everything dirty (mirroring what a real commit-step agent
+/// would do for a worktree this simple) and reports whether it found
+/// anything to commit. It approximates "did the reviewer's own request ask me
+/// not to commit" by scanning only the "request that produced this diff"
+/// section of `run_commit_step`'s prompt (everything before the numbered
+/// steps) -- never the later "Background..." section -- the same separation
+/// that keeps a real agent from confusing pasted task boilerplate for a live
+/// instruction. Every `Runner` double used with `run_feedback` or
+/// `dispatch_pr_auto_fix` must call this first and return its result when
+/// `Some`, falling through to its own resolver-editing behavior otherwise --
+/// the fixer prompt itself is `"Do not run any git commands"`, so without
+/// this the worktree would never actually get committed and every such test
+/// would see `committed: false` regardless of what the resolver wrote.
+fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
+    if !spec.cell_id.ends_with("-commit") {
+        return None;
+    }
+    let prompt = spec.prompt.as_deref().unwrap_or_default();
+    let request_section = prompt
+        .split("\n\n1. Run `git status`")
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let no_commit_requested =
+        request_section.contains("don't commit") || request_section.contains("do not commit");
+    let cwd = PathBuf::from(&spec.cwd);
+    let dirty = !git(&cwd, &["status", "--porcelain"]).trim().is_empty();
+    let committed = dirty && !no_commit_requested;
+    if committed {
+        git(&cwd, &["add", "--all"]);
+        git(&cwd, &["commit", "-m", "test: commit step"]);
+    }
+    Some(RunnerResult {
+        status: "done".into(),
+        tokens_in: 0,
+        tokens_out: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        compaction_input_tokens: 0,
+        compaction_count: 0,
+        cost_usd: 0.0,
+        cost_is_estimated: false,
+        summary: if committed {
+            "committed".into()
+        } else {
+            "nothing to commit".into()
+        },
+        error: None,
+        proofed: Some(committed),
+        agent_session_id: None,
+        ghost: None,
+    })
+}
+
 /// A runner that is never expected to be invoked (no conflicts).
 struct NoopRunner;
 impl Runner for NoopRunner {
@@ -226,6 +286,9 @@ impl Runner for MarkerStrippingRunner {
 struct FeedbackRunner;
 impl Runner for FeedbackRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
         RunnerResult {
             status: "done".into(),
@@ -258,6 +321,9 @@ struct RaceInjectingRunner {
 }
 impl Runner for RaceInjectingRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
         let _ = self.store.lock().set_guardian_status(
             &self.id,
@@ -286,8 +352,8 @@ impl Runner for RaceInjectingRunner {
 
 /// RAL-241 follow-up: a fake reviewer agent that runs successfully but makes
 /// no edits at all -- exercises `run_feedback`'s silent-no-op path (the
-/// worktree stays clean, so nothing gets committed even though `no_commit`
-/// wasn't requested).
+/// worktree stays clean, so the commit step is never even invoked and
+/// nothing gets committed).
 struct SilentNoOpFeedbackRunner;
 impl Runner for SilentNoOpFeedbackRunner {
     fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
@@ -315,6 +381,9 @@ impl Runner for SilentNoOpFeedbackRunner {
 struct NamedFeedbackRunner(pub &'static str);
 impl Runner for NamedFeedbackRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join(self.0), "reviewed\n");
         RunnerResult {
             status: "done".into(),
@@ -352,6 +421,9 @@ impl AutoFixRunner {
 }
 impl Runner for AutoFixRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("fix.txt"), "fixed\n");
         RunnerResult {
@@ -1129,6 +1201,7 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
         reason: "check 'build' failed".to_string(),
         job_url: None,
         log_text: None,
+        checks: vec![],
     };
     let runner = AutoFixRunner::new();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
@@ -1267,6 +1340,7 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
         reason: "check 'build' failed".to_string(),
         job_url: None,
         log_text: None,
+        checks: vec![],
     };
     let runner = AutoFixRunner::new();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
@@ -1372,6 +1446,7 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         reason: "check 'test' failed".to_string(),
         job_url: None,
         log_text: Some("line1\nline2\nline3\n".to_string()),
+        checks: vec![],
     };
     let runner = AutoFixRunner::new();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
@@ -1390,6 +1465,120 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         files1.contains("fix.txt") && files1.contains("a.txt") && files1.contains("b.txt"),
         "branch b should be restacked on top of the auto-fix commit: {files1}"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-<new>: when the forge reports more than one failing check/job,
+/// `dispatch_pr_auto_fix` gives every one of them its own log file and its
+/// own paragraph (reason + URL) in the auto-fix prompt, instead of only the
+/// first one a forge poll happened to notice.
+#[test]
+fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_paragraph() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(12),
+            Some("https://github.com/acme/w/pull/12"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    let worktree = guardian.branches[0].worktree.clone().expect("worktree");
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "2 checks failed: 'build', 'test'".to_string(),
+        job_url: Some("https://ci.example/job/1".to_string()),
+        log_text: Some("build broke\n".to_string()),
+        checks: vec![
+            ralphus_daemon::forge::FailedCheck {
+                name: "build".to_string(),
+                job_url: Some("https://ci.example/job/1".to_string()),
+                log_text: Some("build broke\n".to_string()),
+            },
+            ralphus_daemon::forge::FailedCheck {
+                name: "test".to_string(),
+                job_url: Some("https://ci.example/job/2".to_string()),
+                log_text: Some("test failed\n".to_string()),
+            },
+        ],
+    };
+    let runner = AutoFixRunner::new();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+
+    let build_log =
+        std::fs::read_to_string(Path::new(&worktree).join(".ralphus-ci-failure-build.log"))
+            .expect("build check's own log file written");
+    assert_eq!(build_log, "build broke\n");
+    let test_log =
+        std::fs::read_to_string(Path::new(&worktree).join(".ralphus-ci-failure-test.log"))
+            .expect("test check's own log file written");
+    assert_eq!(test_log, "test failed\n");
+    assert!(
+        !Path::new(&worktree)
+            .join(".ralphus-ci-failure.log")
+            .exists(),
+        "the single-failure filename must not be used once there is more than one failing check"
+    );
+
+    let messages = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
+    assert_eq!(messages.len(), 1);
+    let text = &messages[0].text;
+    assert!(
+        text.contains("https://ci.example/job/1"),
+        "build check's own URL must be in the prompt: {text}"
+    );
+    assert!(
+        text.contains("https://ci.example/job/2"),
+        "test check's own URL must be in the prompt: {text}"
+    );
+    assert!(text.contains("'build' failed"), "{text}");
+    assert!(text.contains("'test' failed"), "{text}");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);
@@ -1953,8 +2142,7 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
 #[test]
 fn feedback_silent_no_op_gets_a_distinct_detail_not_conflated_with_applied() {
     // RAL-241 follow-up regression: an agent run that completes successfully
-    // but edits nothing (and `no_commit` was never requested in the
-    // feedback text) previously landed no commit yet still reported the
+    // but edits nothing previously landed no commit yet still reported the
     // branch detail as "feedback applied" -- identical to a real fix. A
     // reviewer polling `review status` had no way to tell the two apart
     // without manually `git log`-ing the worktree.

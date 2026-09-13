@@ -1016,6 +1016,27 @@ pub struct PrForgeCacheView {
     pub latest_comment_at: Option<String>,
 }
 
+impl Store {
+    /// Undo [`Self::mark_pr_auto_fix_attempted`] (RAL-395 follow-up): called
+    /// when [`crate::guardian_merge::run_feedback`] bailed out before the
+    /// resolver agent ever ran (e.g. the branch's review worktree was
+    /// transiently missing, mid-rebuild, when auto-fix raced the review's own
+    /// background merge loop) so that infrastructure hiccup doesn't
+    /// permanently consume the single-attempt-per-failure budget while CI
+    /// keeps reporting the same `"failing"` status forever.
+    pub fn clear_pr_auto_fix_attempted(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=NULL, updated_at_ms=? WHERE id=?",
+            params![now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
@@ -2157,7 +2178,15 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return settle_pr_merge_states(store, id, &[]);
     }
 
-    let mut freshly_merged = Vec::new();
+    // Resolve each open PR's forge client up front (cheap, local config/DB
+    // reads); the actual forge call is the only genuinely slow part here,
+    // and is fired off concurrently below since one PR's merge state has no
+    // bearing on any other's.
+    struct MergeCheckJob<'a> {
+        pr: &'a PullRequestView,
+        client: crate::forge::ForgeClient,
+    }
+    let mut jobs = Vec::new();
     for pr in prs
         .iter()
         .filter(|pull_request| pull_request.state == "open")
@@ -2181,8 +2210,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         // whichever matches this PR's own recorded `repo`, rather than a
         // single `resolve_remote` call that can only ever match one of them.
         let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
-        let client = match routing.client_for(&pr.repo) {
-            Some(client) if client.kind().as_str() == pr.forge => client.clone(),
+        match routing.client_for(&pr.repo) {
+            Some(client) if client.kind().as_str() == pr.forge => {
+                jobs.push(MergeCheckJob {
+                    pr,
+                    client: client.clone(),
+                });
+            }
             Some(client) => {
                 log_pr_merge_check_failure(
                     store,
@@ -2196,7 +2230,6 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                         pr.repo
                     ),
                 );
-                continue;
             }
             None => {
                 log_pr_merge_check_failure(
@@ -2208,10 +2241,28 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                         pr.forge, pr.repo
                     ),
                 );
-                continue;
             }
-        };
-        poll_pr_merge_state(store, id, pr, &client, &mut freshly_merged);
+        }
+    }
+
+    let fetched: Vec<Option<std::result::Result<String, String>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|job| scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
+            })
+            .collect()
+    });
+
+    let mut freshly_merged = Vec::new();
+    for (job, result) in jobs.iter().zip(fetched) {
+        apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
@@ -2465,23 +2516,40 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     for pr in prs.iter().filter(|p| p.state == "open") {
-        poll_pr_merge_state(store, id, pr, client, &mut freshly_merged);
+        let fetched = fetch_pr_merge_state(pr, client);
+        apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
 
     settle_pr_merge_states(store, id, &freshly_merged)
 }
 
-fn poll_pr_merge_state(
+/// The network half of a single PR's merge-state check: just the forge call,
+/// with no store access, so [`check_pr_merges`] can run it concurrently
+/// across independent PRs. `None` mirrors the "no PR number, nothing to
+/// check" early return.
+fn fetch_pr_merge_state(
+    pr: &PullRequestView,
+    client: &crate::forge::ForgeClient,
+) -> Option<std::result::Result<String, String>> {
+    let number = pr.pr_number?;
+    Some(client.get_pull_request_state(number))
+}
+
+/// The store-writing half of a single PR's merge-state check: apply an
+/// already-fetched forge state ([`fetch_pr_merge_state`]) to the PR row and
+/// `freshly_merged`. Kept serial (unlike the fetch) since it mutates shared
+/// state.
+fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
-    client: &crate::forge::ForgeClient,
+    fetched: Option<std::result::Result<String, String>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
-    let Some(number) = pr.pr_number else {
+    let Some(result) = fetched else {
         return;
     };
-    match client.get_pull_request_state(number) {
+    match result {
         Ok(state) if state != "open" => {
             let _ = store.lock().update_pull_request_ex(
                 &pr.id,
@@ -5557,10 +5625,16 @@ fn classify_sync_drift(
     }
 }
 
-pub fn compute_sync_status(
+/// The network half of [`compute_sync_status`]: fetch a PR branch's current
+/// remote tip into its private sync ref, guarded by `sync_fetch_lock` exactly
+/// like the combined function. Split out so [`sync_remote_pr_commits`] can run
+/// it concurrently across every open PR -- the remote side is independent of
+/// every other PR's -- while the local-side comparison stays serial (see that
+/// function's comment on why).
+fn fetch_remote_pr_tip(
     store: &crate::store_lock::StoreHandle,
     pr_id: &str,
-) -> std::result::Result<PrSyncStatus, String> {
+) -> std::result::Result<Option<String>, String> {
     let pr = store
         .lock()
         .get_pull_request(pr_id)
@@ -5577,32 +5651,85 @@ pub fn compute_sync_status(
     let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
+    // Held across both commands so a concurrent re-check of this same PR
+    // can't read back a fetch this one hasn't written yet. See
+    // `SYNC_FETCH_LOCKS`.
+    let fetch_lock = sync_fetch_lock(&root, pr_id);
+    let _fetching = fetch_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dest_ref = sync_fetch_ref(pr_id);
+    // `+` forces the update: a reviewer force-pushing the PR branch
+    // (an amend, a rebase onto a new base) makes its new tip a
+    // non-fast-forward from whatever this ref last pointed at, which a
+    // plain refspec would otherwise refuse to write.
+    let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
+    Ok(git(&root, &["fetch", &remote_name, &refspec])
+        .ok()
+        .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+        .map(|s| s.trim().to_string()))
+}
+
+/// The comparison logic shared by [`compute_sync_status`] and
+/// [`sync_remote_pr_commits`]: given a remote tip, a local tip, and the last
+/// SHA this daemon itself pushed, classify which side (if either) is ahead as
+/// `(pr_ahead, worktree_ahead, in_sync)`.
+///
+/// RAL-190: prefers `last_pushed_sha` -- the SHA this daemon itself last put
+/// on the PR branch -- over raw ancestry. Ancestry alone can't survive a
+/// rebase: replaying a branch onto a shifted base rewrites every commit's
+/// SHA, so neither tip stays an ancestor of the other even when nothing
+/// genuinely diverged (a clean rebase-through, or a conflict that got
+/// resolved -- however much effort that took). `last_pushed_sha` pins the
+/// fork point to "the last state both sides are known to have agreed on": if
+/// only one side has moved away from it, that side is unambiguously ahead
+/// regardless of how it got there. Ancestry is still the fallback when
+/// neither side matches the fork point (never synced yet, or both sides
+/// changed independently since) -- that's a true two-sided divergence.
+fn classify_pr_sync(
+    root: &Path,
+    remote_sha: Option<&str>,
+    local_sha: Option<&str>,
+    last_pushed: Option<&str>,
+) -> (bool, bool, bool) {
+    let is_ancestor = |ancestor: &str, descendant: &str| {
+        git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+    };
+    match (remote_sha, local_sha) {
+        (Some(r), Some(l)) if r == l => (false, false, true),
+        (Some(r), Some(l)) => match last_pushed {
+            Some(p) if p == r => (false, true, false),
+            Some(p) if p == l => (true, false, false),
+            _ => (!is_ancestor(r, l), !is_ancestor(l, r), false),
+        },
+        (Some(_), None) => (true, false, false),
+        (None, Some(_)) => (false, true, false),
+        (None, None) => (false, false, false),
+    }
+}
+
+pub fn compute_sync_status(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<PrSyncStatus, String> {
+    let pr = store
+        .lock()
+        .get_pull_request(pr_id)
+        .map_err(|e| e.to_string())?;
+    let guardian = store
+        .lock()
+        .get_guardian(&pr.guardian_id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+
     let local_ref = local_ref_for_pr(&guardian, &pr);
     let local_sha = local_ref
         .as_deref()
         .and_then(|r| git(&root, &["rev-parse", r]).ok())
         .map(|s| s.trim().to_string());
-    // Held across both commands so a concurrent re-check of this same PR
-    // can't read back a fetch this one hasn't written yet. See
-    // `SYNC_FETCH_LOCKS`.
-    let remote_sha = {
-        let fetch_lock = sync_fetch_lock(&root, pr_id);
-        let _fetching = fetch_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dest_ref = sync_fetch_ref(pr_id);
-        // `+` forces the update: a reviewer force-pushing the PR branch
-        // (an amend, a rebase onto a new base) makes its new tip a
-        // non-fast-forward from whatever this ref last pointed at, which a
-        // plain refspec would otherwise refuse to write.
-        let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-        git(&root, &["fetch", &remote_name, &refspec])
-            .ok()
-            .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
-            .map(|s| s.trim().to_string())
-    };
+    let remote_sha = fetch_remote_pr_tip(store, pr_id)?;
 
-    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+    let (pr_ahead, worktree_ahead, in_sync) = classify_pr_sync(
         &root,
         remote_sha.as_deref(),
         local_sha.as_deref(),
@@ -5757,9 +5884,57 @@ pub fn sync_remote_pr_commits(
             .unwrap_or(i64::MAX)
     });
 
+    // Every open PR's remote tip is independent of every other PR's -- fetch
+    // them all at once instead of one at a time, cutting this from N
+    // sequential network round trips to one. The local-side comparison and
+    // the actual pull stay serial below, in stack order: pulling a lower
+    // branch restacks its descendants' worktrees, so a descendant's local
+    // tip is only meaningful once every earlier branch has already been
+    // pulled.
+    let remote_tips: Vec<std::result::Result<Option<String>, String>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = pr_ids
+                .iter()
+                .map(|pr| scope.spawn(|| fetch_remote_pr_tip(store, &pr.id)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("remote PR fetch panicked".to_string()))
+                })
+                .collect()
+        });
+
     let mut pulled = 0;
-    for pr in pr_ids {
-        if !compute_sync_status(store, &pr.id)?.pr_ahead {
+    for (pr, remote_sha) in pr_ids.iter().zip(remote_tips) {
+        let remote_sha = remote_sha?;
+        let guardian = store
+            .lock()
+            .get_guardian(&pr.guardian_id)
+            .map_err(|e| e.to_string())?;
+        let root = PathBuf::from(&guardian.git_root);
+        let local_ref = if let Some(bid) = &pr.branch_id {
+            guardian
+                .branches
+                .iter()
+                .find(|b| &b.id == bid)
+                .and_then(|b| b.review_branch.clone())
+        } else {
+            guardian.review_branch.clone()
+        };
+        let local_sha = local_ref
+            .as_deref()
+            .and_then(|r| git(&root, &["rev-parse", r]).ok())
+            .map(|s| s.trim().to_string());
+        let (pr_ahead, _, _) = classify_pr_sync(
+            &root,
+            remote_sha.as_deref(),
+            local_sha.as_deref(),
+            pr.last_pushed_sha.as_deref(),
+        );
+        if !pr_ahead {
             continue;
         }
         if pull_pr_commits(store, runner, &pr.id)
@@ -10666,14 +10841,8 @@ mod tests {
             .lock()
             .create_guardian("demo", "main", root.to_str().unwrap())
             .unwrap();
-        store
-            .lock()
-            .add_guardian_branch(&gid, "branch-a")
-            .unwrap();
-        store
-            .lock()
-            .add_guardian_branch(&gid, "branch-b")
-            .unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-a").unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-b").unwrap();
         let ids_guardian = store.lock().get_guardian(&gid).unwrap();
         let branch_a_id = ids_guardian.branches[0].id.clone();
         let branch_b_id = ids_guardian.branches[1].id.clone();
