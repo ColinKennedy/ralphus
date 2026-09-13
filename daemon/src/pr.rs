@@ -778,6 +778,205 @@ impl Store {
             Ok(())
         }
     }
+
+    // -----------------------------------------------------------------
+    // RAL-366: cached forge state (background poller)
+    // -----------------------------------------------------------------
+
+    /// Upsert the background poller's most recent forge probe of one PR
+    /// (RAL-366). `ok` is whether this poll pass actually reached the forge
+    /// (git-side drift and forge-side comment fetch are both attempted every
+    /// pass, but either can fail independently -- e.g. the fetch lock was
+    /// held by an interactive `sync-status` call this cycle, or the forge
+    /// rejected the token); `last_error` is only meaningful when `!ok`.
+    /// Every other field is `COALESCE`d against the existing row so a half
+    /// that failed (or that this pass didn't even attempt) never clobbers
+    /// the other half's last-known-good value -- only `last_checked_at_ms`/
+    /// `status`/`last_error` unconditionally reflect *this* pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_pr_forge_cache(
+        &self,
+        pr_id: &str,
+        ok: bool,
+        last_error: Option<&str>,
+        in_sync: Option<bool>,
+        pr_ahead: Option<bool>,
+        worktree_ahead: Option<bool>,
+        remote_sha: Option<&str>,
+        local_sha: Option<&str>,
+        etag_conversation: Option<&str>,
+        etag_review: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(
+                pr_id, last_checked_at_ms, status, last_error,
+                in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha,
+                etag_conversation, etag_review
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(pr_id) DO UPDATE SET
+                last_checked_at_ms = excluded.last_checked_at_ms,
+                status             = excluded.status,
+                last_error         = excluded.last_error,
+                in_sync            = COALESCE(excluded.in_sync, in_sync),
+                pr_ahead           = COALESCE(excluded.pr_ahead, pr_ahead),
+                worktree_ahead     = COALESCE(excluded.worktree_ahead, worktree_ahead),
+                remote_sha         = COALESCE(excluded.remote_sha, remote_sha),
+                local_sha          = COALESCE(excluded.local_sha, local_sha),
+                etag_conversation  = COALESCE(excluded.etag_conversation, etag_conversation),
+                etag_review        = COALESCE(excluded.etag_review, etag_review)",
+            params![
+                pr_id,
+                now_ms(),
+                if ok { "ok" } else { "unknown" },
+                last_error,
+                in_sync,
+                pr_ahead,
+                worktree_ahead,
+                remote_sha,
+                local_sha,
+                etag_conversation,
+                etag_review,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read this PR's own stored ETags (RAL-366), if a prior poll pass ever
+    /// recorded one -- so the next conditional fetch can send
+    /// `If-None-Match` and cost no forge quota when nothing changed.
+    pub(crate) fn pr_forge_cache_etags(
+        &self,
+        pr_id: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT etag_conversation, etag_review FROM guardian_pr_forge_cache WHERE pr_id=?",
+                params![pr_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((None, None)))
+    }
+
+    /// Wholesale-replace the comment/note ids the RAL-366 poller last fetched
+    /// for `(pr_id, endpoint)` -- called only after a fresh (non-304)
+    /// conditional fetch, so a comment deleted on the forge between polls
+    /// disappears here too. Never stores comment bodies -- see
+    /// `guardian_pr_forge_comments`'s schema comment for why.
+    pub(crate) fn replace_pr_forge_comments(
+        &self,
+        pr_id: &str,
+        endpoint: &str,
+        comments: &[crate::forge::PrComment],
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM guardian_pr_forge_comments WHERE pr_id=? AND endpoint=?",
+            params![pr_id, endpoint],
+        )?;
+        for c in comments {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO guardian_pr_forge_comments(
+                    pr_id, endpoint, external_id, author, created_at
+                 ) VALUES(?,?,?,?,?)",
+                params![pr_id, endpoint, c.external_id, c.author, c.created_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// This PR's cached forge state (RAL-366), if the background poller has
+    /// ever reached it -- `None` for a PR never polled yet (e.g. just
+    /// submitted this cycle). Comment count/un-actioned count/latest-comment
+    /// fields are always a live join against `guardian_pr_forge_comments` and
+    /// `guardian_pr_feedback_actioned`, never a second cached integer, so
+    /// they can never drift out of sync with those tables' own data.
+    pub fn get_pr_forge_cache(&self, pr_id: &str) -> Result<Option<PrForgeCacheView>> {
+        self.conn
+            .query_row(
+                &format!("{PR_FORGE_CACHE_SELECT} WHERE c.pr_id=?"),
+                params![pr_id],
+                map_pr_forge_cache_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Every PR's cached forge state in one query (RAL-366) -- backs the
+    /// list-view read route so a board rendering many rows never makes one
+    /// lookup per row. Only PRs the poller has reached at least once appear;
+    /// a caller wanting to render every open PR should left-join this
+    /// against [`Self::list_pull_requests_index`] on `pr_id`/`id`.
+    pub fn list_pr_forge_cache(&self) -> Result<Vec<PrForgeCacheView>> {
+        let mut stmt = self.conn.prepare(PR_FORGE_CACHE_SELECT)?;
+        let rows = stmt
+            .query_map([], map_pr_forge_cache_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// Shared `SELECT` behind [`Store::get_pr_forge_cache`]/[`Store::list_pr_forge_cache`]
+/// (RAL-366): the comment-derived columns are correlated subqueries rather
+/// than a `JOIN ... GROUP BY`, since a plain join would double-count once a
+/// PR has both `'conversation'` and `'review'` comment rows.
+const PR_FORGE_CACHE_SELECT: &str = "
+    SELECT
+        c.pr_id, c.last_checked_at_ms, c.status, c.last_error,
+        c.in_sync, c.pr_ahead, c.worktree_ahead, c.remote_sha, c.local_sha,
+        (SELECT COUNT(*) FROM guardian_pr_forge_comments cm WHERE cm.pr_id = c.pr_id),
+        (SELECT COUNT(*) FROM guardian_pr_forge_comments cm
+           WHERE cm.pr_id = c.pr_id
+             AND NOT EXISTS (
+                 SELECT 1 FROM guardian_pr_feedback_actioned a
+                  WHERE a.pr_id = cm.pr_id AND a.external_comment_id = cm.external_id
+             )),
+        (SELECT cm.author FROM guardian_pr_forge_comments cm
+          WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1),
+        (SELECT cm.created_at FROM guardian_pr_forge_comments cm
+          WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1)
+    FROM guardian_pr_forge_cache c";
+
+fn map_pr_forge_cache_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrForgeCacheView> {
+    Ok(PrForgeCacheView {
+        pr_id: r.get(0)?,
+        last_checked_at_ms: r.get(1)?,
+        status: r.get(2)?,
+        last_error: r.get(3)?,
+        in_sync: r.get(4)?,
+        pr_ahead: r.get(5)?,
+        worktree_ahead: r.get(6)?,
+        remote_sha: r.get(7)?,
+        local_sha: r.get(8)?,
+        comment_count: r.get(9)?,
+        unactioned_count: r.get(10)?,
+        latest_comment_author: r.get(11)?,
+        latest_comment_at: r.get(12)?,
+    })
+}
+
+/// One PR's cached forge state (RAL-366): populated only by the background
+/// poller (`refresh_pr_forge_cache_once`), never by an on-demand route --
+/// [`compute_sync_status`]/`list_pr_comments` stay live and authoritative.
+/// `status` is `"ok"` (every field below reflects the most recent
+/// successfully-reached poll) or `"unknown"` (the forge/git side was
+/// unreachable on the last attempt -- see `last_error` -- though the other
+/// fields may still carry a stale-but-known value from an earlier pass).
+#[derive(Debug, Clone, Serialize)]
+pub struct PrForgeCacheView {
+    pub pr_id: String,
+    pub last_checked_at_ms: i64,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub in_sync: Option<bool>,
+    pub pr_ahead: Option<bool>,
+    pub worktree_ahead: Option<bool>,
+    pub remote_sha: Option<String>,
+    pub local_sha: Option<String>,
+    pub comment_count: i64,
+    pub unactioned_count: i64,
+    pub latest_comment_author: Option<String>,
+    pub latest_comment_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3096,13 +3295,310 @@ pub fn poll_pr_base_drift(
     Ok(pulled)
 }
 
-/// Poll every guardian with an open PR stack for forge-side base drift
-/// (RAL-279) once, logging a Cartographer entry per guardian where anything
-/// changed. Never touches a review with no submitted PRs (RAL-279's "no
-/// forge calls for a review that was never submitted" requirement) since
+// ---------------------------------------------------------------------------
+// RAL-366: cached forge state (background poller)
+// ---------------------------------------------------------------------------
+
+/// How long the cache poller waits before retrying a forge client that just
+/// returned a rate-limit response, when the forge gave no `Retry-After`
+/// header to honor instead.
+const DEFAULT_RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-forge-client rate-limit backoff state, keyed by `"{kind}:{repo_label}"`
+/// -- shared across every guardian's poll pass in this process, so a
+/// 429/403 observed while polling one guardian's PRs also holds off comment
+/// fetches for another guardian on the same repo within the same cycle,
+/// rather than each rediscovering the rate limit independently.
+static PR_CACHE_BACKOFF: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn forge_client_backoff_key(client: &crate::forge::ForgeClient) -> String {
+    format!("{}:{}", client.kind().as_str(), client.repo_label())
+}
+
+/// Whether `client` is still cooling down from a prior rate-limit response
+/// this process has already seen.
+fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
+    let key = forge_client_backoff_key(client);
+    PR_CACHE_BACKOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|resume_at| std::time::Instant::now() < *resume_at)
+}
+
+/// Start (or extend) a rate-limit backoff window for `client`, honoring the
+/// forge's own `Retry-After` when it sent one instead of guessing.
+fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::time::Duration>) {
+    let key = forge_client_backoff_key(client);
+    let resume_at = std::time::Instant::now() + retry_after.unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF);
+    PR_CACHE_BACKOFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, resume_at);
+}
+
+/// Poll one PR's comment endpoint(s) -- both of GitHub's conversation/review
+/// endpoints, or GitLab's single notes endpoint -- via
+/// [`crate::forge::ForgeClient::list_pr_comments_conditional`], replacing
+/// `guardian_pr_forge_comments` rows for any endpoint that returned a fresh
+/// (non-304) body. Returns the etags to persist (unchanged when a poll was
+/// skipped/304/errored) and an error message when a call actually failed --
+/// a client already cooling down from a prior rate-limit response is
+/// silently skipped rather than re-attempted and re-erroring every cycle.
+fn poll_pr_comments(
+    store: &crate::store_lock::StoreHandle,
+    client: &crate::forge::ForgeClient,
+    pr_id: &str,
+    number: i64,
+    etag_conversation: Option<String>,
+    etag_review: Option<String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if is_backed_off(client) {
+        return (
+            etag_conversation,
+            etag_review,
+            Some("forge rate-limited; backing off".to_string()),
+        );
+    }
+    let mut error = None;
+    let poll_one =
+        |endpoint: crate::forge::PrCommentEndpoint, prior_etag: Option<String>| match client
+            .list_pr_comments_conditional(number, endpoint, prior_etag.as_deref())
+        {
+            Ok(crate::forge::CommentsPoll::NotModified) => (prior_etag, None),
+            Ok(crate::forge::CommentsPoll::Modified { comments, etag }) => {
+                let table_endpoint = match endpoint {
+                    crate::forge::PrCommentEndpoint::Conversation => "conversation",
+                    crate::forge::PrCommentEndpoint::Review => "review",
+                };
+                let _ = store
+                    .lock()
+                    .replace_pr_forge_comments(pr_id, table_endpoint, &comments);
+                (etag.or(prior_etag), None)
+            }
+            Err(e) => {
+                if e.is_rate_limited() {
+                    start_backoff(client, e.retry_after);
+                }
+                (prior_etag, Some(e.to_string()))
+            }
+        };
+    let (new_conv, conv_err) = poll_one(
+        crate::forge::PrCommentEndpoint::Conversation,
+        etag_conversation,
+    );
+    error = error.or(conv_err);
+    // GitLab's single `/notes` endpoint already returned both conversation
+    // and review comments above -- polling it a second time under `Review`
+    // would just duplicate the exact same rows.
+    let new_review = if client.kind() == crate::forge::ForgeKind::GitHub {
+        let (new_review, review_err) =
+            poll_one(crate::forge::PrCommentEndpoint::Review, etag_review);
+        error = error.or(review_err);
+        new_review
+    } else {
+        etag_review
+    };
+    (new_conv, new_review, error)
+}
+
+/// Refresh cached forge state for every currently-open, forge-numbered PR
+/// belonging to guardian `id`: one batched `git fetch` covering every PR's
+/// branch, plus a conditional comment fetch per PR, writing straight to
+/// `guardian_pr_forge_cache`/`guardian_pr_forge_comments`
+/// ([`Store::upsert_pr_forge_cache`]/[`Store::replace_pr_forge_comments`]).
+/// Never touches a scheduler concurrency permit, and never holds the store
+/// lock across a network call -- mirrors `summary_worker`'s precedent for
+/// background work that must not block a request thread or the store lock on
+/// a subprocess/network call.
+///
+/// The git fetch acquires each PR's own [`SYNC_FETCH_LOCKS`] entry via
+/// `try_lock`, never blocking: a PR whose lock is currently held by an
+/// interactive `sync-status` call is simply left out of this cycle's batch
+/// (its drift fields keep their last-known value; its comments still refresh
+/// independently) rather than making the interactive caller wait on this
+/// poller, or vice versa -- the "poller yields to foreground work"
+/// requirement.
+///
+/// Every PR under one guardian shares the same remote
+/// ([`PrRepoRouting::remote_for`] ignores its `repo` argument once a fork is
+/// registered, and is a single plain fallback otherwise), so one `git fetch`
+/// with every PR's refspec here replaces what would otherwise be one fetch
+/// per PR -- the batching this ticket asks for. Two guardians that happen to
+/// share a git root still each fetch separately: collapsing across
+/// guardians would mean restructuring this whole poll loop from per-guardian
+/// to per-root across every guardian in the daemon, which isn't worth the
+/// risk for what is already an N-to-1 reduction per guardian's own stack.
+fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, id: &str) {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
+        return;
+    };
+    let prs: Vec<PullRequestView> = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.state == "open" && p.pr_number.is_some())
+        .collect();
+    if prs.is_empty() {
+        return;
+    }
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let remote_name = routing.remote_for("").to_string();
+
+    let locks: Vec<Arc<Mutex<()>>> = prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
+    let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
+        locks.iter().map(|l| l.try_lock().ok()).collect();
+    let refspecs: Vec<String> = prs
+        .iter()
+        .zip(guards.iter())
+        .filter(|(_, g)| g.is_some())
+        .map(|(pr, _)| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
+        .collect();
+    if !refspecs.is_empty() {
+        let mut args: Vec<&str> = vec!["fetch", &remote_name];
+        args.extend(refspecs.iter().map(String::as_str));
+        let _ = git(&root, &args);
+    }
+
+    for (pr, guard) in prs.iter().zip(guards.iter()) {
+        let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
+        let drift = guard.is_some().then(|| {
+            let local_ref = local_ref_for_pr(&guardian, pr);
+            let local_sha = local_ref
+                .as_deref()
+                .and_then(|r| git(&root, &["rev-parse", r]).ok())
+                .map(|s| s.trim().to_string());
+            let remote_sha = git(&root, &["rev-parse", &sync_fetch_ref(&pr.id)])
+                .ok()
+                .map(|s| s.trim().to_string());
+            let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+                &root,
+                remote_sha.as_deref(),
+                local_sha.as_deref(),
+                pr.last_pushed_sha.as_deref(),
+            );
+            (in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha)
+        });
+        let (in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha) = match drift {
+            Some((a, b, c, d, e)) => (Some(a), Some(b), Some(c), d, e),
+            None => (None, None, None, None, None),
+        };
+
+        // Fetched before either write path below so the post-write
+        // comparison reflects an actual state transition, not this pass's
+        // own new value.
+        let previous_status = store
+            .lock()
+            .get_pr_forge_cache(&pr.id)
+            .ok()
+            .flatten()
+            .map(|c| c.status);
+
+        let (ok, comment_error, new_conversation_etag, new_review_etag) =
+            match routing.client_for(&pr.repo) {
+                Some(client) => {
+                    let (etag_conversation, etag_review) = store
+                        .lock()
+                        .pr_forge_cache_etags(&pr.id)
+                        .unwrap_or((None, None));
+                    let (new_conversation_etag, new_review_etag, comment_error) = poll_pr_comments(
+                        store,
+                        client,
+                        &pr.id,
+                        number,
+                        etag_conversation,
+                        etag_review,
+                    );
+                    (
+                        comment_error.is_none(),
+                        comment_error,
+                        new_conversation_etag,
+                        new_review_etag,
+                    )
+                }
+                // No resolvable forge client (missing token, unregistered
+                // remote, ...) -- degrade the comments half to "unknown" but
+                // still persist whatever drift this pass computed.
+                None => (
+                    false,
+                    Some("no forge client could be resolved for this PR's repo".to_string()),
+                    None,
+                    None,
+                ),
+            };
+
+        let _ = store.lock().upsert_pr_forge_cache(
+            &pr.id,
+            ok,
+            comment_error.as_deref(),
+            in_sync,
+            pr_ahead,
+            worktree_ahead,
+            remote_sha.as_deref(),
+            local_sha.as_deref(),
+            new_conversation_etag.as_deref(),
+            new_review_etag.as_deref(),
+        );
+        let new_status = if ok { "ok" } else { "unknown" };
+        if previous_status.as_deref() != Some(new_status) {
+            // A genuine reachability transition (first poll, forge recovered,
+            // or forge just became unreachable) -- logged per
+            // `.agent/logging-policy.md`'s Cartographer pairing, unlike the
+            // per-cycle "still unknown"/"still ok" case below, which would
+            // spam every poll interval for as long as an outage lasts.
+            let level = if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            };
+            crate::cartographer::Note::new("pr")
+                .level(level)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    format!(
+                        "ralphus [pr] review {id} pr={} forge cache poll: now {new_status}",
+                        pr.id
+                    ),
+                    serde_json::json!({
+                        "pr_id": pr.id,
+                        "status": new_status,
+                        "error": comment_error,
+                    }),
+                );
+        } else if let Some(err) = comment_error {
+            // DEBUG, not WARNING/ERROR: an unreachable forge or expired
+            // token is expected to recur every cycle until fixed, and this
+            // poller must not spam logs for a condition the on-demand routes
+            // already surface loudly when a human actually asks.
+            // ralphus[ignore-rlog-pair]: per-PR poll detail already covered by the state-transition Cartographer emit above on first occurrence
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] review {id} pr={} forge cache poll: {err}",
+                pr.id
+            );
+        }
+    }
+}
+
+/// Poll every guardian with an open PR stack once (RAL-279's forge-side base
+/// drift, plus RAL-366's cached branch-drift/comment state), logging a
+/// Cartographer entry per guardian where the base-drift half changed. Never
+/// touches a review with no submitted PRs (RAL-279's "no forge calls for a
+/// review that was never submitted" requirement) since
 /// [`Store::guardian_ids_with_open_pull_requests`] only returns guardians
-/// that already have one.
-fn poll_pr_base_drift_once(store: &crate::store_lock::StoreHandle) {
+/// that already have one. One target list shared by both halves per RAL-366's
+/// "one thread, one target list" requirement; each guardian's own base-drift
+/// check and cache refresh stay separate calls below rather than one fused
+/// function, since they hit unrelated forge endpoints and RAL-279's existing
+/// base-drift/cascading-resync logic is already well-exercised -- merging
+/// their call sites would add risk without saving a network round-trip.
+fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle) {
     let ids = match store.lock().guardian_ids_with_open_pull_requests() {
         Ok(ids) => ids,
         Err(e) => {
@@ -3139,21 +3635,33 @@ fn poll_pr_base_drift_once(store: &crate::store_lock::StoreHandle) {
                 );
             }
         }
+        refresh_pr_forge_cache_for_guardian(store, &id);
     }
 }
 
-/// Interval between forge-side base drift polls (RAL-279) -- infrequent
-/// since it's a best-effort reconciliation against manual forge activity,
-/// not something latency-sensitive.
-const PR_BASE_DRIFT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Spawn the background loop that periodically calls
-/// [`poll_pr_base_drift_once`] for as long as the daemon runs (RAL-279).
+/// [`run_pr_forge_poll_cycle`] for as long as the daemon runs (RAL-279,
+/// folding in RAL-366's cached-forge-state refresh per that ticket's "do not
+/// spawn a second independent poller" decision). The interval and an
+/// on/off switch are read fresh from [`crate::config::load_pr_cache_config`]
+/// at the top of every cycle (not just once at startup), so a config edit
+/// takes effect on this daemon without a restart -- matching this module's
+/// "load config fresh where needed" style. Skips a cycle entirely during a
+/// configured `[daemon].downtime` window (RAL-122): this is opportunistic
+/// background reconciliation, not user-facing work, so it yields the same
+/// way scheduled cell claims do.
 pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(PR_BASE_DRIFT_POLL_INTERVAL);
-            poll_pr_base_drift_once(&store);
+            let cache_cfg = crate::config::load_pr_cache_config();
+            std::thread::sleep(cache_cfg.poll_interval());
+            if !cache_cfg.enabled() {
+                continue;
+            }
+            if crate::config::scheduler_in_downtime() {
+                continue;
+            }
+            run_pr_forge_poll_cycle(&store);
         }
     });
 }
@@ -4830,6 +5338,53 @@ pub struct PrSyncStatus {
 /// `git merge-base --is-ancestor` in both directions. A combined-worktree PR
 /// (`branch_id = None`) compares against the guardian's combined review
 /// branch; a stacked PR compares against its own branch's review branch.
+/// The review worktree ref a PR compares its remote branch against (RAL-190):
+/// a stacked branch's own `review_branch` when `pr.branch_id` names one,
+/// else the guardian's combined `review_branch`. Shared by
+/// [`compute_sync_status`] and the RAL-366 cache poller's batched drift check
+/// so the two never disagree about which local ref a PR's drift is measured
+/// against.
+fn local_ref_for_pr(guardian: &GuardianView, pr: &PullRequestView) -> Option<String> {
+    if let Some(bid) = &pr.branch_id {
+        guardian
+            .branches
+            .iter()
+            .find(|b| &b.id == bid)
+            .and_then(|b| b.review_branch.clone())
+    } else {
+        guardian.review_branch.clone()
+    }
+}
+
+/// Classify drift between a PR's remote branch tip and its review worktree
+/// tip into `(pr_ahead, worktree_ahead, in_sync)` (RAL-190) -- the
+/// comparison [`compute_sync_status`] and the RAL-366 cache poller's batched
+/// drift check both need, extracted so the two can never classify the same
+/// (remote, local, last_pushed) triple differently. See
+/// [`compute_sync_status`]'s prior inline version for the full rationale on
+/// preferring `last_pushed` over raw ancestry.
+fn classify_sync_drift(
+    root: &Path,
+    remote_sha: Option<&str>,
+    local_sha: Option<&str>,
+    last_pushed: Option<&str>,
+) -> (bool, bool, bool) {
+    let is_ancestor = |ancestor: &str, descendant: &str| {
+        git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+    };
+    match (remote_sha, local_sha) {
+        (Some(r), Some(l)) if r == l => (false, false, true),
+        (Some(r), Some(l)) => match last_pushed {
+            Some(p) if p == r => (false, true, false),
+            Some(p) if p == l => (true, false, false),
+            _ => (!is_ancestor(r, l), !is_ancestor(l, r), false),
+        },
+        (Some(_), None) => (true, false, false),
+        (None, Some(_)) => (false, true, false),
+        (None, None) => (false, false, false),
+    }
+}
+
 pub fn compute_sync_status(
     store: &crate::store_lock::StoreHandle,
     pr_id: &str,
@@ -4850,15 +5405,7 @@ pub fn compute_sync_status(
     let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
-    let local_ref = if let Some(bid) = &pr.branch_id {
-        guardian
-            .branches
-            .iter()
-            .find(|b| &b.id == bid)
-            .and_then(|b| b.review_branch.clone())
-    } else {
-        guardian.review_branch.clone()
-    };
+    let local_ref = local_ref_for_pr(&guardian, &pr);
     let local_sha = local_ref
         .as_deref()
         .and_then(|r| git(&root, &["rev-parse", r]).ok())
@@ -4883,37 +5430,12 @@ pub fn compute_sync_status(
             .map(|s| s.trim().to_string())
     };
 
-    let is_ancestor = |ancestor: &str, descendant: &str| {
-        git(
-            &root,
-            &["merge-base", "--is-ancestor", ancestor, descendant],
-        )
-        .is_ok()
-    };
-    // RAL-190: prefer `last_pushed_sha` -- the SHA this daemon itself last
-    // put on the PR branch -- over raw ancestry when classifying which side
-    // is "ahead". Ancestry alone can't survive a rebase: replaying a branch
-    // onto a shifted base rewrites every commit's SHA, so neither tip stays
-    // an ancestor of the other even when nothing genuinely diverged (a
-    // clean rebase-through, or a conflict that got resolved -- however much
-    // effort that took). `last_pushed_sha` pins the fork point to "the last
-    // state both sides are known to have agreed on": if only one side has
-    // moved away from it, that side is unambiguously ahead regardless of
-    // how it got there. Ancestry is still the fallback when neither side
-    // matches the fork point (never synced yet, or both sides changed
-    // independently since) -- that's a true two-sided divergence.
-    let last_pushed = pr.last_pushed_sha.as_deref();
-    let (pr_ahead, worktree_ahead, in_sync) = match (&remote_sha, &local_sha) {
-        (Some(r), Some(l)) if r == l => (false, false, true),
-        (Some(r), Some(l)) => match last_pushed {
-            Some(p) if p == r => (false, true, false),
-            Some(p) if p == l => (true, false, false),
-            _ => (!is_ancestor(r, l), !is_ancestor(l, r), false),
-        },
-        (Some(_), None) => (true, false, false),
-        (None, Some(_)) => (false, true, false),
-        (None, None) => (false, false, false),
-    };
+    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+        &root,
+        remote_sha.as_deref(),
+        local_sha.as_deref(),
+        pr.last_pushed_sha.as_deref(),
+    );
 
     Ok(PrSyncStatus {
         remote_sha,
@@ -10610,5 +11132,328 @@ mod tests {
             s.clear_guardian_forge_stack_number("nope"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // RAL-366: cached forge state
+    // -----------------------------------------------------------------
+
+    fn make_pr(s: &Store) -> (String, String) {
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let pr_id = s
+            .create_pull_request(
+                &gid,
+                None,
+                "github",
+                "acme/w",
+                "alias",
+                "main",
+                "T",
+                "D",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        (gid, pr_id)
+    }
+
+    #[test]
+    fn get_pr_forge_cache_is_none_before_any_poll() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        assert!(s.get_pr_forge_cache(&pr_id).unwrap().is_none());
+        assert!(s.list_pr_forge_cache().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_pr_forge_cache_coalesces_fields_a_partial_write_omits() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            true,
+            None,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some("abc"),
+            Some("abc"),
+            Some("etag-1"),
+            None,
+        )
+        .unwrap();
+
+        // A later pass that only refreshed the drift half (comments/etags
+        // omitted as `None`) must not blank out the etag a prior pass wrote.
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            true,
+            None,
+            Some(false),
+            Some(true),
+            Some(false),
+            Some("def"),
+            Some("abc"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(cache.status, "ok");
+        assert_eq!(cache.in_sync, Some(false));
+        assert_eq!(cache.pr_ahead, Some(true));
+        assert_eq!(cache.remote_sha.as_deref(), Some("def"));
+        // Etag survived the second, etag-omitting write untouched.
+        let etags = s.pr_forge_cache_etags(&pr_id).unwrap();
+        assert_eq!(etags.0.as_deref(), Some("etag-1"));
+    }
+
+    #[test]
+    fn upsert_pr_forge_cache_unknown_keeps_prior_drift_visible() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            true,
+            None,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some("abc"),
+            Some("abc"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Forge became unreachable this cycle -- status flips, but the
+        // stale-but-known drift from the last successful pass must remain
+        // readable rather than being wiped to `None`.
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            false,
+            Some("forge API 503: offline"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(cache.status, "unknown");
+        assert_eq!(cache.last_error.as_deref(), Some("forge API 503: offline"));
+        assert_eq!(
+            cache.in_sync,
+            Some(true),
+            "stale drift must survive an unknown-status write"
+        );
+    }
+
+    #[test]
+    fn pr_forge_cache_unactioned_count_is_a_live_join_not_a_cached_integer() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        s.replace_pr_forge_comments(
+            &pr_id,
+            "conversation",
+            &[
+                crate::forge::PrComment {
+                    external_id: "1".to_string(),
+                    author: "alice".to_string(),
+                    body: "first".to_string(),
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                },
+                crate::forge::PrComment {
+                    external_id: "2".to_string(),
+                    author: "bob".to_string(),
+                    body: "second".to_string(),
+                    created_at: "2024-01-02T00:00:00Z".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        s.upsert_pr_forge_cache(&pr_id, true, None, None, None, None, None, None, None, None)
+            .unwrap();
+
+        let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(cache.comment_count, 2);
+        assert_eq!(cache.unactioned_count, 2);
+        assert_eq!(cache.latest_comment_author.as_deref(), Some("bob"));
+        assert_eq!(
+            cache.latest_comment_at.as_deref(),
+            Some("2024-01-02T00:00:00Z")
+        );
+
+        // Marking one actioned changes the *join result* on the next read --
+        // never a second stored count that could drift out of step.
+        s.mark_pr_comment_actioned(&pr_id, "1").unwrap();
+        let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(cache.comment_count, 2);
+        assert_eq!(cache.unactioned_count, 1);
+    }
+
+    #[test]
+    fn replace_pr_forge_comments_wholesale_replaces_only_its_own_endpoint() {
+        let s = store();
+        let (_gid, pr_id) = make_pr(&s);
+        let comment = |id: &str| crate::forge::PrComment {
+            external_id: id.to_string(),
+            author: "a".to_string(),
+            body: "b".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        s.replace_pr_forge_comments(&pr_id, "conversation", &[comment("1"), comment("2")])
+            .unwrap();
+        s.replace_pr_forge_comments(&pr_id, "review", &[comment("9")])
+            .unwrap();
+        s.upsert_pr_forge_cache(&pr_id, true, None, None, None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            s.get_pr_forge_cache(&pr_id).unwrap().unwrap().comment_count,
+            3
+        );
+
+        // A fresh fetch of just `conversation` (e.g. a GitHub 200, not a
+        // 304) replaces only that endpoint's rows -- `review`'s untouched.
+        s.replace_pr_forge_comments(&pr_id, "conversation", &[comment("3")])
+            .unwrap();
+        assert_eq!(
+            s.get_pr_forge_cache(&pr_id).unwrap().unwrap().comment_count,
+            2,
+            "conversation went from 2 rows to 1; review's 1 row is untouched"
+        );
+    }
+
+    #[test]
+    fn pr_forge_cache_is_cascade_deleted_with_its_pr_row() {
+        let s = store();
+        let (gid, pr_id) = make_pr(&s);
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            true,
+            None,
+            Some(true),
+            Some(false),
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.replace_pr_forge_comments(
+            &pr_id,
+            "conversation",
+            &[crate::forge::PrComment {
+                external_id: "1".to_string(),
+                author: "a".to_string(),
+                body: "b".to_string(),
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+        assert!(s.get_pr_forge_cache(&pr_id).unwrap().is_some());
+
+        // No public hard-delete for a single PR row exists (only soft
+        // `drop_pull_request`) -- deleting the owning guardian is the one
+        // path that actually removes `guardian_pull_requests` rows, so it's
+        // the cascade this test exercises.
+        s.delete_guardian(&gid).unwrap();
+        assert!(
+            s.get_pr_forge_cache(&pr_id).unwrap().is_none(),
+            "the cache row must not outlive the PR row it caches"
+        );
+    }
+
+    /// Build a real git repo + remote + guardian + open, numbered PR
+    /// (via [`review_fixture`]) suitable for exercising
+    /// [`refresh_pr_forge_cache_for_guardian`] end to end. The fixture's
+    /// remote is a plain local bare repo, not an actual forge host, so any
+    /// forge *HTTP* client resolution is expected to fail here -- this
+    /// fixture is for proving the batched-git-fetch/drift half of the
+    /// poller works against a real repo, and that a PR degrades to
+    /// `"unknown"` (not a panic, not silence) when no forge client resolves.
+    fn cache_poll_fixture(tag: &str) -> (PathBuf, crate::store_lock::StoreHandle, String, String) {
+        let (root, _remote_dir, store, pr_id, sha) = review_fixture(
+            tag,
+            |root| gwrite(root, "f.txt", "base\n"),
+            |root| gwrite(root, "f.txt", "review\n"),
+        );
+        store
+            .lock()
+            .update_pull_request_ex(&pr_id, Some(Some(1)), None, None, None, None, None, None)
+            .unwrap();
+        (root, store, pr_id, sha)
+    }
+
+    #[test]
+    fn refresh_pr_forge_cache_computes_drift_and_degrades_comments_to_unknown() {
+        let (_root, store, pr_id, sha) = cache_poll_fixture("cache-drift");
+        let guardian_id = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
+
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+
+        let cache = store
+            .lock()
+            .get_pr_forge_cache(&pr_id)
+            .unwrap()
+            .expect("a poll pass must always write a cache row, even a degraded one");
+        // The git side is real and does work even though the "forge" is just
+        // a bare local repo: the pushed `pr-y` branch's tip is exactly the
+        // review-branch commit `review_fixture` created.
+        assert_eq!(cache.remote_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(cache.local_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(cache.in_sync, Some(true));
+        // No forge client resolves from a plain local bare-repo remote --
+        // must degrade visibly, not silently claim success.
+        assert_eq!(cache.status, "unknown");
+        assert!(cache.last_error.is_some());
+    }
+
+    #[test]
+    fn refresh_pr_forge_cache_yields_drift_to_a_held_interactive_lock() {
+        let (root, store, pr_id, _sha) = cache_poll_fixture("cache-lock-yield");
+        let guardian_id = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
+
+        // Pre-seed a known-good drift reading, as if a prior successful pass
+        // (or an on-demand `sync-status` write-through) already ran.
+        store
+            .lock()
+            .upsert_pr_forge_cache(
+                &pr_id,
+                true,
+                None,
+                Some(true),
+                Some(false),
+                Some(false),
+                Some("stale-remote"),
+                Some("stale-local"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Simulate a concurrent interactive `sync-status` call already
+        // holding this PR's fetch lock.
+        let held = sync_fetch_lock(&root, &pr_id);
+        let _guard = held.lock().unwrap();
+
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+
+        let cache = store.lock().get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(
+            cache.remote_sha.as_deref(),
+            Some("stale-remote"),
+            "a PR whose lock is held by interactive work must keep its last-known drift, \
+             not be blocked on or overwritten by the poller"
+        );
+        assert_eq!(cache.local_sha.as_deref(), Some("stale-local"));
+        assert_eq!(cache.in_sync, Some(true));
     }
 }

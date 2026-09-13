@@ -1517,6 +1517,9 @@ fn route_for_user(
         // RAL-362: must precede the generic `pr_id` arm below -- "index" would
         // otherwise be captured as a (nonexistent) PR id.
         ("GET", ["api", "pull-requests", "index"]) => pr_index_list(daemon),
+        // RAL-366: must precede the generic `pr_id` arm below, same reasoning
+        // as `"index"` above.
+        ("GET", ["api", "pull-requests", "forge-cache-index"]) => pr_forge_cache_index(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
@@ -11349,6 +11352,23 @@ fn pr_index_list(daemon: &Daemon) -> Reply {
     }
 }
 
+/// Flat, single-query index of every PR's cached forge state (RAL-366): the
+/// background poller's most recent branch-drift/comment observation, keyed
+/// by `pr_id` so a caller rendering a list of PRs (via `GET .../index`
+/// above) can zip the two together in one request instead of one
+/// `sync-status`/`comments` lookup per row. Only PRs the poller (or a
+/// write-through from `GET .../sync-status`/`GET .../comments`) has reached
+/// at least once appear -- a PR just submitted this cycle is simply absent
+/// until its first poll, which the client should render as "not checked
+/// yet" rather than "unknown" (the latter means a poll was attempted and
+/// failed).
+fn pr_forge_cache_index(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_pr_forge_cache() {
+        Ok(rows) => json(200, &rows),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Look up the ralphus PR row for a given forge PR/MR (PR → worktree
 /// direction): `GET /api/pull-requests?forge=github&repo=acme%2Fwidget&pr_number=42`.
 fn pr_find(daemon: &Daemon, query: &str) -> Reply {
@@ -11456,6 +11476,15 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
+    // RAL-366: write through into the cache the background poller reads
+    // from, so a human explicitly checking comments here also refreshes the
+    // list-view's cached count instead of leaving it to the next poll cycle.
+    // Only the conversation endpoint's rows are written -- this route never
+    // calls GitHub's separate inline-review-comments endpoint, unlike the
+    // poller's own conditional fetch.
+    let _ = store.replace_pr_forge_comments(pr_id, "conversation", &comments);
+    let _ =
+        store.upsert_pr_forge_cache(pr_id, true, None, None, None, None, None, None, None, None);
     let actioned = store.actioned_pr_comment_ids(pr_id).unwrap_or_default();
     let items: Vec<PrCommentItem> = comments
         .into_iter()
@@ -11482,7 +11511,25 @@ fn pr_action_feedback(daemon: &Daemon, pr_id: &str) -> Reply {
 /// worktree (RAL-190) — see [`crate::pr::PrSyncStatus`].
 fn pr_sync_status(daemon: &Daemon, pr_id: &str) -> Reply {
     match crate::pr::compute_sync_status(&daemon.store_handle(), pr_id) {
-        Ok(status) => json(200, &status),
+        Ok(status) => {
+            // RAL-366: write through into the cache the background poller
+            // reads from, so a human's explicit "refresh now" also updates
+            // the list-view's cached drift instead of leaving it stale until
+            // the next poll cycle.
+            let _ = daemon.lock().upsert_pr_forge_cache(
+                pr_id,
+                true,
+                None,
+                Some(status.in_sync),
+                Some(status.pr_ahead),
+                Some(status.worktree_ahead),
+                status.remote_sha.as_deref(),
+                status.local_sha.as_deref(),
+                None,
+                None,
+            );
+            json(200, &status)
+        }
         Err(e) => error(502, "forge_error", &e, vec![]),
     }
 }

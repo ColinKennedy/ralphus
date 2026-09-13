@@ -584,6 +584,75 @@ impl ArbiterConfig {
     }
 }
 
+/// RAL-366: the background poller that caches every open PR's forge state
+/// (un-actioned reviewer feedback, branch drift) -- daemon-singleton
+/// configuration, since one poll pass spans every project's repos rather
+/// than being scoped to a single one, so (like [`ArbiterConfig`]) this is
+/// loaded from the global config file only, never layered per-project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct PrCacheConfig {
+    /// `false` disables the cache poller entirely -- it never runs, and
+    /// every cached row simply stops refreshing (existing rows are left in
+    /// place, not purged). `None`/absent defaults to enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Seconds between poll passes. `None` defaults to
+    /// [`DEFAULT_PR_CACHE_POLL_INTERVAL_SECS`] (RAL-279's original 300s
+    /// base-drift-poll cadence, reused here since this poller folds that
+    /// pass in rather than running alongside it).
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// Fallback [`PrCacheConfig::poll_interval_secs`] when unset -- RAL-279's
+/// original hardcoded `PR_BASE_DRIFT_POLL_INTERVAL`.
+pub const DEFAULT_PR_CACHE_POLL_INTERVAL_SECS: u64 = 300;
+
+impl PrCacheConfig {
+    /// Whether the poller should run at all. Defaults to `true`.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The effective poll interval, defaulting to
+    /// [`DEFAULT_PR_CACHE_POLL_INTERVAL_SECS`] when unset or implausibly
+    /// small (a misconfigured `0` would otherwise busy-loop the poller
+    /// against every open PR's forge).
+    #[must_use]
+    pub fn poll_interval(&self) -> Duration {
+        const MIN_SECS: u64 = 5;
+        Duration::from_secs(
+            self.poll_interval_secs
+                .filter(|&secs| secs >= MIN_SECS)
+                .unwrap_or(DEFAULT_PR_CACHE_POLL_INTERVAL_SECS),
+        )
+    }
+}
+
+/// Parse a `PrCacheConfig` from the given TOML text; the default (enabled,
+/// 300s) when the `[pr_cache]` table is absent.
+#[must_use]
+pub fn pr_cache_from_toml_str(s: &str) -> PrCacheConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .pr_cache
+        .unwrap_or_default()
+}
+
+/// Load the daemon-singleton RAL-366 PR-cache-poller config from the global
+/// config file only -- see [`PrCacheConfig`]'s doc comment for why there is
+/// deliberately no per-project layering. Computed fresh at each call site
+/// (the poller's own sleep-loop, RAL-279-style), matching this module's
+/// "load config fresh where needed" style (e.g. [`load_arbiter_config`]).
+#[must_use]
+pub fn load_pr_cache_config() -> PrCacheConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| pr_cache_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// A project's known monorepo subproject identifiers (`[monorepo]` table,
 /// RAL-346) -- an explicit, user-provided hint rather than an auto-detected
 /// directory scan (per this ticket's Out-of-Scope note: "perfect
@@ -1665,6 +1734,8 @@ struct ConfigFile {
     #[serde(default)]
     arbiter: Option<ArbiterConfig>,
     #[serde(default)]
+    pr_cache: Option<PrCacheConfig>,
+    #[serde(default)]
     monorepo: Option<MonorepoConfig>,
     #[serde(default)]
     review: Option<ReviewConfig>,
@@ -2420,6 +2491,38 @@ mod tests {
             arbiter_from_toml_str("[review]\nskip_worktrees = true\n"),
             ArbiterConfig::default()
         );
+    }
+
+    // ── pr_cache (RAL-366) ──────────────────────────────────────────────────
+
+    #[test]
+    fn pr_cache_config_unset_is_enabled_with_the_default_interval() {
+        let c = PrCacheConfig::default();
+        assert!(c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn pr_cache_config_absent_table_is_default() {
+        assert_eq!(
+            pr_cache_from_toml_str("[review]\nskip_worktrees = true\n"),
+            PrCacheConfig::default()
+        );
+    }
+
+    #[test]
+    fn parse_pr_cache_config_overrides() {
+        let c = pr_cache_from_toml_str("[pr_cache]\nenabled = false\npoll_interval_secs = 60\n");
+        assert!(!c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn pr_cache_config_clamps_an_implausibly_small_interval_to_the_default() {
+        // A misconfigured `0` (or anything under the sanity floor) must not
+        // busy-loop the poller against every open PR's forge.
+        let c = pr_cache_from_toml_str("[pr_cache]\npoll_interval_secs = 0\n");
+        assert_eq!(c.poll_interval(), Duration::from_secs(300));
     }
 
     // ── monorepo (RAL-346) ──────────────────────────────────────────────────
