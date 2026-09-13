@@ -1802,15 +1802,6 @@ mod tests {
     fn delete_pane_snapshot_removes_the_file() {
         let dir = TempSnapshotDir::new("delete");
         write_pane_snapshot_in(&dir.0, "s", "some output");
-<<<<<<< HEAD
-        assert!(read_pane_snapshot_in(&dir.0, "s").is_some());
-        delete_pane_snapshot_in(&dir.0, "s");
-        assert_eq!(read_pane_snapshot_in(&dir.0, "s"), None);
-    }
-
-    #[test]
-    fn delete_pane_snapshot_on_a_never_written_session_is_a_silent_no_op() {
-=======
         assert!(pane_snapshot_path_in(&dir.0, "s").exists());
         delete_pane_snapshot_in(&dir.0, "s");
         assert!(!pane_snapshot_path_in(&dir.0, "s").exists());
@@ -1818,7 +1809,6 @@ mod tests {
 
     #[test]
     fn delete_pane_snapshot_of_a_never_written_session_is_a_silent_no_op() {
->>>>>>> 0dbcd3b8 (feat(RAL-348): Worktree transcript retirement)
         let dir = TempSnapshotDir::new("delete-missing");
         delete_pane_snapshot_in(&dir.0, "never-written");
     }

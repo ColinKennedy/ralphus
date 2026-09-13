@@ -4702,7 +4702,6 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-<<<<<<< HEAD
     /// Every cell/proof session whose persisted `cwd` can name a worktree,
     /// unfiltered by which one -- the path-equality check against a specific
     /// worktree happens in Rust via `guardian_merge::normalized_worktree_path`,
