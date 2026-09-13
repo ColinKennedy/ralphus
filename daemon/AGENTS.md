@@ -17,6 +17,25 @@ base resync, stacking) must follow
 parity + REST-over-CLI, and always folding a PR/MR into the review's
 existing stack, with regression tests to match.
 
+## Project display: name, never a raw path (RAL-396)
+
+Whenever a cell/worktree resolves to a registered project, any API response
+consumed by the web board must expose that project's *name*
+(`Store::project_name_for_path`), not the on-disk path it resolved from. A
+cell can run on a remote machine (RAL-185), so its path is not a stable,
+UI-facing concept — it can be unknowable or change out from under a running
+board. The whole point of registering a project is to give the UI something
+stable to key off of instead of a path.
+
+Concretely: resolve worktree → project *server-side* (daemon or librarian),
+using `Store::project_name_for_path` (already the resolver used by PR/fork
+routing in `pr.rs`) — never ship a raw path to `librarian/assets/board/*.js`
+for the UI to resolve or display itself. Fall back to showing the raw path
+only when no registered project matches at all (there is no registered
+project to protect the path's meaning); once a project association exists,
+its name is the only thing the UI shows. `server.rs::squad_worktrees`
+(`CellPaths::project`) is the reference implementation.
+
 ## Tmux cell process-tree confinement (RAL-321)
 
 On Windows, `tmux.rs`'s `confine` module assigns each cell's `new-session`
