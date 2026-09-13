@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ralphus_core::schema::{ResolvedAgent, TaskFile};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
 
@@ -616,6 +616,90 @@ pub struct ProjectView {
     pub vcs: String,
     /// Registration time (Unix epoch milliseconds).
     pub created_at_ms: i64,
+}
+
+/// RAL-408: a project's DEFAULT review settings, editable any time from the
+/// board's Projects tab (meatball menu) or `ralphus project
+/// review-settings`, and consulted by [`Store::resolve_review_config`] as a
+/// layer over the file-based `.ralphus.toml [review]` defaults
+/// (`crate::config::resolve`). Unlike the write-once "stamp" columns on
+/// `projects` (`skip_base_updates` &c., RAL-250/307/317/378) this is a
+/// genuinely live-editable settings surface.
+///
+/// Every field mirrors a `ReviewConfig` field already wired to a
+/// `ProjectDefault` entry in `daemon::config::REVIEW_FIELD_PARITY` -- i.e.
+/// the full set of `[[review]]` TOML fields the Arbiter's project-default
+/// fallback chain already consults for a review with no `[[review]]` block
+/// of its own -- plus `verify_skip_auto_clean` (RAL-168's project-only
+/// each-branch-scope sub-option, named in this ticket's summary even though
+/// its *per-review* TOML counterpart `skip_auto_clean` is deliberately
+/// `NotApplicable` for a project default, per `REVIEW_FIELD_PARITY`).
+///
+/// Deliberately excludes `checks` (a list-valued, project-only build-gate
+/// default) and `summary_format` (bullet/prose rendering choice, also
+/// project-only): neither is a `[[review]]` TOML field
+/// (`core::validate::REVIEW_KEYS`), so the TOML/UI parity check this ticket
+/// adds has no claim on them -- see RAL-408's Out-of-Scope note ("exposing
+/// existing hidden configuration, not inventing new configurability").
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectReviewSettings {
+    #[serde(default)]
+    pub default_resolver_agent: Option<String>,
+    #[serde(default)]
+    pub default_resolver_model: Option<String>,
+    #[serde(default)]
+    pub default_machine: Option<String>,
+    #[serde(default)]
+    pub default_maximum_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub default_proof_scope: Option<String>,
+    #[serde(default)]
+    pub verify_skip_auto_clean: Option<bool>,
+    #[serde(default)]
+    pub skip_worktrees: Option<bool>,
+    #[serde(default)]
+    pub skip_base_updates: Option<bool>,
+    #[serde(default)]
+    pub match_pr_branch_name: Option<bool>,
+    #[serde(default)]
+    pub separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    pub auto_build: Option<String>,
+    #[serde(default)]
+    pub auto_submit_pr_stack: Option<bool>,
+    #[serde(default)]
+    pub auto_fix_pr_errors: Option<bool>,
+    #[serde(default)]
+    pub auto_fix_prompt_template: Option<String>,
+}
+
+impl ProjectReviewSettings {
+    /// Projects these settings onto a [`crate::config::ReviewConfig`]
+    /// (`checks`/`summary_format` left at their defaults -- see this
+    /// struct's own doc comment for why those two are out of scope here),
+    /// ready to [`crate::config::ReviewConfig::merge`] over the file-based
+    /// layers in [`Store::resolve_review_config`].
+    #[must_use]
+    pub fn into_review_config(self) -> crate::config::ReviewConfig {
+        crate::config::ReviewConfig {
+            skip_worktrees: self.skip_worktrees,
+            checks: Vec::new(),
+            auto_build: self.auto_build,
+            summary_format: None,
+            default_proof_scope: self.default_proof_scope,
+            verify_skip_auto_clean: self.verify_skip_auto_clean,
+            default_resolver_agent: self.default_resolver_agent,
+            default_resolver_model: self.default_resolver_model,
+            default_machine: self.default_machine,
+            default_maximum_budget_usd: self.default_maximum_budget_usd,
+            skip_base_updates: self.skip_base_updates,
+            match_pr_branch_name: self.match_pr_branch_name,
+            auto_submit_pr_stack: self.auto_submit_pr_stack,
+            separate_pr_branch: self.separate_pr_branch,
+            auto_fix_pr_errors: self.auto_fix_pr_errors,
+            auto_fix_prompt_template: self.auto_fix_prompt_template,
+        }
+    }
 }
 
 /// Outcome of a bulk [`Store::clear_all`].
@@ -1329,6 +1413,21 @@ impl Store {
                 vcs           TEXT NOT NULL DEFAULT 'git',
                 created_at_ms INTEGER NOT NULL,
                 skip_base_updates INTEGER
+            );
+            -- RAL-408: a project's live-editable DEFAULT review settings --
+            -- resolver agent/model, proof scope, budget, etc. -- edited any
+            -- time from the board's Projects tab or `ralphus project
+            -- review-settings`, unlike the write-once 'stamp' columns on
+            -- `projects` above (`skip_base_updates` &c., RAL-250/307/317/378)
+            -- which are only ever set at first registration. One JSON blob
+            -- column rather than one column per field (same shape as
+            -- `env_overrides`/`proof_env_overrides` elsewhere in this file)
+            -- so a future new setting never needs its own migration line --
+            -- see `ProjectReviewSettings`'s doc comment for the field list.
+            CREATE TABLE IF NOT EXISTS project_review_settings (
+                project       TEXT PRIMARY KEY,
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                updated_at_ms INTEGER NOT NULL
             );
             -- Minimal user registry (RAL-?): a placeholder identity a request
             -- can name itself as, for `AgentAccess` (`agent_access.rs`) to key
@@ -4462,6 +4561,73 @@ impl Store {
             admin_only: false,
         });
         Ok(())
+    }
+
+    /// RAL-408: this project's live-editable review-setting defaults --
+    /// `ProjectReviewSettings::default()` (every field `None`, meaning
+    /// "not configured here") when the project has never had one saved.
+    /// Consulted by [`Self::resolve_review_config`] as a layer over the
+    /// file-based `.ralphus.toml [review]` defaults.
+    pub fn get_project_review_settings(&self, project: &str) -> Result<ProjectReviewSettings> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT settings_json FROM project_review_settings WHERE project=?",
+                params![project],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
+    }
+
+    /// RAL-408: persist `settings` as this project's review-setting defaults
+    /// in full (callers read the current value via
+    /// [`Self::get_project_review_settings`], apply their own per-field
+    /// touch/clear decision, then pass the resulting whole object here --
+    /// see `daemon/src/server.rs`'s `set_project_review_settings` handler).
+    pub fn set_project_review_settings(
+        &self,
+        project: &str,
+        settings: &ProjectReviewSettings,
+    ) -> Result<()> {
+        let json = serde_json::to_string(settings).unwrap_or_else(|_| "{}".to_string());
+        self.conn.execute(
+            "INSERT INTO project_review_settings(project, settings_json, updated_at_ms) VALUES(?,?,?)
+             ON CONFLICT(project) DO UPDATE SET settings_json=excluded.settings_json, updated_at_ms=excluded.updated_at_ms",
+            params![project, json, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-408: this project's live-editable review-setting defaults, looked
+    /// up by whichever registered project's path is `path` itself or an
+    /// ancestor of it -- same lookup/ancestry semantics as
+    /// [`Self::project_bool_stamp`]. `ProjectReviewSettings::default()`
+    /// (every field `None`) when `path` belongs to no registered project, or
+    /// that project has never saved any settings here.
+    #[must_use]
+    pub fn project_review_settings_for_path(&self, path: &str) -> ProjectReviewSettings {
+        self.project_name_for_path(path)
+            .and_then(|name| self.get_project_review_settings(&name).ok())
+            .unwrap_or_default()
+    }
+
+    /// RAL-408: the effective `ReviewConfig` for a review rooted at `cwd` --
+    /// the file-based layers (`crate::config::resolve`, global under the
+    /// nearest `.ralphus.toml`) with this project's database-backed defaults
+    /// layered on top, since the database settings are the more specific,
+    /// most recently user-edited layer. An unregistered `cwd` (no owning
+    /// project row) resolves to the file-based layers alone, unchanged from
+    /// today.
+    #[must_use]
+    pub fn resolve_review_config(&self, cwd: &Path) -> crate::config::ReviewConfig {
+        let file_cfg = crate::config::resolve(cwd);
+        let db_cfg = self
+            .project_review_settings_for_path(&cwd.to_string_lossy())
+            .into_review_config();
+        file_cfg.merge(db_cfg)
     }
 
     /// RAL-250: the `skip_base_updates` value a project stamped from the live
@@ -13587,6 +13753,170 @@ command = "e"
             "the project's stamped default is frozen onto the new review"
         );
         assert!(g.effective_auto_submit_pr_stack);
+    }
+
+    // ── RAL-408: project-level DEFAULT review settings (database-backed) ────
+
+    /// A fresh, empty directory for a `.ralphus.toml`-based test project --
+    /// no `git init` needed since `crate::config::resolve`/
+    /// `find_project_config` only ever walk the filesystem, never git.
+    fn temp_review_settings_dir() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-review-settings-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn get_project_review_settings_defaults_to_every_field_unset() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", "C:/repos/proj", "git")
+            .unwrap();
+        assert_eq!(
+            store.get_project_review_settings("proj").unwrap(),
+            ProjectReviewSettings::default()
+        );
+    }
+
+    #[test]
+    fn set_project_review_settings_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", "C:/repos/proj", "git")
+            .unwrap();
+        let settings = ProjectReviewSettings {
+            default_resolver_agent: Some("claude-code".to_string()),
+            default_resolver_model: Some("opus".to_string()),
+            default_machine: Some("local".to_string()),
+            default_maximum_budget_usd: Some(5.0),
+            default_proof_scope: Some("final_branch".to_string()),
+            verify_skip_auto_clean: Some(true),
+            skip_worktrees: Some(true),
+            skip_base_updates: Some(false),
+            match_pr_branch_name: Some(true),
+            separate_pr_branch: Some(false),
+            auto_build: Some("make build".to_string()),
+            auto_submit_pr_stack: Some(true),
+            auto_fix_pr_errors: Some(true),
+            auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
+        };
+        store
+            .set_project_review_settings("proj", &settings)
+            .unwrap();
+        assert_eq!(store.get_project_review_settings("proj").unwrap(), settings);
+    }
+
+    #[test]
+    fn set_project_review_settings_overwrites_a_previously_saved_row() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", "C:/repos/proj", "git")
+            .unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    skip_worktrees: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    skip_worktrees: Some(false),
+                    default_resolver_agent: Some("ollama".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let settings = store.get_project_review_settings("proj").unwrap();
+        assert_eq!(settings.skip_worktrees, Some(false));
+        assert_eq!(settings.default_resolver_agent.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn get_project_review_settings_for_an_unregistered_project_is_the_default() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store.get_project_review_settings("does-not-exist").unwrap(),
+            ProjectReviewSettings::default()
+        );
+    }
+
+    #[test]
+    fn resolve_review_config_falls_back_to_file_config_when_no_database_settings_saved() {
+        let root = temp_review_settings_dir();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_agent = \"claude-code\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let cfg = store.resolve_review_config(&root);
+        assert_eq!(cfg.default_resolver_agent(), "claude-code");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_review_config_database_settings_win_over_file_config() {
+        let root = temp_review_settings_dir();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_agent = \"claude-code\"\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        store.register_project("proj", "", &path, "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    default_resolver_agent: Some("ollama".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cfg = store.resolve_review_config(&root);
+        assert_eq!(
+            cfg.default_resolver_agent(),
+            "ollama",
+            "the database-backed override must win over the file-based project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_review_config_matches_a_registered_projects_path_by_ancestor() {
+        let root = temp_review_settings_dir();
+        let store = Store::open_in_memory().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        store.register_project("proj", "", &path, "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    skip_worktrees: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let nested = root.join("nested/child");
+        std::fs::create_dir_all(&nested).unwrap();
+        let cfg = store.resolve_review_config(&nested);
+        assert!(
+            cfg.skip_worktrees(),
+            "a path nested under a registered project's root must still pick up its database settings"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

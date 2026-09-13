@@ -895,6 +895,48 @@ fallback row when --user is omitted).",
     ),
 ];
 
+// RAL-408: a project's database-backed review-setting DEFAULTS -- see
+// `crate::commands::project::ProjectReviewSettingsCommand`.
+const PROJECT_REVIEW_SETTINGS_CHILDREN: &[HelpNode] = &[
+    node(
+        "get",
+        &["name [str]"],
+        &[],
+        "Show a project's current review-setting overrides plus the fully resolved effective \
+value for each (file config + database).",
+        false,
+        true, // ("project", "review-settings", "get")
+        &[],
+    ),
+    node(
+        "set",
+        &["name [str]"],
+        &[
+            "--auto-build [command]",
+            "--auto-fix-pr-errors/--no-auto-fix-pr-errors",
+            "--auto-fix-prompt-template [str]",
+            "--auto-submit-pr-stack/--no-auto-submit-pr-stack",
+            "--clear-maximum-budget-usd",
+            "--machine [scheme:uri]",
+            "--match-pr-branch-name/--no-match-pr-branch-name",
+            "--maximum-budget-usd [usd]",
+            "--proof-scope [each_branch|final_branch|nothing]",
+            "--resolver-agent [name]",
+            "--resolver-model [name]",
+            "--separate-pr-branch/--no-separate-pr-branch",
+            "--skip-auto-clean/--no-skip-auto-clean",
+            "--skip-base-updates/--no-skip-base-updates",
+            "--skip-worktrees/--no-skip-worktrees",
+        ],
+        "Update a project's DEFAULT review settings, applied to future reviews only (an \
+Arbiter-created review with no [[review]] block, or any review whose own block leaves a field \
+unset) -- existing reviews are unaffected.",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const PROJECT_CHILDREN: &[HelpNode] = &[
     node(
         "fork",
@@ -939,6 +981,17 @@ cwds against.",
         false,
         true, // ("project", "list")
         &[],
+    ),
+    node(
+        "review-settings",
+        &[],
+        &[],
+        "Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver \
+agent/model, machine, budget, proof scope, and the project-level equivalents of every \
+`ralphus review settings` opt-out flag.",
+        false,
+        false,
+        PROJECT_REVIEW_SETTINGS_CHILDREN,
     ),
 ];
 

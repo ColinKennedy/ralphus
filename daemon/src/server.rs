@@ -920,6 +920,18 @@ fn route_for_user(
                 delete_project_fork(daemon, &url_decode(name), &url_decode(user))
             })
         }
+        // RAL-408: this project's DEFAULT review settings -- the board's
+        // Projects-tab meatball menu and `ralphus project review-settings`.
+        // Reads open to every caller (matches the `projects`/`forks` pattern
+        // above); the mutating write is admin-gated like `register_project`.
+        ("GET", ["api", "projects", name, "review-settings"]) => {
+            get_project_review_settings(daemon, &url_decode(name))
+        }
+        ("POST", ["api", "projects", name, "review-settings"]) => {
+            admin_gated(daemon, user_header, || {
+                set_project_review_settings(daemon, &url_decode(name), body)
+            })
+        }
         // Machine provider registry (RAL-185) -- RAL-332: admin-only, client
         // and server side. Nothing outside the Machines tab reads this.
         ("GET", ["api", "machines"]) => admin_gated(daemon, user_header, || list_machines(daemon)),
@@ -2135,6 +2147,284 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
             }
             json(201, &body)
         }
+        Err(e) => store_error(&e),
+    }
+}
+
+/// RAL-408: the effective (fully resolved) project-level review-setting
+/// defaults the Arbiter would apply to a fresh auto-review right now --
+/// `Store::resolve_review_config`'s public accessors, projected into a
+/// response-friendly shape. Returned alongside the raw
+/// `ProjectReviewSettings` overrides so the board can show "currently
+/// effective: X" next to each editable field even where this project has no
+/// explicit database override of its own (it's inheriting from
+/// `.ralphus.toml` or the built-in default instead).
+#[derive(Serialize)]
+struct EffectiveReviewDefaults {
+    resolver_agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolver_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maximum_budget_usd: Option<f64>,
+    proof_scope: String,
+    skip_auto_clean: bool,
+    skip_worktrees: bool,
+    skip_base_updates: bool,
+    match_pr_branch_name: bool,
+    separate_pr_branch: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_build: Option<String>,
+    auto_submit_pr_stack: bool,
+    auto_fix_pr_errors: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_fix_prompt_template: Option<String>,
+}
+
+impl EffectiveReviewDefaults {
+    fn from_config(cfg: &crate::config::ReviewConfig) -> Self {
+        Self {
+            resolver_agent: cfg.default_resolver_agent().to_string(),
+            resolver_model: cfg.default_resolver_model().map(str::to_string),
+            machine: cfg.default_machine().map(str::to_string),
+            maximum_budget_usd: cfg.default_maximum_budget_usd(),
+            proof_scope: cfg.default_proof_scope().to_string(),
+            skip_auto_clean: cfg.verify_skip_auto_clean(),
+            skip_worktrees: cfg.skip_worktrees(),
+            skip_base_updates: cfg.skip_base_updates(),
+            match_pr_branch_name: cfg.match_pr_branch_name(),
+            separate_pr_branch: cfg.separate_pr_branch(),
+            auto_build: cfg.auto_build.clone(),
+            auto_submit_pr_stack: cfg.auto_submit_pr_stack(),
+            auto_fix_pr_errors: cfg.auto_fix_pr_errors(),
+            auto_fix_prompt_template: cfg.auto_fix_prompt_template().map(str::to_string),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProjectReviewSettingsResponse {
+    project: String,
+    settings: crate::store::ProjectReviewSettings,
+    effective: EffectiveReviewDefaults,
+}
+
+/// `GET /api/projects/{name}/review-settings` (RAL-408): this project's raw
+/// database-backed review-setting overrides plus the fully resolved
+/// effective defaults (file config + database, `Store::resolve_review_config`).
+fn get_project_review_settings(daemon: &Daemon, name: &str) -> Reply {
+    let store = daemon.lock();
+    let project = match store.get_project(name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no registered project named {name:?}"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let settings = store
+        .get_project_review_settings(&project.name)
+        .unwrap_or_default();
+    let effective = EffectiveReviewDefaults::from_config(
+        &store.resolve_review_config(Path::new(&project.path)),
+    );
+    json(
+        200,
+        &ProjectReviewSettingsResponse {
+            project: project.name,
+            settings,
+            effective,
+        },
+    )
+}
+
+/// `POST /api/projects/{name}/review-settings` (RAL-408) body. Every field is
+/// optional and absent means "leave this setting as-is". String fields use
+/// an empty string to mean "clear this override, inherit from
+/// `.ralphus.toml`/the built-in default" (the same convention
+/// `GuardianSettingsBody`'s `proof_scope`/`auto_fix_prompt_template` already
+/// use); `default_maximum_budget_usd` cannot use that convention (`0.0`/
+/// negative are themselves invalid budgets, not sentinels), so it gets an
+/// explicit `clear_maximum_budget_usd` flag instead, mirroring
+/// `RegisterProjectBody`'s `clear_clone_url` precedent. Boolean fields have
+/// no "clear" path (same as `GuardianSettingsBody`'s booleans) -- set them to
+/// the desired concrete value.
+#[derive(Deserialize, Default)]
+struct ProjectReviewSettingsBody {
+    #[serde(default)]
+    default_resolver_agent: Option<String>,
+    #[serde(default)]
+    default_resolver_model: Option<String>,
+    #[serde(default)]
+    default_machine: Option<String>,
+    #[serde(default)]
+    default_maximum_budget_usd: Option<f64>,
+    #[serde(default)]
+    clear_maximum_budget_usd: bool,
+    #[serde(default)]
+    default_proof_scope: Option<String>,
+    #[serde(default)]
+    verify_skip_auto_clean: Option<bool>,
+    #[serde(default)]
+    skip_worktrees: Option<bool>,
+    #[serde(default)]
+    skip_base_updates: Option<bool>,
+    #[serde(default)]
+    match_pr_branch_name: Option<bool>,
+    #[serde(default)]
+    separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    auto_build: Option<String>,
+    #[serde(default)]
+    auto_submit_pr_stack: Option<bool>,
+    #[serde(default)]
+    auto_fix_pr_errors: Option<bool>,
+    #[serde(default)]
+    auto_fix_prompt_template: Option<String>,
+}
+
+/// `POST /api/projects/{name}/review-settings`: apply a patch (see
+/// [`ProjectReviewSettingsBody`]'s doc comment for its touch/clear
+/// convention) to this project's database-backed review-setting defaults.
+fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<ProjectReviewSettingsBody>(body) else {
+        return error(400, "bad_request", "invalid review-settings body", vec![]);
+    };
+    if req.clear_maximum_budget_usd && req.default_maximum_budget_usd.is_some() {
+        return error(
+            400,
+            "invalid_value",
+            "'clear_maximum_budget_usd' cannot be combined with 'default_maximum_budget_usd'",
+            vec![],
+        );
+    }
+    if let Some(usd) = req.default_maximum_budget_usd {
+        if usd <= 0.0 {
+            return error(
+                400,
+                "invalid_value",
+                "'default_maximum_budget_usd' must be positive",
+                vec![],
+            );
+        }
+    }
+    if let Some(scope) = req.default_proof_scope.as_deref().filter(|s| !s.is_empty()) {
+        if !ralphus_core::schema::PROOF_SCOPE_VALUES.contains(&scope) {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "'default_proof_scope' must be one of {:?} -- got {scope:?}",
+                    ralphus_core::schema::PROOF_SCOPE_VALUES
+                ),
+                vec![],
+            );
+        }
+    }
+    if let Some(template) = req
+        .auto_fix_prompt_template
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        if !ralphus_core::validate::auto_fix_template_has_placeholder(template) {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "'auto_fix_prompt_template' must contain the literal placeholder \"{}\"",
+                    ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER
+                ),
+                vec![],
+            );
+        }
+    }
+    if let Some(machine) = req.default_machine.as_deref().filter(|s| !s.is_empty()) {
+        if let Err(e) = ralphus_core::schema::parse_machine(machine) {
+            return error(
+                400,
+                "invalid_value",
+                &format!("invalid 'default_machine' {machine:?}: {e:?}"),
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let project = match store.get_project(name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no registered project named {name:?}"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let mut settings = store
+        .get_project_review_settings(&project.name)
+        .unwrap_or_default();
+    let clear_if_empty = |v: String| if v.is_empty() { None } else { Some(v) };
+    if let Some(v) = req.default_resolver_agent {
+        settings.default_resolver_agent = clear_if_empty(v);
+    }
+    if let Some(v) = req.default_resolver_model {
+        settings.default_resolver_model = clear_if_empty(v);
+    }
+    if let Some(v) = req.default_machine {
+        settings.default_machine = clear_if_empty(v);
+    }
+    if req.clear_maximum_budget_usd {
+        settings.default_maximum_budget_usd = None;
+    } else if let Some(v) = req.default_maximum_budget_usd {
+        settings.default_maximum_budget_usd = Some(v);
+    }
+    if let Some(v) = req.default_proof_scope {
+        settings.default_proof_scope = clear_if_empty(v);
+    }
+    if let Some(v) = req.verify_skip_auto_clean {
+        settings.verify_skip_auto_clean = Some(v);
+    }
+    if let Some(v) = req.skip_worktrees {
+        settings.skip_worktrees = Some(v);
+    }
+    if let Some(v) = req.skip_base_updates {
+        settings.skip_base_updates = Some(v);
+    }
+    if let Some(v) = req.match_pr_branch_name {
+        settings.match_pr_branch_name = Some(v);
+    }
+    if let Some(v) = req.separate_pr_branch {
+        settings.separate_pr_branch = Some(v);
+    }
+    if let Some(v) = req.auto_build {
+        settings.auto_build = clear_if_empty(v);
+    }
+    if let Some(v) = req.auto_submit_pr_stack {
+        settings.auto_submit_pr_stack = Some(v);
+    }
+    if let Some(v) = req.auto_fix_pr_errors {
+        settings.auto_fix_pr_errors = Some(v);
+    }
+    if let Some(v) = req.auto_fix_prompt_template {
+        settings.auto_fix_prompt_template = clear_if_empty(v);
+    }
+    match store.set_project_review_settings(&project.name, &settings) {
+        Ok(()) => json(
+            200,
+            &ProjectReviewSettingsResponse {
+                project: project.name.clone(),
+                effective: EffectiveReviewDefaults::from_config(
+                    &store.resolve_review_config(Path::new(&project.path)),
+                ),
+                settings,
+            },
+        ),
         Err(e) => store_error(&e),
     }
 }
@@ -14266,6 +14556,188 @@ mod tests {
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"projects\""));
         assert!(r.body.contains("proj"));
+    }
+
+    #[test]
+    fn project_review_settings_route_get_defaults_to_every_field_unset() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-get-default");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["project"], "proj");
+        assert!(body["settings"]["default_resolver_agent"].is_null());
+        assert_eq!(body["effective"]["resolver_agent"], "ollama");
+        assert_eq!(body["effective"]["proof_scope"], "each_branch");
+    }
+
+    #[test]
+    fn project_review_settings_route_get_unknown_project_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "GET",
+            "/api/projects/does-not-exist/review-settings",
+            "",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_persists_and_wins_over_file_config() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-set");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_agent = \"claude-code\"\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_resolver_agent":"ollama","skip_worktrees":true,"default_maximum_budget_usd":5.0}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["default_resolver_agent"], "ollama");
+        assert_eq!(body["settings"]["skip_worktrees"], true);
+        assert_eq!(
+            body["effective"]["resolver_agent"], "ollama",
+            "the database override must win over the file-based project default"
+        );
+        assert!(body["effective"]["skip_worktrees"].as_bool().unwrap());
+        assert_eq!(body["effective"]["maximum_budget_usd"], 5.0);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_empty_string_clears_a_previously_set_override() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-clear");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_resolver_agent":"ollama"}"#,
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_resolver_agent":""}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(body["settings"]["default_resolver_agent"].is_null());
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_an_invalid_proof_scope() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-invalid-scope");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_proof_scope":"bogus"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("invalid_value"));
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_a_non_positive_budget() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-invalid-budget");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_maximum_budget_usd":0.0}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_a_template_missing_the_placeholder() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-invalid-template");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"auto_fix_prompt_template":"fix it please"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_clear_and_value_together() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-clear-and-value");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"default_maximum_budget_usd":5.0,"clear_maximum_budget_usd":true}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_unknown_project_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/does-not-exist/review-settings",
+            r#"{"skip_worktrees":true}"#,
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 
     #[test]

@@ -515,6 +515,55 @@
        * @property {number} created_at_ms
        */
       /**
+       * RAL-408: a project's raw database-backed review-setting overrides
+       * (`GET/POST .../review-settings`'s `settings` field) -- every field
+       * `undefined`/`null` means "not configured here, inherit from file
+       * config/global".
+       * @typedef {object} ProjectReviewSettingsRaw
+       * @property {string|null|undefined} default_resolver_agent
+       * @property {string|null|undefined} default_resolver_model
+       * @property {string|null|undefined} default_machine
+       * @property {number|null|undefined} default_maximum_budget_usd
+       * @property {string|null|undefined} default_proof_scope
+       * @property {boolean|null|undefined} verify_skip_auto_clean
+       * @property {boolean|null|undefined} skip_worktrees
+       * @property {boolean|null|undefined} skip_base_updates
+       * @property {boolean|null|undefined} match_pr_branch_name
+       * @property {boolean|null|undefined} separate_pr_branch
+       * @property {string|null|undefined} auto_build
+       * @property {boolean|null|undefined} auto_submit_pr_stack
+       * @property {boolean|null|undefined} auto_fix_pr_errors
+       * @property {string|null|undefined} auto_fix_prompt_template
+       */
+      /**
+       * RAL-408: the fully resolved effective review-setting defaults (file
+       * config + database) a fresh auto-review would get right now --
+       * `GET/POST .../review-settings`'s `effective` field.
+       * @typedef {object} EffectiveReviewDefaults
+       * @property {string} resolver_agent
+       * @property {string|undefined} resolver_model
+       * @property {string|undefined} machine
+       * @property {number|undefined} maximum_budget_usd
+       * @property {string} proof_scope
+       * @property {boolean} skip_auto_clean
+       * @property {boolean} skip_worktrees
+       * @property {boolean} skip_base_updates
+       * @property {boolean} match_pr_branch_name
+       * @property {boolean} separate_pr_branch
+       * @property {string|undefined} auto_build
+       * @property {boolean} auto_submit_pr_stack
+       * @property {boolean} auto_fix_pr_errors
+       * @property {string|undefined} auto_fix_prompt_template
+       */
+      /**
+       * RAL-408: `GET/POST /api/projects/{name}/review-settings`'s response
+       * shape.
+       * @typedef {object} ProjectReviewSettingsResponse
+       * @property {string} project
+       * @property {ProjectReviewSettingsRaw} settings
+       * @property {EffectiveReviewDefaults} effective
+       */
+      /**
        * @typedef {object} UserView
        * @property {string} name
        * @property {number} created_at_ms

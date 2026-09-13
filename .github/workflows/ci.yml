@@ -269,6 +269,10 @@ jobs:
         run: python -m unittest scripts/test_check_review_settings_parity.py
       - name: Check review settings / TOML parity
         run: python scripts/check_review_settings_parity.py
+      - name: Test project review-settings UI parity checker
+        run: python -m unittest scripts/test_check_project_review_settings_ui_parity.py
+      - name: Check project review-settings TOML / UI parity
+        run: python scripts/check_project_review_settings_ui_parity.py
 
   docs:
     name: Docs (screenshot coverage lint)

@@ -952,12 +952,14 @@ pub fn terminal_modes_for(
     resolver_agent: Option<&str>,
     has_session_id: bool,
     has_worktree: bool,
+    store: &Store,
     cwd: &Path,
 ) -> Vec<&'static str> {
     if has_session_id {
         return vec!["readonly", "open"];
     }
-    let default_agent = crate::config::resolve(cwd)
+    let default_agent = store
+        .resolve_review_config(cwd)
         .default_resolver_agent()
         .to_string();
     let agent = resolver_agent.unwrap_or(&default_agent);
@@ -1046,18 +1048,27 @@ impl Store {
         // so it must be a concrete value from the start, not a perpetual
         // fallback chain.
         let explicit_project = crate::config::project_review_config(Path::new(git_root));
+        // RAL-408: the database-backed project default (edited via the
+        // board/CLI) is the newer, live-editable mechanism this stamping
+        // logic now prefers over an explicit `.ralphus.toml [review]` value
+        // -- unconfigured (the common case today) it's simply `None` on
+        // every field, so this changes nothing for a project that has never
+        // touched the new settings surface.
+        let db_settings = self.project_review_settings_for_path(git_root);
         let stamp = self.project_match_pr_branch_name_stamp(git_root);
         let live_global = crate::config::global_review_config();
-        let match_pr_branch_name = explicit_project
+        let match_pr_branch_name = db_settings
             .match_pr_branch_name
+            .or(explicit_project.match_pr_branch_name)
             .or(stamp)
             .or(live_global.match_pr_branch_name)
             .unwrap_or(false);
         // RAL-317: same stamping shape as `match_pr_branch_name` above -- a
         // concrete value from the start, not a perpetual "inherit" fallback.
         let auto_submit_pr_stack_stamp = self.project_auto_submit_pr_stack_stamp(git_root);
-        let auto_submit_pr_stack = explicit_project
+        let auto_submit_pr_stack = db_settings
             .auto_submit_pr_stack
+            .or(explicit_project.auto_submit_pr_stack)
             .or(auto_submit_pr_stack_stamp)
             .or(live_global.auto_submit_pr_stack)
             .unwrap_or(false);
@@ -1066,8 +1077,9 @@ impl Store {
         // combined branch readably; only reviews that predate the column keep
         // the internal `guardian/<id>/review` ref.
         let separate_pr_branch_stamp = self.project_separate_pr_branch_stamp(git_root);
-        let separate_pr_branch = explicit_project
+        let separate_pr_branch = db_settings
             .separate_pr_branch
+            .or(explicit_project.separate_pr_branch)
             .or(separate_pr_branch_stamp)
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
@@ -3716,8 +3728,9 @@ impl Store {
                 .entry(root.to_string())
                 .or_insert_with(|| {
                     (
-                        crate::config::resolve(Path::new(root)),
+                        self.resolve_review_config(Path::new(root)),
                         crate::config::project_review_config(Path::new(root)),
+                        self.project_review_settings_for_path(root),
                     )
                 });
         }
@@ -3836,6 +3849,7 @@ impl Store {
                     row.resolver_agent.as_deref(),
                     resolver_agent_session_id.is_some(),
                     worktree.is_some(),
+                    self,
                     Path::new(&row.git_root),
                 );
                 Ok(BranchView {
@@ -4027,7 +4041,7 @@ impl Store {
         // GUARDIAN_PERF.local.md: both configs below come from `ctx`, resolved
         // once per distinct `git_root` for the whole call rather than via a
         // fresh filesystem walk on every guardian.
-        let (project_review_config, explicit_project) = ctx
+        let (project_review_config, explicit_project, db_settings) = ctx
             .config_by_git_root
             .get(&row.git_root)
             .cloned()
@@ -4067,8 +4081,16 @@ impl Store {
         // below. `live_global` likewise comes from `ctx`, read once per call.
         let stamps = crate::store::Store::match_project_stamps(&row.git_root, &ctx.project_stamps);
         let live_global = &ctx.live_global;
+        // RAL-408: the database-backed project default (edited via the
+        // board/CLI) slots in right after a per-review override and ahead of
+        // an explicit `.ralphus.toml [review]` value -- it's the newer,
+        // live-editable mechanism the ticket asks to supersede the file-based
+        // one, but must never break a project that has never touched it
+        // (`db_settings.<field>` is simply `None` there, so `.or()` falls
+        // through to the existing chain unchanged).
         let effective_skip_base_updates = row
             .skip_base_updates
+            .or(db_settings.skip_base_updates)
             .or(explicit_project.skip_base_updates)
             .or(stamps.and_then(|s| s.skip_base_updates))
             .or(live_global.skip_base_updates)
@@ -4080,6 +4102,7 @@ impl Store {
         // alias.
         let effective_match_pr_branch_name = row
             .match_pr_branch_name
+            .or(db_settings.match_pr_branch_name)
             .or(explicit_project.match_pr_branch_name)
             .or(stamps.and_then(|s| s.match_pr_branch_name))
             .or(live_global.match_pr_branch_name)
@@ -4090,6 +4113,7 @@ impl Store {
         // reaches a terminal merge state.
         let effective_auto_submit_pr_stack = row
             .auto_submit_pr_stack
+            .or(db_settings.auto_submit_pr_stack)
             .or(explicit_project.auto_submit_pr_stack)
             .or(stamps.and_then(|s| s.auto_submit_pr_stack))
             .or(live_global.auto_submit_pr_stack)
@@ -4100,6 +4124,7 @@ impl Store {
         // from the review branch.
         let effective_separate_pr_branch = row
             .separate_pr_branch
+            .or(db_settings.separate_pr_branch)
             .or(explicit_project.separate_pr_branch)
             .or(stamps.and_then(|s| s.separate_pr_branch))
             .or(live_global.separate_pr_branch)
@@ -4466,12 +4491,22 @@ struct GuardianHydrationCtx {
     /// The global config -- identical for every guardian regardless of
     /// `git_root`, so it is read once instead of once per guardian.
     live_global: crate::config::ReviewConfig,
-    /// Per-`git_root`: `(the layered global+project config, the
-    /// project-only config)` -- memoized so guardians sharing a repo (the
-    /// common case) only pay the filesystem walk once for the whole call.
+    /// Per-`git_root`: `(the layered global+project+database config, the
+    /// project-file-only config, this project's raw database-backed
+    /// settings)` -- memoized so guardians sharing a repo (the common case)
+    /// only pay the filesystem walk + database lookup once for the whole
+    /// call. RAL-408: the raw database settings are kept separate (rather
+    /// than folded into the first element alone) because
+    /// `effective_skip_base_updates` &c. below need to slot them in at a
+    /// specific point in an existing project-file > registration-stamp >
+    /// live-global fallback chain, not simply replace the merged config.
     config_by_git_root: std::collections::HashMap<
         String,
-        (crate::config::ReviewConfig, crate::config::ReviewConfig),
+        (
+            crate::config::ReviewConfig,
+            crate::config::ReviewConfig,
+            crate::store::ProjectReviewSettings,
+        ),
     >,
 }
 
@@ -4609,21 +4644,23 @@ mod tests {
     fn terminal_modes_with_session_id_are_always_readonly_and_open() {
         // A resolver cell id makes both modes available regardless of agent
         // or worktree presence.
+        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(None, true, false, Path::new(".")),
+            terminal_modes_for(None, true, false, &store, Path::new(".")),
             vec!["readonly", "open"]
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), true, true, Path::new(".")),
+            terminal_modes_for(Some("ollama"), true, true, &store, Path::new(".")),
             vec!["readonly", "open"]
         );
     }
 
     #[test]
     fn terminal_modes_cli_agent_with_worktree_offers_worktree_only() {
+        let store = Store::open_in_memory().unwrap();
         for agent in ["claude-code", "codex", "codex-cli", "pi"] {
             assert_eq!(
-                terminal_modes_for(Some(agent), false, true, Path::new(".")),
+                terminal_modes_for(Some(agent), false, true, &store, Path::new(".")),
                 vec!["worktree"]
             );
         }
@@ -4631,16 +4668,17 @@ mod tests {
 
     #[test]
     fn terminal_modes_none_available_without_cell_or_worktree() {
+        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(Some("claude-code"), false, false, Path::new(".")),
+            terminal_modes_for(Some("claude-code"), false, false, &store, Path::new(".")),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), false, true, Path::new(".")),
+            terminal_modes_for(Some("ollama"), false, true, &store, Path::new(".")),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(None, false, false, Path::new(".")),
+            terminal_modes_for(None, false, false, &store, Path::new(".")),
             Vec::<&str>::new()
         );
     }

@@ -1054,6 +1054,13 @@ fn advance_rebase(wt: &Workspace) {
 /// (from `[[review]]`), else the `RALPHUS_RESOLVER_AGENT` env override, else
 /// `.ralphus.toml`'s `[review].default_resolver_agent` (global layered under
 /// `cwd`'s project config), else `"ollama"`.
+///
+/// File-config only -- no database-backed project default (RAL-408), unlike
+/// [`resolve_resolver_agent`]'s own resolution for the actual conflict-
+/// resolution path. This one backs `pr.rs`'s best-effort PR-title/description
+/// synthesis only, a cosmetic LLM call rather than the thing RAL-408's
+/// project-level defaults are meant to govern, so the extra database lookup
+/// on every PR sync isn't worth the plumbing here.
 pub(crate) fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
     stored
         .map(str::trim)
@@ -1072,6 +1079,9 @@ pub(crate) fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
 /// `[review].default_resolver_model` (global layered under `cwd`'s project
 /// config), else `qwen3:8b` for the ollama backend. claude, claude-code, and
 /// codex each pick their own default when still unset → `None`.
+///
+/// File-config only -- see [`resolver_agent`]'s doc comment for why this
+/// doesn't also consult RAL-408's database-backed project defaults.
 pub(crate) fn resolver_model(stored: Option<&str>, agent: &str, cwd: &Path) -> Option<String> {
     stored
         .map(str::trim)
@@ -1110,17 +1120,39 @@ pub(crate) struct ResolvedResolverAgent {
 /// Returns `Err` for a name that is neither a configured profile nor a
 /// built-in backend -- callers must not build a `RunnerSpec` from that name;
 /// see each call site's own error handling for how it surfaces this.
+///
+/// Unlike the bare [`resolver_agent`]/[`resolver_model`] helpers (file-config
+/// only, used by `pr.rs`'s cosmetic PR-text synthesis), this is the actual
+/// conflict-resolution path RAL-408's database-backed project defaults are
+/// meant to govern, so it resolves through `Store::resolve_review_config`
+/// (file layers + database) directly rather than delegating to them.
 fn resolve_resolver_agent(
     stored_agent: Option<&str>,
     stored_model: Option<&str>,
+    store: &crate::store_lock::StoreHandle,
     cwd: &Path,
 ) -> Result<ResolvedResolverAgent, String> {
-    let raw = resolver_agent(stored_agent, cwd);
+    let db_cfg = store.lock().resolve_review_config(cwd);
+    let raw = stored_agent
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("RALPHUS_RESOLVER_AGENT").ok())
+        .unwrap_or_else(|| db_cfg.default_resolver_agent().to_string());
     let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
     // Keyed off the *resolved* backend, not the raw profile name, so a custom
     // profile that resolves to `ollama` still gets the sensible `qwen3:8b`
     // default.
-    let model = resolver_model(stored_model, &selection.backend, cwd);
+    let model = stored_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("RALPHUS_RESOLVER_MODEL").ok())
+        .or_else(|| db_cfg.default_resolver_model().map(ToString::to_string))
+        .or_else(|| match selection.backend.as_str() {
+            "ollama" => Some("qwen3:8b".to_string()),
+            _ => None, // codex, claude, claude-code: each picks its own default
+        });
     Ok(ResolvedResolverAgent {
         backend: selection.backend,
         executable: selection.executable,
@@ -1145,6 +1177,7 @@ fn resolver_backend(
     resolve_resolver_agent(
         g.resolver_agent.as_deref(),
         g.resolver_model.as_deref(),
+        store,
         Path::new(&g.git_root),
     )
 }
@@ -3799,11 +3832,12 @@ fn record_feedback_reply(
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
         Path::new(&guardian.git_root),
     ) {
         Ok(r) => r,
         Err(e) => {
-            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            // ralphus[ignore-rlog-pair]: this low-level helper records no structured workflow outcome of its own; it's a best-effort side task, and the caller doesn't track its failures either
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} branch {branch_id} feedback reply skipped: \
@@ -3941,6 +3975,7 @@ pub fn run_merge_staged(
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
         Path::new(&guardian.git_root),
     ) {
         Ok(resolved) => resolved,
@@ -4587,6 +4622,7 @@ pub fn run_merge_cancellable(
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
         Path::new(&guardian.git_root),
     ) {
         Ok(resolved) => resolved,
@@ -5369,6 +5405,7 @@ pub fn run_feedback(
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
         Path::new(&branch_project),
     ) {
         Ok(r) => r,
@@ -6915,7 +6952,7 @@ fn final_checks(
     // RAL-101: no explicit checks or review auto_build -- fall back to the
     // project's default build/test command, if one is configured, so
     // "in review" still means "testable" rather than "merged and never built".
-    match crate::config::resolve(root.root()).auto_build {
+    match store.lock().resolve_review_config(root.root()).auto_build {
         Some(cmd) => {
             if !root
                 .at(combined_str)
@@ -7011,6 +7048,7 @@ fn run_review_auto_build(
     let resolved = match resolve_resolver_agent(
         def.agent.as_deref().or(stored_agent.as_deref()),
         def.model.as_deref().or(stored_model.as_deref()),
+        store,
         Path::new(&cwd),
     ) {
         Ok(r) => r,
@@ -9118,6 +9156,7 @@ fn generate_final_summary(
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
         ws_root.root(),
     ) {
         Ok(r) => r,
@@ -9131,7 +9170,11 @@ fn generate_final_summary(
     };
     let (agent, model) = (resolved.backend.clone(), resolved.model.clone());
 
-    let prompt = if crate::config::resolve(ws_root.root()).bullet_summary() {
+    let prompt = if store
+        .lock()
+        .resolve_review_config(ws_root.root())
+        .bullet_summary()
+    {
         format!(
             "You are summarising a stacked code review made up of the branches \
              [{branch_labels}]. The following are commit subject lines for each \
@@ -9418,6 +9461,7 @@ fn generate_manual_commands(
         match resolve_resolver_agent(
             stored_agent.as_deref(),
             stored_model.as_deref(),
+            store,
             Path::new(&cwd),
         ) {
             Ok(r) => r,
@@ -9579,6 +9623,7 @@ pub(crate) fn resolve_check_input(
     let resolved = match resolve_resolver_agent(
         stored_agent.as_deref(),
         stored_model.as_deref(),
+        store,
         Path::new(&cwd),
     ) {
         Ok(r) => r,
