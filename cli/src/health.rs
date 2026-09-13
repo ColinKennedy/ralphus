@@ -1,19 +1,36 @@
 //! `ralphus check health` -- check that the local setup can actually run
 //! tasks, ported from `cli/src/ralphus/health.py`.
 //!
-//! Checks are grouped into sections:
-//! - `core`: things every user needs (daemon reachable, git, every
-//!   registered project's on-disk path/git-repo validity, the runner
-//!   binary, Ollama for local-model runs, `nvidia-smi` for GPU metrics,
-//!   `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND`/`$RALPHUS_PI_COMMAND`
-//!   when set). Hard
-//!   requirements (`fail`) except `nvidia-smi` (`warn` -- the GPU column
-//!   just degrades to N/A without it).
-//! - `developer`: `cargo`, needed only to build the Rust binaries from
-//!   source. Opt-in (`--enable-developer-checks`) so end users aren't
-//!   warned about a tool they don't need.
+//! Checks are grouped into three human-facing sections (RAL-415):
+//! - [`CORE`]: daemon reachability, layered configuration provenance, every
+//!   registered project's on-disk path/git-repo validity, and every
+//!   `.ralphus.toml`-driven setting (timeouts, concurrency, forge/PR
+//!   conventions, templates, agent profiles/resolver).
+//! - [`HARNESS`]: everything the actual execution harness needs to run a
+//!   cell -- `git` (only when a registered project actually uses it),
+//!   `tmux`/psmux (live session panes), the runner binary, agent backend
+//!   commands (`claude`/`codex`/`pi`/`ollama`), and the optional `gh`/`glab`
+//!   forge-auth fallbacks.
+//! - [`MACHINE`]: host-level resource/build capabilities that degrade
+//!   gracefully rather than blocking task execution -- `nvidia-smi` (GPU
+//!   sampling), the opt-in developer toolchain (`cargo`), and opt-in
+//!   `--all-remotes` target inventory health.
 //!
-//! Only a `fail` makes `check health` exit non-zero.
+//! Every [`CheckResult`] states three things: `detail` (the observation --
+//! what was found), `impact` (what's at stake if this isn't a clean pass),
+//! and `remediation` (the concrete next step, or "No action needed." for a
+//! pass). `provenance` additionally names the contributing source (a config
+//! file, an env var, a resolution path) when one exists.
+//!
+//! Only a `fail` makes `check health` exit non-zero; `skip` marks a check
+//! that plainly does not apply here (e.g. git validation for a non-Git
+//! project) rather than one that was evaluated and passed.
+//!
+//! Live, cost-incurring agent calls are opt-in: [`check_arbiter`] performs a
+//! real completion round-trip against the configured Arbiter model and only
+//! runs when `enable_live_agent_checks` is set (`--enable-live-agent-check`).
+//! Every other check here is reachability/config-shape only, and runs by
+//! default.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,50 +38,94 @@ use std::time::Duration;
 use crate::client::DaemonClient;
 
 pub const CORE: &str = "core";
-pub const DEVELOPER: &str = "developer";
-/// RAL-355 Phase 9: `--all-remotes` target-inventory health, populated only
-/// when that flag is passed -- otherwise no live SSH connections are opened
-/// just because someone ran plain `ralphus check health`.
-pub const REMOTE: &str = "remote";
+pub const HARNESS: &str = "harness";
+pub const MACHINE: &str = "machine";
 
 const PASS: &str = "pass";
 const WARN: &str = "warn";
 const FAIL: &str = "fail";
+/// A check that was evaluated and found not to apply here -- e.g. git-repo
+/// validation for a project registered with a non-Git `vcs` kind. Distinct
+/// from `pass` (which means "applies, and is fine") so a human/JSON consumer
+/// can tell "nothing to check" apart from "checked, all good".
+const SKIP: &str = "skip";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CheckResult {
     pub name: String,
     pub status: &'static str,
+    /// The observation: what was found (a resolved path, a config value, an
+    /// error message).
     pub detail: String,
     pub section: &'static str,
+    /// What's at stake if this check's status isn't a clean `pass` --
+    /// always populated (including for a `pass`), so a reader never has to
+    /// guess why a check exists.
+    pub impact: String,
+    /// The concrete, actionable next step. `"No action needed."` for a
+    /// clean pass or an inapplicable skip.
+    pub remediation: String,
+    /// Where the effective value/resolution came from -- a config file
+    /// path, an env var name, a resolution source label -- when this check
+    /// has one contributing source worth naming. `None` for checks with no
+    /// single source (e.g. a live daemon round-trip).
+    pub provenance: Option<String>,
 }
 
 impl CheckResult {
-    fn new(name: &str, status: &'static str, detail: impl Into<String>) -> Self {
+    fn build(
+        name: &str,
+        status: &'static str,
+        detail: impl Into<String>,
+        section: &'static str,
+        impact: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             status,
             detail: detail.into(),
-            section: CORE,
+            section,
+            impact: impact.into(),
+            remediation: remediation.into(),
+            provenance: None,
         }
     }
 
-    fn developer(name: &str, status: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.to_string(),
-            status,
-            detail: detail.into(),
-            section: DEVELOPER,
-        }
+    fn new(
+        name: &str,
+        status: &'static str,
+        detail: impl Into<String>,
+        impact: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self::build(name, status, detail, CORE, impact, remediation)
     }
 
-    fn remote(name: &str, status: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.to_string(),
-            status,
-            detail: detail.into(),
-            section: REMOTE,
-        }
+    fn harness(
+        name: &str,
+        status: &'static str,
+        detail: impl Into<String>,
+        impact: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self::build(name, status, detail, HARNESS, impact, remediation)
+    }
+
+    fn machine(
+        name: &str,
+        status: &'static str,
+        detail: impl Into<String>,
+        impact: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self::build(name, status, detail, MACHINE, impact, remediation)
+    }
+
+    #[must_use]
+    fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
+        self.provenance = Some(provenance.into());
+        self
     }
 
     #[must_use]
@@ -114,32 +175,54 @@ pub fn unquote_path(value: &str) -> String {
 
 fn check_agent_command(name: &str, env_var: &str, default_program: &str) -> CheckResult {
     let Ok(raw) = std::env::var(env_var) else {
-        return CheckResult::new(
+        return CheckResult::harness(
             name,
             PASS,
             format!("not set (defaults to '{default_program}' on PATH)"),
+            format!("Tasks using this backend run '{default_program}' resolved from PATH."),
+            "No action needed.",
         );
     };
     if is_compound_shell_command(&raw) {
-        return CheckResult::new(
+        return CheckResult::harness(
             name,
             PASS,
             format!("compound shell command, not path-checked: {raw}"),
+            "The command is a shell pipeline/multi-word invocation, so only a live run can confirm it actually works.",
+            "No action needed; verify by running a task with this backend.",
         );
     }
     let path = unquote_path(&raw);
     let p = Path::new(&path);
     if !p.is_file() {
-        return CheckResult::new(
+        return CheckResult::harness(
             name,
             FAIL,
             format!("{path} does not exist or is not a file"),
+            format!(
+                "Tasks using this backend cannot start; ${env_var} points at a nonexistent file."
+            ),
+            format!("Fix or unset ${env_var} so it points at a real executable."),
         );
     }
     if !is_executable(p) {
-        return CheckResult::new(name, FAIL, format!("{path} is not executable"));
+        return CheckResult::harness(
+            name,
+            FAIL,
+            format!("{path} is not executable"),
+            format!(
+                "Tasks using this backend cannot start; ${env_var} points at a non-executable file."
+            ),
+            format!("Make {path} executable, or point ${env_var} at a real executable."),
+        );
     }
-    CheckResult::new(name, PASS, path)
+    CheckResult::harness(
+        name,
+        PASS,
+        path,
+        "Tasks using this backend can start.",
+        "No action needed.",
+    )
 }
 
 #[cfg(unix)]
@@ -189,6 +272,8 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
             "daemon",
             FAIL,
             format!("unreachable at {daemon_url}: {e}"),
+            "No task can be submitted, monitored, or managed -- and every other check below that talks to the daemon will also fail or be silently skipped.",
+            "Start the daemon (`ralphus-daemon`), or fix --daemon-url/$RALPHUS_DAEMON_URL to point at a running one.",
         )],
         Ok(health) => {
             let version = health["version"].as_str().unwrap_or("?");
@@ -197,6 +282,8 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
                 "daemon",
                 PASS,
                 format!("reachable ({name} {version})"),
+                "The CLI can submit and monitor tasks.",
+                "No action needed.",
             )];
             if let Some(warnings) = health["warnings"].as_array() {
                 for w in warnings {
@@ -204,6 +291,8 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
                         "daemon",
                         WARN,
                         w.as_str().unwrap_or_default().to_string(),
+                        "The daemon itself flagged a condition worth attention; specifics vary by warning.",
+                        "See the daemon's own logs/documentation for this warning.",
                     ));
                 }
             }
@@ -212,20 +301,43 @@ fn check_daemon(daemon_url: &str) -> Vec<CheckResult> {
     }
 }
 
-fn check_git() -> CheckResult {
+/// Whether `git` itself (the binary check, [`check_git`]) is a hard
+/// requirement -- only true when at least one registered project actually
+/// uses it, or when project registration state couldn't be determined at
+/// all (unreachable daemon, nothing registered yet), in which case the
+/// safer default is to still require it.
+fn check_git(git_required: bool) -> CheckResult {
     match which("git") {
-        None => CheckResult::new(
+        Some(path) => CheckResult::harness(
+            "git",
+            PASS,
+            path,
+            "Guardian reviews, worktree creation, and Git-based project validation all shell out to git.",
+            "No action needed.",
+        ),
+        None if !git_required => CheckResult::harness(
+            "git",
+            SKIP,
+            "not found on PATH, but no registered project uses Git",
+            "None today -- every registered project's vcs kind is non-Git, so nothing here depends on a git binary.",
+            "If you register a Git-based project later, install git and re-run this check.",
+        ),
+        None => CheckResult::harness(
             "git",
             FAIL,
-            "not found on PATH (required for Guardian reviews)",
+            "not found on PATH",
+            "Guardian reviews and Git-based project validation cannot run without it.",
+            "Install git and ensure it resolves on PATH.",
         ),
-        Some(path) => CheckResult::new("git", PASS, path),
     }
 }
 
 /// Re-runs the same path/git-repo validation `ralphus project git` does at
-/// registration time, for one already-registered project.
-fn check_project_path(name: &str, path: &str) -> CheckResult {
+/// registration time, for one already-registered project -- skipping the
+/// git-specific half entirely when `vcs` names a non-Git kind (RAL-415: a
+/// project's on-disk path must still exist regardless of VCS, but only a
+/// Git project needs a `.git` checkout).
+fn check_project_path(name: &str, path: &str, vcs: &str) -> CheckResult {
     let check_name = format!("project:{name}");
     let p = Path::new(path);
     if !p.is_dir() {
@@ -233,6 +345,19 @@ fn check_project_path(name: &str, path: &str) -> CheckResult {
             &check_name,
             FAIL,
             format!("{path} does not exist or is not a directory"),
+            "Every task/cell routed to this project fails before it can even start.",
+            format!(
+                "Create {path}, or re-point the registration (ralphus project git --name {name} --path <path>)."
+            ),
+        );
+    }
+    if vcs != "git" {
+        return CheckResult::new(
+            &check_name,
+            SKIP,
+            format!("{path} exists; vcs=\"{vcs}\" is not Git, so repository validation is skipped"),
+            "None -- this project's vcs kind has no git-specific requirement to validate.",
+            "No action needed.",
         );
     }
     let output = std::process::Command::new("git")
@@ -243,13 +368,27 @@ fn check_project_path(name: &str, path: &str) -> CheckResult {
             &check_name,
             FAIL,
             format!("could not run git in {path}: {e}"),
+            "Reviews and worktree operations for this project cannot run.",
+            "Ensure git is installed and runnable from this project's path.",
         ),
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if !out.status.success() || stdout.trim() != "true" {
-                CheckResult::new(&check_name, FAIL, format!("{path} is not a git repository"))
+                CheckResult::new(
+                    &check_name,
+                    FAIL,
+                    format!("{path} is not a git repository"),
+                    "This project is registered with vcs=\"git\" but has no working .git checkout; reviews and worktree creation will fail.",
+                    format!("Run `git init` in {path}, or fix this project's registered vcs kind."),
+                )
             } else {
-                CheckResult::new(&check_name, PASS, path)
+                CheckResult::new(
+                    &check_name,
+                    PASS,
+                    path,
+                    "Reviews and worktree operations can run against this project.",
+                    "No action needed.",
+                )
             }
         }
     }
@@ -276,29 +415,46 @@ fn check_project_clone_url(
     Some(CheckResult::new(
         &format!("project:{name}:clone-url"),
         WARN,
-        format!(
-            "no clone URL registered; a cell routed to a remote machine will fail until one is set (ralphus project git --name {name} --path <path> --url <clone-url>)"
-        ),
+        "no clone URL registered",
+        format!("A cell for \"{name}\" routed to a remote machine will fail during provisioning."),
+        format!("Register one: ralphus project git --name {name} --path <path> --url <clone-url>"),
     ))
 }
 
-/// Validates every project registered with the daemon. Silently contributes
-/// nothing if the daemon is unreachable ([`check_daemon`] already reports
-/// that) or if no projects are registered.
-fn check_projects(daemon_url: &str) -> Vec<CheckResult> {
+/// Per-[`check_projects`] summary: its [`CheckResult`]s, plus the two facts
+/// [`check_git`] needs to decide whether the `git` binary itself is
+/// actually required here (RAL-415).
+struct ProjectsSummary {
+    results: Vec<CheckResult>,
+    any_project_registered: bool,
+    any_git_project: bool,
+}
+
+/// Validates every project registered with the daemon. Contributes empty
+/// results (and treats git as still required, the conservative default) if
+/// the daemon is unreachable ([`check_daemon`] already reports that) or if
+/// no projects are registered.
+fn check_projects(daemon_url: &str) -> ProjectsSummary {
     let client = DaemonClient::new(daemon_url);
     let Ok(response) = client.list_projects() else {
-        return Vec::new();
+        return ProjectsSummary {
+            results: Vec::new(),
+            any_project_registered: false,
+            any_git_project: false,
+        };
     };
     let has_remote_providers = client
         .list_machines()
         .ok()
         .and_then(|m| m["machines"].as_array().map(|a| !a.is_empty()))
         .unwrap_or(false);
-    response["projects"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let projects: Vec<_> = response["projects"].as_array().cloned().unwrap_or_default();
+    let any_project_registered = !projects.is_empty();
+    let any_git_project = projects
+        .iter()
+        .any(|p| p["vcs"].as_str().unwrap_or("git") == "git");
+    let results = projects
+        .iter()
         .flat_map(|p| {
             let Some(name) = p["name"].as_str() else {
                 return Vec::new();
@@ -306,8 +462,9 @@ fn check_projects(daemon_url: &str) -> Vec<CheckResult> {
             let Some(path) = p["path"].as_str() else {
                 return Vec::new();
             };
-            let mut results = vec![check_project_path(name, path)];
-            if p["vcs"].as_str() == Some("git") {
+            let vcs = p["vcs"].as_str().unwrap_or("git");
+            let mut results = vec![check_project_path(name, path, vcs)];
+            if vcs == "git" {
                 results.extend(check_project_clone_url(
                     name,
                     p["clone_url"].as_str(),
@@ -316,7 +473,12 @@ fn check_projects(daemon_url: &str) -> Vec<CheckResult> {
             }
             results
         })
-        .collect()
+        .collect();
+    ProjectsSummary {
+        results,
+        any_project_registered,
+        any_git_project,
+    }
 }
 
 /// RAL-338: fork registration health, evaluated daemon-side (see
@@ -350,6 +512,8 @@ fn check_project_forks(daemon_url: &str) -> Vec<CheckResult> {
                 &check_name,
                 status,
                 c["detail"].as_str().unwrap_or_default(),
+                "A misregistered fork breaks automated PR routing for this project/user.",
+                "Re-run this project/user's fork registration, or see the detail above for specifics.",
             )
         })
         .collect()
@@ -363,23 +527,39 @@ fn check_runner() -> CheckResult {
         .unwrap_or("ralphus-runner")
         .to_string();
     if which(&program).is_none() && !Path::new(&program).exists() {
-        return CheckResult::new(
+        return CheckResult::harness(
             "runner",
             WARN,
             format!("'{program}' not found (set RALPHUS_RUNNER_CMD)"),
+            "The daemon cannot launch cells without a resolvable runner binary; tasks will fail to start.",
+            "Build/install ralphus-runner and put it on PATH, or set RALPHUS_RUNNER_CMD to its full path.",
         );
     }
-    CheckResult::new("runner", PASS, program)
+    CheckResult::harness(
+        "runner",
+        PASS,
+        program,
+        "The daemon can launch cells.",
+        "No action needed.",
+    )
 }
 
 fn check_nvidia_smi() -> CheckResult {
     match which("nvidia-smi") {
-        None => CheckResult::new(
+        None => CheckResult::machine(
             "nvidia-smi",
             WARN,
-            "not found on PATH; GPU usage in the resource view will show N/A",
+            "not found on PATH",
+            "The resource view's GPU column shows N/A instead of live usage; nothing else is affected.",
+            "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.",
         ),
-        Some(path) => CheckResult::new("nvidia-smi", PASS, path),
+        Some(path) => CheckResult::machine(
+            "nvidia-smi",
+            PASS,
+            path,
+            "GPU usage is reported in the resource view.",
+            "No action needed.",
+        ),
     }
 }
 
@@ -394,16 +574,202 @@ fn check_ollama() -> CheckResult {
         .call()
         .is_ok();
     if reachable {
-        CheckResult::new("ollama", PASS, base)
+        CheckResult::harness(
+            "ollama",
+            PASS,
+            base,
+            "Tasks using the ollama agent backend can reach a local model server.",
+            "No action needed.",
+        )
     } else {
-        CheckResult::new(
+        CheckResult::harness(
             "ollama",
             FAIL,
-            format!(
-                "not reachable at {base} (required to run local models; start it with 'ollama serve')"
-            ),
+            format!("not reachable at {base}"),
+            "Tasks using the ollama agent backend (and the Arbiter's default resolver, unless reconfigured) cannot run.",
+            "Start Ollama (`ollama serve`), or point $RALPHUS_OLLAMA_URL at a reachable server.",
         )
     }
+}
+
+/// `daemon/src/forge.rs::resolve_cli_token`'s fallback role, shared by both
+/// [`check_gh_for`] and [`check_glab_for`]'s detail text (RAL-415): neither
+/// binary is ever required, and a missing one must never fail this check --
+/// it just means the fallback path is unavailable if the primary token env
+/// var also turns out to be unset.
+fn check_gh_for(found: Option<String>) -> CheckResult {
+    const ROLE: &str = "optional fallback token source for GitHub auth (`gh auth token`), used only when RALPHUS_GITHUB_TOKEN / [forge].token_env is unset";
+    match found {
+        Some(path) => CheckResult::harness(
+            "gh",
+            PASS,
+            format!("{path} ({ROLE})"),
+            "GitHub PR submission can fall back to a token already cached by `gh auth login`.",
+            "No action needed.",
+        ),
+        None => CheckResult::harness(
+            "gh",
+            PASS,
+            format!("not found on PATH ({ROLE})"),
+            "No effect unless RALPHUS_GITHUB_TOKEN/[forge].token_env is also unset -- in that case GitHub PR submission has no token to use.",
+            "Optional: install the GitHub CLI (https://cli.github.com) and run `gh auth login`, or set RALPHUS_GITHUB_TOKEN directly.",
+        ),
+    }
+}
+
+fn check_gh() -> CheckResult {
+    check_gh_for(which("gh"))
+}
+
+fn check_glab_for(found: Option<String>) -> CheckResult {
+    const ROLE: &str = "optional fallback token source for GitLab auth (`glab auth status --show-token`), used only when RALPHUS_GITLAB_TOKEN / [forge].token_env is unset";
+    match found {
+        Some(path) => CheckResult::harness(
+            "glab",
+            PASS,
+            format!("{path} ({ROLE})"),
+            "GitLab PR submission can fall back to a token already cached by `glab auth login`.",
+            "No action needed.",
+        ),
+        None => CheckResult::harness(
+            "glab",
+            PASS,
+            format!("not found on PATH ({ROLE})"),
+            "No effect unless RALPHUS_GITLAB_TOKEN/[forge].token_env is also unset -- in that case GitLab PR submission has no token to use.",
+            "Optional: install the GitLab CLI (https://gitlab.com/gitlab-org/cli) and run `glab auth login`, or set RALPHUS_GITLAB_TOKEN directly.",
+        ),
+    }
+}
+
+fn check_glab() -> CheckResult {
+    check_glab_for(which("glab"))
+}
+
+/// Resolves tmux/psmux exactly the way the daemon does
+/// (`ralphus_daemon::tmux::resolve_tmux_program_with_source`), reporting
+/// both the resolved value and which resolution source won (an explicit
+/// `RALPHUS_TMUX_CMD` override, the embedded vendored build, or `PATH`) --
+/// RAL-415. A missing binary is a hard `fail`: every live cell session
+/// depends on it.
+fn check_tmux_for(resolved: Result<(String, &'static str), String>) -> CheckResult {
+    match resolved {
+        Ok((program, source)) => CheckResult::harness(
+            "tmux",
+            PASS,
+            format!("{program} (source: {source})"),
+            "Live sessions/panes for running cells depend on this binary.",
+            "No action needed.",
+        )
+        .with_provenance(source),
+        Err(e) => CheckResult::harness(
+            "tmux",
+            FAIL,
+            e,
+            "Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.",
+            "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path (see docs/dependencies.md).",
+        ),
+    }
+}
+
+fn check_tmux() -> CheckResult {
+    check_tmux_for(
+        ralphus_daemon::tmux::resolve_tmux_program_with_source().map_err(|e| e.to_string()),
+    )
+}
+
+/// Lists every `.ralphus.toml`-shaped file that layers into the CLI-side
+/// `task.*`/`[daemon]` settings loader (`crate::config::load_config`), in
+/// resolution order (later wins) -- RAL-415: "which files even contribute"
+/// is a different, prerequisite question to the per-field provenance the
+/// individual `[daemon]`/`[task]` checks below already report.
+fn check_config_sources_cli_for(config: &crate::config::Config) -> CheckResult {
+    if config.sources.is_empty() {
+        return CheckResult::new(
+            "config-sources",
+            PASS,
+            "no .ralphus.toml files contribute to task.*/[daemon] settings; built-in defaults apply",
+            "None -- task.maximum_timeout_seconds and [daemon] settings are at their built-in defaults.",
+            "If you expect an override to apply, confirm the file exists and is named .ralphus.toml.",
+        );
+    }
+    let listing = config
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let label = config
+                .source_labels
+                .iter()
+                .find(|(sp, _)| sp == p)
+                .map(|(_, l)| l.as_str())
+                .unwrap_or("unknown");
+            format!("{}. {} ({label})", i + 1, p.display())
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    CheckResult::new(
+        "config-sources",
+        PASS,
+        format!("{listing} -- later entries override earlier ones for task.*/[daemon] settings"),
+        "Determines the effective task.maximum_timeout_seconds and [daemon] log/concurrency settings.",
+        "No action needed; edit the last-listed file to change effective settings.",
+    )
+    .with_provenance(
+        config
+            .sources
+            .last()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn check_config_sources_cli(cwd: &Path) -> CheckResult {
+    check_config_sources_cli_for(&crate::config::load_config(cwd, true))
+}
+
+/// Lists the global + nearest-per-project `.ralphus.toml` files that layer
+/// into `ralphus_daemon::config`'s own loader (used by the `[forge]`/
+/// `[live_view]`/`[thrash]`/`[[templates]]`/`[ui]` checks below) -- a
+/// distinct resolution chain from [`check_config_sources_cli`]'s
+/// `$RALPHUS_CONFIGURATION_PATH`-based one (RAL-415).
+fn check_config_sources_project_for(global: Option<&Path>, project: Option<&Path>) -> CheckResult {
+    let mut entries = Vec::new();
+    if let Some(g) = global {
+        entries.push(format!("{}. {} (global)", entries.len() + 1, g.display()));
+    }
+    if let Some(p) = project {
+        entries.push(format!(
+            "{}. {} (nearest project)",
+            entries.len() + 1,
+            p.display()
+        ));
+    }
+    if entries.is_empty() {
+        return CheckResult::new(
+            "config-sources-project",
+            PASS,
+            "no global or per-project .ralphus.toml found; built-in defaults apply for [forge]/[live_view]/[thrash]/[[templates]]/[ui]",
+            "None -- those settings are at their built-in defaults.",
+            "No action needed.",
+        );
+    }
+    CheckResult::new(
+        "config-sources-project",
+        PASS,
+        format!(
+            "{} -- project overrides global for [forge]/[live_view]/[thrash]/[[templates]]/[ui] settings",
+            entries.join("; ")
+        ),
+        "Determines the effective forge/live-view/thrash/template/UI settings used by the checks below.",
+        "No action needed; edit the project file to override the global one.",
+    )
+}
+
+fn check_config_sources_project(cwd: &Path) -> CheckResult {
+    check_config_sources_project_for(
+        ralphus_daemon::config::global_config_path().as_deref(),
+        ralphus_daemon::config::find_project_config(cwd).as_deref(),
+    )
 }
 
 fn check_config(cwd: &Path) -> CheckResult {
@@ -416,6 +782,8 @@ fn check_config(cwd: &Path) -> CheckResult {
             format!(
                 "task.maximum_timeout_seconds is {mt}; must be >= 0 (0 = unbounded, positive = seconds)"
             ),
+            "Every subprocess timeout computation is undefined with a negative cap; task execution behavior becomes unreliable.",
+            "Set task.maximum_timeout_seconds to 0 (unbounded) or a positive number of seconds.",
         );
     }
     if mt == 0 {
@@ -427,9 +795,9 @@ fn check_config(cwd: &Path) -> CheckResult {
         return CheckResult::new(
             "config",
             WARN,
-            format!(
-                "task.maximum_timeout_seconds is 0 (no timeout){src}; backend sessions may run forever"
-            ),
+            format!("task.maximum_timeout_seconds is 0 (no timeout){src}"),
+            "Backend sessions may run forever if an agent hangs.",
+            "Set task.maximum_timeout_seconds to a positive number of seconds if you want a hard cap.",
         );
     }
     let src = config
@@ -441,6 +809,8 @@ fn check_config(cwd: &Path) -> CheckResult {
         "config",
         PASS,
         format!("task.maximum_timeout_seconds={mt}s{src}"),
+        "Subprocess backends are capped at this wall-clock duration.",
+        "No action needed.",
     )
 }
 
@@ -461,6 +831,8 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
                 "daemon.max_concurrent unset; using default {}",
                 ralphus_daemon::DEFAULT_MAX_CONCURRENT
             ),
+            "The daemon caps concurrent cells at the built-in default.",
+            "No action needed.",
         );
     };
     let src = config
@@ -473,7 +845,11 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
             "daemon-max-concurrent",
             WARN,
             format!(
-                "daemon.max_concurrent is {mc}{src}; must be >= 0 (0 = no limit, positive = concurrency cap) -- falling back to default {}",
+                "daemon.max_concurrent is {mc}{src}; must be >= 0 (0 = no limit, positive = concurrency cap)"
+            ),
+            "The configured value is ignored; the daemon silently falls back to its built-in default instead.",
+            format!(
+                "Set daemon.max_concurrent to 0 (no limit) or a positive concurrency cap, or leave it unset (default {})",
                 ralphus_daemon::DEFAULT_MAX_CONCURRENT
             ),
         );
@@ -482,15 +858,17 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
         return CheckResult::new(
             "daemon-max-concurrent",
             WARN,
-            format!(
-                "daemon.max_concurrent is 0{src} (no limit); every ready cell may run at once, which can overwhelm the machine"
-            ),
+            format!("daemon.max_concurrent is 0{src} (no limit)"),
+            "Every ready cell may run at once, which can overwhelm the machine.",
+            "Set daemon.max_concurrent to a positive cap if you want to bound parallelism.",
         );
     }
     CheckResult::new(
         "daemon-max-concurrent",
         PASS,
         format!("daemon.max_concurrent={mc}{src}"),
+        "The daemon caps concurrent cells at this value.",
+        "No action needed.",
     )
 }
 
@@ -563,13 +941,14 @@ fn check_tool_arg_truncate_chars_for(
     project_table: Option<&toml::Table>,
     project_path: Option<&Path>,
 ) -> CheckResult {
-    let (raw, src) = if let Some(v) = project_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
-        (Some(v), project_path)
-    } else if let Some(v) = global_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
-        (Some(v), global_path)
-    } else {
-        (None, None)
-    };
+    let (raw, src_path) =
+        if let Some(v) = project_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
+            (Some(v), project_path)
+        } else if let Some(v) = global_table.and_then(|t| t.get("tool_arg_truncate_chars")) {
+            (Some(v), global_path)
+        } else {
+            (None, None)
+        };
 
     let Some(raw) = raw else {
         return CheckResult::new(
@@ -579,9 +958,11 @@ fn check_tool_arg_truncate_chars_for(
                 "live_view.tool_arg_truncate_chars unset; using default {}",
                 ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
             ),
+            "Tool-use argument values in the Live View pane are truncated at the built-in default.",
+            "No action needed.",
         );
     };
-    let src = src
+    let src_str = src_path
         .map(|p| format!(" (from {})", p.display()))
         .unwrap_or_default();
     match raw.as_integer() {
@@ -589,22 +970,33 @@ fn check_tool_arg_truncate_chars_for(
             "tool-arg-truncate-chars",
             WARN,
             format!(
-                "live_view.tool_arg_truncate_chars is not a number{src} -- falling back to the default {}",
+                "live_view.tool_arg_truncate_chars is not a number{src_str} -- falling back to the default {}",
                 ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
             ),
+            "The configured value is ignored; Live View truncation silently uses the default instead.",
+            "Set live_view.tool_arg_truncate_chars to an integer >= 0.",
         ),
         Some(n) if n < 0 => CheckResult::new(
             "tool-arg-truncate-chars",
             WARN,
             format!(
-                "live_view.tool_arg_truncate_chars is {n}{src}; must be >= 0 -- falling back to the default {}",
+                "live_view.tool_arg_truncate_chars is {n}{src_str}; must be >= 0 -- falling back to the default {}",
                 ralphus_daemon::config::DEFAULT_TOOL_ARG_TRUNCATE_CHARS
             ),
+            "The configured value is ignored; Live View truncation silently uses the default instead.",
+            "Set live_view.tool_arg_truncate_chars to an integer >= 0.",
         ),
         Some(n) => CheckResult::new(
             "tool-arg-truncate-chars",
             PASS,
-            format!("live_view.tool_arg_truncate_chars={n}{src}"),
+            format!("live_view.tool_arg_truncate_chars={n}{src_str}"),
+            "Tool-use argument values in the Live View pane are truncated at this length.",
+            "No action needed.",
+        )
+        .with_provenance(
+            src_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         ),
     }
 }
@@ -637,7 +1029,7 @@ fn check_thrash_field_for(
     check_name: &str,
     default: u32,
 ) -> CheckResult {
-    let (raw, src) = if let Some(v) = project_table.and_then(|t| t.get(field)) {
+    let (raw, src_path) = if let Some(v) = project_table.and_then(|t| t.get(field)) {
         (Some(v), project_path)
     } else if let Some(v) = global_table.and_then(|t| t.get(field)) {
         (Some(v), global_path)
@@ -650,25 +1042,44 @@ fn check_thrash_field_for(
             check_name,
             PASS,
             format!("thrash.{field} unset; using default {default}"),
+            "Thrash detection uses the built-in default for this field.",
+            "No action needed.",
         );
     };
-    let src = src
+    let src_str = src_path
         .map(|p| format!(" (from {})", p.display()))
         .unwrap_or_default();
     match raw.as_integer() {
         None => CheckResult::new(
             check_name,
             WARN,
-            format!("thrash.{field} is not a number{src} -- falling back to the default {default}"),
+            format!(
+                "thrash.{field} is not a number{src_str} -- falling back to the default {default}"
+            ),
+            "The configured value is ignored; thrash detection silently uses the default instead.",
+            format!("Set thrash.{field} to a non-negative integer."),
         ),
         Some(n) if n < 0 => CheckResult::new(
             check_name,
             WARN,
             format!(
-                "thrash.{field} is {n}{src}; must be >= 0 -- falling back to the default {default}"
+                "thrash.{field} is {n}{src_str}; must be >= 0 -- falling back to the default {default}"
             ),
+            "The configured value is ignored; thrash detection silently uses the default instead.",
+            format!("Set thrash.{field} to a non-negative integer."),
         ),
-        Some(n) => CheckResult::new(check_name, PASS, format!("thrash.{field}={n}{src}")),
+        Some(n) => CheckResult::new(
+            check_name,
+            PASS,
+            format!("thrash.{field}={n}{src_str}"),
+            "Thrash detection uses this configured value.",
+            "No action needed.",
+        )
+        .with_provenance(
+            src_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
     }
 }
 
@@ -743,11 +1154,25 @@ fn check_pull_request_branch_convention_for(
                 "not set (defaults to '{}')",
                 ralphus_daemon::config::DEFAULT_PR_BRANCH_CONVENTION
             ),
+            "PR branches are named using the built-in default convention.",
+            "No action needed.",
         );
     };
     match ralphus_daemon::config::validate_pull_request_branch_convention(&convention) {
-        Ok(()) => CheckResult::new("pull-request-branch-convention", PASS, convention),
-        Err(e) => CheckResult::new("pull-request-branch-convention", FAIL, e),
+        Ok(()) => CheckResult::new(
+            "pull-request-branch-convention",
+            PASS,
+            convention,
+            "PR branches are named using this convention.",
+            "No action needed.",
+        ),
+        Err(e) => CheckResult::new(
+            "pull-request-branch-convention",
+            FAIL,
+            e,
+            "PR submission fails outright: an invalid convention has no safe default to fall back to.",
+            "Fix [forge].pull_request_branch_convention so it contains the required {name} placeholder.",
+        ),
     }
 }
 
@@ -788,6 +1213,8 @@ fn check_templates_for(
                 "no [[templates]] configured -- using the built-in \"{}\" fallback",
                 ralphus_daemon::config::DEFAULT_TEMPLATE_NAME
             ),
+            "The Simple task form's template picker offers only the built-in fallback.",
+            "No action needed; add [[templates]] entries to offer more.",
         ));
     } else {
         let errors = ralphus_daemon::config::validate_templates(templates);
@@ -796,10 +1223,18 @@ fn check_templates_for(
                 "templates",
                 PASS,
                 format!("{} template(s) configured", templates.len()),
+                "The Simple task form's template picker offers these templates.",
+                "No action needed.",
             ));
         } else {
             for e in errors {
-                results.push(CheckResult::new("templates", FAIL, e.message));
+                results.push(CheckResult::new(
+                    "templates",
+                    FAIL,
+                    e.message,
+                    "A malformed template entry breaks the Simple task form's template picker.",
+                    "Fix the [[templates]] entry named in the detail above.",
+                ));
             }
         }
     }
@@ -808,10 +1243,24 @@ fn check_templates_for(
             "new-task-default-tab",
             PASS,
             "not set (defaults to 'simple')",
+            "The Simple task form opens on the 'simple' tab by default.",
+            "No action needed.",
         )),
         Some(tab) => match ralphus_daemon::config::validate_new_task_default_tab(tab) {
-            Ok(()) => results.push(CheckResult::new("new-task-default-tab", PASS, tab.clone())),
-            Err(e) => results.push(CheckResult::new("new-task-default-tab", FAIL, e)),
+            Ok(()) => results.push(CheckResult::new(
+                "new-task-default-tab",
+                PASS,
+                tab.clone(),
+                "The Simple task form opens on this tab by default.",
+                "No action needed.",
+            )),
+            Err(e) => results.push(CheckResult::new(
+                "new-task-default-tab",
+                FAIL,
+                e,
+                "[ui].new_task_default_tab names an unknown tab; the New Task form's default-tab setting is broken.",
+                "Set [ui].new_task_default_tab to a known tab name.",
+            )),
         },
     }
     results
@@ -832,6 +1281,8 @@ fn check_agent_profiles(daemon_url: &str, cwd: &Path) -> Vec<CheckResult> {
                 "agent-profiles",
                 FAIL,
                 format!("could not reach daemon to check agent profiles: {e}"),
+                "Custom [agent.profiles.*] entries cannot be validated; a misconfigured profile could fail silently at task-submission time instead.",
+                "Ensure the daemon is reachable, then re-run this check.",
             )];
         }
     };
@@ -849,6 +1300,8 @@ fn check_agent_profiles(daemon_url: &str, cwd: &Path) -> Vec<CheckResult> {
                 p["name"].as_str().unwrap_or("agent-profile"),
                 status,
                 p["detail"].as_str().unwrap_or_default(),
+                "A broken agent profile fails any task that selects it, at submission time.",
+                "Fix the profile in .ralphus.toml's [agent.profiles.*] per the detail above.",
             )
         })
         .collect()
@@ -872,6 +1325,8 @@ fn check_default_resolver_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
                 "default-resolver-agent",
                 FAIL,
                 format!("could not reach daemon to check the default resolver agent: {e}"),
+                "Review resolution cannot be validated; a misconfigured resolver agent could fail silently at review time instead.",
+                "Ensure the daemon is reachable, then re-run this check.",
             );
         }
     };
@@ -882,7 +1337,13 @@ fn check_default_resolver_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
         .flatten()
         .any(|a| a["id"].as_str() == Some(default_agent));
     if known {
-        CheckResult::new("default-resolver-agent", PASS, default_agent)
+        CheckResult::new(
+            "default-resolver-agent",
+            PASS,
+            default_agent,
+            "Reviews without an explicit resolver fall back to this agent.",
+            "No action needed.",
+        )
     } else {
         CheckResult::new(
             "default-resolver-agent",
@@ -891,16 +1352,19 @@ fn check_default_resolver_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
                 "[review].default_resolver_agent = \"{default_agent}\" does not match any \
                  built-in backend or configured [agent.profiles.*] entry for this project"
             ),
+            "Reviews without an explicit resolver fail outright instead of falling back to a working agent.",
+            "Fix [review].default_resolver_agent to name a built-in backend or a configured [agent.profiles.*] entry.",
         )
     }
 }
 
 /// RAL-318: a live completion round-trip against the configured Arbiter
 /// agent/model, via `POST /api/health/arbiter`. Unlike every other check in
-/// this module (config shape/reachability only), this is a genuinely live
-/// call -- deliberately user-triggered only (`ralphus check health`, not
-/// polled), so it needs no caching/rate-limiting of its own cost. The
-/// endpoint itself still respects the Arbiter's `maximum_budget_usd` cap.
+/// this module (config shape/reachability only), this is a genuinely live,
+/// cost-incurring call -- gated behind `enable_live_agent_checks`
+/// (`--enable-live-agent-check`, RAL-415) so plain `ralphus check health`
+/// never silently spends model budget; the endpoint itself still respects
+/// the Arbiter's `maximum_budget_usd` cap when it does run.
 fn check_arbiter(daemon_url: &str) -> CheckResult {
     let client = DaemonClient::new(daemon_url);
     match client.health_arbiter() {
@@ -914,6 +1378,8 @@ fn check_arbiter(daemon_url: &str) -> CheckResult {
                         "{agent} responded: {}",
                         response["reply"].as_str().unwrap_or_default()
                     ),
+                    "The Arbiter can complete a live round-trip against its configured agent/model.",
+                    "No action needed.",
                 )
             } else {
                 CheckResult::new(
@@ -923,6 +1389,8 @@ fn check_arbiter(daemon_url: &str) -> CheckResult {
                         "{agent}: {}",
                         response["detail"].as_str().unwrap_or("no reply")
                     ),
+                    "Reviews/tasks that depend on the Arbiter will fail the same way.",
+                    "See the detail above for the underlying agent/model error, and fix the Arbiter's configuration or credentials.",
                 )
             }
         }
@@ -930,18 +1398,28 @@ fn check_arbiter(daemon_url: &str) -> CheckResult {
             "arbiter",
             FAIL,
             format!("could not reach daemon to check the Arbiter: {e}"),
+            "Reviews/tasks that depend on the Arbiter cannot be validated.",
+            "Ensure the daemon is reachable, then re-run with --enable-live-agent-check.",
         ),
     }
 }
 
 fn check_cargo() -> CheckResult {
     match which("cargo") {
-        None => CheckResult::developer(
+        None => CheckResult::machine(
             "cargo",
             FAIL,
-            "cargo not found on PATH (required to build the Rust binaries; install it via https://rustup.rs)",
+            "cargo not found on PATH",
+            "The Rust binaries in this workspace cannot be built from source.",
+            "Install it via https://rustup.rs.",
         ),
-        Some(path) => CheckResult::developer("cargo", PASS, path),
+        Some(path) => CheckResult::machine(
+            "cargo",
+            PASS,
+            path,
+            "The Rust binaries in this workspace can be built from source.",
+            "No action needed.",
+        ),
     }
 }
 
@@ -955,19 +1433,23 @@ fn check_remote_targets(daemon_url: &str) -> Vec<CheckResult> {
     let response = match client.health_remote_targets() {
         Ok(response) => response,
         Err(e) => {
-            return vec![CheckResult::remote(
+            return vec![CheckResult::machine(
                 "remote-targets",
                 FAIL,
                 format!("could not reach daemon to check remote targets: {e}"),
+                "Remote-machine cell routing cannot be validated.",
+                "Ensure the daemon is reachable, then re-run with --all-remotes.",
             )];
         }
     };
     let targets = response["targets"].as_array().cloned().unwrap_or_default();
     if targets.is_empty() {
-        return vec![CheckResult::remote(
+        return vec![CheckResult::machine(
             "remote-targets",
             PASS,
             "no [machine.targets.*] configured",
+            "All work runs locally; no remote machine routing is configured.",
+            "No action needed.",
         )];
     }
     targets
@@ -986,43 +1468,46 @@ fn check_remote_targets(daemon_url: &str) -> Vec<CheckResult> {
                         Some("warn") => WARN,
                         _ => FAIL,
                     };
-                    CheckResult::remote(
+                    CheckResult::machine(
                         &format!("{target_name}:{}", c["name"].as_str().unwrap_or("?")),
                         status,
                         format!("[{machine}] {}", c["detail"].as_str().unwrap_or_default()),
+                        "A broken remote target fails any cell routed to it.",
+                        "See the detail above and this target's machine-provider configuration.",
                     )
                 })
         })
         .collect()
 }
 
-/// Runs the core health checks; adds the developer section when opted in,
-/// and the remote-target section (`--all-remotes`) when opted in.
+/// Runs the core health checks; adds the developer/machine-toolchain check
+/// when opted in (`--enable-developer-checks`), the remote-target inventory
+/// when opted in (`--all-remotes`), and the live Arbiter round-trip when
+/// opted in (`--enable-live-agent-check`, RAL-415 -- every other check here
+/// is reachability/config-shape only and always runs).
 #[must_use]
 pub fn run_checks(
     daemon_url: &str,
     cwd: &Path,
     enable_developer_checks: bool,
     enable_remote_checks: bool,
+    enable_live_agent_checks: bool,
 ) -> Vec<CheckResult> {
     let mut results = check_daemon(daemon_url);
-    results.push(check_git());
-    results.extend(check_projects(daemon_url));
+    results.push(check_config_sources_cli(cwd));
+    results.push(check_config_sources_project(cwd));
+
+    let projects = check_projects(daemon_url);
+    let git_required = !projects.any_project_registered || projects.any_git_project;
+    results.push(check_git(git_required));
+    results.extend(projects.results);
     results.extend(check_project_forks(daemon_url));
+
     results.push(check_runner());
     results.push(check_ollama());
-    results.push(check_nvidia_smi());
-    results.push(check_config(cwd));
-    results.push(check_max_concurrent(cwd));
-    results.push(check_opentelemetry(cwd));
-    results.push(check_tool_arg_truncate_chars(cwd));
-    results.push(check_thrash_max_compactions(cwd));
-    results.push(check_thrash_min_turn_gap(cwd));
-    results.push(check_pull_request_branch_convention(cwd));
-    results.extend(check_templates());
-    results.extend(check_agent_profiles(daemon_url, cwd));
-    results.push(check_default_resolver_agent(daemon_url, cwd));
-    results.push(check_arbiter(daemon_url));
+    results.push(check_tmux());
+    results.push(check_gh());
+    results.push(check_glab());
     results.push(check_agent_command(
         "claude-command",
         "RALPHUS_CLAUDE_COMMAND",
@@ -1038,6 +1523,21 @@ pub fn run_checks(
         "RALPHUS_PI_COMMAND",
         "pi",
     ));
+
+    results.push(check_config(cwd));
+    results.push(check_max_concurrent(cwd));
+    results.push(check_tool_arg_truncate_chars(cwd));
+    results.push(check_thrash_max_compactions(cwd));
+    results.push(check_thrash_min_turn_gap(cwd));
+    results.push(check_pull_request_branch_convention(cwd));
+    results.extend(check_templates());
+    results.extend(check_agent_profiles(daemon_url, cwd));
+    results.push(check_default_resolver_agent(daemon_url, cwd));
+    if enable_live_agent_checks {
+        results.push(check_arbiter(daemon_url));
+    }
+
+    results.push(check_nvidia_smi());
     if enable_developer_checks {
         results.push(check_cargo());
     }
@@ -1050,6 +1550,7 @@ pub fn run_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn is_compound_shell_command_detects_multiword_unquoted() {
@@ -1068,10 +1569,18 @@ mod tests {
 
     #[test]
     fn check_result_is_fail_only_for_fail_status() {
-        let fail = CheckResult::new("x", FAIL, "boom");
-        let warn = CheckResult::new("x", WARN, "meh");
+        let fail = CheckResult::new("x", FAIL, "boom", "impact", "remediation");
+        let warn = CheckResult::new("x", WARN, "meh", "impact", "remediation");
         assert!(fail.is_fail());
         assert!(!warn.is_fail());
+    }
+
+    #[test]
+    fn check_result_states_observation_impact_and_remediation() {
+        let result = CheckResult::new("x", FAIL, "observed thing", "impact text", "fix text");
+        assert_eq!(result.detail, "observed thing");
+        assert_eq!(result.impact, "impact text");
+        assert_eq!(result.remediation, "fix text");
     }
 
     #[test]
@@ -1103,6 +1612,16 @@ mod tests {
         let result = check_agent_command("x-command", "RALPHUS_TEST_UNSET_AGENT_VAR_XYZ", "claude");
         assert_eq!(result.status, PASS);
         assert!(result.detail.contains("not set"));
+    }
+
+    #[test]
+    fn check_agent_command_is_harness_section() {
+        let result = check_agent_command(
+            "x-command",
+            "RALPHUS_TEST_UNSET_AGENT_VAR_HARNESS",
+            "claude",
+        );
+        assert_eq!(result.section, HARNESS);
     }
 
     #[test]
@@ -1165,6 +1684,7 @@ mod tests {
         assert_eq!(result.status, PASS);
         assert!(result.detail.contains("tool_arg_truncate_chars=400"));
         assert!(result.detail.contains("/tmp/.ralphus.toml"));
+        assert_eq!(result.provenance.as_deref(), Some("/tmp/.ralphus.toml"));
     }
 
     #[test]
@@ -1353,5 +1873,209 @@ mod tests {
             .find(|r| r.name == "new-task-default-tab")
             .unwrap();
         assert_eq!(tab_result.status, FAIL);
+    }
+
+    // ── vcs-aware project checks (RAL-415) ────────────────────────────────
+
+    #[test]
+    fn check_project_path_skips_git_validation_for_non_git_vcs() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-health-test-nongit-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = check_project_path("proj", &dir.to_string_lossy(), "none");
+        assert_eq!(result.status, SKIP);
+        assert!(result.detail.contains("vcs=\"none\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_project_path_fails_for_missing_directory_regardless_of_vcs() {
+        let result = check_project_path("proj", "/definitely/does/not/exist/ralphus-xyz", "none");
+        assert_eq!(result.status, FAIL);
+    }
+
+    #[test]
+    fn check_project_path_validates_git_repo_for_git_vcs() {
+        // The worktree this test runs in is itself a git repository.
+        let cwd = std::env::current_dir().unwrap();
+        let result = check_project_path("proj", &cwd.to_string_lossy(), "git");
+        assert_eq!(result.status, PASS);
+    }
+
+    #[test]
+    fn check_project_path_fails_non_repo_directory_for_git_vcs() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-health-test-notrepo-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = check_project_path("proj", &dir.to_string_lossy(), "git");
+        assert_eq!(result.status, FAIL);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_git_skips_when_not_required_and_absent() {
+        let result = check_git(false);
+        if which("git").is_some() {
+            assert_eq!(result.status, PASS);
+        } else {
+            assert_eq!(result.status, SKIP);
+        }
+    }
+
+    #[test]
+    fn check_git_fails_when_required_and_absent() {
+        let result = check_git(true);
+        if which("git").is_some() {
+            assert_eq!(result.status, PASS);
+        } else {
+            assert_eq!(result.status, FAIL);
+        }
+    }
+
+    // ── config-sources (RAL-415 layered config provenance) ────────────────
+
+    #[test]
+    fn check_config_sources_cli_passes_with_no_sources() {
+        let result = check_config_sources_cli_for(&crate::config::Config::default());
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("no .ralphus.toml"));
+    }
+
+    #[test]
+    fn check_config_sources_cli_lists_every_source_in_precedence_order() {
+        let config = crate::config::Config {
+            sources: vec![
+                PathBuf::from("/env/a.toml"),
+                PathBuf::from("/repo/.ralphus.toml"),
+            ],
+            source_labels: vec![
+                (
+                    PathBuf::from("/env/a.toml"),
+                    "environment variable".to_string(),
+                ),
+                (PathBuf::from("/repo/.ralphus.toml"), "local".to_string()),
+            ],
+            ..crate::config::Config::default()
+        };
+        let result = check_config_sources_cli_for(&config);
+        assert_eq!(result.status, PASS);
+        assert!(
+            result
+                .detail
+                .contains("1. /env/a.toml (environment variable)")
+        );
+        assert!(result.detail.contains("2. /repo/.ralphus.toml (local)"));
+        assert_eq!(result.provenance.as_deref(), Some("/repo/.ralphus.toml"));
+    }
+
+    #[test]
+    fn check_config_sources_project_passes_with_no_files() {
+        let result = check_config_sources_project_for(None, None);
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("no global or per-project"));
+    }
+
+    #[test]
+    fn check_config_sources_project_lists_global_then_project() {
+        let global = Path::new("/global/config.toml");
+        let project = Path::new("/repo/.ralphus.toml");
+        let result = check_config_sources_project_for(Some(global), Some(project));
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("1. /global/config.toml (global)"));
+        assert!(
+            result
+                .detail
+                .contains("2. /repo/.ralphus.toml (nearest project)")
+        );
+    }
+
+    // ── optional forge CLI fallbacks (RAL-415) ─────────────────────────────
+
+    #[test]
+    fn check_gh_never_fails_when_missing() {
+        let result = check_gh_for(None);
+        assert_ne!(result.status, FAIL);
+        assert!(result.detail.contains("fallback"));
+        assert_eq!(result.section, HARNESS);
+    }
+
+    #[test]
+    fn check_gh_reports_path_when_found() {
+        let result = check_gh_for(Some("/usr/bin/gh".to_string()));
+        assert_ne!(result.status, FAIL);
+        assert!(result.detail.contains("/usr/bin/gh"));
+    }
+
+    #[test]
+    fn check_glab_never_fails_when_missing() {
+        let result = check_glab_for(None);
+        assert_ne!(result.status, FAIL);
+        assert!(result.detail.contains("fallback"));
+        assert_eq!(result.section, HARNESS);
+    }
+
+    #[test]
+    fn check_glab_reports_path_when_found() {
+        let result = check_glab_for(Some("/usr/bin/glab".to_string()));
+        assert_ne!(result.status, FAIL);
+        assert!(result.detail.contains("/usr/bin/glab"));
+    }
+
+    // ── tmux resolution (RAL-415) ───────────────────────────────────────
+
+    #[test]
+    fn check_tmux_reports_resolved_value_and_source() {
+        let result = check_tmux_for(Ok((
+            "tmux".to_string(),
+            ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE,
+        )));
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("tmux"));
+        assert!(
+            result
+                .detail
+                .contains(ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE)
+        );
+        assert_eq!(
+            result.provenance.as_deref(),
+            Some(ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE)
+        );
+    }
+
+    #[test]
+    fn check_tmux_reports_embedded_and_path_sources() {
+        let embedded = check_tmux_for(Ok((
+            "/tmp/tmux.exe".to_string(),
+            ralphus_daemon::tmux::TMUX_SOURCE_EMBEDDED,
+        )));
+        assert!(
+            embedded
+                .detail
+                .contains(ralphus_daemon::tmux::TMUX_SOURCE_EMBEDDED)
+        );
+
+        let on_path = check_tmux_for(Ok((
+            "tmux".to_string(),
+            ralphus_daemon::tmux::TMUX_SOURCE_PATH,
+        )));
+        assert!(
+            on_path
+                .detail
+                .contains(ralphus_daemon::tmux::TMUX_SOURCE_PATH)
+        );
+    }
+
+    #[test]
+    fn check_tmux_fails_with_remediation_when_unresolved() {
+        let result = check_tmux_for(Err("no tmux-compatible binary found".to_string()));
+        assert_eq!(result.status, FAIL);
+        assert!(result.remediation.contains("RALPHUS_TMUX_CMD"));
+        assert_eq!(result.section, HARNESS);
     }
 }

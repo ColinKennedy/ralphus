@@ -708,8 +708,13 @@ const AGENT_CHILDREN: &[HelpNode] = &[node(
 const CHECK_CHILDREN: &[HelpNode] = &[node(
     "health",
     &[],
-    &["--enable-developer-checks", "--all-remotes", "--json"],
-    "Check the local ralphus setup (daemon, git, runner, ollama). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9).",
+    &[
+        "--enable-developer-checks",
+        "--all-remotes",
+        "--enable-live-agent-check",
+        "--json",
+    ],
+    "Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).",
     true, // ("check", "health") -- multi-step subprocess/filesystem work
     true, // ("check", "health")
     &[],

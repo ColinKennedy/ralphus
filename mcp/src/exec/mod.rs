@@ -385,6 +385,7 @@ fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
         &cwd,
         args.enable_developer_checks,
         args.all_remotes,
+        args.enable_live_agent_check,
     );
     let checks: Vec<Value> = results
         .iter()
@@ -394,6 +395,9 @@ fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
                 "status": r.status,
                 "name": r.name,
                 "detail": r.detail,
+                "impact": r.impact,
+                "remediation": r.remediation,
+                "provenance": r.provenance,
             })
         })
         .collect();
