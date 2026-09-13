@@ -800,11 +800,19 @@
           if (!h || h.tab === "squads") {
             if (h && h.squadId) {
               if (findSquad(h.squadId)) {
-                clearNodeMultiSel();
                 selectedSquadId = h.squadId;
                 revealedSquadId = h.squadId;
                 if (h.sel) { const [k, ti, si, vi] = h.sel.split(":"); sel = { kind: k, taskIdx: +ti || 0, cellIdx: +si || 0, proofIdx: vi !== undefined ? +vi : -1 }; }
                 else sel = { kind: "squad", taskIdx: 0, cellIdx: 0 };
+                // RAL-419: the hash is authoritative, so record the resolved selection
+                // in the per-squad cache (reconciled to the nearest surviving parent
+                // when the hash names a node that no longer exists), and drop any stale
+                // graph-node multi-selection keys.
+                const rec = reconcileSquadSelection(findSquad(h.squadId), sel);
+                sel = rec.sel;
+                nodeMultiSel = new Set();
+                if (rec.stale) clearSquadSelection(h.squadId);
+                else storeSquadSelection(h.squadId, sel, []);
               } else { pendingHash = h; }
             }
             renderSortChips(); renderStatusFilters();

@@ -701,7 +701,9 @@
       }
 
       /**
-       * Builds the stable selection key for one graph node.
+       * Builds the stable selection key for one graph node — the "kind:ti:si:vi"
+       * format RAL-419 persists in its per-squad node cache (`nodeKeyValid` in the
+       * RALPHUS-SEL-TRANSITION region keeps a testable twin — keep them in lockstep).
        * @param {"task"|"cell"|"proof"} kind
        * @param {number} ti
        * @param {number} si
@@ -776,6 +778,7 @@
         const item = graphNodeItem(squadId, kind, ti, si, vi); if (!item) return;
         nodeMultiSel = new Set([item.key]);
         sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi };
+        storeSquadSelection(squadId, sel, [...nodeMultiSel]);
         editing = false;
       }
 
@@ -799,6 +802,7 @@
             nodeMultiSel.add(item.key);
           }
           sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi };
+          storeSquadSelection(selectedSquadId, sel, [...nodeMultiSel]);
           editing = false;
           renderGraph(); renderDetails(); syncHash(true);
           return;
