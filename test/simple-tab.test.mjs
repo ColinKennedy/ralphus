@@ -496,3 +496,59 @@ test("the Agent/Model and Project/Upstream rows override align-items to flex-sta
   const projectRowStart = boardSource.lastIndexOf('<div class="row"', projectRowAt);
   assert.match(boardSource.slice(projectRowStart, projectRowAt), /align-items:flex-start/, "the Project/Upstream row must top-align its columns");
 });
+
+// ---------- "Submit" label + "Submit another" (RAL-351) ----------
+// The primary action is labelled "Submit" (not "Validate & Queue") on every
+// tab, since the same button/footer is shared across Simple/Files/Paste and
+// across the Simple tab's direct-submit and generate-then-confirm paths.
+// "Submit another" (persisted checkbox) or a Shift-click (this submission
+// only) leaves the modal open and reset for another squad instead of
+// closing it on success -- covered here as source-shape assertions since
+// the actual branching lives in DOM/fetch-touching functions the pure-logic
+// harness (board-simple-tab.mjs) deliberately excludes.
+
+test("the primary action is labelled Submit, not Validate & Queue", () => {
+  assert.doesNotMatch(boardSource, /Validate\s*(&amp;|&|and)\s*Queue/, "the old label must be fully replaced");
+  assert.match(boardSource, /class="btn primary"[^>]*>Submit</, "the primary button must read exactly \"Submit\"");
+});
+
+test("a Submit another checkbox sits beside the primary action, wired to the persisted ntSubmitAnother flag, with a tooltip", () => {
+  const btnRowAt = boardSource.indexOf('<div class="btn-row">');
+  const submitAt = boardSource.indexOf(">Submit<", btnRowAt);
+  const footer = boardSource.slice(btnRowAt, submitAt);
+  assert.match(footer, /Submit another/, "the checkbox's label text must read \"Submit another\"");
+  assert.match(footer, /<input type="checkbox" \$\{ntSubmitAnother \? "checked" : ""\} onchange="ntSubmitAnother=this\.checked"/, "the checkbox must read/write the persisted ntSubmitAnother flag");
+  assert.match(footer, /data-tip="/, "the checkbox row must carry a tooltip per the board's tooltip rule");
+});
+
+test("the Submit button captures this click's Shift state before dispatching, so a stale value from an earlier click can't leak in", () => {
+  assert.match(boardSource, /onclick="ntSubmitShiftHeld=event\.shiftKey;submitTask\(\)"/, "the button's onclick must set ntSubmitShiftHeld synchronously, before calling submitTask()");
+});
+
+test("ntSubmitAnotherActive is true from either the persisted checkbox or a Shift-click, and neither alone is required", () => {
+  const body = boardSource.slice(boardSource.indexOf("function ntSubmitAnotherActive()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /return ntSubmitAnother \|\| ntSubmitShiftHeld;/, "must OR the persisted checkbox with this click's Shift state");
+});
+
+test("a successful submitTaskSimple always resets first, then renders in place (Submit another) or closes, but never both", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  const resetAt = fn.lastIndexOf("ntSimpleResetKeepingProjectFields();");
+  const branchAt = fn.indexOf("if (ntSubmitAnotherActive())", resetAt);
+  assert.ok(resetAt > -1 && branchAt > -1, "submitTaskSimple shape changed");
+  assert.ok(resetAt < branchAt, "the reset must happen unconditionally, before deciding whether to stay open");
+  assert.match(fn.slice(branchAt), /if \(ntSubmitAnotherActive\(\)\) \{ renderNewTaskModal\(\); \} else \{ closeModal\(\); \}/, "must render in place when Submit another is active, and only ever close otherwise");
+});
+
+test("a fully-successful submitTaskFiles clears the batch and stays open under Submit another, instead of always closing", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTaskFiles()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /if \(ntSubmitAnotherActive\(\)\) \{ ntFiles = \[\]; renderNewTaskModal\(\); \} else \{ closeModal\(\); \}/, "must clear ntFiles and re-render in place when Submit another is active");
+});
+
+test("the Paste tab's submitTask clears the draft and stays open under Submit another, instead of always closing", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function submitTask()"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /if \(ntSubmitAnotherActive\(\)\) \{ ntPasteToml = ""; ntLabel = ""; renderNewTaskModal\(\); \} else \{ closeModal\(\); \}/, "must clear the pasted TOML/label and re-render in place when Submit another is active");
+});

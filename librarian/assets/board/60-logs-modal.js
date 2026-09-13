@@ -695,7 +695,8 @@
           byId("nt-err").innerHTML = `${succeeded.length}/${succeeded.length + ntFiles.length} queued — ${ntFiles.length} failed, see errors above.`;
           return;
         }
-        closeModal(); tick();
+        if (ntSubmitAnotherActive()) { ntFiles = []; renderNewTaskModal(); } else { closeModal(); }
+        tick();
       }
       /**
        * Validates and submits the New Task modal (dispatches to the active tab).
@@ -712,7 +713,8 @@
         if (!v || !v.valid) return; // errors are already rendered by ntValidate
         const resp = await fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label: label || null }) });
         if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
-        closeModal(); tick();
+        if (ntSubmitAnotherActive()) { ntPasteToml = ""; ntLabel = ""; renderNewTaskModal(); } else { closeModal(); }
+        tick();
       }
 
       // ---------- worktree → cell linking (RAL-71) ----------

@@ -15,6 +15,31 @@
        */
       let ntModalOpen = false;
       /**
+       * The "Submit another" checkbox's persisted state (RAL-351): when
+       * checked, a successful submission on any tab resets the modal for
+       * another squad instead of closing it. Persists across modal opens
+       * (not reset by `openNewTask`) since it's a standing preference, not
+       * part of any one squad's form data.
+       */
+      let ntSubmitAnother = false;
+      /**
+       * Whether the just-clicked Submit button was a Shift-click, captured
+       * by the button's own `onclick` (before `submitTask()` runs) so the
+       * synchronous read in `ntSubmitAnotherActive` below sees this click's
+       * value, not a stale one. A Shift-click behaves like "Submit another"
+       * for this one submission only, without checking (or leaving checked)
+       * the persisted `ntSubmitAnother` box.
+       */
+      let ntSubmitShiftHeld = false;
+      /**
+       * Whether the submission in progress should leave the New Task modal
+       * open and reset for another squad instead of closing it: either the
+       * persisted "Submit another" checkbox, or this click being a
+       * Shift-click.
+       * @returns {boolean}
+       */
+      function ntSubmitAnotherActive() { return ntSubmitAnother || ntSubmitShiftHeld; }
+      /**
        * @typedef {object} NtFile
        * @property {string} name
        * @property {number} size
@@ -62,7 +87,13 @@
             </div>
             <div id="nt-body">${body}</div>
             <div id="nt-err" class="verr"></div>
-            <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close without submitting.">Cancel</button><button class="btn primary" onclick="submitTask()" data-tip="${tip}\nThe daemon will start each as soon as a scheduler slot is available.">Validate &amp; Queue</button></div>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Close without submitting.">Cancel</button>
+              <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted)" data-tip="Keeps this popup open after a successful submission and resets it for another squad, instead of closing it.\nWho/when: use this when you're queuing a series of related squads back-to-back and don't want to reopen the composer each time.\nHold Shift while clicking Submit to do this once, for just that one submission, without checking this box.">
+                <input type="checkbox" ${ntSubmitAnother ? "checked" : ""} onchange="ntSubmitAnother=this.checked"> Submit another
+              </label>
+              <button class="btn primary" onclick="ntSubmitShiftHeld=event.shiftKey;submitTask()" data-tip="${tip}\nThe daemon will start each as soon as a scheduler slot is available.">Submit</button>
+            </div>
           </div></div>`;
       }
       /**
@@ -1115,7 +1146,8 @@
           if (created && created.squad_id) ntRequestSuggestedName(created.squad_id, fallbackName);
         }
         ntSimpleResetKeepingProjectFields();
-        closeModal(); tick();
+        if (ntSubmitAnotherActive()) { renderNewTaskModal(); } else { closeModal(); }
+        tick();
       }
       /**
        * Fires `POST /api/squads/{squadId}/tasks/0/suggest-name` (RAL-398)
