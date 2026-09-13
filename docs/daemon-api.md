@@ -78,8 +78,8 @@ where one exists.
 | POST | `/api/squads/{id}/add-dependency` | [Add a cross-squad dependency](#post-apisquadsidadd-dependency) post-submission |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/restart/preview` | [Dry-run preview](#post-apisquadsidcellstask_idxcell_idxrestartpreview) of a cell restart's downstream impact |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/restart` | [Restart one cell](#post-apisquadsidcellstask_idxcell_idxrestart) + its downstream |
-| POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/restart` | Restart a cell's proof steps from `vi` |
-| POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/restart` | Restart a task's proof steps from `vi` |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/restart` | Restart a cell's whole proof sequence, re-running from the start (`vi` names the step that triggered it) |
+| POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/restart` | Restart a task's whole proof sequence, re-running from the start (`vi` names the step that triggered it) |
 | POST | `/api/squads/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apisquadsidtaskstirestartpreview) of a task restart's downstream impact |
 | POST | `/api/squads/{id}/tasks/{ti}/restart` | [Restart a whole task](#post-apisquadsidtaskstirestart) + its downstream (RAL-150) |
 | GET | `/api/squads/{id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for the squad, secret values masked (RAL-324) |

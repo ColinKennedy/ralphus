@@ -3633,8 +3633,10 @@ impl Store {
     /// Whether any cell-scope proof step for `(task_idx, cell_idx)` at
     /// index >= `from_idx` is currently `Running`. Proof steps within one
     /// scope run sequentially, so at most one can be, but this checks
-    /// defensively. Mirrors [`Store::restart_cell_proof`]'s own WHERE
-    /// clause; used by `server::restart_cell_proof` (RAL-1xx).
+    /// defensively. `server::restart_cell_proof` (RAL-1xx) calls this with
+    /// `from_idx=0` (RAL-289): [`Store::restart_cell_proof`] resets the
+    /// whole scope regardless of which step the caller targeted, so the
+    /// liveness check guarding it must scan the whole scope too.
     pub fn cell_proof_running_from(
         &self,
         squad_id: &str,
@@ -3651,9 +3653,9 @@ impl Store {
     }
 
     /// Whether any task-scope proof step for `task_idx` at index >=
-    /// `from_idx` is currently `Running`. Mirrors
-    /// [`Store::restart_task_proof`]'s own WHERE clause; used by
-    /// `server::restart_task_proof` (RAL-1xx).
+    /// `from_idx` is currently `Running`. `server::restart_task_proof`
+    /// (RAL-1xx) calls this with `from_idx=0` (RAL-289) for the same reason
+    /// as [`Store::cell_proof_running_from`].
     pub fn task_proof_running_from(
         &self,
         squad_id: &str,
@@ -8353,9 +8355,16 @@ impl Store {
         Ok(())
     }
 
-    /// Restart a single cell's proof steps from `proof_from` onwards:
-    /// reset only the cell-level proofs at index >= `proof_from` to
-    /// Pending while leaving the cell itself Done. The owning task and squad
+    /// Restart a single cell's proof steps: reset every cell-level proof
+    /// for this cell back to Pending — not just `proof_from` (the step the
+    /// caller targeted) and whatever came after it — while leaving the
+    /// cell itself Done. Restarting a proof step means re-running its
+    /// whole sequence from the start (RAL-289): [`crate::scheduler`]'s
+    /// `run_proofs` always re-executes every step in a scope in order
+    /// regardless of its prior state (RAL-64), so leaving earlier steps
+    /// stale `done` here just let them silently flip straight to Running
+    /// once `run_proofs` reached them, instead of reading Pending like the
+    /// rest of a fresh restart in the meantime. The owning task and squad
     /// are put back to Pending so the scheduler re-enters them. The scheduler
     /// detects that the cell is Done with pending proofs via
     /// [`Store::cells_needing_proof_only`] and skips re-running the
@@ -8381,12 +8390,12 @@ impl Store {
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        // Reset only proofs at idx >= proof_from — the cell body stays
-        // Done so the scheduler's proof-only path re-runs proofs without
-        // re-running the cell.
+        // Reset every proof in this cell's scope, not just idx >= proof_from
+        // — the cell body stays Done so the scheduler's proof-only path
+        // re-runs proofs without re-running the cell.
         self.conn.execute(
-            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=? AND idx>=?",
-            params![squad_id, task_idx, cell_idx, proof_from],
+            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+            params![squad_id, task_idx, cell_idx],
         )?;
         self.revive_failed_downstream_cells(squad_id, &[(task_idx, cell_idx)])?;
         self.conn.execute(
@@ -8401,20 +8410,26 @@ impl Store {
             Some(squad_id),
             None,
             "proof",
-            Some(&format!("cell t{task_idx}/s{cell_idx}")),
+            Some(&format!(
+                "cell t{task_idx}/s{cell_idx} (from step {proof_from})"
+            )),
             "restarted",
         );
         self.dirty_dependents(squad_id)
     }
 
-    /// Restart a task's task-level proof steps from `proof_from` onwards:
-    /// reset only the task-scope proofs at index >= `proof_from` to Pending
-    /// while leaving all cells and their cell-level proofs intact. The
-    /// task and squad are put back to Pending so the scheduler's task finalizer
-    /// fires and re-runs the task-level proofs. Any cell downstream of
-    /// this task that was left `Failed` by an earlier pass is revived back to
-    /// Pending too (RAL-165) — see [`Store::revive_failed_downstream_cells`].
-    /// Returns dirtied dependent squad ids.
+    /// Restart a task's task-level proof steps: reset every task-scope
+    /// proof for this task back to Pending — not just `proof_from` (the
+    /// step the caller targeted) and whatever came after it — while
+    /// leaving all cells and their cell-level proofs intact. See
+    /// [`Store::restart_cell_proof`]'s doc comment (RAL-289) for why the
+    /// whole sequence resets rather than just the tail from `proof_from`.
+    /// The task and squad are put back to Pending so the scheduler's task
+    /// finalizer fires and re-runs the task-level proofs. Any cell
+    /// downstream of this task that was left `Failed` by an earlier pass is
+    /// revived back to Pending too (RAL-165) — see
+    /// [`Store::revive_failed_downstream_cells`]. Returns dirtied dependent
+    /// squad ids.
     pub fn restart_task_proof(
         &self,
         squad_id: &str,
@@ -8432,14 +8447,14 @@ impl Store {
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        // Reset only task-scope proofs at idx >= proof_from. Cell states
-        // and cell-level proofs are intentionally left untouched: all
-        // cells remain Done so the scheduler's task finalizer fires
-        // immediately and re-runs only the affected task-level proofs,
-        // without re-running any cell body.
+        // Reset every task-scope proof for this task, not just idx >=
+        // proof_from. Cell states and cell-level proofs are intentionally
+        // left untouched: all cells remain Done so the scheduler's task
+        // finalizer fires immediately and re-runs only the task-level
+        // proofs, without re-running any cell body.
         self.conn.execute(
-            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task' AND idx>=?",
-            params![squad_id, task_idx, proof_from],
+            "UPDATE proofs SET state='pending', env_out_of_date=0 WHERE squad_id=? AND task_idx=? AND scope='task'",
+            params![squad_id, task_idx],
         )?;
         let roots: Vec<(i64, i64)> = self
             .cells_of(squad_id)?
@@ -8460,7 +8475,7 @@ impl Store {
             Some(squad_id),
             None,
             "proof",
-            Some(&format!("task t{task_idx}")),
+            Some(&format!("task t{task_idx} (from step {proof_from})")),
             "restarted",
         );
         self.dirty_dependents(squad_id)
@@ -12773,8 +12788,8 @@ command = "y"
         );
     }
 
-    // Three cell-level proof steps: restart from vi=1 leaves vi=0 Done,
-    // resets vi=1 and vi=2 to Pending.
+    // Three cell-level proof steps: restarting any one of them (RAL-289)
+    // resets the whole sequence back to Pending, not just from that step on.
     const THREE_CELL_PROOFS: &str = r#"
 [[task]]
 name = "t"
@@ -12805,7 +12820,7 @@ command = "check-c"
 "#;
 
     #[test]
-    fn restart_cell_proof_from_middle_leaves_earlier_step_intact() {
+    fn restart_cell_proof_from_middle_resets_whole_sequence() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
             .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
@@ -12819,12 +12834,13 @@ command = "check-c"
         }
         store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        // Restart from vi=1 — only steps 1 and 2 should reset.
+        // Restarting the middle step (RAL-289) resets the whole sequence,
+        // including the earlier step, so it re-runs from the start.
         store.restart_cell_proof(&id, 0, 0, 1).unwrap();
 
         let squad = store.get_squad(&id).unwrap();
         let vs = &squad.tasks[0].cells[0].proof;
-        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[0].state, "pending", "vi=0 must reset too, not stay done");
         assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
         assert_eq!(squad.tasks[0].state, "pending");
@@ -12832,7 +12848,7 @@ command = "check-c"
     }
 
     #[test]
-    fn restart_cell_proof_from_last_only_resets_that_step() {
+    fn restart_cell_proof_from_last_resets_whole_sequence() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
             .insert_squad(&parse(THREE_CELL_PROOFS), None, false)
@@ -12845,18 +12861,19 @@ command = "check-c"
         }
         store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        // Restart from vi=2 — only the last step resets.
+        // Restarting the last step (RAL-289) still resets every earlier
+        // step too — restart always means "re-run from the start".
         store.restart_cell_proof(&id, 0, 0, 2).unwrap();
 
         let squad = store.get_squad(&id).unwrap();
         let vs = &squad.tasks[0].cells[0].proof;
-        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
-        assert_eq!(vs[1].state, "done", "vi=1 must stay done");
+        assert_eq!(vs[0].state, "pending", "vi=0 must reset too, not stay done");
+        assert_eq!(vs[1].state, "pending", "vi=1 must reset too, not stay done");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
     }
 
     #[test]
-    fn restart_task_proof_from_middle_leaves_earlier_step_intact() {
+    fn restart_task_proof_from_middle_resets_whole_sequence() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
             .insert_squad(&parse(THREE_TASK_PROOFS), None, false)
@@ -12871,17 +12888,17 @@ command = "check-c"
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
         store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        // Restart from vi=1 — only steps 1 and 2 should reset.
+        // Restarting the middle step (RAL-289) resets the whole sequence.
         store.restart_task_proof(&id, 0, 1).unwrap();
 
         let squad = store.get_squad(&id).unwrap();
         let vs = &squad.tasks[0].proof;
-        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
+        assert_eq!(vs[0].state, "pending", "vi=0 must reset too, not stay done");
         assert_eq!(vs[1].state, "pending", "vi=1 must be reset to pending");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
         assert_eq!(squad.tasks[0].state, "pending");
         assert_eq!(squad.state, "pending");
-        // Cell must be untouched.
+        // Cell must be untouched — only task-scope proofs reset.
         assert_eq!(squad.tasks[0].cells[0].state, "done");
     }
 
@@ -13005,7 +13022,7 @@ command = "check-c"
     }
 
     #[test]
-    fn restart_task_proof_from_last_only_resets_that_step() {
+    fn restart_task_proof_from_last_resets_whole_sequence() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store
             .insert_squad(&parse(THREE_TASK_PROOFS), None, false)
@@ -13019,14 +13036,62 @@ command = "check-c"
         store.set_task_state(&id, 0, NodeState::Done).unwrap();
         store.set_squad_state(&id, SquadState::Done).unwrap();
 
-        // Restart from vi=2 — only the last step resets.
+        // Restarting the last step (RAL-289) still resets every earlier
+        // step too — restart always means "re-run from the start".
         store.restart_task_proof(&id, 0, 2).unwrap();
 
         let squad = store.get_squad(&id).unwrap();
         let vs = &squad.tasks[0].proof;
-        assert_eq!(vs[0].state, "done", "vi=0 must stay done");
-        assert_eq!(vs[1].state, "done", "vi=1 must stay done");
+        assert_eq!(vs[0].state, "pending", "vi=0 must reset too, not stay done");
+        assert_eq!(vs[1].state, "pending", "vi=1 must reset too, not stay done");
         assert_eq!(vs[2].state, "pending", "vi=2 must be reset to pending");
+    }
+
+    #[test]
+    fn restart_proof_step_c_resets_entire_five_step_sequence() {
+        // RAL-289 acceptance scenario: restarting proof step C in a
+        // sequence A→B→C→D→E resets every step (A, B, C, D, E) back to
+        // pending, not just C and downstream.
+        const FIVE_CELL_PROOFS: &str = r#"
+[[task]]
+name = "t"
+[[task.cell]]
+cwd = "."
+command = "build"
+[[task.cell.proof]]
+command = "a"
+[[task.cell.proof]]
+command = "b"
+[[task.cell.proof]]
+command = "c"
+[[task.cell.proof]]
+command = "d"
+[[task.cell.proof]]
+command = "e"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_squad(&parse(FIVE_CELL_PROOFS), None, false)
+            .unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
+        for vi in 0..5i64 {
+            store
+                .set_proof_state(&id, 0, "cell", 0, vi, NodeState::Done)
+                .unwrap();
+        }
+        store.set_squad_state(&id, SquadState::Done).unwrap();
+
+        // Restart C, the step at idx=2.
+        store.restart_cell_proof(&id, 0, 0, 2).unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        let vs = &squad.tasks[0].cells[0].proof;
+        for (i, label) in ["A", "B", "C", "D", "E"].iter().enumerate() {
+            assert_eq!(
+                vs[i].state, "pending",
+                "step {label} (idx={i}) must be pending after restarting C"
+            );
+        }
     }
 
     // ── project registry (RAL-100) ────────────────────────────────────────────
