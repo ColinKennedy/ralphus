@@ -42,7 +42,9 @@ use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;
 use crate::pr::PullRequestView;
 use crate::runner::Runner;
-use crate::store::{Store, now_ms};
+#[cfg(test)]
+use crate::store::Store;
+use crate::store::now_ms;
 
 /// Fast-start/backoff poll cadence (RAL-375): quick enough to catch a
 /// pipeline that finishes in seconds, but backs off for one that runs many
@@ -155,7 +157,7 @@ static WATCHING: LazyLock<Mutex<HashSet<(String, String)>>> =
 /// the poll loop's progress is queryable per-branch instead of only tailable
 /// (RAL-98 pairing).
 fn log_ci_watch(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     branch_id: &str,
     level: LogLevel,
@@ -167,7 +169,7 @@ fn log_ci_watch(
         .scope("branch")
         .guardian(guardian_id)
         .emit(
-            &store.lock().expect("poisoned"),
+            &store.lock(),
             message,
             serde_json::json!({"branch_id": branch_id, "detail": payload}),
         );
@@ -179,7 +181,11 @@ fn log_ci_watch(
 /// running -- fail-safe by design, matching `pr::check_pr_merges`'s
 /// "an unreachable forge changes nothing" precedent, since a watch that
 /// can't be started should never block or fail the push that triggered it.
-pub fn watch_after_feedback_push(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
+pub fn watch_after_feedback_push(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    branch_id: &str,
+) {
     let key = (guardian_id.to_string(), branch_id.to_string());
     {
         let mut watching = WATCHING.lock().expect("poisoned");
@@ -204,18 +210,14 @@ pub fn watch_after_feedback_push(store: &Arc<Mutex<Store>>, guardian_id: &str, b
     });
 }
 
-fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(guardian_id) else {
+fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_id: &str) {
+    let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
         return;
     };
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         return;
     };
-    let Ok(prs) = store
-        .lock()
-        .expect("poisoned")
-        .list_pull_requests_for_guardian(guardian_id)
-    else {
+    let Ok(prs) = store.lock().list_pull_requests_for_guardian(guardian_id) else {
         return;
     };
     let Some(pr) = prs
@@ -299,11 +301,9 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "passing"}),
                 );
-                let _ = store.lock().expect("poisoned").set_pr_ci_status(
-                    &pr.id,
-                    PrCiState::Passing.as_str(),
-                    None,
-                );
+                let _ = store
+                    .lock()
+                    .set_pr_ci_status(&pr.id, PrCiState::Passing.as_str(), None);
                 return;
             }
             Ok(PrCiState::Failing(failure)) => {
@@ -319,7 +319,7 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
                     ),
                     serde_json::json!({"pr_number": number, "outcome": "failing", "reason": failure.reason}),
                 );
-                let _ = store.lock().expect("poisoned").set_pr_ci_status(
+                let _ = store.lock().set_pr_ci_status(
                     &pr.id,
                     PrCiState::Failing(failure.clone()).as_str(),
                     failure.job_url.as_deref(),
@@ -353,7 +353,7 @@ fn run_watch(store: &Arc<Mutex<Store>>, guardian_id: &str, branch_id: &str) {
 /// Wiring up that reply is out of scope here -- this only asks; it never
 /// starts a subagent itself.
 fn enqueue_ci_failure_notice(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     guardian: &GuardianView,
     branch: &BranchView,
     pr: &PullRequestView,
@@ -384,7 +384,7 @@ fn enqueue_ci_failure_notice(
 
     let entity_uri = format!("guardian:{}", guardian.id);
     let enqueued = {
-        let guard = store.lock().expect("poisoned");
+        let guard = store.lock();
         guard.enqueue_mailbox_message_ex(
             MailboxPriority::High,
             &text,
@@ -438,7 +438,11 @@ static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
 /// `watch_after_feedback_push`'s precedent: an unresolvable forge client or a
 /// poll error for one PR never blocks or fails the caller, and never stops
 /// the remaining PRs in the same guardian from being polled.
-pub fn poll_open_pr_ci_status(store: &Arc<Mutex<Store>>, runner: &dyn Runner, guardian_id: &str) {
+pub fn poll_open_pr_ci_status(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian_id: &str,
+) {
     {
         let mut last = STANDING_POLL_LAST.lock().expect("poisoned");
         let now = Instant::now();
@@ -450,14 +454,10 @@ pub fn poll_open_pr_ci_status(store: &Arc<Mutex<Store>>, runner: &dyn Runner, gu
         }
         last.insert(guardian_id.to_string(), now);
     }
-    let Ok(guardian) = store.lock().expect("poisoned").get_guardian(guardian_id) else {
+    let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
         return;
     };
-    let Ok(prs) = store
-        .lock()
-        .expect("poisoned")
-        .list_pull_requests_for_guardian(guardian_id)
-    else {
+    let Ok(prs) = store.lock().list_pull_requests_for_guardian(guardian_id) else {
         return;
     };
     let open: Vec<PullRequestView> = prs
@@ -507,11 +507,9 @@ pub fn poll_open_pr_ci_status(store: &Arc<Mutex<Store>>, runner: &dyn Runner, gu
             PrCiState::Failing(f) => f.job_url.clone(),
             _ => None,
         };
-        let _ = store.lock().expect("poisoned").set_pr_ci_status(
-            &pr.id,
-            state.as_str(),
-            job_url.as_deref(),
-        );
+        let _ = store
+            .lock()
+            .set_pr_ci_status(&pr.id, state.as_str(), job_url.as_deref());
         if let PrCiState::Failing(failure) = state {
             dispatch_pr_auto_fix(store, runner, &guardian, pr, &failure);
         }
@@ -573,7 +571,7 @@ const AUTO_FIX_SUBMITTED_BY: &str = "guardian:ci-watch-auto-fix";
 /// fold into the review's linear stack and restack correctly) belongs
 /// alongside `run_feedback`'s other restack tests, not duplicated here.
 pub fn dispatch_pr_auto_fix(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     guardian: &GuardianView,
     pr: &PullRequestView,
@@ -603,14 +601,10 @@ pub fn dispatch_pr_auto_fix(
 
     // RAL-395: single attempt per failure -- claim it now, before the
     // (potentially long-running) agent dispatch below, not after.
-    let _ = store
-        .lock()
-        .expect("poisoned")
-        .mark_pr_auto_fix_attempted(&pr.id);
+    let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
 
     let cell_prompts = store
         .lock()
-        .expect("poisoned")
         .cell_prompts_for_review_branch(&guardian.id, &branch.branch)
         .unwrap_or_default();
 
@@ -687,11 +681,9 @@ pub fn dispatch_pr_auto_fix(
     // a message-store failure must never block the fix itself from running.
     let _ = store
         .lock()
-        .expect("poisoned")
         .supersede_pending_branch_feedback(&guardian.id, &branch_id);
     let message_seq = store
         .lock()
-        .expect("poisoned")
         .add_guardian_message(
             &guardian.id,
             "reviewer",
@@ -835,16 +827,18 @@ mod tests {
 
     #[test]
     fn watch_after_feedback_push_is_a_noop_without_an_open_pr() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let root = std::env::temp_dir();
         let guardian_id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .create_guardian("r", "main", &root.to_string_lossy())
                 .unwrap()
         };
         let branch_id = {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard
                 .add_guardian_branch(&guardian_id, "feature/a")
                 .unwrap();

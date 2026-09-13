@@ -3,7 +3,7 @@
 //! The routing/handler core (`route`) is a pure function over `(&Daemon, method,
 //! path, body)` so it can be unit-tested without sockets. `serve` wraps it in a
 //! blocking `tiny_http` loop and runs the scheduler on a second thread; both
-//! share the store through an `Arc<Mutex<Store>>`.
+//! share the store through an `StoreHandle`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
@@ -11,7 +11,7 @@ use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{SpanKind, Status};
@@ -24,12 +24,19 @@ use crate::procreg::ProcRegistry;
 use crate::runner::{Runner, SubprocessRunner};
 use crate::scheduler::Semaphore;
 use crate::store::{NodeState, SquadState, Store, StoreError};
+use crate::store_lock::{StoreGuard, StoreHandle, StoreMutex};
+use crate::store_pool::ReadConnPool;
 use crate::summary_worker::SummaryQueue;
 use crate::vcs;
 
 /// The running daemon: its store handle plus configuration.
 pub struct Daemon {
-    store: Arc<Mutex<Store>>,
+    store: StoreHandle,
+    /// RAL-393 Stage 3: this same store's pool of read-only connections,
+    /// held independent of `store` so acquiring one never waits on
+    /// `StoreMutex` -- see [`Daemon::read_pool`] and `crate::store_pool`'s
+    /// module doc comment.
+    read_pool: Arc<ReadConnPool>,
     max_concurrent: i64,
     /// Cancel tokens of in-flight squads, shared with the scheduler's workers so a
     /// `cancel` request can stop the running worker and its subprocess.
@@ -114,8 +121,12 @@ impl Daemon {
     /// Build a daemon around an already-open store.
     #[must_use]
     pub fn new(store: Store, max_concurrent: i64) -> Self {
+        // Cloned before `store` moves into the mutex below: the pool `Arc`
+        // is independent of `StoreMutex`, so this never has to lock it.
+        let read_pool = store.read_pool();
         Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(StoreMutex::new(store)),
+            read_pool,
             max_concurrent,
             cancellations: Cancellations::new(),
             detachments: crate::cancel::Detachments::new(),
@@ -238,7 +249,7 @@ impl Daemon {
 
     /// A cloned handle to the shared store (for the scheduler thread).
     #[must_use]
-    pub fn store_handle(&self) -> Arc<Mutex<Store>> {
+    pub fn store_handle(&self) -> StoreHandle {
         Arc::clone(&self.store)
     }
 
@@ -275,8 +286,20 @@ impl Daemon {
         Arc::clone(&self.summary_queue)
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().expect("store mutex poisoned")
+    pub(crate) fn lock(&self) -> StoreGuard<'_> {
+        self.store.lock()
+    }
+
+    /// [`Store::running_count`], routed through the RAL-393 Stage 3 read
+    /// pool when it has a connection available so this never waits behind
+    /// `StoreMutex`; falls back to the normal locked path only if every
+    /// pooled connection failed to open at startup (see
+    /// [`ReadConnPool::acquire`]'s doc comment).
+    pub(crate) fn read_running_count(&self) -> crate::store::Result<i64> {
+        match self.read_pool.acquire() {
+            Some(conn) => Store::running_count_conn(&conn),
+            None => self.lock().running_count(),
+        }
     }
 
     /// Request that `run_http_loop` stop accepting new requests and return,
@@ -604,6 +627,10 @@ struct DaemonHealth<'a> {
     db: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<&'a str>,
+    /// RAL-393: process-lifetime store-lock acquisition wait (p50/p95/max),
+    /// measured separately from handler execution time so lock contention is
+    /// visible without conflating it with query cost.
+    lock_wait: crate::store_lock::LockWaitSnapshot,
 }
 
 #[derive(Serialize)]
@@ -1559,7 +1586,10 @@ fn extract_squad_id(body: &str) -> Option<String> {
 }
 
 fn health(daemon: &Daemon) -> Reply {
-    let db = if daemon.lock().running_count().is_ok() {
+    // RAL-393: pooled, not `daemon.lock()` -- this is the exact
+    // `SELECT COUNT(*)` that starved behind the scheduler/merge writer on
+    // the old single `Mutex<Store>` (see `crate::store_pool`).
+    let db = if daemon.read_running_count().is_ok() {
         "ok"
     } else {
         "error"
@@ -1576,6 +1606,7 @@ fn health(daemon: &Daemon) -> Reply {
             status: "ok",
             db,
             warnings,
+            lock_wait: crate::store_lock::store_lock_wait_snapshot(),
         },
     )
 }
@@ -4461,7 +4492,7 @@ fn proof_candidates(steps: &[crate::store::ProofView]) -> Vec<String> {
 /// Matches a squad's label *or* its id, since a squad with no label renders as its
 /// id (§C.2). Ambiguity lists the candidates and points at `?id=`; it is never
 /// silently resolved to the most recent (§C.3).
-fn squad_id_for_label(store: &MutexGuard<'_, Store>, label: &str) -> Result<String, ResolveError> {
+fn squad_id_for_label(store: &StoreGuard<'_>, label: &str) -> Result<String, ResolveError> {
     let squads = store.list_squads().map_err(|e| ResolveError {
         status: 500,
         code: "internal",
@@ -4544,7 +4575,7 @@ fn canonical_squad_uri(
 }
 
 fn resolve_squad_uri(
-    store: &MutexGuard<'_, Store>,
+    store: &StoreGuard<'_>,
     uri: &RalphusUri,
 ) -> Result<ResolvedUri, ResolveError> {
     let squad_seg = uri
@@ -4650,7 +4681,7 @@ fn resolve_squad_uri(
 }
 
 fn resolve_review_uri(
-    store: &MutexGuard<'_, Store>,
+    store: &StoreGuard<'_>,
     uri: &RalphusUri,
 ) -> Result<ResolvedUri, ResolveError> {
     let seg = uri
@@ -5357,7 +5388,7 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             }
             _ => (req.fallback_name.clone(), None),
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
             crate::rlog!(
                 WARNING,
@@ -9852,10 +9883,7 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
         drop(store);
         let store_handle = daemon.store_handle();
-        let cells = store_handle
-            .lock()
-            .expect("store mutex poisoned")
-            .cells_of(id);
+        let cells = store_handle.lock().cells_of(id);
         if let Ok(cells) = cells {
             crate::scheduler::try_start_ready_reviews_for_task(
                 &store_handle,
@@ -12796,6 +12824,10 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         accepted_at,
     } = pending;
     let queued_ms = accepted_at.elapsed().as_millis();
+    // RAL-393: zeroed here (not per-thread-spawn) because a `ReadPool` worker
+    // thread answers many requests in sequence, one at a time -- see
+    // `reset_request_lock_wait`'s doc comment.
+    crate::store_lock::reset_request_lock_wait();
     let handler_started = Instant::now();
     // RAL-219: every route requires the configured bearer token (when
     // one is configured - see `Daemon::authorized`), checked here at the
@@ -12820,6 +12852,7 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         )
     };
     let handler_ms = handler_started.elapsed().as_millis();
+    let lock_wait_ms = crate::store_lock::take_request_lock_wait_ms();
     let status = reply.status;
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("valid header");
@@ -12840,12 +12873,12 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     if handler_ms >= SLOW_REQUEST_MS {
         crate::rlog!(
             WARNING,
-            "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms)"
+            "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
         );
     } else {
         crate::rlog!(
             DEBUG,
-            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms)"
+            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
         );
     }
 }
@@ -13050,10 +13083,10 @@ const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 /// path in `run_http_loop`.
 fn serve_events_stream(
     request: tiny_http::Request,
-    store: &Arc<Mutex<Store>>,
+    store: &StoreHandle,
     allow_origin: Option<&str>,
 ) {
-    let (sub_id, rx) = store.lock().unwrap().event_bus().subscribe();
+    let (sub_id, rx) = store.lock().event_bus().subscribe();
     // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
     crate::rlog!(DEBUG, "ralphus [http] SSE client connected sub_id={sub_id}");
     let mut writer = request.into_writer();
@@ -13082,7 +13115,7 @@ X-Accel-Buffering: no\r\n\
             Err(RecvTimeoutError::Disconnected) => false,
         } && writer.flush().is_ok();
     }
-    store.lock().unwrap().event_bus().unsubscribe(sub_id);
+    store.lock().event_bus().unsubscribe(sub_id);
     // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
     crate::rlog!(
         DEBUG,
@@ -22583,5 +22616,81 @@ command=\"cargo test\"
         };
         apply_default_user_admin(&store, &cfg);
         assert!(store.list_users().unwrap().is_empty());
+    }
+
+    /// RAL-393: `GET /api/daemon` was measured at 0.38s-4.2s (mean ~2s) under
+    /// exactly this shape of contention -- several threads reacquiring the
+    /// store lock in a tight loop (standing in for the scheduler + guardian
+    /// merge workers) while a `SELECT COUNT(*)` health check waited its turn
+    /// on the same non-fair `std::sync::Mutex`. This is the "documented load
+    /// condition" for the ticket's p95-under-100ms acceptance criterion: 4
+    /// writer threads continuously taking `StoreMutex` and inserting a
+    /// cartographer event, racing 8 reader threads each issuing 50
+    /// `GET /api/daemon` calls through the RAL-393 Stage 3 read pool. Also
+    /// doubles as the "no new `SQLITE_BUSY` under concurrent read/write"
+    /// check: every response's `db` field must read `"ok"`, since a
+    /// `SQLITE_BUSY` from either the pooled reads or the writer would flip it
+    /// to `"error"` instead of failing the HTTP call outright.
+    #[test]
+    fn api_daemon_health_reads_stay_fast_and_busy_free_under_writer_contention() {
+        let d = Arc::new(daemon());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writers: Vec<_> = (0..4)
+            .map(|i| {
+                let d = Arc::clone(&d);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut n: u64 = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        d.lock()
+                            .log_event(None, None, "test", None, &format!("writer-{i} iter {n}"))
+                            .expect("writer thread's log_event must succeed");
+                        n += 1;
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let d = Arc::clone(&d);
+                std::thread::spawn(move || {
+                    let mut samples = Vec::with_capacity(50);
+                    for _ in 0..50 {
+                        let start = Instant::now();
+                        let r = route(&d, "GET", "/api/daemon", "");
+                        let elapsed = start.elapsed();
+                        assert_eq!(r.status, 200, "{}", r.body);
+                        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+                        assert_eq!(
+                            v["db"], "ok",
+                            "SQLITE_BUSY (or any other store error) must not surface here: {v}"
+                        );
+                        samples.push(elapsed);
+                    }
+                    samples
+                })
+            })
+            .collect();
+
+        let mut all_samples: Vec<Duration> = readers
+            .into_iter()
+            .flat_map(|h| h.join().expect("reader thread must not panic"))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().expect("writer thread must not panic");
+        }
+
+        all_samples.sort();
+        let p95_idx = ((all_samples.len() as f64) * 0.95).ceil() as usize - 1;
+        let p95 = all_samples[p95_idx];
+        assert!(
+            p95 < Duration::from_millis(100),
+            "p95 of {} GET /api/daemon calls under 4-writer contention was {p95:?}, want <100ms \
+             (samples: {all_samples:?})",
+            all_samples.len(),
+        );
     }
 }

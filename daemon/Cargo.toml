@@ -35,6 +35,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 rusqlite = { workspace = true }
+parking_lot = { workspace = true }
 tiny_http = { workspace = true }
 tungstenite = { workspace = true }
 ureq = { workspace = true, features = ["tls"] }

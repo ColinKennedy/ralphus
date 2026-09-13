@@ -167,16 +167,12 @@ fn run_placeholder_task(repo: &str, branch: &str, upstream: &str) -> String {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = daemon.store_handle();
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done,
         "squad must complete"
     );
@@ -289,17 +285,13 @@ fn placeholder_cwd_resolves_to_a_real_worktree_through_full_pipeline() {
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done,
         "squad must complete"
     );
@@ -349,17 +341,13 @@ fn shared_placeholder_across_cells_builds_one_worktree() {
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done
     );
 
@@ -404,11 +392,7 @@ fn restarted_squad_reuses_already_materialized_worktree() {
     let file: TaskFile = toml::from_str(toml).unwrap();
 
     let store = daemon.store_handle();
-    let squad_id = store
-        .lock()
-        .unwrap()
-        .insert_squad(&file, None, false)
-        .unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let runner = CapturingRunner::default();
     execute_squad(&store, &runner, &squad_id);
@@ -419,17 +403,13 @@ fn restarted_squad_reuses_already_materialized_worktree() {
 
     // Simulate a restart: reset squad/task/cell state to Pending (mirrors
     // Store::restart_squad) without touching the already-resolved `cwd` column.
-    store
-        .lock()
-        .unwrap()
-        .reset_squad_to_pending(&squad_id)
-        .unwrap();
+    store.lock().reset_squad_to_pending(&squad_id).unwrap();
 
     let runner2 = CapturingRunner::default();
     execute_squad(&store, &runner2, &squad_id);
 
     assert_eq!(
-        store.lock().unwrap().squad_state(&squad_id).unwrap(),
+        store.lock().squad_state(&squad_id).unwrap(),
         SquadState::Done,
         "restarted squad must complete"
     );

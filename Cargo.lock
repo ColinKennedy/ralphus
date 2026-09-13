@@ -1036,6 +1036,7 @@ dependencies = [
  "nix",
  "opentelemetry",
  "opentelemetry_sdk",
+ "parking_lot",
  "ralphus-auth",
  "ralphus-core",
  "rusqlite",

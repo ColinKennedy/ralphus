@@ -17,6 +17,7 @@ use ralphus_core::schema::TaskFile;
 use ralphus_daemon::runner::SubprocessRunner;
 use ralphus_daemon::scheduler::execute_squad;
 use ralphus_daemon::store::{SquadState, Store};
+use ralphus_daemon::store_lock::StoreMutex;
 
 /// Both tests below build a fresh in-memory `Store` and therefore get the
 /// same deterministic squad/task/cell ids, which collapse to the same tmux
@@ -109,9 +110,9 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let squad_id = {
-        let mut g = store.lock().unwrap();
+        let mut g = store.lock();
         g.insert_squad(&file, Some("prompt-verify-test"), false)
             .unwrap()
     };
@@ -119,7 +120,7 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
     let runner = SubprocessRunner::new(&runner_cmd);
     execute_squad(&store, &runner, &squad_id);
 
-    let guard = store.lock().unwrap();
+    let guard = store.lock();
     let squad_state = guard.squad_state(&squad_id).unwrap();
     let squad = guard.get_squad(&squad_id).unwrap();
     let proof = &squad.tasks[0].proof[0];

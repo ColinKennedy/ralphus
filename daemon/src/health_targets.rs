@@ -17,11 +17,12 @@
 //! project-specific clone-URL reachability (needs project context this
 //! target-scoped sweep doesn't have).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::machine_targets::MachineTarget;
 use crate::remote_runner::{Capabilities, RunRequest};
 use crate::runner::RunnerSpec;
+#[cfg(test)]
 use crate::store::Store;
 
 const PASS: &str = "pass";
@@ -128,7 +129,10 @@ fn git_identity_check(
 /// fails -- every later check would fail the identical way, and reporting
 /// the same connectivity problem five times would bury the one fact that
 /// actually matters.
-fn check_one_target(store: &Arc<Mutex<Store>>, target: &MachineTarget) -> TargetHealthReport {
+fn check_one_target(
+    store: &crate::store_lock::StoreHandle,
+    target: &MachineTarget,
+) -> TargetHealthReport {
     let mut checks = Vec::new();
     let report = |checks| TargetHealthReport {
         target: target.name.clone(),
@@ -137,7 +141,7 @@ fn check_one_target(store: &Arc<Mutex<Store>>, target: &MachineTarget) -> Target
     };
 
     let provider = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         crate::remote_runner::provider_from_store(&guard, &target.machine)
     };
     let provider = match provider {
@@ -261,13 +265,15 @@ fn check_one_target(store: &Arc<Mutex<Store>>, target: &MachineTarget) -> Target
 /// failures are reported *inside* their own [`TargetHealthReport`], never as
 /// this function's own `Err` -- one unreachable machine must not hide every
 /// other target's results.
-pub fn check_all_targets(store: &Arc<Mutex<Store>>) -> Result<Vec<TargetHealthReport>, String> {
+pub fn check_all_targets(
+    store: &crate::store_lock::StoreHandle,
+) -> Result<Vec<TargetHealthReport>, String> {
     let targets = crate::machine_targets::load_machine_targets()?;
     Ok(check_targets(store, targets.into_values().collect()))
 }
 
 fn check_targets(
-    store: &Arc<Mutex<Store>>,
+    store: &crate::store_lock::StoreHandle,
     targets: Vec<MachineTarget>,
 ) -> Vec<TargetHealthReport> {
     let mut reports = Vec::with_capacity(targets.len());
@@ -336,7 +342,9 @@ mod tests {
 
     #[test]
     fn an_unresolvable_machine_reports_one_failing_check() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let report = check_one_target(&store, &target("t", "ssh:nope", "/srv/ralphus"));
         assert_eq!(report.checks.len(), 1);
         assert_eq!(report.checks[0].name, "resolve");
@@ -354,10 +362,11 @@ mod tests {
                 "{\"ok\": false, \"protocol_version\": 1, \"error\": \"connection refused\"}",
             )],
         );
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "healthtest",
                 "",
@@ -400,10 +409,11 @@ mod tests {
                 ),
             ],
         );
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
             .lock()
-            .unwrap()
             .register_machine_provider(
                 "healthtest2",
                 "",
@@ -434,9 +444,11 @@ mod tests {
                 "{\"ok\": false, \"protocol_version\": 1, \"error\": \"connection refused\"}",
             )],
         );
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             for i in 0..3 {
                 guard
                     .register_machine_provider(

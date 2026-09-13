@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ralphus_core::schema::{ResolvedAgent, TaskFile};
-use rusqlite::{Connection, OptionalExtension, named_params, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params};
 use serde::Serialize;
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
@@ -745,6 +745,12 @@ pub struct Store {
     /// independent in-memory stores each test opens.
     pub(crate) secret_env_names_cache:
         std::sync::RwLock<Option<std::collections::BTreeSet<String>>>,
+    /// RAL-393 Stage 3: a small pool of read-only connections to this same
+    /// database, so read-classified methods can run without waiting on
+    /// [`crate::store_lock::StoreMutex`]. See `crate::store_pool`'s module
+    /// doc comment for why this is a connection pool rather than
+    /// `RwLock<Store>`.
+    read_pool: std::sync::Arc<crate::store_pool::ReadConnPool>,
 }
 
 /// RAL-208: see [`Store::guardian_summary_debounce`].
@@ -926,6 +932,16 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // RAL-393 Stage 3: bound how long any connection (this writer, or a
+        // pooled reader opened below) waits on SQLite's busy handler before
+        // surfacing `SQLITE_BUSY`, instead of leaving it at the default of 0
+        // (fail immediately on any lock contention).
+        conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        // Built from the writer connection's own path so pooled reads see
+        // the same on-disk (WAL-mode) database -- see `crate::store_pool`.
+        let read_pool = crate::store_pool::ReadConnPool::open(
+            &crate::store_pool::DbLocation::File(path.to_path_buf()),
+        );
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
@@ -936,6 +952,7 @@ impl Store {
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            read_pool,
         };
         store.init_schema()?;
         #[cfg(unix)]
@@ -943,9 +960,24 @@ impl Store {
         Ok(store)
     }
 
-    /// Open an in-memory store (used by tests).
+    /// Open an in-memory store (used by tests). A named, shared-cache
+    /// in-memory database rather than a plain private one, so
+    /// [`Store::read_pool`]'s pooled connections attach to the same
+    /// in-memory database as the writer instead of each seeing an empty one
+    /// -- see `crate::store_pool::memory_location`.
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let location = crate::store_pool::memory_location();
+        let crate::store_pool::DbLocation::Memory(name) = &location else {
+            unreachable!("memory_location() always returns DbLocation::Memory")
+        };
+        let conn = Connection::open_with_flags(
+            format!("file:{name}?mode=memory&cache=shared"),
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        let read_pool = crate::store_pool::ReadConnPool::open(&location);
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
@@ -956,9 +988,19 @@ impl Store {
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            read_pool,
         };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// This store's pool of read-only connections (RAL-393 Stage 3) --
+    /// cloning the `Arc` is cheap and does not touch `self.conn` or require
+    /// the `StoreMutex`, so callers (see [`crate::server::Daemon::new`]) can
+    /// hold their own handle to it independent of the store lock.
+    #[must_use]
+    pub(crate) fn read_pool(&self) -> std::sync::Arc<crate::store_pool::ReadConnPool> {
+        std::sync::Arc::clone(&self.read_pool)
     }
 
     /// The SSE broadcast registry (RAL-167) — subscribe from the `/api/events`
@@ -3203,7 +3245,15 @@ impl Store {
 
     /// Count of currently running squads.
     pub fn running_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
+        Self::running_count_conn(&self.conn)
+    }
+
+    /// [`Store::running_count`]'s query, shared with the pooled read path
+    /// (RAL-393 Stage 3, see `crate::server::Daemon::read_running_count`) so
+    /// a `GET /api/daemon` health check can run it against a pooled
+    /// connection instead of the writer connection behind `StoreMutex`.
+    pub(crate) fn running_count_conn(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row(
             "SELECT COUNT(*) FROM squads WHERE state='running'",
             [],
             |r| r.get(0),
@@ -9317,6 +9367,11 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            // These legacy-migration tests exercise `store.conn` directly
+            // against a private (non-shared-cache) in-memory connection and
+            // never touch the read pool, so an unrelated, freshly-named
+            // shared-cache location is fine here -- nothing queries it.
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()
@@ -9436,6 +9491,11 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            // These legacy-migration tests exercise `store.conn` directly
+            // against a private (non-shared-cache) in-memory connection and
+            // never touch the read pool, so an unrelated, freshly-named
+            // shared-cache location is fine here -- nothing queries it.
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()
@@ -9528,6 +9588,11 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            // These legacy-migration tests exercise `store.conn` directly
+            // against a private (non-shared-cache) in-memory connection and
+            // never touch the read pool, so an unrelated, freshly-named
+            // shared-cache location is fine here -- nothing queries it.
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()
@@ -9572,6 +9637,11 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            // These legacy-migration tests exercise `store.conn` directly
+            // against a private (non-shared-cache) in-memory connection and
+            // never touch the read pool, so an unrelated, freshly-named
+            // shared-cache location is fine here -- nothing queries it.
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()
@@ -9644,6 +9714,7 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()

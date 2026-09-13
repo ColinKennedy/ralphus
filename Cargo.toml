@@ -30,6 +30,16 @@ tiny_http = "0.12"
 # routing through the daemon's existing HTTP server.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# RAL-393: the daemon's single `Store` mutex is `std::sync::Mutex`, which is
+# not fair -- under sustained contention from scheduler/merge workers,
+# already-parked HTTP read threads can be barged past repeatedly by a thread
+# that re-locks before the OS ever wakes the one waiting, causing multi-second
+# stalls on trivial reads. `parking_lot::Mutex` implements "eventual
+# fairness": a thread blocked past a short internal threshold is handed the
+# lock directly on the next unlock, bypassing barging. Already present
+# transitively (via `crossterm`, pinned at 0.12.5 in the lockfile); promoted
+# to a direct dependency here rather than left implicit.
+parking_lot = "0.12"
 ureq = { version = "2", default-features = false }
 ed25519-dalek = "2"
 base64 = "0.22"
