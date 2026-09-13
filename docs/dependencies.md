@@ -5,6 +5,14 @@ section 1; someone **running** the compiled binaries needs section 2. Section
 3 covers dependencies gated behind an opt-in feature or mode, documented in
 full elsewhere — this is just the index.
 
+**Platform support:** Linux and Windows are fully supported and get CI's full
+fmt/clippy/test suite. macOS is supported as a daemon host on an
+**experimental** basis (RAL-398) — it already runs the same `cfg(unix)` code
+paths Linux does, and CI runs a build-only macOS leg on every PR, but there
+is no real macOS hardware to validate a heavier leg against yet. Everything
+below that says "macOS" or "Unix" applies to it the same as Linux unless
+called out otherwise.
+
 ## 1. Build-time / installation dependencies
 
 What you need installed to build and test the workspace. Nothing in this
@@ -168,6 +176,10 @@ graceful fallback — none of these block core functionality if missing:
 - **macOS/Linux:** `sh -c` (the POSIX equivalent of `cmd /C` above), `open`
   (macOS) / `xdg-open` (Linux) for opening a terminal-log snapshot with the
   OS default handler.
+- **macOS only:** `ps` (per-PID CPU/memory sampling in
+  `daemon/src/resources.rs`, RAL-398 — the macOS equivalent of the
+  Windows/Linux readers above; same best-effort/graceful-degradation
+  contract).
 - **Cross-platform, optional:** `$VISUAL`/`$EDITOR` (user-configured, for
   viewing terminal-log snapshots — falls back to `open`/`xdg-open`/`cmd
   start` if unset), `nvidia-smi` (optional GPU memory sampling in
