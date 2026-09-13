@@ -205,9 +205,10 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let resolved = resolve_branch(client, &selector)?;
             let cell = resolve_squad_selector(client, &cell_selector)?;
             if cell.kind != "cell" {
-                return Err(usage(format!(
-                    "'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)"
-                ).as_str()));
+                return Err(usage(
+                    format!("'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)")
+                        .as_str(),
+                ));
             }
             Ok(client.guardian_link_cell(
                 &resolved.guardian_id,
