@@ -130,7 +130,7 @@ pub struct CartographerPage {
 /// Note::new("scheduler")
 ///     .squad(&squad_id)
 ///     .scope("squad")
-///     .emit(&store, format!("squad {squad_id} claimed → running"), serde_json::json!({}));
+///     .emit(&store, format!("squad {squad_id} claimed"), serde_json::json!({}));
 /// ```
 pub struct Note<'a> {
     source: &'a str,
