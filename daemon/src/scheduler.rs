@@ -866,7 +866,7 @@ fn execute_squad_inner(
     // `resolve_placeholders_with_prefetch`'s doc comment for the full picture,
     // including why a miss here still resolves correctly (just not for free).
     let prefetched_upstreams = {
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let targets =
             crate::worktrees::collect_remote_upstream_prefetch_targets(&guard, &cells, &tasks);
         drop(guard);
@@ -1044,10 +1044,7 @@ fn execute_squad_inner(
         // cell body; after proofs finish they transition to Done/Failed.
         if !proof_only_indices.is_empty() && !squad_marked_running {
             squad_marked_running = true;
-            let _ = store
-                .lock()
-                .expect("store mutex poisoned")
-                .set_squad_state(squad_id, SquadState::Running);
+            let _ = store.lock().set_squad_state(squad_id, SquadState::Running);
         }
         for &i in &proof_only_indices {
             scope.spawn(move || {
@@ -1407,10 +1404,7 @@ fn execute_squad_inner(
             // still in progress.
             if (!to_dispatch.is_empty() || !to_finalize.is_empty()) && !squad_marked_running {
                 squad_marked_running = true;
-                let _ = store
-                    .lock()
-                    .expect("store mutex poisoned")
-                    .set_squad_state(squad_id, SquadState::Running);
+                let _ = store.lock().set_squad_state(squad_id, SquadState::Running);
             }
 
             // Record cells blocked by a failed prerequisite (store writes
@@ -2689,7 +2683,7 @@ fn run_task_finalizer(
             .failed
             .contains(&task_idx);
         if latched {
-            let guard = store.lock().expect("store mutex poisoned");
+            let guard = store.lock();
             let all_done = cells.iter().filter(|s| s.task_idx == task_idx).all(|s| {
                 let effective_done = matches!(
                     guard.effective_state_for_cell(squad_id, task_idx, s.idx),
@@ -4555,7 +4549,7 @@ mod tests {
                      [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
         let (store, id) = store_with(toml);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.set_squad_state(&id, SquadState::Running).unwrap();
             guard.set_task_state(&id, 0, NodeState::Running).unwrap();
             guard.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
@@ -4567,14 +4561,13 @@ mod tests {
         // The operator manually clears the failing proof step after the fact.
         store
             .lock()
-            .unwrap()
             .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
             .unwrap();
 
         // Re-run the finalizer directly, carrying the exact stale in-memory
         // latch a real dispatcher would still hold for the rest of that run
         // even after the DB fix -- this is the scenario the fix must cover.
-        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        let cells = store.lock().cells_of(&id).unwrap();
         let progress = Mutex::new(Progress {
             status: vec![CellState::Done],
             summaries: vec![None],
@@ -4597,7 +4590,7 @@ mod tests {
             &Cancellations::new(),
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(
             guard.get_squad(&id).unwrap().tasks[0].state,
             "done",
@@ -4622,7 +4615,7 @@ mod tests {
                      [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
         let (store, id) = store_with(toml);
         {
-            let guard = store.lock().unwrap();
+            let guard = store.lock();
             guard.set_squad_state(&id, SquadState::Running).unwrap();
             guard.set_task_state(&id, 0, NodeState::Running).unwrap();
             guard.set_cell_state(&id, 0, 0, NodeState::Done).unwrap();
@@ -4631,7 +4624,7 @@ mod tests {
                 .unwrap();
         }
 
-        let cells = store.lock().unwrap().cells_of(&id).unwrap();
+        let cells = store.lock().cells_of(&id).unwrap();
         let progress = Mutex::new(Progress {
             status: vec![CellState::Done],
             summaries: vec![None],
@@ -4654,7 +4647,7 @@ mod tests {
             &Cancellations::new(),
         );
 
-        let guard = store.lock().unwrap();
+        let guard = store.lock();
         assert_eq!(guard.get_squad(&id).unwrap().tasks[0].state, "failed");
     }
 
@@ -4693,7 +4686,7 @@ mod tests {
         // but must not flip the squad to Running -- that only happens once a
         // cell actually starts executing.
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Pending,
             "claiming alone must not present the squad as running"
         );
@@ -4728,10 +4721,7 @@ mod tests {
         });
         let token = CancelToken::new();
 
-        assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
-            SquadState::Pending
-        );
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Pending);
 
         let worker = {
             let (store, runner, token, id) = (
@@ -4749,7 +4739,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(
-            store.lock().unwrap().squad_state(&id).unwrap(),
+            store.lock().squad_state(&id).unwrap(),
             SquadState::Running,
             "once a cell is actually executing the squad must show Running"
         );

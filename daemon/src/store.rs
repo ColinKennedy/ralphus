@@ -9714,6 +9714,7 @@ prompt = "legacy cell, no review_guardian_id"
             guardian_restack_running: std::collections::HashSet::new(),
             stall_escalated: HashMap::new(),
             secret_env_names_cache: std::sync::RwLock::new(None),
+            read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
             .init_schema()

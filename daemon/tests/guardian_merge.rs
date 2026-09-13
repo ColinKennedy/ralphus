@@ -1000,9 +1000,9 @@ fn feedback_push_resolves_a_non_origin_base_branch_remote() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         // `alt/main`, not `main` -- exercises `forge::resolve_remote_name`'s
         // base-branch-prefix resolution, same as `base_branch: alt/staging`.
         let id = g
@@ -1013,7 +1013,7 @@ fn feedback_push_resolves_a_non_origin_base_branch_remote() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     run_feedback(
@@ -1027,7 +1027,7 @@ fn feedback_push_resolves_a_non_origin_base_branch_remote() {
         &CancelToken::never(),
     );
 
-    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let view = store.lock().get_guardian(&id).unwrap();
     let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
     assert!(
         detail0.starts_with("feedback applied") && detail0.contains("pushed"),
@@ -1219,9 +1219,9 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     git(&root, &["commit", "-m", "add a"]);
     git(&root, &["checkout", "main"]);
 
-    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let id = {
-        let g = store.lock().unwrap();
+        let g = store.lock();
         let id = g
             .create_guardian("r", "main", root.to_str().unwrap())
             .unwrap();
@@ -1230,12 +1230,11 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     };
     run_merge(&store, &NoopRunner, &id);
 
-    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
         .id
         .clone();
     let pr_id = store
         .lock()
-        .unwrap()
         .create_pull_request(
             &id,
             Some(&bid0),
@@ -1251,12 +1250,11 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
         .unwrap();
     store
         .lock()
-        .unwrap()
         .set_guardian_auto_fix_pr_errors(&id, Some(true))
         .unwrap();
 
-    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
-    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
     let failure = ralphus_daemon::forge::PrFailure {
         reason: "check 'build' failed".to_string(),
         job_url: None,
@@ -1265,11 +1263,7 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     let runner = AutoFixRunner::new();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
 
-    let messages = store
-        .lock()
-        .unwrap()
-        .guardian_branch_messages(&id, &bid0)
-        .unwrap();
+    let messages = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
     assert_eq!(messages.len(), 1, "expected exactly one feedback message");
     let msg = &messages[0];
     assert_eq!(msg.role, "reviewer");

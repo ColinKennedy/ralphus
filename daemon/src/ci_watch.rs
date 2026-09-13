@@ -681,11 +681,9 @@ pub fn dispatch_pr_auto_fix(
     // a message-store failure must never block the fix itself from running.
     let _ = store
         .lock()
-        .expect("poisoned")
         .supersede_pending_branch_feedback(&guardian.id, &branch_id);
     let message_seq = store
         .lock()
-        .expect("poisoned")
         .add_guardian_message(
             &guardian.id,
             "reviewer",

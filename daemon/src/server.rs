@@ -5388,7 +5388,7 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             }
             _ => (req.fallback_name.clone(), None),
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
             crate::rlog!(
                 WARNING,
@@ -9883,10 +9883,7 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
         drop(store);
         let store_handle = daemon.store_handle();
-        let cells = store_handle
-            .lock()
-            .expect("store mutex poisoned")
-            .cells_of(id);
+        let cells = store_handle.lock().cells_of(id);
         if let Ok(cells) = cells {
             crate::scheduler::try_start_ready_reviews_for_task(
                 &store_handle,

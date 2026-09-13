@@ -5071,10 +5071,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 }
                 let nothing = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
                 if nothing {
-                    let _ = store
-                        .lock()
-                        .expect("poisoned")
-                        .set_branch_empty(id, &ob.id, true);
+                    let _ = store.lock().set_branch_empty(id, &ob.id, true);
                     fail_branch(
                         store,
                         id,
@@ -5571,7 +5568,7 @@ pub fn run_feedback(
                 WARNING,
                 "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
             );
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
@@ -6770,10 +6767,7 @@ fn stack_pick(
             // diff over its predecessor before it can become terminal or
             // queue a PR.
             if review_ref_has_no_changes(wt, newbase, rev) {
-                let _ = store
-                    .lock()
-                    .expect("poisoned")
-                    .set_branch_empty(id, branch_id, true);
+                let _ = store.lock().set_branch_empty(id, branch_id, true);
                 fail_branch(
                     store,
                     id,

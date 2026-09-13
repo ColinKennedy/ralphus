@@ -4115,7 +4115,7 @@ fn reconcile_native_pr_stack(
                         INFO,
                         "ralphus [pr] review {id} registered github pr stack number={stack_number}"
                     );
-                    let guard = store.lock().expect("poisoned");
+                    let guard = store.lock();
                     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                         level: crate::logging::LogLevel::INFO,
                         source: "pr",
@@ -4364,7 +4364,7 @@ pub fn maybe_auto_submit_branch(
             let _ = store
                 .lock()
                 .set_branch_auto_submit_error(id, branch_id, None);
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
@@ -4387,7 +4387,7 @@ pub fn maybe_auto_submit_branch(
             let _ = store
                 .lock()
                 .set_branch_auto_submit_error(id, branch_id, Some(&e));
-            let guard = store.lock().expect("poisoned");
+            let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::WARNING,
                 source: "pr",
