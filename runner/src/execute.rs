@@ -72,7 +72,17 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      worktree of this project's repository, not its main checkout. Implement \
      the work exactly as described and keep every change -- file edits, \
      `git add`, commits, anything -- confined to this worktree; never touch \
-     the main checkout or any other worktree, even to look something up.";
+     the main checkout or any other worktree, even to look something up. \
+     This branch's git upstream is configured to point at its review's \
+     shared base branch, purely so ralphus can diff against it -- `git \
+     status`/`git push` may describe that tracked branch as \"your branch's \
+     upstream,\" but it is not this branch's own remote copy. Never push \
+     directly to it, whether with a bare `git push` or by naming it \
+     explicitly; that lands your commit straight on the shared base branch, \
+     bypassing the review this branch is meant to go through. Only push to a \
+     same-named branch of your own (e.g. `git push <remote> \
+     HEAD:<this-branch-name>`), and only if explicitly instructed to push at \
+     all.";
 
 const MAX_ASYNC_ATTEMPTS: u32 = 3;
 /// RAL-292: how many times a turn that ended with an unresolved backgrounded

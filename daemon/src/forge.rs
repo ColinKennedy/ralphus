@@ -183,6 +183,26 @@ pub struct FailedCheck {
     /// Full, untrimmed text; trimming to a mailbox-safe excerpt is
     /// `crate::ci_watch::trim_log_excerpt`'s job, not this layer's.
     pub log_text: Option<String>,
+    /// The specific step *within* `name`'s job/check that actually failed,
+    /// when the forge can distinguish one (RAL-<new>) -- see
+    /// `.agent/forge-design-principles.md`'s "GitHub job-level ambiguity"
+    /// section for the incident this exists to prevent: a GitHub Actions job
+    /// can bundle several independently-tracked, differently-purposed steps
+    /// under one job name (e.g. this repo's "Docs (screenshot coverage
+    /// lint)" job also runs an unrelated cli-reference.md freshness check as
+    /// a separate step), and `name` alone doesn't tell a caller which one
+    /// actually broke. Always `None` from [`ForgeClient::check_pr_ci_status`]
+    /// itself (both forges) -- populated afterward, on demand, only by a
+    /// caller that's about to hand this to an agent (see
+    /// `ci_watch::run_pr_fix`), since resolving it costs an extra forge call
+    /// per failing check and the routine 2-minute standing poll has no need
+    /// to pay that on every tick. Left `None` for GitLab today: a GitLab CI
+    /// job has no equivalent "steps with their own tracked conclusion"
+    /// concept, and the full job trace this module already fetches for
+    /// GitLab (`log_text`) already surfaces the actual failing command in
+    /// most cases, unlike GitHub's `output.text`/`output.summary`, which is
+    /// usually empty.
+    pub failing_step: Option<String>,
 }
 
 /// A blocker a forge reports against a PR/MR ever landing on its base branch
@@ -979,6 +999,7 @@ impl ForgeClient {
                     .as_str()
                     .or_else(|| run["output"]["summary"].as_str())
                     .map(str::to_string),
+                failing_step: None,
             })
             .collect();
         if !failing.is_empty() {
@@ -1010,6 +1031,7 @@ impl ForgeClient {
                             name: c["context"].as_str().unwrap_or("status").to_string(),
                             job_url: c["target_url"].as_str().map(str::to_string),
                             log_text: None,
+                            failing_step: None,
                         })
                         .collect()
                 })
@@ -1115,6 +1137,9 @@ impl ForgeClient {
                             name: job["name"].as_str().unwrap_or("job").to_string(),
                             job_url: job["web_url"].as_str().map(str::to_string),
                             log_text: job_id.and_then(|id| self.gitlab_job_trace(id, token).ok()),
+                            // GitLab has no step-level equivalent to resolve here --
+                            // see `FailedCheck::failing_step`'s doc comment.
+                            failing_step: None,
                         }
                     })
                     .collect();
@@ -1129,6 +1154,63 @@ impl ForgeClient {
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
+    }
+
+    /// Best-effort lookup of which step inside a GitHub Actions job actually
+    /// failed (RAL-<new>), given that job's `details_url`/`html_url` (the
+    /// same value [`FailedCheck::job_url`] already carries for it). See
+    /// [`FailedCheck::failing_step`]'s doc comment and
+    /// `.agent/forge-design-principles.md`'s "GitHub job-level ambiguity"
+    /// section for the incident this exists to prevent: GitHub's Checks API
+    /// check-run (what [`Self::check_pr_ci_status`] already reads) reports
+    /// only the *job's* name and usually an empty `output.text`/
+    /// `output.summary` -- it says nothing about which of the job's several
+    /// independently-tracked steps actually broke. This makes one extra call
+    /// to the Actions API's job endpoint (`GET .../actions/jobs/{id}`, which
+    /// does expose a `steps` array with per-step `conclusion`) specifically
+    /// to answer that question, since paying for it on every routine
+    /// CI-status poll (every 2 minutes, for every open PR) would be wasteful
+    /// -- callers use this only once they're actually about to hand a
+    /// failure to an agent (`ci_watch::run_pr_fix`).
+    ///
+    /// No-op (`None`) for a non-GitHub client, a `job_url` this can't parse a
+    /// job id out of, or any forge-call/parse failure -- this is a
+    /// nice-to-have enrichment of an already-known failure, never a reason to
+    /// block dispatching a fix over it.
+    pub fn github_failing_step(&self, job_url: &str) -> Option<String> {
+        if self.kind != ForgeKind::GitHub {
+            return None;
+        }
+        let job_id: i64 = job_url
+            .split("/job/")
+            .nth(1)?
+            .split(['/', '?', '#'])
+            .next()?
+            .parse()
+            .ok()?;
+        let token = self.require_token().ok()?;
+        let url = format!(
+            "{}/repos/{}/actions/jobs/{job_id}",
+            self.api_base, self.repo_path
+        );
+        let job = self
+            .get(
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json"),
+            )
+            .ok()?;
+        job["steps"]
+            .as_array()?
+            .iter()
+            .find(|s| {
+                matches!(
+                    s["conclusion"].as_str().unwrap_or_default(),
+                    "failure" | "timed_out" | "cancelled" | "action_required"
+                )
+            })
+            .and_then(|s| s["name"].as_str())
+            .map(str::to_string)
     }
 
     /// Raw text of a GitLab job's trace log (`GET .../jobs/{id}/trace`) --
@@ -4187,6 +4269,7 @@ mod tests {
                     name: "build".to_string(),
                     job_url: Some("https://ci.example/job/1".to_string()),
                     log_text: Some("error: build failed\nsee above".to_string()),
+                    failing_step: None,
                 }],
             })
         );
@@ -4239,11 +4322,13 @@ mod tests {
                         name: "build".to_string(),
                         job_url: Some("https://ci.example/job/1".to_string()),
                         log_text: Some("build broke".to_string()),
+                        failing_step: None,
                     },
                     FailedCheck {
                         name: "test".to_string(),
                         job_url: Some("https://ci.example/job/3".to_string()),
                         log_text: Some("timed out after 10m".to_string()),
+                        failing_step: None,
                     },
                 ],
             }),
@@ -4490,6 +4575,7 @@ mod tests {
                     name: "test".to_string(),
                     job_url: Some("https://gitlab.example/jobs/77".to_string()),
                     log_text: Some("FAIL: assertion failed\n".to_string()),
+                    failing_step: None,
                 }],
             })
         );
@@ -4554,11 +4640,13 @@ mod tests {
                         name: "test".to_string(),
                         job_url: Some("https://gitlab.example/jobs/77".to_string()),
                         log_text: Some("FAIL: assertion failed\n".to_string()),
+                        failing_step: None,
                     },
                     FailedCheck {
                         name: "lint".to_string(),
                         job_url: Some("https://gitlab.example/jobs/78".to_string()),
                         log_text: Some("lint error\n".to_string()),
+                        failing_step: None,
                     },
                 ],
             }),

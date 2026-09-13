@@ -661,21 +661,47 @@ impl Store {
         )))
     }
 
-    /// Idempotently record that `external_comment_id` on `pr_id` has been
-    /// actioned into the owning worktree, so a later feedback-pull only picks
-    /// up genuinely new comments.
-    pub fn mark_pr_comment_actioned(&self, pr_id: &str, external_comment_id: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO guardian_pr_feedback_actioned(id, pr_id, external_comment_id, actioned_at_ms)
-             VALUES(?,?,?,?)",
-            params![
-                format!("{pr_id}:{external_comment_id}"),
-                pr_id,
-                external_comment_id,
-                now_ms()
-            ],
-        )?;
-        Ok(())
+    /// Atomically claim a batch of PR comment ids as actioned, returning only
+    /// the ids this call actually won -- an id already claimed (by an earlier
+    /// call, or one racing concurrently) is silently excluded rather than
+    /// re-actioned. Each id is inserted via its own `INSERT ... WHERE NOT
+    /// EXISTS`, a single atomic statement, so two overlapping callers that
+    /// both read the same "not yet actioned" comments from the forge can
+    /// never both win the same id: whichever statement runs second finds the
+    /// row already there and claims nothing for it.
+    ///
+    /// Callers must claim a comment *before* applying its feedback, not
+    /// after -- the same ordering [`crate::ci_watch::dispatch_pr_auto_fix`]
+    /// uses for `mark_pr_auto_fix_attempted`, and for the same reason: a
+    /// claim recorded only after the (potentially slow) feedback round
+    /// finishes leaves a window where a second caller can start applying the
+    /// same comments before the first one's claim lands.
+    pub fn try_claim_pr_comments(
+        &self,
+        pr_id: &str,
+        external_comment_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let mut won = Vec::new();
+        for external_comment_id in external_comment_ids {
+            let n = self.conn.execute(
+                "INSERT INTO guardian_pr_feedback_actioned(id, pr_id, external_comment_id, actioned_at_ms)
+                 SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                     SELECT 1 FROM guardian_pr_feedback_actioned WHERE pr_id=? AND external_comment_id=?
+                 )",
+                params![
+                    format!("{pr_id}:{external_comment_id}"),
+                    pr_id,
+                    external_comment_id,
+                    now_ms(),
+                    pr_id,
+                    external_comment_id,
+                ],
+            )?;
+            if n > 0 {
+                won.push(external_comment_id.clone());
+            }
+        }
+        Ok(won)
     }
 
     /// External comment ids already actioned for a PR.
@@ -1723,6 +1749,9 @@ fn resync_pr_bases_inner(
     require_forge_success: bool,
 ) -> std::result::Result<usize, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Ok(0);
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
@@ -2164,6 +2193,9 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return false;
     };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return false;
+    }
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -2744,6 +2776,9 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return;
+    }
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -3308,6 +3343,9 @@ pub fn poll_pr_base_drift(
     id: &str,
 ) -> std::result::Result<usize, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Ok(0);
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: resolve both candidate clients so each PR's base-drift check
@@ -4338,6 +4376,15 @@ fn submit_stacked_branch_pr(
     let _ = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
+    // RAL-<new>: start watching this PR's CI status the moment it exists,
+    // rather than leaving it to `ci_watch::poll_open_pr_ci_status`'s coarse,
+    // per-guardian-throttled standing poll. A stack submits one PR at a time
+    // (this whole function is a git push plus a forge API call, often tens of
+    // seconds per branch), so without this a branch submitted early in the
+    // same pass could show a known CI status well before a sibling submitted
+    // moments later -- whose first status then waited on the next standing
+    // poll, up to `ci_watch::STANDING_POLL_INTERVAL` away.
+    crate::ci_watch::start_ci_watch(store, id, branch_id);
     store
         .lock()
         .get_pull_request(&row_id)
@@ -5092,6 +5139,9 @@ pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn
     if !guardian.effective_auto_submit_pr_stack {
         return;
     }
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return;
+    }
     let covered: Vec<String> = guardian
         .branches
         .iter()
@@ -5317,6 +5367,9 @@ pub fn recover_pending_auto_submits_on_startup(store: &crate::store_lock::StoreH
         if !guardian.effective_auto_submit_pr_stack {
             continue;
         }
+        if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+            continue;
+        }
         let has_terminal = guardian.branches.iter().any(|branch| {
             branch.enabled && matches!(branch.merge_status.as_str(), "done" | "conflict_resolved")
         });
@@ -5337,6 +5390,12 @@ fn submit_pull_requests_inner(
     allow_unlinked_fork: bool,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Err(format!(
+            "review {id} is {} and read-only until reopened",
+            guardian.status
+        ));
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let fork_routing = resolve_fork_routing(store, &root, &guardian, &forge_cfg, user)?;
@@ -6005,6 +6064,13 @@ pub fn start_pull_pr_commits(
     reply(202, &serde_json::json!({"status": "pulling_pr_commits"}))
 }
 
+/// Fallback `author` for [`action_pr_feedback`] when no requester identity
+/// resolved at the HTTP boundary (e.g. no `X-Ralphus-User` header and no
+/// `[daemon].default_user` configured) -- distinct from
+/// [`crate::ci_watch::AUTO_FIX_AUTHOR`] so a manual, person-initiated action
+/// never renders under the automated system's own name.
+const MANUAL_PR_FEEDBACK_AUTHOR: &str = "Manual (PR feedback)";
+
 /// Fetch un-actioned comments/notes on the PR recorded as `pr_id`, aggregate
 /// them into one feedback string, and apply them into the owning review
 /// worktree by delegating to `guardian_merge::run_feedback` for the
@@ -6032,10 +6098,17 @@ pub fn start_pull_pr_commits(
 /// button and predates RAL-117), so its own `RunnerSpec` calls still start
 /// unlinked traces — only the PR-specific steps around it (the forge comment
 /// fetch and the push-back) are covered here.
+///
+/// `submitted_by` is the registered user who triggered this action (resolved
+/// at the HTTP boundary, same as [`guardian_merge::start_feedback`]) -- it is
+/// posted as this round's message `author`/`submitted_by` (RAL-379
+/// semantics) so the board's chat thread clearly shows a person asked for
+/// this, never something that reads as coming from an automated system.
 pub fn action_pr_feedback(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
+    submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
     let cx = crate::otel::context_from_traceparent(None);
     let span = crate::otel::start_span("pr.action_feedback", &cx, SpanKind::Internal);
@@ -6043,7 +6116,7 @@ pub fn action_pr_feedback(
 
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [pr] pr {pr_id} actioning feedback");
-    let result = action_pr_feedback_inner(store, runner, pr_id);
+    let result = action_pr_feedback_inner(store, runner, pr_id, submitted_by);
     match &result {
         Ok(n) => {
             span.set_status(Status::Ok);
@@ -6063,6 +6136,7 @@ fn action_pr_feedback_inner(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
+    submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
     let pr = store
         .lock()
@@ -6089,34 +6163,11 @@ fn action_pr_feedback_inner(
         .pr_number
         .ok_or_else(|| "PR has no recorded number yet".to_string())?;
 
-    let comments = client.list_pr_comments(pr_number)?;
-    let already = store
-        .lock()
-        .actioned_pr_comment_ids(pr_id)
-        .map_err(|e| e.to_string())?;
-    let fresh: Vec<_> = comments
-        .into_iter()
-        .filter(|c| !already.contains(&c.external_id))
-        .collect();
-    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-    crate::rlog!(
-        DEBUG,
-        "ralphus [pr] pr {pr_id} comments fresh={} already_actioned={}",
-        fresh.len(),
-        already.len()
-    );
-    if fresh.is_empty() {
-        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-        crate::rlog!(DEBUG, "ralphus [pr] pr {pr_id} no new comments to action");
-        return Ok(0);
-    }
-
-    let feedback = fresh
-        .iter()
-        .map(|c| format!("{}: {}", c.author, c.body))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-
+    // Resolved before claiming any comments below (see `try_claim_pr_comments`'s
+    // doc comment on claim-before-apply ordering): this lookup can fail (e.g.
+    // the branch was removed from the guardian since the PR was filed), and a
+    // claim taken before that failure would strand those comments as
+    // permanently "actioned" without ever having actually been applied.
     let (position, branch_id) = match &pr.branch_id {
         Some(bid) => guardian
             .branches
@@ -6133,85 +6184,180 @@ fn action_pr_feedback_inner(
             .ok_or_else(|| "guardian has no enabled branches".to_string())?,
     };
 
+    let comments = client.list_pr_comments(pr_number)?;
+    // RAL-<new>: claim before applying, not after -- see `try_claim_pr_comments`'s
+    // doc comment. Whatever this call wins is exactly what it (and only it)
+    // is responsible for applying; any id it doesn't win was already claimed
+    // by an earlier, or concurrently overlapping, call.
+    let all_ids: Vec<String> = comments.iter().map(|c| c.external_id.clone()).collect();
+    let claimed = store
+        .lock()
+        .try_claim_pr_comments(pr_id, &all_ids)
+        .map_err(|e| e.to_string())?;
+    let fresh: Vec<_> = comments
+        .into_iter()
+        .filter(|c| claimed.contains(&c.external_id))
+        .collect();
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
-        "ralphus [pr] pr {pr_id} feedback applying {} comment(s) to guardian={} position={position}",
+        "ralphus [pr] pr {pr_id} comments fresh={} already_actioned={}",
         fresh.len(),
-        pr.guardian_id
+        all_ids.len() - fresh.len()
     );
-    let outcome = guardian_merge::run_feedback(
-        store,
-        runner,
-        &pr.guardian_id,
-        &branch_id,
-        &feedback,
-        // RAL-380: this feedback is synthesized from several forge comments,
-        // not one stored "reviewer" message -- there is nothing to mark.
-        None,
-        false,
-        &crate::cancel::CancelToken::never(),
-    );
-
-    for c in &fresh {
-        let _ = store.lock().mark_pr_comment_actioned(pr_id, &c.external_id);
-    }
-
-    if pr.branch_id.is_some() {
-        // `run_feedback` already committed (amend-aware) and pushed this
-        // exact branch's own review ref -- just record the sha it pushed
-        // rather than re-pushing (and re-guarding-against-clobber) the
-        // identical ref a second time.
-        if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
-            let _ = store.lock().update_pull_request_ex(
-                pr_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(Some(sha.as_str())),
-                None,
-            );
-        } else if outcome.committed {
-            return Err("feedback applied but push back to the PR branch failed".to_string());
-        }
+    // RAL-<new>: unlike the old version of this function, an empty `fresh`
+    // no longer early-returns -- "Action feedback" is a manual override a
+    // person clicks expecting *something* to happen, and a PR can easily
+    // have zero un-actioned comments while still having failing CI (see the
+    // live-CI-fix step below). Bailing out here on comments alone silently
+    // did nothing for that case.
+    if fresh.is_empty() {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(DEBUG, "ralphus [pr] pr {pr_id} no new comments to action");
     } else {
-        // A whole-stack PR tracks the COMBINED branch, which `run_feedback`
-        // never pushes (it only pushes the specific branch it edited, here
-        // the topmost enabled one) -- push it back separately, as before.
-        let updated = store
+        let feedback = fresh
+            .iter()
+            .map(|c| format!("{}: {}", c.author, c.body))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        // RAL-<new>: post this round into the branch's feedback thread the
+        // same way `guardian_merge::start_feedback` does for a human
+        // reviewer and `ci_watch::dispatch_pr_auto_fix` does for its
+        // automated fixes -- attributed to the person who triggered this
+        // action (`submitted_by`, resolved at the HTTP boundary), never to a
+        // value that could read as automated. Falls back to
+        // `MANUAL_PR_FEEDBACK_AUTHOR` only when no requester identity was
+        // resolvable at all, so the bubble still reads as a manual,
+        // person-initiated action rather than defaulting to silence.
+        // Superseding any still-pending feedback first mirrors
+        // `start_feedback`'s own invariant: an older bubble must never read
+        // as in-progress once this round has overtaken it.
+        let author = submitted_by
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(MANUAL_PR_FEEDBACK_AUTHOR);
+        let _ = store
             .lock()
-            .get_guardian(&pr.guardian_id)
-            .map_err(|e| e.to_string())?;
-        let local_ref = updated
-            .review_branch
-            .clone()
-            .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
-        guard_against_clobber(
-            &root,
-            &remote_name,
-            &pr.branch_alias,
-            &local_ref,
-            pr.last_pushed_sha.as_deref(),
-        )?;
+            .supersede_pending_branch_feedback(&pr.guardian_id, &branch_id);
+        let message_seq = store
+            .lock()
+            .add_guardian_message(
+                &pr.guardian_id,
+                "reviewer",
+                &feedback,
+                None,
+                Some(&branch_id),
+                Some(author),
+                submitted_by,
+            )
+            .ok();
+
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
-            "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
-            pr.branch_alias
+            "ralphus [pr] pr {pr_id} feedback applying {} comment(s) to guardian={} position={position}",
+            fresh.len(),
+            pr.guardian_id
         );
-        push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
-        if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-            let _ = store.lock().update_pull_request_ex(
-                pr_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(Some(sha.trim())),
-                None,
+        let outcome = guardian_merge::run_feedback(
+            store,
+            runner,
+            &pr.guardian_id,
+            &branch_id,
+            &feedback,
+            message_seq,
+            false,
+            &crate::cancel::CancelToken::never(),
+        );
+
+        if pr.branch_id.is_some() {
+            // `run_feedback` already committed (amend-aware) and pushed this
+            // exact branch's own review ref -- just record the sha it pushed
+            // rather than re-pushing (and re-guarding-against-clobber) the
+            // identical ref a second time.
+            if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
+                let _ = store.lock().update_pull_request_ex(
+                    pr_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(sha.as_str())),
+                    None,
+                );
+            } else if outcome.committed {
+                return Err("feedback applied but push back to the PR branch failed".to_string());
+            }
+        } else {
+            // A whole-stack PR tracks the COMBINED branch, which `run_feedback`
+            // never pushes (it only pushes the specific branch it edited, here
+            // the topmost enabled one) -- push it back separately, as before.
+            let updated = store
+                .lock()
+                .get_guardian(&pr.guardian_id)
+                .map_err(|e| e.to_string())?;
+            let local_ref = updated
+                .review_branch
+                .clone()
+                .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
+            guard_against_clobber(
+                &root,
+                &remote_name,
+                &pr.branch_alias,
+                &local_ref,
+                pr.last_pushed_sha.as_deref(),
+            )?;
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
+                pr.branch_alias
+            );
+            push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
+            if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
+                let _ = store.lock().update_pull_request_ex(
+                    pr_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(sha.trim())),
+                    None,
+                );
+            }
+        }
+    }
+
+    // RAL-<new>: "Action feedback" is a manual override -- besides pulling in
+    // comments above, also check this PR's live CI/mergeability status and,
+    // if it's currently failing, dispatch a fix right now via
+    // `ci_watch::dispatch_pr_fix_manual`, which deliberately bypasses both
+    // `auto_fix_pr_errors` (that toggle gates the *unattended* background
+    // poller, not an explicit person-initiated click) and the single-
+    // attempt-per-failure cap (a person retrying by hand is exactly the case
+    // that cap must not block). Best-effort: a transient forge error here
+    // must not undo the comment-feedback work already applied above.
+    if let Ok(state) = client.check_pr_ci_status(pr_number) {
+        let job_url = match &state {
+            crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
+            _ => None,
+        };
+        let _ = store
+            .lock()
+            .set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref());
+        if let crate::forge::PrCiState::Failing(failure) = state {
+            crate::ci_watch::dispatch_pr_fix_manual(
+                store,
+                runner,
+                &guardian,
+                &pr,
+                &branch_id,
+                &failure,
+                &client,
+                submitted_by,
             );
         }
     }
@@ -6307,10 +6453,13 @@ pub fn start_submit_pull_requests(
 }
 
 /// Kick off actioning a PR's feedback in the background; returns immediately.
+/// `submitted_by` is threaded through to [`action_pr_feedback`] for message
+/// attribution (RAL-379) -- see its doc comment.
 pub fn start_action_pr_feedback(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     pr_id: &str,
+    submitted_by: Option<String>,
 ) -> Reply {
     let pr = {
         let guard = store.lock();
@@ -6321,8 +6470,8 @@ pub fn start_action_pr_feedback(
         Err(e) => return error_reply(404, "not_found", &e.to_string()),
     };
     let pid = pr_id.to_string();
-    std::thread::spawn(
-        move || match action_pr_feedback(&store, runner.as_ref(), &pid) {
+    std::thread::spawn(move || {
+        match action_pr_feedback(&store, runner.as_ref(), &pid, submitted_by.as_deref()) {
             Ok(n) => {
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -6356,8 +6505,8 @@ pub fn start_action_pr_feedback(
                     admin_only: false,
                 });
             }
-        },
-    );
+        }
+    });
     reply(202, &serde_json::json!({"status": "actioning_feedback"}))
 }
 
@@ -6557,6 +6706,7 @@ mod tests {
             inherited_env: std::collections::BTreeMap::new(),
             started_at_ms: None,
             auto_submit_error: None,
+            finished_at_ms: None,
         }
     }
 
@@ -11264,12 +11414,49 @@ mod tests {
                 None,
             )
             .unwrap();
-        s.mark_pr_comment_actioned(&id, "c1").unwrap();
-        s.mark_pr_comment_actioned(&id, "c1").unwrap(); // idempotent
-        s.mark_pr_comment_actioned(&id, "c2").unwrap();
+        let won = s.try_claim_pr_comments(&id, &["c1".to_string()]).unwrap();
+        assert_eq!(won, vec!["c1".to_string()]);
+        // Re-claiming an already-claimed id wins nothing -- this is the
+        // invariant a second, overlapping caller relies on to avoid
+        // double-actioning the same comment.
+        let rewon = s.try_claim_pr_comments(&id, &["c1".to_string()]).unwrap();
+        assert!(rewon.is_empty());
+        let won2 = s.try_claim_pr_comments(&id, &["c2".to_string()]).unwrap();
+        assert_eq!(won2, vec!["c2".to_string()]);
         let ids = s.actioned_pr_comment_ids(&id).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("c1") && ids.contains("c2"));
+    }
+
+    #[test]
+    fn try_claim_pr_comments_only_lets_one_caller_win_each_id() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let id = s
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        // Simulates two overlapping callers (e.g. a manual click racing the
+        // standing poll) both reading the same fresh comment set before
+        // either claims it.
+        let ids = vec!["c1".to_string(), "c2".to_string()];
+        let first = s.try_claim_pr_comments(&id, &ids).unwrap();
+        let second = s.try_claim_pr_comments(&id, &ids).unwrap();
+        assert_eq!(first, ids);
+        assert!(
+            second.is_empty(),
+            "a second overlapping claim must win nothing the first call already won"
+        );
     }
 
     #[test]
@@ -11680,6 +11867,67 @@ mod tests {
                 .take_due_auto_submits(i64::MAX / 2, 0)
                 .unwrap()
                 .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_submit_does_not_create_or_reconcile_a_stack_after_approval() {
+        let root = setup_auto_submit_repo("auto-submit-approved-read-only");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (id, branch_id, _tip) = setup_terminal_branch(&store, &root, true);
+        store
+            .lock()
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        store.lock().approve_guardian(&id).unwrap();
+
+        run_auto_submit_pass(&store, &NoopRunner, &id);
+
+        assert!(
+            store
+                .lock()
+                .list_pull_requests_for_guardian(&id)
+                .unwrap()
+                .is_empty(),
+            "a queued auto-submit must not create a PR after approval"
+        );
+        assert!(
+            store
+                .lock()
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .iter()
+                .find(|branch| branch.id == branch_id)
+                .unwrap()
+                .auto_submit_error
+                .is_none(),
+            "a terminal review must not receive new auto-submit bookkeeping"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_recovery_does_not_requeue_an_approved_review() {
+        let root = setup_auto_submit_repo("recovery-approved-read-only");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (id, _branch_id, _tip) = setup_terminal_branch(&store, &root, true);
+        store
+            .lock()
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        store.lock().approve_guardian(&id).unwrap();
+
+        recover_pending_auto_submits_on_startup(&store);
+
+        assert!(
+            store
+                .lock()
+                .take_due_auto_submits(i64::MAX / 2, 0)
+                .unwrap()
+                .is_empty(),
+            "startup recovery must not revive a terminal review's queue entry"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -29,7 +29,14 @@ Bash:
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 bash scripts/build-debug.sh
 ```
-This env var has to be set in the *same shell* that launches `build-debug.sh`, since the runner subprocess inherits it from the daemon. Without it set, every exporter is a no-op — nothing gets sent anywhere, which is the default.
+This env var has to be set in the *same shell* that launches `build-debug.sh`, since the runner subprocess inherits it from the daemon. Without it set, every exporter is a no-op — nothing gets sent anywhere, which is the default. To disable tracing even when that environment variable is set, add this to the daemon's effective `.ralphus.toml` (or global config):
+
+```toml
+[daemon]
+opentelemetry = false
+```
+
+The switch accepts TOML booleans only: `true` (the default) or `false`; `ralphus check health` reports any other value as a configuration error. When false, the daemon, librarian, and runner do not install an OTLP exporter, so they make no OpenTelemetry network requests.
 
 **3. Generate a trace**
 

@@ -366,8 +366,8 @@ Custom backend routing belongs in `.ralphus.toml`, not in task TOML:
 
 ```toml
 [agent.profiles.openrouter-deepseek]
-backend = "codex"
-executable = "codex-openrouter"
+backend = "pi"
+model = "openrouter/deepseek/deepseek-v4-flash-0731"
 
 [agent.profiles.openrouter-deepseek.env]
 OPENROUTER_API_KEY = { from_env = "OPENROUTER_API_KEY" }
@@ -383,9 +383,9 @@ Rules:
 
 - Profile names must not collide with reserved built-in backends (`claude`, `anthropic`, `ollama`, `claude-code`, `codex`, `raw`, plus the CLI aliases).
 - `backend = "raw"` is the explicit generic external-executable backend and requires `executable`.
-- `executable` is only valid with `claude-code`, `codex`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
+- `executable` is only valid with `claude-code`, `codex`, `pi`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
 - Profile env values may be literal strings or `{ from_env = "VAR" }`; indirection is resolved in the daemon's own OS environment, so secrets never appear in task TOML or HTTP request/response bodies.
-- If a cell resolves to a custom agent profile, do not also set `model`. Current v1 rule: `if you're using a custom agent profile, you can't also set model`.
+- `model` supplies the profile's default model whenever a task or cell does not declare one. A task- or cell-level `model` overrides the profile default.
 - The old implicit fallback from an unknown `agent` name to a generic harness executable is gone. Use a named profile instead.
 
 #### What `--command` accepts (RAL-189)

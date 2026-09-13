@@ -4185,6 +4185,141 @@ command = "cargo test --workspace"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// RAL-408 regression: the auto-fix resolver prompt says "Do not run any git
+/// commands", but nothing enforces that -- an agent that commits its own fix
+/// anyway (observed in the wild with a Haiku resolver) leaves the worktree
+/// clean afterward. That used to read as a genuine no-op (the whole worktree
+/// looked untouched to `run_feedback`'s dirty-tree check) and stranded the
+/// real commit in the worktree forever: never pushed, never reflected on the
+/// linked PR, while the branch status claimed "auto-fix made no changes to
+/// the working tree".
+struct SelfCommittingFeedbackRunner {
+    committed: AtomicBool,
+}
+impl SelfCommittingFeedbackRunner {
+    fn new() -> Self {
+        Self {
+            committed: AtomicBool::new(false),
+        }
+    }
+}
+impl Runner for SelfCommittingFeedbackRunner {
+    fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+        if let Some(r) = maybe_run_commit_step(spec) {
+            return r;
+        }
+        // Only the first non-commit-step call (the resolver's own edit pass)
+        // self-commits -- later calls in the same round (e.g. the dedicated
+        // final-proof pass) must find a clean tree and a no-op left, exactly
+        // like a real second agent invocation would.
+        if !self.committed.swap(true, Ordering::SeqCst) {
+            let cwd = PathBuf::from(&spec.cwd);
+            let _ = std::fs::write(cwd.join("fix.txt"), "fixed\n");
+            git(&cwd, &["add", "--all"]);
+            git(&cwd, &["commit", "-m", "fix: agent self-committed"]);
+        }
+        RunnerResult {
+            status: "done".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+            summary: "fixed\nRALPHUS_PROOF: PASS".into(),
+            error: None,
+            proofed: Some(true),
+            agent_session_id: None,
+            ghost: None,
+        }
+    }
+}
+
+#[test]
+fn auto_fix_resolver_self_commit_is_still_captured_and_pushed() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let rev0_before = {
+        let rb = store.lock().get_guardian(&id).unwrap().branches[0]
+            .review_branch
+            .clone()
+            .unwrap();
+        git(&root, &["rev-parse", &rb])
+    };
+
+    let outcome = run_feedback(
+        &store,
+        &SelfCommittingFeedbackRunner::new(),
+        &id,
+        &bid0,
+        "fix the failing check",
+        None,
+        true, // require_proof, matching the auto-fix dispatcher
+        &CancelToken::never(),
+    );
+
+    assert!(
+        outcome.committed,
+        "a resolver-authored commit must still count as a real commit"
+    );
+    assert!(
+        outcome.pushed,
+        "a resolver-authored commit must still get pushed to the remote"
+    );
+
+    let view = store.lock().get_guardian(&id).unwrap();
+    let detail = view.branches[0].detail.clone().unwrap_or_default();
+    assert!(
+        !detail.contains("no changes"),
+        "a real self-committed fix must not read as a no-op: {detail:?}"
+    );
+
+    let rev0 = view.branches[0].review_branch.clone().unwrap();
+    let rev0_after = git(&root, &["rev-parse", &rev0]);
+    assert_ne!(
+        rev0_before, rev0_after,
+        "review branch must advance past the resolver's own commit"
+    );
+    let files = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
+    assert!(
+        files.contains("fix.txt"),
+        "the resolver's self-authored commit must land on the review branch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 // RAL-52: a feedback message containing "don't commit" must leave edits as
 // uncommitted working-tree changes — no git commit should be created.
 #[test]

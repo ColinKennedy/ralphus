@@ -212,6 +212,8 @@
       let sseRefreshKinds = new Set();
       /** @type {Set<string>} guardian ids referenced by a pending event, since the last flush */
       let sseRefreshGuardianIds = new Set();
+      /** Whether a pending event carries a squad id, even if it is classified as a guardian event. */
+      let sseRefreshHasSquadChange = false;
       // Coalescing window: long enough to merge a burst of near-simultaneous
       // events into one refresh, short enough that push still feels instant
       // next to the old 2s poll.
@@ -222,9 +224,10 @@
        * feedback-thread refresh when the open review itself just changed.
        * @param {Set<string>} kinds
        * @param {Set<string>} guardianIds
+       * @param {boolean} hasSquadChange
        * @returns {Promise<void>}
        */
-      async function applySseRefresh(kinds, guardianIds) {
+      async function applySseRefresh(kinds, guardianIds, hasSquadChange) {
         if (tab === "tasks") {
           await pollTasksTab();
           await refreshBanner();
@@ -240,7 +243,7 @@
           // Every event is Cartographer-worthy by construction -- always
           // refresh this tab's own view of the log, regardless of kind.
           await pollCartographer();
-        } else if (tab === "squads" && kinds.has("squad")) {
+        } else if (tab === "squads" && hasSquadChange) {
           await pollTasks();
         }
         await refreshBanner();
@@ -254,12 +257,14 @@
       function scheduleSseRefresh(kind, row) {
         sseRefreshKinds.add(kind);
         if (row.guardian_id) sseRefreshGuardianIds.add(row.guardian_id);
+        if (row.squad_id) sseRefreshHasSquadChange = true;
         if (sseRefreshTimer) return;
         sseRefreshTimer = setTimeout(() => {
           const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
           const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
+          const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
           sseRefreshTimer = null;
-          applySseRefresh(kinds, guardianIds);
+          applySseRefresh(kinds, guardianIds, hasSquadChange);
         }, SSE_DEBOUNCE_MS);
       }
       // How long to wait before minting a fresh ticket and reconnecting after

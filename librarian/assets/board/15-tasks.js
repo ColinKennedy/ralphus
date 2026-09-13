@@ -124,7 +124,6 @@
        */
       function renderTasksTab() {
         renderTtProjectFilter();
-        renderTtPrFilter();
         ttAllRows = ttBuildRows();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
         const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys));
@@ -158,9 +157,8 @@
         name: "Task name. Click the row to select it; the chevron (when present) expands its cells.",
         squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
-        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA draft pull request carries a \" · draft\" qualifier (the forge's own WIP state).\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
+        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
         time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
-        turns: "Agent-turn count (RAL-352): completed user/assistant message exchanges, summed over this task's cells, cell proof steps, and task-scope proof steps -- each response event counts as both sides of one exchange, so it is the number of back-and-forth messages, not API calls.\nA dash means no contributor has a conversational count (a command-only task, or a legacy row that hasn't re-run). Command-mode cells never contribute one.\nWhile a cell is running this updates live as each turn completes.",
         tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
         cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
         cost: "Total cost in USD, aggregated the same way as Tokens.\nA dash means no backend reported a cost for this task; a \"~\" prefix means at least one contributing figure is a mid-run estimate, not final accounting.",
@@ -527,9 +525,8 @@
           const label = pr.pr_number ? `#${pr.pr_number}` : "PR";
           const extra = prPick.count > 1 ? ` +${prPick.count - 1}` : "";
           const ciNote = pr.state === "open" && pr.ci_status ? ` (CI: ${esc(pr.ci_status)})` : "";
-          const draftSuffix = pr.draft ? `<span style="color:var(--muted)"> · draft</span>` : "";
-          const draftTip = pr.draft ? " Draft (work-in-progress) on the forge." : "";
-          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}${draftTip}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge.">${esc(label)}${draftSuffix}${extra}</span>`);
+          const canQueryForge = pr.state === "open" && pr.pr_number != null;
+          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge. Right-click to refresh its status or pull in feedback.">${esc(label)}${extra}</span>`);
         } else if (reviewBadge && (reviewBadge.review.status === "approved" || reviewBadge.review.status === "merging")) {
           parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
         }
@@ -607,7 +604,6 @@
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
           + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.finishedAtMs, row.state))
-          + ttColCell("turns", ttFmtTurns(row.usage))
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
           + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
@@ -639,7 +635,6 @@
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
           + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.state))
-          + ttColCell("turns", ttFmtTurns(cu))
           + ttColCell("tokens", ttFmtTokens(cu))
           + ttColCell("cache", ttFmtCache(cu))
           + ttColCell("cost", ttCostCellHtml(cu, ttCellUsageItems(cell)))
@@ -657,19 +652,16 @@
         const squad = findSquad(squadId);
         const label = squad ? (squad.label || squad.id) : squadId;
         const squadState = squad ? squadDisplayState(squad) : "pending";
-        const agg = ttGroupAggregateWithGeneration(groupRows, squad ? squad.generation_cost : undefined);
+        const agg = ttGroupAggregate(groupRows);
         const allForSquad = ttAllRows.filter((r) => r.squadId === squadId);
         const filteredOut = allForSquad.length !== groupRows.length;
         /**
          * @param {string} formatted
          * @returns {string}
          */
-        const tip = (formatted) => {
-          const genNote = squad && squad.generation_cost ? " plus the squad's own pre-work generation calls, folded in exactly once" : "";
-          return filteredOut
-            ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest)${genNote}.`
-            : `${formatted} across all ${groupRows.length} tasks in this squad${genNote}.`;
-        };
+        const tip = (formatted) => filteredOut
+          ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
+          : `${formatted} across all ${groupRows.length} tasks in this squad.`;
         return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
           + ttColCell("sel", "")
           + ttColCell("star", "")
@@ -678,7 +670,6 @@
           + ttColCell("cells", "")
           + ttColCell("review", "")
           + ttColCell("time", "")
-          + ttColCell("turns", `<span data-tip="${esc(tip(ttFmtTurns(agg)))}${agg.anyTurns ? ` (${agg.turns} across the rows shown)` : ""}">${ttFmtTurns(agg)}</span>`)
           + ttColCell("tokens", `<span data-tip="${esc(tip(ttFmtTokens(agg)))}">${ttFmtTokens(agg)}</span>`)
           + ttColCell("cache", `<span data-tip="${esc(tip(ttFmtCache(agg)))}">${ttFmtCache(agg)}</span>`)
           + ttColCell("cost", `<span data-tip="${esc(tip(ttFmtCost(agg)))}">${agg.anyCost ? (agg.estimated ? "~" : "") + "$" + agg.cost.toFixed(2) : "–"}</span>`)
@@ -854,135 +845,6 @@
       /** Closes the Tasks toolbar's project-filter dropdown, if open. @returns {void} */
       function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
       document.addEventListener("click", ttCloseProjectFilterMenu);
-      // RAL-353: PR-state filter -- own state/render path, mirroring
-      // `renderTtProjectFilter`'s dropdown+chips idiom. Three composable
-      // dimensions: "has a pull request" (bool), draft status
-      // (any/draft/non-draft), and CI status (any/passing/failing). Any
-      // non-default dimension activates the filter; a task then passes when
-      // at least one of its PRs satisfies every active dimension (see
-      // `ttRowMatchesPrFilter`). Re-rendered on every `renderTasksTab()`
-      // after a `pollTasksTab()` refetch of `GET /api/pull-requests/index`,
-      // so async pull-request data arriving between polls re-evaluates the
-      // visible rows automatically.
-      /** Whether any PR-filter dimension is currently active.
-       * @returns {boolean}
-       */
-      function ttPrFilterActive() {
-        return taskTabFilters.pr || taskTabFilters.prDraft !== "any" || taskTabFilters.prCi !== "any";
-      }
-      /**
-       * Renders the Tasks toolbar's PR-filter dropdown trigger and its
-       * removable chips -- chip markup matches the project filter's `.filter-chip`.
-       * @returns {void}
-       */
-      function renderTtPrFilter() {
-        /** @type {string[]} */
-        const chips = [];
-        if (taskTabFilters.pr) chips.push(`<span class="filter-chip"><span class="x" onclick="ttToggleHasPr(false)" data-tip="Remove the requires-a-pull-request requirement -- show every task again.">✕</span>any PR</span>`);
-        if (taskTabFilters.prDraft !== "any") chips.push(`<span class="filter-chip"><span class="x" onclick="ttSetPrDraft('any')" data-tip="Stop filtering by draft status.">✕</span>${esc(taskTabFilters.prDraft)}</span>`);
-        if (taskTabFilters.prCi !== "any") chips.push(`<span class="filter-chip"><span class="x" onclick="ttSetPrCi('any')" data-tip="Stop filtering by CI status.">✕</span>ci: ${esc(taskTabFilters.prCi)}</span>`);
-        const chipsHtml = chips.join("");
-        byId("tt-pr-filter").innerHTML = `<button type="button" class="btn" onclick="ttOpenPrFilterMenu(event)" data-tip="Filter rows by their pull requests: has any, draft status, and CI status -- composable (a task matches when at least one of its PRs satisfies every chosen dimension).\nNo active dimension shows every task.">PR ▾</button>${chipsHtml}`
-          + (ttPrFilterActive() ? `<span class="chip" onclick="ttClearPrFilter()" data-tip="Clear every pull-request filter dimension.">clear</span>` : "");
-      }
-      /** The display label for a draft-status or CI-status filter value.
-       * @param {string} v
-       * @returns {string}
-       */
-      function ttPrFilterLabel(v) { return { any: "Any", draft: "Draft", "non-draft": "Non-draft", passing: "Passing", failing: "Failing" }[v] || v; }
-      /**
-       * Builds the checkbox rows for the Tasks toolbar's PR-filter dropdown
-       * (RAL-353): a has-PR row, a draft-status section, and a CI-status
-       * section -- the sections are single-choice (radio semantics), the
-       * has-PR row is independent of both.
-       * @returns {string}
-       */
-      function ttPrFilterMenuRowsHtml() {
-        const rows = [];
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">Pull request</div>`);
-        rows.push(`<div class="ctx-check ${taskTabFilters.pr ? "on" : ""}" onclick="ttToggleHasPr(!${taskTabFilters.pr || false})" data-tip="Show only tasks with at least one pull request.">${taskTabFilters.pr ? "✓" : ""} Has pull request</div>`);
-        rows.push(`<div class="ctx-sep"></div>`);
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">Draft status</div>`);
-        for (const mode of ["any", "draft", "non-draft"]) {
-          rows.push(`<div class="ctx-check ${taskTabFilters.prDraft === mode ? "on" : ""}" onclick="ttSetPrDraft('${mode}')" data-tip="${mode === "any" ? "Don't filter by draft status." : `Only tasks with a ${mode} pull request.`}">${taskTabFilters.prDraft === mode ? "✓" : ""} ${esc(ttPrFilterLabel(mode))}</div>`);
-        }
-        rows.push(`<div class="ctx-sep"></div>`);
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">CI status</div>`);
-        for (const mode of ["any", "passing", "failing"]) {
-          rows.push(`<div class="ctx-check ${taskTabFilters.prCi === mode ? "on" : ""}" onclick="ttSetPrCi('${mode}')" data-tip="${mode === "any" ? "Don't filter by CI status." : `Only tasks with a ${mode} pull request.`}">${taskTabFilters.prCi === mode ? "✓" : ""} ${esc(ttPrFilterLabel(mode))}</div>`);
-        }
-        return rows.join("");
-      }
-      /**
-       * Opens the Tasks toolbar's PR-filter dropdown, a `.ctx-menu` popup --
-       * stays open across individual clicks since picking several dimensions
-       * in a row is the common case.
-       * @param {MouseEvent} e
-       * @returns {void}
-       */
-      function ttOpenPrFilterMenu(e) {
-        e.preventDefault(); e.stopPropagation(); ttCloseColMenu(); ttClosePrFilterMenu();
-        const menu = document.createElement("div");
-        menu.className = "ctx-menu"; menu.id = "tt-pr-filter-menu";
-        menu.innerHTML = ttPrFilterMenuRowsHtml();
-        document.body.appendChild(menu);
-        const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
-        menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
-        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
-      }
-      /** Closes the Tasks toolbar's PR-filter dropdown, if open. @returns {void} */
-      function ttClosePrFilterMenu() { const m = document.getElementById("tt-pr-filter-menu"); if (m) m.remove(); }
-      document.addEventListener("click", ttClosePrFilterMenu);
-      /**
-       * Toggles the requires-a-pull-request dimension (RAL-353). Updates the
-       * open dropdown's checkmark in place rather than closing it.
-       * @param {boolean} on
-       * @returns {void}
-       */
-      function ttToggleHasPr(on) {
-        taskTabFilters.pr = on;
-        ttRerenderPrFilter();
-      }
-      /**
-       * Sets the draft-status dimension (RAL-353) -- "any" disables it.
-       * @param {"any"|"draft"|"non-draft"} mode
-       * @returns {void}
-       */
-      function ttSetPrDraft(mode) {
-        taskTabFilters.prDraft = mode;
-        ttRerenderPrFilter();
-      }
-      /**
-       * Sets the CI-status dimension (RAL-353) -- "any" disables it.
-       * @param {"any"|"passing"|"failing"} mode
-       * @returns {void}
-       */
-      function ttSetPrCi(mode) {
-        taskTabFilters.prCi = mode;
-        ttRerenderPrFilter();
-      }
-      /** Clears every PR-filter dimension back to defaults. @returns {void} */
-      function ttClearPrFilter() {
-        taskTabFilters.pr = false;
-        taskTabFilters.prDraft = "any";
-        taskTabFilters.prCi = "any";
-        ttRerenderPrFilter();
-      }
-      /**
-       * Shared tail for the PR-filter setters: re-renders (so the chips,
-       * the visible rows, and the details pane all reflect the new filter),
-       * keeps the selection visible, syncs the URL hash, and refreshes the
-       * open dropdown's checkmarks in place.
-       * @returns {void}
-       */
-      function ttRerenderPrFilter() {
-        renderTasksTab();
-        ttScrollSelectionIntoView();
-        syncHash();
-        renderTtPrFilter();
-        const menu = document.getElementById("tt-pr-filter-menu");
-        if (menu) menu.innerHTML = ttPrFilterMenuRowsHtml();
-      }
       /**
        * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
        * @param {string} squadId
@@ -1255,7 +1117,7 @@
           const branchRows = r.branches.map((b) => {
             const pr = row.prs.find((p) => p.branch_alias === b);
             const badge = pr
-              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}${pr.draft ? " Draft (work-in-progress)." : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}${pr.draft ? `<span style="color:var(--muted)"> · draft</span>` : ""}</span>`
+              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
               : (r.status === "approved" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Approved/merging with no PR submitted yet.">no PR</span>` : "");
             return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
           }).join("");
@@ -1359,202 +1221,6 @@
       let multiSel = new Set();
       /** @type {Set<string>} multi-selected task/cell/proof nodes in the current graph */
       let nodeMultiSel = new Set();
-
-      // RAL-419: per-squad graph-selection cache. A squad's primary selection
-      // (`sel`) and its graph-node multi-selection (`nodeMultiSel`) are snapshotted
-      // here every time they change, so switching squads and coming back restores the
-      // exact prior view -- and the same snapshot is persisted to localStorage so a
-      // browser refresh restores it too. The pure decision logic (restore-vs-explicit
-      // transition, stale-node reconciliation) lives in the RALPHUS-SEL-TRANSITION
-      // region below; these globals and the storage layer are the glue around it.
-      const SQUAD_SELECTION_STORAGE_KEY = "ralphus-squad-selection";
-      /**
-       * Reads the persisted RAL-419 selection blob; corrupt/missing data yields empty state.
-       * @returns {{sel?: {[key: string]: SelStateTasks}, nodes?: {[key: string]: string[]}, last?: string|null}}
-       */
-      function loadSquadSelectionBlob() {
-        try {
-          const raw = JSON.parse(localStorage.getItem(SQUAD_SELECTION_STORAGE_KEY) || "{}");
-          return raw && typeof raw === "object" ? raw : {};
-        } catch (_) { return {}; }
-      }
-      /**
-       * Loads the per-squad primary-selection cache from localStorage (RAL-419).
-       * @returns {{[key: string]: SelStateTasks}}
-       */
-      function loadSquadSelCache() { const b = loadSquadSelectionBlob(); return b.sel && typeof b.sel === "object" ? b.sel : {}; }
-      /**
-       * Loads the per-squad graph-node multi-selection cache from localStorage (RAL-419).
-       * @returns {{[key: string]: string[]}}
-       */
-      function loadSquadNodeCache() { const b = loadSquadSelectionBlob(); return b.nodes && typeof b.nodes === "object" ? b.nodes : {}; }
-      /**
-       * Loads the last-focused squad id from localStorage (a browser refresh returns to it, RAL-419).
-       * @returns {string|null}
-       */
-      function loadLastSquadId() { const v = loadSquadSelectionBlob().last; return typeof v === "string" && v ? v : null; }
-      /**
-       * Persists the in-memory per-squad selection caches; a quota/security failure
-       * just means selection survives only for this session.
-       * @returns {void}
-       */
-      function persistSquadSelectionState() {
-        try {
-          localStorage.setItem(SQUAD_SELECTION_STORAGE_KEY, JSON.stringify({ sel: squadSelCache, nodes: squadNodeCache, last: lastSquadId }));
-        } catch (_) { /* keep the in-memory caches working for this session */ }
-      }
-      // RALPHUS-SEL-STORAGE:BEGIN
-      /**
-       * Snapshots a squad's primary selection + node keys into the per-squad caches
-       * and persists them (RAL-419). `squadId` may be null when called from a context
-       * with no focused squad yet.
-       * @param {string|null} squadId
-       * @param {SelStateTasks} s
-       * @param {Iterable<string>} nodeKeys
-       * @returns {void}
-       */
-      function storeSquadSelection(squadId, s, nodeKeys) {
-        if (!squadId) return;
-        squadSelCache[squadId] = snapshotSel(s);
-        squadNodeCache[squadId] = [...nodeKeys];
-        lastSquadId = squadId;
-        persistSquadSelectionState();
-      }
-      /**
-       * Removes a stale per-squad selection entry and persists the removal (RAL-419).
-       * @param {string|null|undefined} squadId
-       * @returns {void}
-       */
-      function clearSquadSelection(squadId) {
-        if (!squadId) return;
-        delete squadSelCache[squadId];
-        delete squadNodeCache[squadId];
-        persistSquadSelectionState();
-      }
-      // RALPHUS-SEL-STORAGE:END
-      /** @type {{[key: string]: SelStateTasks}} squad id -> last primary selection shown for that squad (RAL-419) */
-      let squadSelCache = loadSquadSelCache();
-      /** @type {{[key: string]: string[]}} squad id -> last graph-node multi-selection keys shown for that squad (RAL-419) */
-      let squadNodeCache = loadSquadNodeCache();
-      /** @type {string|null} last squad focused this session (persisted), so a browser refresh lands back on it (RAL-419) */
-      let lastSquadId = loadLastSquadId();
-
-      // RALPHUS-SEL-TRANSITION:BEGIN
-      // Pure, DOM-free decision logic for the Squads tab's per-squad selection cache.
-      // test/board-sel-transition.mjs slices this exact region out of the shipped
-      // source and exercises it under `node --test`, so these functions must stay
-      // free of DOM/fetch/localStorage/module-level state -- state goes in, state
-      // comes out, and every result is deterministic on the inputs.
-      /**
-       * The selection shown when a squad has no restored child selection.
-       * @returns {SelStateTasks}
-       */
-      function squadLevelSel() {
-        return { kind: "squad", taskIdx: 0, cellIdx: 0, proofIdx: -1 };
-      }
-      /**
-       * Copies a selection into a fresh, cacheable snapshot (normalizing a missing
-       * proof index to -1, the shape every consumer reads).
-       * @param {SelStateTasks} s
-       * @returns {SelStateTasks}
-       */
-      function snapshotSel(s) {
-        return { kind: s.kind, taskIdx: s.taskIdx, cellIdx: s.cellIdx, proofIdx: s.proofIdx ?? -1 };
-      }
-      /**
-       * Validates one selection against a squad's *current* graph and walks up to the
-       * nearest surviving parent when the named entity is gone: a proof step falls
-       * back to its cell, then its task, then the squad banner. `stale` is true
-       * exactly when the requested entity no longer exists (so the caller can clear
-       * the cache entry that produced the dangling reference).
-       * @param {SquadView|undefined} squad
-       * @param {SelStateTasks} sel
-       * @returns {{sel: SelStateTasks, stale: boolean}}
-       */
-      function reconcileSquadSelection(squad, sel) {
-        if (!sel || !sel.kind || sel.kind === "squad") return { sel: snapshotSel(sel || squadLevelSel()), stale: false };
-        if (!squad) return { sel: squadLevelSel(), stale: true };
-        const ti = sel.taskIdx ?? 0;
-        const task = (squad.tasks || [])[ti];
-        if (!task) return { sel: squadLevelSel(), stale: true };
-        if (sel.kind === "task") return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: false };
-        const cells = task.cells || [];
-        const cell = cells[sel.cellIdx ?? -1];
-        if (sel.kind === "cell") {
-          return cell
-            ? { sel: snapshotSel(sel), stale: false }
-            : { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
-        }
-        // "proof": a task-scope step has cellIdx === -1, a cell-scope step names its cell.
-        const steps = sel.cellIdx === -1 ? (task.proof || []) : cell ? (cell.proof || []) : [];
-        if (steps[sel.proofIdx ?? 0]) return { sel: snapshotSel(sel), stale: false };
-        if (sel.cellIdx === -1) return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
-        if (cell) return { sel: { kind: "cell", taskIdx: ti, cellIdx: sel.cellIdx, proofIdx: -1 }, stale: true };
-        return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
-      }
-      /**
-       * Whether one graph-node key ("kind:ti:si:vi", the format `graphNodeKey` in
-       * 35-terminal-logs.js produces and RAL-419 persists) still names a node in the
-       * squad's current graph. This twin exists so the standalone
-       * RALPHUS-SEL-TRANSITION tests can validate persisted keys without depending on
-       * the rest of the board -- keep the formats in lockstep.
-       * @param {SquadView|undefined} squad
-       * @param {string} key
-       * @returns {boolean}
-       */
-      function nodeKeyValid(squad, key) {
-        if (!squad || typeof key !== "string") return false;
-        const parts = key.split(":");
-        const [k, ti, si, vi] = parts;
-        if (parts.length !== 4 || (k !== "task" && k !== "cell" && k !== "proof")) return false;
-        const nTi = Number(ti), nSi = Number(si), nVi = Number(vi);
-        if (!Number.isInteger(nTi) || nTi < 0 || !Number.isInteger(nSi) || !Number.isInteger(nVi)) return false;
-        const task = (squad.tasks || [])[nTi];
-        if (!task) return false;
-        if (k === "task") return true;
-        const cells = task.cells || [];
-        if (k === "cell") return Boolean(cells[nSi]);
-        // proof: cellIdx -1 means a task-scope step, otherwise a cell-scope one.
-        if (nSi < 0) return Boolean((task.proof || [])[nVi]);
-        const cell = cells[nSi];
-        return Boolean(cell && cell.proof?.[nVi]);
-      }
-      /**
-       * Decides what the Squads sidebar shows when squad `squadId` is focused:
-       * focusing a *different* squad is a return, so its cached selection (reconciled
-       * against the current graph) is restored; focusing the squad already on screen
-       * is an explicit click and selects the squad banner. Multi-node keys are kept
-       * only when they still name live nodes.
-       * @param {{[key: string]: SelStateTasks}} cache
-       * @param {{[key: string]: string[]}} nodeCache
-       * @param {string} squadId
-       * @param {SquadView|undefined} squad
-       * @param {string|null} currentSquadId
-       * @returns {{sel: SelStateTasks, nodeKeys: string[], stale: boolean}}
-       */
-      function transitionSquadSelection(cache, nodeCache, squadId, squad, currentSquadId) {
-        if (squadId === currentSquadId) return { sel: squadLevelSel(), nodeKeys: [], stale: false };
-        const cached = cache[squadId];
-        if (!cached || !cached.kind || cached.kind === "squad") return { sel: squadLevelSel(), nodeKeys: [], stale: false };
-        const rec = reconcileSquadSelection(squad, cached);
-        if (rec.stale) return { sel: rec.sel, nodeKeys: [], stale: true };
-        const keys = (nodeCache[squadId] || []).filter((key) => nodeKeyValid(squad, key));
-        return { sel: rec.sel, nodeKeys: keys, stale: false };
-      }
-      /**
-       * Drops cache entries for squads that no longer exist, so the persisted blob
-       * cannot grow without bound as old squads are deleted.
-       * @param {{[key: string]: SelStateTasks}} cache
-       * @param {{[key: string]: string[]}} nodeCache
-       * @param {string[]} aliveIds
-       * @returns {void}
-       */
-      function pruneSquadSelCache(cache, nodeCache, aliveIds) {
-        const alive = new Set(aliveIds);
-        for (const id of Object.keys(cache)) if (!alive.has(id)) delete cache[id];
-        for (const id of Object.keys(nodeCache)) if (!alive.has(id)) delete nodeCache[id];
-      }
-      // RALPHUS-SEL-TRANSITION:END
       // RAL-328/RAL-331/RAL-365: the current user's hidden-item set,
       // refreshed by pollHidden() every tick regardless of active tab
       // (goto-search and both sidebars need it). Hiding is a personal view

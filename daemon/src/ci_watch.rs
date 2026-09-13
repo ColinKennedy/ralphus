@@ -1,11 +1,13 @@
-//! Watch a PR's CI/CD + mergeability after a review-feedback push (RAL-375),
-//! and (RAL-395) a standing poll of every open PR that persists the result
-//! and can trigger an auto-fix dispatch.
+//! Watch a PR's CI/CD + mergeability after it's opened or after a
+//! review-feedback push (RAL-375, extended by RAL-<new>), and (RAL-395) a
+//! standing poll of every open PR that persists the result and can trigger
+//! an auto-fix dispatch.
 //!
-//! [`watch_after_feedback_push`] is called right after
+//! [`start_ci_watch`] is called right after a branch's PR/MR is first
+//! submitted (`crate::pr::submit_stacked_branch_pr`) and right after
 //! `guardian_merge::run_feedback` pushes a new commit onto a stacked branch:
-//! if that branch already has an open forge PR (`crate::pr::PullRequestView`),
-//! it spawns a background poll of [`crate::forge::ForgeClient::check_pr_ci_status`]
+//! if that branch has an open forge PR (`crate::pr::PullRequestView`), it
+//! spawns a background poll of [`crate::forge::ForgeClient::check_pr_ci_status`]
 //! -- fast at first to catch a quick pipeline, backing off for a slow one
 //! (see [`next_poll_delay`]) -- until a terminal state. A terminal failure
 //! drops a `"review"`-category mailbox notice (`crate::mailbox`) naming the
@@ -13,12 +15,21 @@
 //! excerpt, then asks whether to fix it immediately in a subagent. A
 //! terminal success is silent.
 //!
+//! Submitting a stack opens one PR at a time (a git push plus a forge API
+//! call per branch, often tens of seconds apart) -- without a watch starting
+//! the moment each PR exists, a branch submitted early in the same pass could
+//! have its CI status known well before a sibling submitted moments later,
+//! whose own first check only arrives once [`poll_open_pr_ci_status`]'s
+//! coarser, per-guardian-throttled sweep gets around to it (RAL-<new>: this
+//! is what produced two sibling PRs' board badges updating minutes apart even
+//! though both were already green on the forge).
+//!
 //! [`poll_open_pr_ci_status`] (RAL-395) is the standing counterpart: called
 //! on every `review_maintenance` pass (throttled per guardian, see
 //! [`STANDING_POLL_INTERVAL`]) so a PR's CI status is known to the board even
-//! when no feedback push has recently fired `watch_after_feedback_push` --
-//! e.g. the very first CI run after a stack is opened, or a watch that gave
-//! up after [`MAX_WATCH_DURATION`]. It persists every poll's outcome
+//! when no submission or feedback push has recently fired [`start_ci_watch`]
+//! -- e.g. a watch that gave up after [`MAX_WATCH_DURATION`], or a daemon
+//! restart losing the in-memory [`WATCHING`] set. It persists every poll's outcome
 //! (`crate::pr::PullRequestView::ci_status`) and, when the guardian has
 //! opted into `auto_fix_pr_errors`, dispatches [`dispatch_pr_auto_fix`] on a
 //! freshly observed failure. That dispatch posts its own feedback message
@@ -175,17 +186,15 @@ fn log_ci_watch(
         );
 }
 
-/// Start watching `branch_id`'s open PR after a review-feedback push
-/// (RAL-375). No-op if the branch has no open, forge-numbered PR, its forge
-/// client can't be resolved, or a watch for this exact branch is already
-/// running -- fail-safe by design, matching `pr::check_pr_merges`'s
-/// "an unreachable forge changes nothing" precedent, since a watch that
-/// can't be started should never block or fail the push that triggered it.
-pub fn watch_after_feedback_push(
-    store: &crate::store_lock::StoreHandle,
-    guardian_id: &str,
-    branch_id: &str,
-) {
+/// Start watching `branch_id`'s open PR (RAL-375, extended by RAL-<new> to
+/// also fire right after a PR is first submitted, not only after a
+/// review-feedback push). No-op if the branch has no open, forge-numbered
+/// PR, its forge client can't be resolved, or a watch for this exact branch
+/// is already running -- fail-safe by design, matching
+/// `pr::check_pr_merges`'s "an unreachable forge changes nothing" precedent,
+/// since a watch that can't be started should never block or fail whatever
+/// triggered it.
+pub fn start_ci_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_id: &str) {
     let key = (guardian_id.to_string(), branch_id.to_string());
     {
         let mut watching = WATCHING.lock().expect("poisoned");
@@ -422,8 +431,8 @@ fn enqueue_ci_failure_notice(
 // ---------------------------------------------------------------------------
 
 /// Minimum interval between standing CI-status polls for the same guardian
-/// (RAL-395) -- independent of [`watch_after_feedback_push`]'s fast-then-
-/// backoff poll of a single just-pushed branch. [`poll_open_pr_ci_status`]
+/// (RAL-395) -- independent of [`start_ci_watch`]'s fast-then-
+/// backoff poll of a single just-opened or just-pushed branch. [`poll_open_pr_ci_status`]
 /// is cheap to call on every `review_maintenance` pass (a 5s cadence), so it
 /// needs its own, much coarser throttle to stay within forge rate-limit
 /// expectations (`.agent/forge-design-principles.md`).
@@ -442,7 +451,7 @@ static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
 /// guardian has opted into `auto_fix_pr_errors`. Throttled to at most once
 /// per [`STANDING_POLL_INTERVAL`] per guardian -- safe to call on every
 /// `review_maintenance` pass. Fail-safe by design, matching
-/// `watch_after_feedback_push`'s precedent: an unresolvable forge client or a
+/// [`start_ci_watch`]'s precedent: an unresolvable forge client or a
 /// poll error for one PR never blocks or fails the caller, and never stops
 /// the remaining PRs in the same guardian from being polled.
 pub fn poll_open_pr_ci_status(
@@ -464,6 +473,9 @@ pub fn poll_open_pr_ci_status(
     let Ok(guardian) = store.lock().get_guardian(guardian_id) else {
         return;
     };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return;
+    }
     let Ok(prs) = store.lock().list_pull_requests_for_guardian(guardian_id) else {
         return;
     };
@@ -543,7 +555,14 @@ pub fn poll_open_pr_ci_status(
     // matters here.
     for decision in plan_auto_fix_dispatch(&guardian, &polled) {
         if decision.dispatch {
-            dispatch_pr_auto_fix(store, runner, &guardian, decision.pr, decision.failure);
+            dispatch_pr_auto_fix(
+                store,
+                runner,
+                &guardian,
+                decision.pr,
+                decision.failure,
+                &client,
+            );
         } else {
             log_ci_watch(
                 store,
@@ -685,6 +704,21 @@ fn describe_failing_check(
     reason_line: &str,
     only_one: bool,
 ) -> String {
+    // RAL-<new>: a job's name alone can be misleadingly broad -- see
+    // `FailedCheck::failing_step`'s doc comment for the incident this
+    // prevents. When known, name the actual failing step explicitly and
+    // warn against assuming the job's other bundled step(s) are the problem
+    // just because they share its name.
+    let step_note = check
+        .failing_step
+        .as_deref()
+        .map_or_else(String::new, |step| {
+            format!(
+                "This job/check may bundle more than one distinct verification; the one that \
+             actually failed is: '{step}'. Verify and fix THAT specifically -- do not assume a \
+             different, similarly-named step/check under the same job is the problem.\n"
+            )
+        });
     let job_note = check
         .job_url
         .as_deref()
@@ -723,7 +757,7 @@ fn describe_failing_check(
         }
         (_, None) => "The forge did not provide a CI failure log for this job.".to_string(),
     };
-    format!("Reason: {reason_line}\n{job_note}{log_note}")
+    format!("Reason: {reason_line}\n{step_note}{job_note}{log_note}")
 }
 
 /// Attributed `author` (RAL-379 semantics) for the feedback message
@@ -760,12 +794,34 @@ const AUTO_FIX_SUBMITTED_BY: &str = "guardian:ci-watch-auto-fix";
 /// PR-stacking regression coverage this needs (an auto-fix commit must still
 /// fold into the review's linear stack and restack correctly) belongs
 /// alongside `run_feedback`'s other restack tests, not duplicated here.
+/// Attributed `author` for [`dispatch_pr_fix_manual`] when no requester
+/// identity resolved at the HTTP boundary -- distinct from [`AUTO_FIX_AUTHOR`]
+/// so a manual, person-initiated fix never renders under the automated
+/// system's own name.
+pub const MANUAL_PR_FIX_AUTHOR: &str = "Manual (PR fix)";
+
+/// Resolve which branch a PR's fix (auto or manual) targets: the PR's own
+/// recorded branch, or (for a whole-stack PR) the topmost enabled stacked
+/// branch, since the combined worktree itself is read-only.
+fn pr_fix_branch_id(guardian: &GuardianView, pr: &PullRequestView) -> Option<String> {
+    match &pr.branch_id {
+        Some(bid) => Some(bid.clone()),
+        None => guardian
+            .branches
+            .iter()
+            .filter(|b| b.enabled)
+            .max_by_key(|b| b.position)
+            .map(|b| b.id.clone()),
+    }
+}
+
 pub fn dispatch_pr_auto_fix(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     guardian: &GuardianView,
     pr: &PullRequestView,
     failure: &PrFailure,
+    client: &crate::forge::ForgeClient,
 ) {
     if !guardian.auto_fix_pr_errors.unwrap_or(false) {
         return;
@@ -773,25 +829,97 @@ pub fn dispatch_pr_auto_fix(
     if pr.auto_fix_attempted_at_ms.is_some() {
         return;
     }
-    let branch_id = match &pr.branch_id {
-        Some(bid) => bid.clone(),
-        None => match guardian
-            .branches
-            .iter()
-            .filter(|b| b.enabled)
-            .max_by_key(|b| b.position)
-        {
-            Some(b) => b.id.clone(),
-            None => return,
-        },
-    };
-    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+    let Some(branch_id) = pr_fix_branch_id(guardian, pr) else {
         return;
     };
 
     // RAL-395: single attempt per failure -- claim it now, before the
     // (potentially long-running) agent dispatch below, not after.
     let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
+
+    run_pr_fix(
+        store,
+        runner,
+        guardian,
+        pr,
+        &branch_id,
+        failure,
+        client,
+        AUTO_FIX_AUTHOR,
+        Some(AUTO_FIX_SUBMITTED_BY),
+    );
+}
+
+/// Manual counterpart to [`dispatch_pr_auto_fix`] (RAL-<new>): dispatches the
+/// same CI-failure fix, but as an explicit person-initiated override rather
+/// than the unattended background poller's own single attempt. Deliberately
+/// bypasses both gates `dispatch_pr_auto_fix` enforces:
+/// - `guardian.auto_fix_pr_errors` -- that toggle controls whether the
+///   *background poller* may act unattended; it says nothing about whether a
+///   person is allowed to ask for a fix directly, which is a distinct
+///   authorization already granted by them clicking the button.
+/// - `pr.auto_fix_attempted_at_ms` -- the single-attempt-per-failure cap only
+///   exists to stop the unattended poller from hammering a stuck failure; a
+///   person retrying by hand is exactly the case that cap should not block.
+///
+/// Still claims `auto_fix_attempted_at_ms` immediately before dispatching
+/// (same ordering as `dispatch_pr_auto_fix`), so a standing-poll tick landing
+/// concurrently sees an attempt already in flight and does not also fire.
+///
+/// `submitted_by` is the registered user who triggered this (resolved at the
+/// HTTP boundary); the message is attributed to them by name, or
+/// [`MANUAL_PR_FIX_AUTHOR`] if no identity resolved, so the board's chat
+/// thread never shows this as coming from the automated system.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_pr_fix_manual(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian: &GuardianView,
+    pr: &PullRequestView,
+    branch_id: &str,
+    failure: &PrFailure,
+    client: &crate::forge::ForgeClient,
+    submitted_by: Option<&str>,
+) {
+    let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
+    let author = submitted_by
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(MANUAL_PR_FIX_AUTHOR);
+    run_pr_fix(
+        store,
+        runner,
+        guardian,
+        pr,
+        branch_id,
+        failure,
+        client,
+        author,
+        submitted_by,
+    );
+}
+
+/// Shared core of [`dispatch_pr_auto_fix`] and [`dispatch_pr_fix_manual`]:
+/// build the auto-fix-style prompt for `failure`, post it into `branch_id`'s
+/// feedback thread attributed to `author`/`submitted_by`, and run it through
+/// `guardian_merge::run_feedback` with `require_proof: true`. Does not gate
+/// on `auto_fix_pr_errors` or claim/consult `auto_fix_attempted_at_ms` --
+/// callers own their own gating and claiming before calling this.
+#[allow(clippy::too_many_arguments)]
+fn run_pr_fix(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian: &GuardianView,
+    pr: &PullRequestView,
+    branch_id: &str,
+    failure: &PrFailure,
+    client: &crate::forge::ForgeClient,
+    author: &str,
+    submitted_by: Option<&str>,
+) {
+    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+        return;
+    };
 
     let cell_prompts = store
         .lock()
@@ -815,6 +943,7 @@ pub fn dispatch_pr_auto_fix(
                 name: String::new(),
                 job_url: failure.job_url.clone(),
                 log_text: failure.log_text.clone(),
+                failing_step: None,
             },
             &failure.reason,
             only_one,
@@ -829,7 +958,29 @@ pub fn dispatch_pr_auto_fix(
                 } else {
                     format!("'{}' failed", check.name)
                 };
-                describe_failing_check(branch.worktree.as_deref(), check, &reason_line, only_one)
+                // RAL-<new>: a single named job/check can bundle several
+                // differently-purposed steps (the incident that motivated
+                // this: GitHub's "Docs (screenshot coverage lint)" job also
+                // runs an unrelated cli-reference.md freshness check as a
+                // separate step) -- an agent told only the job name can end
+                // up verifying the wrong half of it entirely. Best-effort,
+                // GitHub-only (see `ForgeClient::github_failing_step`'s doc
+                // comment for why GitLab needs no equivalent); a lookup
+                // failure just means this check's paragraph reads the same
+                // as before this enrichment existed.
+                let enriched = FailedCheck {
+                    failing_step: check
+                        .job_url
+                        .as_deref()
+                        .and_then(|url| client.github_failing_step(url)),
+                    ..check.clone()
+                };
+                describe_failing_check(
+                    branch.worktree.as_deref(),
+                    &enriched,
+                    &reason_line,
+                    only_one,
+                )
             })
             .collect()
     };
@@ -859,17 +1010,19 @@ pub fn dispatch_pr_auto_fix(
         &prompt_body,
     );
 
-    // RAL-395 addendum: post this round into the branch's feedback thread
-    // the same way `guardian_merge::start_feedback` does for a human
-    // reviewer, attributed to `AUTO_FIX_AUTHOR` instead of a person -- so the
-    // board's chat thread shows *who* asked for this change, not just that
-    // one happened. Superseding any still-`received` pending message first
-    // mirrors `start_feedback`'s own invariant: an older bubble must never
-    // read as in-progress once this round has overtaken it. Best-effort --
-    // a message-store failure must never block the fix itself from running.
+    // RAL-395 addendum (RAL-<new>: `author`/`submitted_by` now parameterized
+    // rather than always `AUTO_FIX_AUTHOR`, so a manual dispatch attributes
+    // to the actual person instead): post this round into the branch's
+    // feedback thread the same way `guardian_merge::start_feedback` does for
+    // a human reviewer -- so the board's chat thread shows *who* asked for
+    // this change, not just that one happened. Superseding any still-
+    // `received` pending message first mirrors `start_feedback`'s own
+    // invariant: an older bubble must never read as in-progress once this
+    // round has overtaken it. Best-effort -- a message-store failure must
+    // never block the fix itself from running.
     let _ = store
         .lock()
-        .supersede_pending_branch_feedback(&guardian.id, &branch_id);
+        .supersede_pending_branch_feedback(&guardian.id, branch_id);
     let message_seq = store
         .lock()
         .add_guardian_message(
@@ -877,16 +1030,16 @@ pub fn dispatch_pr_auto_fix(
             "reviewer",
             &feedback,
             None,
-            Some(&branch_id),
-            Some(AUTO_FIX_AUTHOR),
-            Some(AUTO_FIX_SUBMITTED_BY),
+            Some(branch_id),
+            Some(author),
+            submitted_by,
         )
         .ok();
 
     log_ci_watch(
         store,
         &guardian.id,
-        &branch_id,
+        branch_id,
         LogLevel::INFO,
         format!(
             "ralphus [ci-watch] review {} branch {} auto-fix dispatching for pr #{}",
@@ -900,7 +1053,7 @@ pub fn dispatch_pr_auto_fix(
         store,
         runner,
         &guardian.id,
-        &branch_id,
+        branch_id,
         &feedback,
         message_seq,
         true,
@@ -910,15 +1063,16 @@ pub fn dispatch_pr_auto_fix(
     // when `run_feedback` bailed out before the resolver agent ran at all
     // (e.g. a concurrent merge/rebuild had the branch's worktree torn down
     // at that instant) -- not a genuine "the agent tried and didn't fix it".
-    // Give that case back its attempt so the next standing poll can retry,
-    // rather than letting a one-off infrastructure race permanently disable
-    // auto-fix for a PR whose CI never stops reporting "failing" in between.
+    // Give that case back its attempt so the next standing poll (or a later
+    // manual retry) can try again, rather than letting a one-off
+    // infrastructure race permanently disable auto-fix for a PR whose CI
+    // never stops reporting "failing" in between.
     let Some(passed) = outcome.proof_passed else {
         let _ = store.lock().clear_pr_auto_fix_attempted(&pr.id);
         log_ci_watch(
             store,
             &guardian.id,
-            &branch_id,
+            branch_id,
             LogLevel::WARNING,
             format!(
                 "ralphus [ci-watch] review {} branch {} auto-fix could not run for pr #{} \
@@ -937,7 +1091,7 @@ pub fn dispatch_pr_auto_fix(
     log_ci_watch(
         store,
         &guardian.id,
-        &branch_id,
+        branch_id,
         if passed {
             LogLevel::INFO
         } else {
@@ -1041,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_after_feedback_push_is_a_noop_without_an_open_pr() {
+    fn start_ci_watch_is_a_noop_without_an_open_pr() {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
@@ -1066,7 +1220,7 @@ mod tests {
         // thread, so poll for it instead of a fixed sleep -- a single sleep
         // is prone to false failures under heavy parallel test load, where
         // the OS scheduler can take well over 50ms to run the thread.
-        watch_after_feedback_push(&store, &guardian_id, &branch_id);
+        start_ci_watch(&store, &guardian_id, &branch_id);
         let key = (guardian_id, branch_id);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && WATCHING.lock().unwrap().contains(&key) {

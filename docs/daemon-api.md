@@ -2369,6 +2369,14 @@ resolve — see below) rather than force-pushing over a PR branch that has
 commits the review worktree doesn't, e.g. a reviewer pushed a fix directly to
 the open PR branch instead of leaving a comment (RAL-190).
 
+The posted feedback message is attributed to the caller-claimed identity sent
+in `X-Ralphus-User` (falling back to `[daemon].default_user`, same resolution
+as everywhere else), or `"Manual (PR feedback)"` if neither resolves — this
+call always reads as a person-initiated action in the board's chat thread,
+distinct from the automated CI auto-fix system's own attribution. Each
+comment is claimed atomically before being applied, so two overlapping calls
+for the same PR (e.g. a double-click) can never both apply the same comment.
+
 ### `GET /api/pull-requests/{pr_id}/sync-status`
 Live drift check between the PR's remote `branch_alias` branch and its owning
 review worktree (RAL-190) — fetches the remote branch and compares tips via

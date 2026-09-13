@@ -246,7 +246,10 @@ fn send(spec_path: Option<&str>, result_file: Option<&str>) -> std::process::Exi
     );
 
     let runner_config = config::load(std::path::Path::new(&spec.cwd));
-    let provider = otel::init("ralphus-runner");
+    let provider = runner_config
+        .opentelemetry_enabled
+        .then(|| otel::init("ralphus-runner"))
+        .flatten();
 
     let result = run_traced(&spec, runner_config.keep_temporary_files);
 

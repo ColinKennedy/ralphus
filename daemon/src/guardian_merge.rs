@@ -509,7 +509,10 @@ fn regen_from_feature_worktree(
 ///    regenerates otherwise.
 /// 3. **Review branch missing** — `checkout -B` recreates it from `branch`.
 /// 4. **Stale git tracking entry** — `git worktree prune` removes it so
-///    `worktree add` does not reject the path as already registered.
+///    `worktree add` does not reject the path as already registered; every
+///    `add` call site retries once more after an extra prune
+///    ([`add_worktree_with_prune_retry`]) in case the entry only frees up
+///    (lock released, concurrent recovery finishes) after the first one.
 /// 5. **Branch mismatch** — `checkout -f -B rev branch` corrects it.
 /// 6. **Detached HEAD** — `checkout` reattaches to a named branch.
 /// 7. **Worktree locked** — unlocked before removal.
@@ -533,13 +536,47 @@ trait RecoveryFaults {
     fn remove_error(&mut self) -> Option<String> {
         None
     }
+
+    fn add_error(&mut self) -> Option<String> {
+        None
+    }
 }
 
 struct NoRecoveryFaults;
 
 impl RecoveryFaults for NoRecoveryFaults {}
 
-/// Test seam for the two transient failures involved in final worktree
+/// `git worktree add -B rev wt_str branch`, retrying once after a fresh
+/// `git worktree prune` if the first attempt fails.
+///
+/// [State 4]: `add` rejects `rev` as "already used by worktree" whenever
+/// *any* tracking entry still claims that branch, even one whose directory
+/// is already gone (a "prunable" entry) or one a concurrent recovery attempt
+/// only just released. Every call site already pruned once before reaching
+/// here, which clears the common case, but a lock freed or a registration
+/// dropped in the gap between that prune and this `add` is still possible --
+/// this retry (guardian-000000000087) catches it instead of surfacing git's
+/// raw error.
+fn add_worktree_with_prune_retry<F: RecoveryFaults>(
+    root: &Workspace,
+    rev: &str,
+    wt_str: &str,
+    branch: &str,
+    faults: &mut F,
+) -> std::result::Result<(), String> {
+    let first = faults.add_error().map_or_else(
+        || root.git(&["worktree", "add", "-B", rev, wt_str, branch]),
+        Err,
+    );
+    first
+        .or_else(|_| {
+            let _ = root.git(&["worktree", "prune"]);
+            root.git(&["worktree", "add", "-B", rev, wt_str, branch])
+        })
+        .map(|_| ())
+}
+
+/// Test seam for the transient failures involved in final worktree
 /// recovery. All non-injected VCS operations still use [`Workspace::git`].
 fn worktree_add_or_reset_with_faults<F>(
     root: &Workspace,
@@ -568,13 +605,7 @@ where
 
         if branch_exists(root, branch) {
             // [State 4] If a stale tracking entry blocks the add, prune and retry.
-            return root
-                .git(&["worktree", "add", "-B", rev, &wt_str, branch])
-                .or_else(|_| {
-                    let _ = root.git(&["worktree", "prune"]);
-                    root.git(&["worktree", "add", "-B", rev, &wt_str, branch])
-                })
-                .map(|_| ());
+            return add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults);
         }
         // Feature branch is also absent — find its worktree and regenerate.
         let _ = root.git(&["worktree", "prune"]);
@@ -640,9 +671,7 @@ where
     if !wt.root().exists() {
         // Removal succeeded; add fresh.
         if branch_exists(root, branch) {
-            return root
-                .git(&["worktree", "add", "-B", rev, &wt_str, branch])
-                .map(|_| ());
+            return add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults);
         }
         return regen_from_feature_worktree(root, rev, wt, branch);
     }
@@ -661,8 +690,7 @@ where
         );
         wt.remove_path(".", true);
         return if branch_exists(root, branch) {
-            root.git(&["worktree", "add", "-B", rev, &wt_str, branch])
-                .map(|_| ())
+            add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults)
         } else {
             regen_from_feature_worktree(root, rev, wt, branch)
         };
@@ -704,8 +732,7 @@ where
             // prune the leftover registration before trying to add it back.
             let _ = root.git(&["worktree", "prune"]);
             if branch_exists(root, branch) {
-                root.git(&["worktree", "add", "-B", rev, &wt_str, branch])
-                    .map(|_| ())
+                add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults)
                     .map_err(|e| format!("{checkout_err}; worktree add: {e}"))
             } else {
                 regen_from_feature_worktree(root, rev, wt, branch)
@@ -2122,6 +2149,11 @@ fn resolve_conflicts_with_agent(
         // within this attempt, wins over the final-proof call that may follow).
         let _ = store.lock().stamp_branch_started_at(id, branch_id);
         let result = runner.run_cancellable(&spec, cancel);
+        // The fix pass has actually finished running -- stamp the branch's
+        // Live-View end time regardless of outcome (a final-proof call, if
+        // one follows, overwrites this with its own later finish time; see
+        // `Store::stamp_branch_finished_at`'s doc comment).
+        let _ = store.lock().stamp_branch_finished_at(id, branch_id);
 
         stop.store(true, Ordering::Relaxed);
         let _ = watcher.join();
@@ -2468,6 +2500,10 @@ fn run_final_proof(
     // proof (clean rebase) gets stamped here.
     let _ = store.lock().stamp_branch_started_at(id, branch_id);
     let result = runner.run_cancellable(&spec, cancel);
+    // The final-proof call has actually finished running -- overwrites the
+    // fix pass's own finish time above, since this call runs later within
+    // the same attempt (see `Store::stamp_branch_finished_at`'s doc comment).
+    let _ = store.lock().stamp_branch_finished_at(id, branch_id);
     // RAL-193: not fatal here -- per this function's own doc comment, the
     // proof call never blocks the rebase from completing, so a budget overrun is
     // recorded but doesn't abort an already-in-flight resolution.
@@ -5121,9 +5157,18 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         return;
                     }
                 }
-                let nothing = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
-                if nothing {
-                    let _ = store.lock().set_branch_empty(id, &ob.id, true);
+                // RAL-190 covers this exact false positive for
+                // `note_if_branch_is_empty`'s pre-rebase check, but this
+                // post-rebase diff has no equivalent escape hatch on its own:
+                // `--empty=drop` above silently drops a branch's real commits
+                // once they're patch-equal on `combined_branch` (e.g. already
+                // landed via a concurrent merge elsewhere), which leaves this
+                // diff empty too even though the task genuinely committed.
+                // Confirm against the same original-branch-vs-boundary check
+                // before treating it as a real failure.
+                if review_ref_has_no_changes(&wt, &combined_branch, "HEAD")
+                    && note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &wt, base_sha)
+                {
                     fail_branch(
                         store,
                         id,
@@ -5144,7 +5189,8 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                     RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
                     RebaseOutcome::Clean => (
                         MergeStatus::Done,
-                        nothing.then(|| "no new commits over base (already merged?)".to_string()),
+                        review_ref_has_no_changes(&wt, &combined_branch, "HEAD")
+                            .then(|| "no new commits over base (already merged?)".to_string()),
                     ),
                 };
                 promote_branch_terminal(
@@ -5729,6 +5775,10 @@ pub fn run_feedback(
                 .map(|_| name)
         }
     };
+    let before_resolver_sha = wt
+        .git(&["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string());
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     // RAL-395: the resolver's own verdict, before we know whether anything it
@@ -5737,7 +5787,21 @@ pub fn run_feedback(
     // an agent that made no committable change can never read as a success.
     let fixer_proof_passed = require_proof.then(|| result.proof_passed());
     let dirty = wt.git(&["status", "--porcelain"]).unwrap_or_default();
-    let attempt_commit = !dirty.trim().is_empty();
+    let leftover_dirty = !dirty.trim().is_empty();
+    // RAL-408: the resolver prompt above tells it "do not run any git
+    // commands", but nothing enforces that -- an agent that commits its own
+    // fix anyway (observed with a Haiku resolver) leaves a clean working tree
+    // behind, which used to read as "did nothing" and strand the real commit
+    // in the worktree forever (never pushed, never surfaced to the PR).
+    // Comparing HEAD before/after the resolver's own run catches that case
+    // regardless of whether the working tree ends up dirty afterward.
+    let after_resolver_sha = wt
+        .git(&["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string());
+    let resolver_self_committed =
+        after_resolver_sha.is_some() && after_resolver_sha != before_resolver_sha;
+    let attempt_commit = leftover_dirty || resolver_self_committed;
     let mut proof_note: Option<String> = None;
     let mut pushed = false;
     let mut pushed_sha: Option<String> = None;
@@ -5769,36 +5833,52 @@ pub fn run_feedback(
             proof_note = Some(note);
         }
 
-        // RAL-<new>: a dedicated agent decides what belongs in the commit --
-        // see `run_commit_step`'s own doc comment for why this replaced a
-        // blind `git add --all` gated on a text-sniffed "did the pasted
-        // context say not to commit" heuristic.
-        let reference_notes = commit_step_reference_notes(store, id, branch_id, &feature);
-        // RAL-201: was `git(wt.root(), ...)`, a direct bypass of `wt`'s
-        // machine sitting right next to the correctly-routed calls above.
-        // RAL-<new>: subject line stays short (this repo's conventional
-        // `type: summary` commit style) with the raw reviewer feedback --
-        // which routinely runs to several sentences -- relegated to the
-        // commit body via a second `-m`, instead of dumping the whole
-        // feedback text into the subject line where it makes
-        // `git log --oneline` and rebase-todo listings unreadable.
-        let subject = format!("fix: apply review feedback ({feature})");
-        let step = run_commit_step(
-            store,
-            id,
-            branch_id,
-            runner,
-            &wt,
-            &wt_str,
-            &resolved,
-            reference_notes.as_deref(),
-            &subject,
-            feedback,
-            squash,
-            cancel,
-        );
-        committed = step.committed;
-        commit_step_detail = Some(step.detail);
+        if leftover_dirty {
+            // RAL-<new>: a dedicated agent decides what belongs in the commit
+            // -- see `run_commit_step`'s own doc comment for why this
+            // replaced a blind `git add --all` gated on a text-sniffed "did
+            // the pasted context say not to commit" heuristic.
+            let reference_notes = commit_step_reference_notes(store, id, branch_id, &feature);
+            // RAL-201: was `git(wt.root(), ...)`, a direct bypass of `wt`'s
+            // machine sitting right next to the correctly-routed calls above.
+            // RAL-<new>: subject line stays short (this repo's conventional
+            // `type: summary` commit style) with the raw reviewer feedback --
+            // which routinely runs to several sentences -- relegated to the
+            // commit body via a second `-m`, instead of dumping the whole
+            // feedback text into the subject line where it makes
+            // `git log --oneline` and rebase-todo listings unreadable.
+            let subject = format!("fix: apply review feedback ({feature})");
+            let step = run_commit_step(
+                store,
+                id,
+                branch_id,
+                runner,
+                &wt,
+                &wt_str,
+                &resolved,
+                reference_notes.as_deref(),
+                &subject,
+                feedback,
+                squash,
+                cancel,
+            );
+            // RAL-408: `step.committed` alone would miss the resolver's own
+            // commit when its leftover dirt is judged incidental (e.g. build
+            // byproducts) and the commit step itself adds nothing new --
+            // `resolver_self_committed` still means a real commit already
+            // sits on HEAD either way.
+            committed = step.committed || resolver_self_committed;
+            commit_step_detail = Some(step.detail);
+        } else {
+            // RAL-408: the resolver committed its own fix directly and left
+            // nothing else to stage -- there's no dirt left for a commit-step
+            // agent to inspect, so skip it and trust the commit already on
+            // HEAD instead of asking an agent to invent a reason nothing
+            // happened.
+            committed = true;
+            commit_step_detail =
+                Some("resolver agent committed its own change directly".to_string());
+        }
 
         if committed {
             // RAL-<new>: push the review branch itself -- force only when we
@@ -5966,7 +6046,7 @@ pub fn run_feedback(
         // since a feedback pass that only reports, or that made nothing the
         // commit step judged genuine, has nothing new on the forge to watch.
         if pushed {
-            crate::ci_watch::watch_after_feedback_push(store, id, branch_id);
+            crate::ci_watch::start_ci_watch(store, id, branch_id);
         }
     }
     // RAL-<new>: combine the resolver's own verdict with whether anything it
@@ -7104,8 +7184,18 @@ fn stack_pick(
             // rebase produces this review ref, it must still contribute a
             // diff over its predecessor before it can become terminal or
             // queue a PR.
-            if review_ref_has_no_changes(wt, newbase, rev) {
-                let _ = store.lock().set_branch_empty(id, branch_id, true);
+            // RAL-190 covers this exact false positive for
+            // `note_if_branch_is_empty`'s pre-rebase check, but this
+            // post-rebase diff has no equivalent escape hatch on its own:
+            // `--empty=drop` inside `drive_rebase` silently drops a branch's
+            // real commits once they're patch-equal on `newbase` (e.g.
+            // already landed via a concurrent merge elsewhere), which leaves
+            // this diff empty too even though the task genuinely committed.
+            // Confirm against the same original-branch-vs-boundary check
+            // before treating it as a real failure.
+            if review_ref_has_no_changes(wt, newbase, rev)
+                && note_if_branch_is_empty(store, id, branch_id, feature_branch, wt, base_sha)
+            {
                 fail_branch(
                     store,
                     id,
@@ -7536,12 +7626,13 @@ fn fetch_branch_for_remote_cell(
     Ok(())
 }
 
-/// Shared `fail_branch` detail for every empty-branch detection in this file
-/// (`staged_merge_pass`'s two `note_if_branch_is_empty` call sites, and
-/// `stack_pick`/`run_merge_shared`'s own post-rebase `review_ref_has_no_changes`
-/// checks) -- previously the latter two inlined a shorter, escape-hatch-free
-/// message that drifted from this one, which a reviewer hitting that exact
-/// path had no way to know about.
+/// Shared `fail_branch` detail for every empty-branch detection in this file:
+/// `staged_merge_pass`'s two direct `note_if_branch_is_empty` call sites, and
+/// `stack_pick`/`run_merge_shared`'s post-rebase `review_ref_has_no_changes`
+/// checks, which now confirm against `note_if_branch_is_empty` too before
+/// failing (RAL-193 covered the pre-rebase check's false positive on a
+/// branch already merged upstream; the post-rebase checks had the identical
+/// gap until they started reusing the same confirmation).
 const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the branch beneath it in the stack. \
      Its task most likely never committed its work -- check that cell, then re-run it. \
      If this branch is meant to be empty, disable it to drop it from the stack.";
@@ -8739,6 +8830,7 @@ fn drive_rebase(
     // resolver/proof session start below). Left NULL if no resolver ever runs
     // for this branch.
     let _ = store.lock().clear_branch_started_at(id, branch_id);
+    let _ = store.lock().clear_branch_finished_at(id, branch_id);
     // Dirty-worktree guard: wait out a concurrent `run_feedback` pass still
     // holding this branch's worktree lease (see the `worktree lease`
     // glossary entry), then -- if the worktree is still dirty once the lease
@@ -9853,6 +9945,11 @@ fn generate_manual_commands(
     // regeneration always shows the latest generation's start).
     let _ = store.lock().stamp_guardian_manual_checks_started_at(id);
     let result = runner.run_cancellable(&spec, cancel);
+    // Generation has actually finished running -- stamp the guardian-level
+    // Live-View end time regardless of outcome, mirroring the started-at stamp
+    // above (plain overwrite, so a regeneration always shows the latest run's
+    // finish).
+    let _ = store.lock().stamp_guardian_manual_checks_finished_at(id);
     let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
 
     stop.store(true, Ordering::Relaxed);
@@ -11456,6 +11553,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn add_worktree_with_prune_retry_recovers_from_a_transient_first_failure() {
+        // Reproduces guardian-000000000087: `worktree add -B rev wt branch`
+        // failed with "'rev' is already used by worktree at <path>" even
+        // though a prune had already run just before it. Only the state-1
+        // call site retried the add after a second prune; the other three
+        // call sites (post-removal-success, foreign-main-repo-wipe, and
+        // post-checkout-failure) attempted `add` exactly once and surfaced
+        // git's raw error on any conflict that survived the one prune
+        // already run before them (e.g. a lock released, or a concurrent
+        // recovery attempt finishing, in the gap after that prune). This
+        // exercises the shared retry helper directly: a failure on the
+        // first attempt must not be fatal as long as a fresh prune before
+        // the retry clears the way.
+        let (base, repo, _fwt) = make_repo("add-retry-transient");
+        let root = Workspace::local(&repo);
+        let rev = "guardian/g/wt-feature-a";
+        let wt_path = base.join("rwt");
+        let wt_str = wt_path.to_string_lossy().to_string();
+
+        #[derive(Default)]
+        struct FailFirstAdd {
+            add_calls: usize,
+        }
+
+        impl RecoveryFaults for FailFirstAdd {
+            fn add_error(&mut self) -> Option<String> {
+                self.add_calls += 1;
+                Some("injected transient add conflict".to_string())
+            }
+        }
+
+        let mut faults = FailFirstAdd::default();
+        let result = add_worktree_with_prune_retry(&root, rev, &wt_str, "feature/a", &mut faults);
+
+        assert!(result.is_ok(), "retry after prune must recover: {result:?}");
+        assert_eq!(
+            faults.add_calls, 1,
+            "only the first attempt is short-circuited; the retry always uses real git"
+        );
+        assert_on_branch(&wt_path, rev);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // -----------------------------------------------------------------------
     // Fail-state 7 — worktree locked externally
     // -----------------------------------------------------------------------
@@ -12997,6 +13139,114 @@ mod tests {
             !store.lock().get_guardian(&id).unwrap().branches[0].is_empty,
             "must not flag a branch that committed real work, even if that \
              work is now also present further up the current base"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stack_pick_does_not_fail_a_branch_already_merged_upstream() {
+        // Reproduces guardian-000000000085: `note_if_branch_is_empty` (tested
+        // above) already knows how to tell "never committed" apart from
+        // "already landed upstream", but `stack_pick`'s own post-rebase
+        // `review_ref_has_no_changes(wt, newbase, rev)` check had no such
+        // escape hatch -- once `--empty=drop` inside `drive_rebase` dropped
+        // this branch's real, patch-equal-on-`newbase` commit, `stack_pick`
+        // failed the branch outright as though its task never committed,
+        // discarding real (and, in the field incident, already-pushed) work.
+        let (base, repo, _fwt) = make_repo("stack-pick-already-merged");
+        let old_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        // Advance `main` past the point where feature/a's own commit already
+        // applies cleanly, simulating a base that absorbed this branch's work
+        // through another route (a concurrent squash-merge, in the field).
+        g(&repo, &["merge", "--no-edit", "feature/a"]);
+        let new_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // A review worktree checked out at feature/a's own (pre-rebase) tip,
+        // exactly as `run_merge_shared`/`staged_merge_pass` set one up before
+        // calling `stack_pick`.
+        let rev = "guardian/test/wt-feature-a";
+        let wt = base.join("review-wt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                rev,
+                wt.to_str().unwrap(),
+                "feature/a",
+            ],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+
+        // "nothing" scope + a runner that fails the test if invoked: this
+        // scenario must resolve without ever needing an agent.
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("an already-clean, already-merged rebase must never call the runner");
+            }
+        }
+        let gate = ProofGate {
+            scope: "nothing".to_string(),
+            skip_auto_clean: false,
+            is_final_branch: false,
+        };
+
+        let result = stack_pick(
+            &store,
+            &MustNotRunRunner,
+            &id,
+            &branch_id,
+            "feature/a",
+            &old_base,
+            &new_base,
+            rev,
+            &Workspace::local(&wt),
+            false,
+            &gate,
+            &CancelToken::never(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "a branch whose commit already landed upstream must not fail the merge"
+        );
+        let branch = store.lock().get_guardian(&id).unwrap().branches[0].clone();
+        assert!(
+            !branch.is_empty,
+            "must not flag a branch that committed real work, even once that \
+             work is also already present on the new base"
+        );
+        assert!(
+            branch
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already merged"),
+            "expected the friendly already-merged note, got {:?}",
+            branch.detail
         );
 
         let _ = std::fs::remove_dir_all(&base);

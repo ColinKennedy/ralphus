@@ -178,7 +178,10 @@ fn main() -> ExitCode {
                     db.display()
                 ),
             );
-            let otel_provider = ralphus_daemon::otel::init("ralphus-daemon");
+            let otel_provider = daemon_cfg
+                .opentelemetry_enabled()
+                .then(|| ralphus_daemon::otel::init("ralphus-daemon"))
+                .flatten();
             let result = server::serve(addr, &db, daemon_cfg.max_concurrent());
             ralphus_daemon::otel::shutdown(otel_provider);
             match result {

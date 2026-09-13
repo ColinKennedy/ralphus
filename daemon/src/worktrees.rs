@@ -563,21 +563,19 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// entirely. A remote-tracking match is preferred over a same-named local
 /// branch, since tracking a remote is `?upstream=`'s primary purpose.
 ///
-/// Also mirrors the resolved ref into a dedicated `ralphus.<branch>.baseline`
-/// git config key (branch name as subsection, like `branch.<branch>.merge`,
-/// rather than as the key itself -- git config keys reject `/`, which slash-
-/// containing branch names would otherwise trip over). `branch.<branch>.remote`/`.merge` (i.e. `@{upstream}`) is
-/// exactly the pair `git push -u`/`--set-upstream` overwrites -- a `finalize`
-/// cell that pushes a brand-new branch for the first time routinely triggers
-/// that (git refuses a bare `git push` with no upstream configured yet, so an
-/// agent reaches for `-u`), silently retargeting `@{upstream}` from the
-/// intended base branch onto the branch's own just-pushed remote copy. Once
-/// that happens `@{upstream}` always equals `HEAD`, which is exactly what
-/// `reviews::worktree_has_commits_ahead_of_upstream` (the no-new-commits
-/// guard) reads as "no progress" even though the branch is genuinely ahead of
-/// its real base. `ralphus.<branch>.baseline` lives in a config namespace
-/// git itself never writes to, so it survives that push untouched and gives
-/// the guard something durable to fall back on.
+/// Does *not* itself record the no-new-commits guard's durable baseline
+/// marker (`ralphus.<branch>.baseline`) -- that used to happen here, mirroring
+/// whichever ref this function just resolved, but a ref *name* is a moving
+/// target: `branch.<branch>.remote`/`.merge` (i.e. `@{upstream}`) is exactly
+/// what `git push -u`/`--set-upstream` overwrites, and a remote-tracking ref
+/// used as the marker can itself be advanced mid-run by any push or fetch
+/// that touches it (including a `finalize` cell pushing its own commit
+/// straight onto what `git status` calls "your branch's upstream," which is
+/// actually the shared base branch here). Either way the guard would then
+/// read the branch's own real work as "already accounted for." The caller
+/// ([`ensure_worktree_with_existing`]) instead freezes the marker to a
+/// resolved commit SHA, once, *after* this function returns and the branch
+/// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
     // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
     // They must be expanded by `resolve_upstream` before materialization; a
@@ -611,11 +609,6 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
                 ],
             )
             .map_err(fail)?;
-            git(
-                wt,
-                &["config", &format!("ralphus.{branch}.baseline"), &remote_ref],
-            )
-            .map_err(fail)?;
             return Ok(());
         }
     }
@@ -627,14 +620,42 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
             &["config", &format!("branch.{branch}.merge"), &local_ref],
         )
         .map_err(fail)?;
-        git(
-            wt,
-            &["config", &format!("ralphus.{branch}.baseline"), &local_ref],
-        )
-        .map_err(fail)?;
         return Ok(());
     }
     Err(fail("no matching ref found".to_string()))
+}
+
+/// Freeze the no-new-commits guard's durable baseline marker
+/// (`ralphus.<branch>.baseline`) to `branch`'s current `@{upstream}`,
+/// resolved to a commit SHA right now. Called once [`set_explicit_upstream`]
+/// and [`resync_remote_tracking_branch`] have both already run, so the
+/// snapshot reflects the branch's real starting line for this
+/// materialization -- any commits the resync just fetched and rebased in are
+/// included (they're genuinely "already there" before this run's own cells
+/// do anything), but nothing that pushes or fetches into that same ref
+/// *afterward*, while cells are running, can move it. A no-op (not an error)
+/// if `@{upstream}` doesn't resolve, matching this marker's existing
+/// best-effort, fall-back-to-live-`@{upstream}` contract in
+/// [`crate::reviews::workspace_baseline_ref`].
+fn freeze_commit_baseline(wt: &Path, branch: &str) {
+    let Ok(upstream) = git(
+        wt,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    ) else {
+        return;
+    };
+    if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
+        crate::rlog!(
+            WARNING,
+            "ralphus: could not freeze commit baseline for branch '{branch}' at {}: {e}",
+            wt.display()
+        );
+    }
 }
 
 /// If `wt`'s checked-out branch tracks a remote (its `@{upstream}` resolves
@@ -766,6 +787,7 @@ pub fn ensure_worktree_with_existing(
     if wt.join(".git").exists() {
         set_explicit_upstream(&wt, branch, upstream)?;
         resync_remote_tracking_branch(&wt)?;
+        freeze_commit_baseline(&wt, branch);
         return Ok(wt);
     }
     if let Some(parent) = wt.parent() {
@@ -808,6 +830,7 @@ pub fn ensure_worktree_with_existing(
     }
     set_explicit_upstream(&wt, branch, upstream)?;
     resync_remote_tracking_branch(&wt)?;
+    freeze_commit_baseline(&wt, branch);
     Ok(wt)
 }
 
@@ -1859,10 +1882,56 @@ mod tests {
         // own `git push -u` never touches this key, so it must be written
         // alongside the real upstream, not only as a UI-facing side effect.
         let repo = init_repo("new-branch-baseline");
+        let main_sha = git(&repo, &["rev-parse", "main"])
+            .expect("main must resolve")
+            .trim()
+            .to_string();
         let wt = ensure_worktree(&repo, "feature-y", "main").expect("materialize");
         let baseline = git(&wt, &["config", "--get", "ralphus.feature-y.baseline"])
             .expect("baseline marker must be recorded");
-        assert_eq!(baseline.trim(), "refs/heads/main");
+        // The marker holds the *resolved commit*, not the ref name -- a
+        // later commit on `main` (or a push landing on it) must never move
+        // this worktree's own baseline out from under it.
+        assert_eq!(baseline.trim(), main_sha);
+    }
+
+    #[test]
+    fn baseline_marker_survives_the_upstream_branch_advancing_after_materialization() {
+        // Reproduces RAL-404's real false failure: something pushes new
+        // commits onto the branch this worktree tracks as its upstream
+        // *after* the worktree was materialized (here, a finalize cell
+        // mistakenly pushing straight onto the shared base branch instead of
+        // its own branch). A live ref-name baseline would silently swallow
+        // that as "already accounted for"; a frozen SHA must not.
+        let repo = init_repo("baseline-survives-upstream-advance");
+        let wt = ensure_worktree(&repo, "feature-v", "main").expect("materialize");
+        let baseline_before = git(&wt, &["config", "--get", "ralphus.feature-v.baseline"])
+            .expect("baseline marker must be recorded");
+
+        std::fs::write(wt.join("work.txt"), "work\n").unwrap();
+        g(&wt, &["add", "."]);
+        g(&wt, &["commit", "--message", "real work"]);
+
+        // Something else advances the tracked upstream (`main`) past this
+        // worktree's own commit -- e.g. a direct push, or another worktree
+        // off the same repo committing to `main`.
+        std::fs::write(repo.join("elsewhere.txt"), "unrelated\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "unrelated advance of main"]);
+
+        let baseline_after = git(&wt, &["config", "--get", "ralphus.feature-v.baseline"])
+            .expect("baseline marker must still be recorded");
+        assert_eq!(
+            baseline_before.trim(),
+            baseline_after.trim(),
+            "the frozen baseline must not move just because the tracked branch advanced"
+        );
+        assert!(
+            crate::reviews::workspace_has_commits_ahead_of_upstream(
+                &crate::workspace::Workspace::local(wt.clone())
+            ),
+            "the worktree's own real commit must still read as progress"
+        );
     }
 
     #[test]

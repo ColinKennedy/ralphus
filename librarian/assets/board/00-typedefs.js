@@ -197,6 +197,7 @@
        * @property {{[key: string]: string}} [inherited_env] - RAL-191: the environment inherited from this branch's source cell (`squad < task < cell`), before `env_overrides` is applied.
        * @property {{[key: string]: string}} [resolved_env] - RAL-191: the effective environment this branch's review worktree actually runs under — `inherited_env` with `env_overrides` applied.
        * @property {number|null} [started_at_ms] - RAL-259: epoch-ms when this branch's conflict-resolver agent (fix pass or final-proof call) most recently began running, or null if none has started. Persists after the resolver finishes.
+       * @property {number|null} [finished_at_ms] - epoch-ms when this branch's conflict-resolver agent (fix pass or final-proof call) most recently finished running, or null if none has completed. Shown alongside `started_at_ms` once the Live View shows a historical record.
        * @property {string|null} [auto_submit_error] - RAL-317: error from this branch's most recent auto-submit-PR-stack attempt, or null/absent if none failed (or none has run). Cleared server-side once the branch's state is covered by an open PR again.
        * @property {boolean} [pr_submission_pending] - RAL-389: true while an auto-submit-PR-stack request for this branch is durably queued or actively running on its own async worker thread, decoupled from the merge worker. Survives a daemon restart; cleared once that attempt completes (success or failure).
        */
@@ -308,6 +309,7 @@
        * @property {number|null} [maximum_budget_usd] - RAL-193: this review's own USD spend cap, or null for no cap.
        * @property {number} [merge_attempt] - RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
        * @property {number|null} [manual_checks_started_at_ms] - RAL-259: epoch-ms when this review's manual-checks generation agent most recently began work, or null if generation hasn't started yet. Persists after generation finishes.
+       * @property {number|null} [manual_checks_finished_at_ms] - epoch-ms when this review's manual-checks generation agent most recently finished work, or null if generation hasn't completed yet. Shown alongside `manual_checks_started_at_ms` once the Live View shows a historical record.
        * @property {number} [attempt_tokens_in] - RAL-193: input tokens spent on this review's own resolver/proof calls during the current merge attempt only.
        * @property {number} [attempt_tokens_out] - RAL-193: output tokens, current merge attempt only.
        * @property {number} [attempt_cost_usd] - RAL-193: USD cost, current merge attempt only.

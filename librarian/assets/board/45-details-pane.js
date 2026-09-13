@@ -1057,7 +1057,7 @@
               + terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms)}${historyBox(key)}`;
+            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms, s.finished_at_ms)}${historyBox(key)}`;
           })()}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a
@@ -1314,7 +1314,7 @@
           }
         }
         try {
-          const resp = await fetch(`/api/squads/${r.id}/edit`, { method: "POST", body: JSON.stringify(body) });
+          const resp = await post(`/api/squads/${r.id}/edit`, body);
           if (!resp.ok) { byId("save-err").textContent = "save failed (" + resp.status + ")"; return; }
           editing = false; await tick();
         } catch (e) { byId("save-err").textContent = "save failed: " + e; }
@@ -1391,4 +1391,3 @@
         m.classList.remove("hidden");
       }
       document.addEventListener("click", () => byId("running-menu").classList.add("hidden"));
-

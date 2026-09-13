@@ -844,6 +844,79 @@
         }
         return TT_PR_COLORS[pr.state] || "--muted";
       }
+      // RALPHUS-PR-BADGE-MENU:BEGIN
+      /**
+       * Opens a PR badge's right-click menu (RAL-<new>) -- shared by the Tasks
+       * tab's row badge and the Reviews tab's branch/PR card, since both
+       * badges point at the same underlying PR row and the two on-demand
+       * actions (live status refresh, pulling in forge comments as feedback)
+       * are identical either way. `canQueryForge` mirrors `ttRunPrCheck`'s own
+       * gate: both actions need a live forge PR number and an `open` PR, so a
+       * PR without one shows a disabled, explained item instead of silently
+       * doing nothing.
+       * @param {MouseEvent} e
+       * @param {string} prId
+       * @param {boolean} canQueryForge
+       * @returns {void}
+       */
+      function openPrMenu(e, prId, canQueryForge) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        if (!prId) return;
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu";
+        const items = canQueryForge
+          ? [
+              `<div data-click="refreshPrStatusMenuItem" data-pr-id="${esc(prId)}" data-tip="Live-poll the forge right now for this PR's current CI/mergeability status, instead of waiting for the next standing poll (every 2 minutes).\nUpdates this badge's color as soon as the forge responds.">↻ Refresh status</div>`,
+              `<div data-click="actionPrFeedbackMenuItem" data-pr-id="${esc(prId)}" data-tip="Pull this PR's un-actioned forge comments into the owning review worktree as feedback -- the same path a manual reviewer's freeform feedback takes.\nWho/when: use this after Refresh status (or the PR's badge) shows new reviewer comments you want applied right away, without waiting for the next standing poll.\nAttributed to you by name in the review's chat thread, so it's clear a person asked for this.">💬 Action feedback</div>`,
+            ]
+          : [
+              `<div style="opacity:.5;cursor:not-allowed;pointer-events:none" data-tip="This PR has no recorded forge number yet, or is no longer open -- there is nothing to refresh or pull feedback from.">↻ Refresh status</div>`,
+            ];
+        menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+      }
+      /**
+       * "Refresh status" menu item (RAL-<new>): on-demand CI/mergeability
+       * refresh for one PR, reusing the same endpoint `ttRunPrCheck`'s "Check
+       * PR" already calls. `tick()` re-polls whichever tab is active, so the
+       * badge repaints with the fresh color as soon as the daemon answers.
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function refreshPrStatusMenuItem(prId) {
+        closeSquadMenu();
+        const resp = await post(`/api/pull-requests/${prId}/refresh-ci`);
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          showReviewError(((e.error || {}).message) || `Refresh failed (${resp.status})`);
+          return;
+        }
+        showInfoToast("Refreshed PR status.");
+        tick();
+      }
+      /**
+       * "Action feedback" menu item (RAL-<new>): pulls this PR's un-actioned
+       * forge comments into the owning review worktree right now, instead of
+       * only via the standalone "Pull in PR feedback" button. Runs in the
+       * background on the daemon side; `tick()` picks up the chat thread /
+       * badge changes once it finishes.
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function actionPrFeedbackMenuItem(prId) {
+        closeSquadMenu();
+        const resp = await post(`/api/pull-requests/${prId}/action-feedback`);
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          showReviewError(((e.error || {}).message) || `Action feedback failed (${resp.status})`);
+          return;
+        }
+        showInfoToast("Actioning PR feedback…");
+        tick();
+      }
+      // RALPHUS-PR-BADGE-MENU:END
       /**
        * The task-level entity URI a squad/task watch is filed under (RAL-362
        * §5), matching `crate::entity_uri::EntityUri`'s `Display` grammar.

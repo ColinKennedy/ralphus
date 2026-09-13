@@ -175,6 +175,13 @@ pub enum GuardianStatus {
 }
 
 impl GuardianStatus {
+    /// Whether this review has reached a terminal state and background work
+    /// must leave it unchanged until it is explicitly reopened.
+    #[must_use]
+    pub fn is_terminal_status(status: &str) -> bool {
+        matches!(status, "approved" | "cancelled" | "deployed")
+    }
+
     /// The stored lowercase string.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -482,6 +489,14 @@ pub struct BranchView {
     /// re-stamped per merge attempt (mirrors cell `started_at_ms`, RAL-210);
     /// persists after the resolver finishes so completed reviews still show it.
     pub started_at_ms: Option<i64>,
+    /// When this branch's conflict-resolver agent (fix pass or final-proof
+    /// call) most recently finished running — the Review Live View's "ended"
+    /// timestamp (epoch ms), shown alongside [`Self::started_at_ms`]. `None`
+    /// until a resolver session actually completes, or for a branch that
+    /// never needed one. Plain overwrite per completed call within an
+    /// attempt (see `Store::stamp_branch_finished_at`); persists after the
+    /// resolver finishes so completed reviews still show it.
+    pub finished_at_ms: Option<i64>,
     /// RAL-317: a one-shot failure marker for this branch's most recent
     /// auto-submit-PR-stack attempt (best-effort side channel -- never blocks
     /// a Guardian merge transition). `None` means no failure to report;
@@ -831,6 +846,12 @@ pub struct GuardianView {
     /// generation finishes so a completed generation still shows it; re-stamped
     /// fresh on every regeneration.
     pub manual_checks_started_at_ms: Option<i64>,
+    /// When this review's manual-checks generation agent most recently
+    /// finished work (epoch ms), for the manual-checks Live View panel's
+    /// "ended" timestamp, shown alongside [`Self::manual_checks_started_at_ms`].
+    /// `None` until generation completes. Plain overwrite; re-stamped fresh on
+    /// every regeneration (see `Store::stamp_guardian_manual_checks_finished_at`).
+    pub manual_checks_finished_at_ms: Option<i64>,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
     /// and prover agent calls during the current merge attempt only --
     /// excludes the tasks/cells that fed into the review.
@@ -3304,6 +3325,46 @@ impl Store {
         Ok(())
     }
 
+    /// Reset a branch's `finished_at_ms` at the start of a fresh merge
+    /// attempt, alongside [`Self::clear_branch_started_at`]. Not strictly
+    /// required for correctness (every real completion overwrites it again
+    /// via [`Self::stamp_branch_finished_at`]), but keeps a stale finish time
+    /// from a prior attempt from lingering while this one is in flight.
+    pub fn clear_branch_finished_at(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET finished_at_ms=NULL WHERE guardian_id=? AND id=?",
+            params![guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a branch's `finished_at_ms` to now, once its resolver agent
+    /// (fix pass or final-proof call) actually finishes running. Plain
+    /// overwrite (not COALESCE, unlike [`Self::stamp_branch_started_at`]) so
+    /// the value always reflects the most recently completed call within the
+    /// current attempt -- e.g. a final-proof call that runs after the fix
+    /// pass overwrites the fix pass's own finish time, which is what the
+    /// Review Live View should show as "ended".
+    pub fn stamp_branch_finished_at(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET finished_at_ms=? WHERE guardian_id=? AND id=?",
+            params![crate::store::now_ms(), guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp when this review's manual-checks generation agent most recently
+    /// finished work -- mirrors [`Self::stamp_guardian_manual_checks_started_at`],
+    /// giving the manual-checks Live View an "ended" timestamp to show
+    /// alongside "started" once generation completes.
+    pub fn stamp_guardian_manual_checks_finished_at(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET manual_checks_finished_at_ms=? WHERE id=?",
+            params![crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
     /// Reorder a guardian's branches to match `order` (a permutation of the
     /// existing branch names). Positions are first shifted out of range to avoid
     /// colliding with the `(guardian_id, position)` primary key, then rewritten.
@@ -3679,7 +3740,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3693,7 +3754,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3798,6 +3859,7 @@ impl Store {
             project: r.get(52)?,
             auto_fix_pr_errors: r.get::<_, Option<i64>>(53)?.map(|v| v != 0),
             auto_fix_prompt_template: r.get(54)?,
+            manual_checks_finished_at_ms: r.get(55)?,
         })
     }
 
@@ -3823,7 +3885,7 @@ impl Store {
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
                     gb.is_empty, s.machine AS source_cell_machine,
                     gb.env_overrides, gb.started_at_ms, gb.auto_submit_error,
-                    gb.readable_review_branch, gb.review_branch_name
+                    gb.readable_review_branch, gb.review_branch_name, gb.finished_at_ms
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -3888,6 +3950,7 @@ impl Store {
                     inherited_env: BTreeMap::new(),
                     started_at_ms: r.get(22)?,
                     auto_submit_error: r.get(23)?,
+                    finished_at_ms: r.get(26)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4213,6 +4276,7 @@ impl Store {
             maximum_budget_usd: row.maximum_budget_usd,
             merge_attempt: row.merge_attempt,
             manual_checks_started_at_ms: row.manual_checks_started_at_ms,
+            manual_checks_finished_at_ms: row.manual_checks_finished_at_ms,
             notice_kind: row.notice_kind,
             notice_message: row.notice_message,
             notice_at_ms: row.notice_at_ms,
@@ -4586,6 +4650,8 @@ struct GuardianRow {
     merge_attempt: i64,
     /// RAL-259: when the manual-checks generation agent most recently began work.
     manual_checks_started_at_ms: Option<i64>,
+    /// When the manual-checks generation agent most recently finished work.
+    manual_checks_finished_at_ms: Option<i64>,
     /// RAL-273: see [`GuardianView::notice_kind`].
     notice_kind: Option<String>,
     notice_message: Option<String>,
@@ -4740,6 +4806,7 @@ mod tests {
             inherited_env: BTreeMap::new(),
             started_at_ms: None,
             auto_submit_error: None,
+            finished_at_ms: None,
         }
     }
 
@@ -5104,6 +5171,31 @@ mod tests {
             store.get_guardian_manual_checks_env_overrides("guardian-nope"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn branch_and_manual_checks_finished_at_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        // Neither stamp has fired yet -- both start out unset.
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.branches[0].finished_at_ms, None);
+        assert_eq!(g.manual_checks_finished_at_ms, None);
+
+        store.stamp_branch_finished_at(&id, &bid).unwrap();
+        store.stamp_guardian_manual_checks_finished_at(&id).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert!(g.branches[0].finished_at_ms.is_some());
+        assert!(g.manual_checks_finished_at_ms.is_some());
+
+        // A fresh attempt clears the branch's finish time (manual-checks has
+        // no clear -- it's a plain overwrite on its own next stamp instead).
+        store.clear_branch_finished_at(&id, &bid).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.branches[0].finished_at_ms, None);
     }
 
     #[test]
