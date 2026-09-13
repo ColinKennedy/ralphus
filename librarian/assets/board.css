@@ -57,7 +57,9 @@
       /* RAL-12: sidebar/details widths are draggable (var-driven) and persisted. */
       main#squads-page { display: grid; grid-template-columns: var(--sidebar-w, 280px) 6px 1fr 6px var(--details-w, 340px); height: calc(100vh - 51px); }
       main#tasks-page { display: grid; grid-template-columns: 1fr 6px var(--task-details-w, 340px); height: calc(100vh - 51px); }
-      main#reviews-page { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 51px); }
+      /* RAL-417: the Reviews sidebar is variable-width and draggable like the Squads one --
+         the same var-driven track + `.splitter` pattern; the 300px fallback is the old fixed width. */
+      main#reviews-page { display: grid; grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr; height: calc(100vh - 51px); }
       main#resources-page { height: calc(100vh - 51px); overflow-y: auto; padding: 18px 20px; }
       .res-table { width: 100%; border-collapse: collapse; font-size: 13px; }
       .res-table th { text-align: right; padding: 6px 12px; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; user-select: none; }
@@ -462,3 +464,18 @@
       .goto-search-row:last-child { border-bottom: none; }
       .goto-search-row:hover { background: var(--panel-2); }
       .goto-search-row.selected { background: rgba(74,163,255,.16); box-shadow: inset 0 0 0 1px var(--accent); }
+
+      /* RAL-417: small screens (incl. iPhones) -- the Reviews two-pane grid doesn't fit a phone
+         in portrait (a 240px detail floor plus a useful sidebar needs ~426px before the drag
+         ceiling even engages), so stack the panes: the list on top (bounded to half the viewport
+         height, scrolling independently), the selected review below at full width, and the page
+         scrolls as one. The splitter is hidden there: mouse-drag resizing is unusable on touch. */
+      @media (max-width: 720px) {
+        /* Wrap the header tabs so the Reviews tab is reachable at all. */
+        header { flex-wrap: wrap; }
+        .tabs { flex-wrap: wrap; }
+        .tab { padding: 4px 8px; }
+        main#reviews-page { grid-template-columns: 1fr; height: auto; overflow-y: auto; }
+        main#reviews-page .splitter { display: none; }
+        main#reviews-page .sidebar { max-height: 45vh; }
+      }
