@@ -44,10 +44,16 @@ test("updateCounter: a successful fetch never marks the board unreachable (the t
 
 // ---------- pollTasksTab: stamps #updated on both render exits ----------
 
+// pollTasksTab fetches /api/task-index and /api/pull-requests/index
+// concurrently via Promise.all (pendingFetches[0] and [1], in that call
+// order) -- every case below must settle both, or the awaited Promise.all
+// never resolves and the test hangs.
+
 test("pollTasksTab: the normal (non-hash) refresh path stamps #updated", async () => {
   const pt = makePollTasksTab();
   const promise = pt.pollTasksTab();
-  resolveJson(pt.pendingFetches[0], {});
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [] });
+  resolveJson(pt.pendingFetches[1], {});
   await promise;
   assert.match(pt.els.updated.textContent, /^updated /);
   assert.equal(pt.calls.renderTasksTab, 1);
@@ -56,7 +62,8 @@ test("pollTasksTab: the normal (non-hash) refresh path stamps #updated", async (
 test("pollTasksTab: the pendingHash restore path also stamps #updated", async () => {
   const pt = makePollTasksTab({ pendingHash: { tab: "tasks", uri: "ralphus:/SQUAD[x]" } });
   const promise = pt.pollTasksTab();
-  resolveJson(pt.pendingFetches[0], {});
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [] });
+  resolveJson(pt.pendingFetches[1], {});
   await promise;
   assert.match(pt.els.updated.textContent, /^updated /);
   assert.equal(pt.calls.ttScrollSelectionIntoView, 1);
@@ -66,7 +73,8 @@ test("pollTasksTab: the pendingHash restore path also stamps #updated", async ()
 test("pollTasksTab: a failed /api/pull-requests/index fetch still stamps #updated (transient, not a daemon-down signal)", async () => {
   const pt = makePollTasksTab();
   const promise = pt.pollTasksTab();
-  rejectFetch(pt.pendingFetches[0]);
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [] });
+  rejectFetch(pt.pendingFetches[1]);
   await promise;
   assert.match(pt.els.updated.textContent, /^updated /);
 });

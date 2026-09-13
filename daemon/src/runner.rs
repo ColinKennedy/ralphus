@@ -329,12 +329,33 @@ const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interact
 const TOOLS_SYSTEM_PROMPT: &str = "## Regarding Tools\nPrefer `rg` for shell searches; \
      use `grep` only when `rg` is unavailable or you need grep-specific \
      behavior. In shell examples, use `rg \"pattern\" .`.";
+// Deliberately not opt-out-able (no field lets a task/cell suppress this
+// paragraph): the tutor and the New Task modal already suggest a near-
+// identical "you're in a dedicated worktree" line as a *cell-authored*
+// `system_prompt`, but that's just a recommendation a task author (or an AI
+// generating the TOML) can omit or word away -- and a cell agent that treats
+// its worktree cwd as optional guidance rather than a hard boundary has in
+// practice wandered into this repository's own main checkout and modified it
+// mid-run, which is a much worse failure than the task itself failing. Full
+// enforcement would need real OS-level confinement (containers); until that
+// exists, restating the boundary here, unconditionally, is the cheapest
+// mitigation available. Redundant with a caller-authored `system_prompt` that
+// says the same thing (see the tutor's recommended layout) is fine -- the
+// repetition costs a little context, not correctness.
 const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unattended in a non-interactive \
      cell — no human is available to answer questions or approve a plan. \
      Never ask a clarifying question, never stop to present a plan for \
      confirmation, and never pause waiting for input. Make the most \
      reasonable judgment call yourself and continue until the task is \
-     complete.";
+     complete. Your working directory for this cell is fixed for the entire \
+     session — never `cd` to, read, or write any path outside it, even one \
+     that looks related or more familiar (such as this repository's main \
+     checkout); every file edit and git operation must happen inside the \
+     working directory you were given.\n\nYou are working in a dedicated git \
+     worktree of this project's repository, not its main checkout. Implement \
+     the work exactly as described and keep every change -- file edits, \
+     `git add`, commits, anything -- confined to this worktree; never touch \
+     the main checkout or any other worktree, even to look something up.";
 
 fn combine_system_prompts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     let combined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n");

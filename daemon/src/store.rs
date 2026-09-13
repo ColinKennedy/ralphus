@@ -642,6 +642,24 @@ pub(crate) struct WorktreeClaim {
     pub state: String,
 }
 
+/// One persisted cell or proof step whose `cwd` names a worktree, with
+/// exactly the fields `crate::tmux::session_name` needs to recompute the
+/// tmux session (and therefore pane-snapshot/terminal-log) name it ran
+/// under. Used by `crate::worktree_transcript_retirement` (RAL-348) to find
+/// every session that ever ran in a worktree that has just been retired.
+// `crate::worktree_transcript_retirement` doesn't exist yet -- this struct
+// and `Store::worktree_session_owners` are the store-layer half of RAL-348,
+// landing ahead of the retirement module that will call them. Remove this
+// once that module exists and calls `worktree_session_owners`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeSessionOwner {
+    pub squad_id: String,
+    pub task_name: String,
+    pub session_id: String,
+    pub cwd: String,
+}
+
 /// One review-worktree path and the timestamp of its owner's last activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GuardianWorktreeRecord {
@@ -2108,6 +2126,26 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER",
             "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER",
             "ALTER TABLE cells ADD COLUMN finished_at_ms INTEGER",
+            // Backfill for rows cancelled before `cancel_unfinished_nodes`
+            // stamped `finished_at_ms`: a task/cell left `cancelled` with a
+            // NULL `finished_at_ms` reads as still-running to the board (the
+            // details pane and the Tasks tab both treat a null
+            // `finished_at_ms` as "still live" and recompute the duration
+            // against the current time on every render). Backfill each such
+            // row from its own squad's `finished_at_ms` -- the moment the
+            // whole squad was cancelled is the moment its still-unfinished
+            // children effectively stopped too -- falling back to "now" for
+            // the rare row whose squad itself has no `finished_at_ms` (e.g.
+            // a squad cancelled before that column existed). Matches zero
+            // rows (a no-op) once every historical row has been repaired.
+            "UPDATE tasks SET finished_at_ms = COALESCE(
+                 (SELECT finished_at_ms FROM squads WHERE squads.id = tasks.squad_id),
+                 CAST(strftime('%s','now') AS INTEGER) * 1000
+             ) WHERE state='cancelled' AND finished_at_ms IS NULL",
+            "UPDATE cells SET finished_at_ms = COALESCE(
+                 (SELECT finished_at_ms FROM squads WHERE squads.id = cells.squad_id),
+                 CAST(strftime('%s','now') AS INTEGER) * 1000
+             ) WHERE state='cancelled' AND finished_at_ms IS NULL",
             // RAL-259: when a review branch's conflict-resolver agent (fix pass
             // or final-proof call) most recently began running, so the Review
             // Live View can show both when work began and how long it's been
@@ -3009,12 +3047,29 @@ impl Store {
     /// it will not re-run any node this flips.
     fn cancel_unfinished_nodes(&self, squad_id: &str) -> Result<()> {
         const UNFINISHED: &str = "('pending','running','failed')";
-        for table in ["cells", "tasks", "proofs"] {
+        let now = now_ms();
+        // `cells`/`tasks` also stamp `finished_at_ms` here, same as
+        // `set_cell_state`/`set_task_state` do on any other transition into a
+        // terminal state. Without it, a node that was `running` at cancel
+        // time keeps `finished_at_ms` NULL forever, and the board's "time
+        // running" display (which treats a null `finished_at_ms` as
+        // still-live) keeps counting it up in the running color even though
+        // it's cancelled and will never run again. `proofs` has no
+        // started_at_ms/finished_at_ms columns.
+        for table in ["cells", "tasks"] {
             self.conn.execute(
-                &format!("UPDATE {table} SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"),
-                params![squad_id],
+                &format!(
+                    "UPDATE {table} SET state='cancelled', finished_at_ms=? WHERE squad_id=? AND state IN {UNFINISHED}"
+                ),
+                params![now, squad_id],
             )?;
         }
+        self.conn.execute(
+            &format!(
+                "UPDATE proofs SET state='cancelled' WHERE squad_id=? AND state IN {UNFINISHED}"
+            ),
+            params![squad_id],
+        )?;
         Ok(())
     }
 
@@ -3348,6 +3403,33 @@ impl Store {
             &raw,
             proof_states.iter().map(String::as_str),
         )))
+    }
+
+    /// Raw (unfolded) states of every cell-scope proof step belonging to one
+    /// cell. Unlike [`Self::effective_state_for_cell`] -- which deliberately
+    /// treats a `cancelled` proof step as compatible with a `done` cell so
+    /// an operator's intentional Queue skip doesn't paint the board red --
+    /// a caller deciding whether a task *genuinely* finished with no
+    /// failures needs the true pass/fail semantics `run_proofs` itself
+    /// applies: a cancelled step forces the owning task Failed the same as
+    /// an outright failure does (see `run_proofs`'s `current_state ==
+    /// "cancelled"` branch), while an `ignored` one is a true no-op. Callers
+    /// wanting that stricter check should treat any `"cancelled"` entry
+    /// here as still-blocking regardless of what the effective cell state
+    /// reports.
+    pub(crate) fn cell_proof_states(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM proofs WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+        )?;
+        let states = stmt
+            .query_map(params![squad_id, task_idx, idx], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(states)
     }
 
     /// Current state of one task, or `None` if it doesn't exist. Same purpose
@@ -4534,6 +4616,52 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every persisted cell and proof step whose `cwd` names a worktree, with
+    /// enough identity (squad id, owning task's name, session id) to
+    /// recompute `crate::tmux::session_name` for it. A proof step's session
+    /// id mirrors the `proof-{scope}-{idx}` cell id `scheduler::run_proofs`
+    /// actually runs it under; a proof always runs "where its owning
+    /// cell/task does" (RAL-185), so it reuses that cell's `cwd` here too.
+    ///
+    /// Deliberately returns every row rather than filtering by a specific
+    /// `cwd` in SQL: `crate::worktree_transcript_retirement` matches paths
+    /// via `guardian_merge::normalized_worktree_path`, the same
+    /// canonicalizing comparison `retire_stale_worktrees` itself uses to
+    /// dedupe/match worktree paths, so the comparison needs to happen in Rust
+    /// on both sides either way.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    // Not called yet -- `crate::worktree_transcript_retirement` (RAL-348),
+    // this method's caller, doesn't exist yet. Remove this once it does.
+    #[allow(dead_code)]
+    pub(crate) fn worktree_session_owners(&self) -> Result<Vec<WorktreeSessionOwner>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.squad_id, t.name, c.sid, c.cwd
+             FROM cells c JOIN tasks t ON t.squad_id=c.squad_id AND t.idx=c.task_idx
+             WHERE c.cwd IS NOT NULL
+             UNION ALL
+             SELECT p.squad_id, t.name, 'proof-' || p.scope || '-' || p.idx, c.cwd
+             FROM proofs p
+             JOIN cells c ON c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+              AND ((p.scope='cell' AND c.idx=p.cell_idx) OR
+                   (p.scope='task' AND c.idx=(SELECT MIN(c2.idx) FROM cells c2
+                     WHERE c2.squad_id=p.squad_id AND c2.task_idx=p.task_idx)))
+             JOIN tasks t ON t.squad_id=p.squad_id AND t.idx=p.task_idx
+             WHERE c.cwd IS NOT NULL",
+        )?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(WorktreeSessionOwner {
+                    squad_id: r.get(0)?,
+                    task_name: r.get(1)?,
+                    session_id: r.get(2)?,
+                    cwd: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Forget a review path after git confirmed that worktree was removed.
     pub(crate) fn clear_guardian_worktree_path(&self, path: &str) -> Result<()> {
         self.conn.execute(
@@ -5620,6 +5748,79 @@ impl Store {
             );
             Ok(())
         }
+    }
+
+    /// Rename a task's display name in place. Purely cosmetic, unlike
+    /// `edit_task_fields`'s `"task"` edit kind: a name doesn't affect what
+    /// runs, so this never resets the squad back to Pending. Rewrites the
+    /// new name into any other same-squad task's `depends_on` that
+    /// referenced the old one, so within-squad dependency wiring survives
+    /// the rename. Used both by a direct user rename action and by the
+    /// Simple-tab auto-naming background job (`generation.rs`'s
+    /// `"task_name"` kind) once it resolves a suggested name.
+    pub fn rename_task(&self, squad_id: &str, task_idx: i64, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Err(StoreError::InvalidTransition(
+                "task name must not be empty".to_string(),
+            ));
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT idx, name, depends_on FROM tasks WHERE squad_id=?")?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((_, old_name, _)) = rows.iter().find(|(idx, _, _)| *idx == task_idx) else {
+            return Err(StoreError::NotFound);
+        };
+        if old_name == new_name {
+            return Ok(());
+        }
+        if rows
+            .iter()
+            .any(|(idx, name, _)| *idx != task_idx && name == new_name)
+        {
+            return Err(StoreError::InvalidTransition(format!(
+                "task name \"{new_name}\" is already used in this squad"
+            )));
+        }
+        let old_name = old_name.clone();
+        self.conn.execute(
+            "UPDATE tasks SET name=? WHERE squad_id=? AND idx=?",
+            params![new_name, squad_id, task_idx],
+        )?;
+        for (idx, _, deps_json) in &rows {
+            if *idx == task_idx {
+                continue;
+            }
+            let mut deps = from_json(deps_json);
+            if deps.iter().any(|d| d == &old_name) {
+                for d in &mut deps {
+                    if *d == old_name {
+                        *d = new_name.to_string();
+                    }
+                }
+                self.conn.execute(
+                    "UPDATE tasks SET depends_on=? WHERE squad_id=? AND idx=?",
+                    params![to_json(&deps), squad_id, idx],
+                )?;
+            }
+        }
+        let _ = self.notify_watchers(
+            crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+            &format!("squad:{squad_id}"),
+            crate::mailbox::MailboxPriority::Normal,
+            "task renamed",
+            Some(squad_id),
+        );
+        Ok(())
     }
 
     /// Edit a proof step's editable definition fields. A field the caller
@@ -9667,6 +9868,77 @@ name = "empty"
     }
 
     #[test]
+    fn cancel_stamps_finished_at_ms_on_nodes_it_flips_to_cancelled() {
+        // Regression: `cancel_unfinished_nodes` used to flip state via a raw
+        // bulk UPDATE that never touched `finished_at_ms`, so a task/cell
+        // that was genuinely `running` at cancel time was left with
+        // `finished_at_ms` NULL forever — and the board's "time running"
+        // display treats a null `finished_at_ms` as still-live, so a
+        // cancelled node kept counting up in the running color.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+
+        store.cancel(&id).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].state, "cancelled");
+        assert!(squad.tasks[0].finished_at_ms.is_some());
+        assert_eq!(squad.tasks[0].cells[0].state, "cancelled");
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_some());
+    }
+
+    #[test]
+    fn init_schema_backfills_finished_at_ms_on_legacy_cancelled_rows() {
+        // Regression: a task/cell cancelled before the
+        // `cancel_stamps_finished_at_ms_on_nodes_it_flips_to_cancelled` fix
+        // shipped is stuck with `state='cancelled'` and `finished_at_ms`
+        // NULL forever unless a schema migration backfills it -- the write
+        // path fix alone only prevents *new* occurrences, it doesn't repair
+        // rows already sitting in the database.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        store.set_squad_state(&id, SquadState::Running).unwrap();
+        store.set_task_state(&id, 0, NodeState::Running).unwrap();
+        store.set_cell_state(&id, 0, 0, NodeState::Running).unwrap();
+        // Simulate the pre-fix bug directly: flip to `cancelled` without
+        // stamping `finished_at_ms`, the way the old raw bulk UPDATE did.
+        store
+            .conn
+            .execute(
+                "UPDATE squads SET state='cancelled', finished_at_ms=? WHERE id=?",
+                params![777_i64, id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET state='cancelled' WHERE squad_id=?",
+                params![id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET state='cancelled' WHERE squad_id=?",
+                params![id],
+            )
+            .unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        assert!(squad.tasks[0].finished_at_ms.is_none());
+        assert!(squad.tasks[0].cells[0].finished_at_ms.is_none());
+
+        // Re-running schema init is what every daemon startup does; the
+        // backfill UPDATE it carries should repair the legacy rows in place.
+        store.init_schema().unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].finished_at_ms, Some(777));
+        assert_eq!(squad.tasks[0].cells[0].finished_at_ms, Some(777));
+    }
+
+    #[test]
     fn cancel_flips_already_failed_tasks_cells_and_proofs() {
         let mut store = Store::open_in_memory().unwrap();
         let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
@@ -13241,5 +13513,94 @@ command = "check-c"
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_task_renames_and_cascades_depends_on() {
+        let src = r#"
+[[task]]
+name = "a"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do a"
+
+[[task]]
+name = "b"
+depends_on = ["a"]
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do b"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+
+        store.rename_task(&id, 0, "renamed-a").unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].name, "renamed-a");
+        assert_eq!(
+            squad.tasks[1].depends_on,
+            vec!["renamed-a".to_string()],
+            "the sibling task's depends_on must follow the rename"
+        );
+    }
+
+    #[test]
+    fn rename_task_rejects_empty_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let err = store.rename_task(&id, 0, "   ").unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+    }
+
+    #[test]
+    fn rename_task_rejects_collision_with_a_sibling_task() {
+        let src = r#"
+[[task]]
+name = "a"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do a"
+
+[[task]]
+name = "b"
+[[task.cell]]
+id = "w"
+cwd = "/repo"
+prompt = "do b"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let err = store.rename_task(&id, 0, "b").unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+        // The rejected rename must not have partially applied.
+        assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "a");
+    }
+
+    #[test]
+    fn rename_task_unknown_squad_or_task_is_not_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.rename_task("squad-nope", 0, "x"),
+            Err(StoreError::NotFound)
+        ));
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert!(matches!(
+            store.rename_task(&id, 99, "x"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn rename_task_to_its_own_current_name_is_a_no_op() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store
+            .insert_squad(&parse(SAMPLE), Some("my squad"), false)
+            .unwrap();
+        store.rename_task(&id, 0, "build").unwrap();
+        assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "build");
     }
 }

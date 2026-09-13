@@ -14,7 +14,9 @@ use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
 use ralphus_daemon::cancel::{CancelToken, Cancellations};
 use ralphus_daemon::cartographer::CartographerFilter;
-use ralphus_daemon::guardian::{GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus};
+use ralphus_daemon::guardian::{
+    FeedbackActionStatus, GuardianAutoBuild, GuardianCheck, GuardianStatus, MergeStatus,
+};
 use ralphus_daemon::guardian_merge::{
     poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees, rebase_command_progress,
     rebase_on_manual_push, rebuild_on_base_shift, reopen_cancelled_guardian_merge,
@@ -959,6 +961,95 @@ fn feedback_edits_review_worktree_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// Regression for a real-world failure: a guardian whose base branch lives on
+/// a remote that isn't named `origin` (e.g. `alt/staging`) -- and which has
+/// no registered fork (RAL-338) -- previously had every feedback push
+/// (human-submitted or RAL-395 auto-fix) silently fail on its first attempt.
+/// `push_feedback_branch`'s own inference (`@{u}` of the review branch, then
+/// `remote.pushDefault`) has nothing to go on for a review branch's first
+/// feedback push -- its only prior push was the initial PR-stack push via
+/// `pr::push_ref`, which never sets `@{u}` -- so it fell through to a
+/// hardcoded `"origin"` that doesn't exist in this repo at all. `run_feedback`
+/// must instead fall back to the same base-branch-aware remote resolution
+/// (`forge::resolve_remote_name`) the initial PR-stack push already uses, so
+/// a feedback push actually lands on the same remote the review's PR lives
+/// on. This repo deliberately has no `origin` remote at all, so the old
+/// hardcoded fallback would fail outright rather than merely picking the
+/// wrong (but existing) remote.
+#[test]
+fn feedback_push_resolves_a_non_origin_base_branch_remote() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    // A remote named `alt` (not `origin`) is the review's actual home,
+    // mirroring `base_branch: alt/staging` in the field report -- no `origin`
+    // remote exists anywhere in this repo.
+    let alt_remote = temp_repo();
+    git(&alt_remote, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "alt", alt_remote.to_str().unwrap()],
+    );
+    git(&root, &["push", "alt", "main"]);
+    git(&root, &["fetch", "alt"]);
+
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        // `alt/main`, not `main` -- exercises `forge::resolve_remote_name`'s
+        // base-branch-prefix resolution, same as `base_branch: alt/staging`.
+        let id = g
+            .create_guardian("r", "alt/main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    run_feedback(
+        &store,
+        &FeedbackRunner,
+        &id,
+        &bid0,
+        "add a note file",
+        None,
+        false,
+        &CancelToken::never(),
+    );
+
+    let view = store.lock().unwrap().get_guardian(&id).unwrap();
+    let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
+    assert!(
+        detail0.starts_with("feedback applied") && detail0.contains("pushed"),
+        "feedback must have pushed successfully to the `alt` remote, got: {detail0:?}"
+    );
+
+    // Prove the commit actually landed on the bare `alt` remote, not just
+    // locally -- reading straight from the bare repo's own ref, not this
+    // worktree's local review branch.
+    let review0 = view.branches[0].review_branch.clone().unwrap();
+    let remote_files = git(&alt_remote, &["ls-tree", "-r", "--name-only", &review0]);
+    assert!(
+        remote_files.contains("note.txt"),
+        "the feedback commit must have been pushed to the alt remote: {remote_files:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&alt_remote);
+}
+
 /// RAL-395: `dispatch_pr_auto_fix` is not a different, stack-breaking code
 /// path from a human feedback round -- it funnels into the same
 /// `run_feedback`, so an auto-fix commit must fold into the review's linear
@@ -1095,6 +1186,111 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     assert_eq!(
         sha0, sha0_again,
         "no new commit from the no-op second dispatch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-395 addendum: `dispatch_pr_auto_fix` must post its feedback into the
+/// branch's feedback thread attributed to `ci_watch::AUTO_FIX_AUTHOR`, so the
+/// board can tell an automated CI-fix round apart from a human reviewer's own
+/// feedback -- and that message's completion checkmark must reflect the
+/// resolver's actual `RALPHUS_PROOF` verdict, exactly like a human-submitted
+/// round's does.
+#[test]
+fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
+    let root = temp_repo();
+    init_repo(&root);
+    // A real remote is required here, not just for the sibling tests below:
+    // `run_feedback` marks the reviewer message `Failed` whenever the
+    // resulting commit fails to push (see its `branch_status`/`push_error`
+    // handling), regardless of the resolver's own `RALPHUS_PROOF` verdict --
+    // without a remote, `push_feedback_branch` falls back to a hardcoded
+    // "origin" that doesn't exist, so the push errors and this test's own
+    // `Done` assertion below fails every time, deterministically.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock().unwrap();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().unwrap().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .unwrap()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(11),
+            Some("https://github.com/acme/w/pull/11"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+
+    let guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    let pr = store.lock().unwrap().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'build' failed".to_string(),
+        job_url: None,
+        log_text: None,
+    };
+    let runner = AutoFixRunner::new();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+
+    let messages = store
+        .lock()
+        .unwrap()
+        .guardian_branch_messages(&id, &bid0)
+        .unwrap();
+    assert_eq!(messages.len(), 1, "expected exactly one feedback message");
+    let msg = &messages[0];
+    assert_eq!(msg.role, "reviewer");
+    assert_eq!(
+        msg.author.as_deref(),
+        Some(ralphus_daemon::ci_watch::AUTO_FIX_AUTHOR),
+        "the feedback bubble must be attributed to the auto-fix system, not a person"
+    );
+    assert!(
+        msg.submitted_by.is_some(),
+        "an audit-only submitted_by identity must still be recorded"
+    );
+    assert_eq!(
+        msg.action_status.as_deref(),
+        Some(FeedbackActionStatus::Done.as_str()),
+        "a successful auto-fix (resolver passes, commit pushes cleanly) must mark the message done"
     );
 
     let _ = std::fs::remove_dir_all(&root);

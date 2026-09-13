@@ -23,6 +23,19 @@
        */
       const cvar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n) || "var(--muted)";
       /**
+       * A task's `name` is stored as a real, non-empty string at all times
+       * (it can't be null in the DB), so the Simple tab's automatic naming
+       * fallback (RAL-398) uses a recognizable placeholder --
+       * `pending-name-<slug>` -- for a task whose real name is still being
+       * decided by a background `POST .../suggest-name` call, rather than
+       * showing that internal placeholder as if it were a real name. Render
+       * any task/queue-item name through this before display; it passes an
+       * already-resolved name through unchanged.
+       * @param {string} name
+       * @returns {string}
+       */
+      const ntTaskDisplayName = (name) => (name && name.startsWith("pending-name-") ? "⏳ generating name… check back shortly" : name);
+      /**
        * Stamps the shared freshness indicator with the current time. Call from a
        * poller's success path, once that poller's own data has landed.
        * @returns {void}

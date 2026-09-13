@@ -32,6 +32,9 @@ const {
   ntSimpleSubmitAction,
   ntResolveDefaultTab,
   ntSanitizeSquadLabel,
+  extractTicketId,
+  slugifyTaskName,
+  ntResolveNaming,
 } = simpleTab;
 
 /** A minimal valid NtSimpleState, overridable per test. */
@@ -322,14 +325,64 @@ test("ntSanitizeSquadLabel passes an ordinary prompt through unchanged (aside fr
   assert.equal(ntSanitizeSquadLabel("fix the login bug"), "fix the login bug");
 });
 
-test("submitTaskSimple sanitizes the label before submitting, and retries with no label on an invalid_label response", () => {
+test("submitTaskSimple sanitizes the resolved naming label before submitting, and retries with no label on an invalid_label response", () => {
   const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
-  assert.match(fn, /ntSanitizeSquadLabel\(ntSimple\.prompt\)/, "the label sent to the daemon must be sanitized first");
+  assert.match(fn, /ntSanitizeSquadLabel\(naming\.squadLabel\)/, "the label sent to the daemon must be sanitized first (RAL-398: derived from ntResolveNaming, not always the raw prompt)");
   const invalidLabelAt = fn.indexOf('"invalid_label"');
   const retryAt = fn.indexOf("postSquad(null)");
   assert.ok(invalidLabelAt > -1 && retryAt > -1, "submitTaskSimple must retry with no label on an invalid_label response");
   assert.ok(invalidLabelAt < retryAt, "the invalid_label check must gate the no-label retry");
+});
+
+// ---------- Task/squad naming (RAL-398) ----------
+// A typed label wins outright; failing that, a ticket-id-shaped token found
+// in the prompt (instant, no LLM call); failing that, both are left
+// unresolved so the caller falls back to a placeholder name and asks the
+// daemon to suggest one in the background (POST .../suggest-name).
+
+test("extractTicketId finds common ticket-id shapes, case-insensitively", () => {
+  assert.equal(extractTicketId("fix ABC-1234 please"), "ABC-1234");
+  assert.equal(extractTicketId("see pipe-5163 for context"), "pipe-5163");
+  assert.equal(extractTicketId("ref dev_1234 in the title"), "dev_1234");
+  assert.equal(extractTicketId("FOO-980713-some_description needs work"), "FOO-980713-some_description");
+});
+
+test("extractTicketId returns null when no ticket-id-shaped token is present", () => {
+  assert.equal(extractTicketId("just a plain description of the work"), null);
+  assert.equal(extractTicketId(""), null);
+});
+
+test("slugifyTaskName lowercases and collapses non-alphanumeric runs to a single hyphen", () => {
+  assert.equal(slugifyTaskName("Add Retry Logic To Upload Client!"), "add-retry-logic-to-upload-client");
+  assert.equal(slugifyTaskName("PIPE-5163"), "pipe-5163");
+  assert.equal(slugifyTaskName("  --leading/trailing--  "), "leading-trailing");
+});
+
+test("slugifyTaskName caps length at 60 chars", () => {
+  const long = "word ".repeat(30);
+  assert.ok(slugifyTaskName(long).length <= 60);
+});
+
+test("ntResolveNaming prefers a typed label over a ticket id in the prompt", () => {
+  const result = ntResolveNaming("fix ABC-1234", "My Custom Label");
+  assert.equal(result.squadLabel, "My Custom Label");
+  assert.equal(result.taskName, "my-custom-label");
+  assert.equal(result.needsGeneration, false);
+});
+
+test("ntResolveNaming falls back to a ticket id in the prompt when no label is typed", () => {
+  const result = ntResolveNaming("fix PIPE-5163 in the uploader", "");
+  assert.equal(result.squadLabel, "PIPE-5163");
+  assert.equal(result.taskName, "pipe-5163");
+  assert.equal(result.needsGeneration, false);
+});
+
+test("ntResolveNaming requests generation when neither a label nor a ticket id is available", () => {
+  const result = ntResolveNaming("just fix the thing that's broken", "  ");
+  assert.equal(result.squadLabel, null);
+  assert.equal(result.taskName, null);
+  assert.equal(result.needsGeneration, true);
 });
 
 // ---------- New Task modal reopen/resubmit resets the form to defaults ----------

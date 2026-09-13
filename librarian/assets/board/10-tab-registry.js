@@ -16,10 +16,10 @@
       let triageCandidates = [];
       /**
        * Default (empty) filters for the Triage tab's candidate list.
-       * @returns {{type: string, project: string, q: string}}
+       * @returns {{type: string, project: Set<string>, q: string}}
        */
-      function defaultTriageCandidateFilters() { return { type: "", project: "", q: "" }; }
-      /** Client-side filters for the Triage tab's candidate list -- empty string means "no filter" for each field. */
+      function defaultTriageCandidateFilters() { return { type: "", project: new Set(), q: "" }; }
+      /** Client-side filters for the Triage tab's candidate list -- empty string/Set means "no filter" for each field. */
       let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
@@ -366,9 +366,9 @@
         jumpToTask(hit.squadId, hit.taskIdx, -1, "task");
       }
       /**
-       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean}}
+       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, project: Set<string>}}
        */
-      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false }; }
+      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false, project: new Set() }; }
       /**
        * @typedef {object} TaskTabFilters
        * @property {string} q
@@ -378,6 +378,7 @@
        * @property {boolean} showHidden - include tasks belonging to hidden squads
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
+       * @property {Set<string>} project - RAL-345: task project names to include; empty means "no filter" (every project shown)
        */
       /**
        * @returns {TaskTabFilters}
@@ -386,7 +387,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, project: new Set() }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -896,7 +897,8 @@
       }
       /**
        * Whether a built row survives the toolbar's filters (RAL-362 §2):
-       * name substring, status set, hidden-squad inclusion, and "needs me".
+       * name substring, status set, hidden-squad inclusion, "needs me", and
+       * project set (RAL-345; empty means every project passes).
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @param {Set<string>} hiddenSquadIds
@@ -908,6 +910,7 @@
         if (!filters.status.has(row.state)) return false;
         if (!filters.showHidden && hiddenSquadIds.has(row.squadId)) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
+        if (filters.project.size && !filters.project.has(row.task.project)) return false;
         return true;
       }
       /**

@@ -25,6 +25,7 @@ where one exists.
 | GET | `/api/daemon` | [Health/version probe](#get-apidaemon) |
 | POST | `/api/daemon/shutdown` | [Kill every spawned process and exit](#post-apidaemonshutdown) (`ralphus-daemon stop`) |
 | GET | `/api/tasks` | [Board state](#get-apitasks); `?status=&name=&sort=` filter/sort |
+| GET | `/api/task-index` | Compact cross-squad data for the flat Tasks tab |
 | GET | `/api/resources` | [Per-task CPU/RAM/GPU](#get-apiresources) |
 | GET | `/api/config/live-view` | [Live View "Show Debug Messages" default](#get-apiconfiglive-view-ral-232) (RAL-232) |
 | GET | `/api/config/templates` | [Simple task form's template picker](#get-apiconfigtemplates) (RAL-297) |
@@ -89,6 +90,8 @@ where one exists.
 | GET | *(each of the six `.../env` paths above)* | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that surface, secret values masked (RAL-324) |
 | POST | `/api/squads/{id}/tasks/{ti}/solo` | [Solo a task](#post-apisquadsidtaskstisolo) (RAL-157) — pauses every other task in the squad until un-soloed |
 | POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
+| POST | `/api/squads/{id}/tasks/{ti}/rename` | [Rename a task](#post-apisquadsidtaskstirename) (RAL-398) — purely cosmetic, unlike a `"task"`-kind edit |
+| POST | `/api/squads/{id}/tasks/{ti}/suggest-name` | [Auto-name a task/squad in the background](#post-apisquadsidtaskstisuggest-name) (RAL-398) — the Simple tab's naming fallback |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/terminal-ticket` | [Mint a one-shot ticket for the **remote** Open Agent terminal relay](#post-apisquadsidcellstisiterminal-ticket) (RAL-355 Phase 10) — a WebSocket alternative to `open-terminal?mode=agent` for cells running on a `machine`, since that route only ever spawns a window on the daemon's own desktop |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
@@ -1831,7 +1834,10 @@ is the registered user this feedback is attributed to — the only identity
 the board shows. `submitted_by` is the resolved authenticated/default
 requester who actually made the request; kept for audit/provenance only and
 never shown in the UI, and still just caller-claimed via `X-Ralphus-User`
-until RAL-252 makes authentication authoritative.
+until RAL-252 makes authentication authoritative. `action_status` (RAL-380,
+also omitted when unset) is `received`/`done`/`failed`/`superseded` — the
+source of a "reviewer"-role bubble's checkmark, set once `run_feedback`
+finishes acting on that message.
 
 Populated by `POST .../branches/{branch_id}/feedback`, body
 `{ "feedback": "...", "author"?: "alice" }`. `feedback` must be non-empty
@@ -1846,6 +1852,15 @@ follows in the background (`role: "guardian"`), generated via
 `chat_client::call_direct`. The board shows this thread only once a branch's
 detail view is expanded and it has at least one message — otherwise it shows
 a "No feedback yet" placeholder pointing at the `feedback` command above.
+
+The auto-fix dispatch a standing CI-status poll triggers when a guardian has
+opted into `auto_fix_pr_errors` (RAL-395, see the PR endpoints below) posts
+its own `role: "reviewer"` message into this same thread, attributed to
+`author: "PR Auto-Fix"` (`submitted_by: "guardian:ci-watch-auto-fix"`) instead
+of a person — this is the only way to tell an automated CI-fix round apart
+from one a human reviewer typed themselves. Its `action_status` resolves to
+`done`/`failed` from the resolver's own `RALPHUS_PROOF` verdict, exactly like
+a human-submitted round.
 
 ### `POST /api/guardians/{id}/pull-requests`
 Submit one or more PRs/MRs for a review (RAL-117). Body:
@@ -2309,6 +2324,15 @@ These are distinct from each `CellView`'s resolved `agent`/`model` fields;
 the board uses the raw task values to explain whether a cell's displayed
 resolved value came from the task or was set explicitly on the cell.
 
+### `GET /api/task-index`
+
+Compact cross-squad data for the flat Tasks tab. It has the same `daemon` and
+`squads` nesting needed by that table, but omits authored prompts, commands,
+system prompts, proof specifications, captured proof output, and configuration
+fields the table never renders. This keeps a historical board from repeatedly
+transferring multi-megabyte text blobs on tab entry. It is read-only and has no
+query parameters.
+
 `started_at_ms` (RAL-210) is epoch-ms local-machine time of the moment this
 cell most recently transitioned to `running`; omitted from the JSON
 (rather than `null`) until it has started at least once. A restart
@@ -2577,6 +2601,37 @@ squad or task index is a `404`; a non-integer `{ti}` is a `400`.
 Un-solo a task (RAL-157) — the reverse of
 [`POST /api/squads/{id}/tasks/{ti}/solo`](#post-apisquadsidtaskstisolo). Returns
 the refreshed `SquadView`. Idempotent; same error responses as `solo`.
+
+### `POST /api/squads/{id}/tasks/{ti}/rename`
+Rename a task's display name in place (RAL-398). Body: `{"name": "<new-name>"}`.
+Purely cosmetic — unlike a `"task"`-kind [`POST /api/squads/{id}/edit`](#post-apisquadsidedit),
+this never resets the squad back to Pending, since a name doesn't affect what
+runs. Rewrites the new name into any other same-squad task's `depends_on`
+that referenced the old one, so within-squad dependency wiring survives the
+rename. Returns the refreshed `SquadView` (`200`). `400` if the name is
+empty; `409` if another task in the squad already has that name; `404` for
+an unknown squad or task index.
+
+### `POST /api/squads/{id}/tasks/{ti}/suggest-name`
+The Simple tab's automatic naming fallback (RAL-398) for a prompt with no
+ticket-id-shaped token to name the task after — the common case (a token
+like `ABC-1234` in the prompt) is resolved entirely client-side by regex,
+with no LLM call and no request to this endpoint at all. Body:
+```json
+{"cwd": "...", "agent": "...", "model": "...", "prompt_context": "...", "fallback_name": "..."}
+```
+`model` is optional. Always `202`, immediately — this spawns a background
+thread (mirroring `POST /api/generate`'s fire-and-forget rationale) that runs
+one `"task_name"` generation call and, on success, renames the task and — if
+the squad's label is still unset — sets the squad's label too, both via
+direct store calls rather than the generic edit path (same rationale as
+`rename`: purely cosmetic, must not reset the squad to Pending). On failure
+(or an unusable result), the task is renamed to `fallback_name` instead, so
+it never gets stuck showing its `pending-name-...` placeholder forever.
+There is no poll endpoint for this job — the caller (a squad that was just
+created) has nothing useful to do with the result beyond what this endpoint
+already applies on its behalf, and the board picks up the renamed task/squad
+on its next regular poll.
 
 ### `POST /api/squads/{id}/cancel/preview`
 Dry-run preview of [`POST /api/squads/{id}/cancel`](#post-apisquadsidcancel)

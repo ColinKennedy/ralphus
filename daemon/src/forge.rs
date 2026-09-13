@@ -272,6 +272,26 @@ impl ForgeClient {
         &self.repo_path
     }
 
+    /// The `head` value to use when this client's own repo owns both the
+    /// branch and the PR/MR -- i.e. everywhere except the GitHub cross-repo
+    /// fork root, which already builds its own `owner:branch` head from the
+    /// fork's registered owner. GitHub's `pulls` list endpoint silently
+    /// ignores a bare branch name in its `head` filter (it returns every
+    /// open PR unfiltered instead of erroring or matching nothing), so a
+    /// same-repo GitHub head must still carry the `owner:` prefix or
+    /// [`Self::find_open_pull_request`] adopts an unrelated open PR;
+    /// GitLab's `source_branch` filter has no such requirement.
+    #[must_use]
+    pub fn same_repo_head(&self, alias: &str) -> String {
+        match self.kind {
+            ForgeKind::GitHub => {
+                let owner = self.repo_path.split('/').next().unwrap_or(&self.repo_path);
+                format!("{owner}:{alias}")
+            }
+            ForgeKind::GitLab => alias.to_string(),
+        }
+    }
+
     fn require_token(&self) -> Result<&str, String> {
         #[cfg(test)]
         if self.token.is_none() && self.api_base.starts_with("http://127.0.0.1:") {
@@ -763,6 +783,17 @@ impl ForgeClient {
     /// (`"blocked"`/`"behind"`), neither of which this poll can act on
     /// itself; a genuinely failing required check still surfaces via the
     /// check-runs scan below regardless of `mergeable_state`.
+    ///
+    /// After check-runs all report `completed`, this also consults the
+    /// legacy combined-status endpoint (`.../commits/{sha}/status`) as a
+    /// belt-and-suspenders check for the older commit-status API -- but that
+    /// endpoint's `state` defaults to `"pending"` whenever the commit has
+    /// zero legacy statuses at all (`total_count: 0`), which is the normal
+    /// case for any repo (like this one) whose CI reports exclusively
+    /// through the Checks API. That default must be told apart from a real
+    /// in-flight legacy status (`total_count > 0`) -- conflating them once
+    /// made every such PR report `Pending` forever, no matter how green its
+    /// check-runs were.
     fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
         let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
@@ -850,7 +881,22 @@ impl ForgeClient {
                 log_text: None,
             }));
         }
-        if status["state"].as_str() == Some("pending") {
+        // GitHub's combined-status endpoint defaults `state` to `"pending"`
+        // whenever the commit has zero legacy commit statuses at all
+        // (`total_count: 0`, `statuses: []`) -- this is GitHub's documented
+        // behavior for that endpoint, not a transient/in-flight signal. A repo
+        // whose CI reports exclusively through the Checks API (as this one
+        // does: every job above comes back as a check-run, never a legacy
+        // status) will *always* get `total_count: 0` here, so treating that
+        // default the same as a real pending status made every such PR stick
+        // at `Pending` forever -- the check-runs gate above had already
+        // confirmed everything completed, but this fallthrough overrode it on
+        // every poll. Only an actual pending legacy status (`total_count > 0`)
+        // should hold up the verdict; zero statuses means there is nothing
+        // more to check, so fall through to `Passing`.
+        if status["total_count"].as_i64().unwrap_or(0) > 0
+            && status["state"].as_str() == Some("pending")
+        {
             return Ok(PrCiState::Pending);
         }
 
@@ -2701,6 +2747,69 @@ mod tests {
     }
 
     #[test]
+    fn same_repo_head_prefixes_github_with_the_repos_own_owner() {
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "http://x".to_string(),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.same_repo_head("my-branch"), "acme:my-branch");
+    }
+
+    #[test]
+    fn same_repo_head_leaves_gitlab_head_bare() {
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "http://x".to_string(),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.same_repo_head("my-branch"), "my-branch");
+    }
+
+    #[test]
+    fn find_open_pull_request_with_a_bare_github_head_would_match_any_open_pr() {
+        // Regression guard for the bug this module's `same_repo_head` fixes:
+        // GitHub's documented `head` filter silently returns every open PR,
+        // unfiltered, when given a bare branch name instead of `owner:branch`
+        // -- it does NOT error and does NOT scope to the named branch. Any
+        // caller building a same-repo GitHub head must go through
+        // `same_repo_head`, never pass a bare branch name directly, or a
+        // "does a PR already exist for this branch" check silently adopts an
+        // unrelated open PR. This test pins that raw (buggy-if-relied-on)
+        // server behavior so a regression in `same_repo_head`'s callers is
+        // caught even though this call site itself is intentionally bare.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/repos/acme/widget/pulls");
+            assert!(query.contains("head=totally-unrelated-branch"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"number":2,"html_url":"http://x/2","base":{"ref":"staging"},"title":"unrelated","body":"unrelated"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let found = client
+            .find_open_pull_request("totally-unrelated-branch")
+            .unwrap()
+            .expect("bare head is ignored server-side and returns the unfiltered list");
+        assert_eq!(found.number, 2);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn forge_kind_detected_from_host() {
         assert_eq!(ForgeKind::from_host("github.com"), Some(ForgeKind::GitHub));
         assert_eq!(
@@ -3816,6 +3925,91 @@ mod tests {
             Some("tok".to_string()),
         );
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_passing_when_there_are_zero_legacy_statuses() {
+        // Regression test for a real false-permanently-pending bug: a repo
+        // whose CI reports exclusively through the Checks API (no legacy
+        // commit statuses ever set) gets `{"state": "pending", "total_count":
+        // 0}` from the combined-status endpoint forever, even after every
+        // check-run has completed successfully. That default must not be
+        // mistaken for a real in-flight legacy status.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "pending", "total_count": 0, "statuses": []}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_pending_when_a_legacy_status_is_actually_pending() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"check_runs": []}"#).with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "pending", "total_count": 1, "statuses": [{"state": "pending", "context": "legacy-ci"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
         handle.join().unwrap();
     }
 

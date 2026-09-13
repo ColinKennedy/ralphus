@@ -143,17 +143,25 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> std::result::Result<String, Str
 /// shows the change immediately) or the basis a separate PR branch was built
 /// from (whose own rebase is a different, already-existing concern).
 ///
-/// `fork_remote` (RAL-338): when `Some`, always pushes there, ignoring
-/// `@{upstream}`/`remote.pushDefault` entirely -- the project has a
-/// registered fork, and every review branch lives there regardless of what a
-/// prior `git push -u` may have set `@{upstream}` to (a stray push can
-/// rewrite it and cause the fork remote to be mistaken for the parent's; see
-/// this ticket's Risks section). When `None` (no registered fork), behavior
-/// is unchanged: the branch's already-configured upstream (`@{u}`) when one
-/// exists, else the git default remote (`remote.pushDefault`, else
-/// `"origin"`), pushing to a same-named remote branch and setting upstream
-/// tracking on that first push so later feedback pushes on this branch
-/// naturally follow `@{u}` from then on.
+/// `explicit_remote`: when `Some`, always pushes there, ignoring
+/// `@{upstream}`/`remote.pushDefault` entirely. The caller resolves this
+/// itself -- either the project's registered fork remote (RAL-338: every
+/// review branch lives there regardless of what a prior `git push -u` may
+/// have set `@{upstream}` to, since a stray push can rewrite it and cause the
+/// fork remote to be mistaken for the parent's; see that ticket's Risks
+/// section), or, lacking a registered fork, the same base-branch-aware
+/// resolution (`forge::resolve_remote_name`) the initial PR-stack push
+/// already uses (RAL-<new>: a repo whose base branch lives on a non-`origin`
+/// remote has no `@{u}` to infer from until a feedback push has already
+/// succeeded once through this very function, so relying on inference alone
+/// left the very first feedback push with nothing to go on but a hardcoded
+/// `"origin"` that may not exist). When `None` (should not normally happen
+/// given the caller always resolves one of the two), falls back to the
+/// branch's already-configured upstream (`@{u}`) when one exists, else the
+/// git default remote (`remote.pushDefault`, else `"origin"`), pushing to a
+/// same-named remote branch and setting upstream tracking on that first push
+/// so later feedback pushes on this branch naturally follow `@{u}` from then
+/// on.
 ///
 /// `force`: pass `false` when the local commit was `--amend`ed onto history
 /// the remote already has an older version of (the previous push already
@@ -168,10 +176,10 @@ pub(crate) fn push_feedback_branch(
     wt: &Workspace,
     local_branch: &str,
     force: bool,
-    fork_remote: Option<&str>,
+    explicit_remote: Option<&str>,
 ) -> std::result::Result<String, String> {
-    let (remote, remote_branch) = if let Some(fork_remote) = fork_remote {
-        (fork_remote.to_string(), local_branch.to_string())
+    let (remote, remote_branch) = if let Some(explicit_remote) = explicit_remote {
+        (explicit_remote.to_string(), local_branch.to_string())
     } else {
         match wt.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
             Ok(upstream) => {
@@ -4396,7 +4404,7 @@ fn staged_merge_pass(
                     id,
                     &bv.id,
                     &bv.branch,
-                    "branch is empty: it adds no changes over the branch beneath it in the stack.                      Its task most likely never committed its work -- check that cell, then re-run                      it. If this branch is meant to be empty, disable it to drop it from the stack.",
+                    EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
                 return StagedPassOutcome::Failed;
@@ -5009,7 +5017,7 @@ pub fn run_merge_cancellable(
                     id,
                     &ob.id,
                     &ob.branch,
-                    "branch is empty: it adds no changes over the branch beneath it in the stack.                      Its task most likely never committed its work -- check that cell, then re-run                      it. If this branch is meant to be empty, disable it to drop it from the stack.",
+                    EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
                 return;
@@ -5162,7 +5170,22 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         return;
                     }
                 }
-                let nothing = contributed_nothing(&wt, &combined_branch, "HEAD");
+                let nothing = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
+                if nothing {
+                    let _ = store
+                        .lock()
+                        .expect("poisoned")
+                        .set_branch_empty(id, &ob.id, true);
+                    fail_branch(
+                        store,
+                        id,
+                        &ob.id,
+                        &ob.branch,
+                        EMPTY_BRANCH_DETAIL,
+                        set_status,
+                    );
+                    return;
+                }
                 if let Err(e) = wt.git(&["checkout", "-B", &combined_branch, "HEAD"]) {
                     fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
                     return;
@@ -5619,9 +5642,31 @@ pub fn run_feedback(
         // RAL-338: resolve the fork remote explicitly, if this branch's
         // project has one registered, rather than letting
         // `push_feedback_branch` infer it through `@{upstream}`.
-        let fork_remote =
-            crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project));
-        match push_feedback_branch(&wt, &review_branch, !squash, fork_remote.as_deref()) {
+        //
+        // RAL-<new>: when there's no registered fork, fall back to the same
+        // base-branch-aware resolution the initial PR-stack push already
+        // uses (`forge::resolve_remote_name`) instead of leaving it to
+        // `push_feedback_branch`'s own `@{u}`/`remote.pushDefault` inference.
+        // That inference only succeeds once *this* function has itself
+        // pushed the branch before (its own prior call sets `@{u}` via
+        // `--set-upstream`) -- a review branch whose only prior push was the
+        // initial PR-stack push (which never sets `@{u}`) has neither, and a
+        // repo whose base branch lives on a non-`origin` remote (e.g.
+        // `alt/staging`) then falls through to a hardcoded `"origin"` that
+        // may not exist at all, silently failing every feedback push
+        // (human-submitted or RAL-395 auto-fix) until one succeeds by luck.
+        let push_remote =
+            crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project)).or_else(
+                || {
+                    let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
+                    Some(crate::forge::resolve_remote_name(
+                        Path::new(&branch_project),
+                        &base,
+                        &forge_cfg,
+                    ))
+                },
+            );
+        match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
             Ok(sha) => {
                 pushed = true;
                 pushed_sha = Some(sha);
@@ -5643,6 +5688,16 @@ pub fn run_feedback(
                 WARNING,
                 "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
             );
+            let guard = store.lock().expect("poisoned");
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    "feedback stash restore failed",
+                    serde_json::json!({"branch_id": branch_id, "stash_name": name, "error": e}),
+                );
         }
     }
     // RAL-241 follow-up: every path here previously reported the same
@@ -6866,6 +6921,25 @@ fn stack_pick(
         cancel,
     ) {
         Ok((outcome, session_id)) => {
+            // Readiness only says the source cell has finished. Once the
+            // rebase produces this review ref, it must still contribute a
+            // diff over its predecessor before it can become terminal or
+            // queue a PR.
+            if review_ref_has_no_changes(wt, newbase, rev) {
+                let _ = store
+                    .lock()
+                    .expect("poisoned")
+                    .set_branch_empty(id, branch_id, true);
+                fail_branch(
+                    store,
+                    id,
+                    branch_id,
+                    feature_branch,
+                    EMPTY_BRANCH_DETAIL,
+                    &set_status,
+                );
+                return Err(());
+            }
             let (status, detail): (MergeStatus, Option<String>) = match outcome {
                 RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
                 // RAL-168: proofed but no conflict occurred -- still `Done`.
@@ -6874,7 +6948,7 @@ fn stack_pick(
                     MergeStatus::Done,
                     // Surface a branch that added nothing over the base rather than
                     // reporting a silent, work-free "done".
-                    contributed_nothing(wt, newbase, rev)
+                    review_ref_has_no_changes(wt, newbase, rev)
                         .then(|| "no new commits over base (already merged?)".to_string()),
                 ),
             };
@@ -7291,6 +7365,16 @@ fn fetch_branch_for_remote_cell(
     Ok(())
 }
 
+/// Shared `fail_branch` detail for every empty-branch detection in this file
+/// (`staged_merge_pass`'s two `note_if_branch_is_empty` call sites, and
+/// `stack_pick`/`run_merge_shared`'s own post-rebase `review_ref_has_no_changes`
+/// checks) -- previously the latter two inlined a shorter, escape-hatch-free
+/// message that drifted from this one, which a reviewer hitting that exact
+/// path had no way to know about.
+const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the branch beneath it in the stack. \
+     Its task most likely never committed its work -- check that cell, then re-run it. \
+     If this branch is meant to be empty, disable it to drop it from the stack.";
+
 /// Flag a branch whose *own, pre-rebase* commits added nothing over `upstream`
 /// (RAL-190). Returns whether it is empty.
 ///
@@ -7581,7 +7665,7 @@ fn cleanup_review_worktrees(
 /// accumulation in a daemon that runs for months.
 pub(crate) const WORKTREE_RETIREMENT_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
-fn normalized_worktree_path(path: &Path) -> String {
+pub(crate) fn normalized_worktree_path(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
@@ -7631,6 +7715,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         let claims = match guard.worktree_claims() {
             Ok(claims) => claims,
             Err(error) => {
+                // ralphus[ignore-rlog-pair]: transient snapshot read diagnostic; actual retirement emits its structured outcome
                 crate::rlog!(
                     WARNING,
                     "ralphus [guardian] worktree claim snapshot failed: {error}"
@@ -7656,6 +7741,25 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
             records_by_path.insert(key, record);
         }
     }
+    // `normalized path -> every claim at that path`, built once (O(claims))
+    // instead of the `claims.iter().find(...)` linear scan this loop used to
+    // run per stale candidate.
+    let mut claims_by_path: HashMap<String, Vec<&crate::store::WorktreeClaim>> = HashMap::new();
+    for claim in &claims {
+        claims_by_path
+            .entry(normalized_worktree_path(Path::new(&claim.path)))
+            .or_default()
+            .push(claim);
+    }
+    // `git worktree list --porcelain` root -> its normalized registered
+    // paths, populated once per distinct project root the first time a
+    // candidate needs it, and reused for every later candidate sharing that
+    // root. Previously this ran fresh for EVERY stale candidate just to
+    // confirm that one path is still registered -- O(candidates * worktree
+    // count) `git` subprocess calls on a project whose total worktree count
+    // (this repo has accumulated 638) already makes a single such call take
+    // several seconds.
+    let mut registered_by_root: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     for (key, record) in records_by_path {
         if record.last_activity_ms > cutoff {
             continue;
@@ -7673,18 +7777,27 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         ) {
             continue;
         }
-        let registered = root
-            .git(&["worktree", "list", "--porcelain"])
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .any(|path| normalized_worktree_path(Path::new(path.trim())) == key);
+        let root_key = root.root().to_path_buf();
+        if !registered_by_root.contains_key(&root_key) {
+            let listed = root
+                .git(&["worktree", "list", "--porcelain"])
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .map(|path| normalized_worktree_path(Path::new(path.trim())))
+                .collect();
+            registered_by_root.insert(root_key.clone(), listed);
+        }
+        let registered = registered_by_root
+            .get(&root_key)
+            .is_some_and(|paths| paths.contains(&key));
         if !registered {
             continue;
         }
-        let active_claim = claims.iter().find(|claim| {
-            normalized_worktree_path(Path::new(&claim.path)) == key
-                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        let active_claim = claims_by_path.get(&key).and_then(|at_path| {
+            at_path
+                .iter()
+                .find(|claim| !terminal_worktree_claim(&claim.kind, &claim.state))
         });
         if let Some(claim) = active_claim {
             let guard = store.lock().expect("poisoned");
@@ -7971,6 +8084,17 @@ pub(crate) fn worktree_retirement_view(
     // the last branch's worktree, so one path commonly has two rows; the
     // newest activity wins. Keyed on the normalized path, matching how
     // retirement dedups and how claims are matched.
+    //
+    // `normalized_worktree_path` calls `std::fs::canonicalize` -- a real
+    // filesystem syscall -- so every path below is normalized exactly once
+    // (here, and in the two index-building loops just after) and reused via
+    // `records_by_path`'s own keys, `retirements_by_key`, and
+    // `claims_by_path`. The previous version recomputed it inside a linear
+    // `.find()` over the *entire* retirements/claims list for every single
+    // record -- O(records * (retirements + claims)) syscalls -- which is
+    // what made this view take well over a minute, freezing every other
+    // endpoint meanwhile (this runs under the daemon's global store lock),
+    // once this project accumulated a few hundred worktrees of history.
     let mut records_by_path: HashMap<String, crate::store::GuardianWorktreeRecord> = HashMap::new();
     for record in records {
         let key = normalized_worktree_path(Path::new(&record.path));
@@ -7985,9 +8109,37 @@ pub(crate) fn worktree_retirement_view(
         }
     }
 
+    // `(guardian_id, normalized path) -> first non-"retired" retirement row`
+    // -- one O(retirements) pass, preserving `.find()`'s original
+    // first-match-wins semantics via `entry(...).or_insert(...)`.
+    let mut retirements_by_key: HashMap<
+        (String, String),
+        &crate::store::GuardianWorktreeRetirementRecord,
+    > = HashMap::new();
+    for r in &retirements {
+        if r.status == "retired" {
+            continue;
+        }
+        let key = (
+            r.guardian_id.clone(),
+            normalized_worktree_path(Path::new(&r.path)),
+        );
+        retirements_by_key.entry(key).or_insert(r);
+    }
+
+    // `normalized path -> every claim at that path`, so the per-entry
+    // "first non-terminal claim" lookup below scans only that path's
+    // (typically tiny) claim list instead of every claim in the project.
+    let mut claims_by_path: HashMap<String, Vec<&crate::store::WorktreeClaim>> = HashMap::new();
+    for claim in &claims {
+        claims_by_path
+            .entry(normalized_worktree_path(Path::new(&claim.path)))
+            .or_default()
+            .push(claim);
+    }
+
     let mut entries = Vec::with_capacity(records_by_path.len());
-    for record in records_by_path.values() {
-        let key = normalized_worktree_path(Path::new(&record.path));
+    for (key, record) in &records_by_path {
         let eligible_at_ms = record
             .last_activity_ms
             .saturating_add(WORKTREE_RETIREMENT_AGE_MS);
@@ -7995,14 +8147,11 @@ pub(crate) fn worktree_retirement_view(
         // this exact (guardian, path) pair wins over the derived live states
         // -- it is the newest fact the sweep recorded, and it stays until an
         // attempt succeeds (RAL-386 widened this beyond just `failed`).
-        let pending = retirements.iter().find(|r| {
-            r.guardian_id == record.guardian_id
-                && r.status != "retired"
-                && normalized_worktree_path(Path::new(&r.path)) == key
-        });
-        let active_claim = claims.iter().find(|claim| {
-            normalized_worktree_path(Path::new(&claim.path)) == key
-                && !terminal_worktree_claim(&claim.kind, &claim.state)
+        let pending = retirements_by_key.get(&(record.guardian_id.clone(), key.clone()));
+        let active_claim = claims_by_path.get(key).and_then(|at_path| {
+            at_path
+                .iter()
+                .find(|claim| !terminal_worktree_claim(&claim.kind, &claim.state))
         });
         let (state, claim_kind, claim_owner, claim_state, error, last_attempt_ms, retry_at_ms) =
             if let Some(p) = pending {
@@ -8522,7 +8671,7 @@ fn drive_rebase(
             // rebased cleanly -- not just one whose conflicts the agent
             // resolved -- as long as it actually contributed real changes (a
             // true no-op always skips the proof call, no setting needed).
-            let nothing = contributed_nothing(wt, newbase, branch_arg);
+            let nothing = review_ref_has_no_changes(wt, newbase, branch_arg);
             if nothing || !gate.allows_for_clean_branch() {
                 return Ok((RebaseOutcome::Clean, None));
             }
@@ -8651,10 +8800,8 @@ fn squash_review_commits(
     Ok(())
 }
 
-/// Whether a just-built review branch (`rev`) contributed no commits over
-/// `newbase` — i.e. all of the feature's changes were already present. Returned
-/// as a branch detail so a silently-empty stack entry is surfaced, not hidden.
-fn contributed_nothing(wt: &Workspace, newbase: &str, rev: &str) -> bool {
+/// Whether a just-built review branch (`rev`) has no commits over `newbase`.
+fn review_ref_has_no_changes(wt: &Workspace, newbase: &str, rev: &str) -> bool {
     let range = format!("{newbase}..{rev}");
     wt.git(&["rev-list", "--count", &range])
         .ok()
@@ -12422,6 +12569,23 @@ mod tests {
         assert!(
             store.lock().unwrap().get_guardian(&id).unwrap().branches[0].is_empty,
             "a branch with no diff over its base must be flagged empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn review_ref_with_no_diff_is_not_terminal_work() {
+        let (base, repo, _fwt) = make_repo("resolved-empty-review-ref");
+        let wt = Workspace::local(&repo);
+
+        assert!(
+            review_ref_has_no_changes(&wt, "main", "main"),
+            "a review ref equal to its predecessor has no PRable diff"
+        );
+        assert!(
+            !review_ref_has_no_changes(&wt, "main", "feature/a"),
+            "a review ref with commits remains terminal work"
         );
 
         let _ = std::fs::remove_dir_all(&base);

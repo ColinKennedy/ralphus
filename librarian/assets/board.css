@@ -96,6 +96,11 @@
       .chip.active { color: var(--text); border-color: var(--accent); }
       .newtask { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 10px; font-weight: 600; }
       .status-filters label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-right: 6px; }
+      /* RAL-345: project filter chip -- same bordered-chip idiom as .chip/.sel-tab, but the
+         remove "x" sits on the left per the ticket's interview decision (label-list chips elsewhere in the app put it on the right). */
+      .filter-chip { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px 3px 6px; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+      .filter-chip .x { color: var(--muted); cursor: pointer; }
+      .filter-chip .x:hover { color: var(--danger); }
 
       .squad-item { padding: 9px 12px; border-left: 3px solid transparent; border-bottom: 1px solid var(--border); cursor: pointer; }
       .squad-item:hover { background: var(--panel-2); }
@@ -300,8 +305,8 @@
       .tt-sort-caret.desc { transform: rotate(180deg); }
       .tt-meatball { opacity: .55; cursor: pointer; padding: 0 3px; border-radius: 4px; margin-left: auto; }
       .tt-meatball:hover { opacity: 1 !important; background: var(--panel-2); }
-      .tt-col-resize { position: absolute; right: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
-      .tt-col-resize:hover, .tt-col-resize.dragging { background: var(--accent); opacity: .5; }
+      .tt-col-resize { position: absolute; right: 0; top: 0; bottom: 0; width: 12px; cursor: col-resize; z-index: 2; background: transparent; transition: background .12s; }
+      .tt-col-resize:hover, .tt-col-resize.dragging { background: var(--accent); }
       .tt-body { position: relative; }
       .tt-row { display: grid; grid-template-columns: var(--tt-grid, 1fr); border-bottom: 1px solid var(--border); align-items: center; cursor: pointer; position: absolute; left: 0; right: 0; }
       .tt-row:hover { background: var(--panel-2); }

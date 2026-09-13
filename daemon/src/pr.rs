@@ -3333,7 +3333,7 @@ fn fork_aware_route(
         }
         crate::forge::ForgeKind::GitHub => Ok(crate::forge::PrRoute {
             client: routing.fork_client.clone(),
-            head: alias.to_string(),
+            head: routing.fork_client.same_repo_head(alias),
             base: computed_base.to_string(),
             target_project_id: None,
             repo: routing.fork_client.repo_label().to_string(),
@@ -3635,7 +3635,7 @@ fn submit_stacked_branch_pr(
         Some(routing) => fork_aware_route(routing, &alias, &base, base_branch_name)?,
         None => crate::forge::PrRoute {
             client: client.clone(),
-            head: alias.clone(),
+            head: client.same_repo_head(&alias),
             base: base.clone(),
             target_project_id: None,
             repo: client.repo_label().to_string(),
@@ -3791,10 +3791,26 @@ enum StackAction {
 /// every enabled branch that now has an open PR (existing + just-created),
 /// as `(branch_id, position, pr_number)`, in any order.
 /// `recorded_stack` is the guardian's previously-registered native stack and
-/// its live ordered member PR numbers, if any.
+/// its live ordered member PR numbers, if any. `chain_is_valid` is whether
+/// this guardian's locally-resynced PR rows already form a valid bottom-to-top
+/// base-ref chain (RAL-401 follow-up) -- see [`ordered_prs_form_a_chain`]'s
+/// caller. GitHub's stack API rejects `create`/`add`/rebuild-`create` calls
+/// whenever the chain isn't valid yet (e.g. a mid-stack branch was just
+/// disabled and downstream bases haven't finished repointing around it), and
+/// `Rebuild` in particular starts by dissolving whatever stack is currently
+/// registered -- attempting it against a chain we already know is broken
+/// would tear down a working stack only to fail to replace it, leaving the
+/// review fully unstacked on the forge until a later pass happens to retry
+/// (RAL-401 follow-up: this is what actually happened, confirmed against
+/// both the daemon log and GitHub's own "added to stack / removed from
+/// stack" PR timeline). Skipping here instead costs nothing: the review
+/// keeps whatever stack registration it already has (however stale) and the
+/// next reconcile pass -- run again on every terminal branch transition --
+/// retries once the chain is actually consistent.
 fn decide_stack_action(
     all_branches_with_prs: &[(String, i64, i64)],
     recorded_stack: Option<(i64, Vec<i64>)>,
+    chain_is_valid: bool,
 ) -> StackAction {
     let mut all_ordered: Vec<(i64, i64)> = all_branches_with_prs
         .iter()
@@ -3808,11 +3824,23 @@ fn decide_stack_action(
         };
     }
     match recorded_stack {
-        None => StackAction::Create { all_ordered },
+        None => {
+            if !chain_is_valid {
+                return StackAction::Skip {
+                    reason: "base-ref chain isn't fully resynced yet; postponing native stack registration until it is",
+                };
+            }
+            StackAction::Create { all_ordered }
+        }
         Some((stack_number, members)) => {
             if members == all_ordered {
                 return StackAction::Skip {
                     reason: "native stack already matches the review PR order",
+                };
+            }
+            if !chain_is_valid {
+                return StackAction::Skip {
+                    reason: "base-ref chain isn't fully resynced yet; leaving the existing native stack alone until it is",
                 };
             }
             if all_ordered.starts_with(&members) {
@@ -3828,6 +3856,20 @@ fn decide_stack_action(
             }
         }
     }
+}
+
+/// Whether `ordered_prs` (bottom-to-top, one entry per stack member) already
+/// forms a valid GitHub PR-stack chain per our own locally-resynced records:
+/// every PR's `base_ref` equal to the previous PR's pushed `branch_alias`.
+/// Pure and independent of API calls -- it trusts the same `base_ref` values
+/// [`resync_pr_bases_synchronously`] just confirmed the forge accepted
+/// (RAL-279's `last_pushed_base_ref` invariant), so it can tell "still
+/// mid-cascade" apart from "ready" without an extra round trip, and without
+/// ever having to discover a broken chain via a failed forge call.
+fn ordered_prs_form_a_chain(ordered_prs: &[&PullRequestView]) -> bool {
+    ordered_prs
+        .windows(2)
+        .all(|w| w[1].base_ref == w[0].branch_alias)
 }
 
 /// Re-checks each already-recorded "open" PR's *live* state on the forge
@@ -4066,6 +4108,23 @@ fn reconcile_native_pr_stack(
             Some((branch.id.clone(), branch.position, number))
         })
         .collect();
+    // `ordered_enabled` is already position-sorted (every caller sorts it
+    // before passing it in), so this filter_map preserves bottom-to-top
+    // order without a separate sort -- exactly the order `ordered_prs_form_a_chain`
+    // needs to check each PR's base against the previous one's pushed branch.
+    let ordered_prs: Vec<&PullRequestView> = ordered_enabled
+        .iter()
+        .filter_map(|branch| {
+            let pr_view = already_open.get(branch.id.as_str()).copied()?;
+            if let Some(routing) = fork_routing {
+                if pr_view.repo != routing.fork_client.repo_label() {
+                    return None;
+                }
+            }
+            pr_view.pr_number.is_some().then_some(pr_view)
+        })
+        .collect();
+    let chain_is_valid = ordered_prs_form_a_chain(&ordered_prs);
 
     let recorded = store
         .lock()
@@ -4097,7 +4156,7 @@ fn reconcile_native_pr_stack(
         },
         None => None,
     };
-    match decide_stack_action(&all_with_prs, recorded) {
+    match decide_stack_action(&all_with_prs, recorded, chain_is_valid) {
         StackAction::Create { all_ordered } => {
             match create_and_record_native_stack(store, id, client, &all_ordered) {
                 Ok(Some(stack_number)) => {
@@ -4105,6 +4164,20 @@ fn reconcile_native_pr_stack(
                         INFO,
                         "ralphus [pr] review {id} registered github pr stack number={stack_number}"
                     );
+                    let guard = store.lock().expect("poisoned");
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::INFO,
+                        source: "pr",
+                        message: "registered github pr stack",
+                        scope: Some("guardian"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({"stack_number": stack_number}),
+                        admin_only: false,
+                    });
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -4343,10 +4416,28 @@ pub fn maybe_auto_submit_branch(
     }
     match auto_submit_terminal_branches(store, runner, id) {
         Ok(_) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack completed"
+            );
             let _ = store
                 .lock()
                 .expect("poisoned")
                 .set_branch_auto_submit_error(id, branch_id, None);
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "pr",
+                message: "auto-submit completed",
+                scope: Some("branch"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"branch_id": branch_id}),
+                admin_only: false,
+            });
         }
         Err(e) => {
             crate::rlog!(
@@ -4357,6 +4448,20 @@ pub fn maybe_auto_submit_branch(
                 .lock()
                 .expect("poisoned")
                 .set_branch_auto_submit_error(id, branch_id, Some(&e));
+            let guard = store.lock().expect("poisoned");
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "auto-submit failed",
+                scope: Some("branch"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"branch_id": branch_id, "error": e.to_string()}),
+                admin_only: false,
+            });
         }
     }
 }
@@ -4368,10 +4473,11 @@ const AUTO_SUBMIT_DEBOUNCE_MS: i64 = 400;
 /// Queue a guardian for asynchronous PR-stack submission. The durable row is
 /// guardian-scoped; the worker reads the terminal branches fresh when it runs.
 pub(crate) fn schedule_auto_submit_branch(store: &Arc<Mutex<Store>>, id: &str, branch_id: &str) {
+    let requested_at_ms = now_ms();
     if let Err(e) = store
         .lock()
         .expect("poisoned")
-        .request_auto_submit_branch(id, now_ms())
+        .request_auto_submit_branch(id, requested_at_ms)
     {
         crate::rlog!(
             WARNING,
@@ -4389,6 +4495,25 @@ pub(crate) fn schedule_auto_submit_branch(store: &Arc<Mutex<Store>>, id: &str, b
             task: None,
             log_path: None,
             payload: serde_json::json!({"branch_id": branch_id, "error": e.to_string()}),
+            admin_only: false,
+        });
+    } else {
+        crate::rlog!(
+            INFO,
+            "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack queued"
+        );
+        let guard = store.lock().expect("poisoned");
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "pr",
+            message: "auto-submit queued",
+            scope: Some("branch"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"branch_id": branch_id, "requested_at_ms": requested_at_ms}),
             admin_only: false,
         });
     }
@@ -5763,11 +5888,64 @@ mod tests {
         );
     }
 
+    fn test_pr(branch_alias: &str, base_ref: &str) -> PullRequestView {
+        PullRequestView {
+            id: "pr-test".to_string(),
+            guardian_id: "guardian-test".to_string(),
+            branch_id: None,
+            forge: "github".to_string(),
+            repo: "o/r".to_string(),
+            branch_alias: branch_alias.to_string(),
+            base_ref: base_ref.to_string(),
+            title: String::new(),
+            description: String::new(),
+            pr_number: Some(1),
+            pr_url: None,
+            state: "open".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_pushed_sha: None,
+            last_pushed_base_ref: None,
+            stack_id: None,
+            dropped_reason: None,
+            superseded_by: None,
+            ci_status: None,
+            ci_failure_job_url: None,
+            auto_fix_attempted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ordered_prs_form_a_chain_accepts_a_valid_bottom_to_top_chain() {
+        let a = test_pr("a-review", "main");
+        let b = test_pr("b-review", "a-review");
+        let c = test_pr("c-review", "b-review");
+        assert!(ordered_prs_form_a_chain(&[&a, &b, &c]));
+    }
+
+    #[test]
+    fn ordered_prs_form_a_chain_rejects_a_gap_left_by_a_disabled_branch() {
+        // `c`'s base still points at a branch that no longer precedes it in
+        // the stack -- exactly the mid-cascade state a just-disabled branch
+        // leaves until resync repoints it.
+        let a = test_pr("a-review", "main");
+        let b = test_pr("b-review", "a-review");
+        let c = test_pr("c-review", "disabled-review");
+        assert!(!ordered_prs_form_a_chain(&[&a, &b, &c]));
+    }
+
+    #[test]
+    fn ordered_prs_form_a_chain_accepts_fewer_than_two_prs() {
+        let a = test_pr("a-review", "main");
+        assert!(ordered_prs_form_a_chain(&[&a]));
+        assert!(ordered_prs_form_a_chain(&[]));
+    }
+
     #[test]
     fn decide_stack_action_creates_once_two_prs_exist() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         assert_eq!(
-            decide_stack_action(&prs, None),
+            decide_stack_action(&prs, None, true),
             StackAction::Create {
                 all_ordered: vec![3, 6]
             }
@@ -5778,7 +5956,7 @@ mod tests {
     fn decide_stack_action_skips_a_single_pr() {
         let prs = vec![("b-a".to_string(), 0, 3)];
         assert_eq!(
-            decide_stack_action(&prs, None),
+            decide_stack_action(&prs, None, true),
             StackAction::Skip {
                 reason: "fewer than 2 PRs in the stack"
             }
@@ -5793,7 +5971,7 @@ mod tests {
             ("b-c".to_string(), 2, 9),
         ];
         assert_eq!(
-            decide_stack_action(&prs, Some((42, vec![3, 6]))),
+            decide_stack_action(&prs, Some((42, vec![3, 6])), true),
             StackAction::Append {
                 stack_number: 42,
                 missing_ordered: vec![9],
@@ -5810,7 +5988,7 @@ mod tests {
             ("b-c".to_string(), 2, 9),
         ];
         assert_eq!(
-            decide_stack_action(&prs, Some((42, vec![3, 9]))),
+            decide_stack_action(&prs, Some((42, vec![3, 9])), true),
             StackAction::Rebuild {
                 stack_number: 42,
                 all_ordered: vec![3, 6, 9]
@@ -5822,7 +6000,7 @@ mod tests {
     fn decide_stack_action_skips_when_recorded_stack_already_matches() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         assert_eq!(
-            decide_stack_action(&prs, Some((42, vec![3, 6]))),
+            decide_stack_action(&prs, Some((42, vec![3, 6])), true),
             StackAction::Skip {
                 reason: "native stack already matches the review PR order"
             }
@@ -5833,9 +6011,47 @@ mod tests {
     fn decide_stack_action_repairs_an_unrecorded_stack_when_nothing_is_new() {
         let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
         assert_eq!(
-            decide_stack_action(&prs, None),
+            decide_stack_action(&prs, None, true),
             StackAction::Create {
                 all_ordered: vec![3, 6]
+            }
+        );
+    }
+
+    /// RAL-401 follow-up: a mid-stack branch disable (or any other cause)
+    /// leaving downstream base refs mid-cascade must never be treated as
+    /// "create a fresh stack" -- GitHub would reject it anyway, but checking
+    /// locally first means ralphus never has to find that out by touching
+    /// the forge at all.
+    #[test]
+    fn decide_stack_action_skips_create_when_chain_is_not_yet_valid() {
+        let prs = vec![("b-a".to_string(), 0, 3), ("b-b".to_string(), 1, 6)];
+        assert_eq!(
+            decide_stack_action(&prs, None, false),
+            StackAction::Skip {
+                reason: "base-ref chain isn't fully resynced yet; postponing native stack registration until it is"
+            }
+        );
+    }
+
+    /// RAL-401 follow-up: this is the core fix. Previously a stale-looking
+    /// recorded stack plus an inconsistent chain led straight to `Rebuild`,
+    /// which dissolves the existing (still working) native stack before
+    /// attempting to recreate it -- if the chain is genuinely still
+    /// mid-cascade, that recreate fails and the review is left completely
+    /// unstacked until a later pass happens to retry. Skipping instead keeps
+    /// the old (stale but real) stack registration intact.
+    #[test]
+    fn decide_stack_action_skips_rebuild_when_chain_is_not_yet_valid() {
+        let prs = vec![
+            ("b-a".to_string(), 0, 3),
+            ("b-b".to_string(), 1, 6),
+            ("b-c".to_string(), 2, 9),
+        ];
+        assert_eq!(
+            decide_stack_action(&prs, Some((42, vec![3, 9])), false),
+            StackAction::Skip {
+                reason: "base-ref chain isn't fully resynced yet; leaving the existing native stack alone until it is"
             }
         );
     }
@@ -8819,14 +9035,18 @@ mod tests {
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
 
-            // Branch b: fork-internal PR based on a's own alias.
+            // Branch b: fork-internal PR based on a's own alias. Still a
+            // same-repo (alice/widget) head, but GitHub's `head` filter
+            // silently ignores a bare branch name (see
+            // `ForgeClient::same_repo_head`), so even a fork-internal head
+            // must carry the fork's own `owner:` prefix.
             let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
-            assert_eq!(payload["head"], serde_json::json!("b-alias"));
+            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
 
             // Branch c: fork-internal PR based on b's own alias.
             let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
-            assert_eq!(payload["head"], serde_json::json!("c-alias"));
+            assert_eq!(payload["head"], serde_json::json!("alice:c-alias"));
             assert_eq!(payload["base"], serde_json::json!("b-alias"));
         });
 

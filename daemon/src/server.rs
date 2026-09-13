@@ -602,6 +602,146 @@ struct Board {
     squads: Vec<crate::store::SquadView>,
 }
 
+/// The compact board representation used exclusively by the flat Tasks tab.
+/// It excludes prompt and proof text the table never renders.
+#[derive(Serialize)]
+struct TaskIndexBoard {
+    daemon: DaemonStatus,
+    squads: Vec<TaskIndexSquad>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexSquad {
+    id: String,
+    label: Option<String>,
+    state: String,
+    tasks: Vec<TaskIndexTask>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexTask {
+    name: String,
+    project: String,
+    agent: Option<String>,
+    model: Option<String>,
+    state: String,
+    error: Option<String>,
+    cells: Vec<TaskIndexCell>,
+    proof: Vec<TaskIndexProof>,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexCell {
+    id: String,
+    name: Option<String>,
+    agent: String,
+    model: Option<String>,
+    state: String,
+    tokens_in: i64,
+    tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    compaction_input_tokens: i64,
+    compaction_count: i64,
+    cost_usd: f64,
+    cost_is_estimated: bool,
+    error: Option<String>,
+    proof: Vec<TaskIndexProof>,
+    reviews: Vec<crate::store::SquadReviewRef>,
+    triage_types: Vec<String>,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct TaskIndexProof {
+    id: Option<String>,
+    kind: String,
+    state: String,
+    tokens_in: i64,
+    tokens_out: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    compaction_input_tokens: i64,
+    compaction_count: i64,
+    cost_usd: f64,
+    cost_is_estimated: bool,
+}
+
+impl From<crate::store::ProofView> for TaskIndexProof {
+    fn from(value: crate::store::ProofView) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            state: value.state,
+            tokens_in: value.tokens_in,
+            tokens_out: value.tokens_out,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            compaction_input_tokens: value.compaction_input_tokens,
+            compaction_count: value.compaction_count,
+            cost_usd: value.cost_usd,
+            cost_is_estimated: value.cost_is_estimated,
+        }
+    }
+}
+
+impl From<crate::store::CellView> for TaskIndexCell {
+    fn from(value: crate::store::CellView) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            agent: value.agent,
+            model: value.model,
+            state: value.state,
+            tokens_in: value.tokens_in,
+            tokens_out: value.tokens_out,
+            cache_creation_tokens: value.cache_creation_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            compaction_input_tokens: value.compaction_input_tokens,
+            compaction_count: value.compaction_count,
+            cost_usd: value.cost_usd,
+            cost_is_estimated: value.cost_is_estimated,
+            error: value.error,
+            proof: value.proof.into_iter().map(Into::into).collect(),
+            reviews: value.reviews,
+            triage_types: value.triage_types,
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+impl From<crate::store::TaskView> for TaskIndexTask {
+    fn from(value: crate::store::TaskView) -> Self {
+        Self {
+            name: value.name,
+            project: value.project,
+            agent: value.agent,
+            model: value.model,
+            state: value.state,
+            error: value.error,
+            cells: value.cells.into_iter().map(Into::into).collect(),
+            proof: value.proof.into_iter().map(Into::into).collect(),
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+impl From<crate::store::SquadView> for TaskIndexSquad {
+    fn from(value: crate::store::SquadView) -> Self {
+        Self {
+            id: value.id,
+            label: value.label,
+            state: value.state,
+            tasks: value.tasks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ResourcesResponse {
     resources: Vec<crate::resources::ResourceRow>,
@@ -667,6 +807,7 @@ fn route_for_user(
         // like every other route.
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
         ("GET", ["api", "tasks"]) => board(daemon, query),
+        ("GET", ["api", "task-index"]) => task_index(daemon),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
         // for every user, not just admins. Only the mutating registration
@@ -930,6 +1071,12 @@ fn route_for_user(
         }
         ("POST", ["api", "squads", id, "tasks", ti, "restart"]) => {
             restart_task(daemon, id, ti, body)
+        }
+        ("POST", ["api", "squads", id, "tasks", ti, "rename"]) => {
+            rename_task_route(daemon, id, ti, body)
+        }
+        ("POST", ["api", "squads", id, "tasks", ti, "suggest-name"]) => {
+            suggest_task_name(daemon, id, ti, body)
         }
         ("POST", ["api", "squads", id, "env"]) => set_squad_env(daemon, id, body),
         // RAL-324: each `POST .../env` route below has a read-only `GET` twin
@@ -1287,6 +1434,7 @@ fn route_for_user(
             guardian_list_pr_stacks(daemon, id)
         }
         ("GET", ["api", "pull-requests"]) => pr_find(daemon, query),
+        ("GET", ["api", "pull-requests", "index"]) => pr_index(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
@@ -1494,6 +1642,49 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
         }
         Err(e) => store_error(&e),
     }
+}
+
+/// Compact cross-squad task data for the Tasks tab, with stage timings that
+/// separate store-lock contention, view construction, and serialization.
+fn task_index(daemon: &Daemon) -> Reply {
+    let lock_started = Instant::now();
+    let store = daemon.lock();
+    let lock_wait_ms = lock_started.elapsed().as_millis();
+    let view_started = Instant::now();
+    let squads = match store.list_squads() {
+        Ok(squads) => squads,
+        Err(e) => return store_error(&e),
+    };
+    let view_ms = view_started.elapsed().as_millis();
+    let running = daemon.sem.in_use();
+    let running_reviews = store
+        .merging_guardians()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name)| RunningReviewItem { id, name })
+        .collect();
+    drop(store);
+    let response = TaskIndexBoard {
+        daemon: DaemonStatus {
+            running,
+            max_concurrent: daemon.max_concurrent,
+            running_reviews,
+            downtime_active: crate::config::scheduler_in_downtime(),
+        },
+        squads: squads.into_iter().map(Into::into).collect(),
+    };
+    let serialize_started = Instant::now();
+    let reply = json(200, &response);
+    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
+    crate::rlog!(
+        INFO,
+        "ralphus [performance] task-index lock_wait={}ms view={}ms serialize={}ms bytes={}",
+        lock_wait_ms,
+        view_ms,
+        serialize_started.elapsed().as_millis(),
+        reply.body.len()
+    );
+    reply
 }
 
 /// Per-task resource usage for every running cell with a live subprocess
@@ -3799,6 +3990,46 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         }
     }
 
+    // RAL-<pending>: fetch every registered-remote project's bare
+    // `?upstream=`/declared review `upstream` BEFORE taking the long-held
+    // lock below -- `git fetch` is a real network call (bounded to
+    // `GIT_TIMEOUT`, but that's still up to a minute against a dead
+    // remote), and the daemon's single global `Mutex<Store>` must never be
+    // held for that long: `store` below stays locked for the rest of this
+    // submit, including `derive_reviews`, so every other request (every
+    // board read, every other squad's dispatch) would otherwise queue
+    // behind this one submission for as long as the fetch takes. See
+    // `crate::worktrees::resolve_placeholders_with_prefetch`'s doc comment
+    // for the full picture, including why a miss here still resolves
+    // correctly (just not for free).
+    let prefetched_upstreams = {
+        let guard = daemon.lock();
+        let targets = crate::reviews::collect_remote_upstream_prefetch_targets(&guard, &file);
+        drop(guard);
+        let mut resolved = std::collections::HashMap::new();
+        for (project, upstream) in targets {
+            match crate::worktrees::resolve_registered_remote_upstream(
+                std::path::Path::new(&project.path),
+                &project,
+                &upstream,
+            ) {
+                Ok(remote_upstream) => {
+                    resolved.insert((project.name.clone(), upstream), remote_upstream);
+                }
+                // Not fatal here -- the locked pass below retries the same
+                // fetch live and surfaces the real error through the normal
+                // validation-failure path if it's still broken.
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [submit] could not prefetch \"?upstream={upstream}\" for project \
+                     \"{}\": {e}",
+                    project.name
+                ),
+            }
+        }
+        resolved
+    };
+
     let mut store = daemon.lock();
     let squad_id = match store.insert_squad(&file, req.label.as_deref(), req.hold) {
         Ok(id) => id,
@@ -3880,7 +4111,12 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
 
     // Derive per-project review guardians. A preflight failure (bad worktree, no
     // upstream for a `<<upstream>>` base) rolls the squad back and rejects the submit.
-    if let Err(e) = crate::reviews::derive_reviews(&store, &squad_id, &file) {
+    if let Err(e) = crate::reviews::derive_reviews_with_prefetch(
+        &store,
+        &squad_id,
+        &file,
+        &prefetched_upstreams,
+    ) {
         let _ = store.delete_squad(&squad_id);
         return error(400, "review_preflight_failed", &e.message, vec![]);
     }
@@ -4864,6 +5100,136 @@ fn unsolo_task(daemon: &Daemon, id: &str, ti: &str) -> Reply {
         },
         Err(e) => store_error(&e),
     }
+}
+
+#[derive(Deserialize)]
+struct RenameTaskBody {
+    name: String,
+}
+
+/// `POST /api/squads/{id}/tasks/{ti}/rename` (RAL-398): rename a task's
+/// display name in place, via [`crate::store::Store::rename_task`]. Purely
+/// cosmetic — unlike a `"task"`-kind `POST .../edit`, this never resets the
+/// squad back to Pending. Body: `{"name": "<new-name>"}`. Returns the
+/// refreshed [`SquadView`].
+fn rename_task_route(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let Ok(req) = serde_json::from_str::<RenameTaskBody>(body) else {
+        return error(400, "bad_request", "invalid rename body", vec![]);
+    };
+    let guard = daemon.lock();
+    match guard.rename_task(id, task_idx, &req.name) {
+        Ok(()) => match guard.get_squad(id) {
+            Ok(squad) => json(200, &squad),
+            Err(e) => store_error(&e),
+        },
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SuggestNameBody {
+    cwd: String,
+    agent: String,
+    #[serde(default)]
+    model: Option<String>,
+    prompt_context: String,
+    /// The name to rename the task to if the LLM call fails or produces an
+    /// unusable result — the Simple tab passes its own `simple-<random>`
+    /// worktree-branch slug, so a failure here still ends the placeholder
+    /// state rather than leaving it stuck forever.
+    fallback_name: String,
+}
+
+/// `POST /api/squads/{id}/tasks/{ti}/suggest-name` (RAL-398): the Simple
+/// tab's automatic naming fallback for a prompt with no ticket-id-shaped
+/// token to name the task after (`extractTicketId` in
+/// `55-new-task-modal.js` handles the common case entirely client-side,
+/// with no LLM call at all). Spawns a background thread that runs one
+/// `"task_name"` generation call and, on success, renames the task and — if
+/// the squad's label is still unset — sets the squad's label too, both via
+/// direct store calls rather than the generic edit path (same rationale as
+/// [`rename_task_route`]: purely cosmetic, must not reset the squad to
+/// Pending). Mirrors `generate_start`'s fire-and-forget-plus-poll rationale
+/// for why this can't block the accept loop — except here there is no poll
+/// endpoint, since the caller (a squad that was just created) has nothing
+/// useful to do with the result beyond what this endpoint already applies
+/// on its behalf; the board picks up the renamed task/squad on its next
+/// regular poll. Always `202`, even for an unknown squad/task index — the
+/// background thread's `rename_task` failure is logged and otherwise
+/// swallowed, since there is no synchronous caller left to report it to.
+fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
+    let Ok(task_idx) = ti.parse::<i64>() else {
+        return error(400, "bad_request", "task index must be an integer", vec![]);
+    };
+    let req: SuggestNameBody = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid suggest-name request body: {e}"),
+                vec![],
+            );
+        }
+    };
+    let squad_id = id.to_string();
+    let store = daemon.store_handle();
+    let cancellations = daemon.cancellations_handle();
+    let cancel_id = format!("suggest-name-{squad_id}-{task_idx}");
+    std::thread::spawn(move || {
+        let token = cancellations.register(&cancel_id);
+        let gen_req = crate::generation::GenerateRequest {
+            kind: "task_name".to_string(),
+            cwd: req.cwd,
+            agent: req.agent,
+            model: req.model,
+            prompt_context: req.prompt_context,
+        };
+        let result = crate::generation::run_generation(&gen_req, &token);
+        cancellations.remove(&cancel_id);
+        let (name, label) = match result {
+            crate::generation::GenerationJob::Done { items } if !items.is_empty() => {
+                let item = &items[0];
+                match crate::generation::slugify_task_name(&item.value) {
+                    Some(slug) => (slug, Some(item.label.clone())),
+                    None => (req.fallback_name.clone(), None),
+                }
+            }
+            _ => (req.fallback_name.clone(), None),
+        };
+        let guard = store.lock().expect("store mutex poisoned");
+        if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [naming] suggest-name rename failed squad={squad_id} task_idx={task_idx}: {e}"
+            );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "naming",
+                message: "suggest-name rename failed",
+                scope: Some("task"),
+                squad_id: Some(&squad_id),
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"task_idx": task_idx, "error": e.to_string()}),
+                admin_only: false,
+            });
+        }
+        if let Some(label) = label {
+            let already_labeled = guard
+                .get_squad(&squad_id)
+                .is_ok_and(|s| s.label.as_deref().is_some_and(|l| !l.is_empty()));
+            if !already_labeled {
+                let _ = guard.edit_squad_label(&squad_id, Some(&label));
+            }
+        }
+    });
+    json(202, &serde_json::json!({}))
 }
 
 #[derive(Deserialize)]
@@ -9312,10 +9678,40 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
         let _ = store.reconcile_squad_cancellation(id);
     }
-    match store.get_squad(id) {
+    let reply = match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
+    };
+    // A manual `done` override on a task/cell/proof step is invisible to the
+    // scheduler's own task-completion path (`run_task_finalizer`'s
+    // `try_start_ready_reviews_for_task` call) for the same RAL-315 reason
+    // the cancellation reconcile above exists: this request happens outside
+    // that loop entirely. Without this, a review branch fed by the
+    // just-fixed cell only got promoted to `ready` once the periodic
+    // maintenance sweep's straggler pass eventually noticed -- not
+    // immediately, the way a natural completion does. `store` must be
+    // dropped first: `try_start_ready_reviews_for_task` locks the same
+    // mutex itself.
+    if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
+        drop(store);
+        let store_handle = daemon.store_handle();
+        let cells = store_handle
+            .lock()
+            .expect("store mutex poisoned")
+            .cells_of(id);
+        if let Ok(cells) = cells {
+            crate::scheduler::try_start_ready_reviews_for_task(
+                &store_handle,
+                id,
+                &cells,
+                req.task_idx,
+                &daemon.semaphore_handle(),
+                &daemon.summary_queue_handle(),
+                &daemon.cancellations_handle(),
+            );
+        }
     }
+    reply
 }
 
 // ── Queue (RAL Queue) ────────────────────────────────────────────────────────
@@ -10417,6 +10813,14 @@ fn guardian_list_pr_stacks(daemon: &Daemon, id: &str) -> Reply {
 fn pr_get(daemon: &Daemon, pr_id: &str) -> Reply {
     match daemon.lock().get_pull_request(pr_id) {
         Ok(pr) => json(200, &pr),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Compact PR/MR rows keyed back to their source task for the Tasks tab.
+fn pr_index(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_pull_requests_index() {
+        Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
 }
@@ -12068,6 +12472,25 @@ fn resolve_cors(request: &tiny_http::Request) -> ralphus_core::cors::CorsDecisio
 /// the global `Mutex<Store>` low.
 const READ_WORKERS: usize = 12;
 
+/// How many mutating (non-`GET`) requests the daemon answers concurrently.
+///
+/// Exactly 1, deliberately: mutating handlers must stay totally ordered
+/// (see [`ReadPool`]'s doc comment on why GETs alone get real concurrency),
+/// so this exists only to get them OFF the accept loop, never to
+/// parallelize them -- [`ReadPool`] with one worker gives exactly that: a
+/// single dedicated thread draining requests strictly in arrival order,
+/// same as the accept loop answering them inline used to.
+///
+/// Without this, a mutating handler that takes real wall-clock time --
+/// e.g. `POST /api/squads` fetching a registered project's remote upstream
+/// (`resolve_registered_remote_upstream`'s `git fetch`, RAL-<pending>) --
+/// blocks the accept loop from ever calling `Server::recv()` again for
+/// that whole duration. `Server::recv()` is also how brand-new connections
+/// get noticed at all (GETs dispatched to `ReadPool` only need the accept
+/// loop free to accept THEM in the first place), so one slow mutation used
+/// to freeze the *entire* HTTP API, not just other mutations.
+const WRITE_WORKERS: usize = 1;
+
 /// Handler wall time at or above which a request is logged as slow.
 ///
 /// One second is well past anything the API is expected to take -- the
@@ -12234,6 +12657,7 @@ enum HttpLoopEnd {
 
 fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
     let read_pool = ReadPool::new(daemon, READ_WORKERS);
+    let write_pool = ReadPool::new(daemon, WRITE_WORKERS);
     loop {
         let mut request = match server.recv() {
             Ok(r) => r,
@@ -12351,9 +12775,19 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             cors,
             accepted_at: Instant::now(),
         };
-        // Read-only requests go to the pool so a slow one cannot stall the
-        // accept loop; everything that mutates state is answered right here,
-        // keeping mutating requests totally ordered. See `ReadPool`.
+        // Read-only requests go to `read_pool` (real concurrency, see
+        // `ReadPool`'s doc comment); mutating requests go to `write_pool`
+        // (exactly one worker, so they stay totally ordered exactly like
+        // answering them inline used to -- see `WRITE_WORKERS`'s doc
+        // comment for why they still can't run on the accept loop itself).
+        //
+        // `POST /api/daemon/shutdown` is the one exception, answered inline
+        // as before: this loop's very next statement polls
+        // `daemon.shutdown_requested()` to decide whether to keep serving,
+        // which only works if the flag it sets has already been set by the
+        // time that poll runs -- true when the accept loop itself just ran
+        // the handler, not guaranteed if a `write_pool` worker is still
+        // mid-flight on a separate thread.
         if pending.method == "GET" {
             // `dispatch` only hands the request back if every worker thread
             // is gone (they all panicked); answering it inline then is
@@ -12361,8 +12795,12 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             if let Some(returned) = read_pool.dispatch(pending) {
                 answer_request(daemon, returned);
             }
-        } else {
+        } else if pending.method == "POST"
+            && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
+        {
             answer_request(daemon, pending);
+        } else if let Some(returned) = write_pool.dispatch(pending) {
+            answer_request(daemon, returned);
         }
         // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
         // Breaking here — rather than calling `server.unblock()` — is
@@ -13032,6 +13470,21 @@ mod tests {
         assert_eq!(board.status, 200);
         assert!(board.body.contains("\"max_concurrent\":0"));
         assert!(board.body.contains("\"running\":0"));
+    }
+
+    #[test]
+    fn task_index_omits_authored_and_captured_text() {
+        let d = daemon();
+        let body = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"private prompt\"\n[[task.cell.proof]]\ncommand=\"private proof\"\n";
+        let submitted = route(&d, "POST", "/api/squads", &submit_body(body));
+        assert_eq!(submitted.status, 201, "{}", submitted.body);
+
+        let index = route(&d, "GET", "/api/task-index", "");
+        assert_eq!(index.status, 200, "{}", index.body);
+        assert!(index.body.contains("\"name\":\"t\""));
+        assert!(!index.body.contains("private prompt"));
+        assert!(!index.body.contains("private proof"));
+        assert!(!index.body.contains("\"system_prompt\""));
     }
 
     // ── Project registry (RAL-100) ───────────────────────────────────────────
@@ -14245,6 +14698,61 @@ machine=\"incredibuild:B\"
         );
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("spans two machines"), "{}", r.body);
+    }
+
+    #[test]
+    fn manual_cell_done_override_promotes_a_ready_review_branch_immediately() {
+        // RAL-<new>: a manual `set-status` (RAL-74) bypasses the scheduler's
+        // own task-completion path entirely, so before this fix a review
+        // branch fed by the just-fixed cell only got promoted to `ready`
+        // once the periodic maintenance sweep's straggler pass eventually
+        // noticed -- not immediately, the way a natural completion does.
+        let d = daemon();
+        let repo = tmp_git_repo("manual-done-review-ready");
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+                    [[review]]\nid=\"r\"\nskip_auto_build=true\n";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap().to_string();
+
+        let gid = d.lock().guardians_for_squad(&squad_id).unwrap()[0].clone();
+        assert_eq!(
+            d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending",
+            "branch must not already be ready before the cell finishes"
+        );
+
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "done"
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/set-status"),
+            &body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        assert_eq!(
+            d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+            "ready",
+            "a manual cell `done` override must promote the review branch \
+             immediately, not only once the periodic maintenance sweep \
+             eventually notices"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -16598,6 +17106,98 @@ command = "true"
             "POST",
             "/api/squads/squad-000000000001/tasks/nope/solo",
             "",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn rename_task_route_renames_and_returns_refreshed_squad() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            r#"{"name": "pipe-5163-add-retry-logic"}"#,
+        );
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["tasks"][0]["name"], "pipe-5163-add-retry-logic");
+    }
+
+    #[test]
+    fn rename_task_route_duplicate_name_is_conflict() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(TWO_TASKS));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            r#"{"name": "b"}"#,
+        );
+        assert_eq!(r.status, 409);
+    }
+
+    #[test]
+    fn rename_task_route_unknown_squad_is_not_found() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-nope/tasks/0/rename",
+            r#"{"name": "x"}"#,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn rename_task_route_non_integer_index_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/nope/rename",
+            r#"{"name": "x"}"#,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn rename_task_route_invalid_body_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/rename",
+            "not json",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn suggest_task_name_non_integer_index_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/nope/suggest-name",
+            r#"{"cwd":".","agent":"claude","prompt_context":"do it","fallback_name":"fallback"}"#,
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn suggest_task_name_invalid_body_is_bad_request() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/tasks/0/suggest-name",
+            "not json",
         );
         assert_eq!(r.status, 400);
     }
@@ -20235,6 +20835,32 @@ command = "true"
         assert_eq!(updated.status, 200);
         assert!(updated.body.contains("\"pr_number\":43"));
         assert!(updated.body.contains("\"state\":\"closed\""));
+    }
+
+    #[test]
+    fn pr_index_lists_recorded_pull_requests() {
+        let d = daemon();
+        let guardian_id = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &guardian_id,
+                None,
+                "github",
+                "acme/widget",
+                "feature/task-index",
+                "main",
+                "Task index",
+                "",
+                Some(42),
+                Some("https://github.com/acme/widget/pull/42"),
+            )
+            .unwrap();
+
+        let reply = route(&d, "GET", "/api/pull-requests/index", "");
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(reply.body.contains(&pr_id));
+        assert!(reply.body.contains("\"pr_number\":42"));
     }
 
     #[test]

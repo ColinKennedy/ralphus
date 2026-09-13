@@ -21,7 +21,10 @@
 //! up after [`MAX_WATCH_DURATION`]. It persists every poll's outcome
 //! (`crate::pr::PullRequestView::ci_status`) and, when the guardian has
 //! opted into `auto_fix_pr_errors`, dispatches [`dispatch_pr_auto_fix`] on a
-//! freshly observed failure.
+//! freshly observed failure. That dispatch posts its own feedback message
+//! into the branch's feedback thread, attributed to [`AUTO_FIX_AUTHOR`]
+//! rather than any human reviewer, so it reads as its own provenance in the
+//! board's chat thread instead of blending in with a person's own feedback.
 //!
 //! There is no new tracking type here: a PR is already reachable from a
 //! review worktree via the `guardian_id`/`branch_id` pair
@@ -535,14 +538,27 @@ fn write_ci_failure_log(worktree: &str, log_text: &str) -> Option<PathBuf> {
     std::fs::write(&path, log_text).ok().map(|()| path)
 }
 
+/// Attributed `author` (RAL-379 semantics) for the feedback message
+/// [`dispatch_pr_auto_fix`] posts to a branch's feedback thread -- the same
+/// field a human reviewer's name renders from, so the board shows this round
+/// came from the auto-fix system rather than a person.
+pub const AUTO_FIX_AUTHOR: &str = "PR Auto-Fix";
+
+/// Audit-only `submitted_by` value (RAL-379 semantics: never rendered) paired
+/// with [`AUTO_FIX_AUTHOR`], identifying the subsystem that posted the message.
+const AUTO_FIX_SUBMITTED_BY: &str = "guardian:ci-watch-auto-fix";
+
 /// Dispatch the review's agent to fix a failing PR/MR (RAL-395): composes the
 /// auto-fix prompt (project/per-review template, `<<prompt>>` replaced by the
 /// failing branch's own Cells' prompts, `{insert URL here}` replaced by the
-/// PR's URL when present) and runs it through `guardian_merge::run_feedback`
-/// with `require_proof: true`, gating success/failure specifically on the
-/// agent's own `RALPHUS_PROOF` verdict (interview Q7) rather than
-/// `run_feedback`'s own `Done`/`Failed` distinction, which doesn't tell
-/// "agent fixed it" apart from "agent gave up without erroring".
+/// PR's URL when present), posts it to the branch's feedback thread
+/// (`guardian::MessageView`) attributed to [`AUTO_FIX_AUTHOR`] so it's visibly
+/// distinct from human-authored feedback, and runs it through
+/// `guardian_merge::run_feedback` with `require_proof: true`, gating
+/// success/failure specifically on the agent's own `RALPHUS_PROOF` verdict
+/// (interview Q7) rather than `run_feedback`'s own `Done`/`Failed`
+/// distinction, which doesn't tell "agent fixed it" apart from "agent gave up
+/// without erroring".
 ///
 /// No-ops when `auto_fix_pr_errors` isn't enabled for this guardian, or when
 /// auto-fix was already attempted for this PR's *current* failure (single
@@ -661,6 +677,32 @@ pub fn dispatch_pr_auto_fix(
         &prompt_body,
     );
 
+    // RAL-395 addendum: post this round into the branch's feedback thread
+    // the same way `guardian_merge::start_feedback` does for a human
+    // reviewer, attributed to `AUTO_FIX_AUTHOR` instead of a person -- so the
+    // board's chat thread shows *who* asked for this change, not just that
+    // one happened. Superseding any still-`received` pending message first
+    // mirrors `start_feedback`'s own invariant: an older bubble must never
+    // read as in-progress once this round has overtaken it. Best-effort --
+    // a message-store failure must never block the fix itself from running.
+    let _ = store
+        .lock()
+        .expect("poisoned")
+        .supersede_pending_branch_feedback(&guardian.id, &branch_id);
+    let message_seq = store
+        .lock()
+        .expect("poisoned")
+        .add_guardian_message(
+            &guardian.id,
+            "reviewer",
+            &feedback,
+            None,
+            Some(&branch_id),
+            Some(AUTO_FIX_AUTHOR),
+            Some(AUTO_FIX_SUBMITTED_BY),
+        )
+        .ok();
+
     log_ci_watch(
         store,
         &guardian.id,
@@ -680,7 +722,7 @@ pub fn dispatch_pr_auto_fix(
         &guardian.id,
         &branch_id,
         &feedback,
-        None,
+        message_seq,
         true,
         &CancelToken::never(),
     );

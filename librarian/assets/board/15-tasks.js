@@ -32,14 +32,23 @@
       /**
        * Polls the Tasks tab's one additional endpoint (RAL-362 §1) and
        * re-renders. `squads` itself is kept current by the shared
-       * `updateCounter()` call `tick()` already makes before this, so this
-       * is the only extra daemon request rendering the tab adds.
+       * `/api/task-index` provides exactly the compact data this table needs,
+       * avoiding historical prompts and proof text it never renders.
        * @returns {Promise<void>}
        */
       async function pollTasksTab() {
         try {
-          const res = await fetch("/api/pull-requests/index");
-          if (res.ok) taskTabPrIndex = await res.json();
+          const [indexRes, prRes] = await Promise.all([
+            fetch("/api/task-index"),
+            fetch("/api/pull-requests/index"),
+          ]);
+          if (indexRes.ok) {
+            const d = await indexRes.json();
+            /** @type {any} */ (window)._daemonStatus = d.daemon;
+            squads = d.squads || [];
+            byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
+          }
+          if (prRes.ok) taskTabPrIndex = await prRes.json();
         } catch (e) { /* transient -- the next poll retries */ }
         markUpdated();
         if (pendingHash && pendingHash.tab === "tasks") {
@@ -114,6 +123,7 @@
        * @returns {void}
        */
       function renderTasksTab() {
+        renderTtProjectFilter();
         ttAllRows = ttBuildRows();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
         const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys));
@@ -482,7 +492,7 @@
         const needsDot = row.needsMe ? `<span style="color:var(--accent)" data-tip="${esc(row.needsMeReason || "")}">●</span>` : "";
         return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
           + ttColCell("star", star)
-          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(row.name)}</span>${needsDot}</span>`)
+          + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(ntTaskDisplayName(row.name))}</span>${needsDot}</span>`)
           + ttColCell("squad", ttSquadChipHtml(row))
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
@@ -645,6 +655,77 @@
         /** @type {HTMLInputElement} */ (byId("tt-show-hidden")).checked = taskTabFilters.showHidden;
         /** @type {HTMLInputElement} */ (byId("tt-needs-me")).checked = taskTabFilters.needsMe;
       }
+      // RAL-345: project filter -- own state/render path, deliberately not
+      // shared with the Squads tab's identical-looking (non-`tt`-prefixed)
+      // equivalent in 25-chrome.js. Empty set means "no filter" (every
+      // project shown), unlike the status filter's "empty means hide
+      // everything" -- the project universe grows over time (new
+      // registrations) so a first-time visitor must see every project
+      // without opting in project-by-project. Kept outside the
+      // RALPHUS-TT-FILTER-SELECTION-SCROLL region above (like `ttOpenColMenu`
+      // et al.) since it touches `document` directly, which the region's own
+      // sandboxed test harness (board-filter-selection-scroll.mjs) never stubs.
+      /**
+       * Toggles one project in/out of the Tasks tab's filter, from the project dropdown's checkbox list. Updates the open dropdown's checkmarks in place rather than closing it. Re-centers the retained selection (RAL-383).
+       * @param {string} name
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function ttToggleProjectFilter(name, on) {
+        if (on) taskTabFilters.project.add(name); else taskTabFilters.project.delete(name);
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+        syncHash();
+        const menu = document.getElementById("tt-project-filter-menu");
+        if (menu) menu.innerHTML = ttProjectFilterMenuRowsHtml();
+      }
+      /**
+       * Clears the Tasks tab's project filter back to "no filter" (every project shown). Re-centers the retained selection (RAL-383).
+       * @returns {void}
+       */
+      function ttClearProjectFilter() {
+        taskTabFilters.project = new Set();
+        ttCloseProjectFilterMenu();
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+        syncHash();
+      }
+      /**
+       * Renders the Tasks toolbar's project-filter dropdown trigger and its removable chips (RAL-345) -- chip markup matches the Squads tab's `.filter-chip` exactly, per the ticket's "same as existing label-lists" instruction.
+       * @returns {void}
+       */
+      function renderTtProjectFilter() {
+        const chips = [...taskTabFilters.project].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="ttToggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
+        byId("tt-project-filter").innerHTML = `<button type="button" class="btn" onclick="ttOpenProjectFilterMenu(event)" data-tip="Filter rows by project. No projects selected shows every project.">Project ▾</button>${chips}`
+          + (taskTabFilters.project.size ? `<span class="chip" onclick="ttClearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
+      }
+      /**
+       * Builds the checkbox rows for the Tasks toolbar's project-filter dropdown, alphabetical by registered project name (RAL-345).
+       * @returns {string}
+       */
+      function ttProjectFilterMenuRowsHtml() {
+        const names = projects.map((p) => p.name).sort((a, b) => a.localeCompare(b));
+        if (!names.length) return `<div style="color:var(--muted);cursor:default">No registered projects.</div>`;
+        return names.map((name) => `<div class="ctx-check ${taskTabFilters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${taskTabFilters.project.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+      }
+      /**
+       * Opens the Tasks toolbar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function ttOpenProjectFilterMenu(e) {
+        e.preventDefault(); e.stopPropagation(); ttCloseColMenu(); ttCloseProjectFilterMenu();
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "tt-project-filter-menu";
+        menu.innerHTML = ttProjectFilterMenuRowsHtml();
+        document.body.appendChild(menu);
+        const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+        menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
+      }
+      /** Closes the Tasks toolbar's project-filter dropdown, if open. @returns {void} */
+      function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
+      document.addEventListener("click", ttCloseProjectFilterMenu);
       /**
        * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
        * @param {string} squadId
@@ -1008,4 +1089,3 @@
       let pendingGuardianActions = new Set();
       /** @type {Set<string>} gid -> a Merge / rebase kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
       let pendingMergeActions = new Set();
-

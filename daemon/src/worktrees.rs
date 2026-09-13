@@ -27,6 +27,7 @@
 //! resolved and persisted, a restarted squad reads the real path back from the
 //! store — the placeholder string is gone; there's nothing left to resolve.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,37 @@ pub(crate) struct PlaceholderContext<'a> {
     /// intermediate function.
     pub(crate) targets:
         &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+    /// `(registered project name, bare upstream) -> already-fetched
+    /// "<remote>/<branch>"`, computed by [`collect_remote_upstream_prefetch_targets`]
+    /// and the caller's own fetch loop OUTSIDE the store lock this whole
+    /// resolution pass otherwise runs under (RAL-<pending>) -- see
+    /// [`resolve_placeholders_with_prefetch`]'s doc comment. A lookup miss
+    /// (a `<<...>>` sentinel upstream, or a caller that didn't prefetch at
+    /// all -- e.g. every existing test, and env-override placeholder
+    /// expansion) falls back to fetching live, right where the fetch used to
+    /// happen unconditionally, so correctness never depends on this cache
+    /// being complete.
+    pub(crate) prefetched_upstreams: &'a HashMap<(String, String), String>,
+    /// Per-project-root `git worktree list --porcelain` snapshots
+    /// (short-name -> branch, [`existing_task_worktree_branches`]'s shape),
+    /// lazily populated by [`GitProjectStartupAdapter::resolve_placeholder`]
+    /// and shared across every cell in one [`resolve_placeholders`] call --
+    /// not just within one cell's own resolution the way
+    /// [`ensure_worktree_with_existing`]'s doc comment describes.
+    ///
+    /// Querying this is O(worktree count) and, on a dev machine with
+    /// hundreds accumulated, can take real wall-clock time -- paying for it
+    /// once per DISTINCT PROJECT ROOT per submission (instead of once per
+    /// branch) is the difference between that cost scaling with the
+    /// project's total worktree count once, versus once per cell. Safe to
+    /// share across cells because every new worktree this resolution pass
+    /// itself creates is recorded back into the same map immediately after
+    /// creation (see the catch-all branch's post-`ensure_worktree_with_existing`
+    /// insert) -- so a later cell in this same call always sees an earlier
+    /// one's freshly materialized worktree, exactly as a fresh git query
+    /// would show it. `RefCell` because [`PlaceholderContext`] is `Copy` and
+    /// threaded by value through a trait method.
+    pub(crate) on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
 }
 
 trait ProjectStartupAdapter {
@@ -162,8 +194,21 @@ fn existing_task_worktree_branches(root: &Path) -> HashMap<String, String> {
 /// safety: the branch keeps the same directory across a squad restart). A
 /// directory occupied by any other branch is skipped in favor of the next
 /// suffix. A short name with no worktree registered at all is free.
-fn resolve_task_worktree_dir(root: &Path, branch: &str) -> PathBuf {
-    let existing = existing_task_worktree_branches(root);
+///
+/// `existing` is a caller-supplied `git worktree list --porcelain` snapshot
+/// rather than one freshly queried here -- see
+/// [`ensure_worktree_with_existing`]'s doc comment for why: on a dev machine
+/// with hundreds of worktrees this query alone can take real wall-clock
+/// time, and [`GitProjectStartupAdapter::resolve_placeholder`] otherwise
+/// pays for it twice per branch (once via [`resolve_squad_branch`], once via
+/// this function) for no reason -- both reads happen back-to-back with no
+/// worktree created in between, so sharing one snapshot between them is
+/// exactly as fresh as querying twice.
+fn resolve_task_worktree_dir_with_existing(
+    root: &Path,
+    branch: &str,
+    existing: &HashMap<String, String>,
+) -> PathBuf {
     let base = crate::short_paths::short_name(branch);
     let mut candidate = base.clone();
     let mut n = 2;
@@ -244,6 +289,7 @@ fn resolve_squad_branch(
     project: &ProjectView,
     base_branch: &str,
     squad_id: &str,
+    on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
     if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
         return Ok(base_branch.to_string());
@@ -258,7 +304,6 @@ fn resolve_squad_branch(
         .task_worktree_claims(&project.name, base_branch)
         .map_err(|e| e.to_string())?;
     let claimed: HashSet<&str> = claims.iter().map(|c| c.branch.as_str()).collect();
-    let on_disk = existing_task_worktree_branches(Path::new(&project.path));
     let occupied: HashSet<&str> = on_disk.values().map(String::as_str).collect();
 
     let mut candidate = base_branch.to_string();
@@ -348,6 +393,58 @@ fn resolve_upstream(root: &Path, upstream: &str) -> Result<String, String> {
         )),
         other => Ok(other.to_string()),
     }
+}
+
+/// For a project registered with a remote (`clone_url` set via
+/// `ralphus project git --url ...`), resolve a bare `?upstream=<branch>`
+/// value (no `<<...>>` sentinel, no explicit `<remote>/<branch>` prefix)
+/// against that remote -- fetching it fresh -- instead of against whatever
+/// the shared, locally-registered `root` checkout happens to have on disk
+/// under that branch name right now.
+///
+/// Without this, a registered project's bare upstream resolved purely
+/// locally (`refs/heads/<upstream>` in `root`), which reflects whatever a
+/// concurrent `git checkout`/commit in that same shared directory last left
+/// there -- not necessarily the branch the submitter meant by naming a
+/// remote-backed project's upstream. Rewriting to the explicit
+/// `<remote>/<branch>` form here makes every downstream step
+/// ([`branch_materialization`], [`set_explicit_upstream`],
+/// [`resync_remote_tracking_branch`]) treat a bare `?upstream=staging`
+/// exactly as if the submitter had written `?upstream=origin/staging`
+/// themselves -- reusing their already-correct remote-tracking handling
+/// rather than adding a parallel code path.
+///
+/// A no-op for a project with no `clone_url` (a purely local repo has
+/// nothing to fetch from, so its bare upstream stays a local branch lookup)
+/// and for an `upstream` that already names its remote explicitly.
+///
+/// `pub(crate)` (not just used from [`GitProjectStartupAdapter::resolve`]
+/// below): [`crate::reviews`] applies the same rule to a `[[review]]`
+/// block's own declared `upstream` field, which is a value the submitter
+/// writes directly rather than a cell `cwd`'s `?upstream=` -- same
+/// registered-remote-vs-shared-checkout ambiguity, so it needs the same fix.
+pub(crate) fn resolve_registered_remote_upstream(
+    root: &Path,
+    project: &ProjectView,
+    upstream: &str,
+) -> Result<String, String> {
+    if project.clone_url.is_none() || upstream.contains('/') {
+        return Ok(upstream.to_string());
+    }
+    let cfg = crate::config::resolve_forge(root);
+    let remote = crate::forge::resolve_remote_name(root, upstream, &cfg);
+    if git(root, &["remote", "get-url", &remote]).is_err() {
+        return Ok(upstream.to_string());
+    }
+    let refspec = format!("+refs/heads/{upstream}:refs/remotes/{remote}/{upstream}");
+    git(root, &["fetch", &remote, &refspec]).map_err(|e| {
+        format!(
+            "project \"{}\" is registered with a remote, but \"?upstream={upstream}\" could not \
+             be fetched from \"{remote}\": {e}",
+            project.name
+        )
+    })?;
+    Ok(format!("{remote}/{upstream}"))
 }
 
 /// The repository's default branch for `root`: the branch the `origin`
@@ -626,16 +723,46 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 /// remote-tracking ref — a real, attached branch checkout (never a detached
 /// HEAD), so ordinary git operations (commit, diff, `@{upstream}`) behave
 /// normally inside it. Otherwise the branch name is treated literally —
-/// slashes included — and a new local branch is forked from `root`'s current
-/// `HEAD`; when that literal name *looks* like `<remote>/<branch>` but no
-/// matching remote-tracking ref exists, a warning is emitted so the fallback
-/// is explicit rather than silently guessed. Either way, `upstream` -- not
-/// the branch's own name or `root`'s `HEAD` -- decides what tracking gets
-/// configured; a review worktree tracking a remote keeps up with pushes to
-/// that branch over the life of the project via the resync described above.
+/// slashes included — and a new local branch is forked from the resolved
+/// `upstream` ref itself, **never from `root`'s current `HEAD`**: whatever
+/// the shared project checkout happens to have checked out at materialization
+/// time must never leak into a freshly created branch's history. When that
+/// literal name *looks* like `<remote>/<branch>` but no matching
+/// remote-tracking ref exists, a warning is emitted so the fallback is
+/// explicit rather than silently guessed. Either way, `upstream` -- not the
+/// branch's own name or `root`'s `HEAD` -- decides both what the branch
+/// actually starts from and what tracking gets configured; a review worktree
+/// tracking a remote keeps up with pushes to that branch over the life of the
+/// project via the resync described above.
 pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<PathBuf, String> {
+    ensure_worktree_with_existing(
+        root,
+        branch,
+        upstream,
+        &existing_task_worktree_branches(root),
+    )
+}
+
+/// Like [`ensure_worktree`], but `existing` is a caller-supplied `git
+/// worktree list --porcelain` snapshot instead of one freshly queried here.
+///
+/// [`GitProjectStartupAdapter::resolve_placeholder`] already calls
+/// [`resolve_squad_branch`] for the same branch immediately before this, and
+/// that also needs the on-disk worktree listing -- querying it twice (once
+/// there, once here via [`resolve_task_worktree_dir`]) doubles a git call
+/// that's O(worktree count) and can take real wall-clock time on a dev
+/// machine with hundreds of them accumulated, all spent while the caller
+/// holds the daemon's single global `Mutex<Store>`. No worktree is created
+/// between those two reads, so one shared snapshot is exactly as fresh as
+/// querying twice.
+pub fn ensure_worktree_with_existing(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+    existing: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
     let materialization = branch_materialization(root, branch)?;
-    let wt = resolve_task_worktree_dir(root, branch);
+    let wt = resolve_task_worktree_dir_with_existing(root, branch, existing);
     if wt.join(".git").exists() {
         set_explicit_upstream(&wt, branch, upstream)?;
         resync_remote_tracking_branch(&wt)?;
@@ -671,8 +798,12 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
                 // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                 crate::rlog!(WARNING, "ralphus [scheduler] {warning}");
             }
-            preflight_worktree_budget(root, &wt, "HEAD", path_budget_limit())?;
-            git(root, &["worktree", "add", "-b", branch, &wt_str])?;
+            // Branch explicitly from the resolved `upstream` ref -- never
+            // implicit `HEAD` -- so this new branch's content always reflects
+            // what the submitter named, not whatever the shared `root`
+            // checkout happens to have checked out right now.
+            preflight_worktree_budget(root, &wt, upstream, path_budget_limit())?;
+            git(root, &["worktree", "add", "-b", branch, &wt_str, upstream])?;
         }
     }
     set_explicit_upstream(&wt, branch, upstream)?;
@@ -695,6 +826,8 @@ fn placeholder_context_for_cell<'a>(
     squad_id: &'a str,
     cell: &'a CellRow,
     targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+    prefetched_upstreams: &'a HashMap<(String, String), String>,
+    on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
 ) -> PlaceholderContext<'a> {
     PlaceholderContext {
         squad_id,
@@ -704,6 +837,8 @@ fn placeholder_context_for_cell<'a>(
         cell_id: &cell.cell_id,
         machine: cell.machine.as_deref(),
         targets,
+        prefetched_upstreams,
+        on_disk_worktrees,
     }
 }
 
@@ -765,7 +900,24 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // squad actually gets depends on whether another squad already owns
         // it. Without this, a resubmission of the same task file resolves to
         // the first squad's branch and inherits its finished commits.
-        let branch = resolve_squad_branch(store, project, branch, ctx.squad_id).map_err(|e| {
+        //
+        // The on-disk snapshot this needs (and `ensure_worktree_with_existing`
+        // below needs again) is queried at most once per project root for
+        // this whole submission, via `ctx.on_disk_worktrees` -- not once per
+        // branch -- see `PlaceholderContext::on_disk_worktrees`'s doc comment.
+        let root_key = Path::new(&project.path).to_path_buf();
+        if !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
+            let snapshot = existing_task_worktree_branches(&root_key);
+            ctx.on_disk_worktrees
+                .borrow_mut()
+                .insert(root_key.clone(), snapshot);
+        }
+        let branch = {
+            let all = ctx.on_disk_worktrees.borrow();
+            let on_disk = all.get(&root_key).expect("populated just above");
+            resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
+        }
+        .map_err(|e| {
             format!(
                 "cell '{}': could not allocate a worktree branch for \"{placeholder}\": {e}",
                 ctx.cell_id
@@ -783,15 +935,61 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 ctx.squad_id,
                 ctx.targets,
             )?,
-            _ => ensure_worktree(Path::new(&project.path), branch, &upstream)
+            _ => {
+                // RAL-<pending>: a registered (remote-backed) project's bare
+                // upstream must resolve against that remote, never against
+                // whatever the shared `project.path` checkout happens to have
+                // on disk -- see `resolve_registered_remote_upstream`. Prefer
+                // an already-fetched result from `ctx.prefetched_upstreams`
+                // (computed by the caller OUTSIDE the store lock this whole
+                // function runs under) over fetching live right here, which
+                // would hold that lock for as long as the network fetch
+                // takes -- see `resolve_placeholders_with_prefetch`'s doc
+                // comment. Falling back to a live fetch on a cache miss keeps
+                // this correct even when the caller didn't prefetch at all.
+                let upstream = match ctx
+                    .prefetched_upstreams
+                    .get(&(project.name.clone(), upstream.clone()))
+                {
+                    Some(resolved) => resolved.clone(),
+                    None => resolve_registered_remote_upstream(
+                        Path::new(&project.path),
+                        project,
+                        &upstream,
+                    )?,
+                };
+                let materialized = {
+                    let all = ctx.on_disk_worktrees.borrow();
+                    let on_disk = all.get(&root_key).expect("populated above");
+                    ensure_worktree_with_existing(
+                        Path::new(&project.path),
+                        branch,
+                        &upstream,
+                        on_disk,
+                    )
+                }
                 .map_err(|e| {
                     format!(
                         "cell '{}': could not materialize worktree for \"{placeholder}\": {e}",
                         ctx.cell_id
                     )
-                })?
-                .to_string_lossy()
-                .into_owned(),
+                })?;
+                // Record this branch's (new-or-reused) worktree back into the
+                // shared snapshot so a LATER cell in this same submission
+                // sees it without a fresh `git worktree list` -- exactly
+                // what a live re-query would show it, since this is the only
+                // thing that could have changed the on-disk state since the
+                // snapshot was taken.
+                ctx.on_disk_worktrees
+                    .borrow_mut()
+                    .get_mut(&root_key)
+                    .expect("populated above")
+                    .insert(
+                        crate::short_paths::short_name(branch).to_string(),
+                        branch.to_string(),
+                    );
+                materialized.to_string_lossy().into_owned()
+            }
         };
         Ok(Some(resolved))
     }
@@ -1107,6 +1305,39 @@ pub fn resolve_placeholders(
     tasks: &[TaskRow],
     parent: &Context,
 ) -> Result<(), String> {
+    resolve_placeholders_with_prefetch(store, squad_id, cells, tasks, &HashMap::new(), parent)
+}
+
+/// Like [`resolve_placeholders`], but `prefetched_upstreams` supplies
+/// `(registered project name, bare upstream) -> "<remote>/<branch>"` results
+/// the caller already fetched -- see
+/// [`collect_remote_upstream_prefetch_targets`]'s doc comment for how to
+/// build this map, and why: `resolve_placeholders` runs entirely while its
+/// caller (`execute_squad_inner`, `derive_reviews`) holds the daemon's single
+/// global `Mutex<Store>` (RAL-<pending>'s [`GitProjectStartupAdapter::resolve_placeholder`]
+/// added the first git operation in this whole call graph that hits the
+/// network -- `resolve_registered_remote_upstream`'s `git fetch` -- rather
+/// than staying local like every other step here). A dead or slow remote can
+/// stall that fetch for the full `GIT_TIMEOUT`, and while it's stalled every
+/// other request queues behind the same lock, so the entire daemon API
+/// freezes for as long as the fetch takes -- not just this one squad. Doing
+/// every such fetch up front, before the lock is even taken, and passing the
+/// results in here removes that fetch from the locked critical path
+/// entirely. A cache miss (a `<<...>>` sentinel upstream that hadn't expanded
+/// to a concrete branch name yet when the caller collected targets, or a
+/// caller that didn't prefetch at all -- e.g. [`resolve_placeholders`] above,
+/// used by every existing test) falls back to fetching live right here,
+/// under whatever lock the caller holds, exactly as it always has: this
+/// parameter only ever makes the common case faster, never changes what a
+/// given input resolves to.
+pub fn resolve_placeholders_with_prefetch(
+    store: &Store,
+    squad_id: &str,
+    cells: &mut [CellRow],
+    tasks: &[TaskRow],
+    prefetched_upstreams: &HashMap<(String, String), String>,
+    parent: &Context,
+) -> Result<(), String> {
     let span = otel::start_span("scheduler.resolve_worktrees", parent, SpanKind::Internal);
     span.set_attribute("squad_id", squad_id.to_string());
     // RAL-355 Phase 2: loaded once per call (not per cell) and threaded down
@@ -1123,7 +1354,14 @@ pub fn resolve_placeholders(
             return Err(e);
         }
     };
-    match resolve_placeholders_inner(store, squad_id, cells, tasks, &targets) {
+    match resolve_placeholders_inner(
+        store,
+        squad_id,
+        cells,
+        tasks,
+        &targets,
+        prefetched_upstreams,
+    ) {
         Ok(materialized) => {
             span.set_attribute("worktrees.materialized", materialized as i64);
             span.set_status(Status::Ok);
@@ -1138,6 +1376,79 @@ pub fn resolve_placeholders(
             Err(e)
         }
     }
+}
+
+/// Every `(registered project, bare upstream)` pair among `cells`' worktree
+/// placeholders that [`GitProjectStartupAdapter::resolve_placeholder`] would
+/// otherwise call [`resolve_registered_remote_upstream`] for -- i.e. a
+/// placeholder naming a project registered with a remote (`clone_url` set)
+/// and an already-literal upstream (no `<<...>>` sentinel, no explicit
+/// `<remote>/<branch>` prefix). Read-only over `store` and cheap (no git
+/// subprocess, just parsing + a project lookup), so it's safe to call while
+/// holding whatever lock guards `store` -- the caller's job is to then DROP
+/// that lock and run the actual `git fetch` for each result (call
+/// [`resolve_registered_remote_upstream`] directly) before calling
+/// [`resolve_placeholders_with_prefetch`] with the results, keyed by
+/// `(project.name.clone(), upstream)`. See
+/// [`resolve_placeholders_with_prefetch`]'s doc comment for why this
+/// two-phase split exists.
+///
+/// A `<<...>>` sentinel upstream is skipped here on purpose: expanding it
+/// (`resolve_upstream`) needs local git state read from the project root, so
+/// the concrete branch name it resolves to genuinely isn't known until
+/// [`resolve_placeholders_with_prefetch`]'s own locked pass runs -- that
+/// expansion itself stays local/cheap (RAL-258), so leaving it there costs
+/// nothing. Only the plain-literal case (the common one) is collected here.
+#[must_use]
+pub fn collect_remote_upstream_prefetch_targets(
+    store: &Store,
+    cells: &[CellRow],
+    tasks: &[TaskRow],
+) -> Vec<(ProjectView, String)> {
+    let task_projects: HashMap<i64, Option<&str>> = tasks
+        .iter()
+        .map(|t| (t.idx, t.project.as_deref()))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for cell in cells {
+        let Some(cwd) = cell.cwd.as_deref() else {
+            continue;
+        };
+        let mut placeholders = Vec::new();
+        if classify_placeholder(cwd).ok().flatten().is_some() {
+            placeholders.push(cwd);
+        }
+        placeholders.extend(
+            ralphus_core::schema::text_placeholders(cwd)
+                .into_iter()
+                .filter(|body| ralphus_core::schema::parse_worktree_placeholder(body).is_some()),
+        );
+        for placeholder in placeholders {
+            let Some(upstream) =
+                ralphus_core::schema::parse_worktree_placeholder_upstream(placeholder)
+            else {
+                continue;
+            };
+            if upstream.starts_with("<<") || upstream.contains('/') {
+                continue;
+            }
+            let Some(project_name) = task_projects.get(&cell.task_idx).copied().flatten() else {
+                continue;
+            };
+            if !seen.insert((project_name.to_string(), upstream.to_string())) {
+                continue;
+            }
+            let Ok(Some(project)) = store.resolve_project(project_name) else {
+                continue;
+            };
+            if project.clone_url.is_none() {
+                continue;
+            }
+            out.push((project, upstream.to_string()));
+        }
+    }
+    out
 }
 
 /// Test-only entry point mirroring [`resolve_placeholders`] but taking the
@@ -1155,7 +1466,7 @@ fn resolve_placeholders_with_targets(
     tasks: &[TaskRow],
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<(), String> {
-    resolve_placeholders_inner(store, squad_id, cells, tasks, targets).map(|_| ())
+    resolve_placeholders_inner(store, squad_id, cells, tasks, targets, &HashMap::new()).map(|_| ())
 }
 
 /// The count returned is how many distinct placeholders were newly
@@ -1168,12 +1479,21 @@ fn resolve_placeholders_inner(
     cells: &mut [CellRow],
     tasks: &[TaskRow],
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+    prefetched_upstreams: &HashMap<(String, String), String>,
 ) -> Result<usize, String> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
         .map(|t| (t.idx, t.project.as_deref()))
         .collect();
     let mut cache: HashMap<String, String> = HashMap::new();
+    // Shared across every cell below, not just within one cell's own
+    // resolution -- see `PlaceholderContext::on_disk_worktrees`'s doc
+    // comment for why this is safe (every worktree this pass itself creates
+    // is recorded back in here immediately) and why it matters (this
+    // query's cost is O(the project's total worktree count); paying it once
+    // per project root per submission, rather than once per branch, is the
+    // whole point).
+    let on_disk_worktrees = RefCell::new(HashMap::new());
     let mut materialized = 0usize;
     for cell in cells.iter_mut() {
         let Some(cwd) = cell.cwd.clone() else {
@@ -1199,7 +1519,13 @@ fn resolve_placeholders_inner(
             store,
             project_name,
             &cwd,
-            placeholder_context_for_cell(squad_id, cell, targets),
+            placeholder_context_for_cell(
+                squad_id,
+                cell,
+                targets,
+                prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
             &mut cache,
         )
         .map_err(|e| {
@@ -1432,6 +1758,31 @@ mod tests {
                 .unwrap()
                 .trim(),
             "feature-x"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_forks_new_branches_from_the_resolved_upstream_not_the_checkouts_current_head()
+     {
+        // RAL-<pending>: a fresh task branch materialized while the shared
+        // project checkout happened to have some other local branch checked
+        // out must never inherit that other branch's commits just because it
+        // was `HEAD` at the moment of creation.
+        let repo = init_repo("head-vs-upstream");
+        g(&repo, &["branch", "staging"]);
+        // Simulate the shared checkout being mid-flight on `main`, with real
+        // work that has nothing to do with the new task and never landed on
+        // `staging`.
+        std::fs::write(repo.join("unrelated.txt"), "unrelated\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "unrelated work on main"]);
+
+        let wt = ensure_worktree(&repo, "feature-new", "staging").expect("materialize");
+        let log = git(&wt, &["log", "--format=%s"]).unwrap();
+        assert!(
+            !log.contains("unrelated work on main"),
+            "new branch must fork from \"staging\" (the resolved upstream), not from whatever \
+             the shared checkout's HEAD happened to be: {log}"
         );
     }
 
@@ -2236,6 +2587,94 @@ mod tests {
             .trim(),
             "other",
             "the branch must track the explicit ?upstream= value, not HEAD (main)"
+        );
+    }
+
+    #[test]
+    fn resolve_placeholders_resolves_a_bare_upstream_against_the_remote_for_a_registered_project() {
+        // RAL-<pending> / PR #70: for a project registered with a remote
+        // (`clone_url` set), a bare `?upstream=staging` must resolve against
+        // that remote's `staging` -- exactly as if the submitter had written
+        // `?upstream=origin/staging` -- never against whatever the shared,
+        // locally-registered checkout happens to have on disk. Without this,
+        // the checkout being mid-flight on an unrelated local branch with
+        // un-pushed work leaks that work into the new task branch.
+        let base = tmp_dir("registered-remote-upstream");
+        let remote = base.join("remote.git");
+        let mut bare_opts = git2::RepositoryInitOptions::new();
+        bare_opts.bare(true).initial_head("main");
+        git2::Repository::init_opts(&remote, &bare_opts).unwrap();
+
+        let seed = base.join("seed");
+        let mut seed_opts = git2::RepositoryInitOptions::new();
+        seed_opts.initial_head("main");
+        let seed_repo = git2::Repository::init_opts(&seed, &seed_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        let base_oid = git2_commit_all(&seed_repo, &sig, "base", &[]);
+        let base_commit = seed_repo.find_commit(base_oid).unwrap();
+        let mut origin = seed_repo
+            .remote("origin", remote.to_str().unwrap())
+            .unwrap();
+        origin
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+
+        seed_repo.branch("staging", &base_commit, false).unwrap();
+        git2_checkout(&seed_repo, "staging");
+        std::fs::write(seed.join("staging-only.txt"), "staging content\n").unwrap();
+        git2_commit_all(&seed_repo, &sig, "staging work", &[&base_commit]);
+        origin
+            .push(&["refs/heads/staging:refs/heads/staging"], None)
+            .unwrap();
+
+        let clone_path = base.join("clone");
+        let clone_repo = git2::Repository::clone(remote.to_str().unwrap(), &clone_path).unwrap();
+        let mut clone_config = clone_repo.config().unwrap();
+        clone_config.set_str("user.name", "t").unwrap();
+        clone_config.set_str("user.email", "t@t").unwrap();
+        drop(clone_repo);
+
+        // The project's shared checkout is mid-flight on an unrelated local
+        // branch -- real, legitimate work, just not `staging` and never
+        // pushed anywhere.
+        g(&clone_path, &["checkout", "-b", "changes"]);
+        std::fs::write(clone_path.join("unrelated.txt"), "local dev work\n").unwrap();
+        g(&clone_path, &["add", "."]);
+        g(
+            &clone_path,
+            &["commit", "--message", "local unrelated work"],
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &clone_path.to_string_lossy(),
+                "git",
+                Some(remote.to_str().unwrap()),
+                None,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feature-new?upstream=staging"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize");
+        let resolved = cells[0].cwd.clone().expect("resolved cwd");
+        let log = git(Path::new(&resolved), &["log", "--format=%s"]).unwrap();
+        assert!(
+            log.contains("staging work"),
+            "new branch must contain the remote's \"staging\" commit: {log}"
+        );
+        assert!(
+            !log.contains("local unrelated work"),
+            "new branch must not inherit the shared checkout's unrelated local branch: {log}"
         );
     }
 
