@@ -198,6 +198,7 @@ produced no pane output.
 | GET | `/api/guardians/{id}/pull-request-stacks` | [List past PR stacks](#get-apiguardiansidpull-request-stacks) submitted for a review, most recent first (RAL-302) |
 | GET | `/api/pull-requests` | [Find the PR row](#get-apipull-requests) for a forge PR/MR number; `?forge=&repo=&pr_number=` |
 | GET | `/api/pull-requests/index` | [Flat index](#get-apipull-requestsindex) of every PR row across every guardian, annotated with source squad/task/cell (RAL-362, board Tasks tab) |
+| GET | `/api/pull-requests/forge-cache-index` | [Flat index](#get-apipull-requestsforge-cache-index) of every PR's cached forge state (un-actioned feedback, branch drift) -- background-polled (RAL-366) |
 | GET | `/api/pull-requests/{pr_id}` | One PR row |
 | POST | `/api/pull-requests/{pr_id}` | [Mutate the PR mapping](#post-apipull-requestspr_id) (number/url/alias/state) |
 | GET | `/api/pull-requests/{pr_id}/comments` | [Live-query the forge](#get-apipull-requestspr_idcomments) for this PR's comments |
@@ -2195,6 +2196,83 @@ most once every two minutes per guardian) and by
 Identical for GitHub- and GitLab-backed PRs — both resolve through the same
 `ForgeClient::check_pr_ci_status`.
 
+### `GET /api/pull-requests/forge-cache-index`
+RAL-366: a flat, single-query index of every PR's *cached* forge state — the
+background poller's most recent observation of un-actioned reviewer feedback
+and branch drift, so a list view can render both for every row in one
+request instead of one `sync-status`/`comments` call per row. Only PRs the
+poller (or a write-through from `sync-status`/`comments` below) has reached
+at least once appear; a PR just submitted this cycle is simply absent until
+its first poll:
+```json
+[
+  {
+    "pr_id": "pr-abc123",
+    "last_checked_at_ms": 1700000005000,
+    "status": "ok",
+    "last_error": null,
+    "in_sync": false,
+    "pr_ahead": false,
+    "worktree_ahead": true,
+    "remote_sha": "abc123...",
+    "local_sha": "def456...",
+    "comment_count": 3,
+    "unactioned_count": 1,
+    "latest_comment_author": "reviewer1",
+    "latest_comment_at": "2026-01-02T00:00:00Z"
+  }
+]
+```
+- `status` is `"ok"` (every field below reflects the most recently
+  *successfully* reached poll) or `"unknown"` (the forge was unreachable, a
+  credential was rejected, or a rate limit is in effect on the last attempt —
+  see `last_error`). A row can be `"unknown"` while still showing
+  stale-but-known `in_sync`/`comment_count`/etc from an earlier successful
+  pass — a client should render this as "checked N ago, currently unknown",
+  never as live truth. Cached data is stale by construction; `GET
+  .../sync-status` and `GET .../comments` remain the authoritative,
+  always-live routes and are unchanged by this endpoint's existence.
+- `in_sync`/`pr_ahead`/`worktree_ahead`/`remote_sha`/`local_sha` mirror
+  `PrSyncStatus` (see `GET .../sync-status` below) and are `null` until the
+  poller's first successful git-drift check for this PR.
+- `comment_count`/`unactioned_count` are computed live from the poller's
+  locally-cached comment id/author/timestamp set (never comment bodies — see
+  below) joined against the same `guardian_pr_feedback_actioned` rows
+  `POST .../action-feedback` already consults — never a second, independently
+  maintained counter that could drift out of sync with it.
+- `latest_comment_author`/`latest_comment_at` describe the newest comment the
+  poller has seen (by timestamp), across both GitHub's conversation and
+  inline-review-comment endpoints (or GitLab's single notes endpoint).
+
+A human explicitly hitting `GET .../sync-status` or `GET .../comments` writes
+its live result through into this same cache, so an on-demand "refresh now"
+also updates what this index next reports — there is no separate "refresh"
+endpoint for this cache.
+
+The cache is kept fresh by a background poller (folded into RAL-279's
+existing PR-base-drift poller — one thread, one pass per open PR, covering
+base drift, branch drift, and comments together) configured via a
+daemon-singleton `[pr_cache]` table in the global config file only (never
+per-project, since one poll cycle spans every project's repos):
+
+| `.ralphus.toml [pr_cache]` key | Meaning | Unset resolves to |
+|---|---|---|
+| `enabled` | Whether the poller runs at all. `false` disables it entirely — existing cached rows are left in place, just stop refreshing. | `true` |
+| `poll_interval_secs` | Seconds between poll passes. Values under 5s are treated as unset (a misconfigured `0` would otherwise busy-loop the poller against every open PR's forge). | `300` (RAL-279's original base-drift-poll cadence) |
+
+The poller never consumes a scheduler concurrency permit, skips entirely
+during a configured `[daemon].downtime` window (RAL-122), and batches one
+`git fetch` per guardian's git root covering every one of that guardian's
+open PRs' branches — never one `git fetch` per PR. It acquires each PR's
+drift-check lock with a non-blocking `try_lock`: a PR an interactive
+`sync-status` call is already checking is simply left at its last-known
+value for that cycle rather than making either side wait on the other.
+Forge comment fetches are conditional (`If-None-Match`/`ETag`), so an
+unchanged PR costs no forge quota on repeat polls, and a `429`/`403`
+response backs the affected forge client off for a cooldown window
+(honoring the forge's own `Retry-After` when it sends one) instead of
+retrying every cycle.
+
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
 change):
@@ -2223,6 +2301,10 @@ annotated with whether each has already been actioned into the worktree:
 [ { "external_id": "123", "author": "reviewer1", "body": "please rename this", "created_at": "2026-01-01T00:00:00Z", "actioned": false } ]
 ```
 `409` if the PR has no recorded number yet; `502` on a forge API error.
+Write-through (RAL-366): a successful call also refreshes this PR's row in
+`GET .../forge-cache-index` (id/author/timestamp only — comment bodies are
+never cached at rest), so an explicit check here also updates the cached
+count a list view reads, instead of leaving it to the next poll cycle.
 
 ### `POST /api/pull-requests/{pr_id}/action-feedback`
 Fetch this PR's un-actioned comments, aggregate them into one feedback string,
@@ -2259,7 +2341,10 @@ reviewer pushed directly to it — the board should offer "Pull PR commits");
 reflected on the PR branch, e.g. right after resolving feedback — the board
 should offer "Push to PR", which submitting/action-feedback already do
 automatically). Both can be `false` and `in_sync` `true` when they match
-exactly. `502` if the guardian/PR can't be resolved.
+exactly. `502` if the guardian/PR can't be resolved. Write-through (RAL-366):
+a successful call also refreshes this PR's drift fields in
+`GET .../forge-cache-index`, the same "refresh now" write-through
+`GET .../comments` does for its half.
 
 ### `POST /api/pull-requests/{pr_id}/refresh-ci`
 Live-polls the forge for this one PR's current CI/mergeability status

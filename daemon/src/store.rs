@@ -1584,6 +1584,55 @@ impl Store {
                 UNIQUE(pr_id, external_comment_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_feedback_pr ON guardian_pr_feedback_actioned(pr_id);
+            -- RAL-366: one row per PR holding the background poller's most
+            -- recently observed forge state -- branch drift (mirrors
+            -- `PrSyncStatus`) and a per-endpoint ETag pair for the
+            -- conditional comment fetch below. `status`/`last_error` record
+            -- whether the *last* poll pass actually reached the forge --
+            -- `'unknown'` (an unreachable host, an expired token, a rate
+            -- limit) never wipes the drift/etag columns from a prior
+            -- successful pass, so the board can still show stale-but-known
+            -- data alongside \"unknown / last checked N ago\" rather than
+            -- blanking out. Deliberately holds no comment text or count --
+            -- see `guardian_pr_forge_comments` below for why those are
+            -- derived at read time instead of cached here.
+            CREATE TABLE IF NOT EXISTS guardian_pr_forge_cache (
+                pr_id              TEXT PRIMARY KEY REFERENCES guardian_pull_requests(id) ON DELETE CASCADE,
+                last_checked_at_ms INTEGER NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'unknown',
+                last_error         TEXT,
+                in_sync            INTEGER,
+                pr_ahead           INTEGER,
+                worktree_ahead     INTEGER,
+                remote_sha         TEXT,
+                local_sha          TEXT,
+                etag_conversation  TEXT,
+                etag_review        TEXT
+            );
+            -- RAL-366: the set of PR comments/notes last fetched by the
+            -- background poller -- id/author/timestamp only, deliberately
+            -- never the body text, so no reviewer-written feedback lands at
+            -- rest in the daemon DB beyond what a human already put on the
+            -- forge. `endpoint` is `'conversation'` (GitHub issue comments /
+            -- GitLab notes) or `'review'` (GitHub inline review comments on
+            -- `/pulls/{n}/comments`; unused for GitLab, whose notes endpoint
+            -- already returns both kinds). Replaced wholesale per
+            -- `(pr_id, endpoint)` on every fresh (non-304) conditional fetch
+            -- -- a comment deleted on the forge between polls is expected to
+            -- disappear here too, unlike `guardian_pr_feedback_actioned`
+            -- which is intentionally permanent. The un-actioned count the
+            -- board reads is always a live join against that table, never a
+            -- second cached integer, so it can never drift out of sync with
+            -- the actioned-ids table that is its actual source of truth.
+            CREATE TABLE IF NOT EXISTS guardian_pr_forge_comments (
+                pr_id       TEXT NOT NULL REFERENCES guardian_pull_requests(id) ON DELETE CASCADE,
+                endpoint    TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                author      TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (pr_id, endpoint, external_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_forge_comments_pr ON guardian_pr_forge_comments(pr_id);
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)

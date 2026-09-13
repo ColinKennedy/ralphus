@@ -119,6 +119,45 @@ pub struct PrComment {
     pub created_at: String,
 }
 
+/// Which comment endpoint [`ForgeClient::list_pr_comments_conditional`]
+/// polls (RAL-366). GitHub splits PR feedback across two REST resources --
+/// general conversation (`/issues/{n}/comments`) and inline review comments
+/// (`/pulls/{n}/comments`) -- so the RAL-366 cache poller fetches both.
+/// GitLab's single `/notes` endpoint already returns both kinds, so `source`
+/// is ignored there; the poller still only needs to call it once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrCommentEndpoint {
+    Conversation,
+    Review,
+}
+
+/// Result of [`ForgeClient::get_conditional`] (RAL-366).
+enum ConditionalGet {
+    /// The forge returned `304`: `etag` still matches, nothing to re-parse.
+    NotModified,
+    /// A fresh body, plus this response's own `ETag` (`None` if the forge
+    /// didn't send one) to store for the next poll's `If-None-Match`.
+    Modified {
+        value: serde_json::Value,
+        etag: Option<String>,
+    },
+}
+
+/// Result of [`ForgeClient::list_pr_comments_conditional`] (RAL-366).
+#[derive(Debug)]
+pub enum CommentsPoll {
+    /// The stored ETag still matched -- no forge quota spent, caller should
+    /// keep whatever comment set it already has cached for this endpoint.
+    NotModified,
+    /// A fresh comment set, plus the new ETag to store for next time (`None`
+    /// if this forge/response didn't send one, in which case the next poll
+    /// falls back to an unconditional fetch).
+    Modified {
+        comments: Vec<PrComment>,
+        etag: Option<String>,
+    },
+}
+
 /// Live base-ref metadata used to reconcile forge-authored base edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestBaseState {
@@ -1311,7 +1350,7 @@ impl ForgeClient {
         {
             Ok(_) => Ok(true),
             Err(ureq::Error::Status(404, _)) => Ok(false),
-            Err(e) => Err(self.describe_evicting(e)),
+            Err(e) => Err(self.describe_evicting(e).into()),
         };
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
@@ -1375,7 +1414,7 @@ impl ForgeClient {
                 Ok(Some(members))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(self.describe_evicting(e)),
+            Err(e) => Err(self.describe_evicting(e).into()),
         };
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
@@ -1511,15 +1550,7 @@ impl ForgeClient {
                 let items = resp
                     .as_array()
                     .ok_or_else(|| format!("unexpected GitHub comments response shape: {resp}"))?;
-                Ok(items
-                    .iter()
-                    .map(|c| PrComment {
-                        external_id: c["id"].as_i64().unwrap_or_default().to_string(),
-                        author: c["user"]["login"].as_str().unwrap_or_default().to_string(),
-                        body: c["body"].as_str().unwrap_or_default().to_string(),
-                        created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
-                    })
-                    .collect())
+                Ok(parse_github_comments(items))
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -1530,19 +1561,64 @@ impl ForgeClient {
                 let items = resp
                     .as_array()
                     .ok_or_else(|| format!("unexpected GitLab notes response shape: {resp}"))?;
-                Ok(items
-                    .iter()
-                    .filter(|n| !n["system"].as_bool().unwrap_or(false))
-                    .map(|n| PrComment {
-                        external_id: n["id"].as_i64().unwrap_or_default().to_string(),
-                        author: n["author"]["username"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        body: n["body"].as_str().unwrap_or_default().to_string(),
-                        created_at: n["created_at"].as_str().unwrap_or_default().to_string(),
-                    })
-                    .collect())
+                Ok(parse_gitlab_notes(items))
+            }
+        }
+    }
+
+    /// Conditional counterpart to [`Self::list_pr_comments`] (RAL-366): sends
+    /// `If-None-Match: etag` when `etag` is `Some`, and returns
+    /// [`CommentsPoll::NotModified`] on a `304` -- no forge quota spent, no
+    /// re-parse. `source` selects which of GitHub's two comment endpoints to
+    /// poll (conversation vs. inline review comments); GitLab has only one
+    /// endpoint covering both kinds, so `source` is ignored there. Returns the
+    /// structured [`ForgeError`] rather than a plain string so the RAL-366
+    /// cache poller can back off on a 429/403 instead of retrying next cycle.
+    pub fn list_pr_comments_conditional(
+        &self,
+        number: i64,
+        source: PrCommentEndpoint,
+        etag: Option<&str>,
+    ) -> Result<CommentsPoll, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        let req = match (self.kind, source) {
+            (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => {
+                let url = format!(
+                    "{}/repos/{}/issues/{number}/comments",
+                    self.api_base, self.repo_path
+                );
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+            }
+            (ForgeKind::GitHub, PrCommentEndpoint::Review) => {
+                let url = format!(
+                    "{}/repos/{}/pulls/{number}/comments",
+                    self.api_base, self.repo_path
+                );
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+            }
+            (ForgeKind::GitLab, _) => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}/notes",
+                    self.api_base, self.repo_path
+                );
+                ureq::get(&url).set("PRIVATE-TOKEN", token)
+            }
+        };
+        match self.get_conditional(req, etag)? {
+            ConditionalGet::NotModified => Ok(CommentsPoll::NotModified),
+            ConditionalGet::Modified { value, etag } => {
+                let items = value.as_array().ok_or_else(|| {
+                    ForgeError::other(format!("unexpected comments response shape: {value}"))
+                })?;
+                let comments = match self.kind {
+                    ForgeKind::GitHub => parse_github_comments(items),
+                    ForgeKind::GitLab => parse_gitlab_notes(items),
+                };
+                Ok(CommentsPoll::Modified { comments, etag })
             }
         }
     }
@@ -1639,6 +1715,40 @@ impl ForgeClient {
     }
 }
 
+/// Parse a GitHub comments-array response (shared by both
+/// `/issues/{n}/comments` and `/pulls/{n}/comments` -- their item shape is
+/// identical) into normalised [`PrComment`]s.
+fn parse_github_comments(items: &[serde_json::Value]) -> Vec<PrComment> {
+    items
+        .iter()
+        .map(|c| PrComment {
+            external_id: c["id"].as_i64().unwrap_or_default().to_string(),
+            author: c["user"]["login"].as_str().unwrap_or_default().to_string(),
+            body: c["body"].as_str().unwrap_or_default().to_string(),
+            created_at: c["created_at"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+/// Parse a GitLab MR notes-array response into normalised [`PrComment`]s,
+/// filtering out system-generated notes (label changes, etc.) -- never
+/// actionable feedback.
+fn parse_gitlab_notes(items: &[serde_json::Value]) -> Vec<PrComment> {
+    items
+        .iter()
+        .filter(|n| !n["system"].as_bool().unwrap_or(false))
+        .map(|n| PrComment {
+            external_id: n["id"].as_i64().unwrap_or_default().to_string(),
+            author: n["author"]["username"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            body: n["body"].as_str().unwrap_or_default().to_string(),
+            created_at: n["created_at"].as_str().unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
 /// GitHub's contents API returns base64 with embedded newlines every 60 chars;
 /// strip whitespace before decoding.
 fn decode_base64_maybe_wrapped(s: &str) -> Option<String> {
@@ -1675,6 +1785,44 @@ impl ForgeClient {
         parse_body(resp)
     }
 
+    /// `GET` with conditional-request support (RAL-366): sets `If-None-Match`
+    /// when `etag` is given, and reports a `304` as
+    /// [`ConditionalGet::NotModified`] rather than an error. `304` has no
+    /// `Location` header for ureq's redirect-following to act on, so ureq
+    /// returns it as `Ok(resp)` (status < 400) rather than `Err`, unlike
+    /// every other non-2xx status this file otherwise routes through
+    /// [`Self::describe_evicting`] -- checked via `resp.status()` before
+    /// attempting to parse what is, on a 304, always an empty body.
+    /// Returns the raw [`ForgeError`] (not stringified) so a caller polling
+    /// on a schedule can inspect `status`/`retry_after` and back off on a
+    /// rate limit instead of retrying next cycle as if nothing happened.
+    fn get_conditional(
+        &self,
+        mut req: ureq::Request,
+        etag: Option<&str>,
+    ) -> Result<ConditionalGet, ForgeError> {
+        if let Some(etag) = etag {
+            req = req.set("If-None-Match", etag);
+        }
+        match req.call() {
+            Ok(resp) if resp.status() == 304 => Ok(ConditionalGet::NotModified),
+            Ok(resp) => {
+                let etag = resp.header("ETag").map(str::to_string);
+                let body = resp
+                    .into_string()
+                    .map_err(|e| ForgeError::other(format!("forge API read: {e}")))?;
+                let value = serde_json::from_str(&body)
+                    .map_err(|e| ForgeError::other(format!("forge API JSON parse: {e}")))?;
+                Ok(ConditionalGet::Modified { value, etag })
+            }
+            // Defensive: not observed with this ureq version's redirect
+            // handling (a 304 without `Location` comes back `Ok` above), but
+            // handled in case that behavior ever changes.
+            Err(ureq::Error::Status(304, _)) => Ok(ConditionalGet::NotModified),
+            Err(e) => Err(self.describe_evicting(e)),
+        }
+    }
+
     /// [`describe_error`], plus (RAL-<new>) evicting this client's
     /// [`CLI_TOKEN_CACHE`] entry on a 401/403 -- the daemon's one signal that
     /// a token might genuinely be bad (revoked, expired), as opposed to the
@@ -1682,7 +1830,7 @@ impl ForgeClient {
     /// served from cache to every request that hits it until the TTL expires
     /// on its own; with it, the very next resolve re-checks the CLI live
     /// instead of waiting.
-    fn describe_evicting(&self, e: ureq::Error) -> String {
+    fn describe_evicting(&self, e: ureq::Error) -> ForgeError {
         if let ureq::Error::Status(401 | 403, _) = &e {
             if let Some(host) = &self.cli_token_host {
                 evict_cli_token(self.kind, host);
@@ -1692,13 +1840,76 @@ impl ForgeClient {
     }
 }
 
-fn describe_error(e: ureq::Error) -> String {
+/// A forge API error (RAL-366): carries the HTTP status and `Retry-After`
+/// header when the forge sent one, alongside the same human-readable message
+/// every pre-existing caller already treats as an opaque `String` (via
+/// `From<ForgeError> for String`, so every `Result<_, String>` method in this
+/// file that reaches this type through `?` keeps compiling unchanged). Only
+/// the new RAL-366 cache-poller call sites -- [`ForgeClient::get_conditional`]
+/// and [`ForgeClient::list_pr_comments_conditional`] -- need the structured
+/// fields, to back off on a rate limit instead of retrying immediately.
+#[derive(Debug, Clone)]
+pub struct ForgeError {
+    pub status: Option<u16>,
+    pub retry_after: Option<Duration>,
+    message: String,
+}
+
+impl ForgeError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            retry_after: None,
+            message: message.into(),
+        }
+    }
+
+    /// Whether this is a forge rate-limit/quota response (RAL-366) the
+    /// cache poller should back off from rather than retry next cycle as if
+    /// nothing happened. GitHub uses 403 for both a genuine auth failure and
+    /// secondary rate limiting; there is no way to tell them apart from the
+    /// status code alone, but backing off either way is the safe choice --
+    /// retrying an auth failure on every cycle is exactly the "retry storm"
+    /// risk this exists to avoid.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self.status, Some(403 | 429))
+    }
+}
+
+impl std::fmt::Display for ForgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<ForgeError> for String {
+    fn from(e: ForgeError) -> String {
+        e.message
+    }
+}
+
+/// Parse a `Retry-After` header value (RAL-366): supports only the
+/// delay-seconds form (`Retry-After: 120`), which is what GitHub/GitLab both
+/// send on a rate limit -- the HTTP-date form is valid per spec but not
+/// something either forge actually emits, so it's left as `None` rather than
+/// pulling in a date-parsing dependency for a case that doesn't occur.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn describe_error(e: ureq::Error) -> ForgeError {
     match e {
         ureq::Error::Status(code, resp) => {
+            let retry_after = resp.header("Retry-After").and_then(parse_retry_after);
             let body = resp.into_string().unwrap_or_default();
-            format!("forge API {code}: {body}")
+            ForgeError {
+                status: Some(code),
+                retry_after,
+                message: format!("forge API {code}: {body}"),
+            }
         }
-        other => format!("forge API: {other}"),
+        other => ForgeError::other(format!("forge API: {other}")),
     }
 }
 
@@ -4114,6 +4325,229 @@ mod tests {
             Some("tok".to_string()),
         );
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // RAL-366: structured forge errors + conditional (ETag) comment fetch
+    // -----------------------------------------------------------------
+
+    fn req_header(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    }
+
+    #[test]
+    fn parse_retry_after_parses_plain_delay_seconds() {
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after(" 5 "), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_retry_after_is_none_for_an_http_date_or_garbage() {
+        // Valid per HTTP spec, but neither forge actually sends this form --
+        // deliberately not parsed (see `parse_retry_after`'s doc comment).
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn forge_error_is_rate_limited_only_for_429_and_403() {
+        let make = |status: Option<u16>| ForgeError {
+            status,
+            retry_after: None,
+            message: "x".to_string(),
+        };
+        assert!(make(Some(429)).is_rate_limited());
+        assert!(make(Some(403)).is_rate_limited());
+        assert!(!make(Some(404)).is_rate_limited());
+        assert!(!make(Some(500)).is_rate_limited());
+        assert!(!make(None).is_rate_limited());
+    }
+
+    #[test]
+    fn forge_error_converts_to_string_preserving_the_message() {
+        let e = ForgeError {
+            status: Some(429),
+            retry_after: Some(Duration::from_secs(30)),
+            message: "forge API 429: slow down".to_string(),
+        };
+        let s: String = e.into();
+        assert_eq!(s, "forge API 429: slow down");
+    }
+
+    #[test]
+    fn describe_error_captures_status_and_integer_retry_after() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string("rate limited")
+                    .with_status_code(429)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"30"[..]).unwrap(),
+                    ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client
+            .list_pr_comments_conditional(1, PrCommentEndpoint::Conversation, None)
+            .unwrap_err();
+        assert_eq!(err.status, Some(429));
+        assert_eq!(err.retry_after, Some(Duration::from_secs(30)));
+        assert!(err.is_rate_limited());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_conditional_sends_if_none_match_and_reports_not_modified_on_304() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"v1\""));
+            req.respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let req = ureq::get(&format!("http://{addr}/x"));
+        let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
+        assert!(matches!(result, ConditionalGet::NotModified));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_pr_comments_conditional_github_fetches_both_endpoints_with_fresh_etags() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let conv = server.recv().unwrap();
+            assert_eq!(conv.url(), "/repos/acme/widget/issues/7/comments");
+            assert_eq!(req_header(&conv, "If-None-Match"), None);
+            conv.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id":1,"user":{"login":"alice"},"body":"hi","created_at":"2024-01-01T00:00:00Z"}]"#,
+                )
+                .with_status_code(200)
+                .with_header(tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"c1\""[..]).unwrap()),
+            )
+            .unwrap();
+
+            let review = server.recv().unwrap();
+            assert_eq!(review.url(), "/repos/acme/widget/pulls/7/comments");
+            review
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"id":2,"user":{"login":"bob"},"body":"inline","created_at":"2024-01-02T00:00:00Z"}]"#,
+                    )
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"r1\""[..]).unwrap(),
+                    ),
+                )
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let conv = client
+            .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, None)
+            .unwrap();
+        let CommentsPoll::Modified { comments, etag } = conv else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(
+            comments,
+            vec![PrComment {
+                external_id: "1".to_string(),
+                author: "alice".to_string(),
+                body: "hi".to_string(),
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+            }]
+        );
+        assert_eq!(etag.as_deref(), Some("\"c1\""));
+
+        let review = client
+            .list_pr_comments_conditional(7, PrCommentEndpoint::Review, None)
+            .unwrap();
+        let CommentsPoll::Modified { comments, etag } = review else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(comments[0].author, "bob");
+        assert_eq!(etag.as_deref(), Some("\"r1\""));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_pr_comments_conditional_reports_not_modified_and_costs_no_reparse() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"c1\""));
+            req.respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client
+            .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, Some("\"c1\""))
+            .unwrap();
+        assert!(matches!(result, CommentsPoll::NotModified));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_pr_comments_conditional_gitlab_uses_the_single_notes_endpoint_for_either_source() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/3/notes");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id":5,"system":false,"author":{"username":"carol"},"body":"note","created_at":"2024-01-03T00:00:00Z"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        // `Review` is meaningless for GitLab -- must route to the exact same
+        // single notes endpoint as `Conversation`, not error or 404.
+        let result = client
+            .list_pr_comments_conditional(3, PrCommentEndpoint::Review, None)
+            .unwrap();
+        let CommentsPoll::Modified { comments, .. } = result else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(comments[0].author, "carol");
         handle.join().unwrap();
     }
 }
