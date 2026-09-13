@@ -3826,6 +3826,31 @@ fn ordered_prs_form_a_chain(ordered_prs: &[&PullRequestView]) -> bool {
         .all(|w| w[1].base_ref == w[0].branch_alias)
 }
 
+/// Drops any recorded "open" PR whose stored `repo` matches neither of the
+/// clients the guardian's *current* base branch resolves to (RAL-397): once
+/// a review's upstream branch is changed to point at a different remote, an
+/// open PR row still naming the old remote's repository can never again be
+/// reached through the client(s) submission now resolves, so
+/// [`refresh_open_prs`]'s live-state check would just fail against the
+/// wrong repository (or, worse, a same-numbered PR that happens to exist
+/// there) and conservatively keep counting it as still open, permanently
+/// blocking a fresh PR from ever being filed against the new remote.
+/// Retargeting that old PR is out of scope -- it is left exactly as
+/// recorded and simply excluded from "already submitted" bookkeeping, so
+/// [`submit_stack_for_guardian`] files a new one against the current remote
+/// instead of silently skipping the branch forever.
+fn retain_prs_reachable_via_current_routing<'a>(
+    by_branch: &mut HashMap<&'a str, &'a PullRequestView>,
+    client: &crate::forge::ForgeClient,
+    fork_routing: Option<&ForkRouting>,
+) {
+    let candidates: Vec<&crate::forge::ForgeClient> = match fork_routing {
+        Some(routing) => vec![&routing.parent_client, &routing.fork_client],
+        None => vec![client],
+    };
+    by_branch.retain(|_, pr| crate::forge::client_for_repo(&pr.repo, &candidates).is_some());
+}
+
 /// Re-checks each already-recorded "open" PR's *live* state on the forge
 /// before letting it count toward "this branch already has one" (RAL-190+):
 /// a PR closed or merged outside ralphus -- the GitHub/GitLab UI, `gh pr
@@ -3837,7 +3862,9 @@ fn ordered_prs_form_a_chain(ordered_prs: &[&PullRequestView]) -> bool {
 /// state-lookup failure (network, missing token, ...) is logged and that PR
 /// is conservatively left as still-open, so "couldn't check" never gets
 /// mistaken for "confirmed closed" and duplicates a PR that's actually
-/// still fine.
+/// still fine. Callers should first narrow `open_by_branch` with
+/// [`retain_prs_reachable_via_current_routing`] so that narrowing applies
+/// before this best-effort fallback ever comes into play.
 fn refresh_open_prs<'a>(
     store: &crate::store_lock::StoreHandle,
     client: &crate::forge::ForgeClient,
@@ -3887,11 +3914,14 @@ fn refresh_open_prs<'a>(
 }
 
 /// Submit a PR for every enabled branch that doesn't already have an open
-/// one -- checking each recorded PR's *live* forge state first via
+/// one -- first dropping any recorded "open" PR that a review's upstream
+/// change has made unreachable via [`retain_prs_reachable_via_current_routing`]
+/// (RAL-397), then checking what's left's *live* forge state via
 /// [`refresh_open_prs`], so a branch whose old PR was closed/merged outside
-/// ralphus gets a fresh one instead of being silently skipped forever --
-/// chaining bases via [`submit_stacked_branch_pr`] exactly like an explicit
-/// per-branch request would. Also re-runs [`resync_pr_bases`] so any
+/// ralphus (or whose remote changed) gets a fresh one instead of being
+/// silently skipped forever -- chaining bases via [`submit_stacked_branch_pr`]
+/// exactly like an explicit per-branch request would. Also re-runs
+/// [`resync_pr_bases`] so any
 /// *pre-existing* open PR whose base no longer matches the current chain
 /// (e.g. one created before this bug fix landed, still pointed at the
 /// guardian's own base branch instead of the branch below it) gets corrected
@@ -3922,7 +3952,9 @@ fn submit_stack_for_guardian(
     use_worktree_branch_name: Option<bool>,
     fork_routing: Option<&ForkRouting>,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
-    let already_open = refresh_open_prs(store, client, open_prs_by_branch(existing_prs));
+    let mut open_by_branch = open_prs_by_branch(existing_prs);
+    retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
+    let already_open = refresh_open_prs(store, client, open_by_branch);
     let mut created = Vec::new();
 
     for branch in ordered_enabled {
@@ -3996,7 +4028,9 @@ fn reconcile_native_pr_stack(
         .lock()
         .list_pull_requests_for_guardian(id)
         .map_err(|e| e.to_string())?;
-    let already_open = refresh_open_prs(store, client, open_prs_by_branch(&existing_prs));
+    let mut open_by_branch = open_prs_by_branch(&existing_prs);
+    retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
+    let already_open = refresh_open_prs(store, client, open_by_branch);
 
     // Re-target any PR that already existed for this guardian but whose base
     // no longer matches the current stack order/chain (RAL-190) -- without
@@ -9111,6 +9145,280 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&origin_bare);
+    }
+
+    /// RAL-397 regression: submit a review's PR stack against `origin`,
+    /// change its upstream to a different remote (`ralphus review upstream
+    /// set`, modeled here via [`Store::set_guardian_base_branch`]), then
+    /// resubmit -- the fresh PR must land on the *new* remote, not be
+    /// silently blocked because a still-recorded-open PR row names the old
+    /// remote's repository. `client`/`remote_name` are passed in manually
+    /// for each round rather than re-derived through
+    /// `crate::forge::resolve_remote_name_excluding`/`resolve_remote_for`,
+    /// exactly like every other push+create test in this module (see the
+    /// note above [`setup_auto_submit_repo`]: there is no portable way to
+    /// combine a real local push target with a forge-host-parseable remote
+    /// URL in this test environment) -- they stand in for exactly what
+    /// `submit_pull_requests_inner` freshly resolves from the guardian's
+    /// `base_branch` on every call.
+    fn resubmit_after_upstream_change_targets_the_new_remote(forge: &str) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let forge_name = forge.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut next_number = 101_i64;
+            loop {
+                let req = match server.recv_timeout(std::time::Duration::from_secs(20)) {
+                    Ok(Some(r)) => r,
+                    Ok(None) | Err(_) => break,
+                };
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                let path = url.split('?').next().unwrap_or(&url).to_string();
+                let is_list = if forge_name == "github" {
+                    path.ends_with("/pulls")
+                } else {
+                    path.ends_with("/merge_requests")
+                };
+                let is_item = if forge_name == "github" {
+                    path.contains("/pulls/")
+                } else {
+                    path.contains("/merge_requests/")
+                };
+                if method == tiny_http::Method::Get && is_list {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Post && is_list {
+                    let number = next_number;
+                    next_number += 1;
+                    let body = if forge_name == "github" {
+                        format!(r#"{{"number":{number},"html_url":"http://x/{number}"}}"#)
+                    } else {
+                        format!(r#"{{"iid":{number},"web_url":"http://x/{number}"}}"#)
+                    };
+                    req.respond(tiny_http::Response::from_string(body).with_status_code(201))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get && is_item {
+                    let body = if forge_name == "github" {
+                        r#"{"state":"open"}"#
+                    } else {
+                        r#"{"state":"opened"}"#
+                    };
+                    req.respond(tiny_http::Response::from_string(body).with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && forge_name == "github"
+                    && path.contains("/contents/")
+                {
+                    // `synthesize_pr_text`'s PR-template lookup -- 404 on
+                    // every candidate path means "no template found", which
+                    // it already treats as a normal fallback case.
+                    req.respond(tiny_http::Response::from_string("{}").with_status_code(404))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && forge_name == "gitlab"
+                    && path.starts_with("/projects/")
+                    && !path.contains("/merge_requests")
+                {
+                    // `synthesize_pr_text`'s PR-template lookup starts by
+                    // fetching the project's default branch -- 404 means "no
+                    // default branch found", which it already treats as
+                    // "no template".
+                    req.respond(tiny_http::Response::from_string("{}").with_status_code(404))
+                        .unwrap();
+                } else {
+                    panic!(
+                        "unexpected request in resubmit-after-upstream-change test: \
+                         {method:?} {url}"
+                    );
+                }
+            }
+        });
+
+        let origin_bare = tmp_dir(&format!("resubmit-remote-origin-bare-{forge}"));
+        g(&origin_bare, &["init", "--bare"]);
+        let alt_bare = tmp_dir(&format!("resubmit-remote-alt-bare-{forge}"));
+        g(&alt_bare, &["init", "--bare"]);
+
+        let root_dir = tmp_dir(&format!("resubmit-remote-work-{forge}"));
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(&root_dir, &["checkout", "-b", "review/a"]);
+        gwrite(&root_dir, "a.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add a.txt"]);
+        g(&root_dir, &["checkout", "release"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", origin_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "alt", alt_bare.to_str().unwrap()],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "origin/release", root_dir.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review/a", "wt")
+            .unwrap();
+
+        let (origin_repo, alt_repo) = if forge == "github" {
+            (
+                "acme/origin-widget".to_string(),
+                "acme/alt-widget".to_string(),
+            )
+        } else {
+            (
+                "acme%2Forigin-widget".to_string(),
+                "acme%2Falt-widget".to_string(),
+            )
+        };
+        let kind = if forge == "github" {
+            crate::forge::ForgeKind::GitHub
+        } else {
+            crate::forge::ForgeKind::GitLab
+        };
+        let client_origin = crate::forge::ForgeClient::new(
+            kind,
+            format!("http://{addr}"),
+            origin_repo.clone(),
+            Some("tok".to_string()),
+        );
+        let client_alt = crate::forge::ForgeClient::new(
+            kind,
+            format!("http://{addr}"),
+            alt_repo.clone(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+
+        // Round 1: submit the (one-branch) stack against `origin`, exactly
+        // what a fresh review's first "submit PR stack" does.
+        let guardian1 = store.lock().get_guardian(&gid).unwrap();
+        let mut ordered_enabled1: Vec<&BranchView> =
+            guardian1.branches.iter().filter(|b| b.enabled).collect();
+        ordered_enabled1.sort_by_key(|b| b.position);
+        let mut alias_by_branch: HashMap<String, String> = HashMap::new();
+        let created1 = submit_stack_for_guardian(
+            &store,
+            &runner,
+            &client_origin,
+            &gid,
+            &root_dir,
+            "origin",
+            &guardian1,
+            &ordered_enabled1,
+            &mut alias_by_branch,
+            "release",
+            &[],
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            created1.len(),
+            1,
+            "round 1 should file one PR against origin"
+        );
+        assert_eq!(created1[0].repo, origin_repo);
+        assert!(created1[0].pr_number.is_some());
+        let origin_pr_id = created1[0].id.clone();
+
+        // The review's upstream branch is switched to a different remote,
+        // exactly what `ralphus review upstream set` does.
+        store
+            .lock()
+            .set_guardian_base_branch(&gid, "alt/release")
+            .unwrap();
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().base_branch,
+            "alt/release"
+        );
+
+        // Round 2: resubmit. `client_alt`/`"alt"` stand in for what
+        // `submit_pull_requests_inner` freshly resolves from the guardian's
+        // now-changed `base_branch` -- this is the regression under test:
+        // the still-recorded-open PR against `origin` must not block a
+        // fresh PR from being filed against `alt`.
+        let guardian2 = store.lock().get_guardian(&gid).unwrap();
+        let mut ordered_enabled2: Vec<&BranchView> =
+            guardian2.branches.iter().filter(|b| b.enabled).collect();
+        ordered_enabled2.sort_by_key(|b| b.position);
+        let existing_prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let mut alias_by_branch = open_alias_by_branch(&existing_prs);
+        let created2 = submit_stack_for_guardian(
+            &store,
+            &runner,
+            &client_alt,
+            &gid,
+            &root_dir,
+            "alt",
+            &guardian2,
+            &ordered_enabled2,
+            &mut alias_by_branch,
+            "release",
+            &existing_prs,
+            "{name}-alias",
+            None,
+            "stack-2",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            created2.len(),
+            1,
+            "resubmitting after an upstream change must file a fresh PR against \
+             the new remote instead of treating the old remote's PR as still blocking"
+        );
+        assert_eq!(created2[0].repo, alt_repo);
+        assert!(created2[0].pr_number.is_some());
+
+        // The branch's alias actually landed on the ALT bare repo, not the
+        // original one.
+        let alt_refs = g(
+            &alt_bare,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(
+            alt_refs.contains(&created2[0].branch_alias),
+            "alias must have been pushed to the new remote: {alt_refs}"
+        );
+
+        // The old, now-unreachable PR against origin is left exactly as
+        // recorded -- retargeting it is explicitly out of scope for RAL-397.
+        let old_pr = store.lock().get_pull_request(&origin_pr_id).unwrap();
+        assert_eq!(old_pr.state, "open");
+        assert_eq!(old_pr.repo, origin_repo);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&origin_bare);
+        let _ = std::fs::remove_dir_all(&alt_bare);
+    }
+
+    #[test]
+    fn resubmit_after_upstream_change_targets_the_new_remote_github() {
+        resubmit_after_upstream_change_targets_the_new_remote("github");
+    }
+
+    #[test]
+    fn resubmit_after_upstream_change_targets_the_new_remote_gitlab() {
+        resubmit_after_upstream_change_targets_the_new_remote("gitlab");
     }
 
     #[test]
