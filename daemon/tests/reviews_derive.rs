@@ -43,25 +43,29 @@ impl Runner for OkRunner {
 }
 
 /// A runner that actually resolves git conflict markers in the worktree by
-/// keeping the "ours" (HEAD) side of every conflict. Used to test the
-/// conflict-resolution loop without requiring a live ollama instance.
+/// keeping BOTH sides of every conflict (just dropping the marker lines
+/// themselves). Used to test the conflict-resolution loop without requiring a
+/// live ollama instance.
+///
+/// Deliberately not "keep ours, drop theirs": during a rebase, "ours" is the
+/// base being rebased onto and "theirs" is the incoming commit's own change,
+/// so discarding theirs entirely can make the resolved commit patch-equal to
+/// the base -- git's `--empty=drop` then skips creating it, tripping
+/// `stack_pick`'s "review branch must contribute at least one commit" empty
+/// check for a reason that has nothing to do with what this fake resolver is
+/// meant to exercise. Keeping both sides guarantees the incoming branch's own
+/// content survives the resolution, so the replayed commit is always real.
 struct ConflictResolvingRunner;
 
 fn strip_conflict_markers(content: &str) -> String {
     let mut out = String::new();
-    // 0 = normal, 1 = ours (keep), 2 = theirs (drop)
-    let mut state: u8 = 0;
     for line in content.lines() {
-        if line.starts_with("<<<<<<<") {
-            state = 1;
-        } else if line.starts_with("=======") && state == 1 {
-            state = 2;
-        } else if line.starts_with(">>>>>>>") && state == 2 {
-            state = 0;
-        } else if state != 2 {
-            out.push_str(line);
-            out.push('\n');
+        if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>")
+        {
+            continue;
         }
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
