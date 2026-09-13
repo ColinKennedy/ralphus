@@ -273,6 +273,36 @@ Work submitted against it will fail — fix the machine or deregister the provid
         } catch (e) { markUnreachable(); }
       }
       /**
+       * Fetches only `triageTypes`/`triagePools` -- the subset of
+       * `pollTriage`'s four endpoints the Projects-tab auto-review-threshold
+       * popup (`renderProjectTriageModal`) actually renders. RAL-404: that
+       * popup used to call the full `pollTriage()`, which also fetches
+       * every configured cron schedule and, worse, `/api/triage/candidates`
+       * -- every Triage-opted-in cell across every squad in the daemon that
+       * hasn't been linked to a review yet, resolved with a per-row
+       * database query. That candidate list has nothing to do with this
+       * popup (it isn't rendered here at all) but scales with total cell
+       * history, which is what made opening/reopening this popup take
+       * seconds. Skips the Triage tab's own `renderTriage()` too, since
+       * this popup never touches that DOM.
+       * @returns {Promise<void>}
+       */
+      async function pollTriageForProjectModal() {
+        try {
+          const [typesResp, poolsResp] = await Promise.all([
+            fetch("/api/triage/types"),
+            fetch("/api/triage/pools"),
+          ]);
+          const [typesData, poolsData] = await Promise.all([
+            typesResp.json(),
+            poolsResp.json(),
+          ]);
+          triageTypes = (typesData.types || []).slice().sort(
+            (/** @type {TriageTypeView} */ a, /** @type {TriageTypeView} */ b) => a.name.localeCompare(b.name));
+          triagePools = poolsData.pools || [];
+        } catch (e) { projectTriageModalError = "daemon unreachable"; }
+      }
+      /**
        * Renders the Triage tab: the registered type registry, current pool
        * state with editable count thresholds, configured cron schedules,
        * and (at the bottom) the candidate list of cells that opted into
@@ -1478,7 +1508,8 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * Opens the "auto-review thresholds" popup for one project (RAL-318) --
        * lets you configure "every N cells of type X" pool-drain thresholds
        * for that project without leaving the Projects tab. Refreshes the
-       * Triage tab's own `triageTypes`/`triagePools` state first so the
+       * Triage tab's own `triageTypes`/`triagePools` state first (RAL-404:
+       * via `pollTriageForProjectModal`, not the full `pollTriage`) so the
        * popup reflects the latest registered types and pool counts.
        *
        * The daemon resolves this registered project's name to its actual
@@ -1491,7 +1522,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       async function openProjectTriageThresholds(projectName) {
         projectTriageModalProject = projectName;
         projectTriageModalError = "";
-        await pollTriage();
+        await pollTriageForProjectModal();
         renderProjectTriageModal();
       }
       /**
@@ -1638,7 +1669,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
-        await pollTriage();
+        await pollTriageForProjectModal();
         renderProjectTriageModal();
       }
       /**
@@ -1666,7 +1697,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           });
           projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
-        await pollTriage();
+        await pollTriageForProjectModal();
         renderProjectTriageModal();
       }
 
