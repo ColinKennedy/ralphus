@@ -6879,9 +6879,10 @@ fn restart_task_preview(daemon: &Daemon, id: &str, ti: &str) -> Reply {
     }
 }
 
-/// Restart a single cell's proof steps from `vi` onwards: resets
-/// cell-level proofs at index >= vi to Pending while leaving the cell
-/// body Done so the scheduler re-runs only the affected proof steps.
+/// Restart a single cell's proof steps: resets every cell-level proof back
+/// to Pending (RAL-289 — restarting any one step re-runs the whole
+/// sequence from the start) while leaving the cell body Done so the
+/// scheduler re-runs only the proof steps.
 ///
 /// Like [`restart_cell`], only cancels the squad's worker when one of the
 /// targeted proof steps is actually still `Running` — see that function's
@@ -6906,9 +6907,14 @@ fn restart_cell_proof(
             vec![],
         );
     };
+    // RAL-289: the reset that follows covers the whole proof sequence, not
+    // just idx >= proof_from, so the liveness check guarding it must too —
+    // otherwise a step earlier than the one the caller targeted could still
+    // be genuinely `Running` and get its state clobbered out from under the
+    // live worker.
     let target_running = daemon
         .lock()
-        .cell_proof_running_from(id, task_idx, cell_idx, proof_from)
+        .cell_proof_running_from(id, task_idx, cell_idx, 0)
         .unwrap_or(true);
     if target_running {
         daemon.cancellations.cancel(id);
@@ -6944,9 +6950,10 @@ fn restart_cell_proof(
     }
 }
 
-/// Restart a task's proof steps from `vi` onwards: resets task-scope proofs
-/// at index >= vi to Pending while leaving all cells Done so the scheduler
-/// re-runs only the affected task-level proofs.
+/// Restart a task's proof steps: resets every task-scope proof back to
+/// Pending (RAL-289 — restarting any one step re-runs the whole sequence
+/// from the start) while leaving all cells Done so the scheduler re-runs
+/// only the task-level proofs.
 ///
 /// Like [`restart_cell`], only cancels the squad's worker when one of the
 /// targeted proof steps is actually still `Running` — see that function's
@@ -6962,9 +6969,11 @@ fn restart_task_proof(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str)
             vec![],
         );
     };
+    // RAL-289: same widening as `restart_cell_proof` above — the reset now
+    // covers every task-scope proof, not just idx >= proof_from.
     let target_running = daemon
         .lock()
-        .task_proof_running_from(id, task_idx, proof_from)
+        .task_proof_running_from(id, task_idx, 0)
         .unwrap_or(true);
     if target_running {
         daemon.cancellations.cancel(id);

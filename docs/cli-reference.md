@@ -188,7 +188,7 @@ aborts the remaining batch).
 |---|---|
 | `task show <selector>` | Task node detail |
 | `task set-status <selector> <state>` | Override a task's status |
-| `task restart-proof <selector> --from <i>` | Restart task-level proof steps from index `i` |
+| `task restart-proof <selector> --from <i>` | Restart every task-level proof step, re-running from the start |
 | `task edit <selector> [--name] [--project]` | Edit a task node's name/project |
 
 ## cell
@@ -200,7 +200,7 @@ aborts the remaining batch).
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
 | `cell set-status <selector> <state>` | Override a cell's status |
 | `cell restart <selector>` | Restart a cell and its downstream |
-| `cell restart-proof <selector> --from <i>` | Restart cell-level proof steps from index `i` |
+| `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
 | `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
@@ -569,7 +569,7 @@ use; see `READ_ONLY_NOTE`.
         - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
         - restart selector [uri]  {Restart a cell (and its downstream), dirtying dependent squads.}
-        - restart-proof selector [uri] --from [index]  {Restart a cell's proof steps from an index onwards.}
+        - restart-proof selector [uri] --from [index]  {Restart a cell's proof steps: resets the whole sequence to pending and re-runs from the start.}
         - resume-automation selector [uri]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
         - (read-only-safe) reviews selector [uri]  {The reviews this cell's branch participates in.}
         - set-status selector [uri] state [str]  {Manually override a cell's status.}
@@ -699,7 +699,7 @@ use; see `READ_ONLY_NOTE`.
     - task  {Task-authoring helpers and task-node inspection.}
         - edit selector [uri] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
         - (read-only-safe) env selector [uri] --scope [task|proof]  {List a task's resolved environment variables, read-only (RAL-324); --scope proof shows what its task-scoped proof steps inherit.}
-        - restart-proof selector [uri] --from [index]  {Restart a task's proof steps from an index onwards.}
+        - restart-proof selector [uri] --from [index]  {Restart a task's proof steps: resets the whole sequence to pending and re-runs from the start.}
         - set-status selector [uri] state [str]  {Manually override a task's status.}
         - (read-only-safe) show selector [uri]  {Show a single task node's detail.}
     - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
