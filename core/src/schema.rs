@@ -1043,11 +1043,17 @@ pub struct ProofStep {
     /// Prompt routed to the local brain (deferred in ralphus MVP).
     #[serde(default)]
     pub brain: Option<String>,
-    /// Headless AI proof-step prompt. Runs using the owning cell's
-    /// resolved backend program (its `agent`), with this step's own `model`
-    /// as an override — a proof step has no separate backend selector.
+    /// Headless AI proof-step prompt. Runs using this step's own `agent`
+    /// override when set, falling back to the owning cell's/task's resolved
+    /// backend program otherwise, with this step's own `model` as a further
+    /// override (RAL-290).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Backend override for this proof step (RAL-290). Falls back to the
+    /// owning cell's resolved agent for a cell-scope step, or the task's for
+    /// a task-scope one -- see [`ResolvedAgent::resolve`]/[`ResolvedAgent::from_task`].
+    #[serde(default)]
+    pub agent: Option<String>,
     /// Model override for the `prompt` proof (falls back to the owning
     /// cell's resolved model when unset).
     #[serde(default)]
