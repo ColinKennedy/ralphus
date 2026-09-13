@@ -18,7 +18,7 @@ use ralphus_cli::commands::review::{
 use ralphus_cli::commands::task::with_uri;
 use ralphus_cli::selector::{
     DEFAULT_REVIEW_LIST_HINT, ResolvedGuardianSelector, SelectorError, guardian_view_uri,
-    resolve_guardian_selector,
+    resolve_guardian_selector, resolve_squad_selector,
 };
 use serde_json::{Value, json};
 
@@ -197,6 +197,25 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         ReviewCommand::AddBranch { selector, branch } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_add_branch(&resolved.guardian_id, &branch)?)
+        }
+        ReviewCommand::LinkCell {
+            selector,
+            cell_selector,
+        } => {
+            let resolved = resolve_branch(client, &selector)?;
+            let cell = resolve_squad_selector(client, &cell_selector)?;
+            if cell.kind != "cell" {
+                return Err(usage(format!(
+                    "'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)"
+                ).as_str()));
+            }
+            Ok(client.guardian_link_cell(
+                &resolved.guardian_id,
+                resolved.branch_id.as_deref().unwrap_or_default(),
+                &cell.squad_id,
+                cell.task_idx,
+                cell.cell_idx,
+            )?)
         }
         ReviewCommand::Reorder {
             selector,

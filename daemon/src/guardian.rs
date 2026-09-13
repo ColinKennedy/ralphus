@@ -1406,6 +1406,71 @@ impl Store {
         Ok(n)
     }
 
+    /// Link an existing cell/task to a guardian's branch after the fact
+    /// (RAL-392): stamps `cells.review_branch`/`review_guardian_id` the same
+    /// way [`crate::reviews::derive_reviews`] does at submit time, for a
+    /// branch that instead reached the guardian through the manual `ralphus
+    /// review create` + `add-branch` attach path, which has no
+    /// submission-time cell membership to record one against -- and so,
+    /// without this, can never be observed `done` (readiness is driven by
+    /// [`Self::mark_ready_branches_with_done_cells`]/
+    /// [`Self::guardian_unfinished_linked_branches`] matching `cells.review_branch`,
+    /// which stays `NULL` forever on the manual path) nor show up on the
+    /// originating squad's `squad show` (`Store::reviews_for_squad` is itself
+    /// cell-derived, RAL-392).
+    ///
+    /// Deliberately overwrites any different link already on the cell --
+    /// re-pointing a cell at a different review when its current one is
+    /// broken is half the point of this ticket -- but never touches the old
+    /// review's own state (detaching from it is a separate, later
+    /// operation). Deliberately does NOT require `guardian_id`'s status to be
+    /// `collecting`: linking must work regardless of the target cell's (or
+    /// the review's) current state.
+    ///
+    /// If the cell is already `done`, promotes the branch straight out of
+    /// `pending` (via [`Self::mark_ready_branches_with_done_cells`]) instead
+    /// of waiting for a task-completion event that will never come now that
+    /// the cell already finished.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] if the guardian, the branch (by id, scoped to
+    /// this guardian), or the cell (by `squad_id`/`task_idx`/`idx`) doesn't
+    /// exist.
+    pub fn link_review_cell(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.guardian_exists(guardian_id)?;
+        let branch: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT branch FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let branch = branch.ok_or(StoreError::NotFound)?;
+        let cell_exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if cell_exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        self.set_cell_review_branch(squad_id, task_idx, idx, &branch)?;
+        self.set_cell_review_guardian(squad_id, task_idx, idx, guardian_id)?;
+        self.mark_ready_branches_with_done_cells(guardian_id)?;
+        Ok(())
+    }
+
     /// RAL-280 dispatch-priority signal for one cell: is it the first
     /// not-yet-contributed branch of a Review it feeds, and if so how many
     /// enabled branches does that Review have? Reuses the same "enabled +
@@ -7046,5 +7111,125 @@ mod tests {
             store.cell_review_dispatch_priority(&squad, 1, 0).unwrap(),
             Some(1)
         );
+    }
+
+    // ── link_review_cell (RAL-392) ──────────────────────────────────────────
+
+    #[test]
+    fn link_review_cell_promotes_branch_ready_immediately_when_cell_already_done() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        // Manual attach path: `review create` + `add-branch`, no submit-time
+        // cell membership of its own.
+        let gid = store
+            .create_guardian("Manual review", "main", "/repo")
+            .unwrap();
+        store.add_guardian_branch(&gid, "feature/x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+
+        // The cell already finished before it's linked -- nothing wires
+        // `review_branch` to it yet, so readiness has no way to observe that.
+        store
+            .set_cell_state(&squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending"
+        );
+
+        store
+            .link_review_cell(&gid, &branch_id, &squad, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "ready",
+            "an already-done linked cell must promote its branch out of pending immediately"
+        );
+        let view = store.get_squad(&squad).unwrap();
+        let cell = &view.tasks[0].cells[0];
+        assert_eq!(cell.reviews.len(), 1);
+        assert_eq!(cell.reviews[0].id, gid);
+    }
+
+    #[test]
+    fn link_review_cell_leaves_branch_pending_when_cell_not_done_yet() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        let gid = store
+            .create_guardian("Manual review", "main", "/repo")
+            .unwrap();
+        store.add_guardian_branch(&gid, "feature/x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+
+        store
+            .link_review_cell(&gid, &branch_id, &squad, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            store.get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn link_review_cell_overwrites_a_prior_different_link() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        let old_gid = store
+            .create_guardian_for_squad("Old review", "main", "/repo", Some(&squad))
+            .unwrap();
+        store.add_guardian_branch(&old_gid, "old-branch").unwrap();
+        store
+            .set_cell_review_branch(&squad, 0, 0, "old-branch")
+            .unwrap();
+        store
+            .set_cell_review_guardian(&squad, 0, 0, &old_gid)
+            .unwrap();
+
+        let new_gid = store
+            .create_guardian("New review", "main", "/repo")
+            .unwrap();
+        store.add_guardian_branch(&new_gid, "new-branch").unwrap();
+        let new_branch_id = store.get_guardian(&new_gid).unwrap().branches[0].id.clone();
+
+        store
+            .link_review_cell(&new_gid, &new_branch_id, &squad, 0, 0)
+            .unwrap();
+
+        let view = store.get_squad(&squad).unwrap();
+        let cell = &view.tasks[0].cells[0];
+        assert_eq!(
+            cell.reviews.len(),
+            1,
+            "re-linking must overwrite, not append to, the old link"
+        );
+        assert_eq!(cell.reviews[0].id, new_gid);
+    }
+
+    #[test]
+    fn link_review_cell_errors_not_found_for_unknown_guardian_branch_or_cell() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(TWO_TASKS).unwrap();
+        let squad = store.insert_squad(&tf, Some("r"), false).unwrap();
+        let gid = store.create_guardian("R", "main", "/repo").unwrap();
+        store.add_guardian_branch(&gid, "feature/x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+
+        assert!(matches!(
+            store.link_review_cell("nope", &branch_id, &squad, 0, 0),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.link_review_cell(&gid, "nope", &squad, 0, 0),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.link_review_cell(&gid, &branch_id, &squad, 9, 9),
+            Err(StoreError::NotFound)
+        ));
     }
 }

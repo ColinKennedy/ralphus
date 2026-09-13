@@ -120,6 +120,7 @@ where one exists.
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
 | POST | `/api/guardians/{id}/branches/{branch_id}/dismiss_reenable` | Dismiss the "can re-enable" notice |
 | POST | `/api/guardians/{id}/branches/{branch_id}/move` | [Move a branch to another review](#post-apiguardiansidbranchesposmove) (RAL-118) |
+| POST | `/api/guardians/{id}/branches/{branch_id}/link_cell` | [Link a cell/task to an already-attached branch](#post-apiguardiansidbranchesbranch_idlink_cell) (RAL-392) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that review worktree (RAL-324) |
 | GET | `/api/guardians/{id}/build-env` | Resolved environment variables for the finalize-time auto-build step (RAL-324) |
@@ -1751,6 +1752,29 @@ against its own chain — would need on top of this:
   building one copy do not leak into or corrupt the other's rebuild — this is
   the same isolation `move_guardian_branch`'s source-side rebuild relies on
   (see `guardian_merge::purge_worktrees`).
+
+### `POST /api/guardians/{id}/branches/{branch_id}/link_cell`
+Link an existing cell/task to `{id}`'s `branch_id` after the fact (RAL-392) --
+the manual counterpart to what submitting a `[[review]]`-declared cell does
+automatically at submit time. This is for the manual attach path (`review
+create` + `POST .../branches`), which has no submit-time cell membership of
+its own -- without this, that branch can never be observed `done` (readiness
+is driven by matching `cells.review_branch` against the guardian's branches)
+and the review never shows up on the cell's own squad (`GET
+/api/squads/{id}`'s `reviews` list is itself cell-derived). Body:
+```json
+{ "squad_id": "squad-000000000001", "task_idx": 0, "idx": 0 }
+```
+Deliberately overwrites any different link already on the cell -- re-pointing
+a cell at a different review when its current one is broken is expected;
+detaching from the old review is a separate, unrelated operation this
+endpoint does not perform. Works regardless of the target cell's current
+state: if it has already finished, the branch is promoted straight out of
+`pending` to `ready` as part of this same call, instead of waiting for a
+task-completion event that will never come. A missing `id`/`branch_id` (not
+found in this guardian's branches) or `squad_id`/`task_idx`/`idx` (no such
+cell) is a `404`; a malformed body is a `400`. Returns the updated guardian
+view.
 
 ### `POST /api/guardians/{id}/resolve-input`
 "Set it for me" (RAL-164): asks the resolver agent to propose a value for one

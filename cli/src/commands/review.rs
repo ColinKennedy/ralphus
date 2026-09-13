@@ -34,7 +34,7 @@ use crate::commands::{CommandError, emit, run_and_report};
 use crate::flags::{Scanner, UsageError};
 use crate::selector::{
     DEFAULT_REVIEW_LIST_HINT, ResolvedGuardianSelector, SelectorError, guardian_view_uri,
-    resolve_guardian_selector,
+    resolve_guardian_selector, resolve_squad_selector,
 };
 
 #[derive(Debug, Clone)]
@@ -134,6 +134,16 @@ pub enum ReviewCommand {
     AddBranch {
         selector: String,
         branch: String,
+    },
+    /// RAL-392: link an already-attached branch (typically added via
+    /// `AddBranch` against a review created via `Create`) to the cell/task
+    /// that actually produced it, so the branch's readiness is driven by
+    /// that cell finishing (same as the automatic submit-time path) instead
+    /// of being permanently stuck `pending`, and so the review shows up on
+    /// that cell's squad.
+    LinkCell {
+        selector: String,
+        cell_selector: String,
     },
     Reorder {
         selector: String,
@@ -454,6 +464,18 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 _ => {
                     ReviewCommand::UsageError("add-branch requires <selector> <branch>".to_string())
                 }
+            }
+        }
+        Some("link-cell") => {
+            let rest = scanner.remaining();
+            match (rest.first(), rest.get(1)) {
+                (Some(selector), Some(cell_selector)) => ReviewCommand::LinkCell {
+                    selector: selector.clone(),
+                    cell_selector: cell_selector.clone(),
+                },
+                _ => ReviewCommand::UsageError(
+                    "link-cell requires <selector> <cell_selector>".to_string(),
+                ),
             }
         }
         Some("reorder") => {
@@ -1356,6 +1378,41 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
+        ReviewCommand::LinkCell {
+            selector,
+            cell_selector,
+        } => {
+            let resolved = match resolve_branch(opts, &client, &selector) {
+                Ok(r) => r,
+                Err(code) => return code,
+            };
+            let cell = match resolve_squad_selector(&client, &cell_selector) {
+                Ok(r) => r,
+                Err(e) => return fail_selector(opts, e),
+            };
+            if cell.kind != "cell" {
+                return fail_message(
+                    opts,
+                    format!("'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)"),
+                    2,
+                );
+            }
+            match client.guardian_link_cell(
+                &resolved.guardian_id,
+                resolved.branch_id.as_deref().unwrap_or_default(),
+                &cell.squad_id,
+                cell.task_idx,
+                cell.cell_idx,
+            ) {
+                Ok(result) => {
+                    emit(opts, &result, |_| {
+                        println!("{cell_selector} linked to {selector}")
+                    });
+                    0
+                }
+                Err(e) => fail_daemon(opts, e),
+            }
+        }
         ReviewCommand::Reorder {
             selector,
             order,
@@ -2993,6 +3050,28 @@ mod tests {
                 assert_eq!(selector, "g1~0");
                 assert_eq!(to_review, "g2");
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_link_cell() {
+        match parse(&v(&["link-cell", "g1~0", "squad-1/0/0"])) {
+            ReviewCommand::LinkCell {
+                selector,
+                cell_selector,
+            } => {
+                assert_eq!(selector, "g1~0");
+                assert_eq!(cell_selector, "squad-1/0/0");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_cell_requires_both_selectors() {
+        match parse(&v(&["link-cell", "g1~0"])) {
+            ReviewCommand::UsageError(_) => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
