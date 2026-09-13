@@ -2629,14 +2629,21 @@ as within-squad `depends_on` resolution). Shape:
 
 ### `GET /api/squads/{id}/worktrees`
 Per-cell git info for the detail pane's read-only rows (CCTL-148; `upstream`
-added later): the cell's own worktree (`cwd`), its shared project root, and
-the upstream to display. Computed on demand (runs `git` per cell), not on
-the hot board path:
+added later): the cell's own worktree (`cwd`), its project, and the upstream
+to display. Computed on demand (runs `git` per cell), not on the hot board
+path:
 ```json
 [
-  { "task_idx": 0, "cell_idx": 0, "worktree": "C:/repo/.git/.ralphus_worktrees/feat", "project": "C:/repo", "upstream": "main" }
+  { "task_idx": 0, "cell_idx": 0, "worktree": "C:/repo/.git/.ralphus_worktrees/feat", "project": "ralphus", "upstream": "main" }
 ]
 ```
+`project` (RAL-396) is the registered project's name when the cell's derived
+project root matches one (`Store::project_name_for_path`), otherwise the raw
+derived path as a fallback for an unregistered repo -- resolved server-side
+so the UI never has to resolve or display a raw path itself (paths aren't a
+stable, UI-facing concept for a cell that may run on a remote machine,
+RAL-185).
+
 `project`/`upstream` are `null` when `cwd` is not inside a git worktree.
 `upstream` is one of two things, per the cell's `upstream = "<<task:...>>"`
 sentinel (RAL-50 branch-chaining):

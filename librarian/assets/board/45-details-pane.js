@@ -726,10 +726,13 @@
           ${envSection}`;
       }
 
-      // CCTL-148: worktree (the cell's own cwd) and project (its shared git
-      // root) are distinct — fetch the derived project root lazily and cache it.
+      // CCTL-148: worktree (the cell's own cwd) and project are distinct —
+      // fetch this squad's per-cell project info lazily and cache it. RAL-396:
+      // `project` is already resolved server-side to a registered project's
+      // name when one matches (falling back to the derived path only when
+      // none does) — this UI never resolves or displays a raw path itself.
       /**
-       * Lazily fetches and caches a squad's per-cell worktree/project paths.
+       * Lazily fetches and caches a squad's per-cell worktree/project info.
        * @param {string} id
        * @returns {Promise<void>}
        */

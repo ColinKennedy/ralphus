@@ -84,12 +84,12 @@
       /**
        * One cell's derived git info from `GET /api/squads/{id}/worktrees`
        * (CCTL-148; `upstream` added later) — the cell's own worktree
-       * (`cwd`), its shared project root, and its read-only display upstream.
+       * (`cwd`), its project, and its read-only display upstream.
        * @typedef {object} CellPathInfo
        * @property {number} task_idx
        * @property {number} cell_idx
        * @property {string|null} worktree
-       * @property {string|null} project
+       * @property {string|null} project - RAL-396: the registered project's name when this cell's worktree maps to one, otherwise the derived (unregistered) repo path as a fallback. Resolved server-side — never a raw path to display when a project association exists, since a cell's on-disk path isn't stable for remote-machine cells (RAL-185).
        * @property {string|null} upstream
        */
       /**
