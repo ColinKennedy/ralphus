@@ -123,6 +123,23 @@ fn fill_metrics(rows: &mut [ResourceRow]) {
 type CpuMap = HashMap<u32, Option<f64>>;
 type MemMap = HashMap<u32, Option<u64>>;
 
+/// A single-shot read of each PID's cumulative CPU time in seconds (RAL-308),
+/// with no blocking delta sample -- unlike [`sample_cpu_mem`], which sleeps
+/// [`CPU_SAMPLE_INTERVAL`] to turn two cumulative readings into a percentage.
+/// A periodic caller that already samples minutes apart (e.g.
+/// [`crate::cpu_stall::CpuStallTracker::sweep`]) diffs successive raw
+/// readings itself, so there's nothing to gain from blocking here. Reuses
+/// the same per-OS [`read_procs`] abstraction as every other metric in this
+/// module -- `None` for a PID this platform/build can't read (unsupported
+/// OS, or a transient read failure), never a guessed value.
+#[must_use]
+pub fn cpu_seconds(pids: &[u32]) -> HashMap<u32, Option<f64>> {
+    let snap = read_procs(pids);
+    pids.iter()
+        .map(|&pid| (pid, snap.get(&pid).and_then(|s| s.cpu_secs)))
+        .collect()
+}
+
 fn sample_cpu_mem(pids: &[u32]) -> (CpuMap, MemMap) {
     let first = read_procs(pids);
     std::thread::sleep(CPU_SAMPLE_INTERVAL);

@@ -267,6 +267,62 @@ pub struct RunnerSpec {
     /// streams like any other text) wherever this spec isn't resolved from
     /// `.ralphus.toml`.
     pub hide_thinking: bool,
+    /// RAL-308 cumulative `maximum_timeout_seconds` hard-cap accounting.
+    /// `None` when neither this row, its owning cell, nor its owning task
+    /// declared the field -- the common case, costing nothing extra at poll
+    /// time. See [`MaximumTimeoutCaps`] for the scoping rules and
+    /// [`SubprocessRunner::maximum_timeout_exceeded`] for enforcement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_timeout: Option<MaximumTimeoutCaps>,
+}
+
+/// Wall-clock hard-cap accounting for the task-file `maximum_timeout_seconds`
+/// field (RAL-308) -- cumulative across a task's/cell's descendants, unlike
+/// the override-inheritance `timeout_minutes` -> `timeout_sec` chain
+/// ([`RunnerSpec::timeout_sec`]), which keeps enforcing its own
+/// single-attempt deadline unchanged and independently of this: both caps
+/// are checked every poll tick, and either one killing a run records its own
+/// distinct failure reason.
+///
+/// Which fields apply depends on whether the owning [`RunnerSpec`] is a cell
+/// (`proof: false`) or a proof step (`proof: true`) -- see
+/// [`SubprocessRunner::maximum_timeout_exceeded`]:
+/// - Cell: `self_cap_sec` is the cell's own field, already the cumulative
+///   cap covering the cell and its cell-scope proofs. `cell_cap_sec` is
+///   unused.
+/// - Proof step: `self_cap_sec` is the step's own field, a simple self-only
+///   cap (a proof has no descendants). `cell_cap_sec`, when `cell_idx` is
+///   `Some`, is the owning cell's own field (its cumulative cell+proofs
+///   cap) -- distinct from `self_cap_sec`.
+/// - Both: `task_cap_sec` is the owning task's field, cumulative across
+///   every cell and proof step in the task.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaximumTimeoutCaps {
+    /// Owning squad id.
+    pub squad_id: String,
+    /// Owning task index within the squad.
+    pub task_idx: i64,
+    /// Owning cell index within the task. `Some` for a cell run or a
+    /// cell-scope proof step; `None` for a task-scope proof step.
+    pub cell_idx: Option<i64>,
+    /// This row's own `maximum_timeout_seconds`, in seconds.
+    pub self_cap_sec: Option<u64>,
+    /// The owning cell's own `maximum_timeout_seconds`, in seconds --
+    /// meaningful only for a cell-scope proof step.
+    pub cell_cap_sec: Option<u64>,
+    /// The owning task's `maximum_timeout_seconds`, in seconds.
+    pub task_cap_sec: Option<u64>,
+}
+
+impl MaximumTimeoutCaps {
+    /// Whether any cap is actually configured -- if not, the caller should
+    /// store `None` instead of `Some(caps)` so enforcement has nothing to
+    /// check.
+    #[must_use]
+    fn has_any_cap(&self) -> bool {
+        self.self_cap_sec.is_some() || self.cell_cap_sec.is_some() || self.task_cap_sec.is_some()
+    }
+}
 }
 
 /// Generate a fresh RFC 4122 version-4 (random) UUID, formatted as the
@@ -568,6 +624,22 @@ impl RunnerSpec {
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
             hide_thinking: resolved_hide_thinking(),
+            // RAL-308: a cell's own cap is already the cumulative cap
+            // covering itself and its cell-scope proofs -- see
+            // `MaximumTimeoutCaps`'s doc comment.
+            maximum_timeout: {
+                let caps = MaximumTimeoutCaps {
+                    squad_id: squad_id.to_string(),
+                    task_idx: row.task_idx,
+                    cell_idx: Some(row.idx),
+                    self_cap_sec: row.maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                    cell_cap_sec: None,
+                    task_cap_sec: row
+                        .task_maximum_timeout_sec
+                        .and_then(|v| u64::try_from(v).ok()),
+                };
+                caps.has_any_cap().then_some(caps)
+            },
         }
     }
 
@@ -580,6 +652,36 @@ impl RunnerSpec {
     #[must_use]
     pub fn with_machine(mut self, machine: Option<String>) -> Self {
         self.machine = machine;
+        self
+    }
+
+    /// Attach RAL-308 cumulative `maximum_timeout_seconds` cap accounting to
+    /// a proof-step spec built by [`Self::for_proof`]/[`Self::for_command_proof`]
+    /// -- a builder for the same reason as [`Self::with_machine`]: those
+    /// constructors already take enough positional arguments. A no-op
+    /// (leaves `maximum_timeout` at `None`) when none of the three caps is
+    /// set, so a task file that never uses the field pays no extra runtime
+    /// cost polling for it.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_maximum_timeout_caps(
+        mut self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: Option<i64>,
+        self_cap_sec: Option<u64>,
+        cell_cap_sec: Option<u64>,
+        task_cap_sec: Option<u64>,
+    ) -> Self {
+        let caps = MaximumTimeoutCaps {
+            squad_id: squad_id.to_string(),
+            task_idx,
+            cell_idx,
+            self_cap_sec,
+            cell_cap_sec,
+            task_cap_sec,
+        };
+        self.maximum_timeout = caps.has_any_cap().then_some(caps);
         self
     }
 
@@ -644,6 +746,9 @@ impl RunnerSpec {
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
             hide_thinking: resolved_hide_thinking(),
+            // RAL-308: attached via `with_maximum_timeout_caps` by callers
+            // that need it (the scheduler); most test-only callers don't.
+            maximum_timeout: None,
         }
     }
 
@@ -724,6 +829,9 @@ impl RunnerSpec {
             // rendering is inert -- same rationale as the isolation fields
             // above.
             hide_thinking: false,
+            // RAL-308: attached via `with_maximum_timeout_caps` by callers
+            // that need it (the scheduler); most test-only callers don't.
+            maximum_timeout: None,
         }
     }
 }
@@ -877,6 +985,36 @@ impl RunnerResult {
             turns: Some(usage.turns),
             ghost: None,
             retry_after_secs: None,
+        }
+    }
+
+    /// A cell or proof step killed mid-run for exceeding a RAL-308
+    /// `maximum_timeout_seconds` hard cap -- either its own, its owning
+    /// cell's, or its owning task's cumulative budget (see
+    /// [`SubprocessRunner::maximum_timeout_exceeded`] for which one).
+    /// Deliberately a distinct constructor from [`Self::failure`]'s generic
+    /// `timed_out after {secs}s` message (the existing `timeout_minutes`
+    /// path) so the two hard caps record unambiguously different failure
+    /// reasons, and carries the last-known live usage like
+    /// [`Self::cost_exceeded`] for the same reason: a zeroed-out failure
+    /// would regress the board's already-live numbers.
+    #[must_use]
+    pub fn maximum_timeout_exceeded(usage: LiveUsage, reason: impl Into<String>) -> Self {
+        Self {
+            status: "failed".to_string(),
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: usage.cost_usd,
+            cost_is_estimated: true,
+            summary: String::new(),
+            error: Some(format!("terminated: {}", reason.into())),
+            proofed: None,
+            agent_session_id: None,
+            ghost: None,
         }
     }
 
@@ -2032,6 +2170,24 @@ impl SubprocessRunner {
                     break RunnerResult::cost_exceeded(current_usage, cap);
                 }
             }
+            // RAL-308: the hard, cumulative `maximum_timeout_seconds` caps --
+            // independent of (and checked alongside) `timeout_sec`/`deadline`
+            // above, which stays exactly as it was for `timeout_minutes`.
+            if let Some(reason) = self.maximum_timeout_exceeded(attempt_spec, started.elapsed()) {
+                let _ = tmux.kill_session(session_name);
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [runner] {reason}, killing squad={} cell={}",
+                    attempt_spec.squad_id,
+                    attempt_spec.cell_id
+                );
+                self.emit_tmux_note(
+                    attempt_spec,
+                    "tmux session killed: maximum_timeout_seconds exceeded",
+                    session_name,
+                );
+                break RunnerResult::maximum_timeout_exceeded(current_usage, reason);
+            }
             if first_tick || last_tmux_poll.elapsed() >= TMUX_POLL_INTERVAL {
                 first_tick = false;
                 last_tmux_poll = Instant::now();
@@ -2324,6 +2480,75 @@ impl SubprocessRunner {
         let mut guard = store.lock();
         guard.clear_live_activity(session_name);
         guard.clear_stall_escalated(session_name);
+    }
+
+    /// RAL-308: check the hard, cumulative `maximum_timeout_seconds` caps
+    /// for this attempt's row and (if applicable) its owning cell/task.
+    /// Returns a human-readable reason once any configured cap's usage has
+    /// reached or exceeded it, or `None` if no cap is configured or none has
+    /// tripped yet. `elapsed` is `started.elapsed()` from the caller's shared
+    /// deadline tracking -- the same value `timeout_sec` is checked against,
+    /// so a proof step's own cap spans reattach attempts exactly like
+    /// `timeout_sec` already does.
+    ///
+    /// The cumulative (task/cell) caps are read live from the store's
+    /// `started_at_ms`/`finished_at_ms` spans rather than tracked via a
+    /// separate in-memory running counter, so this stays correct even when
+    /// sibling cells/proofs under the same cap run concurrently: each
+    /// sibling's own row already carries the ground truth, including a
+    /// still-running sibling's live elapsed time (its `finished_at_ms` is
+    /// still `NULL`). A no-op when no cartographer store is attached,
+    /// mirroring [`Self::check_stall_escalation`].
+    fn maximum_timeout_exceeded(&self, spec: &RunnerSpec, elapsed: Duration) -> Option<String> {
+        let caps = spec.maximum_timeout.as_ref()?;
+        if spec.proof {
+            // A proof step has no descendants -- its own cap is a simple
+            // single-attempt deadline, exactly like `timeout_sec` above.
+            if let Some(cap_sec) = caps.self_cap_sec {
+                if elapsed.as_secs() >= cap_sec {
+                    return Some(format!(
+                        "proof step's own maximum_timeout_seconds ({cap_sec}s) exceeded"
+                    ));
+                }
+            }
+        }
+        let store = self.cartographer.as_ref()?;
+        let guard = store.lock();
+        let now = crate::store::now_ms();
+        // For a cell run, its own `maximum_timeout_seconds` (`self_cap_sec`)
+        // is already the cumulative cell+proofs cap; for a cell-scope proof,
+        // it's the owning cell's separate `cell_cap_sec`. Either way this is
+        // "the cell-scope cumulative cap to check", checked the same way.
+        let cell_cap = if spec.proof {
+            caps.cell_cap_sec
+        } else {
+            caps.self_cap_sec
+        };
+        if let (Some(cap_sec), Some(cell_idx)) = (cell_cap, caps.cell_idx) {
+            if let Ok(used_ms) =
+                guard.cell_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, cell_idx, now)
+            {
+                if used_ms >= saturating_cap_ms(cap_sec) {
+                    return Some(format!(
+                        "cell's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the cell and its proofs)",
+                        used_ms / 1000
+                    ));
+                }
+            }
+        }
+        if let Some(cap_sec) = caps.task_cap_sec {
+            if let Ok(used_ms) =
+                guard.task_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, now)
+            {
+                if used_ms >= saturating_cap_ms(cap_sec) {
+                    return Some(format!(
+                        "task's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the task)",
+                        used_ms / 1000
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// RAL-241: check whether `session_name` has shown no activity (pane
@@ -2741,6 +2966,19 @@ fn timed_out(elapsed: Duration, deadline: Option<Duration>) -> bool {
     matches!(deadline, Some(d) if elapsed >= d)
 }
 
+/// A `maximum_timeout_seconds` cap, converted to milliseconds for comparison
+/// against [`crate::store::Store::task_cumulative_runtime_ms`]/
+/// [`crate::store::Store::cell_cumulative_runtime_ms`], saturating rather
+/// than overflowing for a cap large enough that `* 1000` would exceed
+/// `i64::MAX` (astronomically larger than any real timeout, but `unwrap_or`
+/// on the intermediate `u64` -> `i64` conversion keeps this total instead of
+/// panicking).
+fn saturating_cap_ms(cap_sec: u64) -> i64 {
+    i64::try_from(cap_sec)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000)
+}
+
 /// Writes `session_name`'s durable attempt log for `attempt`, preferring the
 /// unbounded-depth `.raw` pipe-pane transcript (RAL-397 Phase 2E) over a
 /// single `capture-pane` scrollback snapshot. Falls back to
@@ -2915,6 +3153,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let json = serde_json::to_string(&spec).unwrap();
@@ -2952,6 +3192,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         // No `[live_view]` config file in the test environment, so this
@@ -2988,6 +3230,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(spec.maximum_context, Some(100_000));
@@ -3024,6 +3268,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(
@@ -3070,6 +3316,7 @@ mod tests {
             allow_personal_settings: false,
             allow_personal_memory: false,
             hide_thinking: false,
+            maximum_timeout: None,
         }
     }
 
@@ -3083,6 +3330,122 @@ mod tests {
                 rusqlite::params![id],
             )
             .unwrap();
+    }
+
+    // ── RAL-308: maximum_timeout_seconds hard-cap enforcement ─────────────────
+
+    #[test]
+    fn maximum_timeout_exceeded_is_none_without_any_cap() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
+        let spec = stall_test_spec();
+        assert!(spec.maximum_timeout.is_none());
+        assert!(
+            runner
+                .maximum_timeout_exceeded(&spec, Duration::from_secs(999_999))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn maximum_timeout_exceeded_fires_for_proof_self_cap() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
+        let mut spec = stall_test_spec();
+        spec.proof = true;
+        spec.maximum_timeout = Some(MaximumTimeoutCaps {
+            squad_id: spec.squad_id.clone(),
+            task_idx: 0,
+            cell_idx: None,
+            self_cap_sec: Some(5),
+            cell_cap_sec: None,
+            task_cap_sec: None,
+        });
+        assert!(
+            runner
+                .maximum_timeout_exceeded(&spec, Duration::from_secs(4))
+                .is_none(),
+            "must not fire before the cap"
+        );
+        let reason = runner
+            .maximum_timeout_exceeded(&spec, Duration::from_secs(5))
+            .expect("own cap exceeded at exactly the deadline");
+        assert!(reason.contains("proof step's own maximum_timeout_seconds"));
+    }
+
+    #[test]
+    fn maximum_timeout_exceeded_fires_for_cumulative_cell_cap() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        insert_squad_for_stall_test(&store.lock(), "squad-cap-1");
+        // A cell-scope proof under cell 0 that already burned 10s.
+        let now = crate::store::now_ms();
+        store
+            .lock()
+            .conn
+            .execute(
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, started_at_ms, finished_at_ms)
+                 VALUES('squad-cap-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', ?1, ?2)",
+                rusqlite::params![now - 10_000, now],
+            )
+            .unwrap();
+        let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
+        let mut spec = stall_test_spec();
+        spec.squad_id = "squad-cap-1".to_string();
+        // `spec.proof` is `false` here (this is the cell's own run): its own
+        // `self_cap_sec` is the cumulative cell+proofs cap being checked.
+        spec.maximum_timeout = Some(MaximumTimeoutCaps {
+            squad_id: "squad-cap-1".to_string(),
+            task_idx: 0,
+            cell_idx: Some(0),
+            self_cap_sec: Some(5),
+            cell_cap_sec: None,
+            task_cap_sec: None,
+        });
+        let reason = runner
+            .maximum_timeout_exceeded(&spec, Duration::from_secs(0))
+            .expect("cell's cumulative cap (5s) already exceeded by the proof's 10s");
+        assert!(reason.contains("cell's maximum_timeout_seconds"));
+    }
+
+    #[test]
+    fn maximum_timeout_exceeded_is_none_below_cumulative_task_cap() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        insert_squad_for_stall_test(&store.lock(), "squad-cap-2");
+        let now = crate::store::now_ms();
+        store
+            .lock()
+            .conn
+            .execute(
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, started_at_ms, finished_at_ms)
+                 VALUES('squad-cap-2', 0, 'task', -1, 0, 'command', 'true', 'claude', 'done', ?1, ?2)",
+                rusqlite::params![now - 5_000, now],
+            )
+            .unwrap();
+        let runner = SubprocessRunner::new("unused").with_cartographer(Arc::clone(&store));
+        let mut spec = stall_test_spec();
+        spec.squad_id = "squad-cap-2".to_string();
+        spec.maximum_timeout = Some(MaximumTimeoutCaps {
+            squad_id: "squad-cap-2".to_string(),
+            task_idx: 0,
+            cell_idx: Some(0),
+            self_cap_sec: None,
+            cell_cap_sec: None,
+            // Far above the 5s already used by the task-scope proof.
+            task_cap_sec: Some(3600),
+        });
+        assert!(
+            runner
+                .maximum_timeout_exceeded(&spec, Duration::from_secs(0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3191,6 +3554,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let effective = RunnerSpec::from_row("run-1", &row)
             .effective_system_prompt()
@@ -3249,6 +3614,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         assert!(
             RunnerSpec::from_row("run-1", &row)
@@ -3282,6 +3649,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let json = serde_json::to_string(&RunnerSpec::from_row("run-1", &row)).unwrap();
         assert!(!json.contains("system_prompt"));
@@ -3371,6 +3740,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3413,6 +3784,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3449,6 +3822,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3491,6 +3866,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert!(
@@ -4069,6 +4446,8 @@ prompt = "make it build"
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let spec = RunnerSpec::from_row(&run_id, &row);
         // See the sibling `..._for_a_command_kind_spec` test: cancel on
@@ -4153,6 +4532,8 @@ prompt = "make it build"
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let result = runner.run(&RunnerSpec::from_row(&run_id, &row));
         assert!(!result.is_done());
@@ -4854,6 +5235,7 @@ prompt = "make it build"
             allow_personal_settings: false,
             allow_personal_memory: false,
             hide_thinking: false,
+            maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 
@@ -4992,6 +5374,7 @@ prompt = "make it build"
             allow_personal_settings: false,
             allow_personal_memory: false,
             hide_thinking: false,
+            maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
 

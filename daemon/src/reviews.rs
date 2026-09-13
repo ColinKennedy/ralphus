@@ -455,6 +455,8 @@ fn rows_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInf
                 upstream: s.upstream.clone(),
                 machine: ralphus_core::schema::resolve_cell_machine(task, s),
                 share_session: false,
+                maximum_timeout_sec: None,
+                task_maximum_timeout_sec: None,
             });
             // Collect the cell's cwd and its optional review opt-in id. `review`
             // is a `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` sentinel
@@ -2574,6 +2576,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         }
     }
 
@@ -2821,6 +2825,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         }
     }
 

@@ -322,6 +322,7 @@ pub fn run_generation(
         allow_personal_settings: false,
         allow_personal_memory: false,
         hide_thinking: false,
+        maximum_timeout: None,
     };
     let runner = SubprocessRunner::from_env();
     let result = runner.run_cancellable(&spec, cancel);

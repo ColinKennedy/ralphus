@@ -133,6 +133,17 @@ pub struct TaskDef {
     /// steps; each may override with its own `timeout_minutes`.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Hard maximum runtime in seconds for this whole task (RAL-308),
+    /// cumulative across every one of its cells and proof steps (both
+    /// task-scope and cell-scope). Independent of `timeout_minutes` above,
+    /// which is a per-cell/per-proof override-inheritance deadline for a
+    /// single attempt rather than a running total across descendants: both
+    /// caps are enforced simultaneously, and either one killing a run
+    /// records its own distinct failure reason. `None` means no task-wide
+    /// cap. See [`CellDef::maximum_timeout_seconds`] and
+    /// [`ProofStep::maximum_timeout_seconds`] for the narrower scopes.
+    #[serde(default)]
+    pub maximum_timeout_seconds: Option<u64>,
     /// Other tasks/cells this whole task waits on.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -266,6 +277,15 @@ pub struct CellDef {
     /// `timeout_minutes` when unset.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Hard maximum runtime in seconds for this cell (RAL-308), cumulative
+    /// across the cell itself and its own cell-scope proof steps. Does
+    /// *not* fall back to [`TaskDef::maximum_timeout_seconds`] the way
+    /// `timeout_minutes` falls back to `timeout_minutes` -- the task's cap
+    /// and this cell's cap are independent budgets enforced side by side
+    /// (the task's covers every cell/proof under it; this one covers just
+    /// this cell and its proofs). `None` means no cell-wide cap.
+    #[serde(default)]
+    pub maximum_timeout_seconds: Option<u64>,
     /// Initial queue-priority hint for this cell (lower value = higher
     /// priority = runs sooner). Seeds the live queue rank at submit time; the
     /// Queue view/CLI own ordering thereafter.
@@ -1086,6 +1106,15 @@ pub struct ProofStep {
     /// `timeout_minutes` when unset.
     #[serde(default)]
     pub timeout_minutes: Option<u32>,
+    /// Hard maximum runtime in seconds for this proof step alone (RAL-308).
+    /// A proof step has no descendants, so unlike
+    /// [`TaskDef::maximum_timeout_seconds`]/[`CellDef::maximum_timeout_seconds`]
+    /// this is a simple self-only cap, not a cumulative one -- it does not
+    /// fall back to the owning cell's/task's value, which are separate,
+    /// independently-enforced budgets. `None` means no cap on this step
+    /// alone (it is still bound by its owning cell's and task's caps).
+    #[serde(default)]
+    pub maximum_timeout_seconds: Option<u64>,
     /// Whether the step needs human approval.
     #[serde(default)]
     pub requires_approval: bool,
@@ -1420,6 +1449,7 @@ mod tests {
             max_retries: None,
             priority: None,
             timeout_minutes: None,
+            maximum_timeout_seconds: None,
             depends_on: vec![],
             environment: BTreeMap::new(),
             no_commit_required: false,
@@ -1450,6 +1480,7 @@ mod tests {
             maximum_context: None,
             auto_compact_threshold: None,
             timeout_minutes: None,
+            maximum_timeout_seconds: None,
             priority: None,
             environment: BTreeMap::new(),
             proof: vec![],
