@@ -5131,6 +5131,13 @@ struct CellPaths {
     task_idx: usize,
     cell_idx: usize,
     worktree: Option<String>,
+    /// The registered project's name when the cell's derived project root
+    /// (its shared git dir) matches one (`Store::project_name_for_path`);
+    /// otherwise the raw derived path, as a last-resort fallback for an
+    /// unregistered repo. Resolved here, server-side, rather than in the
+    /// UI — see `librarian/AGENTS.md`'s "Project display: name, never a
+    /// raw path" section for why the UI must never do this resolution
+    /// itself. `null` when the cwd is not a git worktree.
     project: Option<String>,
     /// The read-only "upstream" to show for this cell's git worktree —
     /// either the branch of a chained dependency (`upstream = "<<task:...>>"`,
@@ -5141,9 +5148,10 @@ struct CellPaths {
     upstream: Option<String>,
 }
 
-/// For each cell in a squad, its worktree (`cwd`), the derived project root
-/// (the shared git dir), and its display upstream, so the detail pane can show
-/// them as distinct read-only fields (CCTL-148; upstream row added later). The
+/// For each cell in a squad, its worktree (`cwd`), its project (RAL-396: the
+/// registered project's name when its derived root matches one, else the
+/// raw path), and its display upstream, so the detail pane can show them as
+/// distinct read-only fields (CCTL-148; upstream row added later). The
 /// project/upstream are `null` when the cwd is not a git worktree. Computed on
 /// demand (runs git per cell) rather than on the hot board path.
 fn squad_worktrees(daemon: &Daemon, id: &str) -> Reply {
@@ -5158,7 +5166,9 @@ fn squad_worktrees(daemon: &Daemon, id: &str) -> Reply {
     let mut paths = Vec::new();
     for (ti, task) in squad.tasks.iter().enumerate() {
         for (si, s) in task.cells.iter().enumerate() {
-            let project = s.cwd.as_deref().and_then(crate::reviews::project_root_of);
+            let project_root = s.cwd.as_deref().and_then(crate::reviews::project_root_of);
+            let project =
+                project_root.map(|root| daemon.lock().project_name_for_path(&root).unwrap_or(root));
             let upstream = crate::reviews::cell_upstream_display(
                 s.cwd.as_deref(),
                 &rows,
@@ -16951,6 +16961,56 @@ command=\"check\"
         assert!(r.body.contains("\"worktree\":\"/r\""));
         assert!(r.body.contains("\"project\":null"));
         assert!(r.body.contains("\"upstream\":null"));
+    }
+
+    /// RAL-396: when a cell's worktree resolves to a registered project, the
+    /// `project` field returned to the details pane must be that project's
+    /// name -- never the raw disk path (paths aren't stable for a cell that
+    /// might run on a remote machine, RAL-185; the project name is).
+    #[test]
+    fn squad_worktrees_shows_registered_project_name_not_path() {
+        let d = daemon();
+        let repo = tmp_git_repo("worktrees-project-name");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        let toml = format!("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n");
+        let r = route(&d, "POST", "/api/squads", &submit_body(&toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap();
+        let r = route(&d, "GET", &format!("/api/squads/{squad_id}/worktrees"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        // `worktree` stays the cell's own raw cwd (unrelated field, untouched by
+        // this resolution) -- only `project` must resolve to the registered name.
+        assert!(r.body.contains("\"project\":\"proj\""), "{}", r.body);
+    }
+
+    /// RAL-396: with no registered project matching the cell's worktree, the
+    /// `project` field falls back to the derived path -- there is no third
+    /// state and no "show both" (see the "Settled decisions" in the ticket).
+    #[test]
+    fn squad_worktrees_falls_back_to_path_for_an_unregistered_git_repo() {
+        let d = daemon();
+        let repo = tmp_git_repo("worktrees-unregistered");
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        let toml = format!("[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n");
+        let r = route(&d, "POST", "/api/squads", &submit_body(&toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap();
+        let r = route(&d, "GET", &format!("/api/squads/{squad_id}/worktrees"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("\"project\":null"), "{}", r.body);
+        assert!(
+            r.body.to_lowercase().contains("worktrees-unregistered"),
+            "no registered project matches, so the raw derived path should still show through: {}",
+            r.body
+        );
     }
 
     #[test]

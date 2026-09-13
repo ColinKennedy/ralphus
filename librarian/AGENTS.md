@@ -229,6 +229,19 @@ items.push(`<div data-tip="Cancel this squad — stops all running cells." oncli
 
 **Do not use the native `title` attribute** for new tooltips — it renders with browser default styling and ignores the dark theme. The `title` attribute can remain on existing splitter elements (they already use `data-tip`) but should not be added to new elements.
 
+## Project display: name, never a raw path (RAL-396)
+
+When a board view shows the project a cell/worktree belongs to, it must
+display the registered project's *name*, never the on-disk path — a cell can
+run on a remote machine (RAL-185), so the path isn't something the UI can
+treat as stable or even knowable. Do not add path→project resolution logic
+to a board chunk; the daemon already resolves this server-side
+(`Store::project_name_for_path`, see `daemon/AGENTS.md`'s matching section)
+and sends the UI whichever of {registered project name, raw path fallback}
+is correct. A board chunk should just render whatever string the API gives
+it (e.g. `CellPathInfo.project` in `00-typedefs.js`) — it must never itself
+decide between showing a name or a path.
+
 ## Design / UI colors
 
 **Any time you choose a color for the web board or any UI, consult
