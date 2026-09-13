@@ -9,7 +9,9 @@ concurrency:
   cancel-in-progress: true
 
 # RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
-# full suite on linux+windows plus a pinned 1.86 MSRV build-only leg.
+# full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
+# adds a macOS leg -- experimental, so build-only rather than the full suite
+# (see "Platform support" in README.md and docs/dependencies.md).
 
 jobs:
   rust:
@@ -22,7 +24,10 @@ jobs:
         # Windows-specific daemon/runner paths are covered (see
         # .agent/gotchas.md). The pinned "1.86" MSRV leg only proves the
         # workspace still builds at the minimum supported toolchain; lint/test
-        # drift is stable's job.
+        # drift is stable's job. The macOS leg (RAL-398) is deliberately
+        # minimal -- a build-only smoke test, not the full suite -- since
+        # macOS support is experimental and there's no real macOS hardware in
+        # CI to validate a heavier leg against.
         include:
           - os: ubuntu-latest
             toolchain: stable
@@ -33,6 +38,9 @@ jobs:
           - os: ubuntu-latest
             toolchain: "1.86"
             suite: msrv
+          - os: macos-latest
+            toolchain: stable
+            suite: macos-min
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +75,13 @@ jobs:
       # only guard against a dependency silently bumping the floor.)
       - name: Build (MSRV verification)
         if: matrix.suite == 'msrv'
+        run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
+      # macOS leg (RAL-398): experimental support, so this only proves the
+      # workspace builds -- no fmt/clippy/test/doctest suite, and no vendored
+      # psmux (that feature is Windows-only and off by default). A deeper
+      # macOS CI leg can follow once there's a real need to justify it.
+      - name: Build (macOS smoke test)
+        if: matrix.suite == 'macos-min'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
   psmux-integration:

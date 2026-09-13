@@ -5,10 +5,11 @@
 //! squad/task/cell consuming them, for the board's "Resources" tab.
 //!
 //! CPU/RAM use no extra crates: on Linux we read `/proc/<pid>/{stat,statm}`
-//! directly; on Windows we shell out to PowerShell's `Get-Process`. CPU% is a
-//! two-sample delta over a short interval. GPU is best-effort via `nvidia-smi`
-//! and degrades to `null` ("N/A") whenever the tool is absent or reports nothing
-//! for a PID. Any platform we don't handle simply yields `null` for every metric.
+//! directly; on Windows we shell out to PowerShell's `Get-Process`; on macOS
+//! (RAL-398, experimental) we shell out to `ps`. CPU% is a two-sample delta
+//! over a short interval. GPU is best-effort via `nvidia-smi` and degrades to
+//! `null` ("N/A") whenever the tool is absent or reports nothing for a PID.
+//! Any platform we don't handle simply yields `null` for every metric.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -253,9 +254,79 @@ fn parse_windows_procs(text: &str) -> HashMap<u32, ProcSnap> {
     out
 }
 
+// ── macOS: shell out to `ps` (zero dependencies, RAL-398, experimental) ────────
+
+#[cfg(target_os = "macos")]
+fn read_procs(pids: &[u32]) -> HashMap<u32, ProcSnap> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let ids = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // `time` is cumulative CPU time as `[[dd-]hh:]mm:ss`; `rss` is resident
+    // memory in KiB. Unlike Linux/Windows, a PID `ps` doesn't recognize is
+    // simply omitted from the output rather than erroring the whole call.
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=,time=,rss=", "-p", &ids])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => parse_macos_ps(&String::from_utf8_lossy(&o.stdout)),
+        _ => HashMap::new(),
+    }
+}
+
+/// Parse `pid time rss` lines from macOS `ps -o pid=,time=,rss=`.
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_ps(text: &str) -> HashMap<u32, ProcSnap> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [pid_s, time_s, rss_s] = fields.as_slice() else {
+            continue;
+        };
+        let Ok(pid) = pid_s.parse::<u32>() else {
+            continue;
+        };
+        let cpu_secs = parse_macos_cpu_time_secs(time_s);
+        let mem_bytes = rss_s.parse::<u64>().ok().map(|kib| kib * 1024);
+        out.insert(
+            pid,
+            ProcSnap {
+                cpu_secs,
+                mem_bytes,
+            },
+        );
+    }
+    out
+}
+
+/// Parse a macOS `ps -o time=` value (`[[dd-]hh:]mm:ss`) into cumulative CPU
+/// seconds.
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_cpu_time_secs(time: &str) -> Option<f64> {
+    let (days, rest) = match time.split_once('-') {
+        Some((d, rest)) => (d.parse::<f64>().ok()?, rest),
+        None => (0.0, time),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let nums: Vec<f64> = parts
+        .iter()
+        .map(|p| p.parse::<f64>().ok())
+        .collect::<Option<_>>()?;
+    let secs = match nums.as_slice() {
+        [h, m, s] => h * 3600.0 + m * 60.0 + s,
+        [m, s] => m * 60.0 + s,
+        _ => return None,
+    };
+    Some(days * 86400.0 + secs)
+}
+
 // ── Fallback: unknown OS yields nothing (all metrics degrade to null) ─────────
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn read_procs(_pids: &[u32]) -> HashMap<u32, ProcSnap> {
     HashMap::new()
 }
@@ -315,7 +386,7 @@ mod tests {
         let (cpu, mem) = sample_cpu_mem(&[me]);
         assert!(cpu.contains_key(&me));
         assert!(mem.contains_key(&me));
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         assert!(
             mem[&me].is_some_and(|b| b > 0),
             "the current process should report a non-zero RSS"
@@ -360,6 +431,35 @@ mod tests {
         // Blank CPU -> missing reading, memory still parsed.
         assert_eq!(m[&99].cpu_secs, None);
         assert_eq!(m[&99].mem_bytes, Some(2048));
+    }
+
+    #[test]
+    fn macos_ps_parses_pid_time_and_rss() {
+        let text = "4242 01:02:03 10240\n99   00:00 2\n";
+        let m = parse_macos_ps(text);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&4242].cpu_secs, Some(3723.0)); // 1*3600 + 2*60 + 3
+        assert_eq!(m[&4242].mem_bytes, Some(10240 * 1024));
+        assert_eq!(m[&99].cpu_secs, Some(0.0));
+        assert_eq!(m[&99].mem_bytes, Some(2 * 1024));
+    }
+
+    #[test]
+    fn macos_ps_skips_malformed_lines() {
+        let m = parse_macos_ps("bad line here\n\n42 00:01 100");
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(&42));
+    }
+
+    #[test]
+    fn macos_cpu_time_parses_mm_ss_hh_mm_ss_and_dd_hh_mm_ss() {
+        assert_eq!(parse_macos_cpu_time_secs("01:30"), Some(90.0));
+        assert_eq!(parse_macos_cpu_time_secs("01:00:00"), Some(3600.0));
+        assert_eq!(
+            parse_macos_cpu_time_secs("2-01:00:00"),
+            Some(2.0 * 86400.0 + 3600.0)
+        );
+        assert_eq!(parse_macos_cpu_time_secs("garbage"), None);
     }
 
     #[test]
