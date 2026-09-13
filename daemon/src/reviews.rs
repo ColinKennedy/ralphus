@@ -1039,7 +1039,7 @@ pub fn derive_reviews_with_prefetch(
         } else {
             suggested
         };
-        require_auto_build_declaration(&members, std::slice::from_ref(project), &name)?;
+        require_auto_build_declaration(store, &members, std::slice::from_ref(project), &name)?;
         let registered_project = single_registered_project(&members);
         let gid = store
             .create_guardian_keyed(
@@ -1097,7 +1097,7 @@ pub fn derive_reviews_with_prefetch(
                 .collect()
         };
         let review_ref = format!("{}{key}", ralphus_core::schema::REVIEW_LINK_PREFIX);
-        require_auto_build_declaration(&members, &distinct_projects, &review_ref)?;
+        require_auto_build_declaration(store, &members, &distinct_projects, &review_ref)?;
         let registered_project = single_registered_project(&members);
         let gid = store
             .create_guardian_keyed(
@@ -1188,7 +1188,10 @@ fn apply_project_review_defaults(
     gid: &str,
     project: &str,
 ) -> std::result::Result<(), ReviewError> {
-    let cfg = crate::config::resolve(Path::new(project));
+    // RAL-408: layers the project's database-backed review-setting defaults
+    // (edited via the board/CLI) over the file-based `.ralphus.toml [review]`
+    // ones -- see `Store::resolve_review_config`.
+    let cfg = store.resolve_review_config(Path::new(project));
     if cfg.skip_worktrees() {
         store
             .set_guardian_skip_worktrees(gid, true)
@@ -1379,6 +1382,7 @@ fn apply_auto_build(
 /// guardian id exists yet to reference instead); for a project group it is
 /// the review's resolved name.
 fn require_auto_build_declaration(
+    store: &Store,
     members: &[&Membership],
     distinct_projects: &[String],
     review_ref: &str,
@@ -1390,9 +1394,12 @@ fn require_auto_build_declaration(
         return Ok(());
     }
     let covered_by_config = !distinct_projects.is_empty()
-        && distinct_projects
-            .iter()
-            .all(|p| crate::config::resolve(Path::new(p)).auto_build.is_some());
+        && distinct_projects.iter().all(|p| {
+            store
+                .resolve_review_config(Path::new(p))
+                .auto_build
+                .is_some()
+        });
     if covered_by_config {
         return Ok(());
     }
@@ -2816,7 +2823,8 @@ mod tests {
         };
         let root = temp_repo();
         let project = root.to_string_lossy().into_owned();
-        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let store = Store::open_in_memory().unwrap();
+        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2828,7 +2836,8 @@ mod tests {
         };
         let root = temp_repo();
         let project = root.to_string_lossy().into_owned();
-        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let store = Store::open_in_memory().unwrap();
+        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2842,7 +2851,8 @@ mod tests {
         .unwrap();
         let m = membership(None);
         let project = root.to_string_lossy().into_owned();
-        assert!(require_auto_build_declaration(&[&m], &[project], "r").is_ok());
+        let store = Store::open_in_memory().unwrap();
+        assert!(require_auto_build_declaration(&store, &[&m], &[project], "r").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2851,8 +2861,10 @@ mod tests {
         let root = temp_repo();
         let m = membership(None);
         let project = root.to_string_lossy().into_owned();
-        let err = require_auto_build_declaration(&[&m], &[project], "ralphus:new-review/abc123")
-            .unwrap_err();
+        let store = Store::open_in_memory().unwrap();
+        let err =
+            require_auto_build_declaration(&store, &[&m], &[project], "ralphus:new-review/abc123")
+                .unwrap_err();
         assert!(
             err.to_string().contains("ralphus:new-review/abc123"),
             "error must identify the pending review: {err}"
@@ -2878,7 +2890,8 @@ mod tests {
             covered.to_string_lossy().into_owned(),
             uncovered.to_string_lossy().into_owned(),
         ];
-        assert!(require_auto_build_declaration(&[&m], &projects, "r").is_err());
+        let store = Store::open_in_memory().unwrap();
+        assert!(require_auto_build_declaration(&store, &[&m], &projects, "r").is_err());
         let _ = std::fs::remove_dir_all(&covered);
         let _ = std::fs::remove_dir_all(&uncovered);
     }

@@ -467,6 +467,17 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  default_maximum_budget_usd, default_proof_scope (RAL-342/RAL-338).
  Set these once per project rather than per submission.
 
+ RAL-408: the same project-level defaults (plus skip_worktrees,
+ skip_base_updates, match_pr_branch_name, separate_pr_branch,
+ auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
+ auto_fix_prompt_template, and skip_auto_clean) can also be set from
+ the database, via `ralphus project review-settings set <name>
+ [flags]` or the board's Projects tab (the ... menu -> Review
+ Settings), instead of hand-editing .ralphus.toml. A database
+ override wins over an explicit .ralphus.toml value. Read the
+ current settings (raw overrides plus the resolved effective
+ values) with `ralphus project review-settings get <name>`.
+
  Key         Type             Notes
  triage      bool             Opt this cell into Triage instead of
                                naming an explicit `review`. Requires

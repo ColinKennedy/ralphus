@@ -1478,8 +1478,30 @@ Work submitted against it will fail — fix the machine or deregister the provid
             <td><span class="proj-field mono" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Clone URL a machine provider uses to provision this project on another machine (RAL-355).\nBlank means remote work on this project will fail until one is set.">${p.clone_url ? esc(p.clone_url) : `<span style="color:var(--muted)">(none)</span>`}</span></td>
             <td><span class="proj-field" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Only \"git\" is implemented today.">${esc(p.vcs)}</span></td>
             <td style="color:var(--muted)">${fmtProjCreated(p.created_at_ms)}</td>
-            <td><button class="btn" data-click="openProjectTriageThresholds" data-name="${esc(p.name)}" style="padding:2px 8px;font-size:12px" data-tip="Configure auto-review (Triage) thresholds for this project -- e.g. \"once 4 bug fixes for this project are recorded, make a review\".\nOnly registered Triage types (see the Triage tab) can be picked here.">⋯</button></td>
+            <td><button class="btn" data-click="openProjectMenu" data-name="${esc(p.name)}" style="padding:2px 8px;font-size:12px" data-tip="Project actions: auto-review (Triage) thresholds, and this project's DEFAULT review settings.">⋯</button></td>
           </tr>`;
+      }
+      /**
+       * Opens the Projects-tab per-project "..." meatball menu (RAL-408):
+       * auto-review (Triage) thresholds and this project's DEFAULT review
+       * settings. Mirrors `openUserMenu`'s floating-menu pattern -- same
+       * shared `#squad-menu` element and outside-click handler
+       * (`closeSquadMenu` already closes this one too).
+       * @param {MouseEvent} e
+       * @param {string} name
+       * @returns {void}
+       */
+      function openProjectMenu(e, name) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        const items = [
+          `<div data-click="openProjectTriageThresholds" data-name="${esc(name)}" data-tip="Configure auto-review (Triage) thresholds for this project -- e.g. \"once 4 bug fixes for this project are recorded, make a review\".\nOnly registered Triage types (see the Triage tab) can be picked here.">⏱ Auto-review thresholds</div>`,
+          `<div data-click="openProjectReviewSettings" data-name="${esc(name)}" data-tip="Configure this project's DEFAULT review settings -- resolver agent/model, machine, budget, proof scope, and more.\nApplies to future reviews only (an Arbiter-created review, or any review whose own [[review]] block leaves a field unset); existing reviews are unaffected.">⚙ Review settings</div>`,
+        ];
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu"; menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
       }
       /**
        * Renders the Projects tab's table.

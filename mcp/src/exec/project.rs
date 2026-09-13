@@ -1,7 +1,9 @@
 //! Mirrors `ralphus_cli::commands::project::dispatch`.
 
-use ralphus_cli::client::DaemonClient;
-use ralphus_cli::commands::project::{ProjectCommand, ProjectForkCommand};
+use ralphus_cli::client::{DaemonClient, ProjectReviewSettingsPatch};
+use ralphus_cli::commands::project::{
+    ProjectCommand, ProjectForkCommand, ProjectReviewSettingsCommand,
+};
 
 use super::{ExecResult, usage};
 
@@ -33,6 +35,55 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         ProjectCommand::List { short: _ } => Ok(client.list_projects()?),
         ProjectCommand::Get { name } => Ok(client.get_project(&name)?),
         ProjectCommand::Fork(cmd) => exec_fork(cmd, client),
+        ProjectCommand::ReviewSettings(cmd) => exec_review_settings(cmd, client),
+    }
+}
+
+fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient) -> ExecResult {
+    match cmd {
+        ProjectReviewSettingsCommand::Help | ProjectReviewSettingsCommand::UsageError(_) => {
+            Err(usage("no such tool"))
+        }
+        ProjectReviewSettingsCommand::Get { name } => {
+            Ok(client.get_project_review_settings(&name)?)
+        }
+        ProjectReviewSettingsCommand::Set {
+            name,
+            resolver_agent,
+            resolver_model,
+            machine,
+            maximum_budget_usd,
+            clear_maximum_budget_usd,
+            proof_scope,
+            skip_auto_clean,
+            skip_worktrees,
+            skip_base_updates,
+            match_pr_branch_name,
+            separate_pr_branch,
+            auto_build,
+            auto_submit_pr_stack,
+            auto_fix_pr_errors,
+            auto_fix_prompt_template,
+        } => {
+            let patch = ProjectReviewSettingsPatch {
+                default_resolver_agent: resolver_agent.as_deref(),
+                default_resolver_model: resolver_model.as_deref(),
+                default_machine: machine.as_deref(),
+                default_maximum_budget_usd: maximum_budget_usd,
+                clear_maximum_budget_usd,
+                default_proof_scope: proof_scope.as_deref(),
+                verify_skip_auto_clean: skip_auto_clean,
+                skip_worktrees,
+                skip_base_updates,
+                match_pr_branch_name,
+                separate_pr_branch,
+                auto_build: auto_build.as_deref(),
+                auto_submit_pr_stack,
+                auto_fix_pr_errors,
+                auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
+            };
+            Ok(client.set_project_review_settings(&name, &patch)?)
+        }
     }
 }
 

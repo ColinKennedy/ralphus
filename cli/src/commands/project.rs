@@ -43,6 +43,40 @@ pub enum ProjectCommand {
         name: String,
     },
     Fork(ProjectForkCommand),
+    ReviewSettings(ProjectReviewSettingsCommand),
+    UsageError(String),
+}
+
+/// `ralphus project review-settings <subcommand>` (RAL-408): a project's
+/// database-backed review-setting DEFAULTS -- resolver agent/model, machine,
+/// budget, proof scope, and the project-level equivalents of every
+/// `ralphus review settings` opt-out flag. Applied to FUTURE reviews only
+/// (an Arbiter-created review with no `[[review]]` block, or any review
+/// whose own block leaves a field unset); existing reviews are unaffected.
+#[derive(Debug, Clone)]
+pub enum ProjectReviewSettingsCommand {
+    Help,
+    Get {
+        name: String,
+    },
+    Set {
+        name: String,
+        resolver_agent: Option<String>,
+        resolver_model: Option<String>,
+        machine: Option<String>,
+        maximum_budget_usd: Option<f64>,
+        clear_maximum_budget_usd: bool,
+        proof_scope: Option<String>,
+        skip_auto_clean: Option<bool>,
+        skip_worktrees: Option<bool>,
+        skip_base_updates: Option<bool>,
+        match_pr_branch_name: Option<bool>,
+        separate_pr_branch: Option<bool>,
+        auto_build: Option<String>,
+        auto_submit_pr_stack: Option<bool>,
+        auto_fix_pr_errors: Option<bool>,
+        auto_fix_prompt_template: Option<String>,
+    },
     UsageError(String),
 }
 
@@ -97,6 +131,9 @@ pub fn parse(args: &[String]) -> ProjectCommand {
             None => ProjectCommand::UsageError("get requires a <name> argument".to_string()),
         },
         Some("fork") => ProjectCommand::Fork(parse_fork(&scanner.remaining())),
+        Some("review-settings") => {
+            ProjectCommand::ReviewSettings(parse_review_settings(&scanner.remaining()))
+        }
         Some(other) => ProjectCommand::UsageError(format!("unknown project subcommand: {other}")),
     }
 }
@@ -222,6 +259,88 @@ fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
     })
 }
 
+fn parse_review_settings(args: &[String]) -> ProjectReviewSettingsCommand {
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ProjectReviewSettingsCommand::Help,
+        Some("get") => match scanner.remaining().into_iter().next() {
+            Some(name) => ProjectReviewSettingsCommand::Get { name },
+            None => ProjectReviewSettingsCommand::UsageError(
+                "review-settings get requires a <name> argument".to_string(),
+            ),
+        },
+        Some("set") => match parse_review_settings_set(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectReviewSettingsCommand::UsageError(e.0),
+        },
+        Some(other) => ProjectReviewSettingsCommand::UsageError(format!(
+            "unknown project review-settings subcommand: {other}"
+        )),
+    }
+}
+
+fn parse_review_settings_set(
+    scanner: &mut Scanner,
+) -> Result<ProjectReviewSettingsCommand, UsageError> {
+    let resolver_agent = scanner.take_value("--resolver-agent")?;
+    let resolver_model = scanner.take_value("--resolver-model")?;
+    let machine = scanner.take_value("--machine")?;
+    let maximum_budget_usd_raw = scanner.take_value("--maximum-budget-usd")?;
+    let clear_maximum_budget_usd = scanner.take_bool("--clear-maximum-budget-usd");
+    let proof_scope = scanner.take_value("--proof-scope")?;
+    let skip_auto_clean = crate::commands::review::take_tri_bool(scanner, "--skip-auto-clean");
+    let skip_worktrees = crate::commands::review::take_tri_bool(scanner, "--skip-worktrees");
+    let skip_base_updates = crate::commands::review::take_tri_bool(scanner, "--skip-base-updates");
+    let match_pr_branch_name =
+        crate::commands::review::take_tri_bool(scanner, "--match-pr-branch-name");
+    let separate_pr_branch =
+        crate::commands::review::take_tri_bool(scanner, "--separate-pr-branch");
+    let auto_build = scanner.take_value("--auto-build")?;
+    let auto_submit_pr_stack =
+        crate::commands::review::take_tri_bool(scanner, "--auto-submit-pr-stack");
+    let auto_fix_pr_errors =
+        crate::commands::review::take_tri_bool(scanner, "--auto-fix-pr-errors");
+    let auto_fix_prompt_template = scanner.take_value("--auto-fix-prompt-template")?;
+    if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
+        return Err(UsageError(
+            "review-settings set: --clear-maximum-budget-usd cannot be combined with \
+             --maximum-budget-usd"
+                .to_string(),
+        ));
+    }
+    let maximum_budget_usd = match maximum_budget_usd_raw {
+        Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
+            UsageError(format!(
+                "review-settings set: --maximum-budget-usd must be a number, got {raw:?}"
+            ))
+        })?),
+        None => None,
+    };
+    let Some(name) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "review-settings set requires a <name> argument".to_string(),
+        ));
+    };
+    Ok(ProjectReviewSettingsCommand::Set {
+        name,
+        resolver_agent,
+        resolver_model,
+        machine,
+        maximum_budget_usd,
+        clear_maximum_budget_usd,
+        proof_scope,
+        skip_auto_clean,
+        skip_worktrees,
+        skip_base_updates,
+        match_pr_branch_name,
+        separate_pr_branch,
+        auto_build,
+        auto_submit_pr_stack,
+        auto_fix_pr_errors,
+        auto_fix_prompt_template,
+    })
+}
+
 #[must_use]
 pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
     let client = opts.client();
@@ -297,7 +416,137 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
             }
         },
         ProjectCommand::Fork(cmd) => dispatch_fork(cmd, opts),
+        ProjectCommand::ReviewSettings(cmd) => dispatch_review_settings(cmd, opts),
     }
+}
+
+#[must_use]
+fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts) -> i32 {
+    let client = opts.client();
+    match cmd {
+        ProjectReviewSettingsCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["project", "review-settings"])
+                    .expect("project review-settings help exists")
+            );
+            0
+        }
+        ProjectReviewSettingsCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ProjectReviewSettingsCommand::Get { name } => {
+            match client.get_project_review_settings(&name) {
+                Ok(payload) => {
+                    render_review_settings(&payload);
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    2
+                }
+            }
+        }
+        ProjectReviewSettingsCommand::Set {
+            name,
+            resolver_agent,
+            resolver_model,
+            machine,
+            maximum_budget_usd,
+            clear_maximum_budget_usd,
+            proof_scope,
+            skip_auto_clean,
+            skip_worktrees,
+            skip_base_updates,
+            match_pr_branch_name,
+            separate_pr_branch,
+            auto_build,
+            auto_submit_pr_stack,
+            auto_fix_pr_errors,
+            auto_fix_prompt_template,
+        } => {
+            let patch = crate::client::ProjectReviewSettingsPatch {
+                default_resolver_agent: resolver_agent.as_deref(),
+                default_resolver_model: resolver_model.as_deref(),
+                default_machine: machine.as_deref(),
+                default_maximum_budget_usd: maximum_budget_usd,
+                clear_maximum_budget_usd,
+                default_proof_scope: proof_scope.as_deref(),
+                verify_skip_auto_clean: skip_auto_clean,
+                skip_worktrees,
+                skip_base_updates,
+                match_pr_branch_name,
+                separate_pr_branch,
+                auto_build: auto_build.as_deref(),
+                auto_submit_pr_stack,
+                auto_fix_pr_errors,
+                auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
+            };
+            match client.set_project_review_settings(&name, &patch) {
+                Ok(payload) => {
+                    println!("updated review-settings defaults for project \"{name}\"");
+                    render_review_settings(&payload);
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Renders a `GET`/`POST .../review-settings` response: this project's raw
+/// database overrides (blank fields inherit) and, beneath each, the
+/// currently effective value (file config + database).
+fn render_review_settings(payload: &Value) {
+    let project = payload["project"].as_str().unwrap_or_default();
+    let settings = &payload["settings"];
+    let effective = &payload["effective"];
+    println!("project: {project}");
+    let opt_str = |v: &Value| v.as_str().map(str::to_string);
+    let opt_bool = |v: &Value| v.as_bool();
+    let opt_f64 = |v: &Value| v.as_f64();
+    let row_str = |label: &str, key: &str| {
+        let override_val = opt_str(&settings[key]);
+        println!(
+            "  {label:<26} {:<24} (effective: {})",
+            override_val.as_deref().unwrap_or("(inherited)"),
+            effective[key].as_str().unwrap_or_default()
+        );
+    };
+    let row_bool = |label: &str, key: &str| {
+        let override_val = opt_bool(&settings[key]);
+        println!(
+            "  {label:<26} {:<24} (effective: {})",
+            override_val.map_or("(inherited)".to_string(), |v| v.to_string()),
+            effective[key].as_bool().unwrap_or(false)
+        );
+    };
+    row_str("resolver agent:", "default_resolver_agent");
+    row_str("resolver model:", "default_resolver_model");
+    row_str("machine:", "default_machine");
+    println!(
+        "  {:<26} {:<24} (effective: {})",
+        "maximum budget usd:",
+        opt_f64(&settings["default_maximum_budget_usd"])
+            .map_or("(inherited)".to_string(), |v| v.to_string()),
+        effective["maximum_budget_usd"]
+            .as_f64()
+            .map_or("(unbounded)".to_string(), |v| v.to_string())
+    );
+    row_str("proof scope:", "default_proof_scope");
+    row_bool("skip auto-clean:", "verify_skip_auto_clean");
+    row_bool("skip worktrees:", "skip_worktrees");
+    row_bool("skip base updates:", "skip_base_updates");
+    row_bool("match pr branch name:", "match_pr_branch_name");
+    row_bool("separate pr branch:", "separate_pr_branch");
+    row_str("auto build:", "auto_build");
+    row_bool("auto submit pr stack:", "auto_submit_pr_stack");
+    row_bool("auto fix pr errors:", "auto_fix_pr_errors");
+    row_str("auto fix prompt template:", "auto_fix_prompt_template");
 }
 
 #[must_use]
@@ -861,6 +1110,133 @@ mod tests {
         assert!(matches!(
             parse(&v(&["fork", "bogus"])),
             ProjectCommand::Fork(ProjectForkCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn bare_review_settings_is_help() {
+        assert!(matches!(
+            parse(&v(&["review-settings"])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn parses_review_settings_get() {
+        match parse(&v(&["review-settings", "get", "proj"])) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Get { name }) => {
+                assert_eq!(name, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_settings_get_requires_name() {
+        assert!(matches!(
+            parse(&v(&["review-settings", "get"])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_review_settings_set_with_string_and_bool_flags() {
+        match parse(&v(&[
+            "review-settings",
+            "set",
+            "proj",
+            "--resolver-agent",
+            "claude-code",
+            "--machine",
+            "local",
+            "--proof-scope",
+            "final_branch",
+            "--skip-worktrees",
+            "--no-auto-submit-pr-stack",
+        ])) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Set {
+                name,
+                resolver_agent,
+                machine,
+                proof_scope,
+                skip_worktrees,
+                auto_submit_pr_stack,
+                ..
+            }) => {
+                assert_eq!(name, "proj");
+                assert_eq!(resolver_agent.as_deref(), Some("claude-code"));
+                assert_eq!(machine.as_deref(), Some("local"));
+                assert_eq!(proof_scope.as_deref(), Some("final_branch"));
+                assert_eq!(skip_worktrees, Some(true));
+                assert_eq!(auto_submit_pr_stack, Some(false));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_settings_set_maximum_budget_usd() {
+        match parse(&v(&[
+            "review-settings",
+            "set",
+            "proj",
+            "--maximum-budget-usd",
+            "12.5",
+        ])) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Set {
+                maximum_budget_usd,
+                clear_maximum_budget_usd,
+                ..
+            }) => {
+                assert_eq!(maximum_budget_usd, Some(12.5));
+                assert!(!clear_maximum_budget_usd);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_settings_set_rejects_a_non_numeric_budget() {
+        assert!(matches!(
+            parse(&v(&[
+                "review-settings",
+                "set",
+                "proj",
+                "--maximum-budget-usd",
+                "lots",
+            ])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn review_settings_set_rejects_clear_and_value_together() {
+        assert!(matches!(
+            parse(&v(&[
+                "review-settings",
+                "set",
+                "proj",
+                "--maximum-budget-usd",
+                "5",
+                "--clear-maximum-budget-usd",
+            ])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn review_settings_set_requires_name() {
+        assert!(matches!(
+            parse(&v(&["review-settings", "set", "--skip-worktrees"])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_review_settings_subcommand_is_a_usage_error() {
+        assert!(matches!(
+            parse(&v(&["review-settings", "bogus"])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
         ));
     }
 }

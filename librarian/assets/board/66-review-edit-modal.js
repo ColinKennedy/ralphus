@@ -419,6 +419,93 @@
       }
 
       /**
+       * RAL-408: resolver agent/model fields, shared between the per-review
+       * Edit Details modal and the per-project Review Settings modal (each
+       * supplies its own onchange handler NAME since the two modals mutate
+       * different draft globals -- inline `onchange`/`oninput` attributes
+       * need a literal function name, not a closure). `frozen` (review-only
+       * -- a project default is never frozen) renders the resolved values
+       * read-only, same as an approved/deployed review's own resolver
+       * fields.
+       * @param {string} cwd
+       * @param {string} resolverAgent
+       * @param {string} resolverModel
+       * @param {boolean} frozen
+       * @param {string} onAgentChange
+       * @param {string} onModelChange
+       * @returns {string}
+       */
+      function renderResolverFieldsHtml(cwd, resolverAgent, resolverModel, frozen, onAgentChange, onModelChange) {
+        return frozen
+          ? `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverAgent || "agent default")}</span></div>
+             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(resolverModel || "agent default")}</span></div>`
+          : `<div class="kv-row"><span class="k">resolver agent</span><select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onAgentChange}(this.value)" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts. Applies on Save.">${resolverOptionHtml(cwd, resolverAgent)}</select></div>
+             <div class="kv-row"><span class="k">resolver model</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(resolverModel)}" placeholder="agent default" oninput="${onModelChange}(this.value)" data-tip="Exact model passed to the selected resolver agent. Clear to use the agent's default. Applies on Save."></div>`;
+      }
+      /**
+       * RAL-408: proof-scope + skip-auto-clean fields, shared as
+       * [`renderResolverFieldsHtml`] above. `allowInherit` (project-settings
+       * scope only -- a review's effective proof scope is always a concrete
+       * resolved value, never blank) adds a leading "(inherit)" option for
+       * `proofScope === ""`, so a project default can be told apart from an
+       * explicit `each_branch` override.
+       * @param {string} proofScope
+       * @param {boolean} proofSkipAutoClean
+       * @param {string} onScopeChange
+       * @param {string} onSkipAutoCleanChange
+       * @param {boolean} [allowInherit]
+       * @returns {string}
+       */
+      function renderProofScopeFieldsHtml(proofScope, proofSkipAutoClean, onScopeChange, onSkipAutoCleanChange, allowInherit) {
+        return `<div class="kv-row"><span class="k">proof scope</span><div style="display:flex;flex-direction:column;gap:4px">
+            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onScopeChange}(this.value)" data-tip="How often the dedicated final-proof agent call runs after a branch's rebase. Applies on Save.">
+              ${allowInherit ? `<option value="" ${proofScope === "" ? "selected" : ""}>(inherit)</option>` : ""}
+              <option value="each_branch" ${proofScope === "each_branch" ? "selected" : ""}>each branch</option>
+              <option value="final_branch" ${proofScope === "final_branch" ? "selected" : ""}>the final branch</option>
+              <option value="nothing" ${proofScope === "nothing" ? "selected" : ""}>nothing</option>
+            </select>
+            ${proofScope === "each_branch" ? `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Within \"each branch\" scope, additionally skip verification on branches whose rebase applied cleanly with no conflict at all.">
+              <input type="checkbox" ${proofSkipAutoClean ? "checked" : ""} onchange="${onSkipAutoCleanChange}(this.checked)">skip auto-clean branches</label>` : ""}
+          </div></div>`;
+      }
+      /**
+       * RAL-408: pull-request settings fields (separate PR branch / match
+       * worktree branch name / auto-submit PR stack), shared as above.
+       * @param {boolean} separatePrBranch
+       * @param {boolean} matchPrBranchName
+       * @param {boolean} autoSubmitPrStack
+       * @param {string} onSeparateChange
+       * @param {string} onMatchChange
+       * @param {string} onAutoSubmitChange
+       * @returns {string}
+       */
+      function renderPrSettingsFieldsHtml(separatePrBranch, matchPrBranchName, autoSubmitPrStack, onSeparateChange, onMatchChange, onAutoSubmitChange) {
+        return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Push this review's PRs to a branch of their own, derived from the task branch, instead of opening them straight from the review branch. Applies on Save.">
+            <input type="checkbox" ${separatePrBranch ? "checked" : ""} onchange="${onSeparateChange}(this.checked)">separate PR branch</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px${separatePrBranch ? "" : ";opacity:0.5"}" data-tip="Only applies when 'separate PR branch' is on. Use the exact worktree/feature branch name as the PR branch. Applies on Save.">
+            <input type="checkbox" ${matchPrBranchName ? "checked" : ""} ${separatePrBranch ? "" : "disabled"} onchange="${onMatchChange}(this.checked)">match worktree branch name</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing. Applies on Save.">
+            <input type="checkbox" ${autoSubmitPrStack ? "checked" : ""} onchange="${onAutoSubmitChange}(this.checked)">auto-submit PR stack</label>`;
+      }
+      /**
+       * RAL-408: auto-fix-PR-errors checkbox + prompt-template textarea,
+       * shared as above.
+       * @param {boolean} autoFixPrErrors
+       * @param {string} autoFixPromptTemplate
+       * @param {string} onErrorsChange
+       * @param {string} onTemplateChange
+       * @returns {string}
+       */
+      function renderAutoFixFieldsHtml(autoFixPrErrors, autoFixPromptTemplate, onErrorsChange, onTemplateChange) {
+        return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically dispatch the resolver agent to fix this review's PR when its CI checks go red. Applies on Save.">
+            <input type="checkbox" ${autoFixPrErrors ? "checked" : ""} onchange="${onErrorsChange}(this.checked)">auto-fix PR errors</label>
+          <div style="margin-top:8px">
+            <label for="auto-fix-prompt-template-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">auto-fix prompt template</label>
+            <textarea id="auto-fix-prompt-template-input" rows="4" style="${REVIEW_EDIT_TEXTAREA_STYLE}" placeholder="inherits project default" oninput="${onTemplateChange}(this.value)" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">${esc(autoFixPromptTemplate)}</textarea>
+          </div>`;
+      }
+
+      /**
        * Renders the Edit Details modal from `reviewEditDraft`. A one-shot
        * `innerHTML` write into `#modal-root`, matching every other modal in
        * this codebase -- not itself subject to `renderReviewDetail()`'s
@@ -430,20 +517,8 @@
         if (!draft) return;
         const g = guardians.find((x) => x.id === draft.gid);
         const cwd = (g && (g.git_root || (g.projects && g.projects[0]))) || "";
-        const resolverSection = draft.resolverFrozen
-          ? `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(draft.resolverAgent || "agent default")}</span></div>
-             <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(draft.resolverModel || "agent default")}</span></div>`
-          : `<div class="kv-row"><span class="k">resolver agent</span><select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="onEditResolverAgent(this.value)" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts. Applies on Save.">${resolverOptionHtml(cwd, draft.resolverAgent)}</select></div>
-             <div class="kv-row"><span class="k">resolver model</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(draft.resolverModel)}" placeholder="agent default" oninput="onEditResolverModel(this.value)" data-tip="Exact model passed to the selected resolver agent. Clear to use the agent's default. Applies on Save."></div>`;
-        const proofScopeSection = `<div class="kv-row"><span class="k">proof scope</span><div style="display:flex;flex-direction:column;gap:4px">
-            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="onEditProofScope(this.value)" data-tip="How often the dedicated final-proof agent call runs after a branch's rebase. Applies on Save.">
-              <option value="each_branch" ${draft.proofScope === "each_branch" ? "selected" : ""}>each branch</option>
-              <option value="final_branch" ${draft.proofScope === "final_branch" ? "selected" : ""}>the final branch</option>
-              <option value="nothing" ${draft.proofScope === "nothing" ? "selected" : ""}>nothing</option>
-            </select>
-            ${draft.proofScope === "each_branch" ? `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)" data-tip="Within \"each branch\" scope, additionally skip verification on branches whose rebase applied cleanly with no conflict at all.">
-              <input type="checkbox" ${draft.proofSkipAutoClean ? "checked" : ""} onchange="onEditProofSkipAutoClean(this.checked)">skip auto-clean branches</label>` : ""}
-          </div></div>`;
+        const resolverSection = renderResolverFieldsHtml(cwd, draft.resolverAgent, draft.resolverModel, draft.resolverFrozen, "onEditResolverAgent", "onEditResolverModel");
+        const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onEditProofScope", "onEditProofSkipAutoClean");
         const squashSection = draft.projects.map((p) => {
           const label = (p || "").split(/[\\/]/).filter(Boolean).pop() || p;
           return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Collapse this git project's task branches to a single squashed commit each in the review worktree. Applies on the next Merge / rebase.">
@@ -467,18 +542,8 @@
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
             <h3 class="section">squash</h3>${squashSection}
             <h3 class="section">pull requests</h3>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Push this review's PRs to a branch of their own, derived from the task branch, instead of opening them straight from the review branch. Applies on Save.">
-              <input type="checkbox" ${draft.separatePrBranch ? "checked" : ""} onchange="onEditSeparatePrBranch(this.checked)">separate PR branch</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px${draft.separatePrBranch ? "" : ";opacity:0.5"}" data-tip="Only applies when 'separate PR branch' is on. Use the exact worktree/feature branch name as the PR branch. Applies on Save.">
-              <input type="checkbox" ${draft.matchPrBranchName ? "checked" : ""} ${draft.separatePrBranch ? "" : "disabled"} onchange="onEditMatchPrBranchName(this.checked)">match worktree branch name</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing. Applies on Save.">
-              <input type="checkbox" ${draft.autoSubmitPrStack ? "checked" : ""} onchange="onEditAutoSubmitPrStack(this.checked)">auto-submit PR stack</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically dispatch the resolver agent to fix this review's PR when its CI checks go red. Applies on Save.">
-              <input type="checkbox" ${draft.autoFixPrErrors ? "checked" : ""} onchange="onEditAutoFixPrErrors(this.checked)">auto-fix PR errors</label>
-            <div style="margin-top:8px">
-              <label for="auto-fix-prompt-template-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">auto-fix prompt template</label>
-              <textarea id="auto-fix-prompt-template-input" rows="4" style="${REVIEW_EDIT_TEXTAREA_STYLE}" placeholder="inherits project default" oninput="onEditAutoFixPromptTemplate(this.value)" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">${esc(draft.autoFixPromptTemplate)}</textarea>
-            </div>
+            ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack")}
+            ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate")}
             <h3 class="section">environment overrides</h3>
             ${buildEnvSection}
             ${manualChecksEnvSection}
@@ -596,3 +661,5 @@
           tick();
         }
       }
+
+      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate];

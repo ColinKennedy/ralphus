@@ -397,6 +397,71 @@ impl DaemonClient {
         self.get(&format!("/api/projects/{name}"))
     }
 
+    /// `GET /api/projects/{name}/review-settings` (RAL-408): this project's
+    /// raw database-backed review-setting overrides plus the fully resolved
+    /// effective defaults (file config + database).
+    pub fn get_project_review_settings(&self, name: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{name}/review-settings"))
+    }
+
+    /// `POST /api/projects/{name}/review-settings` (RAL-408): apply a patch
+    /// to this project's database-backed review-setting defaults. See
+    /// [`ProjectReviewSettingsPatch`]'s doc comment for the touch/clear
+    /// convention.
+    pub fn set_project_review_settings(
+        &self,
+        name: &str,
+        patch: &ProjectReviewSettingsPatch<'_>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({});
+        set_if_some(
+            &mut body,
+            "default_resolver_agent",
+            patch.default_resolver_agent,
+        );
+        set_if_some(
+            &mut body,
+            "default_resolver_model",
+            patch.default_resolver_model,
+        );
+        set_if_some(&mut body, "default_machine", patch.default_machine);
+        set_if_some(
+            &mut body,
+            "default_maximum_budget_usd",
+            patch.default_maximum_budget_usd,
+        );
+        if patch.clear_maximum_budget_usd {
+            body["clear_maximum_budget_usd"] = json!(true);
+        }
+        set_if_some(&mut body, "default_proof_scope", patch.default_proof_scope);
+        set_if_some(
+            &mut body,
+            "verify_skip_auto_clean",
+            patch.verify_skip_auto_clean,
+        );
+        set_if_some(&mut body, "skip_worktrees", patch.skip_worktrees);
+        set_if_some(&mut body, "skip_base_updates", patch.skip_base_updates);
+        set_if_some(
+            &mut body,
+            "match_pr_branch_name",
+            patch.match_pr_branch_name,
+        );
+        set_if_some(&mut body, "separate_pr_branch", patch.separate_pr_branch);
+        set_if_some(&mut body, "auto_build", patch.auto_build);
+        set_if_some(
+            &mut body,
+            "auto_submit_pr_stack",
+            patch.auto_submit_pr_stack,
+        );
+        set_if_some(&mut body, "auto_fix_pr_errors", patch.auto_fix_pr_errors);
+        set_if_some(
+            &mut body,
+            "auto_fix_prompt_template",
+            patch.auto_fix_prompt_template,
+        );
+        self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
+    }
+
     /// `GET /api/project-forks` (RAL-338): every registered fork row.
     pub fn list_all_project_forks(&self) -> Result<Value, DaemonError> {
         self.get("/api/project-forks")
@@ -1618,6 +1683,36 @@ pub struct GuardianSettings<'a> {
     /// failing PR's CI status.
     pub auto_fix_pr_errors: Option<bool>,
     /// RAL-395: the prompt template used for the auto-fix dispatch above.
+    pub auto_fix_prompt_template: Option<&'a str>,
+}
+
+/// RAL-408: bundled optional fields for
+/// [`DaemonClient::set_project_review_settings`] -- a project's
+/// database-backed review-setting DEFAULTS, applied to future auto-reviews
+/// (an Arbiter-created review, or any review whose own `[[review]]` block
+/// leaves a field unset). `None` means "leave this setting as-is"; an empty
+/// string on a string field clears it back to "inherit from
+/// `.ralphus.toml`/the built-in default" (same convention as
+/// [`GuardianSettings`]'s `proof_scope`/`auto_fix_prompt_template`).
+#[derive(Debug, Clone, Default)]
+pub struct ProjectReviewSettingsPatch<'a> {
+    pub default_resolver_agent: Option<&'a str>,
+    pub default_resolver_model: Option<&'a str>,
+    pub default_machine: Option<&'a str>,
+    pub default_maximum_budget_usd: Option<f64>,
+    /// Explicitly reset `default_maximum_budget_usd` to unbounded --
+    /// mutually exclusive with `default_maximum_budget_usd` (a numeric field
+    /// has no empty-string sentinel to clear it with).
+    pub clear_maximum_budget_usd: bool,
+    pub default_proof_scope: Option<&'a str>,
+    pub verify_skip_auto_clean: Option<bool>,
+    pub skip_worktrees: Option<bool>,
+    pub skip_base_updates: Option<bool>,
+    pub match_pr_branch_name: Option<bool>,
+    pub separate_pr_branch: Option<bool>,
+    pub auto_build: Option<&'a str>,
+    pub auto_submit_pr_stack: Option<bool>,
+    pub auto_fix_pr_errors: Option<bool>,
     pub auto_fix_prompt_template: Option<&'a str>,
 }
 
