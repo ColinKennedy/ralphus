@@ -76,6 +76,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
      return {
        updateCounter,
        pollTasks,
+       invalidateTasksFetch,
        state: () => ({ seq: tasksPollSeq, squads, daemonStatus: window._daemonStatus }),
      };`,
   );
