@@ -228,6 +228,7 @@ aborts the remaining batch).
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
+| `review link-cell <selector#branch> <cell_selector>` | Link a cell/task to an already-attached branch, so its readiness follows that cell finishing instead of staying `pending` forever (RAL-392) |
 | `review reorder <selector> <b1,b2,...> [--disable b,b] [--enable b,b]` | Reorder branches + rebase, atomically |
 | `review branch enable\|disable <selector#branch>` | Enable/disable one branch + rebase |
 | `review merge <selector>` | Start/continue the stacked rebase |
@@ -646,6 +647,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
+        - link-cell selector [uri] cell [str]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
         - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
         - manual-checks-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}

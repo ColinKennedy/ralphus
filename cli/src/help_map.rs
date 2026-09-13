@@ -489,6 +489,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "link-cell",
+        &["selector [str]", "cell [str]"],
+        &[],
+        "Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "list",
         &[],
         &["--pr-ready", "--status [statuses]"],

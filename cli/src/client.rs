@@ -1407,6 +1407,22 @@ impl DaemonClient {
         )
     }
 
+    /// Link an existing cell/task to `guardian_id`'s `branch_id` after the
+    /// fact (RAL-392) -- see `ralphus review link-cell`.
+    pub fn guardian_link_cell(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/branches/{branch_id}/link_cell"),
+            Some(json!({"squad_id": squad_id, "task_idx": task_idx, "idx": idx})),
+        )
+    }
+
     pub fn guardian_merge(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/guardians/{guardian_id}/merge"), None)
     }

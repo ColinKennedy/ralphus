@@ -1354,6 +1354,9 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "branches", branch_id, "move"]) => {
             guardian_move_branch(daemon, id, branch_id, body)
         }
+        ("POST", ["api", "guardians", id, "branches", branch_id, "link_cell"]) => {
+            guardian_link_cell(daemon, id, branch_id, body)
+        }
         (
             "POST",
             [
@@ -12047,6 +12050,40 @@ fn guardian_dismiss_reenable(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
 }
 
 #[derive(Deserialize)]
+struct LinkCellBody {
+    squad_id: String,
+    task_idx: i64,
+    idx: i64,
+}
+
+/// Link an existing cell/task to this guardian's branch after the fact
+/// (RAL-392) -- the manual counterpart to what `reviews::derive_reviews`
+/// stamps automatically at submit time, for a branch attached via `ralphus
+/// review create` + `add-branch` instead. See `Store::link_review_cell` for
+/// the overwrite/immediate-promotion semantics.
+fn guardian_link_cell(daemon: &Daemon, id: &str, branch_id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<LinkCellBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {squad_id, task_idx, idx}",
+            vec![],
+        );
+    };
+    if let Err(e) =
+        daemon
+            .lock()
+            .link_review_cell(id, branch_id, &req.squad_id, req.task_idx, req.idx)
+    {
+        return store_error(&e);
+    }
+    match daemon.lock().get_guardian(id) {
+        Ok(g) => json(200, &g),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
 struct MoveBranchBody {
     to_guardian_id: String,
 }
@@ -18378,6 +18415,100 @@ command = "true"
             &move_body,
         );
         assert_eq!(r.status, 409);
+    }
+
+    #[test]
+    fn guardian_link_cell_route_links_and_promotes_when_cell_already_done() {
+        // RAL-392: the manual-attach path (`review create` + `add-branch`)
+        // has no submit-time cell membership -- this route wires an existing
+        // squad cell to the branch after the fact.
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        d.lock()
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches"),
+            &serde_json::json!({ "branch": "feature/x" }).to_string(),
+        );
+        let guardian_before = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        let before_json: serde_json::Value = serde_json::from_str(&guardian_before.body).unwrap();
+        let branch_id = before_json["branches"][0]["id"].as_str().unwrap();
+
+        let link_body =
+            serde_json::json!({"squad_id": squad_id, "task_idx": 0, "idx": 0}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/link_cell"),
+            &link_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let g: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(g["branches"][0]["merge_status"], "ready");
+
+        let squad_view = route(&d, "GET", &format!("/api/squads/{squad_id}"), "");
+        let squad_json: serde_json::Value = serde_json::from_str(&squad_view.body).unwrap();
+        assert_eq!(squad_json["tasks"][0]["cells"][0]["reviews"][0]["id"], gid);
+        assert_eq!(squad_json["reviews"][0]["id"], gid);
+    }
+
+    #[test]
+    fn guardian_link_cell_route_bad_body_is_400() {
+        let d = daemon();
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches"),
+            &serde_json::json!({ "branch": "a" }).to_string(),
+        );
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/0/link_cell"),
+            "not json",
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn guardian_link_cell_route_unknown_cell_is_404() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let body =
+            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001";
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches"),
+            &serde_json::json!({ "branch": "a" }).to_string(),
+        );
+        let guardian = route(&d, "GET", &format!("/api/guardians/{gid}"), "");
+        let g: serde_json::Value = serde_json::from_str(&guardian.body).unwrap();
+        let branch_id = g["branches"][0]["id"].as_str().unwrap();
+
+        let link_body =
+            serde_json::json!({"squad_id": squad_id, "task_idx": 9, "idx": 9}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{branch_id}/link_cell"),
+            &link_body,
+        );
+        assert_eq!(r.status, 404);
     }
 
     #[test]
