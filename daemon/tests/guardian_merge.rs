@@ -1710,7 +1710,7 @@ fn feedback_that_pushes_a_new_commit_retriggers_pr_auto_submit() {
         vec![id.clone()],
         "feedback must queue the PR auto-submit hook"
     );
-    ralphus_daemon::pr::maybe_auto_submit_branch(&store, &NoopRunner, &id, &bid0);
+    ralphus_daemon::pr::run_auto_submit_pass(&store, &NoopRunner, &id);
     let view = store.lock().get_guardian(&id).unwrap();
     let detail0 = view.branches[0].detail.as_deref().unwrap_or("");
     assert!(
