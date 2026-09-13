@@ -1675,6 +1675,7 @@ fn task_index(daemon: &Daemon) -> Reply {
     };
     let serialize_started = Instant::now();
     let reply = json(200, &response);
+    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
     crate::rlog!(
         INFO,
         "ralphus [performance] task-index lock_wait={}ms view={}ms serialize={}ms bytes={}",
@@ -5205,6 +5206,19 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
                 WARNING,
                 "ralphus [naming] suggest-name rename failed squad={squad_id} task_idx={task_idx}: {e}"
             );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "naming",
+                message: "suggest-name rename failed",
+                scope: Some("task"),
+                squad_id: Some(&squad_id),
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"task_idx": task_idx, "error": e.to_string()}),
+                admin_only: false,
+            });
         }
         if let Some(label) = label {
             let already_labeled = guard

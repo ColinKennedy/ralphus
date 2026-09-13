@@ -546,7 +546,7 @@ pub const AUTO_FIX_AUTHOR: &str = "PR Auto-Fix";
 
 /// Audit-only `submitted_by` value (RAL-379 semantics: never rendered) paired
 /// with [`AUTO_FIX_AUTHOR`], identifying the subsystem that posted the message.
-const AUTO_FIX_SUBMITTED_BY: &str = "system:ci-watch-auto-fix";
+const AUTO_FIX_SUBMITTED_BY: &str = "guardian:ci-watch-auto-fix";
 
 /// Dispatch the review's agent to fix a failing PR/MR (RAL-395): composes the
 /// auto-fix prompt (project/per-review template, `<<prompt>>` replaced by the

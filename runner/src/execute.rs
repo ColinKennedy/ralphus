@@ -56,6 +56,9 @@ const ASYNC_SYSTEM_PROMPT: &str = "## Conclusion\nThis is a single, non-interact
 const TOOLS_SYSTEM_PROMPT: &str = "## Regarding Tools\nPrefer `rg` for shell searches; \
      use `grep` only when `rg` is unavailable or you need grep-specific \
      behavior. In shell examples, use `rg \"pattern\" .`.";
+// Deliberately not opt-out-able -- see `daemon/src/runner.rs`'s own comment
+// on this constant for why the worktree-confinement paragraph is baked in
+// here unconditionally instead of left to a caller-authored `system_prompt`.
 const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unattended in a non-interactive \
      cell — no human is available to answer questions or approve a plan. \
      Never ask a clarifying question, never stop to present a plan for \
@@ -65,7 +68,11 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      session — never `cd` to, read, or write any path outside it, even one \
      that looks related or more familiar (such as this repository's main \
      checkout); every file edit and git operation must happen inside the \
-     working directory you were given.";
+     working directory you were given.\n\nYou are working in a dedicated git \
+     worktree of this project's repository, not its main checkout. Implement \
+     the work exactly as described and keep every change -- file edits, \
+     `git add`, commits, anything -- confined to this worktree; never touch \
+     the main checkout or any other worktree, even to look something up.";
 
 const MAX_ASYNC_ATTEMPTS: u32 = 3;
 /// RAL-292: how many times a turn that ended with an unresolved backgrounded

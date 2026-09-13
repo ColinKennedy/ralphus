@@ -1856,7 +1856,7 @@ a "No feedback yet" placeholder pointing at the `feedback` command above.
 The auto-fix dispatch a standing CI-status poll triggers when a guardian has
 opted into `auto_fix_pr_errors` (RAL-395, see the PR endpoints below) posts
 its own `role: "reviewer"` message into this same thread, attributed to
-`author: "PR Auto-Fix"` (`submitted_by: "system:ci-watch-auto-fix"`) instead
+`author: "PR Auto-Fix"` (`submitted_by: "guardian:ci-watch-auto-fix"`) instead
 of a person — this is the only way to tell an automated CI-fix round apart
 from one a human reviewer typed themselves. Its `action_status` resolves to
 `done`/`failed` from the resolver's own `RALPHUS_PROOF` verdict, exactly like

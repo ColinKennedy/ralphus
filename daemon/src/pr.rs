@@ -4164,6 +4164,20 @@ fn reconcile_native_pr_stack(
                         INFO,
                         "ralphus [pr] review {id} registered github pr stack number={stack_number}"
                     );
+                    let guard = store.lock().expect("poisoned");
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::INFO,
+                        source: "pr",
+                        message: "registered github pr stack",
+                        scope: Some("guardian"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({"stack_number": stack_number}),
+                        admin_only: false,
+                    });
                 }
                 Ok(None) => {}
                 Err(e) => {

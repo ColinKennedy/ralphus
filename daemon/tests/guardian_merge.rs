@@ -1202,6 +1202,19 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
 fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     let root = temp_repo();
     init_repo(&root);
+    // A real remote is required here, not just for the sibling tests below:
+    // `run_feedback` marks the reviewer message `Failed` whenever the
+    // resulting commit fails to push (see its `branch_status`/`push_error`
+    // handling), regardless of the resolver's own `RALPHUS_PROOF` verdict --
+    // without a remote, `push_feedback_branch` falls back to a hardcoded
+    // "origin" that doesn't exist, so the push errors and this test's own
+    // `Done` assertion below fails every time, deterministically.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
     write(&root, "base.txt", "base\n");
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "base"]);
@@ -1277,10 +1290,11 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     assert_eq!(
         msg.action_status.as_deref(),
         Some(FeedbackActionStatus::Done.as_str()),
-        "the resolver's passing RALPHUS_PROOF verdict must mark the message done"
+        "a successful auto-fix (resolver passes, commit pushes cleanly) must mark the message done"
     );
 
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
 /// RAL-395: when the forge supplies a raw CI failure log, `dispatch_pr_auto_fix`

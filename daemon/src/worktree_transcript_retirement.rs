@@ -52,6 +52,19 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
                 WARNING,
                 "ralphus [guardian] could not enumerate session owners while retiring worktree {worktree_path}: {error}"
             );
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "guardian",
+                message: "could not enumerate session owners for worktree retirement",
+                scope: Some("worktree"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"worktree_path": worktree_path, "error": error.to_string()}),
+                admin_only: false,
+            });
             return 0;
         }
     };

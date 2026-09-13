@@ -4404,7 +4404,7 @@ fn staged_merge_pass(
                     id,
                     &bv.id,
                     &bv.branch,
-                    "branch is empty: it adds no changes over the branch beneath it in the stack.                      Its task most likely never committed its work -- check that cell, then re-run                      it. If this branch is meant to be empty, disable it to drop it from the stack.",
+                    EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
                 return StagedPassOutcome::Failed;
@@ -5017,7 +5017,7 @@ pub fn run_merge_cancellable(
                     id,
                     &ob.id,
                     &ob.branch,
-                    "branch is empty: it adds no changes over the branch beneath it in the stack.                      Its task most likely never committed its work -- check that cell, then re-run                      it. If this branch is meant to be empty, disable it to drop it from the stack.",
+                    EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
                 return;
@@ -5181,7 +5181,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                         id,
                         &ob.id,
                         &ob.branch,
-                        "review worktree has no changes over the branch beneath it after rebase; a review branch must contribute at least one commit",
+                        EMPTY_BRANCH_DETAIL,
                         set_status,
                     );
                     return;
@@ -5688,6 +5688,16 @@ pub fn run_feedback(
                 WARNING,
                 "ralphus [guardian] review {id} feedback: stash restore failed: {e}"
             );
+            let guard = store.lock().expect("poisoned");
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    "feedback stash restore failed",
+                    serde_json::json!({"branch_id": branch_id, "stash_name": name, "error": e}),
+                );
         }
     }
     // RAL-241 follow-up: every path here previously reported the same
@@ -6925,7 +6935,7 @@ fn stack_pick(
                     id,
                     branch_id,
                     feature_branch,
-                    "review worktree has no changes over the branch beneath it after rebase; a review branch must contribute at least one commit",
+                    EMPTY_BRANCH_DETAIL,
                     &set_status,
                 );
                 return Err(());
@@ -7355,6 +7365,16 @@ fn fetch_branch_for_remote_cell(
     Ok(())
 }
 
+/// Shared `fail_branch` detail for every empty-branch detection in this file
+/// (`staged_merge_pass`'s two `note_if_branch_is_empty` call sites, and
+/// `stack_pick`/`run_merge_shared`'s own post-rebase `review_ref_has_no_changes`
+/// checks) -- previously the latter two inlined a shorter, escape-hatch-free
+/// message that drifted from this one, which a reviewer hitting that exact
+/// path had no way to know about.
+const EMPTY_BRANCH_DETAIL: &str = "branch is empty: it adds no changes over the branch beneath it in the stack. \
+     Its task most likely never committed its work -- check that cell, then re-run it. \
+     If this branch is meant to be empty, disable it to drop it from the stack.";
+
 /// Flag a branch whose *own, pre-rebase* commits added nothing over `upstream`
 /// (RAL-190). Returns whether it is empty.
 ///
@@ -7695,6 +7715,7 @@ pub fn retire_stale_worktrees(store: &Arc<Mutex<Store>>) {
         let claims = match guard.worktree_claims() {
             Ok(claims) => claims,
             Err(error) => {
+                // ralphus[ignore-rlog-pair]: transient snapshot read diagnostic; actual retirement emits its structured outcome
                 crate::rlog!(
                     WARNING,
                     "ralphus [guardian] worktree claim snapshot failed: {error}"
