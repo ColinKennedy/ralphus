@@ -361,10 +361,10 @@
         return { kind: "squad", taskIdx: 0, cellIdx: 0, proofIdx: -1 };
       }
       /**
-       * Refreshes the current user's hidden-squad/hidden-review sets
-       * (RAL-328/RAL-331) from the daemon. Called from `tick()` regardless
-       * of the active tab, since goto-search and both sidebars need it.
-       * Silent on failure (e.g. no default_user configured and no
+       * Refreshes the current user's hidden-squad/hidden-review/hidden-task
+       * sets (RAL-328/RAL-331/RAL-365) from the daemon. Called from `tick()`
+       * regardless of the active tab, since goto-search and both sidebars
+       * need it. Silent on failure (e.g. no default_user configured and no
        * X-Ralphus-User header sent) -- hidden filtering simply stays
        * inactive until identity resolves.
        * @returns {Promise<void>}
@@ -377,6 +377,7 @@
           const d = await res.json();
           hiddenSquadIds = new Set(d.hidden.filter((h) => h.kind === "squad" && h.squad_id).map((h) => /** @type {string} */ (h.squad_id)));
           hiddenGuardianIds = new Set(d.hidden.filter((h) => h.kind === "review" && h.guardian_id).map((h) => /** @type {string} */ (h.guardian_id)));
+          hiddenTaskKeys = new Set(d.hidden.filter((h) => h.kind === "task" && h.squad_id != null && h.task_idx != null).map((h) => `${h.squad_id}:${h.task_idx}`));
         } catch (e) { /* transient -- the next tick retries */ }
       }
       // RALPHUS-POLL-TASKS:BEGIN

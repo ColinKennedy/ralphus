@@ -237,6 +237,163 @@ fn hidden_squads_batch_applies_in_one_request() {
     assert_eq!(status, 400, "empty batch body: {body}");
 }
 
+#[test]
+fn hidden_tasks_are_scoped_by_the_user_header_and_independent_of_their_squad() {
+    let base = spawn_server();
+    for name in ["alice", "bob"] {
+        let body = serde_json::json!({ "name": name }).to_string();
+        let (status, response) = post(&base, "/api/users", &body);
+        assert_eq!(status, 200, "create user body: {response}");
+    }
+    let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
+    let (status, response) = post(&base, "/api/squads", &submit_body);
+    assert_eq!(status, 201, "submit body: {response}");
+
+    let path = "/api/hidden/tasks/squad-000000000001/0";
+    let (status, body) = request_as_user(&base, "POST", path, "alice", "");
+    assert_eq!(status, 200, "hide task body: {body}");
+    assert_eq!(body, r#"{"hidden":true}"#);
+
+    let (status, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    assert_eq!(status, 200, "alice list body: {alice}");
+    assert!(alice.contains(r#""kind":"task""#));
+    assert!(alice.contains(r#""task_idx":0"#));
+    let (status, bob) = request_as_user(&base, "GET", "/api/hidden", "bob", "");
+    assert_eq!(status, 200, "bob list body: {bob}");
+    assert_eq!(bob, r#"{"hidden":[]}"#);
+
+    // Hiding the task's owning squad too is an independent row (the
+    // union rule) -- unhiding the squad afterward leaves the task hidden.
+    let squad_path = "/api/hidden/squads/squad-000000000001";
+    let (status, _) = request_as_user(&base, "POST", squad_path, "alice", "");
+    assert_eq!(status, 200);
+    let (_, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    let parsed: serde_json::Value = serde_json::from_str(&alice).expect("json");
+    assert_eq!(parsed["hidden"].as_array().unwrap().len(), 2);
+
+    let (status, _) = request_as_user(&base, "DELETE", squad_path, "alice", "");
+    assert_eq!(status, 200);
+    let (_, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    let parsed: serde_json::Value = serde_json::from_str(&alice).expect("json");
+    let remaining = parsed["hidden"].as_array().unwrap();
+    assert_eq!(remaining.len(), 1, "task must still be hidden: {alice}");
+    assert_eq!(remaining[0]["kind"], "task");
+
+    let (status, body) = request_as_user(&base, "DELETE", path, "alice", "");
+    assert_eq!(status, 200, "unhide task body: {body}");
+    assert_eq!(body, r#"{"hidden":false}"#);
+    let (_, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    assert_eq!(alice, r#"{"hidden":[]}"#);
+
+    // A non-integer task index is a 400, and a task that does not exist is
+    // a 404 -- same shape as the squad/review endpoints.
+    let (status, _) = request_as_user(
+        &base,
+        "POST",
+        "/api/hidden/tasks/squad-000000000001/not-a-number",
+        "alice",
+        "",
+    );
+    assert_eq!(status, 400);
+    let (status, _) = request_as_user(
+        &base,
+        "POST",
+        "/api/hidden/tasks/squad-000000000001/99",
+        "alice",
+        "",
+    );
+    assert_eq!(status, 404);
+
+    // RAL-332: hide/unhide task rows are admin-only Cartographer rows, same
+    // as squads/reviews.
+    let (status, _) = post(
+        &base,
+        "/api/users/alice/admin",
+        &serde_json::json!({ "is_admin": true }).to_string(),
+    );
+    assert_eq!(status, 200);
+    let (_, admin_events) =
+        request_as_user(&base, "GET", "/api/cartographer?source=hidden", "alice", "");
+    assert!(
+        admin_events.contains("task hidden"),
+        "events body: {admin_events}"
+    );
+    assert!(
+        admin_events.contains("task unhidden"),
+        "events body: {admin_events}"
+    );
+}
+
+#[test]
+fn hidden_tasks_batch_applies_in_one_request() {
+    let base = spawn_server();
+    let body = serde_json::json!({ "name": "alice" }).to_string();
+    let (status, response) = post(&base, "/api/users", &body);
+    assert_eq!(status, 200, "create user body: {response}");
+
+    let two_tasks = "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n[[task]]\nname=\"test\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n";
+    let submit_body = serde_json::json!({ "toml": two_tasks }).to_string();
+    let (status, response) = post(&base, "/api/squads", &submit_body);
+    assert_eq!(status, 201, "submit body: {response}");
+
+    // One request hides both real tasks plus an index that does not exist --
+    // the valid ones still succeed and the bad one comes back in `failed`.
+    let batch_body = serde_json::json!({
+        "tasks": [
+            { "squad_id": "squad-000000000001", "task_idx": 0 },
+            { "squad_id": "squad-000000000001", "task_idx": 1 },
+            { "squad_id": "squad-000000000001", "task_idx": 99 }
+        ],
+        "hidden": true
+    })
+    .to_string();
+    let (status, body) = request_as_user(
+        &base,
+        "POST",
+        "/api/hidden/tasks/batch",
+        "alice",
+        &batch_body,
+    );
+    assert_eq!(status, 200, "batch hide body: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(parsed["hidden"], true);
+    let failed = parsed["failed"].as_array().expect("failed array");
+    assert_eq!(failed.len(), 1, "batch hide body: {body}");
+    assert_eq!(failed[0]["task_idx"], 99);
+
+    let (_, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    let parsed: serde_json::Value = serde_json::from_str(&alice).expect("json");
+    assert_eq!(parsed["hidden"].as_array().unwrap().len(), 2);
+
+    let unbatch_body = serde_json::json!({
+        "tasks": [
+            { "squad_id": "squad-000000000001", "task_idx": 0 },
+            { "squad_id": "squad-000000000001", "task_idx": 1 }
+        ],
+        "hidden": false
+    })
+    .to_string();
+    let (status, body) = request_as_user(
+        &base,
+        "POST",
+        "/api/hidden/tasks/batch",
+        "alice",
+        &unbatch_body,
+    );
+    assert_eq!(status, 200, "batch unhide body: {body}");
+    let (_, alice) = request_as_user(&base, "GET", "/api/hidden", "alice", "");
+    assert_eq!(alice, r#"{"hidden":[]}"#);
+
+    let (status, body) = request_as_user(
+        &base,
+        "POST",
+        "/api/hidden/tasks/batch",
+        "alice",
+        &serde_json::json!({ "tasks": [], "hidden": true }).to_string(),
+    );
+    assert_eq!(status, 400, "empty batch body: {body}");
+}
+
 // ── RAL-332: admin flag, admin-only endpoints, Cartographer visibility ─────
 
 /// Promotes `name` to admin via `POST /api/users/{name}/admin`, as `caller`
