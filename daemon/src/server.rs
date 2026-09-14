@@ -404,6 +404,22 @@ impl Daemon {
         }
     }
 
+    /// [`Store::board_snapshot_conn`] routed through the RAL-393 Stage 3
+    /// read pool, so the board poll — by far the largest and most frequent
+    /// read the daemon serves — no longer holds the writer lock away from
+    /// the scheduler, the guardian-merge workers, and every mutation for the
+    /// whole time it runs. Falls back to the locked writer connection only
+    /// when the pool has no connections at all (see [`ReadConnPool::acquire`]).
+    ///
+    /// Snapshot consistency comes from the read transaction inside
+    /// `board_snapshot_conn`, not from excluding the writer.
+    pub(crate) fn read_board_snapshot(&self) -> crate::store::Result<crate::store::BoardSnapshot> {
+        match self.read_pool.acquire() {
+            Some(conn) => Store::board_snapshot_conn(&conn),
+            None => Store::board_snapshot_conn(&self.lock().conn),
+        }
+    }
+
     /// Request that `run_http_loop` stop accepting new requests and return,
     /// so `serve()` returns and the daemon process exits. See the `shutdown`
     /// field's doc comment.
@@ -1800,40 +1816,55 @@ fn filter_and_sort_squads(
 
 /// `?status=queued,running&name=foo&sort=name` — see [`filter_and_sort_squads`].
 fn board(daemon: &Daemon, query: &str) -> Reply {
-    let store = daemon.lock();
+    // Served from the read pool, not the writer lock. This is the single
+    // largest response the daemon produces (megabytes once a real squad
+    // history has accumulated) and every open board polls it, so running it
+    // under the daemon-wide mutex stalled the scheduler, every
+    // guardian-merge worker, and every mutation for its whole duration.
+    // `read_board_snapshot` reads both halves inside one read transaction,
+    // which is what preserves the atomicity the mutex used to provide.
+    let read_started = Instant::now();
+    let (squads, merging) = match daemon.read_board_snapshot() {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let view_ms = read_started.elapsed().as_millis();
     // Ground truth is the shared concurrency semaphore, not a DB row count:
     // a permit is held for a cell/proof/review-merge's entire time in
     // flight, which outlasts the windows where any single row actually reads
     // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
     let running = daemon.sem.in_use();
-    let running_reviews: Vec<RunningReviewItem> = store
-        .merging_guardians()
-        .unwrap_or_default()
+    let running_reviews: Vec<RunningReviewItem> = merging
         .into_iter()
         .map(|(id, name)| RunningReviewItem { id, name })
         .collect();
-    match store.list_squads() {
-        Ok(squads) => {
-            let status = query_filter(query, "status");
-            let name = query_filter(query, "name");
-            let sort = query_filter(query, "sort");
-            let squads =
-                filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
-            json(
-                200,
-                &Board {
-                    daemon: DaemonStatus {
-                        running,
-                        max_concurrent: daemon.max_concurrent,
-                        running_reviews,
-                        downtime_active: crate::config::scheduler_in_downtime(),
-                    },
-                    squads,
-                },
-            )
-        }
-        Err(e) => store_error(&e),
-    }
+    let status = query_filter(query, "status");
+    let name = query_filter(query, "name");
+    let sort = query_filter(query, "sort");
+    let squads =
+        filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
+    let serialize_started = Instant::now();
+    let reply = json(
+        200,
+        &Board {
+            daemon: DaemonStatus {
+                running,
+                max_concurrent: daemon.max_concurrent,
+                running_reviews,
+                downtime_active: crate::config::scheduler_in_downtime(),
+            },
+            squads,
+        },
+    );
+    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
+    crate::rlog!(
+        INFO,
+        "ralphus [performance] board read={}ms serialize={}ms bytes={}",
+        view_ms,
+        serialize_started.elapsed().as_millis(),
+        reply.body.len()
+    );
+    reply
 }
 
 /// Compact cross-squad task data for the Tasks tab, with stage timings that

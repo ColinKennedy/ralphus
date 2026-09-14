@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use ralphus_core::schema::TaskFile;
@@ -305,10 +305,10 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn triage_types_by_cell(
-        &self,
+        conn: &Connection,
         squad_id: &str,
     ) -> StoreResult<std::collections::HashMap<(i64, i64), Vec<String>>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT task_idx, idx, triage_type FROM triage_cell_types WHERE squad_id=? ORDER BY task_idx, idx, triage_type",
         )?;
         let rows = stmt
@@ -504,8 +504,11 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub fn subprojects_by_cell(&self, squad_id: &str) -> StoreResult<CellSubprojectsMap> {
-        let mut stmt = self.conn.prepare(
+    pub fn subprojects_by_cell(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> StoreResult<CellSubprojectsMap> {
+        let mut stmt = conn.prepare(
             "SELECT task_idx, idx, subproject, inferred FROM cell_subprojects
              WHERE squad_id=? ORDER BY task_idx, idx, subproject",
         )?;
