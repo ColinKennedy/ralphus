@@ -3765,6 +3765,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             .is_some_and(is_backed_off)
     };
     if backed_off {
+        // ralphus[ignore-rlog-pair]: rate-limit path records the structured outcome; this routine only skips a poll
         crate::rlog!(
             DEBUG,
             "ralphus [pr] review {id} forge cache poll skipped: still backing off from a rate limit"

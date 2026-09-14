@@ -650,6 +650,7 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
         return;
     };
     if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
+        // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
         crate::rlog!(
             WARNING,
             "ralphus: could not freeze commit baseline for branch '{branch}' at {}: {e}",
