@@ -1,0 +1,218 @@
+[[review]]
+id                   = "ralphus:new-review/ral-308-414-415-416"
+name                 = "RAL-308 / RAL-414 / RAL-415 / RAL-416"
+upstream             = "staging"
+agent                = "claude-code"
+model                = "haiku"
+proof_scope          = "nothing"
+skip_auto_build      = true
+auto_submit_pr_stack = true
+
+# RAL-308 — core/daemon/runner timeout and stall behavior.
+[[task]]
+name    = "RAL-308"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-308: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-308-maximum-timeout-stall-detection?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-308-414-415-416>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-308: Add per-task maximum_timeout and stall detection
+
+Implement a seconds-based, hard maximum runtime for task-file tasks, cells, and proofs. A task cap is cumulative across all of its descendants; a cell cap is cumulative across that cell and its proofs; a proof cap applies to itself. At expiry, cancel/kill the running worker or tmux execution, preserve logs and completed work, reclaim resources, and record an explicit maximum-runtime failure. Existing quiet-pane stall detection stays advisory and must never kill healthy work.
+
+The repository already has inheritable `timeout_minutes`, runner enforcement across reattach attempts, a config fallback named `maximum_timeout_seconds`, and advisory tmux-pane stall mailbox escalation. Reuse and reconcile those mechanisms rather than creating competing timeout paths. Ensure process termination uses safe kill/wait/pipe-draining behavior and does not strand locks.
+
+Add task-file schema support and `ralphus tutor` documentation. Before adding any `core/src/validate.rs` rule for the new field, stop and obtain the required user decision on validation semantics: whether it accepts only positive seconds with omission meaning no cap, or whether zero is accepted as unbounded. Do not infer that policy from this prompt. If no answer is available through the task's normal interaction channel, report the precise blocked decision rather than adding validation behavior.
+
+Add a conservative daemon periodic stall sweep that recognizes a still-running proof/cell with no CPU-time progress over repeated samples across several minutes and emits an additive RAL-241 escalation-mailbox notification. Do not auto-kill from the stall detector. Keep platform-specific CPU accounting behind an appropriate abstraction.
+
+Acceptance criteria:
+- Task/cell/proof maximum runtime is enforced as a hard cap and reported clearly.
+- Negative values are rejected with a line-numbered validation error once the user has chosen the numeric policy.
+- `ralphus tutor` explains the field, seconds unit, and valid placement.
+- Repeated CPU-flat samples produce a mailbox escalation without changing kill behavior.
+- Add focused tests; run relevant format, lint, and test checks.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    model  = "haiku"
+    prompt = "Run `cargo fmt --all -- --check`. If it fails, run `cargo fmt --all`, then re-run the check. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "clippy"
+    model  = "haiku"
+    prompt = "Run `cargo clippy --all-targets -- -D warnings`. If it fails, fix only issues caused by this task and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "test"
+    model  = "haiku"
+    prompt = "Run focused core, daemon, and runner tests for this change. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`, because this dogfooding environment can lock daemon/librarian executables. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-308: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-308-maximum-timeout-stall-detection?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+# RAL-414 — board cold-load performance and observability.
+[[task]]
+name    = "RAL-414"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-414: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-414-board-performance-under-load?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-308-414-415-416>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-414: Verify board tab performance under load
+
+Implement deterministic integration coverage for every supported board tab's true cold-navigation, user-visible readiness. Centralize a documented 2-second default cold-load budget with a test/config override for slower CI and diagnostics. On failure report tab, fixture, budget, observed time, and available phase timings.
+
+Add isolated representative fixtures: more than 600 worktrees for Retirements; hundreds of squads, tasks, and projects for their relevant tabs; and equivalent high-entity scenarios for other blocking tab paths. Measure navigation only after setup, from a clean browser/session state, and avoid accidental cache/reused-tab success.
+
+Add dormant-by-default, build-agnostic opt-in timing instrumentation with stable phase names and elapsed durations for every relevant server/API/data-load/render blocking path. It must work in debug, release, and release-with-symbols builds, have low disabled overhead, and make failures actionable.
+
+Current mitigation includes SSE refresh, virtualized task rows, in-flight `/api/tasks` sharing, and partial hydration; it does not bound the full board payload. The desired product behavior permits progressive retained-history loading and search discovery while typing, but must keep active/hot work responsive without requiring users to hide history.
+
+Document local standard/heavy test execution and instrumentation. Add both server-side SQLite/API/payload measurements and browser response/render benchmarks. Follow librarian conventions for board tests and code organization.
+"""
+
+    [[task.cell.proof]]
+    id     = "rust"
+    model  = "haiku"
+    prompt = "Run focused daemon integration/library tests for the performance fixtures and instrumentation. Do not use all-targets dogfooding commands. Fix task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if passing."
+
+    [[task.cell.proof]]
+    id     = "web"
+    model  = "haiku"
+    prompt = "From the repository root, run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and the relevant browser/node tests. Fix task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-414: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-414-board-performance-under-load?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+# RAL-415 — CLI health diagnostics. RAL-416 stacks on this task.
+[[task]]
+name    = "RAL-415"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-415: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-415-clearer-health-diagnostics?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-308-414-415-416>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-415: Expand health diagnostics and dependency checks
+
+Improve `ralphus check health` without losing useful existing checks. Human output must have clearly indented Core, Harness, and Machine sections (or documented equivalent), and every result must state observation, impact, and an actionable remediation. Add a durable output fixture/snapshot covering layout, statuses, explanations, and indentation. Keep JSON output consistent with grouping, applicability, status, and provenance.
+
+Add optional/fallback-only `gh` and `glab` executable resolution checks; missing commands must not become universal failures and must explain their fallback-token role. Add tmux/platform-equivalent resolution honoring the dedicated `RALPHUS_` override, reporting both source and resolved value. Require git only for projects that use Git; non-Git projects must clearly report skipped/not-applicable.
+
+Report every contributing layered configuration file in precedence order, with source provenance for effective displayed settings where practical. Never expose secrets. Preserve daemon reachability, runner, configured harness commands, resource checks, and other relevant existing diagnostics in their correct section. Make any live agent call opt-in; retain non-live checking by default.
+
+Add focused tests for Git/non-Git projects, layered config reporting, environment overrides, missing optional forge CLIs, tmux resolution, output snapshot, and machine-readable consistency. Update help/reference and dependency documentation.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    model  = "haiku"
+    prompt = "Run `cargo fmt --all -- --check`; fix formatting if needed and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "clippy"
+    model  = "haiku"
+    prompt = "Run `cargo clippy --all-targets -- -D warnings`; fix task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "test"
+    model  = "haiku"
+    prompt = "Run focused `ralphus-cli` tests plus `cargo nextest run -p ralphus-daemon --lib` if daemon code changed. Do not run all-targets dogfooding commands. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-415: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-415-clearer-health-diagnostics?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+# RAL-416 — catalog-backed board and machine health administration, stacked on RAL-415.
+[[task]]
+name       = "RAL-416"
+project    = "ralphus"
+agent      = "claude-code"
+model      = "sonnet"
+depends_on = ["RAL-415"]
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-416: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-416-health-admin-experience?upstream=staging>>"
+  upstream               = "<<task:RAL-415>>"
+  review                 = "<<ralphus:new-review/ral-308-414-415-416>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree stacked on RAL-415's branch.
+
+# RAL-416: Build catalog-driven health administration experience
+
+Implement the approved portions of `HEALTH-ADMIN-TAB-PLAN.local.md`, preserving RAL-415 behavior. Introduce one Rust health-check catalog with stable IDs, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, impact text aligned to `docs/dependencies.md`, and probe binding. Migrate existing CLI health checks to it and add CI parity coverage that reports named, actionable catalog/CLI/board drift.
+
+Build read-only catalog/report API and CLI surfaces, an admin-only board Health tab, machine summary badges and reports, a synthetic daemon-as-local-machine row, report timestamps/statuses, raw detail, impact, retry/check-now feedback, and copy remediation/report affordances. Follow librarian CSS variable, tooltip, chunk, lint/type/knip/test, documentation, and screenshot conventions. Reuse existing health target, machine, store, and Arbiter foundations rather than rebuilding them.
+
+Add only Free checks to a configurable hourly background sweep and enforce that OnDemand checks never run there. Preserve truthful unknown/not-checked/not-applicable outcomes. Model daemon and remote checks described in the ticket, including Git, runner, tmux/psmux, optional forge CLIs, platform executables, optional NVIDIA/Ollama, configuration/project/fork, SSH/capabilities/root/identity, remote runner, and documented-unverified credentials. On-demand authentication probes must live in existing concrete backend abstractions; Ollama auth is not applicable and raw-command auth is not generically verifiable.
+
+Before any MCP schema/configuration, validation, or generic MCP-auth work, obtain explicit user decisions; do not infer them. Also obtain explicit user decisions before implementing the unresolved Python-harness meaning, PowerShell/Windows Terminal severity, remote gh/glab and tmux applicability, daemon-row labeling/visibility, remote check-now API shape, and backend-auth probe mechanics. If those decisions are unavailable, complete safe catalog/read-only work and report each remaining decision precisely rather than inventing semantics.
+"""
+
+    [[task.cell.proof]]
+    id     = "rust"
+    model  = "haiku"
+    prompt = "Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, focused CLI tests, and `cargo nextest run -p ralphus-daemon --lib` when applicable. Do not run all-targets dogfooding tests. Fix task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected checks pass."
+
+    [[task.cell.proof]]
+    id     = "web"
+    model  = "haiku"
+    prompt = "From the repository root, run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and relevant node tests. Fix task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-416: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-416-health-admin-experience?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
