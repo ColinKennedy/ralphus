@@ -7479,6 +7479,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mark_ready_branches_ignores_stale_cancelled_cells_from_other_guardians() {
+        // RAL-345-style resubmission: a cancelled earlier attempt reuses the
+        // same branch string, leaving `cancelled` cell rows (recorded against
+        // a *different*, superseded guardian) sharing `review_branch` with the
+        // current attempt's `done` rows. `mark_ready_branches_with_done_cells`
+        // must scope its contributor check to THIS guardian's cells
+        // (RAL-314 `review_guardian_id`) instead of letting the other
+        // guardian's stale non-`done` rows keep the branch `pending` forever.
+        let mut store = Store::open_in_memory().unwrap();
+
+        // Superseded attempt (a cancelled guardian, like RAL-345's first
+        // squad-000000000150 run): cancelled cell recorded against it.
+        let cancelled_guardian = store.create_guardian("old", "main", "/repo").unwrap();
+        store
+            .add_guardian_branch(&cancelled_guardian, "feat")
+            .unwrap();
+        let cancelled_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Cancelled);
+        store
+            .set_cell_review_guardian(&cancelled_squad, 0, 0, &cancelled_guardian)
+            .unwrap();
+
+        // Current attempt: done cell recorded against *this* guardian.
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let done_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        store
+            .set_cell_review_guardian(&done_squad, 0, 0, &id)
+            .unwrap();
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            1,
+            "the current attempt's cell is done and the stale cancelled row \
+             belongs to a different guardian -- the branch must be promoted"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn mark_ready_branches_stays_pending_for_a_same_guardian_unfinished_cell() {
+        // Guards the fix above from over-correcting: a non-`done` cell that
+        // really is recorded against THIS guardian (an implicit worktree
+        // sibling, RAL-159) must still hold the branch at `pending`.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let done_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        store
+            .set_cell_review_guardian(&done_squad, 0, 0, &id)
+            .unwrap();
+        let pending_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Pending);
+        store
+            .set_cell_review_guardian(&pending_squad, 0, 0, &id)
+            .unwrap();
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            0,
+            "one of THIS guardian's cells is still pending -- must not promote"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "pending"
+        );
+
+        // Finish the sibling: now it promotes.
+        store
+            .set_cell_state(&pending_squad, 0, 0, NodeState::Done)
+            .unwrap();
+        assert_eq!(store.mark_ready_branches_with_done_cells(&id).unwrap(), 1);
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "ready"
+        );
+    }
+
     /// RAL-424: `reset_guardian_to_collecting` must accept `merge_failed` as
     /// a source state, not just `merging`/`in_review`. It's the mechanism
     /// `restart_guardian_merge` uses to re-arm `kickoff_merge`'s per-branch
