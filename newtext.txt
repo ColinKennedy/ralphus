@@ -1,0 +1,111 @@
+    // RAL-422: the completion record must fire even on early-return errors,
+    // so the cartographer log stays paired. The heavy work is wrapped; the
+    // outer scope only logs and returns.
+    let (result, guardian_id_str): (std::result::Result<PrSyncStatus, String>, Option<String>) =
+        match compute_sync_status_inner(store, pr_id) {
+            Ok(status) => {
+                let gid = store
+                    .lock()
+                    .get_pull_request(pr_id)
+                    .ok()
+                    .map(|pr| pr.guardian_id);
+                (Ok(status), gid)
+            }
+            Err(e) => (Err(e), None),
+        };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let level = if result.is_ok() {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level,
+            source: "pr",
+            message: &format!("PR sync status check completed ({:.1}s)", elapsed),
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: guardian_id_str.as_deref(),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "pr_id": pr_id,
+                "elapsed_s": elapsed,
+                "ok": result.is_ok(),
+                "error": result.as_ref().err(),
+            }),
+            admin_only: false,
+        });
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] PR sync status check completed pr_id={pr_id} elapsed={elapsed:.1}s"
+    );
+    result
+}
+
+fn compute_sync_status_inner(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<PrSyncStatus, String> {
+    let pr = store
+        .lock()
+        .get_pull_request(pr_id)
+        .map_err(|e| e.to_string())?;
+    let guardian = store
+        .lock()
+        .get_guardian(&pr.guardian_id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    // RAL-338: this PR's branch alias lives on the fork's remote in fork
+    // mode, including the root's (its PR is filed against the parent, but
+    // its ref still lives on the fork).
+    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let remote_name = routing.remote_for(&pr.repo).to_string();
+
+    let local_ref = local_ref_for_pr(&guardian, &pr);
+    let local_sha = local_ref
+        .as_deref()
+        .and_then(|r| git(&root, &["rev-parse", r]).ok())
+        .map(|s| s.trim().to_string());
+    // Held across both commands so a concurrent re-check of this same PR
+    // can't read back a fetch this one hasn't written yet. See
+    // `SYNC_FETCH_LOCKS`.
+    let remote_sha = {
+        let fetch_lock = sync_fetch_lock(&root, pr_id);
+        let _fetching = fetch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dest_ref = sync_fetch_ref(pr_id);
+        // `+` forces the update: a reviewer force-pushing the PR branch
+        // (an amend, a rebase onto a new base) makes its new tip a
+        // non-fast-forward from whatever this ref last pointed at, which a
+        // plain refspec would otherwise refuse to write.
+        let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
+        git(&root, &["fetch", &remote_name, &refspec])
+            .ok()
+            .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+            .map(|s| s.trim().to_string())
+    };
+
+    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+        &root,
+        remote_sha.as_deref(),
+        local_sha.as_deref(),
+        pr.last_pushed_sha.as_deref(),
+    );
+
+    Ok(PrSyncStatus {
+        remote_sha,
+        local_sha,
+        last_pushed_sha: pr.last_pushed_sha,
+        in_sync,
+        pr_ahead,
+        worktree_ahead,
+    })
+}
+
