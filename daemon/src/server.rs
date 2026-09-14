@@ -116,6 +116,13 @@ pub struct Daemon {
     /// buttons -- see `crate::generation`'s module doc comment for why this
     /// is fire-and-forget-plus-poll rather than a blocking HTTP call.
     generation_jobs: crate::generation::GenerationJobs,
+    /// RAL-416: the hourly Free-tier health-sweep's latest cached report --
+    /// see `crate::health_sweep`'s module doc comment. The background
+    /// sweep loop itself is spawned in `serve()` (not here, matching
+    /// `summary_queue`'s precedent), so plain `Daemon::new` (used by unit
+    /// tests that don't want live background threads) starts with an empty
+    /// cache rather than a real sweep thread.
+    health_sweep: crate::health_sweep::HealthSweepState,
 }
 
 impl Daemon {
@@ -142,6 +149,7 @@ impl Daemon {
             active_terminal_sessions: Mutex::new(std::collections::HashSet::new()),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
             generation_jobs: crate::generation::GenerationJobs::new(),
+            health_sweep: crate::health_sweep::HealthSweepState::new(),
         }
     }
 
@@ -285,6 +293,14 @@ impl Daemon {
     #[must_use]
     pub fn summary_queue_handle(&self) -> Arc<SummaryQueue> {
         Arc::clone(&self.summary_queue)
+    }
+
+    /// A cloned handle to the RAL-416 health-sweep cache (for the background
+    /// sweep thread spawned in `serve()`, and for the `GET /api/health/report`
+    /// route handler to read).
+    #[must_use]
+    pub fn health_sweep_handle(&self) -> crate::health_sweep::HealthSweepState {
+        self.health_sweep.clone()
     }
 
     pub(crate) fn lock(&self) -> StoreGuard<'_> {
@@ -1023,6 +1039,17 @@ fn route_for_user(
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
+        // RAL-416: catalog-driven health administration -- read-only, admin
+        // gated like the other machine/health board surfaces above.
+        ("GET", ["api", "health", "catalog"]) => {
+            admin_gated(daemon, user_header, health_catalog_reply)
+        }
+        ("GET", ["api", "health", "report"]) => {
+            admin_gated(daemon, user_header, || health_report(daemon))
+        }
+        ("POST", ["api", "health", "report", "refresh"]) => {
+            admin_gated(daemon, user_header, || health_report_refresh(daemon))
+        }
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
         // form's agent picker -- see `crate::agent_catalog`.
@@ -2742,6 +2769,56 @@ fn health_all_targets(daemon: &Daemon) -> Reply {
         }
         Err(e) => error(500, "internal_error", &e, vec![]),
     }
+}
+
+/// `GET /api/health/catalog` (RAL-416): every `ralphus_core::health_catalog`
+/// entry, with no probes run -- the board's read-only reference for
+/// section/applicability/cost-tier/requirement-level/impact metadata,
+/// joined client-side against `GET /api/health/report`'s live statuses.
+fn health_catalog_reply() -> Reply {
+    json(
+        200,
+        &serde_json::json!({"catalog": ralphus_core::health_catalog::CATALOG}),
+    )
+}
+
+/// `GET /api/health/report` (RAL-416): the daemon's latest hourly Free-tier
+/// health-sweep pass (`crate::health_sweep`), including a synthetic
+/// `"machine": "daemon (local)"` row so the board can render this daemon's
+/// own host alongside real `[machine.targets.*]` rows from
+/// `GET /api/machines/targets/health` in one list. Cached, unlike that
+/// endpoint -- this is the always-on background sweep's last result, not a
+/// live on-demand probe; `checked_at_ms`/`checks` are `null`/`[]` if the
+/// daemon hasn't completed a sweep yet (e.g. `[health].enabled = false`, or
+/// a fresh restart racing the first sweep).
+fn health_report(daemon: &Daemon) -> Reply {
+    let latest = daemon.health_sweep_handle().latest();
+    json(
+        200,
+        &serde_json::json!({
+            "machine": "daemon (local)",
+            "checked_at_ms": latest.as_ref().map(|r| r.checked_at_ms),
+            "checks": latest.map(|r| r.checks).unwrap_or_default(),
+        }),
+    )
+}
+
+/// `POST /api/health/report/refresh` (RAL-416): re-runs the Free-tier
+/// daemon-local sweep immediately (`HealthSweepState::refresh_now`) instead
+/// of waiting for the next scheduled pass, and caches the result -- the
+/// board's "check now" affordance for this daemon's own synthetic row.
+/// Deliberately local-only; see [`health_sweep::HealthSweepState::refresh_now`]'s
+/// doc comment for why a remote-target counterpart isn't part of this route.
+fn health_report_refresh(daemon: &Daemon) -> Reply {
+    let report = daemon.health_sweep_handle().refresh_now();
+    json(
+        200,
+        &serde_json::json!({
+            "machine": "daemon (local)",
+            "checked_at_ms": report.checked_at_ms,
+            "checks": report.checks,
+        }),
+    )
 }
 
 /// `GET /api/machines`: every registered provider plus the built-in schemes.
@@ -13359,6 +13436,10 @@ pub fn serve<A: ToSocketAddrs>(
     // subprocesses into (`with_registry` above), so the CPU-flat stall sweep
     // sees every live cell/proof subprocess without a separate tracking path.
     let procs = daemon.procs_handle();
+    // RAL-416: hourly (configurable) sweep of every Free-tier, daemon-local
+    // health check -- see `crate::health_sweep`'s module doc comment for
+    // why it's scoped to a subset of the catalog.
+    crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -15577,6 +15658,51 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"ok\":true"), "{}", r.body);
         assert!(r.body.contains("\"targets\":[]"), "{}", r.body);
+    }
+
+    #[test]
+    fn health_catalog_route_returns_every_catalog_entry() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/health/catalog", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let catalog = parsed["catalog"].as_array().unwrap();
+        assert_eq!(catalog.len(), ralphus_core::health_catalog::CATALOG.len());
+        assert!(catalog.iter().any(|e| e["id"] == "git"));
+    }
+
+    #[test]
+    fn health_report_refresh_route_populates_the_cache_immediately() {
+        let d = daemon();
+        let before = route(&d, "GET", "/api/health/report", "");
+        let before: serde_json::Value = serde_json::from_str(&before.body).unwrap();
+        assert!(before["checked_at_ms"].is_null());
+
+        let r = route(&d, "POST", "/api/health/report/refresh", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let refreshed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(!refreshed["checked_at_ms"].is_null());
+        assert!(!refreshed["checks"].as_array().unwrap().is_empty());
+
+        // The GET route now serves what the refresh just cached.
+        let after = route(&d, "GET", "/api/health/report", "");
+        let after: serde_json::Value = serde_json::from_str(&after.body).unwrap();
+        assert_eq!(after["checked_at_ms"], refreshed["checked_at_ms"]);
+    }
+
+    #[test]
+    fn health_report_route_is_empty_before_any_sweep_has_run() {
+        // `daemon()` builds a bare `Daemon` (no `serve()`, so
+        // `spawn_health_sweep` never ran) -- proves the route reports
+        // truthfully-empty rather than panicking or fabricating a status
+        // when no sweep has completed yet.
+        let d = daemon();
+        let r = route(&d, "GET", "/api/health/report", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(parsed["machine"], "daemon (local)");
+        assert!(parsed["checked_at_ms"].is_null());
+        assert_eq!(parsed["checks"].as_array().unwrap().len(), 0);
     }
 
     #[test]

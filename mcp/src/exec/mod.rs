@@ -73,6 +73,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::RetryRun { squad_id } => Ok(client.retry_squad(&squad_id)?),
         Command::Clear(args) => exec_clear(client, args),
         Command::Check(args) => Ok(exec_check(client, args)),
+        Command::CheckCatalog => Ok(exec_check_catalog()),
         Command::Completion => Ok(json!({
             "message": format!(
                 "# {} shell completion is not yet ported in this Rust build.",
@@ -393,6 +394,7 @@ fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
                 "section": r.section,
                 "status": r.status,
                 "name": r.name,
+                "id": r.id,
                 "detail": r.detail,
                 "impact": r.impact,
                 "remediation": r.remediation,
@@ -414,6 +416,13 @@ fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
         .collect();
     let failed = results.iter().filter(|r| r.is_fail()).count() + file_issues.len();
     json!({"checks": checks, "config_file_issues": issues, "failed": failed})
+}
+
+/// RAL-416: `check_catalog` -- every `ralphus_core::health_catalog` entry,
+/// with no probes run. See `misc::cmd_check_catalog`'s doc comment for how
+/// this differs from `check_health`'s per-run results.
+fn exec_check_catalog() -> Value {
+    json!({"catalog": ralphus_core::health_catalog::CATALOG})
 }
 
 fn exec_configuration() -> Value {

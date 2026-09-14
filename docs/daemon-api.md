@@ -1043,7 +1043,12 @@ computed live — never cached or polled, so calling this is itself the
 per-target probes. Each target's checks stop at the first failure that would
 make every later check fail identically (an unreachable machine skips
 straight past `capabilities`/`remote_root`/git checks rather than repeating
-the same connectivity failure five times).
+the same connectivity failure five times). Every check's `id` (RAL-416)
+names its `ralphus_core::health_catalog` entry — see
+[`docs/dependencies.md`](dependencies.md)'s "ssh / rsync / tar" section for
+what each one covers, including `push_credentials`/`runner`, which are
+*documented-unverified*: always `warn`, with no real pass/fail, since no
+safe non-mutating check exists yet for either.
 ```json
 {
   "ok": true,
@@ -1053,13 +1058,14 @@ the same connectivity failure five times).
       "target": "devbox",
       "machine": "ssh:devbox",
       "checks": [
-        { "name": "ssh_reachable", "status": "pass", "detail": "reachable" },
-        { "name": "capabilities", "status": "pass", "detail": "os=linux, arch=x86_64, async_exec=true, terminal=false" },
-        { "name": "remote_root", "status": "pass", "detail": "create/read/rename/delete all succeeded under \"/srv/ralphus\"" },
-        { "name": "git_version", "status": "pass", "detail": "git version 2.43.0" },
-        { "name": "git_user.name", "status": "pass", "detail": "Ralphus Bot" },
-        { "name": "git_user.email", "status": "warn", "detail": "no global git user.email is set for the remote account -- commits will fail until it is, unless every repository sets it per-repo instead" },
-        { "name": "push_credentials", "status": "warn", "detail": "not verified -- no safe, non-mutating way to confirm push authorization exists yet" }
+        { "name": "ssh_reachable", "status": "pass", "detail": "reachable", "id": "remote-ssh-reachable" },
+        { "name": "capabilities", "status": "pass", "detail": "os=linux, arch=x86_64, async_exec=true, terminal=false", "id": "remote-capabilities" },
+        { "name": "remote_root", "status": "pass", "detail": "create/read/rename/delete all succeeded under \"/srv/ralphus\"", "id": "remote-root" },
+        { "name": "git_version", "status": "pass", "detail": "git version 2.43.0", "id": "remote-git-version" },
+        { "name": "git_user.name", "status": "pass", "detail": "Ralphus Bot", "id": "remote-git-identity-name" },
+        { "name": "git_user.email", "status": "warn", "detail": "no global git user.email is set for the remote account -- commits will fail until it is, unless every repository sets it per-repo instead", "id": "remote-git-identity-email" },
+        { "name": "push_credentials", "status": "warn", "detail": "not verified -- no safe, non-mutating way to confirm push authorization exists yet", "id": "remote-push-credentials" },
+        { "name": "runner", "status": "warn", "detail": "not verified -- confirming 'ralphus-runner' resolves on the remote would require the SSH provider's run verb to accept an arbitrary program, which is deliberately scoped to git only", "id": "remote-runner" }
       ]
     }
   ]
@@ -1069,6 +1075,52 @@ the same connectivity failure five times).
 `.ralphus.toml`) — an individual target's own failures are reported inside
 its own `checks`, never as an overall error, so one unreachable machine
 never hides every other target's results.
+
+### `GET /api/health/catalog` (RAL-416)
+Every `ralphus_core::health_catalog` entry, with no probes run — admin
+gated, like the rest of this section. The board's read-only reference for
+section/applicability/cost-tier/requirement-level/impact metadata, joined
+client-side against `GET /api/health/report`'s live statuses. Same payload
+`ralphus check catalog --json` prints.
+```json
+{
+  "catalog": [
+    { "id": "git", "label": "git", "section": "harness", "applicability": "daemon_local", "cost_tier": "free", "requirement": "required", "probe": {"kind": "local"}, "impact": "Guardian reviews, worktree creation, and Git-based project validation all shell out to git; required whenever any registered project uses vcs=\"git\"." }
+  ]
+}
+```
+
+### `GET /api/health/report` (RAL-416)
+The daemon's latest hourly Free-tier health-sweep pass
+(`daemon/src/health_sweep.rs`) — cached, unlike
+`/api/machines/targets/health`: this is the always-on background sweep's
+last result, not a live on-demand probe. Includes a synthetic
+`"machine": "daemon (local)"` row so the board can render this daemon's own
+host alongside real `[machine.targets.*]` rows from
+`/api/machines/targets/health` in one list. `checked_at_ms`/`checks` are
+`null`/`[]` if the daemon hasn't completed a sweep yet (`[health].enabled =
+false`, or a fresh restart racing the first sweep). Deliberately scoped to a
+subset of `Free`/daemon-local catalog entries whose probe is self-contained
+inside the daemon process (`git`, `tmux`, `runner`, `gh`, `glab`,
+`nvidia-smi`, `ollama`) — see that module's own doc comment for why the
+CLI's `.ralphus.toml`-shape checks aren't part of this sweep.
+```json
+{
+  "machine": "daemon (local)",
+  "checked_at_ms": 1757793600000,
+  "checks": [
+    { "id": "git", "status": "pass", "detail": "/usr/bin/git" }
+  ]
+}
+```
+
+### `POST /api/health/report/refresh` (RAL-416)
+Re-runs the sweep immediately (rather than waiting for the next scheduled
+pass) and caches the result -- the board's "check now" affordance for this
+daemon's own synthetic row. Same response shape as `GET /api/health/report`.
+Deliberately local-only: there is no remote-target counterpart to this route
+(the daemon's own Free-tier subset is the only thing "check now" re-runs
+here) -- see `daemon/src/health_sweep.rs`'s `refresh_now` doc comment.
 
 ### `POST /api/clear`
 Bulk-delete tasks and reviews (RAL-13).

@@ -653,6 +653,71 @@ pub fn load_pr_cache_config() -> PrCacheConfig {
         .unwrap_or_default()
 }
 
+/// RAL-416: the hourly background sweep that runs every Free-tier,
+/// daemon-local `ralphus_core::health_catalog` check and caches the latest
+/// results for the read-only health-report API -- daemon-singleton
+/// configuration, same "global file only, no per-project layering"
+/// rationale as [`PrCacheConfig`] (one sweep covers the daemon host as a
+/// whole, not any one project).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct HealthSweepConfig {
+    /// `false` disables the sweep entirely -- it never runs, and the report
+    /// API keeps serving whatever it last cached (or nothing, if the daemon
+    /// hasn't swept since it started). `None`/absent defaults to enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Seconds between sweep passes. `None` defaults to
+    /// [`DEFAULT_HEALTH_SWEEP_INTERVAL_SECS`] (one hour, per RAL-416).
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// Fallback [`HealthSweepConfig::poll_interval_secs`] when unset: one hour.
+pub const DEFAULT_HEALTH_SWEEP_INTERVAL_SECS: u64 = 3600;
+
+impl HealthSweepConfig {
+    /// Whether the sweep should run at all. Defaults to `true`.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The effective sweep interval, defaulting to
+    /// [`DEFAULT_HEALTH_SWEEP_INTERVAL_SECS`] when unset or implausibly
+    /// small (a misconfigured `0` would otherwise busy-loop the sweep).
+    #[must_use]
+    pub fn poll_interval(&self) -> Duration {
+        const MIN_SECS: u64 = 60;
+        Duration::from_secs(
+            self.poll_interval_secs
+                .filter(|&secs| secs >= MIN_SECS)
+                .unwrap_or(DEFAULT_HEALTH_SWEEP_INTERVAL_SECS),
+        )
+    }
+}
+
+/// Parse a `HealthSweepConfig` from the given TOML text; the default
+/// (enabled, 3600s) when the `[health]` table is absent.
+#[must_use]
+pub fn health_sweep_from_toml_str(s: &str) -> HealthSweepConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .health
+        .unwrap_or_default()
+}
+
+/// Load the daemon-singleton RAL-416 health-sweep config from the global
+/// config file only -- see [`HealthSweepConfig`]'s doc comment for why.
+/// Computed fresh at each call site, matching [`load_pr_cache_config`]'s
+/// "load config fresh where needed" style.
+#[must_use]
+pub fn load_health_sweep_config() -> HealthSweepConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| health_sweep_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// A project's known monorepo subproject identifiers (`[monorepo]` table,
 /// RAL-346) -- an explicit, user-provided hint rather than an auto-detected
 /// directory scan (per this ticket's Out-of-Scope note: "perfect
@@ -1736,6 +1801,8 @@ struct ConfigFile {
     #[serde(default)]
     pr_cache: Option<PrCacheConfig>,
     #[serde(default)]
+    health: Option<HealthSweepConfig>,
+    #[serde(default)]
     monorepo: Option<MonorepoConfig>,
     #[serde(default)]
     review: Option<ReviewConfig>,
@@ -2523,6 +2590,38 @@ mod tests {
         // busy-loop the poller against every open PR's forge.
         let c = pr_cache_from_toml_str("[pr_cache]\npoll_interval_secs = 0\n");
         assert_eq!(c.poll_interval(), Duration::from_secs(300));
+    }
+
+    // ── health sweep (RAL-416) ───────────────────────────────────────────────
+
+    #[test]
+    fn health_sweep_config_unset_is_enabled_with_the_default_interval() {
+        let c = HealthSweepConfig::default();
+        assert!(c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn health_sweep_config_absent_table_is_default() {
+        assert_eq!(
+            health_sweep_from_toml_str("[review]\nskip_worktrees = true\n"),
+            HealthSweepConfig::default()
+        );
+    }
+
+    #[test]
+    fn parse_health_sweep_config_overrides() {
+        let c = health_sweep_from_toml_str("[health]\nenabled = false\npoll_interval_secs = 120\n");
+        assert!(!c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn health_sweep_config_clamps_an_implausibly_small_interval_to_the_default() {
+        // A misconfigured `0` (or anything under the sanity floor) must not
+        // busy-loop the sweep.
+        let c = health_sweep_from_toml_str("[health]\npoll_interval_secs = 1\n");
+        assert_eq!(c.poll_interval(), Duration::from_secs(3600));
     }
 
     // ── monorepo (RAL-346) ──────────────────────────────────────────────────

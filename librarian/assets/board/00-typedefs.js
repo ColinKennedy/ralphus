@@ -747,3 +747,47 @@
       /**
        * @typedef {StatusPickerItem & { key: string, kind: "task"|"cell"|"proof" }} GraphNodeSelectionItem
        */
+      /**
+       * One `ralphus_core::health_catalog` entry (RAL-416) -- catalog
+       * metadata only, no live result. `GET /api/health/catalog`.
+       * @typedef {object} HealthCatalogEntry
+       * @property {string} id
+       * @property {string} label
+       * @property {string} section - "core" | "harness" | "machine"
+       * @property {string} applicability - "daemon_local" | "remote"
+       * @property {string} cost_tier - "free" | "on_demand"
+       * @property {string} requirement - "required" | "optional" | "fallback_only"
+       * @property {object} probe - `{kind: string, detail?: string}`
+       * @property {string} impact
+       * @property {string} remediation
+       */
+      /**
+       * One check's cached outcome from the daemon's hourly Free-tier health
+       * sweep (RAL-416, `daemon/src/health_sweep.rs`). `GET /api/health/report`
+       * / `POST /api/health/report/refresh`.
+       * @typedef {object} HealthSweepCheck
+       * @property {string} id
+       * @property {string} status - "pass" | "warn" | "fail"
+       * @property {string} detail
+       */
+      /**
+       * @typedef {object} HealthSweepReport
+       * @property {string} machine - synthetic label for this daemon's own host, e.g. "daemon (local)".
+       * @property {number|null} checked_at_ms - null if no sweep has completed yet.
+       * @property {HealthSweepCheck[]} checks
+       */
+      /**
+       * One named check's outcome for one `[machine.targets.*]` entry
+       * (RAL-355 Phase 9 / RAL-416's `id`). `GET /api/machines/targets/health`.
+       * @typedef {object} TargetHealthCheck
+       * @property {string} name
+       * @property {string} status - "pass" | "warn" | "fail"
+       * @property {string} detail
+       * @property {string} id - RAL-416 `ralphus_core::health_catalog` entry id.
+       */
+      /**
+       * @typedef {object} TargetHealthReport
+       * @property {string} target
+       * @property {string} machine
+       * @property {TargetHealthCheck[]} checks
+       */

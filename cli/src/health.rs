@@ -58,6 +58,18 @@ pub struct CheckResult {
     /// error message).
     pub detail: String,
     pub section: &'static str,
+    /// RAL-416: the stable [`ralphus_core::health_catalog`] entry this
+    /// result belongs to (e.g. `"git"`, `"project-path"`,
+    /// `"remote-ssh-reachable"`) -- distinct from `name`, which is a
+    /// free-form, sometimes per-instance display identifier (`"project:foo"`,
+    /// a fork's own name). Set via [`CheckResult::with_id`] at the point
+    /// each check is assembled into [`run_checks`]'s final list, so a
+    /// result can always be joined back to its catalog entry (applicability/
+    /// cost tier/requirement level) regardless of how its `name` varies.
+    /// Empty for a handful of defensive/internal fallback paths that don't
+    /// correspond to a normal catalog entry (e.g. a target-check thread
+    /// panic) -- see this module's own parity tests.
+    pub id: String,
     /// What's at stake if this check's status isn't a clean `pass` --
     /// always populated (including for a `pass`), so a reader never has to
     /// guess why a check exists.
@@ -86,6 +98,7 @@ impl CheckResult {
             status,
             detail: detail.into(),
             section,
+            id: String::new(),
             impact: impact.into(),
             remediation: remediation.into(),
             provenance: None,
@@ -125,6 +138,14 @@ impl CheckResult {
     #[must_use]
     fn with_provenance(mut self, provenance: impl Into<String>) -> Self {
         self.provenance = Some(provenance.into());
+        self
+    }
+
+    /// Tags this result with its stable [`ralphus_core::health_catalog`]
+    /// entry id -- see the field doc comment on [`CheckResult::id`].
+    #[must_use]
+    fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
         self
     }
 
@@ -463,13 +484,15 @@ fn check_projects(daemon_url: &str) -> ProjectsSummary {
                 return Vec::new();
             };
             let vcs = p["vcs"].as_str().unwrap_or("git");
-            let mut results = vec![check_project_path(name, path, vcs)];
+            let mut results = vec![
+                check_project_path(name, path, vcs)
+                    .with_id(ralphus_core::health_catalog::ID_PROJECT_PATH),
+            ];
             if vcs == "git" {
-                results.extend(check_project_clone_url(
-                    name,
-                    p["clone_url"].as_str(),
-                    has_remote_providers,
-                ));
+                results.extend(
+                    check_project_clone_url(name, p["clone_url"].as_str(), has_remote_providers)
+                        .map(|r| r.with_id(ralphus_core::health_catalog::ID_PROJECT_CLONE_URL)),
+                );
             }
             results
         })
@@ -1215,29 +1238,42 @@ fn check_templates_for(
             }
         }
     }
+    let mut results: Vec<CheckResult> = results
+        .into_iter()
+        .map(|r| r.with_id(ralphus_core::health_catalog::ID_TEMPLATES))
+        .collect();
     match &ui.new_task_default_tab {
-        None => results.push(CheckResult::new(
-            "new-task-default-tab",
-            PASS,
-            "not set (defaults to 'simple')",
-            "The Simple task form opens on the 'simple' tab by default.",
-            "No action needed.",
-        )),
-        Some(tab) => match ralphus_daemon::config::validate_new_task_default_tab(tab) {
-            Ok(()) => results.push(CheckResult::new(
+        None => results.push(
+            CheckResult::new(
                 "new-task-default-tab",
                 PASS,
-                tab.clone(),
-                "The Simple task form opens on this tab by default.",
+                "not set (defaults to 'simple')",
+                "The Simple task form opens on the 'simple' tab by default.",
                 "No action needed.",
-            )),
-            Err(e) => results.push(CheckResult::new(
-                "new-task-default-tab",
-                FAIL,
-                e,
-                "[ui].new_task_default_tab names an unknown tab; the New Task form's default-tab setting is broken.",
-                "Set [ui].new_task_default_tab to a known tab name.",
-            )),
+            )
+            .with_id(ralphus_core::health_catalog::ID_NEW_TASK_DEFAULT_TAB),
+        ),
+        Some(tab) => match ralphus_daemon::config::validate_new_task_default_tab(tab) {
+            Ok(()) => results.push(
+                CheckResult::new(
+                    "new-task-default-tab",
+                    PASS,
+                    tab.clone(),
+                    "The Simple task form opens on this tab by default.",
+                    "No action needed.",
+                )
+                .with_id(ralphus_core::health_catalog::ID_NEW_TASK_DEFAULT_TAB),
+            ),
+            Err(e) => results.push(
+                CheckResult::new(
+                    "new-task-default-tab",
+                    FAIL,
+                    e,
+                    "[ui].new_task_default_tab names an unknown tab; the New Task form's default-tab setting is broken.",
+                    "Set [ui].new_task_default_tab to a known tab name.",
+                )
+                .with_id(ralphus_core::health_catalog::ID_NEW_TASK_DEFAULT_TAB),
+            ),
         },
     }
     results
@@ -1445,16 +1481,41 @@ fn check_remote_targets(daemon_url: &str) -> Vec<CheckResult> {
                         Some("warn") => WARN,
                         _ => FAIL,
                     };
+                    let check_name = c["name"].as_str().unwrap_or("?");
                     CheckResult::machine(
-                        &format!("{target_name}:{}", c["name"].as_str().unwrap_or("?")),
+                        &format!("{target_name}:{check_name}"),
                         status,
                         format!("[{machine}] {}", c["detail"].as_str().unwrap_or_default()),
                         "A broken remote target fails any cell routed to it.",
                         "See the detail above and this target's machine-provider configuration.",
                     )
+                    .with_id(remote_target_catalog_id(check_name))
                 })
         })
         .collect()
+}
+
+/// Maps a daemon-reported remote-target sub-check name
+/// (`daemon::health_targets::TargetCheck::name`) to its stable
+/// [`ralphus_core::health_catalog`] entry id. `"panic"` (the defensive
+/// fallback `daemon::health_targets::check_targets` reports if a check
+/// thread itself panics) is treated as the same connectivity-class failure
+/// as an unreachable SSH connection, since neither tells you anything more
+/// specific than "this target could not be checked."
+fn remote_target_catalog_id(check_name: &str) -> &'static str {
+    use ralphus_core::health_catalog::*;
+    match check_name {
+        "resolve" => ID_REMOTE_RESOLVE,
+        "ssh_reachable" | "panic" => ID_REMOTE_SSH_REACHABLE,
+        "capabilities" => ID_REMOTE_CAPABILITIES,
+        "remote_root" => ID_REMOTE_ROOT,
+        "git_version" => ID_REMOTE_GIT_VERSION,
+        "git_user.name" => ID_REMOTE_GIT_IDENTITY_NAME,
+        "git_user.email" => ID_REMOTE_GIT_IDENTITY_EMAIL,
+        "push_credentials" => ID_REMOTE_PUSH_CREDENTIALS,
+        "runner" => ID_REMOTE_RUNNER,
+        _ => "",
+    }
 }
 
 /// Runs the core health checks; adds the developer/machine-toolchain check
@@ -1470,53 +1531,62 @@ pub fn run_checks(
     enable_remote_checks: bool,
     enable_live_agent_checks: bool,
 ) -> Vec<CheckResult> {
-    let mut results = check_daemon(daemon_url);
-    results.push(check_config_sources_cli(cwd));
-    results.push(check_config_sources_project(cwd));
+    use ralphus_core::health_catalog::*;
+
+    let mut results: Vec<CheckResult> = check_daemon(daemon_url)
+        .into_iter()
+        .map(|r| r.with_id(ID_DAEMON))
+        .collect();
+    results.push(check_config_sources_cli(cwd).with_id(ID_CONFIG_SOURCES));
+    results.push(check_config_sources_project(cwd).with_id(ID_CONFIG_SOURCES_PROJECT));
 
     let projects = check_projects(daemon_url);
     let git_required = !projects.any_project_registered || projects.any_git_project;
-    results.push(check_git(git_required));
+    results.push(check_git(git_required).with_id(ID_GIT));
     results.extend(projects.results);
-    results.extend(check_project_forks(daemon_url));
+    results.extend(
+        check_project_forks(daemon_url)
+            .into_iter()
+            .map(|r| r.with_id(ID_PROJECT_FORK)),
+    );
 
-    results.push(check_runner());
-    results.push(check_ollama());
-    results.push(check_tmux());
-    results.push(check_gh());
-    results.push(check_glab());
-    results.push(check_agent_command(
-        "claude-command",
-        "RALPHUS_CLAUDE_COMMAND",
-        "claude",
-    ));
-    results.push(check_agent_command(
-        "codex-command",
-        "RALPHUS_CODEX_COMMAND",
-        "codex",
-    ));
-    results.push(check_agent_command(
-        "pi-command",
-        "RALPHUS_PI_COMMAND",
-        "pi",
-    ));
+    results.push(check_runner().with_id(ID_RUNNER));
+    results.push(check_ollama().with_id(ID_OLLAMA));
+    results.push(check_tmux().with_id(ID_TMUX));
+    results.push(check_gh().with_id(ID_GH));
+    results.push(check_glab().with_id(ID_GLAB));
+    results.push(
+        check_agent_command("claude-command", "RALPHUS_CLAUDE_COMMAND", "claude")
+            .with_id(ID_CLAUDE_COMMAND),
+    );
+    results.push(
+        check_agent_command("codex-command", "RALPHUS_CODEX_COMMAND", "codex")
+            .with_id(ID_CODEX_COMMAND),
+    );
+    results
+        .push(check_agent_command("pi-command", "RALPHUS_PI_COMMAND", "pi").with_id(ID_PI_COMMAND));
 
-    results.push(check_config(cwd));
-    results.push(check_max_concurrent(cwd));
-    results.push(check_tool_arg_truncate_chars(cwd));
-    results.push(check_thrash_max_compactions(cwd));
-    results.push(check_thrash_min_turn_gap(cwd));
-    results.push(check_pull_request_branch_convention(cwd));
+    results.push(check_config(cwd).with_id(ID_CONFIG));
+    results.push(check_max_concurrent(cwd).with_id(ID_DAEMON_MAX_CONCURRENT));
+    results.push(check_tool_arg_truncate_chars(cwd).with_id(ID_TOOL_ARG_TRUNCATE_CHARS));
+    results.push(check_thrash_max_compactions(cwd).with_id(ID_THRASH_MAX_COMPACTIONS));
+    results.push(check_thrash_min_turn_gap(cwd).with_id(ID_THRASH_MIN_TURN_GAP));
+    results
+        .push(check_pull_request_branch_convention(cwd).with_id(ID_PULL_REQUEST_BRANCH_CONVENTION));
     results.extend(check_templates());
-    results.extend(check_agent_profiles(daemon_url, cwd));
-    results.push(check_default_resolver_agent(daemon_url, cwd));
+    results.extend(
+        check_agent_profiles(daemon_url, cwd)
+            .into_iter()
+            .map(|r| r.with_id(ID_AGENT_PROFILES)),
+    );
+    results.push(check_default_resolver_agent(daemon_url, cwd).with_id(ID_DEFAULT_RESOLVER_AGENT));
     if enable_live_agent_checks {
-        results.push(check_arbiter(daemon_url));
+        results.push(check_arbiter(daemon_url).with_id(ID_ARBITER));
     }
 
-    results.push(check_nvidia_smi());
+    results.push(check_nvidia_smi().with_id(ID_NVIDIA_SMI));
     if enable_developer_checks {
-        results.push(check_cargo());
+        results.push(check_cargo().with_id(ID_CARGO));
     }
     if enable_remote_checks {
         results.extend(check_remote_targets(daemon_url));
