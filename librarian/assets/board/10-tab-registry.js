@@ -986,6 +986,33 @@
         return acc;
       }
       /**
+       * Folds a squad's own pre-work generation cost (RAL-420) into the
+       * group-by-squad aggregate exactly once per squad, on top of
+       * {@link ttGroupAggregate}: pre-work generation calls are squad-owned
+       * (the Simple form's Generate buttons + the suggest-name fallback ran
+       * before any task/cell/proof row existed, so their usage never appears
+       * in a task row) -- this is the only place those figures enter a squad's
+       * normal totals. Mirrors `ttUsageOf`'s `anyCost` semantics: only a
+       * nonzero reported dollar figure renders as cost, and a `~` prefix once
+       * any contributing figure is a mid-run estimate. `generation` is the
+       * SquadView's `generation_cost` object, or null/undefined for a squad
+       * with none (the common case).
+       * @param {TtRow[]} rows
+       * @param {{count: number, tokens_in: number, tokens_out: number, cache_creation_tokens: number, cache_read_tokens: number, cost_usd: number, estimated: boolean}|null|undefined} generation
+       * @returns {TtUsage}
+       */
+      function ttGroupAggregateWithGeneration(rows, generation) {
+        const acc = ttGroupAggregate(rows);
+        if (!generation) return acc;
+        acc.tokensIn += generation.tokens_in || 0;
+        acc.tokensOut += generation.tokens_out || 0;
+        acc.cacheCreate += generation.cache_creation_tokens || 0;
+        acc.cacheRead += generation.cache_read_tokens || 0;
+        if (generation.cost_usd) { acc.cost += generation.cost_usd; acc.anyCost = true; }
+        if (generation.estimated) acc.estimated = true;
+        return acc;
+      }
+      /**
        * Computes the visible window for a virtualized list (RAL-362 §2): the
        * first/last indices to actually render, with a small overscan on each
        * side so fast scrolling doesn't flash empty rows.

@@ -538,6 +538,60 @@ pub struct EventView {
     pub at_ms: i64,
 }
 
+/// One persisted pre-work generation call (RAL-420) — the full audit shape
+/// of a retained cost row. Rows exist from the moment the call finishes
+/// (whether it succeeded, failed, or was cancelled), with `squad_id` filled
+/// in only once the call is attributed to a submitted squad.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationCostView {
+    /// Stable database row id.
+    pub id: i64,
+    /// The client-visible generation job id (`gen-…`), or the server-minted
+    /// id used by a call that never had one (the post-submit `suggest-name`
+    /// job). The Simple form echoes these ids back in a submit request's
+    /// `generation_ids` so the daemon can attribute them (`POST /api/squads`).
+    pub job_id: String,
+    /// `Some` once this call has been attributed to a submitted squad;
+    /// `None` for a retained call whose squad was never submitted.
+    pub squad_id: Option<String>,
+    /// `"proof_steps"`, `"manual_checks"`, `"auto_build_steps"`, or `"task_name"`.
+    pub kind: String,
+    /// `"done"`, `"error"`, or `"cancelled"`.
+    pub status: String,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+    /// RAL-326: `true` when the figures are a live mid-run snapshot (the call
+    /// was killed/cancelled/sat before a terminal usage event) rather than the
+    /// backend's own final accounting.
+    pub cost_is_estimated: bool,
+    /// The underlying runner failure detail, when the call did not succeed.
+    pub error: Option<String>,
+    pub agent: String,
+    pub model: Option<String>,
+    pub created_at_ms: i64,
+    pub finished_at_ms: i64,
+    /// When the call was attributed to a squad (or `None` if never).
+    pub attributed_at_ms: Option<i64>,
+}
+
+/// The squad-level aggregate of its attributed generation calls (RAL-420) —
+/// what a squad's normal totals fold in exactly once. Values are sums across
+/// every attributed row; `estimated` is `true` when any row's figures are a
+/// live snapshot rather than final accounting.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GenerationUsage {
+    pub count: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+    pub estimated: bool,
+}
+
 /// A squad (submission) as shown in the board.
 #[derive(Debug, Clone, Serialize)]
 pub struct SquadView {
@@ -573,6 +627,13 @@ pub struct SquadView {
     /// Empty for the vast majority of squads (no overrides ever set).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
+    /// RAL-420: this squad's own pre-work generation cost — a distinct,
+    /// squad-owned category included exactly once in normal squad totals.
+    /// `None` when the squad incurred none (the vast majority of squads;
+    /// only Simple-tab submissions that used the Generate buttons or the
+    /// post-submit `suggest-name` fallback have rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_cost: Option<GenerationUsage>,
 }
 
 /// A node in the cross-squad `[[default]] depends_on` gating graph
@@ -1860,6 +1921,43 @@ impl Store {
                 cost_usd      REAL NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL
             );
+            -- RAL-420: durable ledger for every pre-work generation agent/
+            -- model call (the Simple form's \"Generate Proof Steps\"/\"Generate
+            -- Manual Checks\"/\"Generate Auto-Build Steps\" buttons plus the
+            -- RAL-398 `suggest-name` fallback): the usage the call reported,
+            -- retained even when the call failed or was cancelled, so a
+            -- cancelled New Task modal never silently discards spend it
+            -- already incurred. A row is attributed to a squad -- `squad_id`
+            -- set -- once the squad that call was made for is actually
+            -- submitted; rows whose squad never materializes stay behind with
+            -- `squad_id` NULL, retained for audit without ever inflating any
+            -- squad's totals (see `attribute_generation_costs`). Deliberately
+            -- NOT the daemon-global Arbiter ledger (`arbiter_costs`, which
+            -- owns the Arbiter's own classification/health_check spend for
+            -- the `[arbiter] maximum_budget_usd` cap) and NOT `guardian_costs`
+            -- (review-owned resolver/proof spend) -- generation cost is a
+            -- distinct, squad-owned category.
+            CREATE TABLE IF NOT EXISTS squad_generation_costs (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id                TEXT NOT NULL UNIQUE,
+                squad_id              TEXT REFERENCES squads(id) ON DELETE CASCADE,
+                kind                  TEXT NOT NULL,
+                status                TEXT NOT NULL,
+                tokens_in             INTEGER NOT NULL DEFAULT 0,
+                tokens_out            INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                cost_usd              REAL NOT NULL DEFAULT 0,
+                cost_is_estimated     INTEGER NOT NULL DEFAULT 0,
+                error                 TEXT,
+                agent                 TEXT NOT NULL,
+                model                 TEXT,
+                created_at_ms         INTEGER NOT NULL,
+                finished_at_ms        INTEGER NOT NULL,
+                attributed_at_ms      INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_squad_generation_costs_squad
+                ON squad_generation_costs(squad_id);
             -- RAL-337: which squad owns a task worktree branch. A
             -- `ralphus:new-worktree/<base_branch>` placeholder is resolved
             -- against this table so a *new* squad gets its own branch
@@ -4022,6 +4120,7 @@ impl Store {
         }
 
         let reviews = self.reviews_for_squad(&id)?;
+        let generation_cost = self.squad_generation_usage(&id)?;
         let state = effective_squad_state(&self.conn, state, &id)?;
         Ok(SquadView {
             id,
@@ -4033,6 +4132,217 @@ impl Store {
             tasks,
             reviews,
             env_overrides,
+            generation_cost,
+        })
+    }
+
+    // ── RAL-420: pre-work generation cost ─────────────────────────────────
+
+    /// Persist one finished pre-work generation call's usage (RAL-420). Called
+    /// from the background thread that ran the call, so the usage survives a
+    /// daemon restart regardless of whether the call was ever attributed to a
+    /// squad, and regardless of whether the call itself succeeded: a failed or
+    /// cancelled call still records whatever tokens/cost the runner captured
+    /// (`cost_is_estimated` marking a live-snapshot figure). `squad_id` is
+    /// `None` for a pre-submit job (the Simple form's Generate buttons — the
+    /// owning squad does not exist yet; `attribute_generation_costs` fills it
+    /// in at submit) and `Some` for a call whose squad was already known up
+    /// front (the post-submit `suggest-name` fallback), which is attributed
+    /// immediately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_generation_cost(
+        &self,
+        squad_id: Option<&str>,
+        job_id: &str,
+        kind: &str,
+        status: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
+        cost_usd: f64,
+        cost_is_estimated: bool,
+        error: Option<&str>,
+        agent: &str,
+        model: Option<&str>,
+        created_at_ms: i64,
+        finished_at_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO squad_generation_costs \
+             (job_id, squad_id, kind, status, tokens_in, tokens_out, \
+              cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
+              error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                job_id,
+                squad_id,
+                kind,
+                status,
+                tokens_in,
+                tokens_out,
+                cache_creation_tokens,
+                cache_read_tokens,
+                cost_usd,
+                cost_is_estimated,
+                error,
+                agent,
+                model,
+                created_at_ms,
+                finished_at_ms,
+                if squad_id.is_some() {
+                    Some(finished_at_ms)
+                } else {
+                    None
+                },
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Attribute previously-retained generation rows to a squad (RAL-420),
+    /// called once a submit request referencing those jobs' ids succeeds. Only
+    /// rows not yet attributed are touched — a job id that was already claimed
+    /// by an earlier squad (or that names a row that never existed, e.g. a job
+    /// whose persistence was lost when the daemon died mid-run) is skipped, and
+    /// the count reflects only rows newly claimed here. Returns the number of
+    /// rows attributed; the caller logs `0` distinctly so a submit that echoed
+    /// ids the daemon knows nothing about is audible.
+    pub fn attribute_generation_costs(&self, squad_id: &str, job_ids: &[String]) -> Result<usize> {
+        if job_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; job_ids.len()].join(",");
+        let sql = format!(
+            "UPDATE squad_generation_costs SET squad_id=?, attributed_at_ms=? \
+             WHERE squad_id IS NULL AND job_id IN ({placeholders})"
+        );
+        let attributed_at = now_ms();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![
+            &squad_id as &dyn rusqlite::ToSql,
+            &attributed_at as &dyn rusqlite::ToSql,
+        ];
+        for id in job_ids {
+            bound.push(id as &dyn rusqlite::ToSql);
+        }
+        let n = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(bound.iter()))?;
+        Ok(n)
+    }
+
+    /// One squad's attributed generation rows (RAL-420), newest first — the
+    /// per-squad "detail" half of the audit surface (`GET /api/squads/{id}/generation-costs`).
+    pub fn squad_generation_costs(&self, squad_id: &str) -> Result<Vec<GenerationCostView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, job_id, squad_id, kind, status, tokens_in, tokens_out, \
+                    cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
+                    error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms \
+             FROM squad_generation_costs WHERE squad_id=? \
+             ORDER BY finished_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok(GenerationCostView {
+                    id: r.get::<_, i64>(0)?,
+                    job_id: r.get::<_, String>(1)?,
+                    squad_id: r.get::<_, Option<String>>(2)?,
+                    kind: r.get::<_, String>(3)?,
+                    status: r.get::<_, String>(4)?,
+                    tokens_in: r.get::<_, i64>(5)?,
+                    tokens_out: r.get::<_, i64>(6)?,
+                    cache_creation_tokens: r.get::<_, i64>(7)?,
+                    cache_read_tokens: r.get::<_, i64>(8)?,
+                    cost_usd: r.get::<_, f64>(9)?,
+                    cost_is_estimated: r.get::<_, bool>(10)?,
+                    error: r.get::<_, Option<String>>(11)?,
+                    agent: r.get::<_, String>(12)?,
+                    model: r.get::<_, Option<String>>(13)?,
+                    created_at_ms: r.get::<_, i64>(14)?,
+                    finished_at_ms: r.get::<_, i64>(15)?,
+                    attributed_at_ms: r.get::<_, Option<i64>>(16)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every persisted generation row, attributed or not (RAL-420), newest
+    /// first — the cross-squad "audit" half of the surface
+    /// (`GET /api/generation-costs`): retained-but-never-attributed rows
+    /// (a cancelled New Task modal, a job whose squad was never submitted)
+    /// are visible here and only here.
+    pub fn list_generation_costs(&self) -> Result<Vec<GenerationCostView>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, job_id, squad_id, kind, status, tokens_in, tokens_out, \
+                    cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
+                    error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms \
+             FROM squad_generation_costs \
+             ORDER BY finished_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(GenerationCostView {
+                    id: r.get::<_, i64>(0)?,
+                    job_id: r.get::<_, String>(1)?,
+                    squad_id: r.get::<_, Option<String>>(2)?,
+                    kind: r.get::<_, String>(3)?,
+                    status: r.get::<_, String>(4)?,
+                    tokens_in: r.get::<_, i64>(5)?,
+                    tokens_out: r.get::<_, i64>(6)?,
+                    cache_creation_tokens: r.get::<_, i64>(7)?,
+                    cache_read_tokens: r.get::<_, i64>(8)?,
+                    cost_usd: r.get::<_, f64>(9)?,
+                    cost_is_estimated: r.get::<_, bool>(10)?,
+                    error: r.get::<_, Option<String>>(11)?,
+                    agent: r.get::<_, String>(12)?,
+                    model: r.get::<_, Option<String>>(13)?,
+                    created_at_ms: r.get::<_, i64>(14)?,
+                    finished_at_ms: r.get::<_, i64>(15)?,
+                    attributed_at_ms: r.get::<_, Option<i64>>(16)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The squad-level aggregate of its attributed generation rows (RAL-420):
+    /// what a squad's normal totals fold in exactly once. `None` when the
+    /// squad has none — its totals must not show a bogus "$0.00 generation"
+    /// line. Sums, not averages; `estimated` is `true` when any constituent
+    /// row's figures are a live snapshot.
+    pub fn squad_generation_usage(&self, squad_id: &str) -> Result<Option<GenerationUsage>> {
+        let row = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), \
+                    COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
+                    COALESCE(SUM(cost_usd),0), COALESCE(MAX(cost_is_estimated),0) \
+             FROM squad_generation_costs WHERE squad_id=?",
+            params![squad_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, f64>(5)?,
+                    r.get::<_, bool>(6)?,
+                ))
+            },
+        )?;
+        let (count, tokens_in, tokens_out, cache_creation, cache_read, cost, estimated) = row;
+        Ok(if count == 0 {
+            None
+        } else {
+            Some(GenerationUsage {
+                count,
+                tokens_in,
+                tokens_out,
+                cache_creation_tokens: cache_creation,
+                cache_read_tokens: cache_read,
+                cost_usd: cost,
+                estimated,
+            })
         })
     }
 
@@ -14447,5 +14757,241 @@ prompt = "do b"
             .unwrap();
         store.rename_task(&id, 0, "build").unwrap();
         assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "build");
+    }
+
+    // ── RAL-420: pre-work generation cost ─────────────────────────────────┐
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_gen(
+        store: &Store,
+        squad_id: Option<&str>,
+        job_id: &str,
+        kind: &str,
+        status: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        cost_usd: f64,
+        estimated: bool,
+    ) {
+        store
+            .record_generation_cost(
+                squad_id,
+                job_id,
+                kind,
+                status,
+                tokens_in,
+                tokens_out,
+                10,
+                20,
+                cost_usd,
+                estimated,
+                if status == "done" { None } else { Some("boom") },
+                "claude-code",
+                Some("sonnet"),
+                1_000,
+                2_000,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn generation_cost_rows_are_retained_unattributed_and_auditable() {
+        let mut store = Store::open_in_memory().unwrap();
+        // A pre-submit job (Simple form's Generate button) and a cancelled
+        // job whose modal was closed before any submit both land with
+        // `squad_id` NULL -- retained for audit, never inflating any squad's
+        // totals until attributed.
+        record_gen(
+            &store,
+            None,
+            "gen-a",
+            "proof_steps",
+            "done",
+            100,
+            50,
+            0.02,
+            false,
+        );
+        record_gen(
+            &store,
+            None,
+            "gen-b",
+            "manual_checks",
+            "cancelled",
+            0,
+            0,
+            0.0,
+            true,
+        );
+        let all = store.list_generation_costs().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|c| c.squad_id.is_none()));
+        assert_eq!(all[0].job_id, "gen-b"); // newest-first (finished_at_ms DESC)
+        assert_eq!(all[0].status, "cancelled");
+        assert!(all[0].cost_is_estimated);
+        assert_eq!(all[0].error.as_deref(), Some("boom"));
+        // A real squad with no attributed rows reports no generation cost at
+        // all (`None`), so its totals must not show a bogus "$0.00" line.
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert!(store.squad_generation_usage(&id).unwrap().is_none());
+        assert!(store.squad_generation_costs(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn generation_cost_attribution_claims_each_row_exactly_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        record_gen(
+            &store,
+            None,
+            "gen-a",
+            "proof_steps",
+            "done",
+            100,
+            50,
+            0.02,
+            false,
+        );
+        record_gen(
+            &store,
+            None,
+            "gen-b",
+            "manual_checks",
+            "error",
+            30,
+            10,
+            0.005,
+            true,
+        );
+        // An id the daemon knows nothing about (its background thread died
+        // mid-run / persistence lost to a restart) is skipped, not fatal.
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let echo = vec![
+            "gen-a".to_string(),
+            "gen-b".to_string(),
+            "gen-ghost".to_string(),
+        ];
+        let n = store.attribute_generation_costs(&id, &echo).unwrap();
+        assert_eq!(n, 2);
+        let rows = store.squad_generation_costs(&id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|c| c.squad_id.is_some()));
+        assert!(rows.iter().all(|c| c.attributed_at_ms.is_some()));
+        // Attribution is one-way: a second call (retry, resubmit echo) claims
+        // nothing new, and the rows stay on the first squad.
+        let other = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        assert_eq!(
+            store
+                .attribute_generation_costs(&other, &["gen-a".to_string()])
+                .unwrap(),
+            0
+        );
+        assert!(store.squad_generation_costs(&other).unwrap().is_empty());
+        assert_eq!(store.squad_generation_costs(&id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn generation_cost_squad_totals_sum_mixed_statuses_exactly_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        record_gen(
+            &store,
+            None,
+            "gen-a",
+            "proof_steps",
+            "done",
+            100,
+            50,
+            0.02,
+            false,
+        );
+        record_gen(
+            &store,
+            None,
+            "gen-b",
+            "manual_checks",
+            "cancelled",
+            7,
+            3,
+            0.0,
+            true,
+        );
+        record_gen(
+            &store,
+            None,
+            "gen-c",
+            "auto_build_steps",
+            "error",
+            30,
+            10,
+            0.005,
+            false,
+        );
+        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+        let echo = vec![
+            "gen-a".to_string(),
+            "gen-b".to_string(),
+            "gen-c".to_string(),
+        ];
+        store.attribute_generation_costs(&id, &echo).unwrap();
+        let usage = store.squad_generation_usage(&id).unwrap().unwrap();
+        // Every retained row counts once -- done, cancelled, and error alike --
+        // sums over tokens/cost, with `estimated` true because the cancelled
+        // call's figures were a live snapshot.
+        assert_eq!(usage.count, 3);
+        assert_eq!(usage.tokens_in, 137);
+        assert_eq!(usage.tokens_out, 63);
+        assert_eq!(usage.cache_creation_tokens, 30);
+        assert_eq!(usage.cache_read_tokens, 60);
+        assert!((usage.cost_usd - 0.025).abs() < 1e-9);
+        assert!(usage.estimated);
+        // The same squad's view exposes the aggregate, and it is *not* folded
+        // into any cell/proof row (generation calls never became cells), so a
+        // consumer has exactly one place to add it.
+        let view = store.get_squad(&id).unwrap();
+        assert_eq!(view.generation_cost.map(|g| g.count), Some(3));
+        assert!(
+            view.tasks
+                .iter()
+                .all(|t| t.cells.iter().all(|c| c.cost_usd == 0.0))
+        );
+    }
+
+    #[test]
+    fn generation_cost_rows_survive_a_store_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-store-gen-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ralphus.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            record_gen(
+                &store,
+                None,
+                "gen-a",
+                "proof_steps",
+                "done",
+                100,
+                50,
+                0.02,
+                false,
+            );
+            let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
+            assert_eq!(
+                store
+                    .attribute_generation_costs(&id, &["gen-a".to_string()])
+                    .unwrap(),
+                1
+            );
+        }
+        // A fresh Store over the same file -- the daemon-restart shape -- must
+        // see the retained rows and their attribution.
+        let store = Store::open(&path).unwrap();
+        let all = store.list_generation_costs().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].squad_id.is_some());
+        let squads = store.list_squads().unwrap();
+        assert_eq!(squads.len(), 1);
+        assert_eq!(squads[0].generation_cost.as_ref().map(|g| g.count), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

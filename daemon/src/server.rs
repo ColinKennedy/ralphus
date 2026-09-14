@@ -368,6 +368,19 @@ struct SubmitBody {
     hold: bool,
     #[serde(default)]
     label: Option<String>,
+    /// RAL-420: the job ids of every pre-work generation call the submitting
+    /// board ran for this squad (the Simple form's Generate buttons — each
+    /// `POST /api/generate` response's `gen-…` id, retained client-side even
+    /// after the job finished, done, failed, or cancelled). The daemon
+    /// retained those calls' usage in `squad_generation_costs` with `squad_id`
+    /// NULL; this submit claims exactly those rows for the squad it just
+    /// created (`attribute_generation_costs`). Jobs whose rows the daemon no
+    /// longer knows (e.g. lost to a daemon restart mid-run) are skipped, and
+    /// the caller surfaces a distinct "attributed 0" log. The post-submit
+    /// `suggest-name` fallback never appears here — its row is attributed by
+    /// the suggest-name handler itself.
+    #[serde(default)]
+    generation_ids: Vec<String>,
 }
 
 fn default_vcs() -> String {
@@ -1118,6 +1131,11 @@ fn route_for_user(
         ("GET", ["api", "graph"]) => global_graph(daemon, query),
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
+        // RAL-420: pre-work generation cost — per-squad detail + cross-squad audit.
+        ("GET", ["api", "squads", id, "generation-costs"]) => {
+            squad_generation_cost_rows(daemon, id)
+        }
+        ("GET", ["api", "generation-costs"]) => generation_costs_audit(daemon),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
@@ -4323,6 +4341,107 @@ struct GenerateStartResponse {
     id: String,
 }
 
+/// RAL-420: derive the retained-cost-row status for a finished generation
+/// job: `"done"` when the job produced its items (a cancel that landed after
+/// the work already finished still counts as done -- the spend bought a
+/// usable result), `"cancelled"` when the caller's cancel token was tripped,
+/// and `"error"` otherwise (a call that completed or died without a usable
+/// result -- its runner-captured tokens/cost are still retained for audit).
+#[must_use]
+fn generation_call_status(
+    job: &crate::generation::GenerationJob,
+    cancel: &crate::cancel::CancelToken,
+) -> &'static str {
+    match job {
+        crate::generation::GenerationJob::Done { .. } => "done",
+        _ if cancel.is_cancelled() => "cancelled",
+        _ => "error",
+    }
+}
+
+/// RAL-420: persist one finished pre-work generation call's usage (the
+/// Simple form's Generate buttons, or the post-submit `suggest-name`
+/// fallback) into `squad_generation_costs` and log it (rlog + a Cartographer
+/// note) -- the retention half of "account for squad generation cost".
+/// `squad_id` is `None` for a pre-submit job (the owning squad does not
+/// exist yet; `submit`'s `attribute_generation_costs` fills it in at
+/// submission) and `Some(squad)` for a call whose squad was already known up
+/// front (the RAL-398 `suggest-name` fallback), which is attributed
+/// immediately. The runner's captured usage -- including the last live
+/// snapshot of a killed/cancelled/failed call (`cost_is_estimated`) -- is
+/// retained exactly as reported, whatever the outcome: a failed or cancelled
+/// job is still an audit event and still spent tokens, so a cancelled New
+/// Task modal never silently discards spend it already incurred.
+#[allow(clippy::too_many_arguments)]
+fn record_generation_call_cost(
+    store: &StoreHandle,
+    squad_id: Option<&str>,
+    job_id: &str,
+    kind: &str,
+    status: &str,
+    result: &crate::runner::RunnerResult,
+    agent: &str,
+    model: Option<&str>,
+    started_at_ms: i64,
+) {
+    let guard = store.lock();
+    let finished_at_ms = crate::store::now_ms();
+    let _ = guard.record_generation_cost(
+        squad_id,
+        job_id,
+        kind,
+        status,
+        result.tokens_in,
+        result.tokens_out,
+        result.cache_creation_tokens,
+        result.cache_read_tokens,
+        result.cost_usd,
+        result.cost_is_estimated,
+        result.error.as_deref(),
+        agent,
+        model,
+        started_at_ms,
+        finished_at_ms,
+    );
+    let level = if status == "done" {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    let squad_tag = squad_id.unwrap_or("pre-submit");
+    let log_line = format!(
+        "ralphus [generation] squad={squad_tag} job={job_id} kind={kind} status={status} \
+         in={} out={} cost=${:.6} estimated={}",
+        result.tokens_in, result.tokens_out, result.cost_usd, result.cost_is_estimated,
+    );
+    match status {
+        "done" => crate::rlog!(INFO, "{}", log_line),
+        _ => crate::rlog!(WARNING, "{}", log_line),
+    }
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level,
+        source: "generation",
+        message: "generation cost recorded",
+        scope: squad_id.map(|_| "squad"),
+        squad_id,
+        guardian_id: None,
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({
+            "job_id": job_id,
+            "kind": kind,
+            "status": status,
+            "squad_id": squad_tag,
+            "tokens_in": result.tokens_in,
+            "tokens_out": result.tokens_out,
+            "cost_usd": result.cost_usd,
+            "cost_is_estimated": result.cost_is_estimated,
+        }),
+        admin_only: false,
+    });
+}
+
 /// `POST /api/generate` (RAL-297): kicks off one "generation step" (Simple
 /// form's opt-in "Generate Proofs"/"Generate Manual Checks"/"Generate
 /// Auto-Build Steps") on a background thread and returns `202` immediately
@@ -4333,6 +4452,10 @@ struct GenerateStartResponse {
 /// `Cancellations` registry -- the same one `crate::scheduler` registers a
 /// squad's cells under -- for the lifetime of the background thread, so
 /// cancelling a generation job really does kill its agent subprocess.
+/// RAL-420: the same thread persists the call's usage to
+/// `squad_generation_costs` (unattributed -- `squad_id` NULL) and logs it,
+/// so a cancelled or failed call's cost survives even though the owning
+/// squad may never be submitted.
 fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     let req: crate::generation::GenerateRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -4355,14 +4478,30 @@ fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     }
     let id = daemon.generation_jobs.start();
     let jobs = daemon.generation_jobs.clone();
+    let store = daemon.store_handle();
     let job_id = id.clone();
+    let kind = req.kind.clone();
+    let agent = req.agent.clone();
+    let model = req.model.clone();
     let cancellations = daemon.cancellations_handle();
     let cancel_id = id.clone();
     std::thread::spawn(move || {
         let token = cancellations.register(&cancel_id);
-        let result = crate::generation::run_generation(&req, &token);
+        let started_at_ms = crate::store::now_ms();
+        let (job, usage_result) = crate::generation::run_generation(&req, &token);
         cancellations.remove(&cancel_id);
-        jobs.finish(&job_id, result);
+        jobs.finish(&job_id, job.clone());
+        record_generation_call_cost(
+            &store,
+            None,
+            &job_id,
+            &kind,
+            generation_call_status(&job, &token),
+            &usage_result,
+            &agent,
+            model.as_deref(),
+            started_at_ms,
+        );
     });
     json(202, &GenerateStartResponse { id })
 }
@@ -4604,6 +4743,60 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         let _ = store.delete_squad(&squad_id);
         return error(400, "review_preflight_failed", &e.message, vec![]);
     }
+    // RAL-420: the squad is committed past this point (no more rollback
+    // paths delete it below), so now -- and only now -- is it safe to claim
+    // the retained pre-work generation rows this submit echoed. Unclaimed
+    // rows (a `gen-…` id the board sent but the daemon never persisted, e.g.
+    // a job whose background thread died before its write, or whose
+    // persistence was lost when the daemon restarted mid-run) are skipped;
+    // the count logged below makes a submit that echoed ids the daemon knows
+    // nothing about audible. Best-effort: a store error here must not fail
+    // the submit itself (the squad exists either way; the rows stay
+    // unclaimed, visible in the cross-squad audit surface), so the error is
+    // logged and swallowed.
+    let attributed = store
+        .attribute_generation_costs(&squad_id, &req.generation_ids)
+        .unwrap_or_else(|e| {
+            crate::rlog!(
+                WARNING,
+                "ralphus [generation] attribution failed squad={squad_id}: {e}"
+            );
+            0usize
+        });
+    if attributed == 0 && !req.generation_ids.is_empty() {
+        crate::rlog!(
+            WARNING,
+            "ralphus [generation] submit echoed {} generation id(s) but the daemon attributed none squad={squad_id}",
+            req.generation_ids.len()
+        );
+    } else if attributed > 0 {
+        crate::rlog!(
+            INFO,
+            "ralphus [generation] attributed {attributed} pre-work generation call(s) to squad={squad_id}"
+        );
+    }
+    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+        level: if attributed > 0 {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        },
+        source: "generation",
+        message: "generation costs attributed",
+        scope: Some("squad"),
+        squad_id: Some(&squad_id),
+        guardian_id: None,
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({
+            "squad_id": squad_id,
+            "attributed": attributed,
+            "echoed": req.generation_ids.len(),
+        }),
+        admin_only: false,
+    });
+
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
     // (a real, sometimes multi-second `git worktree add`, see
     // `worktrees::resolve_placeholders`'s doc comment) `derive_triage_pools`
@@ -4670,6 +4863,29 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
 fn get_squad(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().get_squad(id) {
         Ok(squad) => json(200, &squad),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/squads/{id}/generation-costs` (RAL-420): the per-squad "detail"
+/// half of the pre-work generation cost audit surface — every generation
+/// call attributed to this squad, newest first, each with its retained
+/// tokens/cost figures, outcome status, and timestamps.
+fn squad_generation_cost_rows(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.lock().squad_generation_costs(id) {
+        Ok(rows) => json(200, &rows),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/generation-costs` (RAL-420): the cross-squad "audit" half of
+/// the pre-work generation cost audit surface — every persisted generation
+/// call row, attributed or not, newest first. The retained-but-never-
+/// attributed rows (a cancelled New Task modal, a job whose squad was never
+/// submitted) are visible here and only here.
+fn generation_costs_audit(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_generation_costs() {
+        Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
 }
@@ -5682,9 +5898,24 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             model: req.model,
             prompt_context: req.prompt_context,
         };
-        let result = crate::generation::run_generation(&gen_req, &token);
+        let started_at_ms = crate::store::now_ms();
+        let (job, usage_result) = crate::generation::run_generation(&gen_req, &token);
         cancellations.remove(&cancel_id);
-        let (name, label) = match result {
+        // RAL-420: this call's squad is known up front, so the retained row
+        // is attributed immediately (unlike the Simple form's Generate
+        // buttons, whose rows `attribute_generation_costs` claims at submit).
+        record_generation_call_cost(
+            &store,
+            Some(&squad_id),
+            &cancel_id,
+            "task_name",
+            generation_call_status(&job, &token),
+            &usage_result,
+            &gen_req.agent,
+            gen_req.model.as_deref(),
+            started_at_ms,
+        );
+        let (name, label) = match job {
             crate::generation::GenerationJob::Done { items } if !items.is_empty() => {
                 let item = &items[0];
                 match crate::generation::slugify_task_name(&item.value) {
@@ -18178,6 +18409,167 @@ command = "true"
             "not json",
         );
         assert_eq!(r.status, 400);
+    }
+
+    // ── RAL-420: pre-work generation cost ─────────────────────────────────
+
+    /// Seed `record_generation_cost` rows the way `generate_start`'s
+    /// background thread does: unattributed (the owning squad has not been
+    /// submitted yet).
+    fn seed_retained_generation_rows(d: &Daemon, ids: &[(&str, &str, &str)]) {
+        let store = d.store_handle();
+        for (job_id, kind, status) in ids {
+            let (tokens_in, tokens_out, cost, estimated) = match *status {
+                "done" => (100i64, 50i64, 0.02, false),
+                "cancelled" => (7i64, 3i64, 0.0, true),
+                _ => (30i64, 10i64, 0.005, false),
+            };
+            let _ = store.lock().record_generation_cost(
+                None,
+                job_id,
+                kind,
+                status,
+                tokens_in,
+                tokens_out,
+                0,
+                0,
+                cost,
+                estimated,
+                if *status == "done" {
+                    None
+                } else {
+                    Some("boom")
+                },
+                "claude-code",
+                None,
+                1_000,
+                2_000,
+            );
+        }
+    }
+
+    #[test]
+    fn generation_cost_submit_attributes_retained_rows_and_logs() {
+        let d = daemon();
+        seed_retained_generation_rows(
+            &d,
+            &[
+                ("gen-a", "proof_steps", "done"),
+                ("gen-b", "manual_checks", "cancelled"),
+            ],
+        );
+        // The board echoes every job id it ever obtained, including ids the
+        // daemon no longer knows (lost to a restart mid-run / a background
+        // thread that died before its write) and the cancelled call.
+        let mut body = serde_json::json!({ "toml": GOOD });
+        body["generation_ids"] = serde_json::json!([
+            "gen-a".to_string(),
+            "gen-b".to_string(),
+            "gen-unknown".to_string(),
+        ]);
+        let r = route(&d, "POST", "/api/squads", &body.to_string());
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        // Per-squad detail: both retained rows are now this squad's.
+        let detail = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/generation-costs",
+            "",
+        );
+        assert_eq!(detail.status, 200);
+        assert!(
+            detail.body.contains("\"squad_id\":\"squad-000000000001\""),
+            "{}",
+            detail.body
+        );
+        assert!(detail.body.contains("\"gen-a\""));
+        assert!(detail.body.contains("\"gen-b\""));
+        assert!(detail.body.contains("\"status\":\"cancelled\""));
+        assert!(!detail.body.contains("gen-unknown"));
+
+        // The audit surface shows the same two rows (both now attributed).
+        let audit = route(&d, "GET", "/api/generation-costs", "");
+        assert_eq!(audit.status, 200);
+        assert!(audit.body.contains("\"gen-a\""));
+        assert!(audit.body.contains("\"gen-b\""));
+        assert!(!audit.body.contains("gen-unknown"));
+
+        // The squad's own totals fold the generation cost in exactly once
+        // (summed up in `SquadView.generation_cost`).
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        assert!(squad.body.contains("\"generation_cost\""), "{}", squad.body);
+        assert!(squad.body.contains("\"count\":2"));
+        assert!(squad.body.contains("\"estimated\":true"));
+
+        // Logging: the submit logged its attribution as a Cartographer row
+        // (source "generation"), carrying the echoed-vs-attributed split so
+        // a submit that echoed ids the daemon knew nothing about is audible.
+        let filter = crate::cartographer::CartographerFilter {
+            source: Some("generation".to_string()),
+            ..crate::cartographer::CartographerFilter::recent(50)
+        };
+        let page = d.lock().cartographer_query(&filter).unwrap();
+        let row = page
+            .rows
+            .iter()
+            .find(|r| r.message == "generation costs attributed")
+            .unwrap();
+        assert_eq!(row.payload["attributed"].as_i64(), Some(2));
+        assert_eq!(row.payload["echoed"].as_i64(), Some(3));
+    }
+
+    #[test]
+    fn generation_cost_audit_lists_never_attributed_rows() {
+        let d = daemon();
+        // A generation call whose New Task modal was cancelled before any
+        // submit: its row is retained with `squad_id` NULL and visible in
+        // the cross-squad audit list and only there.
+        seed_retained_generation_rows(&d, &[("gen-orphan", "auto_build_steps", "cancelled")]);
+        let audit = route(&d, "GET", "/api/generation-costs", "");
+        assert_eq!(audit.status, 200);
+        assert!(audit.body.contains("\"gen-orphan\""));
+        assert!(audit.body.contains("\"squad_id\":null"), "{}", audit.body);
+        // No squad exists (nothing was submitted), so no squad view or
+        // per-squad detail can show it -- it never inflates any squad's totals.
+        let detail = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/generation-costs",
+            "",
+        );
+        assert_eq!(detail.status, 200);
+        assert!(detail.body.contains("[]"), "{}", detail.body);
+        let r = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn generation_cost_submit_with_unknown_ids_logs_attributed_zero() {
+        let d = daemon();
+        // A submit echoing job ids the daemon has no rows for (persistence
+        // lost to a restart mid-run) still succeeds -- attribution is
+        // best-effort -- but the log row records the 0-vs-echoed split.
+        let mut body = serde_json::json!({ "toml": GOOD });
+        body["generation_ids"] = serde_json::json!(["gen-ghost".to_string()]);
+        let r = route(&d, "POST", "/api/squads", &body.to_string());
+        assert_eq!(r.status, 201, "{}", r.body);
+        let filter = crate::cartographer::CartographerFilter {
+            source: Some("generation".to_string()),
+            ..crate::cartographer::CartographerFilter::recent(50)
+        };
+        let page = d.lock().cartographer_query(&filter).unwrap();
+        let row = page
+            .rows
+            .iter()
+            .find(|r| r.message == "generation costs attributed")
+            .unwrap();
+        assert_eq!(row.payload["attributed"].as_i64(), Some(0));
+        assert_eq!(row.payload["echoed"].as_i64(), Some(1));
+        assert_eq!(row.level, "warning");
+        // The squad is clean: no generation-cost aggregate at all.
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        assert!(!squad.body.contains("generation_cost"), "{}", squad.body);
     }
 
     #[test]

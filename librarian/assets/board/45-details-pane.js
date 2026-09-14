@@ -270,8 +270,54 @@
           <div class="kv-row"><span class="k">watchers</span><span class="v">${watchersHtml(`squad:${r.id}`)}</span></div>
           ${tasks}
           ${reviews}
+          ${generationCostSection(r)}
           ${envOverridesSection(r)}
           ${editBtn()}`;
+      }
+      /**
+       * Renders the squad's pre-work generation cost (RAL-420), when it has
+       * any: the retained usage of the agent/model calls the Simple form made
+       * before this squad was submitted (Generate proof steps / manual checks
+       * / auto-build steps, plus the post-submit `suggest-name` fallback),
+       * attributed to this squad at submit time. A distinct squad-owned
+       * category -- never a cell/proof row -- folded into this squad's normal
+       * totals (Tasks tab group header) exactly once. The "🎛 calls" button
+       * loads the per-call detail list (`GET /api/squads/{id}/generation-costs`).
+       * @param {SquadView} r
+       * @returns {string}
+       */
+      function generationCostSection(r) {
+        const g = r.generation_cost;
+        if (!g) return "";
+        const countNote = `${g.count} pre-work generation call${g.count === 1 ? "" : "s"}`;
+        const tip = "Pre-work generation cost (RAL-420) — the agent/model calls the Simple form made before this squad was submitted: “Generate proof steps / manual checks / auto-build steps”, plus the suggest-name fallback.\nRetained even when a call failed or was cancelled; included in this squad's totals exactly once.\nA “≈” prefix means at least one call's figures are a mid-run estimate, not final accounting.";
+        return `<h3 class="section">generation cost</h3>
+          <div class="kv-row" data-tip="${esc(tip)}"><span class="k">${esc(countNote)}</span><span class="v">${usageSummary(g)}${estimatedBadge(g.estimated)} <button class="btn" data-click="openGenerationCosts" data-squad-id="${esc(r.id)}" data-tip="List every generation call attributed to this squad — job id, kind, status, tokens/cost, and timing.">🎛 calls</button></span></div>
+          <div id="gen-cost-detail-${esc(r.id)}"></div>`;
+      }
+      /**
+       * Fetches and lists the per-call detail behind a squad's pre-work
+       * generation cost (RAL-420): `GET /api/squads/{id}/generation-costs`,
+       * newest first, each row with its retained tokens/cost figures, outcome
+       * status, and timestamps. Renders into the `#gen-cost-detail-{id}`
+       * element `generationCostSection` emits; clicking again re-renders.
+       * @param {MouseEvent} e
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function openGenerationCosts(e, id) {
+        e.stopPropagation();
+        const box = byId(`gen-cost-detail-${id}`);
+        if (!box) return;
+        const rows = await (await fetch(`/api/squads/${encodeURIComponent(id)}/generation-costs`)).json().catch(() => null);
+        if (!Array.isArray(rows)) { box.innerHTML = `<span style="color:var(--error)">could not load generation cost detail</span>`; return; }
+        if (!rows.length) { box.innerHTML = `<span style="color:var(--muted)">none retained.</span>`; return; }
+        box.innerHTML = rows.map((c) => {
+          const cost = c.cost_usd ? ` · $${c.cost_usd.toFixed(4)}` : "";
+          const est = c.cost_is_estimated ? " ≈" : "";
+          const err = c.error ? ` <span data-tip="${esc(c.error)}" style="color:var(--error)">⚠</span>` : "";
+          return `<div class="kv-row" style="font-size:11px"><span class="k mono">${esc(c.job_id)}</span><span class="v">${esc(c.kind)} · ${esc(c.status)}${est} · in ${c.tokens_in} / out ${c.tokens_out}${cost}${err}</span></div>`;
+        }).join("");
       }
       /**
        * Shared markup for an "environment overrides" section at any scope

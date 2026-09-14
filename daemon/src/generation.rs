@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancelToken;
-use crate::runner::{Runner, RunnerSpec, SubprocessRunner};
+use crate::runner::{Runner, RunnerResult, RunnerSpec, SubprocessRunner};
 
 /// One proposed proof step or manual check, generic enough for the board's
 /// single reusable editable-list widget to render either kind.
@@ -265,16 +265,31 @@ pub fn slugify_task_name(s: &str) -> Option<String> {
 /// `GenerationJob::Error` like any other failure -- no separate "cancelled"
 /// status is needed since the board never renders a generation job's result
 /// once its owning New Task modal has been closed.
+///
+/// Returns the [`crate::runner::RunnerResult`] alongside the job (RAL-420):
+/// the job is what the board polls, but the runner's captured tokens/cost --
+/// including the last live snapshot of a call that was killed, cancelled, or
+/// failed mid-run -- are what `server::record_generation_call_cost` retains
+/// in `squad_generation_costs`. Every branch returns a result, including the
+/// unknown-kind validation error (a synthetic failure), so the callers can
+/// record a row for every finished job.
 #[must_use]
-pub fn run_generation(req: &GenerateRequest, cancel: &CancelToken) -> GenerationJob {
+pub fn run_generation(
+    req: &GenerateRequest,
+    cancel: &CancelToken,
+) -> (GenerationJob, RunnerResult) {
     let Some(kind) = GenerationKind::parse(&req.kind) else {
-        return GenerationJob::Error {
-            message: format!(
-                "unknown generation kind \"{}\" (expected \"proof_steps\", \"manual_checks\", \
-                 or \"auto_build_steps\")",
-                req.kind
-            ),
-        };
+        let message = format!(
+            "unknown generation kind \"{}\" (expected \"proof_steps\", \"manual_checks\", \
+             or \"auto_build_steps\")",
+            req.kind
+        );
+        return (
+            GenerationJob::Error {
+                message: message.clone(),
+            },
+            RunnerResult::failure(message),
+        );
     };
     let (system_prompt, prompt) = generation_prompt(kind, &req.prompt_context);
     let spec = RunnerSpec {
@@ -310,17 +325,21 @@ pub fn run_generation(req: &GenerateRequest, cancel: &CancelToken) -> Generation
     let runner = SubprocessRunner::from_env();
     let result = runner.run_cancellable(&spec, cancel);
     if !result.is_done() {
-        return GenerationJob::Error {
-            message: result
-                .error
-                .unwrap_or_else(|| "generation call did not complete".to_string()),
-        };
+        let message = result
+            .error
+            .as_deref()
+            .unwrap_or("generation call did not complete")
+            .to_string();
+        return (GenerationJob::Error { message }, result);
     }
     match parse_generated_items(&result.summary) {
-        Some(items) => GenerationJob::Done { items },
-        None => GenerationJob::Error {
-            message: "the agent's response was not a valid JSON list of items".to_string(),
-        },
+        Some(items) => (GenerationJob::Done { items }, result),
+        None => (
+            GenerationJob::Error {
+                message: "the agent's response was not a valid JSON list of items".to_string(),
+            },
+            result,
+        ),
     }
 }
 
@@ -407,12 +426,18 @@ mod tests {
             model: None,
             prompt_context: "do the thing".to_string(),
         };
-        match run_generation(&req, &CancelToken::never()) {
+        let (job, result) = run_generation(&req, &CancelToken::never());
+        match job {
             GenerationJob::Error { message } => {
                 assert!(message.contains("unknown generation kind"))
             }
             other => panic!("expected an error, got {other:?}"),
         }
+        // RAL-420: the callers need a retained result even for a rejected
+        // request, so a submit can still attribute (and an audit can still
+        // see) the failed job.
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.cost_usd, 0.0);
     }
 
     #[test]

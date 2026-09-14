@@ -651,16 +651,19 @@
         const squad = findSquad(squadId);
         const label = squad ? (squad.label || squad.id) : squadId;
         const squadState = squad ? squadDisplayState(squad) : "pending";
-        const agg = ttGroupAggregate(groupRows);
+        const agg = ttGroupAggregateWithGeneration(groupRows, squad ? squad.generation_cost : undefined);
         const allForSquad = ttAllRows.filter((r) => r.squadId === squadId);
         const filteredOut = allForSquad.length !== groupRows.length;
         /**
          * @param {string} formatted
          * @returns {string}
          */
-        const tip = (formatted) => filteredOut
-          ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
-          : `${formatted} across all ${groupRows.length} tasks in this squad.`;
+        const tip = (formatted) => {
+          const genNote = squad && squad.generation_cost ? " plus the squad's own pre-work generation calls, folded in exactly once" : "";
+          return filteredOut
+            ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest)${genNote}.`
+            : `${formatted} across all ${groupRows.length} tasks in this squad${genNote}.`;
+        };
         return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
           + ttColCell("sel", "")
           + ttColCell("star", "")
