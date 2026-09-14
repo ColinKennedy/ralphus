@@ -2311,10 +2311,16 @@ per-project, since one poll cycle spans every project's repos):
 The poller never consumes a scheduler concurrency permit, skips entirely
 during a configured `[daemon].downtime` window (RAL-122), and batches one
 `git fetch` per guardian's git root covering every one of that guardian's
-open PRs' branches — never one `git fetch` per PR. It acquires each PR's
-drift-check lock with a non-blocking `try_lock`: a PR an interactive
-`sync-status` call is already checking is simply left at its last-known
-value for that cycle rather than making either side wait on the other.
+open PRs' branches — never one `git fetch` per PR. Each poll pass is two
+phases (RAL-423): a **drift pass** that holds every reached PR's
+drift-check lock only while that PR's own fetch + classification happens,
+then a **comment pass** that makes the per-PR forge comment calls with *no*
+drift-check lock held at all. A PR whose lock an interactive `sync-status`
+call is already holding is simply left at its last-known drift value for
+that cycle rather than making either side wait on the other — the poller
+yields to foreground work in both directions: an interactive `sync-status`
+can only ever wait behind this poller for that same PR's own git fetch,
+never behind the (network-bound) comment fetches of this PR or any other.
 Forge comment fetches are conditional (`If-None-Match`/`ETag`), so an
 unchanged PR costs no forge quota on repeat polls, and a `429`/`403`
 response backs the affected forge client off for a cooldown window
@@ -2392,7 +2398,11 @@ automatically). Both can be `false` and `in_sync` `true` when they match
 exactly. `502` if the guardian/PR can't be resolved. Write-through (RAL-366):
 a successful call also refreshes this PR's drift fields in
 `GET .../forge-cache-index`, the same "refresh now" write-through
-`GET .../comments` does for its half.
+`GET .../comments` does for its half. The call never waits longer than
+one `git fetch` of this PR's own branch behind the background poller
+(RAL-423): the poller holds this PR's drift-check lock only while the
+poller itself fetches that same branch, and releases it before any of its
+forge comment round-trips.
 
 ### `POST /api/pull-requests/{pr_id}/refresh-ci`
 Live-polls the forge for this one PR's current CI/mergeability status
