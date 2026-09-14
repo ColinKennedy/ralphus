@@ -190,6 +190,41 @@
        */
       function invalidateTasksFetch() { tasksFetchInFlight = null; taskIndexFetchInFlight = null; }
       // RALPHUS-TASKS-POLL-SEQ:END
+      // ---- cross-squad task/cell index (on demand) ----
+      // Three board features are genuinely cross-squad -- go-to search, the
+      // header's running-work dropdown, and the review worktree-linkage
+      // lookup -- but each needs only shallow fields (task name/project,
+      // cell state/name/cwd, proof state), never the per-cell prompt text or
+      // the rest of the full board view. They read this index instead, so
+      // the standing `/api/tasks` poll does not have to carry the whole task
+      // tree on their behalf.
+      /** @type {SquadView[]} */
+      let taskIndex = [];
+      /** Whether {@link loadTaskIndex} has ever completed, so an on-demand opener can tell "empty" from "not fetched yet". */
+      let taskIndexLoaded = false;
+      /**
+       * Records a freshly fetched `/api/task-index` squad list.
+       * @param {SquadView[]|undefined} squadList
+       * @returns {void}
+       */
+      function setTaskIndex(squadList) {
+        taskIndex = squadList || [];
+        taskIndexLoaded = true;
+      }
+      /**
+       * Fetches `/api/task-index` into {@link taskIndex}. Called by the
+       * features above right before they open, and for free by
+       * `updateCounter`, which already reads that endpoint on every tab
+       * whose own poll does not.
+       * @returns {Promise<void>}
+       */
+      async function loadTaskIndex() {
+        try {
+          // Shares `updateCounter`'s in-flight request rather than issuing a
+          // second one: on every tab where that runs, this costs nothing.
+          setTaskIndex((await fetchTaskIndexShared()).squads);
+        } catch (e) { /* transient -- the opener falls back to whatever is cached */ }
+      }
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
        * Fetches the daemon status counter and `squads` cache from
@@ -254,7 +289,9 @@
           pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(),
           ...(selfCountingTab ? [] : [updateCounter()]),
         ]);
-        if (tab === "reviews") { await pollReviews(); }
+        // `findLinkedCells` runs inside the Reviews tab's synchronous render,
+        // so the index it reads has to be in place before `pollReviews`.
+        if (tab === "reviews") { await loadTaskIndex(); await pollReviews(); }
         else if (tab === "resources") { await pollResources(); }
         else if (tab === "queue") { if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
         else if (tab === "cartographer") { await pollCartographer(); }

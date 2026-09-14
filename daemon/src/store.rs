@@ -573,6 +573,11 @@ pub struct SquadView {
     pub finished_at_ms: Option<i64>,
     /// The tasks in the squad.
     pub tasks: Vec<TaskView>,
+    /// Every distinct [`TaskView::project`] among this squad's tasks, in
+    /// first-seen order. Precomputed here so the board's project filter can
+    /// work off the squad row alone rather than walking each squad's whole
+    /// task list -- the one thing the sidebar needed the task tree for.
+    pub projects: Vec<String>,
     /// Reviews (guardians) derived from this squad.
     pub reviews: Vec<SquadReviewRef>,
     /// Persistent environment-variable overrides applied to every subprocess
@@ -4179,6 +4184,12 @@ impl Store {
 
         let reviews = Self::reviews_for_squad(conn, &id)?;
         let state = effective_squad_state(conn, state, &id)?;
+        let mut projects: Vec<String> = Vec::new();
+        for t in &tasks {
+            if !projects.iter().any(|p| p == &t.project) {
+                projects.push(t.project.clone());
+            }
+        }
         Ok(SquadView {
             id,
             label,
@@ -4187,6 +4198,7 @@ impl Store {
             started_at_ms,
             finished_at_ms,
             tasks,
+            projects,
             reviews,
             env_overrides,
             error,

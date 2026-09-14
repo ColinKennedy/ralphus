@@ -835,6 +835,12 @@ struct TaskIndexTask {
 struct TaskIndexCell {
     id: String,
     name: Option<String>,
+    /// Working directory, needed by the board's worktree-linkage lookup
+    /// (`findLinkedCells`), which matches a review worktree path against
+    /// every cell's cwd. Short compared with the prompt text the full board
+    /// view carries, and it is the only field that lookup needs beyond what
+    /// this index already had.
+    cwd: Option<String>,
     agent: String,
     model: Option<String>,
     state: String,
@@ -892,6 +898,7 @@ impl From<crate::store::CellView> for TaskIndexCell {
         Self {
             id: value.id,
             name: value.name,
+            cwd: value.cwd,
             agent: value.agent,
             model: value.model,
             state: value.state,

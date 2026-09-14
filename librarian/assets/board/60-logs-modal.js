@@ -763,7 +763,7 @@
       function findLinkedCells(worktreePath) {
         /** @type {LinkedCell[]} */
         const results = [];
-        for (const squad of squads) {
+        for (const squad of taskIndex) {
           squad.tasks.forEach((t, ti) => {
             t.cells.forEach((s, si) => {
               if (s.cwd && pathLinked(s.cwd, worktreePath)) {

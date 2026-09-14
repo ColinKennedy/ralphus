@@ -818,7 +818,9 @@
           && (filters.showHidden || !hiddenSquadIds.has(r.id) || r.id === revealedSquadId)
           // RAL-345: a squad matches the project filter if any of its own
           // tasks' projects is in the selected set; empty set means no filter.
-          && (!filters.project.size || (r.tasks || []).some((t) => filters.project.has(t.project))));
+          // Reads the squad-level `projects` union rather than walking the
+          // task tree, so the sidebar needs no per-task data at all.
+          && (!filters.project.size || (r.projects || []).some((project) => filters.project.has(project))));
         list.sort((a, b) => filters.sort === "name"
           ? filters.dir * (a.label || a.id).localeCompare(b.label || b.id)
           : filters.dir * (a.created_at_ms - b.created_at_ms));

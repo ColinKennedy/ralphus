@@ -264,7 +264,7 @@
         const needle = String(query || "").trim().toLowerCase();
         /** @type {GotoSearchResult[]} */
         const out = [];
-        squads.forEach((squad) => {
+        taskIndex.forEach((squad) => {
           // RAL-331/RAL-365: a hidden squad's tasks, and any individually
           // hidden task, are excluded from go-to search by default too --
           // same "hidden unless specifically surfaced" rule as the sidebar,
@@ -297,9 +297,12 @@
       }
       /**
        * Opens the cross-squad task go-to search overlay (RAL-253).
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function openGotoSearch() {
+      async function openGotoSearch() {
+        // Cross-squad task names come from the compact index, fetched when
+        // this actually opens rather than ridden along on every board poll.
+        await loadTaskIndex();
         gotoSearchQuery = "";
         gotoSearchSelected = 0;
         gotoSearchShowHidden = false;
@@ -334,7 +337,7 @@
         if (!list || !summary) return;
         const results = gotoSearchResults(gotoSearchQuery);
         clampGotoSearchSelection(results.length);
-        summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${squads.length} squad${squads.length === 1 ? "" : "s"}.`;
+        summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${taskIndex.length} squad${taskIndex.length === 1 ? "" : "s"}.`;
         list.innerHTML = results.length
           ? results.map((result, index) => `<button type="button" id="goto-search-row-${index}" class="goto-search-row${index === gotoSearchSelected ? " selected" : ""}" onclick="selectGotoSearchResult(${index})" ondblclick="gotoSelectedTaskSearchResult()" data-tip="Open ${esc(result.label)} on the Squads tab.\nWho/when: use this when several squads contain similarly named work and you need the exact owner shown.">${esc(result.label)}</button>`).join("")
           : `<div class="empty" style="margin:0;padding:20px" data-tip="No current task names contain this substring.\nWho/when: clear or broaden the query to search across every squad again.">No matching tasks.</div>`;
