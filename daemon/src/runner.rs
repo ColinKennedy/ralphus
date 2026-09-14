@@ -963,6 +963,7 @@ impl RunnerResult {
             error: Some(format!("terminated: {}", reason.into())),
             proofed: None,
             agent_session_id: None,
+            turns: Some(usage.turns),
             ghost: None,
         }
     }
