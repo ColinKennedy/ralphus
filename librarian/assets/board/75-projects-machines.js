@@ -1318,7 +1318,12 @@ Work submitted against it will fail — fix the machine or deregister the provid
           await pollMailboxHistory();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
-            fetch("/api/tasks"),
+            // `/api/task-index`, not `/api/tasks`: the only fields read below
+            // are each squad's id/label and its tasks' names, all of which the
+            // compact index carries. The full board view is ~9x larger (6.2MB
+            // vs 684KB against a real squad history) and every byte past those
+            // three fields is discarded here.
+            fetch("/api/task-index"),
             fetch("/api/guardians"),
           ]);
           byId("conn").className = "dot on";
