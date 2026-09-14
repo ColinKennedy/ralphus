@@ -183,12 +183,16 @@ impl NodeState {
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
 /// One row from [`Store::proof_specs`]:
-/// `(idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
+/// `(idx, kind, spec, model, timeout_sec, budget_tokens,
+/// maximum_tool_output_tokens, maximum_timeout_sec)`. The last field is this
+/// step's own RAL-308 hard-cap value; see
+/// `ralphus_core::schema::ProofStep::maximum_timeout_seconds`.
 pub type ProofSpecRow = (
     i64,
     String,
     String,
     Option<String>,
+    Option<i64>,
     Option<i64>,
     Option<i64>,
     Option<i64>,
@@ -1267,6 +1271,7 @@ impl Store {
                 started_at_ms  INTEGER,
                 finished_at_ms INTEGER,
                 no_commit_required INTEGER NOT NULL DEFAULT 0,
+                maximum_timeout_sec INTEGER,
                 PRIMARY KEY (squad_id, idx)
             );
             CREATE TABLE IF NOT EXISTS cells (
@@ -1297,6 +1302,7 @@ impl Store {
                 error      TEXT,
                 review_branch TEXT,
                 timeout_sec   INTEGER,
+                maximum_timeout_sec INTEGER,
                 budget_tokens INTEGER,
                 agent_session_id TEXT,
                 maximum_budget_usd REAL,
@@ -1327,12 +1333,15 @@ impl Store {
                 output      TEXT,
                 agent_session_id TEXT,
                 timeout_sec   INTEGER,
+                maximum_timeout_sec INTEGER,
                 budget_tokens INTEGER,
                 maximum_tool_output_tokens INTEGER,
                 turns         INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
+                started_at_ms  INTEGER,
+                finished_at_ms INTEGER,
                 PRIMARY KEY (squad_id, task_idx, scope, cell_idx, idx)
             );
             CREATE TABLE IF NOT EXISTS guardians (
@@ -2752,6 +2761,28 @@ impl Store {
             // the board treats NULL as not-draft (matching how the
             // "non-draft" filter reads it).
             "ALTER TABLE guardian_pull_requests ADD COLUMN draft INTEGER",
+            // RAL-308: hard cumulative maximum-runtime cap in seconds, at
+            // each of the three task-file scopes -- see
+            // `ralphus_core::schema::TaskDef::maximum_timeout_seconds` /
+            // `CellDef::maximum_timeout_seconds` / `ProofStep::
+            // maximum_timeout_seconds` for the semantics. Resolved once at
+            // submit time (this row's own declared value, no
+            // override-inheritance) and enforced by
+            // `SubprocessRunner::maximum_timeout_exceeded` against the
+            // cumulative `started_at_ms`/`finished_at_ms` span of a task's
+            // or cell's descendants -- see `Store::task_cumulative_runtime_ms`/
+            // `Store::cell_cumulative_runtime_ms`.
+            "ALTER TABLE tasks ADD COLUMN maximum_timeout_sec INTEGER",
+            "ALTER TABLE cells ADD COLUMN maximum_timeout_sec INTEGER",
+            "ALTER TABLE proofs ADD COLUMN maximum_timeout_sec INTEGER",
+            // RAL-308: a proof step's own wall-clock span, needed so its
+            // contribution to its owning cell's/task's cumulative
+            // `maximum_timeout_seconds` budget can be summed the same way
+            // `cells.started_at_ms`/`finished_at_ms` already let
+            // `set_cell_state` stamp a cell's span. NULL until the step's
+            // first real run under this column's existence.
+            "ALTER TABLE proofs ADD COLUMN started_at_ms INTEGER",
+            "ALTER TABLE proofs ADD COLUMN finished_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3094,8 +3125,11 @@ impl Store {
 
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
+            let task_maximum_timeout_sec = task
+                .maximum_timeout_seconds
+                .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
             tx.execute(
-                "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required, maximum_timeout_sec) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     squad_id,
                     t_idx_i,
@@ -3113,6 +3147,12 @@ impl Store {
                     // indistinguishable.
                     to_json_map(&task.environment),
                     task.no_commit_required,
+                    // RAL-308: this task's own cumulative maximum-runtime
+                    // cap across every cell/proof it owns -- see
+                    // `ralphus_core::schema::TaskDef::maximum_timeout_seconds`.
+                    // Not resolved/inherited from anywhere; a task has no
+                    // parent scope to fall back to.
+                    task_maximum_timeout_sec,
                 ],
             )?;
 
@@ -3135,12 +3175,20 @@ impl Store {
                     ralphus_core::schema::resolve_cell_maximum_tool_output_tokens(task, cell)
                         .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
                 let share_session = ralphus_core::schema::resolve_cell_share_session(task, cell);
+                // RAL-308: the cell's own cumulative maximum-runtime cap
+                // (covering itself and its cell-scope proofs) -- not
+                // resolved/inherited from the task's, which is a separate,
+                // independently-enforced budget. See
+                // `ralphus_core::schema::CellDef::maximum_timeout_seconds`.
+                let cell_maximum_timeout_sec = cell
+                    .maximum_timeout_seconds
+                    .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -3183,6 +3231,7 @@ impl Store {
                         // task file can't silently move an in-flight squad's machine.
                         ralphus_core::schema::resolve_cell_machine(task, cell),
                         share_session,
+                        cell_maximum_timeout_sec,
                     ],
                 )?;
 
@@ -5784,14 +5833,22 @@ fn insert_proof(
         None => ralphus_core::schema::resolve_task_proof_maximum_tool_output_tokens(task, v),
     }
     .map(|val| i64::try_from(val).unwrap_or(i64::MAX));
+    // RAL-308: a proof step's own maximum-runtime cap is a simple self-only
+    // value -- it has no descendants to sum, and does not fall back to the
+    // owning cell's/task's cap (those are separate, independently-enforced
+    // cumulative budgets). See
+    // `ralphus_core::schema::ProofStep::maximum_timeout_seconds`.
+    let maximum_timeout_sec = v
+        .maximum_timeout_seconds
+        .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
     let effective_system_prompt = if kind == "prompt" {
         Some(effective_proof_system_prompt(None))
     } else {
         None
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -5806,6 +5863,7 @@ fn insert_proof(
             agent,
             NodeState::Pending.as_str(),
             timeout_sec,
+            maximum_timeout_sec,
             budget_tokens,
             maximum_tool_output_tokens,
             // RAL-352: same rule as cells -- a `prompt`-kind step starts at
@@ -5822,7 +5880,7 @@ fn insert_proof(
 
 /// The executable fields of a cell, as the scheduler needs them to build a
 /// runner spec.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CellRow {
     /// Index of the owning task within the squad.
     pub task_idx: i64,
@@ -5892,6 +5950,16 @@ pub struct CellRow {
     /// `share_session` TOML field (off by default) -- see
     /// `ralphus_core::schema::resolve_cell_share_session`.
     pub share_session: bool,
+    /// This cell's own RAL-308 cumulative maximum-runtime cap in seconds
+    /// (covering itself and its cell-scope proofs), or `None` for no
+    /// cell-wide cap. See
+    /// `ralphus_core::schema::CellDef::maximum_timeout_seconds`.
+    pub maximum_timeout_sec: Option<i64>,
+    /// The owning task's RAL-308 cumulative maximum-runtime cap in seconds
+    /// (covering every cell/proof under the task), or `None` for no
+    /// task-wide cap. See
+    /// `ralphus_core::schema::TaskDef::maximum_timeout_seconds`.
+    pub task_maximum_timeout_sec: Option<i64>,
 }
 
 /// Editable cell definition fields (from the details pane).
@@ -6089,7 +6157,7 @@ impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -6121,10 +6189,74 @@ impl Store {
                     auto_compact_threshold: r.get(19)?,
                     maximum_tool_output_tokens: r.get(20)?,
                     share_session: r.get(21)?,
+                    maximum_timeout_sec: r.get(22)?,
+                    task_maximum_timeout_sec: r.get(23)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Cumulative wall-clock milliseconds already consumed by every cell and
+    /// proof step under one task (RAL-308), for enforcing a task-level
+    /// `maximum_timeout_seconds` cap that's cumulative across the whole
+    /// task's descendants (both cell-scope and task-scope proofs). A row
+    /// that has started contributes `min(now_ms, finished_at_ms) -
+    /// started_at_ms` (a still-running row's `finished_at_ms` is still
+    /// `NULL`, so it contributes its own live elapsed time); a row that
+    /// never started (still pending, or `ignored`/`cancelled` before it
+    /// ran) contributes nothing. Reading live from these columns rather than
+    /// tracking a separate running counter means this stays correct even
+    /// when sibling cells run concurrently under the same task.
+    pub fn task_cumulative_runtime_ms(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let cells_ms: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
+             FROM cells WHERE squad_id=?2 AND task_idx=?3 AND started_at_ms IS NOT NULL",
+            params![now_ms, squad_id, task_idx],
+            |r| r.get(0),
+        )?;
+        let proofs_ms: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
+             FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND started_at_ms IS NOT NULL",
+            params![now_ms, squad_id, task_idx],
+            |r| r.get(0),
+        )?;
+        Ok(cells_ms + proofs_ms)
+    }
+
+    /// Cumulative wall-clock milliseconds already consumed by one cell and
+    /// its own cell-scope proof steps (RAL-308) -- the same shape as
+    /// [`Self::task_cumulative_runtime_ms`], scoped one level narrower for a
+    /// cell-level `maximum_timeout_seconds` cap.
+    pub fn cell_cumulative_runtime_ms(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        now_ms: i64,
+    ) -> Result<i64> {
+        let cell_ms: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(finished_at_ms, ?1) - started_at_ms
+                 FROM cells WHERE squad_id=?2 AND task_idx=?3 AND idx=?4 AND started_at_ms IS NOT NULL",
+                params![now_ms, squad_id, task_idx, cell_idx],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let proofs_ms: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(COALESCE(finished_at_ms, ?1) - started_at_ms), 0)
+             FROM proofs WHERE squad_id=?2 AND task_idx=?3 AND scope='cell' AND cell_idx=?4 AND started_at_ms IS NOT NULL",
+            params![now_ms, squad_id, task_idx, cell_idx],
+            |r| r.get(0),
+        )?;
+        Ok(cell_ms + proofs_ms)
     }
 
     /// All tasks of a squad with their dependencies, in order.
@@ -6283,7 +6415,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
+            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens, maximum_timeout_sec FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -6296,6 +6428,7 @@ impl Store {
                     r.get::<_, Option<i64>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6324,7 +6457,14 @@ impl Store {
             .optional()?)
     }
 
-    /// Set a proof step's state.
+    /// Set a proof step's state. Also stamps `started_at_ms` (once, the
+    /// first time the step enters `running`) and `finished_at_ms` (every
+    /// time it enters a terminal state, so a restart-triggered re-run
+    /// reflects the latest completion) -- mirrors [`Store::set_cell_state`]'s
+    /// semantics, added by RAL-308 so a proof step's own wall-clock span can
+    /// be summed into its owning cell's/task's cumulative
+    /// `maximum_timeout_seconds` budget (see
+    /// [`Store::cell_cumulative_runtime_ms`]/[`Store::task_cumulative_runtime_ms`]).
     pub fn set_proof_state(
         &self,
         squad_id: &str,
@@ -6345,11 +6485,27 @@ impl Store {
             .ok()
             .flatten()
             .unwrap_or_else(|| "unknown".to_string());
+        let now = now_ms();
+        let entering_running = i64::from(state == NodeState::Running);
+        let entering_terminal = i64::from(state.is_terminal());
         // RAL-271: see the matching comment in `set_cell_state`.
         self.conn.execute(
-            "UPDATE proofs SET state=?, env_out_of_date=0
+            "UPDATE proofs SET state=?, env_out_of_date=0,
+                 started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
-            params![state.as_str(), squad_id, task_idx, scope, cell_idx, idx],
+            params![
+                state.as_str(),
+                entering_running,
+                now,
+                entering_terminal,
+                now,
+                squad_id,
+                task_idx,
+                scope,
+                cell_idx,
+                idx
+            ],
         )?;
         crate::rlog!(
             DEBUG,
@@ -12198,6 +12354,196 @@ command = "y"
 
         let view = store.get_squad(&squad).unwrap();
         assert!(!view.tasks[0].cells[0].proof[0].env_out_of_date);
+    }
+
+    // ── RAL-308: maximum_timeout_seconds persistence and cumulative accounting ──
+
+    #[test]
+    fn set_proof_state_stamps_started_and_finished_at_ms() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("r"), false)
+            .unwrap();
+
+        let read_stamps = |store: &Store| -> (Option<i64>, Option<i64>) {
+            store
+                .conn
+                .query_row(
+                    "SELECT started_at_ms, finished_at_ms FROM proofs
+                     WHERE squad_id=?1 AND task_idx=0 AND scope='cell' AND cell_idx=0 AND idx=0",
+                    params![squad],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+
+        let (started, finished) = read_stamps(&store);
+        assert!(started.is_none());
+        assert!(finished.is_none());
+
+        store
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Running)
+            .unwrap();
+        let (started, finished) = read_stamps(&store);
+        let started = started.expect("started_at_ms set on entering running");
+        assert!(finished.is_none());
+
+        // Re-entering running (shouldn't normally happen, but the setter must
+        // be idempotent) must not overwrite the original start time -- same
+        // contract as `set_cell_state`/`set_squad_state`.
+        store
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Running)
+            .unwrap();
+        assert_eq!(read_stamps(&store).0, Some(started));
+
+        store
+            .set_proof_state(&squad, 0, "cell", 0, 0, NodeState::Done)
+            .unwrap();
+        let (started_after, finished) = read_stamps(&store);
+        assert_eq!(started_after, Some(started));
+        assert!(finished.is_some());
+    }
+
+    #[test]
+    fn maximum_timeout_seconds_persists_at_all_three_scopes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(
+                &parse(
+                    r#"
+[[task]]
+name = "build"
+maximum_timeout_seconds = 3600
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "make it build"
+maximum_timeout_seconds = 1800
+[[task.cell.proof]]
+id = "fmt"
+command = "cargo fmt --check"
+maximum_timeout_seconds = 60
+[[task.proof]]
+command = "cargo test"
+"#,
+                ),
+                Some("r"),
+                false,
+            )
+            .unwrap();
+        let task_cap: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT maximum_timeout_sec FROM tasks WHERE squad_id=?1 AND idx=0",
+                params![squad],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_cap, Some(3600));
+        let cell_cap: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT maximum_timeout_sec FROM cells WHERE squad_id=?1 AND task_idx=0 AND idx=0",
+                params![squad],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cell_cap, Some(1800));
+        let proof_cap: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT maximum_timeout_sec FROM proofs
+                 WHERE squad_id=?1 AND task_idx=0 AND scope='cell' AND cell_idx=0 AND idx=0",
+                params![squad],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_cap, Some(60));
+        // The task-scope proof declared no cap of its own -- `None`, not
+        // inherited from the task (RAL-308's caps are independent per scope,
+        // unlike `timeout_minutes`'s override-inheritance).
+        let task_proof_cap: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT maximum_timeout_sec FROM proofs
+                 WHERE squad_id=?1 AND task_idx=0 AND scope='task' AND idx=0",
+                params![squad],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_proof_cap, None);
+
+        let cells = store.cells_of(&squad).unwrap();
+        assert_eq!(cells[0].maximum_timeout_sec, Some(1800));
+        assert_eq!(cells[0].task_maximum_timeout_sec, Some(3600));
+    }
+
+    #[test]
+    fn cumulative_runtime_sums_cell_and_its_proofs_and_task_wide() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO squads(id, state, created_at_ms, updated_at_ms) VALUES('squad-1','running',0,0)",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tasks(squad_id, idx, name, state) VALUES('squad-1', 0, 'task-0', 'running')",
+                [],
+            )
+            .unwrap();
+        let now = now_ms();
+        // Cell 0: still running, started 10s ago -- contributes its own live
+        // elapsed time (finished_at_ms is NULL).
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, started_at_ms, finished_at_ms)
+                 VALUES('squad-1', 0, 0, 'cell-a', 'claude', 'running', ?1, NULL)",
+                params![now - 10_000],
+            )
+            .unwrap();
+        // A cell-scope proof under cell 0 that already finished, took 4s.
+        store
+            .conn
+            .execute(
+                "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, kind, spec, agent, state, started_at_ms, finished_at_ms)
+                 VALUES('squad-1', 0, 'cell', 0, 0, 'command', 'true', 'claude', 'done', ?1, ?2)",
+                params![now - 20_000, now - 16_000],
+            )
+            .unwrap();
+        // A different cell (idx 1) under the same task, already finished,
+        // took 3s -- counts toward the task-wide total but not cell 0's.
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state, started_at_ms, finished_at_ms)
+                 VALUES('squad-1', 0, 1, 'cell-b', 'claude', 'done', ?1, ?2)",
+                params![now - 9_000, now - 6_000],
+            )
+            .unwrap();
+        // A pending cell that never started contributes nothing.
+        store
+            .conn
+            .execute(
+                "INSERT INTO cells(squad_id, task_idx, idx, sid, agent, state)
+                 VALUES('squad-1', 0, 2, 'cell-c', 'claude', 'pending')",
+                [],
+            )
+            .unwrap();
+
+        let cell0_ms = store
+            .cell_cumulative_runtime_ms("squad-1", 0, 0, now)
+            .unwrap();
+        // cell-a's live elapsed (~10_000ms) + the proof's 4_000ms.
+        assert!((13_900..=14_100).contains(&cell0_ms), "cell0_ms={cell0_ms}");
+
+        let task_ms = store.task_cumulative_runtime_ms("squad-1", 0, now).unwrap();
+        // cell-a (~10_000) + the proof (4_000) + cell-b (3_000).
+        assert!((16_900..=17_100).contains(&task_ms), "task_ms={task_ms}");
     }
 
     #[test]

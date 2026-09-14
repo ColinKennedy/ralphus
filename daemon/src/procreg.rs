@@ -47,6 +47,19 @@ impl ProcRegistry {
             .copied()
     }
 
+    /// Every currently-registered `(run_id, session_id, pid)` triple
+    /// (RAL-308), for a periodic sweep that needs to enumerate all live
+    /// subprocesses rather than look one up by key -- e.g.
+    /// [`crate::cpu_stall::CpuStallTracker::sweep`], which has no per-cell
+    /// loop of its own to drive individual [`Self::pid_of`] lookups from.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, String, u32)> {
+        self.lock()
+            .iter()
+            .map(|((run_id, session_id), &pid)| (run_id.clone(), session_id.clone(), pid))
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), u32>> {
         self.inner.lock().expect("procreg mutex poisoned")
     }

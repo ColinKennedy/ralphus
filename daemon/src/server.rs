@@ -13316,6 +13316,10 @@ pub fn serve<A: ToSocketAddrs>(
     // ralphus entirely -- still gets pulled back into this guardian's branch
     // order instead of silently drifting forever.
     crate::pr::spawn_pr_base_drift_poller(daemon.store_handle());
+    // RAL-308: the same PID registry the local runner reports its spawned
+    // subprocesses into (`with_registry` above), so the CPU-flat stall sweep
+    // sees every live cell/proof subprocess without a separate tracking path.
+    let procs = daemon.procs_handle();
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -13324,6 +13328,7 @@ pub fn serve<A: ToSocketAddrs>(
             cancellations,
             sem,
             summary_queue,
+            procs,
         );
     });
 
