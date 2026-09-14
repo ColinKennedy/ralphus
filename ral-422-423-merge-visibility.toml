@@ -1,0 +1,192 @@
+[[review]]
+id                   = "ralphus:new-review/ral-422-423"
+name                 = "RAL-422 / RAL-423"
+upstream             = "staging"
+agent                = "pi-openrouter-deepseek"
+proof_scope          = "nothing"
+auto_submit_pr_stack = true
+auto_fix_pr_errors   = true
+skip_auto_build      = true
+
+# ===========================================================================
+# RAL-422: Instrument the merge pipeline's silent phases
+# ===========================================================================
+[[task]]
+name    = "RAL-422"
+project = "ralphus"
+agent   = "pi-openrouter-deepseek"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-422: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-422-instrument-merge-pipeline?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-422-423>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run the relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-422: Instrument the merge pipeline's silent phases
+
+## Summary
+
+After a review's last branch finishes rebasing, `run_merge_shared` in `daemon/src/guardian_merge.rs` runs a sequence of further steps before the review reaches `in_review`. Every one of those steps is currently uninstrumented: no `rlog!`, no `cartographer_log`, no `log_event`, and no intermediate guardian status. The daemon is busy for many minutes and emits nothing at all, so the board has nothing to render and the review is indistinguishable from a hang.
+
+This was observed live on `guardian-000000000090`. Measured from its own review log and Cartographer rows:
+
+- `18:41:13` the last branch (`branch-000000000310`) transitions to `done` — the final logged event.
+- `18:41:40` the combined worktree is fully written to disk.
+- `18:41:57` a tmux session, two `ralphus-runner` processes and a node process spawn (the manual-checks agent).
+- `18:41:57` through `18:51:41` — **nine minutes forty-four seconds with zero log lines, zero Cartographer rows, and zero status changes.**
+- `18:51:41` `review -> in_review` appears, the first event in almost ten minutes.
+
+The immediately preceding merge cycle on the same review showed the same phase taking eleven minutes three seconds, so this is the normal duration of the phase, not an anomaly.
+
+## Values
+
+Missing instrumentation here is not only a logging-policy violation; it silently disables the board's entire live-update path. `daemon/src/events.rs` is fed exclusively by `Store::cartographer_log`, and its own module documentation states the assumption it rests on: "Cartographer already instruments every notable state transition". The board consumes that stream over `GET /api/events` as its primary refresh trigger, with only a sixty-second `setInterval` fallback behind it.
+
+So a phase that writes no Cartographer row emits no server-sent event, and a board watching that review does not refresh at all for the phase's whole duration except on the sixty-second fallback timer. The ten-minute silent phase above produced a frozen-looking review pane for exactly that reason. Restoring instrumentation restores push updates as a direct consequence.
+
+Beyond that, a review spending ten minutes in a phase that reports nothing is the single largest source of "is this stuck or is it working?" ambiguity in the product. Users cannot tell a healthy long-running phase from a dead merge worker, and the only way to find out today is to list operating-system processes by hand.
+
+## Risks
+
+- Over-logging a per-branch loop could flood Cartographer on a large stack; instrumentation must be per-phase, not per-iteration, except where a phase genuinely has per-branch substeps worth separating.
+- A new guardian status value is a state-machine change; adding one risks breaking status matches elsewhere in the daemon, the CLI, and the board.
+- Emitting a Cartographer row requires the store lock. These call sites sit in a background merge worker, and the lock must never be held across the subprocess or network call the phase is about to make.
+
+## Acceptance Criteria
+
+- [ ] `generate_manual_commands` (`daemon/src/guardian_merge.rs`) emits a paired start and completion record — stderr via `rlog!` and a structured Cartographer row — around its agent invocation, including the resolved agent and model and the elapsed duration on completion, and a distinct record when it returns early because there is nothing to summarize.
+- [ ] The same start/completion treatment is applied to every other currently-silent phase of the merge pipeline. A survey of the current code found these with zero instrumentation: `regenerate_readme`, `run_commit_checks`, `final_checks`, `claim_combined_review_ref_by_id`, and `compute_sync_status` in `daemon/src/pr.rs`. Verify this list against the code rather than trusting it, and instrument every silent phase found, not only the listed ones.
+- [ ] `final_checks`'s project-default `auto_build` tier logs the command it is about to run and the outcome. The review-declared `auto_build` tier already logs its outcome; bring it to the same start/done shape rather than leaving the two tiers inconsistent.
+- [ ] A review in the post-branch phase is distinguishable from one that is idle, from both the API and the board, without reading operating-system process lists.
+- [ ] Long phases report progress or at least liveness while running, not only on completion, so a phase that genuinely hangs is distinguishable from one that is merely slow.
+- [ ] Every new record follows `.agent/logging-policy.md`: stderr and Cartographer together, never stdout, with the `ralphus[ignore-rlog-pair]` marker used only where genuinely justified and with a reason.
+- [ ] A board connected to `GET /api/events` receives at least one event during each instrumented phase, so a review in a long phase refreshes from the push stream rather than only from the sixty-second fallback timer. Prove this with a test asserting the event bus publishes during the phase, not by inspection.
+- [ ] Audit the rest of the daemon for the same class of defect: any operation that can run for longer than the sixty-second fallback interval without writing a Cartographer row leaves the board un-pushed for its whole duration. Report what was found and fix what is in reach of this ticket.
+- [ ] Regression coverage proves each instrumented phase emits its records, including the failure and early-return paths, not only the happy path.
+- [ ] Auto-formatters run, linting passes, and relevant tests pass.
+
+## Technical Notes
+
+`run_merge_shared` is the orchestrator; read it end to end and treat every call it makes between the branch loop and `set_status(GuardianStatus::InReview, ...)` as in scope. `worktree_add_or_reset` is already instrumented and is a reasonable shape to copy.
+
+Observe the dogfooding restriction in AGENTS.md: do not run `cargo test --all-targets` or `cargo nextest run --all-targets`. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage.
+
+## Local implementation decisions
+
+- Prefer a phase-level guardian status or a phase field over a free-text notice, so the board can render the current phase name rather than parse a message.
+- If a new guardian status is introduced, audit every existing match on guardian status across `daemon/`, `cli/`, and `librarian/assets/board/` and update each one; a new status that falls through an existing match arm silently is worse than no new status.
+- Record elapsed duration on the completion record for every phase, so the ten-minute manual-checks phase is measurable from Cartographer alone in future.
+- Do not hold the store lock across the agent invocation or any subprocess spawn; acquire it only to write each record.
+"""
+
+    [[task.cell.proof]]
+    id     = "rust"
+    prompt = "Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and focused daemon tests. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`; use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Fix only task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected checks pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-422: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-422-instrument-merge-pipeline?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists. Do NOT run formatters, linters, or tests."
+  system_prompt_position = "append"
+  prompt                 = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists."
+
+# ===========================================================================
+# RAL-423: Stop slow PR drift checks from stalling the board
+# Stacked after RAL-422 because both touch the review pane's data flow.
+# ===========================================================================
+[[task]]
+name       = "RAL-423"
+project    = "ralphus"
+agent      = "pi-openrouter-deepseek"
+depends_on = ["RAL-422"]
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-423: work"
+  cwd                    = "<<ralphus:new-worktree/RAL-423-responsive-merge-feedback?upstream=staging>>"
+  upstream               = "<<task:RAL-422>>"
+  review                 = "<<ralphus:new-review/ral-422-423>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run the relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch, stacked on top of RAL-422's finalized branch.
+
+# RAL-423: Stop slow PR drift checks from stalling the board
+
+## Summary
+
+The "Merge / rebase" button stays on its "Starting…" pending label for tens of seconds to minutes after the daemon has already accepted the request, and the review pane renders stale branch and pull-request data for just as long. Neither is caused by the merge itself. Both are caused by the board's reload path serializing on `GET /api/pull-requests/{id}/sync-status`, which is slow because the RAL-366 background cache poller holds the very lock that endpoint needs.
+
+Measured on the running daemon, with seventy open pull requests across twenty-eight reviews:
+
+- `GET /api/pull-requests/{id}/sync-status` takes 7.7 s, 12.7 s, 17.6 s, 18.4 s and 20.6 s across repeated samples.
+- The underlying network operation the endpoint performs takes 1.8 s, measured directly with `git ls-remote`. The remaining time is lock wait, not work.
+- `GET /api/guardians`, a pure database read, takes 3.5 s to 10.3 s.
+- A full RAL-366 poller pass takes roughly 505 s against a configured 300 s interval, so the poller is effectively always running. Per-pull-request cost is a 5.5 s median and a 16.4 s ninetieth percentile.
+- The write worker answers in 176 ms to 203 ms, so nothing is queued behind mutating work.
+
+There are three separate contributors, all of which must be addressed for the symptom to go away:
+
+1. `refresh_pr_forge_cache_for_guardian` in `daemon/src/pr.rs` acquires every pull request's `SYNC_FETCH_LOCKS` entry with `try_lock`, then holds all of those guards across the loop that performs its forge comment API calls — two network round-trips per pull request. `fetch_remote_tip`, reached from `compute_sync_status`, takes the same lock with a blocking `lock()`. The doc comments on both the function and `docs/daemon-api.md` claim neither side waits on the other; that is only true in one direction, and the direction that matters to a user is the one that blocks.
+2. Each blocked request occupies one of the twelve read-pool workers for its entire blocked duration, so unrelated reads queue behind them. `READ_WORKERS`' own doc comment predicts exactly this starvation.
+3. `mergeReview` in `librarian/assets/board/65-reviews.js` holds its pending state until `await tick()` resolves, and `tick()` in `librarian/assets/board/70-sse.js` is a fully sequential await chain that ends in `pollReviews`, which itself awaits every open pull request's drift check before it finishes.
+
+## Values
+
+The merge button currently lies about how long the daemon took to accept a request, and the review pane shows stale state while a merge is actively progressing. Together they make healthy work look broken, which is what leads users to click the button repeatedly or conclude a review is stuck.
+
+## Risks
+
+- Releasing the drift locks earlier changes the poller's concurrency envelope against interactive callers; a pull request could be fetched by both sides at once if the release point is chosen carelessly.
+- Clearing the button's pending state earlier could re-enable it before the daemon's state transition is visible, reintroducing the double-submission this pending state exists to prevent.
+- The board's per-poll drift fetches write into shared state; making them non-blocking must not let a slow response from an earlier poll overwrite a newer one.
+
+## Acceptance Criteria
+
+- [ ] The RAL-366 cache poller no longer holds any pull request's drift-check lock across a forge network call. The drift pass and the comment pass are separated so the guards are released before the comment fetches begin.
+- [ ] An interactive `sync-status` request is never blocked by the background poller for longer than one pull request's own git fetch, and this is proven by a regression test rather than asserted in a comment.
+- [ ] The doc comments on `refresh_pr_forge_cache_for_guardian` and the matching prose in `docs/daemon-api.md` are corrected to describe the actual behavior in both directions.
+- [ ] `sync-status` served under normal conditions is close to the cost of its own git fetch, not a multiple of it.
+- [ ] The "Merge / rebase" pending state clears when the daemon answers the kickoff request, not after a full board reload, while still preventing double submission.
+- [ ] The review pane renders pull-request badges and branch state from data that has already arrived instead of waiting on every open pull request's drift check.
+- [ ] A drift result arriving from an earlier poll can never overwrite a newer poll's value.
+- [ ] Auto-formatters run, linting passes, and relevant tests pass, including the board's own pure tests.
+
+## Technical Notes
+
+The working tree this ticket's branch is cut from may already contain an uncommitted partial change to `pollPullRequests` in `librarian/assets/board/70-sse.js` that stops it awaiting the drift checks. Do not assume it is present. Implement the board-side change in this worktree from scratch, and keep it as small and self-contained as possible so that reconciling it with any local edit is trivial.
+
+RAL-366 added a cached forge state table and a `GET /api/pull-requests/forge-cache-index` endpoint that no consumer currently reads. Consider whether `compute_sync_status` should serve from that cache when the cached observation is recent enough, falling back to a live check otherwise. That was the stated purpose of the cache and it would remove the contention at its source rather than shortening the window.
+
+Observe the dogfooding restriction in AGENTS.md: do not run `cargo test --all-targets` or `cargo nextest run --all-targets`. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage.
+
+## Local implementation decisions
+
+- Split the poller's per-guardian loop into a drift pass that holds the guards and a comment pass that runs after they are dropped, rather than trying to release individual guards inside the existing single loop.
+- Keep the existing non-blocking `try_lock` behavior for the drift pass; a pull request an interactive caller is already checking should still be skipped for that cycle.
+- Clear the merge button's pending state on the daemon's response, and rely on the review's own status transition out of a startable state to keep the button disabled afterwards.
+- Do not change the poll interval or the poller's on/off switch as a workaround; the contention is the defect.
+"""
+
+    [[task.cell.proof]]
+    id     = "rust"
+    prompt = "Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and focused daemon tests. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`; use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Fix only task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected checks pass."
+
+    [[task.cell.proof]]
+    id     = "web"
+    prompt = "Run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and the relevant board tests. Fix only task-caused failures and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected checks pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-423: finalize"
+  cwd                    = "<<ralphus:new-worktree/RAL-423-responsive-merge-feedback?upstream=staging>>"
+  depends_on             = ["work"]
+  system_prompt          = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists. Do NOT run formatters, linters, or tests."
+  system_prompt_position = "append"
+  prompt                 = "ONLY git stage the relevant source files, commit them, and push the commit if a remote exists."
