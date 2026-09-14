@@ -413,6 +413,31 @@ impl Daemon {
     ///
     /// Snapshot consistency comes from the read transaction inside
     /// `board_snapshot_conn`, not from excluding the writer.
+    /// Run `f` against a pooled read-only connection inside one read
+    /// transaction, so a multi-statement read observes a single consistent
+    /// snapshot and never takes the writer lock. Falls back to the writer
+    /// connection when the pool has none (see [`ReadConnPool::acquire`]).
+    ///
+    /// The transaction is what preserves the atomicity the writer lock used
+    /// to supply implicitly — see [`Store::board_snapshot_conn`] for the
+    /// torn-read this prevents.
+    pub(crate) fn with_read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        match self.read_pool.acquire() {
+            Some(conn) => {
+                let tx = conn.unchecked_transaction()?;
+                f(&tx)
+            }
+            None => {
+                let store = self.lock();
+                let tx = store.conn.unchecked_transaction()?;
+                f(&tx)
+            }
+        }
+    }
+
     pub(crate) fn read_board_snapshot(&self) -> crate::store::Result<crate::store::BoardSnapshot> {
         match self.read_pool.acquire() {
             Some(conn) => Store::board_snapshot_conn(&conn),
@@ -7387,7 +7412,10 @@ fn add_dependency(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// Dry-run preview of [`restart_squad`]: computes the same downstream-impact
 /// set the real restart would dirty, without mutating anything (RAL-104).
 fn restart_squad_preview(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().compute_squad_restart_impact(id) {
+    // Read-only dry run: served from the read pool, so it no longer queues
+    // behind whatever holds the writer lock. That wait, not the graph walk,
+    // is what made this preview take many seconds on a busy daemon.
+    match daemon.with_read_snapshot(|c| Store::compute_squad_restart_impact_conn(c, id)) {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
     }
@@ -7505,9 +7533,9 @@ fn restart_cell_preview(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply 
             vec![],
         );
     };
+    // Read-only dry run -- see `restart_squad_preview` above.
     match daemon
-        .lock()
-        .compute_cell_restart_impact(id, task_idx, cell_idx)
+        .with_read_snapshot(|c| Store::compute_cell_restart_impact_conn(c, id, task_idx, cell_idx))
     {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
@@ -7574,7 +7602,8 @@ fn restart_task_preview(daemon: &Daemon, id: &str, ti: &str) -> Reply {
     let Ok(task_idx) = ti.parse::<i64>() else {
         return error(400, "bad_request", "task index must be an integer", vec![]);
     };
-    match daemon.lock().compute_task_restart_impact(id, task_idx) {
+    // Read-only dry run -- see `restart_squad_preview` above.
+    match daemon.with_read_snapshot(|c| Store::compute_task_restart_impact_conn(c, id, task_idx)) {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
     }
