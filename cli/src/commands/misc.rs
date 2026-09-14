@@ -1130,6 +1130,9 @@ pub struct CheckArgs {
 
 pub fn parse_check(scanner: &mut Scanner) -> super::Command {
     let tail = scanner.clone().remaining();
+    if tail.first().map(String::as_str) == Some("catalog") {
+        return super::Command::CheckCatalog;
+    }
     let mut inner = Scanner::new(if tail.first().map(String::as_str) == Some("health") {
         &tail[1..]
     } else {
@@ -1271,6 +1274,44 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
     }
 
     if failed > 0 { 1 } else { 0 }
+}
+
+/// RAL-416: `ralphus check catalog` -- every `ralphus_core::health_catalog`
+/// entry, with no probes run. Distinct from `check health`'s JSON output
+/// (which is every *result*, one per catalog entry actually evaluated this
+/// run): this is the catalog itself, instant and side-effect-free, useful
+/// for a board/report surface to render section groupings and cost/
+/// requirement metadata without first triggering a real check pass.
+pub fn cmd_check_catalog(opts: &GlobalOpts) -> i32 {
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(ralphus_core::health_catalog::CATALOG).unwrap_or_default()
+        );
+        return 0;
+    }
+    for (section, title) in [
+        (crate::health::CORE, "Core"),
+        (crate::health::HARNESS, "Harness"),
+        (crate::health::MACHINE, "Machine"),
+    ] {
+        let entries: Vec<_> = ralphus_core::health_catalog::CATALOG
+            .iter()
+            .filter(|e| e.section == section)
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        println!("{title}:");
+        for e in entries {
+            println!(
+                "  {} ({:?}, {:?}, {:?}) -- {}",
+                e.id, e.applicability, e.cost_tier, e.requirement, e.label
+            );
+            println!("        impact: {}", e.impact);
+        }
+    }
+    0
 }
 
 // ---- completion / configuration / initialize --------------------------------
@@ -1431,6 +1472,7 @@ mod tests {
                 status: "pass",
                 detail: "reachable (ralphus-daemon 1.2.3)".to_string(),
                 section: crate::health::CORE,
+                id: "daemon".to_string(),
                 impact: "The CLI can submit and monitor tasks.".to_string(),
                 remediation: "No action needed.".to_string(),
                 provenance: None,
@@ -1440,6 +1482,7 @@ mod tests {
                 status: "fail",
                 detail: "task.maximum_timeout_seconds is -5; must be >= 0 (0 = unbounded, positive = seconds)".to_string(),
                 section: crate::health::CORE,
+                id: "config".to_string(),
                 impact: "Every subprocess timeout computation is undefined with a negative cap; task execution behavior becomes unreliable.".to_string(),
                 remediation: "Set task.maximum_timeout_seconds to 0 (unbounded) or a positive number of seconds.".to_string(),
                 provenance: Some("/repo/.ralphus.toml".to_string()),
@@ -1449,6 +1492,7 @@ mod tests {
                 status: "skip",
                 detail: "not found on PATH, but no registered project uses Git".to_string(),
                 section: crate::health::HARNESS,
+                id: "git".to_string(),
                 impact: "None today -- every registered project's vcs kind is non-Git.".to_string(),
                 remediation: "If you register a Git-based project later, install git and re-run this check.".to_string(),
                 provenance: None,
@@ -1458,6 +1502,7 @@ mod tests {
                 status: "fail",
                 detail: "no tmux-compatible binary found".to_string(),
                 section: crate::health::HARNESS,
+                id: "tmux".to_string(),
                 impact: "Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.".to_string(),
                 remediation: "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path.".to_string(),
                 provenance: None,
@@ -1467,6 +1512,7 @@ mod tests {
                 status: "warn",
                 detail: "not found on PATH".to_string(),
                 section: crate::health::MACHINE,
+                id: "nvidia-smi".to_string(),
                 impact: "The resource view's GPU column shows N/A instead of live usage; nothing else is affected.".to_string(),
                 remediation: "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.".to_string(),
                 provenance: None,
@@ -1528,6 +1574,7 @@ Configuration file issues:
             status: "pass",
             detail: "reachable".to_string(),
             section: crate::health::CORE,
+            id: "daemon".to_string(),
             impact: "impact".to_string(),
             remediation: "No action needed.".to_string(),
             provenance: None,
@@ -1558,6 +1605,7 @@ Configuration file issues:
         let config_check = checks.iter().find(|c| c["name"] == "config").unwrap();
         assert_eq!(config_check["section"], "core");
         assert_eq!(config_check["status"], "fail");
+        assert_eq!(config_check["id"], "config");
         assert_eq!(config_check["provenance"], "/repo/.ralphus.toml");
         assert!(config_check["impact"].as_str().unwrap().contains("timeout"));
         assert!(

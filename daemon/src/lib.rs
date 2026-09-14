@@ -25,6 +25,7 @@ pub mod generation;
 pub mod ghost;
 pub mod guardian;
 pub mod guardian_merge;
+pub mod health_sweep;
 pub mod health_targets;
 pub mod hidden;
 pub mod jobobject;

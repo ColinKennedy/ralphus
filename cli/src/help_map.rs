@@ -686,20 +686,31 @@ const AGENT_CHILDREN: &[HelpNode] = &[node(
     &[],
 )];
 
-const CHECK_CHILDREN: &[HelpNode] = &[node(
-    "health",
-    &[],
-    &[
-        "--enable-developer-checks",
-        "--all-remotes",
-        "--enable-live-agent-check",
-        "--json",
-    ],
-    "Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).",
-    true, // ("check", "health") -- multi-step subprocess/filesystem work
-    true, // ("check", "health")
-    &[],
-)];
+const CHECK_CHILDREN: &[HelpNode] = &[
+    node(
+        "health",
+        &[],
+        &[
+            "--enable-developer-checks",
+            "--all-remotes",
+            "--enable-live-agent-check",
+            "--json",
+        ],
+        "Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).",
+        true, // ("check", "health") -- multi-step subprocess/filesystem work
+        true, // ("check", "health")
+        &[],
+    ),
+    node(
+        "catalog",
+        &[],
+        &["--json"],
+        "List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.",
+        false, // ("check", "catalog") -- pure in-memory lookup, no subprocess/filesystem work
+        true,  // ("check", "catalog")
+        &[],
+    ),
+];
 
 const INITIALIZE_CHILDREN: &[HelpNode] = &[node(
     "git",
