@@ -11146,7 +11146,14 @@ struct PositionResponse {
 }
 
 fn guardian_list(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_guardians() {
+    // Served from the read pool inside one read transaction. This is the
+    // Reviews tab's poll: ~600KB and multiple seconds against a real review
+    // history, since every guardian is hydrated individually. Holding the
+    // writer lock for that stalled the scheduler and every merge worker --
+    // and, because the `MutexGuard` was a temporary in the `match`
+    // scrutinee, it stayed held across the `json(...)` serialization below
+    // as well.
+    match daemon.with_read_snapshot(Store::list_guardians_conn) {
         Ok(gs) => {
             // RAL-121: this list only ever needs to show summary DATA for the
             // one review the user actually opens (`guardian_get` promotes

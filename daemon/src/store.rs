@@ -4775,8 +4775,15 @@ impl Store {
     /// Consulted by [`Self::resolve_review_config`] as a layer over the
     /// file-based `.ralphus.toml [review]` defaults.
     pub fn get_project_review_settings(&self, project: &str) -> Result<ProjectReviewSettings> {
-        let raw: Option<String> = self
-            .conn
+        Self::get_project_review_settings_conn(&self.conn, project)
+    }
+    /// [`Self::get_project_review_settings`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn get_project_review_settings_conn(
+        conn: &Connection,
+        project: &str,
+    ) -> Result<ProjectReviewSettings> {
+        let raw: Option<String> = conn
             .query_row(
                 "SELECT settings_json FROM project_review_settings WHERE project=?",
                 params![project],
@@ -4815,8 +4822,17 @@ impl Store {
     /// that project has never saved any settings here.
     #[must_use]
     pub fn project_review_settings_for_path(&self, path: &str) -> ProjectReviewSettings {
-        self.project_name_for_path(path)
-            .and_then(|name| self.get_project_review_settings(&name).ok())
+        Self::project_review_settings_for_path_conn(&self.conn, path)
+    }
+    /// [`Self::project_review_settings_for_path`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    #[must_use]
+    pub(crate) fn project_review_settings_for_path_conn(
+        conn: &Connection,
+        path: &str,
+    ) -> ProjectReviewSettings {
+        Self::project_name_for_path_conn(conn, path)
+            .and_then(|name| Self::get_project_review_settings_conn(conn, &name).ok())
             .unwrap_or_default()
     }
 
@@ -4829,9 +4845,17 @@ impl Store {
     /// today.
     #[must_use]
     pub fn resolve_review_config(&self, cwd: &Path) -> crate::config::ReviewConfig {
+        Self::resolve_review_config_conn(&self.conn, cwd)
+    }
+    /// [`Self::resolve_review_config`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    #[must_use]
+    pub(crate) fn resolve_review_config_conn(
+        conn: &Connection,
+        cwd: &Path,
+    ) -> crate::config::ReviewConfig {
         let file_cfg = crate::config::resolve(cwd);
-        let db_cfg = self
-            .project_review_settings_for_path(&cwd.to_string_lossy())
+        let db_cfg = Self::project_review_settings_for_path_conn(conn, &cwd.to_string_lossy())
             .into_review_config();
         file_cfg.merge(db_cfg)
     }
@@ -4879,8 +4903,13 @@ impl Store {
     /// this guardian's `git_root` belong to" for fork resolution -- a
     /// guardian has no direct project foreign key, only a filesystem path.
     pub fn project_name_for_path(&self, path: &str) -> Option<String> {
+        Self::project_name_for_path_conn(&self.conn, path)
+    }
+    /// [`Self::project_name_for_path`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn project_name_for_path_conn(conn: &Connection, path: &str) -> Option<String> {
         let trimmed = Self::normalize_for_project_lookup(path);
-        let mut stmt = self.conn.prepare("SELECT name, path FROM projects").ok()?;
+        let mut stmt = conn.prepare("SELECT name, path FROM projects").ok()?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .ok()?
@@ -4943,8 +4972,10 @@ impl Store {
     /// separate full-table-scan queries *per guardian*. Same
     /// swallow-and-return-empty failure mode as `project_bool_stamp` (a
     /// project lookup is best-effort, never a hard error).
-    pub(crate) fn load_all_project_stamps(&self) -> Vec<(String, ProjectStamps)> {
-        let mut stmt = match self.conn.prepare(
+    /// [`Self::load_all_project_stamps`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn load_all_project_stamps_conn(conn: &Connection) -> Vec<(String, ProjectStamps)> {
+        let mut stmt = match conn.prepare(
             "SELECT path, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch FROM projects",
         ) {
             Ok(s) => s,
@@ -6962,6 +6993,14 @@ impl Store {
         &self,
         refs: &[CellRef],
     ) -> Result<HashMap<CellRef, BTreeMap<String, String>>> {
+        Self::resolve_cell_env_overrides_batch_conn(&self.conn, refs)
+    }
+    /// [`Self::resolve_cell_env_overrides_batch`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn resolve_cell_env_overrides_batch_conn(
+        conn: &Connection,
+        refs: &[CellRef],
+    ) -> Result<HashMap<CellRef, BTreeMap<String, String>>> {
         if refs.is_empty() {
             return Ok(HashMap::new());
         }
@@ -6975,7 +7014,7 @@ impl Store {
 
         let mut squad_env: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, env_overrides FROM squads WHERE id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
@@ -6989,7 +7028,7 @@ impl Store {
 
         let mut task_env: HashMap<(String, i64), BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT squad_id, idx, env_overrides FROM tasks WHERE squad_id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
@@ -7007,7 +7046,7 @@ impl Store {
 
         let mut cell_env: HashMap<(String, i64, i64), BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT squad_id, task_idx, idx, env_overrides FROM cells WHERE squad_id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {

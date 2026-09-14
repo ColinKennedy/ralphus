@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::store::{ProofView, Result, Store, StoreError};
@@ -992,14 +992,13 @@ pub fn terminal_modes_for(
     resolver_agent: Option<&str>,
     has_session_id: bool,
     has_worktree: bool,
-    store: &Store,
+    conn: &Connection,
     cwd: &Path,
 ) -> Vec<&'static str> {
     if has_session_id {
         return vec!["readonly", "open"];
     }
-    let default_agent = store
-        .resolve_review_config(cwd)
+    let default_agent = Store::resolve_review_config_conn(conn, cwd)
         .default_resolver_agent()
         .to_string();
     let agent = resolver_agent.unwrap_or(&default_agent);
@@ -1223,11 +1222,13 @@ impl Store {
 
     /// Every input-resolution row for `guardian_id` (RAL-164), for
     /// [`GuardianView::input_resolutions`].
-    fn guardian_input_resolutions(
-        &self,
+    /// [`Self::guardian_input_resolutions`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    fn guardian_input_resolutions_conn(
+        conn: &Connection,
         guardian_id: &str,
     ) -> Result<std::collections::HashMap<String, InputResolutionView>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT input_name, status, value FROM guardian_input_resolutions WHERE guardian_id=?",
         )?;
         let rows = stmt
@@ -2409,7 +2410,15 @@ impl Store {
     /// `(tokens_in, tokens_out, cost_usd)` cumulative across every
     /// rebase/re-merge attempt.
     pub fn guardian_cost_total(&self, guardian_id: &str) -> Result<(i64, i64, f64)> {
-        Ok(self.conn.query_row(
+        Self::guardian_cost_total_conn(&self.conn, guardian_id)
+    }
+    /// [`Self::guardian_cost_total`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn guardian_cost_total_conn(
+        conn: &Connection,
+        guardian_id: &str,
+    ) -> Result<(i64, i64, f64)> {
+        Ok(conn.query_row(
             "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COALESCE(SUM(cost_usd),0)
              FROM guardian_costs WHERE guardian_id=?",
             params![guardian_id],
@@ -2424,7 +2433,16 @@ impl Store {
         guardian_id: &str,
         attempt: i64,
     ) -> Result<(i64, i64, f64)> {
-        Ok(self.conn.query_row(
+        Self::guardian_cost_total_for_attempt_conn(&self.conn, guardian_id, attempt)
+    }
+    /// [`Self::guardian_cost_total_for_attempt`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn guardian_cost_total_for_attempt_conn(
+        conn: &Connection,
+        guardian_id: &str,
+        attempt: i64,
+    ) -> Result<(i64, i64, f64)> {
+        Ok(conn.query_row(
             "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COALESCE(SUM(cost_usd),0)
              FROM guardian_costs WHERE guardian_id=? AND attempt=?",
             params![guardian_id, attempt],
@@ -3867,7 +3885,12 @@ impl Store {
 
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_guardians_conn(&self.conn)
+    }
+    /// [`Self::list_guardians`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
+        let mut stmt = conn.prepare(
             "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
@@ -3881,9 +3904,9 @@ impl Store {
         // mirrors how `build_squad_view` batches its own per-squad queries
         // (see the RAL-121-style comment there) rather than forking the
         // response into a separate lean/full shape.
-        let ctx = self.build_hydration_ctx(rows.iter().map(|r| r.git_root.as_str()));
+        let ctx = Self::build_hydration_ctx_conn(conn, rows.iter().map(|r| r.git_root.as_str()));
         rows.into_iter()
-            .map(|r| self.hydrate_guardian(r, &ctx))
+            .map(|r| Self::hydrate_guardian_conn(conn, r, &ctx))
             .collect()
     }
 
@@ -3897,20 +3920,28 @@ impl Store {
         &self,
         git_roots: impl Iterator<Item = &'a str>,
     ) -> GuardianHydrationCtx {
+        Self::build_hydration_ctx_conn(&self.conn, git_roots)
+    }
+    /// [`Self::build_hydration_ctx`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    fn build_hydration_ctx_conn<'a>(
+        conn: &Connection,
+        git_roots: impl Iterator<Item = &'a str>,
+    ) -> GuardianHydrationCtx {
         let mut config_by_git_root = std::collections::HashMap::new();
         for root in git_roots {
             config_by_git_root
                 .entry(root.to_string())
                 .or_insert_with(|| {
                     (
-                        self.resolve_review_config(Path::new(root)),
+                        Self::resolve_review_config_conn(conn, Path::new(root)),
                         crate::config::project_review_config(Path::new(root)),
-                        self.project_review_settings_for_path(root),
+                        Self::project_review_settings_for_path_conn(conn, root),
                     )
                 });
         }
         GuardianHydrationCtx {
-            project_stamps: self.load_all_project_stamps(),
+            project_stamps: Self::load_all_project_stamps_conn(conn),
             live_global: crate::config::global_review_config(),
             config_by_git_root,
         }
@@ -3986,13 +4017,22 @@ impl Store {
         row: GuardianRow,
         ctx: &GuardianHydrationCtx,
     ) -> Result<GuardianView> {
+        Self::hydrate_guardian_conn(&self.conn, row, ctx)
+    }
+    /// [`Self::hydrate_guardian`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    fn hydrate_guardian_conn(
+        conn: &Connection,
+        row: GuardianRow,
+        ctx: &GuardianHydrationCtx,
+    ) -> Result<GuardianView> {
         // RAL-121: one correlated subquery per branch (finding that branch's
         // most-recent cell by rowid) instead of the previous four -- each of
         // state/squad_id/task_idx/idx was a separate subquery re-scanning
         // `cells` for the same row. Paired with `idx_cells_review_branch`
         // (see `store.rs`'s migration list) this is now an index seek, not a
         // table scan, per branch.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT gb.position, gb.branch, gb.merge_status, gb.detail, gb.review_branch,
                     gb.worktree, gb.conflicts_found, gb.conflicts_fixed, gb.conflicts_committed,
                     gb.enabled, gb.project, gb.dismissed_reenable,
@@ -4029,7 +4069,7 @@ impl Store {
                     row.resolver_agent.as_deref(),
                     resolver_agent_session_id.is_some(),
                     worktree.is_some(),
-                    self,
+                    conn,
                     Path::new(&row.git_root),
                 );
                 Ok(BranchView {
@@ -4092,9 +4132,8 @@ impl Store {
                 }
             })
             .collect();
-        let resolved_envs = self
-            .resolve_cell_env_overrides_batch(&env_refs)
-            .unwrap_or_default();
+        let resolved_envs =
+            Self::resolve_cell_env_overrides_batch_conn(conn, &env_refs).unwrap_or_default();
         for b in &mut branches {
             b.inherited_env = match (
                 b.source_squad_id.as_deref(),
@@ -4190,7 +4229,7 @@ impl Store {
         } else {
             "waiting"
         };
-        let input_resolutions = self.guardian_input_resolutions(&row.id)?;
+        let input_resolutions = Self::guardian_input_resolutions_conn(conn, &row.id)?;
 
         // RAL-203: the combined worktree has no upstream task cell of its
         // own to inherit an environment from (unlike a per-branch worktree,
@@ -4319,9 +4358,9 @@ impl Store {
         // decision), which is why this sums `guardian_costs` rather than
         // joining `cells`.
         let (attempt_tokens_in, attempt_tokens_out, attempt_cost_usd) =
-            self.guardian_cost_total_for_attempt(&row.id, row.merge_attempt)?;
+            Self::guardian_cost_total_for_attempt_conn(conn, &row.id, row.merge_attempt)?;
         let (cumulative_tokens_in, cumulative_tokens_out, cumulative_cost_usd) =
-            self.guardian_cost_total(&row.id)?;
+            Self::guardian_cost_total_conn(conn, &row.id)?;
 
         Ok(GuardianView {
             id: row.id,
@@ -4843,11 +4882,11 @@ mod tests {
         // or worktree presence.
         let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(None, true, false, &store, Path::new(".")),
+            terminal_modes_for(None, true, false, &store.conn, Path::new(".")),
             vec!["readonly", "open"]
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), true, true, &store, Path::new(".")),
+            terminal_modes_for(Some("ollama"), true, true, &store.conn, Path::new(".")),
             vec!["readonly", "open"]
         );
     }
@@ -4857,7 +4896,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         for agent in ["claude-code", "codex", "codex-cli", "pi"] {
             assert_eq!(
-                terminal_modes_for(Some(agent), false, true, &store, Path::new(".")),
+                terminal_modes_for(Some(agent), false, true, &store.conn, Path::new(".")),
                 vec!["worktree"]
             );
         }
@@ -4867,15 +4906,21 @@ mod tests {
     fn terminal_modes_none_available_without_cell_or_worktree() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(Some("claude-code"), false, false, &store, Path::new(".")),
+            terminal_modes_for(
+                Some("claude-code"),
+                false,
+                false,
+                &store.conn,
+                Path::new(".")
+            ),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), false, true, &store, Path::new(".")),
+            terminal_modes_for(Some("ollama"), false, true, &store.conn, Path::new(".")),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(None, false, false, &store, Path::new(".")),
+            terminal_modes_for(None, false, false, &store.conn, Path::new(".")),
             Vec::<&str>::new()
         );
     }
