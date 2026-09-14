@@ -70,3 +70,6 @@ ignore_names = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "heavy: large-fixture/slow tests (e.g. RAL-414 board cold-load perf: real Chromium + a real compiled ralphus-librarian + hundreds of fixture rows) -- opt in with `-m heavy`, or exclude with `-m 'not heavy'`; a plain `uv run pytest` still runs them like anything else.",
+]
