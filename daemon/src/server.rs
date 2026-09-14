@@ -1916,23 +1916,22 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
 /// Compact cross-squad task data for the Tasks tab, with stage timings that
 /// separate store-lock contention, view construction, and serialization.
 fn task_index(daemon: &Daemon) -> Reply {
-    let lock_started = Instant::now();
-    let store = daemon.lock();
-    let lock_wait_ms = lock_started.elapsed().as_millis();
-    let view_started = Instant::now();
-    let squads = match store.list_squads() {
-        Ok(squads) => squads,
+    // Same read as `board` above, served from the same pooled snapshot --
+    // this endpoint reads exactly the two things `board_snapshot_conn`
+    // returns, so there is no reason for it to take the writer lock either.
+    // The Tasks tab polls it, and `updateCounter` polls it from every other
+    // tab, so it is nearly as hot as `/api/tasks` itself.
+    let read_started = Instant::now();
+    let (squads, merging) = match daemon.read_board_snapshot() {
+        Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let view_ms = view_started.elapsed().as_millis();
+    let view_ms = read_started.elapsed().as_millis();
     let running = daemon.sem.in_use();
-    let running_reviews = store
-        .merging_guardians()
-        .unwrap_or_default()
+    let running_reviews = merging
         .into_iter()
         .map(|(id, name)| RunningReviewItem { id, name })
         .collect();
-    drop(store);
     let response = TaskIndexBoard {
         daemon: DaemonStatus {
             running,
@@ -1947,8 +1946,7 @@ fn task_index(daemon: &Daemon) -> Reply {
     // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
     crate::rlog!(
         INFO,
-        "ralphus [performance] task-index lock_wait={}ms view={}ms serialize={}ms bytes={}",
-        lock_wait_ms,
+        "ralphus [performance] task-index read={}ms serialize={}ms bytes={}",
         view_ms,
         serialize_started.elapsed().as_millis(),
         reply.body.len()
