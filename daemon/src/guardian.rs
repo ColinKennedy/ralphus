@@ -7589,6 +7589,36 @@ mod tests {
         );
     }
 
+    /// RAL-424: `reset_guardian_to_collecting` must accept `merge_failed` as
+    /// a source state, not just `merging`/`in_review`. It's the mechanism
+    /// `restart_guardian_merge` uses to re-arm `kickoff_merge`'s per-branch
+    /// cell-readiness gate (which only fires while genuinely `collecting`)
+    /// before re-attempting a merge on a review that previously failed.
+    #[test]
+    fn reset_guardian_to_collecting_accepts_merge_failed() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        store
+            .set_guardian_status(&id, GuardianStatus::MergeFailed, Some("boom"))
+            .unwrap();
+        store.reset_guardian_to_collecting(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+    }
+
+    /// Guards the fix above from over-widening: a terminal `approved` review
+    /// must still refuse to be reset back to `collecting`.
+    #[test]
+    fn reset_guardian_to_collecting_still_rejects_a_terminal_status() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(&id, GuardianStatus::Approved, None)
+            .unwrap();
+
+        assert!(store.reset_guardian_to_collecting(&id).is_err());
+    }
+
     #[test]
     fn guardian_branches_still_in_flight_reports_a_branch_whose_cell_has_not_finished() {
         let mut store = Store::open_in_memory().unwrap();
