@@ -190,6 +190,7 @@
         else if (tab === "users") { await updateCounter(); await pollUsers(); }
         else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
         else if (tab === "worktree-retirement") { await updateCounter(); await pollWorktreeRetirements(); }
+        else if (tab === "health") { await updateCounter(); await pollHealth(); }
         else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
         else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
         else { await ensureProjectsLoadedForFilters(); await pollTasks(); }

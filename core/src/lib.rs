@@ -7,7 +7,9 @@
 pub mod agent_resume;
 mod bench_demo;
 pub mod cors;
+pub mod health_catalog;
 pub mod license;
+pub mod process;
 pub mod redact;
 pub mod schema;
 pub mod uri;
