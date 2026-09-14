@@ -27,7 +27,7 @@ uv run pytest                       # run one: uv run pytest -k name
 |---|---|
 | `test_docsgen_helpmap.py` | `helpmap_docs.py`'s marker splice + drift-check logic, and a real (non-mocked) call into the compiled `ralphus show help-map` |
 | `test_docsgen_lint.py` | `lint.py`'s `board_tabs()` scan: the `TABS` array found in a `board/*.js` chunk, in board.html itself, or nowhere (error) |
-| `test_board_cold_load_perf.py` | RAL-414: real-Chromium cold-navigation timing for the Squads/Tasks/Retirements/Projects tabs against large (600+ row) fixtures; `heavy`-marked, needs a compiled `ralphus-librarian` (skips cleanly without one) |
+| `test_board_cold_load_perf.py` | RAL-414: real-Chromium cold-navigation timing for the Squads/Tasks/Retirements/Projects tabs against large (600+ row) fixtures; `heavy`-marked, needs a compiled `ralphus-librarian` + playwright's chromium (skips cleanly without either) -- the `python-lint`/`python-test` CI jobs don't install either, so this only actually runs in the dedicated `perf-tests` job (`.github/workflows/ci.yml`) |
 | `test_bench_storage.py` | Bench record read/write, filename hashing |
 | `test_bench_graphs.py` | SVG/HTML rendering from stored records |
 | `test_bench_gitinfo.py` | Git commit/dirty-state detection |
