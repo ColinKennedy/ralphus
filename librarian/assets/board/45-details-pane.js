@@ -7,6 +7,10 @@
         const el = byId("graph");
         const squad = findSquad(selectedSquadId);
         if (!squad) { el.innerHTML = `<div class="empty">Select a squad.</div>`; return; }
+        if (squad.state === "materializing") {
+          el.innerHTML = `<div class="empty materializing-graph" data-tip="This squad is creating its worktrees and deriving its review plan. Its task graph will appear when materialization finishes.">Materializing squad…</div>`;
+          return;
+        }
         /**
          * @param {string} k
          * @param {number} [t]

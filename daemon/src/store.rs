@@ -192,9 +192,10 @@ impl NodeState {
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
 /// One row from [`Store::proof_specs`]:
-/// `(idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
+/// `(idx, id, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
 pub type ProofSpecRow = (
     i64,
+    Option<String>,
     String,
     String,
     Option<String>,
@@ -1622,7 +1623,20 @@ impl Store {
                 remote_sha         TEXT,
                 local_sha          TEXT,
                 etag_conversation  TEXT,
-                etag_review        TEXT
+                etag_review        TEXT,
+                -- Per-half freshness. `last_checked_at_ms`/`status`/
+                -- `last_error` above are the rolled-up most-recent-of-either;
+                -- these describe each half on its own, because a pass
+                -- refreshes drift (git) and comments (forge) independently
+                -- and either can fail or be skipped alone. Without them a row
+                -- can claim to be seconds old while the half a caller
+                -- actually wants is hours stale.
+                drift_checked_at_ms    INTEGER,
+                drift_status           TEXT,
+                drift_error            TEXT,
+                comments_checked_at_ms INTEGER,
+                comments_status        TEXT,
+                comments_error         TEXT
             );
             -- RAL-366: the set of PR comments/notes last fetched by the
             -- background poller -- id/author/timestamp only, deliberately
@@ -2650,6 +2664,38 @@ impl Store {
             // Mirrors the above for the manual-checks generation pass -- see
             // `Store::stamp_guardian_manual_checks_finished_at`.
             "ALTER TABLE guardians ADD COLUMN manual_checks_finished_at_ms INTEGER",
+            // The post-merge phase: the check gates and manual-checks
+            // generation that run *after* a merge is already complete.
+            //
+            // A merge finishes when every branch has been rebased; these two
+            // jobs then run concurrently against the finished stack, and the
+            // review sits in `in_review` throughout rather than still claiming
+            // to be `merging`. They are deliberately a guardian *field* and not
+            // a `GuardianStatus` variant: the review's status is genuinely
+            // `in_review` while they run, and adding a status would mean
+            // auditing every match on one across the daemon, CLI, and board.
+            //
+            // `post_merge_status` is 'running', 'ok', or 'failed'; 'failed' is
+            // advisory and never blocks approval or PR submission -- it records
+            // that a gate reported a failure, nothing more.
+            // `post_merge_detail` carries what failed, NULL otherwise.
+            // Per-half freshness for `guardian_pr_forge_cache`. A poll pass
+            // refreshes drift (git) and comments (forge) independently, and
+            // either can fail or be skipped on its own, so one shared
+            // `last_checked_at_ms`/`status` pair cannot describe both without
+            // lying about one: a row could read "checked 2s ago, ok" while its
+            // drift columns were hours stale and its last git fetch had failed.
+            // `last_checked_at_ms`/`status` stay as the rolled-up view.
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_checked_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_status TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_error TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_checked_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_status TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_error TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_status TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_detail TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_started_at_ms INTEGER",
+            "ALTER TABLE guardians ADD COLUMN post_merge_finished_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -5619,6 +5665,12 @@ pub struct CellEdit<'a> {
     pub command: Option<Option<&'a str>>,
     /// Per-cell auto-compact trigger, in tokens (RAL-304).
     pub auto_compact_threshold: Option<Option<i64>>,
+    /// Per-cell context-window token limit (RAL-304). The caller
+    /// (`edit_squad`'s `"cell"` arm) rejects this up front when the cell's
+    /// effective agent has no delivery mechanism for it -- see
+    /// `ralphus_core::schema::agent_supports_maximum_context` -- before it
+    /// ever reaches the store.
+    pub maximum_context: Option<Option<i64>>,
     /// Per-cell cap on a single tool-call output, in tokens (RAL-333). The
     /// caller (`edit_squad`'s `"cell"` arm) rejects this up front when the
     /// cell's effective agent has no delivery mechanism for it -- see
@@ -5985,19 +6037,20 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
+            "SELECT idx, vid, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
             .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6414,6 +6467,8 @@ impl Store {
         let command_value = edit.command.flatten();
         let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
         let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
+        let maximum_context_touched = edit.maximum_context.is_some();
+        let maximum_context_value = edit.maximum_context.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
@@ -6437,6 +6492,7 @@ impl Store {
                 system_prompt = CASE WHEN :system_prompt_touched THEN :system_prompt ELSE system_prompt END,
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
                 auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
+                maximum_context = CASE WHEN :maximum_context_touched THEN :maximum_context ELSE maximum_context END,
                 maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
@@ -6456,6 +6512,8 @@ impl Store {
                 ":effective_system_prompt": effective_system_prompt,
                 ":auto_compact_threshold_touched": auto_compact_threshold_touched,
                 ":auto_compact_threshold": auto_compact_threshold_value,
+                ":maximum_context_touched": maximum_context_touched,
+                ":maximum_context": maximum_context_value,
                 ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
                 ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,

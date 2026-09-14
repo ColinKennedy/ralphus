@@ -284,7 +284,7 @@ fn resolve_agent_for_path_with(
 
 fn config_cwd_for_cell(
     store: &Store,
-    task: &ralphus_core::schema::TaskDef,
+    task_project: Option<&str>,
     cell: &ralphus_core::schema::CellDef,
 ) -> Option<PathBuf> {
     if let Some(cwd) = cell.cwd.as_deref() {
@@ -292,8 +292,7 @@ fn config_cwd_for_cell(
             return Some(PathBuf::from(cwd));
         }
     }
-    task.project
-        .as_deref()
+    task_project
         .and_then(|name| store.resolve_project(name).ok().flatten())
         .map(|p| PathBuf::from(p.path))
 }
@@ -323,7 +322,7 @@ fn validate_task_file_profiles_with(
                 .as_deref()
                 .or(task.agent.as_deref())
                 .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
-            let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
+            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
             let selection = match resolve_agent_for_path_with(agent, &cwd, configuration_path_env) {
@@ -456,7 +455,7 @@ fn validate_task_file_profiles_with(
                 if cell_review_id != Some(review_id) {
                     continue;
                 }
-                let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
+                let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                     continue;
                 };
                 if !seen_cwds.insert(cwd.clone()) {
@@ -497,7 +496,7 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
                 .as_deref()
                 .or(task.agent.as_deref())
                 .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
-            let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
+            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
             if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
@@ -520,7 +519,7 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
                     .as_deref()
                     .and_then(ralphus_core::schema::parse_cell_review_sentinel)
                     == Some(review_id))
-                .then(|| config_cwd_for_cell(store, task, cell))
+                .then(|| config_cwd_for_cell(store, task.project.as_deref(), cell))
                 .flatten()
             })
         });

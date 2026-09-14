@@ -41,6 +41,7 @@ pub enum CellCommand {
         prompt: Option<String>,
         command: Option<String>,
         auto_compact_threshold: Option<String>,
+        maximum_context: Option<String>,
         maximum_tool_output_tokens: Option<String>,
         system_prompt: Option<String>,
     },
@@ -114,6 +115,7 @@ pub fn parse(args: &[String]) -> CellCommand {
                 .take_value("--auto-compact-threshold")
                 .ok()
                 .flatten();
+            let maximum_context = scanner.take_value("--maximum-context").ok().flatten();
             let maximum_tool_output_tokens = scanner
                 .take_value("--maximum-tool-output-tokens")
                 .ok()
@@ -127,6 +129,7 @@ pub fn parse(args: &[String]) -> CellCommand {
                 prompt,
                 command,
                 auto_compact_threshold,
+                maximum_context,
                 maximum_tool_output_tokens,
                 system_prompt,
             })
@@ -368,6 +371,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             prompt,
             command,
             auto_compact_threshold,
+            maximum_context,
             maximum_tool_output_tokens,
             system_prompt,
         } => run_and_report(opts, None, || {
@@ -382,6 +386,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                 prompt.as_deref(),
                 command.as_deref(),
                 auto_compact_threshold.as_deref(),
+                maximum_context.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
                 system_prompt.as_deref(),
             )?;
@@ -645,6 +650,39 @@ mod tests {
                     Some("Do NOT commit and do NOT push.")
                 );
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_maximum_context() {
+        match parse(&v(&[
+            "edit",
+            "squad-1/build/0",
+            "--maximum-context",
+            "100000",
+        ])) {
+            CellCommand::Edit {
+                selector,
+                maximum_context,
+                ..
+            } => {
+                assert_eq!(selector, "squad-1/build/0");
+                assert_eq!(maximum_context.as_deref(), Some("100000"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_clearing_maximum_context_with_empty_value() {
+        // An empty value is the wire form for "clear it" -- it must survive
+        // parsing as `Some("")`, not collapse to `None` (which would mean
+        // "leave untouched").
+        match parse(&v(&["edit", "squad-1/build/0", "--maximum-context", ""])) {
+            CellCommand::Edit {
+                maximum_context, ..
+            } => assert_eq!(maximum_context.as_deref(), Some("")),
             other => panic!("unexpected: {other:?}"),
         }
     }

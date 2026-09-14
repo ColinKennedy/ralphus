@@ -119,6 +119,15 @@ pub struct PrComment {
     pub created_at: String,
 }
 
+/// Page size requested from every paginated forge listing.
+///
+/// Both GitHub and GitLab cap `per_page` at 100 and default to far less (30
+/// and 20). Requesting the maximum is what keeps a single page enough for all
+/// but the busiest PRs -- without it, a PR's 31st comment onward was invisible
+/// to `pull-feedback`, so that feedback was never actioned and the un-actioned
+/// count silently under-reported.
+const PER_PAGE: u32 = 100;
+
 /// Which comment endpoint [`ForgeClient::list_pr_comments_conditional`]
 /// polls (RAL-366). GitHub splits PR feedback across two REST resources --
 /// general conversation (`/issues/{n}/comments`) and inline review comments
@@ -1737,24 +1746,45 @@ impl ForgeClient {
         let token = self.require_token()?;
         match self.kind {
             ForgeKind::GitHub => {
-                // GitHub models a PR as an issue for general conversation comments.
-                let url = format!(
-                    "{}/repos/{}/issues/{number}/comments",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
-                let items = resp
-                    .as_array()
-                    .ok_or_else(|| format!("unexpected GitHub comments response shape: {resp}"))?;
-                Ok(parse_github_comments(items))
+                // GitHub splits PR feedback across two resources: general
+                // conversation (a PR is an issue) and inline review comments
+                // on the diff. Both are read, because this is what feeds
+                // `pull-feedback`, and a reviewer's line comments are usually
+                // the substantive half of a review.
+                //
+                // Reading only the conversation endpoint meant inline comments
+                // could never be claimed into `guardian_pr_feedback_actioned`,
+                // so they were never actioned into the worktree and the
+                // un-actioned count could never reach zero for any PR that had
+                // one.
+                let mut out = Vec::new();
+                for path in [
+                    format!("issues/{number}/comments"),
+                    format!("pulls/{number}/comments"),
+                ] {
+                    let url = format!(
+                        "{}/repos/{}/{path}?per_page={PER_PAGE}",
+                        self.api_base, self.repo_path
+                    );
+                    let resp = self.get(
+                        ureq::get(&url)
+                            .set("Authorization", &format!("Bearer {token}"))
+                            .set("Accept", "application/vnd.github+json"),
+                    )?;
+                    let items = resp.as_array().ok_or_else(|| {
+                        format!("unexpected GitHub comments response shape: {resp}")
+                    })?;
+                    out.extend(parse_github_comments(items));
+                }
+                // Oldest first across both sources, matching this method's
+                // documented ordering. Both endpoints emit ISO-8601 UTC, which
+                // sorts correctly as text.
+                out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                Ok(out)
             }
             ForgeKind::GitLab => {
                 let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes",
+                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
                 let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
@@ -1784,7 +1814,7 @@ impl ForgeClient {
         let req = match (self.kind, source) {
             (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => {
                 let url = format!(
-                    "{}/repos/{}/issues/{number}/comments",
+                    "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
                 ureq::get(&url)
@@ -1793,7 +1823,7 @@ impl ForgeClient {
             }
             (ForgeKind::GitHub, PrCommentEndpoint::Review) => {
                 let url = format!(
-                    "{}/repos/{}/pulls/{number}/comments",
+                    "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
                 ureq::get(&url)
@@ -1802,7 +1832,7 @@ impl ForgeClient {
             }
             (ForgeKind::GitLab, _) => {
                 let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes",
+                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
                     self.api_base, self.repo_path
                 );
                 ureq::get(&url).set("PRIVATE-TOKEN", token)
@@ -4785,7 +4815,10 @@ mod tests {
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
             let conv = server.recv().unwrap();
-            assert_eq!(conv.url(), "/repos/acme/widget/issues/7/comments");
+            assert_eq!(
+                conv.url(),
+                "/repos/acme/widget/issues/7/comments?per_page=100"
+            );
             assert_eq!(req_header(&conv, "If-None-Match"), None);
             conv.respond(
                 tiny_http::Response::from_string(
@@ -4797,7 +4830,10 @@ mod tests {
             .unwrap();
 
             let review = server.recv().unwrap();
-            assert_eq!(review.url(), "/repos/acme/widget/pulls/7/comments");
+            assert_eq!(
+                review.url(),
+                "/repos/acme/widget/pulls/7/comments?per_page=100"
+            );
             review
                 .respond(
                     tiny_http::Response::from_string(
@@ -4873,7 +4909,10 @@ mod tests {
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/3/notes");
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fproj/merge_requests/3/notes?per_page=100"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"[{"id":5,"system":false,"author":{"username":"carol"},"body":"note","created_at":"2024-01-03T00:00:00Z"}]"#,

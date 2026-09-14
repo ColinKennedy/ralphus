@@ -414,7 +414,7 @@
       /**
        * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, project: Set<string>}}
        */
-      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false, project: new Set() }; }
+      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(SQUAD_STATES), showHidden: false, project: new Set() }; }
       /**
        * @typedef {object} TaskTabFilters
        * @property {string} q

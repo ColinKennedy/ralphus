@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{git, init_repo};
 use ralphus_core::schema::TaskFile;
@@ -419,6 +419,19 @@ impl AutoFixRunner {
         }
     }
 }
+/// A `dispatch_pr_auto_fix` client for tests that never needs to reach a
+/// real forge: `ForgeKind::GitLab` makes `ForgeClient::github_failing_step`
+/// (the only method `dispatch_pr_auto_fix`'s path calls on it) a guaranteed
+/// no-op, so these tests never attempt a real network call.
+fn test_forge_client() -> ralphus_daemon::forge::ForgeClient {
+    ralphus_daemon::forge::ForgeClient::new(
+        ralphus_daemon::forge::ForgeKind::GitLab,
+        "http://unused.invalid".to_string(),
+        "acme/w".to_string(),
+        None,
+    )
+}
+
 impl Runner for AutoFixRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         if let Some(r) = maybe_run_commit_step(spec) {
@@ -644,6 +657,64 @@ fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
     let guardian = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(guardian.status, "collecting");
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
+    let (root, store, gid) = single_feature_repo();
+    store.lock().cancel_guardian(&gid).unwrap();
+
+    let cancellations = Cancellations::new();
+    let key = format!("guardian:{gid}");
+    let _in_flight_worker = cancellations.register(&key);
+    let store_while_stopping = Arc::clone(&store);
+    let cancellations_while_stopping = cancellations.clone();
+    let gid_while_stopping = gid.clone();
+    let remained_cancelled = Arc::new(AtomicBool::new(false));
+    let remained_cancelled_while_stopping = Arc::clone(&remained_cancelled);
+    let release_worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(75));
+        remained_cancelled_while_stopping.store(
+            store_while_stopping
+                .lock()
+                .get_guardian(&gid_while_stopping)
+                .is_ok_and(|guardian| guardian.status == "cancelled"),
+            Ordering::SeqCst,
+        );
+        cancellations_while_stopping.remove(&format!("guardian:{gid_while_stopping}"));
+    });
+
+    let started = Instant::now();
+    let reply = reopen_cancelled_guardian_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &gid,
+        Arc::new(Semaphore::new(4)),
+        cancellations.clone(),
+    );
+    release_worker.join().unwrap();
+
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "reopen must wait for the active cancelled merge worker"
+    );
+    assert!(
+        remained_cancelled.load(Ordering::SeqCst),
+        "reopen must not change status or start a new worker before the old one exits"
+    );
+
+    for _ in 0..100 {
+        if !cancellations.is_active(&key) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !cancellations.is_active(&key),
+        "reopened merge worker did not finish"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1204,7 +1275,10 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
         checks: vec![],
     };
     let runner = AutoFixRunner::new();
-    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
 
     let calls_after_first = runner.calls.load(Ordering::Relaxed);
     assert!(calls_after_first > 0, "the resolver agent must have run");
@@ -1247,7 +1321,7 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     // A second poll tick against the now-stamped PR is a no-op.
     let guardian2 = store.lock().get_guardian(&id).unwrap();
     ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
-        &store, &runner, &guardian2, &pr_after, &failure,
+        &store, &runner, &guardian2, &pr_after, &failure, &client,
     );
     assert_eq!(
         runner.calls.load(Ordering::Relaxed),
@@ -1343,7 +1417,10 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
         checks: vec![],
     };
     let runner = AutoFixRunner::new();
-    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
 
     let messages = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
     assert_eq!(messages.len(), 1, "expected exactly one feedback message");
@@ -1449,7 +1526,10 @@ fn auto_fix_dispatch_writes_ci_failure_log_into_branch_worktree() {
         checks: vec![],
     };
     let runner = AutoFixRunner::new();
-    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
 
     let log_path = Path::new(&worktree).join(".ralphus-ci-failure.log");
     let log_contents = std::fs::read_to_string(&log_path).expect("ci failure log written");
@@ -1540,16 +1620,21 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
                 name: "build".to_string(),
                 job_url: Some("https://ci.example/job/1".to_string()),
                 log_text: Some("build broke\n".to_string()),
+                failing_step: None,
             },
             ralphus_daemon::forge::FailedCheck {
                 name: "test".to_string(),
                 job_url: Some("https://ci.example/job/2".to_string()),
                 log_text: Some("test failed\n".to_string()),
+                failing_step: None,
             },
         ],
     };
     let runner = AutoFixRunner::new();
-    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(&store, &runner, &guardian, &pr, &failure);
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
 
     let build_log =
         std::fs::read_to_string(Path::new(&worktree).join(".ralphus-ci-failure-build.log"))
@@ -2345,15 +2430,25 @@ fn auto_build_runs_when_no_checks_configured() {
     run_merge(&store, &NoopRunner, &id);
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+    // The auto-build runs after the merge is already complete, so its note
+    // lands on the post-merge phase rather than on the review's own `detail` --
+    // which belongs to the merge, and which a human may overwrite by approving
+    // while the build is still running.
+    assert_eq!(view.post_merge_status.as_deref(), Some("ok"));
     assert!(
-        view.detail.unwrap_or_default().contains("auto-built"),
-        "expected the auto-build note to surface in the review detail"
+        view.post_merge_detail
+            .unwrap_or_default()
+            .contains("auto-built"),
+        "expected the auto-build note to surface on the post-merge phase"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// A failing auto-build is advisory: the branches were rebased correctly, so the
+// merge succeeded and the review stays approvable. The failure is reported on
+// the post-merge phase instead of being allowed to discard a good rebase.
 #[test]
-fn failing_auto_build_fails_the_merge() {
+fn failing_auto_build_is_advisory_and_does_not_fail_the_merge() {
     let (root, store, id) = single_feature_repo();
     write(
         &root,
@@ -2362,9 +2457,13 @@ fn failing_auto_build_fails_the_merge() {
     );
     run_merge(&store, &NoopRunner, &id);
     let view = store.lock().get_guardian(&id).unwrap();
-    assert_eq!(view.status, "merge_failed");
+    assert_eq!(
+        view.status, "in_review",
+        "a failing post-merge gate must not undo a completed merge"
+    );
+    assert_eq!(view.post_merge_status.as_deref(), Some("failed"));
     assert!(
-        view.detail
+        view.post_merge_detail
             .unwrap_or_default()
             .contains("auto-build failed")
     );

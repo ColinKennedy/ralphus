@@ -42,6 +42,11 @@ test("a fresh rebase reads as Merge / rebase and is clickable", () => {
   }
 });
 
+test("a manual rebase advertises that it renews automatic CI-fix eligibility", () => {
+  assert.match(mergeButtonView("in_review", false).tip, /fresh automatic CI-fix attempt/i);
+  assert.match(mergeButtonView("merge_stopped", false).tip, /fresh automatic CI-fix attempt/i);
+});
+
 test("a stopped review offers Resume rebase, not a fresh merge", () => {
   const view = mergeButtonView("merge_stopped", false);
   assert.equal(view.label, "Resume rebase");
@@ -122,11 +127,30 @@ test("mergeReview marks the button pending and toasts before awaiting the daemon
   const pendingAt = fn.indexOf("pendingMergeActions.add(id)");
   const toastAt = fn.indexOf("showInfoToast(mergeRequestedToast(status))");
   const awaitAt = fn.indexOf("await guardianAction(");
-  const tickAt = fn.indexOf("await tick()");
-  assert.ok(pendingAt > -1 && toastAt > -1 && awaitAt > -1 && tickAt > -1, "mergeReview shape changed");
+  const clearAt = fn.indexOf("pendingMergeActions.delete(id)");
+  const tickAt = fn.indexOf("tick();");
+  assert.ok(
+    pendingAt > -1 && toastAt > -1 && awaitAt > -1 && clearAt > -1 && tickAt > -1,
+    "mergeReview shape changed",
+  );
   assert.ok(pendingAt < awaitAt, "the pending state must not wait on the daemon");
   assert.ok(toastAt < awaitAt, "the toast must not wait on the daemon");
   assert.ok(toastAt < tickAt, "the toast must not wait on the board reload");
+});
+
+// The daemon claims the review before it answers, so once `guardianAction`
+// resolves the rebase has already started. `tick()` reloads the whole board
+// and ends in `pollReviews`, which waits on every open PR's drift check --
+// awaiting it here is what left the button reading "Starting…" for tens of
+// seconds after the rebase was underway. The button stays correctly disabled
+// without the pending flag, because `merging` is not in MERGE_STARTABLE.
+test("mergeReview's pending state ends with the daemon's answer, not the board reload", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function mergeReview(id, status)"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.doesNotMatch(fn, /await tick\(\)/, "the pending state must not span a full board reload");
+  const clearAt = fn.indexOf("pendingMergeActions.delete(id)");
+  const tickAt = fn.indexOf("tick();");
+  assert.ok(clearAt < tickAt, "the pending state must be cleared before the reload is kicked off");
 });
 
 test("mergeReview refuses a second submission while one is in flight", () => {

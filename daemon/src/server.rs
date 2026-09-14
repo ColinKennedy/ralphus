@@ -5966,6 +5966,8 @@ struct EditBody {
     #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
+    maximum_context: Option<String>,
+    #[serde(default)]
     maximum_tool_output_tokens: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
@@ -6025,6 +6027,32 @@ fn nullable_i64_field_edit(
             Err(_) => Err(format!("{field}: invalid integer '{s}'")),
         },
     }
+}
+
+/// Reject a `maximum_context` edit up front when the agent that would run
+/// the edited node has no delivery mechanism for the cap (RAL-304), mirroring
+/// `core::validate`'s submit-time rule rather than storing a value the
+/// backend would silently never apply -- the same shape as the
+/// `reject_unsupported_maximum_tool_output_tokens` guard in `edit_squad`'s
+/// `"cell"` arm.
+///
+/// A custom agent profile name (not in `RESERVED_AGENT_NAMES`) is deferred the
+/// way `core` defers it: resolving a profile's backend needs the cwd/config
+/// this edit path doesn't have on hand.
+fn reject_unsupported_maximum_context(agent: &str) -> Option<Reply> {
+    if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !ralphus_core::schema::agent_supports_maximum_context(agent)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "'maximum_context' is only supported for the 'codex'/'pi' agents right now, not '{agent}'"
+            ),
+            vec![],
+        ));
+    }
+    None
 }
 
 /// Reject a `maximum_tool_output_tokens` edit up front when the agent that
@@ -6121,6 +6149,11 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
+            let maximum_context =
+                match nullable_i64_field_edit("maximum_context", req.maximum_context.as_ref()) {
+                    Ok(v) => v,
+                    Err(msg) => return error(400, "bad_request", &msg, vec![]),
+                };
             let maximum_tool_output_tokens = match nullable_i64_field_edit(
                 "maximum_tool_output_tokens",
                 req.maximum_tool_output_tokens.as_ref(),
@@ -6161,6 +6194,21 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             // Same up-front rejection as `system_prompt` above, for the same
             // reason: a cap the cell's agent can't deliver is silently inert.
             // Clearing the field back out (`Some(None)`) needs no check.
+            if let Some(Some(_)) = maximum_context {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_unsupported_maximum_context(&effective_agent) {
+                    return reply;
+                }
+            }
+            // Same up-front rejection as `system_prompt` above, for the same
+            // reason: a cap the cell's agent can't deliver is silently inert.
+            // Clearing the field back out (`Some(None)`) needs no check.
             if let Some(Some(_)) = maximum_tool_output_tokens {
                 let effective_agent = match new_agent {
                     Some(a) => a.to_string(),
@@ -6181,6 +6229,7 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 prompt,
                 command,
                 auto_compact_threshold,
+                maximum_context,
                 maximum_tool_output_tokens,
                 system_prompt,
             };
@@ -8348,13 +8397,17 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
             vec![],
         );
     };
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
+    let (cell_id, task) = {
+        let store = daemon.lock();
+        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        let task = match store.get_task_name(id, task_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        (cell_id, task)
     };
     capture_pane_reply(daemon, id, &task, &cell_id, query)
 }
@@ -8371,13 +8424,17 @@ fn cell_pane_transcript(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &s
             vec![],
         );
     };
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
+    let (cell_id, task) = {
+        let store = daemon.lock();
+        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        let task = match store.get_task_name(id, task_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        (cell_id, task)
     };
     pane_transcript_range_reply(id, &task, &cell_id, query)
 }
@@ -10429,6 +10486,16 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
         drop(store);
         let store_handle = daemon.store_handle();
+        {
+            let guard = store_handle.lock();
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, id) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] failed to re-check thresholds after manual completion in {id}: {}",
+                    e.message
+                );
+            }
+        }
         let cells = store_handle.lock().cells_of(id);
         if let Ok(cells) = cells {
             crate::scheduler::try_start_ready_reviews_for_task(
@@ -11397,7 +11464,18 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 
     let mut base_change: Option<ChangeBaseStatus> = None;
-    if status == "merging" {
+    // `merging`/`in_review`/`merge_failed` are exactly the non-`collecting`
+    // statuses `kickoff_merge` itself will still claim from (see
+    // `claim_guardian_merge`) -- but its per-branch cell-readiness gate
+    // (`guardian_unfinished_linked_branches`) only ever runs while the
+    // guardian is genuinely `collecting`. A details edit on a review sitting
+    // in one of these three statuses must therefore always go through
+    // `restart_guardian_merge`, which resets to `collecting` first so that
+    // gate re-applies -- calling `kickoff_merge` directly here would walk
+    // straight into a branch whose upstream cell never finished (RAL-424:
+    // exactly what happened to a triage-created review edited while
+    // `merge_failed`).
+    if matches!(status.as_str(), "merging" | "in_review" | "merge_failed") {
         if rebase_relevant {
             let runner = guardian_agent_runner(daemon);
             let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -11428,7 +11506,10 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 action: None,
             });
         }
-    } else if rebase_relevant && has_branches && status != "approved" && status != "deployed" {
+    } else if rebase_relevant && has_branches && status == "collecting" {
+        // Only a guardian that is genuinely `collecting` is safe for a direct
+        // `kickoff_merge` call: its readiness gate fires unconditionally in
+        // this state, so there is nothing to reset first.
         let runner = guardian_agent_runner(daemon);
         if let Ok(crate::guardian_merge::StartMergeOutcome::Merging) =
             crate::guardian_merge::kickoff_merge(
@@ -11662,38 +11743,72 @@ struct PrCommentItem {
 /// notes/comments be queried"), flagging which ones have already been
 /// actioned into the worktree so the UI can highlight what's new.
 fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
-    let store = daemon.lock();
-    let pr = match store.get_pull_request(pr_id) {
-        Ok(pr) => pr,
-        Err(e) => return store_error(&e),
-    };
-    let guardian = match store.get_guardian(&pr.guardian_id) {
-        Ok(g) => g,
-        Err(e) => return store_error(&e),
+    // Scoped so the store guard is released before anything below reaches for
+    // the forge. Two reasons, and both are load-bearing:
+    //
+    // `forge_client_for_pr` takes the store lock itself, and the daemon's mutex
+    // is not reentrant -- holding it across that call deadlocks the daemon
+    // outright. And the forge round-trip that follows is a network call: this
+    // is the *global* store lock, so holding it there blocks every other
+    // request, on every endpoint, for as long as the forge takes to answer.
+    let (pr, guardian) = {
+        let store = daemon.lock();
+        let pr = match store.get_pull_request(pr_id) {
+            Ok(pr) => pr,
+            Err(e) => return store_error(&e),
+        };
+        let guardian = match store.get_guardian(&pr.guardian_id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        (pr, guardian)
     };
     let Some(pr_number) = pr.pr_number else {
         return error(409, "no_pr_number", "PR has no recorded number yet", vec![]);
     };
     let root = Path::new(&guardian.git_root);
+    // Resolved through the same PR-aware routing the cache poller uses, rather
+    // than a plain `resolve_remote` on the guardian's base branch. Under fork
+    // routing (RAL-338) those two disagree -- a PR's comments live on whichever
+    // repo its own `repo` field names, which need not be the base branch's
+    // remote -- so the old call could read a different repo than the poller,
+    // and the two would then report different answers for the same PR.
     let forge_cfg = crate::config::resolve_forge(root);
-    let client = match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
-        Ok(c) => c,
-        Err(e) => return error(502, "forge_error", &e, vec![]),
+    let client = match crate::pr::forge_client_for_pr(
+        &daemon.store_handle(),
+        root,
+        &guardian.base_branch,
+        &forge_cfg,
+        &pr.repo,
+    ) {
+        Some(c) => c,
+        None => {
+            return error(
+                502,
+                "forge_error",
+                "no forge client could be resolved for this PR's repo",
+                vec![],
+            );
+        }
     };
     let comments = match client.list_pr_comments(pr_number) {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
-    // RAL-366: write through into the cache the background poller reads
-    // from, so a human explicitly checking comments here also refreshes the
-    // list-view's cached count instead of leaving it to the next poll cycle.
-    // Only the conversation endpoint's rows are written -- this route never
-    // calls GitHub's separate inline-review-comments endpoint, unlike the
-    // poller's own conditional fetch.
-    let _ = store.replace_pr_forge_comments(pr_id, "conversation", &comments);
-    let _ =
-        store.upsert_pr_forge_cache(pr_id, true, None, None, None, None, None, None, None, None);
-    let actioned = store.actioned_pr_comment_ids(pr_id).unwrap_or_default();
+    // Deliberately does NOT write through into the forge cache.
+    //
+    // `list_pr_comments` returns GitHub's conversation and inline-review
+    // comments merged into one list, and a `PrComment` does not record which
+    // endpoint it came from. Filing all of them under `'conversation'` would
+    // double-count every inline comment against the `'review'` rows the poller
+    // stores separately, inflating the very count this cache exists to report.
+    //
+    // The caller still gets the live answer below; the cache stays the
+    // poller's to own, and it refreshes on its own cycle.
+    let actioned = daemon
+        .lock()
+        .actioned_pr_comment_ids(pr_id)
+        .unwrap_or_default();
     let items: Vec<PrCommentItem> = comments
         .into_iter()
         .map(|c| PrCommentItem {
@@ -11724,24 +11839,40 @@ fn pr_action_feedback(daemon: &Daemon, user_header: Option<&str>, pr_id: &str) -
 /// Live drift check between this PR's remote branch and its owning review
 /// worktree (RAL-190) — see [`crate::pr::PrSyncStatus`].
 fn pr_sync_status(daemon: &Daemon, pr_id: &str) -> Reply {
-    match crate::pr::compute_sync_status(&daemon.store_handle(), pr_id) {
-        Ok(status) => {
+    // The board calls this once per open PR of the selected review, so it is
+    // allowed to reuse the cache poller's recent remote-tip observation rather
+    // than performing a `git fetch` per row. The worktree side is still read
+    // live on every call, so the only thing that can lag is a push made to the
+    // PR branch within the cache's own freshness window.
+    match crate::pr::compute_sync_status_cached(&daemon.store_handle(), pr_id) {
+        Ok((status, fetched_live)) => {
             // RAL-366: write through into the cache the background poller
             // reads from, so a human's explicit "refresh now" also updates
             // the list-view's cached drift instead of leaving it stale until
             // the next poll cycle.
-            let _ = daemon.lock().upsert_pr_forge_cache(
-                pr_id,
-                true,
-                None,
-                Some(status.in_sync),
-                Some(status.pr_ahead),
-                Some(status.worktree_ahead),
-                status.remote_sha.as_deref(),
-                status.local_sha.as_deref(),
-                None,
-                None,
-            );
+            //
+            // Only the drift half is passed -- this route never fetches
+            // comments, so `None` for that half leaves its stored timestamp
+            // and status untouched rather than claiming they were just
+            // verified.
+            //
+            // And only when the remote tip was actually fetched: writing back
+            // a reading that came *from* the cache would renew its own
+            // freshness without re-verifying anything, letting one stale
+            // observation keep itself alive forever.
+            if fetched_live {
+                let _ = daemon.lock().upsert_pr_forge_cache(
+                    pr_id,
+                    Some(Ok(crate::pr::DriftObservation {
+                        in_sync: status.in_sync,
+                        pr_ahead: status.pr_ahead,
+                        worktree_ahead: status.worktree_ahead,
+                        remote_sha: status.remote_sha.as_deref(),
+                        local_sha: status.local_sha.as_deref(),
+                    })),
+                    None,
+                );
+            }
             json(200, &status)
         }
         Err(e) => error(502, "forge_error", &e, vec![]),
@@ -12032,18 +12163,27 @@ fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
 }
 
 fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
-    // Stop any live merge worker first -- otherwise it keeps running
-    // in-flight resolver agents to completion and its own end-of-pass
-    // status write clobbers `cancelled` back to `in_review`. See
-    // `stop_merge_worker_for_cancel`'s doc comment.
+    // Signal the worker before the state transition so active subprocesses
+    // begin their normal cancellation path. Do not wait for it here: the
+    // store's cancelled-status guard prevents a late worker from reviving the
+    // review, and an acknowledgement must not wait behind slow cleanup.
     crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
     match daemon.lock().cancel_guardian(id) {
-        Ok(status) => json(
-            200,
-            &StateResponse {
-                state: status.as_str(),
-            },
-        ),
+        Ok(status) => {
+            // Tmux teardown can require a process query. It belongs to the
+            // cancellation cleanup path, not the HTTP acknowledgement path.
+            let store = daemon.store_handle();
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                crate::guardian_merge::kill_guardian_agent_sessions(&store, &id);
+            });
+            json(
+                200,
+                &StateResponse {
+                    state: status.as_str(),
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -12616,6 +12756,7 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         return store_error(&e);
     }
     drop(store);
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     // RAL-279: force_start only fires while status == "collecting", which
     // precedes PR submission, so this is a no-op today -- kept for
     // correctness/future-proofing if that invariant ever changes (see the
@@ -12760,6 +12901,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
 }
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_merge(
         daemon.store_handle(),
@@ -12768,6 +12910,43 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
     )
+}
+
+/// An explicit rebase request gives the CI watcher another chance to fix an
+/// unchanged failure after the rebuild. Background polling retains its
+/// one-attempt cap until a person makes this request.
+fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
+    let reset = daemon.lock().reset_open_pr_auto_fix_attempts(id);
+    match reset {
+        Ok(0) => {}
+        Ok(count) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [server] review {id} manual rebase reset auto-fix attempts for {count} open PR(s)"
+            );
+            let _ = daemon
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "server",
+                    message: "manual rebase reset PR auto-fix attempts",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"reset_count": count}),
+                    admin_only: false,
+                });
+        }
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [server] review {id} could not reset PR auto-fix attempts before manual rebase: {e}"
+            );
+        }
+    }
 }
 
 /// Stop an in-progress rebase (status `merging`) at its next checkpoint,
@@ -12792,6 +12971,7 @@ fn guardian_stop(daemon: &Daemon, id: &str) -> Reply {
 /// threads shared (RAL-213's second bug: `cancel_and_merge` was already
 /// unsafe before this fix).
 fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::restart_guardian_merge(
         daemon.store_handle(),
@@ -14324,7 +14504,14 @@ mod tests {
         let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
         assert_eq!(r.status, 201);
         assert!(r.body.contains("squad-000000000001"));
-        assert!(r.body.contains("\"state\":\"pending\""));
+        // The reply is built before the materialization follow-up runs, so it
+        // reports `materializing` rather than the state the squad ends up in.
+        assert!(r.body.contains("\"state\":\"materializing\""));
+        assert_eq!(
+            d.lock().get_squad("squad-000000000001").unwrap().state,
+            SquadState::Pending.as_str(),
+            "an un-held submission must settle in pending once materialized"
+        );
 
         let board = route(&d, "GET", "/api/tasks", "");
         assert_eq!(board.status, 200);
@@ -15952,7 +16139,16 @@ machine=\"incredibuild:B\"
         let body =
             serde_json::to_string(&serde_json::json!({ "toml": GOOD, "hold": true })).unwrap();
         let r = route(&d, "POST", "/api/squads", &body);
-        assert!(r.body.contains("\"state\":\"queued\""));
+        // `submit` always answers `materializing`: the reply is built before
+        // the follow-up that creates worktrees and derives reviews has run, so
+        // it cannot report the hold-derived state yet. `queued` is what the
+        // squad settles into once that follow-up completes.
+        assert!(r.body.contains("\"state\":\"materializing\""));
+        assert_eq!(
+            d.lock().get_squad("squad-000000000001").unwrap().state,
+            SquadState::Queued.as_str(),
+            "a held submission must settle in queued, not pending"
+        );
 
         let act = route(&d, "POST", "/api/squads/squad-000000000001/activate", "");
         assert_eq!(act.status, 200);
@@ -16177,6 +16373,98 @@ agent=\"claude-code\"
     }
 
     #[test]
+    fn edit_cell_maximum_context_set_and_clear() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"codex\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"maximum_context\":100000"), "{}", r.body);
+
+        // Present-but-empty clears it back to NULL, which `CellView` omits
+        // from the JSON entirely (`skip_serializing_if = "Option::is_none"`)
+        // rather than rendering as `null`.
+        let clear = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_omitted_maximum_context_is_untouched() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"codex\"
+maximum_context=100000
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "model": "sonnet"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"maximum_context\":100000"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_rejected_for_unsupported_agent() {
+        // GOOD's cell resolves to the default "claude", which has no
+        // context-window delivery mechanism (RAL-304).
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_accepted_with_supporting_agent_in_same_call() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "agent": "codex", "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_clear_does_not_require_agent_support() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
     fn edit_cell_omitted_maximum_tool_output_tokens_is_untouched() {
         let d = daemon();
         let toml = "[[task]]
@@ -16256,6 +16544,9 @@ agent=\"claude-code\"
             ("maximum_tool_output_tokens", "0"),
             ("maximum_tool_output_tokens", "-5"),
             ("maximum_tool_output_tokens", "lots"),
+            ("maximum_context", "0"),
+            ("maximum_context", "-5"),
+            ("maximum_context", "lots"),
             ("auto_compact_threshold", "0"),
             ("auto_compact_threshold", "-5"),
             ("auto_compact_threshold", "lots"),
@@ -22032,6 +22323,39 @@ command = "true"
     }
 
     #[test]
+    fn manual_merge_resets_open_pr_auto_fix_attempts() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        d.lock().mark_pr_auto_fix_attempted(&pr_id).unwrap();
+
+        let reply = route(&d, "POST", &format!("/api/guardians/{gid}/merge"), "");
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(
+            d.lock()
+                .get_pull_request(&pr_id)
+                .unwrap()
+                .auto_fix_attempted_at_ms,
+            None,
+            "an explicit Merge / rebase request resets the CI watcher's retry budget"
+        );
+    }
+
+    #[test]
     fn unlink_prs_drops_open_rows_clears_stack_number_and_keeps_history() {
         let d = daemon();
         let gid = make_guardian(&d);
@@ -22638,6 +22962,53 @@ command = "true"
         );
     }
 
+    /// RAL-424 regression: `kickoff_merge`'s per-branch cell-readiness gate
+    /// (`guardian_unfinished_linked_branches`) only ever runs while the
+    /// guardian is genuinely `collecting`. A `merge_failed` review's details
+    /// edit used to call `kickoff_merge` directly -- skipping that gate --
+    /// and would walk straight into rebasing a branch whose upstream cell
+    /// hadn't finished yet. This hit live: a triage-created review with a
+    /// still-`pending` cell was edited while `merge_failed`, and the rebase
+    /// attempted (and correctly failed on) the empty branch that pending
+    /// cell was supposed to produce. `guardian_details` must instead always
+    /// restart through `restart_guardian_merge`, which resets the guardian to
+    /// `collecting` first so the gate re-applies and the merge defers instead.
+    #[test]
+    fn guardian_details_on_merge_failed_review_defers_instead_of_merging_an_unfinished_branch() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let squad_id = submit_squad(&d);
+        d.lock()
+            .set_cell_review_branch(&squad_id, 0, 0, "feat")
+            .unwrap();
+        // Left at its post-submit default of `pending`: this cell's task
+        // never ran, so the branch it's meant to produce doesn't exist yet.
+        d.lock().add_guardian_branch(&gid, "feat").unwrap();
+        d.lock()
+            .set_guardian_status(
+                &gid,
+                crate::guardian::GuardianStatus::MergeFailed,
+                Some("boom"),
+            )
+            .unwrap();
+
+        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &rebase_relevant,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["status"], "collecting",
+            "a merge_failed review with a not-yet-finished branch must defer \
+             (not merge) when its details are edited: {}",
+            r.body
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RAL-188: GET /api/resolve?uri=
     // -----------------------------------------------------------------------
@@ -22887,6 +23258,28 @@ command=\"cargo test\"
         assert!(r.body.contains("never be deregistered"));
     }
 
+    /// Pool a cell for `(project, triage_type)` against a real, finished
+    /// squad.
+    ///
+    /// `triage_pool_count` resolves each pooled cell's effective state and
+    /// only counts finished ones, so a pool row pointing at a squad id that
+    /// was never inserted resolves to no state and counts zero. These route
+    /// tests care about the pool API's shape, not the done-gating rule
+    /// (`triage.rs` covers that), so they need a cell that genuinely finished.
+    fn pool_a_finished_cell(d: &Daemon, project: &str, triage_type: &str, branch: &str) -> String {
+        let squad_id = submit_squad(d);
+        {
+            let store = d.lock();
+            store
+                .record_triage_pool_cell(project, triage_type, &squad_id, 0, 0, branch, "main")
+                .unwrap();
+            store
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+        }
+        squad_id
+    }
+
     #[test]
     fn triage_pool_and_schedule_routes() {
         let d = daemon();
@@ -22897,9 +23290,7 @@ command=\"cargo test\"
 
         // Populate a pool row directly via the store (submit-time pooling is
         // exercised in `reviews.rs`'s own tests).
-        d.lock()
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
+        pool_a_finished_cell(&d, "proj", "security", "b1");
         let r = route(&d, "GET", "/api/triage/pools", "");
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"count\":1"));
@@ -22982,9 +23373,7 @@ command=\"cargo test\"
 
         // A cell pooled under the project's resolved name must land in the
         // very same row the path-set threshold configured.
-        d.lock()
-            .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
+        pool_a_finished_cell(&d, "proj", "bug", "b1");
 
         let r = route(&d, "GET", "/api/triage/pools", "");
         assert_eq!(r.status, 200, "{}", r.body);

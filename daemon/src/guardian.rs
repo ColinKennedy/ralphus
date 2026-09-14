@@ -852,6 +852,25 @@ pub struct GuardianView {
     /// `None` until generation completes. Plain overwrite; re-stamped fresh on
     /// every regeneration (see `Store::stamp_guardian_manual_checks_finished_at`).
     pub manual_checks_finished_at_ms: Option<i64>,
+    /// The post-merge phase's rolled-up state: `"running"` while the check
+    /// gates and/or manual-checks generation are still working against the
+    /// finished stack, then `"ok"` or `"failed"`. `None` for a review that has
+    /// never completed a merge.
+    ///
+    /// A merge is complete once every branch has been rebased, so the review is
+    /// already `in_review` while this is `"running"` -- these two jobs are
+    /// post-merge work, not part of the merge. `"failed"` is advisory: it
+    /// records that a gate reported a failure and never blocks approval or PR
+    /// submission.
+    pub post_merge_status: Option<String>,
+    /// What failed during the post-merge phase, when
+    /// [`Self::post_merge_status`] is `"failed"`. `None` otherwise.
+    pub post_merge_detail: Option<String>,
+    /// When the post-merge phase most recently started (epoch ms).
+    pub post_merge_started_at_ms: Option<i64>,
+    /// When the post-merge phase most recently finished (epoch ms). `None`
+    /// while it is still running.
+    pub post_merge_finished_at_ms: Option<i64>,
     /// RAL-193: input tokens spent on this review's own conflict-resolution
     /// and prover agent calls during the current merge attempt only --
     /// excludes the tasks/cells that fed into the review.
@@ -2079,10 +2098,25 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| "unknown".to_string());
         let n = self.conn.execute(
-            "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=?",
-            params![status.as_str(), detail, crate::store::now_ms(), id],
+            "UPDATE guardians SET status=?, detail=?, updated_at_ms=? WHERE id=? \
+             AND (status != 'cancelled' OR ?='cancelled')",
+            params![
+                status.as_str(),
+                detail,
+                crate::store::now_ms(),
+                id,
+                status.as_str()
+            ],
         )?;
         if n == 0 {
+            // A cancelled review is terminal. Merge workers can observe their
+            // cancellation after a slow operation completes, so their final
+            // status write must not revive a review the user has cancelled.
+            // Explicit reopening uses `reopen_cancelled_guardian`, whose
+            // transition is deliberately separate from this generic setter.
+            if old == "cancelled" && status != GuardianStatus::Cancelled {
+                return Ok(());
+            }
             Err(StoreError::NotFound)
         } else {
             crate::rlog!(
@@ -3365,6 +3399,51 @@ impl Store {
         Ok(())
     }
 
+    /// Mark this review's post-merge phase (check gates + manual-checks
+    /// generation) as started, clearing any previous run's result.
+    ///
+    /// Called once the merge itself is complete -- every branch rebased and the
+    /// review already moved to `in_review`. The two jobs it covers run
+    /// concurrently against the finished stack; see [`GuardianView::post_merge_status`].
+    pub fn start_guardian_post_merge(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET post_merge_status='running', post_merge_detail=NULL, \
+             post_merge_started_at_ms=?, post_merge_finished_at_ms=NULL WHERE id=?",
+            params![crate::store::now_ms(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the post-merge phase's outcome. `detail` is what failed when
+    /// `ok` is false, and the gate's own summary note (e.g. which build command
+    /// ran) when it is true.
+    ///
+    /// Deliberately written here rather than onto the guardian's `status`/
+    /// `detail`: the review's status belongs to the merge, which already
+    /// finished, and a human may well have approved it while these jobs were
+    /// still running. Writing status from here would clobber that.
+    ///
+    /// A `false` is advisory only -- it never changes the review's status and
+    /// never blocks approval or PR submission.
+    pub fn finish_guardian_post_merge(
+        &self,
+        id: &str,
+        ok: bool,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET post_merge_status=?, post_merge_detail=?, \
+             post_merge_finished_at_ms=? WHERE id=?",
+            params![
+                if ok { "ok" } else { "failed" },
+                detail,
+                crate::store::now_ms(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Reorder a guardian's branches to match `order` (a permutation of the
     /// existing branch names). Positions are first shifted out of range to avoid
     /// colliding with the `(guardian_id, position)` primary key, then rewritten.
@@ -3740,7 +3819,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -3754,7 +3833,7 @@ impl Store {
     /// List all guardians, newest first.
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -3860,6 +3939,10 @@ impl Store {
             auto_fix_pr_errors: r.get::<_, Option<i64>>(53)?.map(|v| v != 0),
             auto_fix_prompt_template: r.get(54)?,
             manual_checks_finished_at_ms: r.get(55)?,
+            post_merge_status: r.get(56)?,
+            post_merge_detail: r.get(57)?,
+            post_merge_started_at_ms: r.get(58)?,
+            post_merge_finished_at_ms: r.get(59)?,
         })
     }
 
@@ -4277,6 +4360,10 @@ impl Store {
             merge_attempt: row.merge_attempt,
             manual_checks_started_at_ms: row.manual_checks_started_at_ms,
             manual_checks_finished_at_ms: row.manual_checks_finished_at_ms,
+            post_merge_status: row.post_merge_status,
+            post_merge_detail: row.post_merge_detail,
+            post_merge_started_at_ms: row.post_merge_started_at_ms,
+            post_merge_finished_at_ms: row.post_merge_finished_at_ms,
             notice_kind: row.notice_kind,
             notice_message: row.notice_message,
             notice_at_ms: row.notice_at_ms,
@@ -4432,19 +4519,24 @@ impl Store {
         }
     }
 
-    /// Reset a guardian from `merging` or `in_review` back to `collecting` so
-    /// a fresh merge can be started immediately. Used by the cancel-and-restart
-    /// flow: the in-flight background thread is superseded by the new one.
+    /// Reset a guardian from `merging`, `in_review`, or `merge_failed` back to
+    /// `collecting` so a fresh merge can be started immediately. Used by the
+    /// cancel-and-restart flow: the in-flight background thread (if any) is
+    /// superseded by the new one, and `merge_failed` is included so a
+    /// rebase-relevant re-trigger on a failed review re-enters `collecting`
+    /// and gets `kickoff_merge`'s per-branch cell-readiness gate re-applied,
+    /// instead of restarting the merge directly from `merge_failed` (which
+    /// the gate skips, since it only ever fires while genuinely `collecting`).
     pub fn reset_guardian_to_collecting(&self, id: &str) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET status='collecting', detail=NULL, updated_at_ms=? \
-             WHERE id=? AND status IN ('merging','in_review')",
+             WHERE id=? AND status IN ('merging','in_review','merge_failed')",
             params![crate::store::now_ms(), id],
         )?;
         if n == 0 {
             let _ = self.guardian_status_str(id)?; // propagate NotFound if missing
             Err(StoreError::InvalidTransition(
-                "can only reset a guardian that is merging or in_review".into(),
+                "can only reset a guardian that is merging, in_review, or merge_failed".into(),
             ))
         } else {
             let _ = self.log_event(
@@ -4652,6 +4744,10 @@ struct GuardianRow {
     manual_checks_started_at_ms: Option<i64>,
     /// When the manual-checks generation agent most recently finished work.
     manual_checks_finished_at_ms: Option<i64>,
+    post_merge_status: Option<String>,
+    post_merge_detail: Option<String>,
+    post_merge_started_at_ms: Option<i64>,
+    post_merge_finished_at_ms: Option<i64>,
     /// RAL-273: see [`GuardianView::notice_kind`].
     notice_kind: Option<String>,
     notice_message: Option<String>,
@@ -5908,6 +6004,22 @@ mod tests {
 
         // Already reopened: a second reopen call must be rejected.
         assert!(store.reopen_cancelled_guardian(&id).is_err());
+    }
+
+    #[test]
+    fn late_merge_status_write_cannot_revive_cancelled_guardian() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        store.claim_guardian_merge(&id).unwrap();
+        store.cancel_guardian(&id).unwrap();
+
+        // This models a merge worker completing a slow operation after the
+        // HTTP cancellation request has already committed its state change.
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
     }
 
     /// RAL-375: a guardian left `merging` by an unclean shutdown must land
@@ -7208,6 +7320,36 @@ mod tests {
             store.guardian_unfinished_linked_branches(&id).unwrap(),
             vec!["feat".to_string()]
         );
+    }
+
+    /// RAL-424: `reset_guardian_to_collecting` must accept `merge_failed` as
+    /// a source state, not just `merging`/`in_review`. It's the mechanism
+    /// `restart_guardian_merge` uses to re-arm `kickoff_merge`'s per-branch
+    /// cell-readiness gate (which only fires while genuinely `collecting`)
+    /// before re-attempting a merge on a review that previously failed.
+    #[test]
+    fn reset_guardian_to_collecting_accepts_merge_failed() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        store
+            .set_guardian_status(&id, GuardianStatus::MergeFailed, Some("boom"))
+            .unwrap();
+        store.reset_guardian_to_collecting(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+    }
+
+    /// Guards the fix above from over-widening: a terminal `approved` review
+    /// must still refuse to be reset back to `collecting`.
+    #[test]
+    fn reset_guardian_to_collecting_still_rejects_a_terminal_status() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_status(&id, GuardianStatus::Approved, None)
+            .unwrap();
+
+        assert!(store.reset_guardian_to_collecting(&id).is_err());
     }
 
     #[test]

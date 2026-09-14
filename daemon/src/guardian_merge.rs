@@ -2560,6 +2560,14 @@ fn run_final_proof(
 /// reliable signal that the last full check pass actually succeeded, not
 /// just that the agent said so. No note when `checks` is empty (nothing was
 /// actually validated) or `skip_auto_build` is set.
+///
+/// A failure here **does** fail the merge, unlike the post-merge gates run by
+/// [`final_checks`], which are advisory. The two are not inconsistent: this
+/// runs *during* the merge, per stacked branch, and a branch whose gate fails
+/// should not be stacked on top of. `final_checks` runs after every branch is
+/// rebased and the merge is already complete -- at that point the stack is
+/// built and correct, and a failing gate is information about the code, not a
+/// reason to discard the rebase.
 fn run_commit_checks(
     store: &crate::store_lock::StoreHandle,
     id: &str,
@@ -2582,6 +2590,28 @@ fn run_commit_checks(
     // the agent invocations against this worktree -- a gate like `cargo test`
     // is worthless if it runs without the variables the code expects.
     let env = branch_env(store, id, branch_id);
+    // Per-branch, not per-check: a stack's gates can run for minutes each, and
+    // without a record here the branch simply appears to hang mid-rebase. One
+    // entry per branch keeps that visible without flooding Cartographer on a
+    // large stack.
+    if !checks.is_empty() {
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::INFO,
+            format!(
+                "review {id} running {} check gate(s) for branch {branch}",
+                checks.len()
+            ),
+            serde_json::json!({
+                "phase": "commit_checks",
+                "state": "started",
+                "branch": branch,
+                "check_count": checks.len(),
+            }),
+        );
+    }
+    let checks_started = std::time::Instant::now();
     for cmd in &checks {
         // RAL-239: a review cancelled while a check gate is running must not
         // let the next queued check start against this worktree.
@@ -2589,8 +2619,38 @@ fn run_commit_checks(
             return Err("cancelled".to_string());
         }
         if !wt.run_command_with_env(cmd, &env, cancel).0 {
+            phase_note(
+                store,
+                id,
+                crate::logging::LogLevel::WARNING,
+                format!("review {id} check gate failed for branch {branch}: {cmd}"),
+                serde_json::json!({
+                    "phase": "commit_checks",
+                    "state": "failed",
+                    "branch": branch,
+                    "command": cmd,
+                    "elapsed_ms": elapsed_ms(checks_started),
+                }),
+            );
             return Err(format!("check failed after '{branch}': {cmd}"));
         }
+    }
+    if !checks.is_empty() {
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::INFO,
+            format!(
+                "review {id} check gates passed for branch {branch} in {}ms",
+                elapsed_ms(checks_started)
+            ),
+            serde_json::json!({
+                "phase": "commit_checks",
+                "state": "passed",
+                "branch": branch,
+                "elapsed_ms": elapsed_ms(checks_started),
+            }),
+        );
     }
     let wt_str = wt.root().to_string_lossy().into_owned();
     if !checks.is_empty() {
@@ -3414,6 +3474,33 @@ pub(crate) fn kickoff_merge(
         return Ok(StartMergeOutcome::Deferred);
     }
 
+    // A review reaches `in_review` as soon as its branches are rebased, while
+    // its post-merge jobs (check gates, manual-checks generation) are still
+    // working inside the combined worktree. `in_review` is a claimable state,
+    // so without this a merge started in that window would run a second worker
+    // through the same worktree as the first one's jobs.
+    //
+    // Reported as already-in-progress because that is what it is, and the
+    // board already renders that 409 as a real error rather than a silent
+    // no-op.
+    //
+    // Time-bounded on purpose. Nothing clears `running` if the daemon is
+    // restarted mid-phase, or if the phase panics before it can record an
+    // outcome -- an unbounded check would make a review permanently
+    // un-mergeable with no way back. Past the bound the flag is assumed
+    // abandoned and the merge proceeds.
+    const POST_MERGE_STALE_AFTER_MS: i64 = 60 * 60 * 1000;
+    let post_merge_running = matches!(
+        lock_timed(&store, id, "post-merge").get_guardian(id),
+        Ok(g) if g.post_merge_status.as_deref() == Some("running")
+            && g.post_merge_started_at_ms.is_some_and(|started| {
+                crate::store::now_ms().saturating_sub(started) < POST_MERGE_STALE_AFTER_MS
+            })
+    );
+    if post_merge_running {
+        return Ok(StartMergeOutcome::AlreadyInProgress);
+    }
+
     // Atomically transition collecting, merge_failed, or in_review → merging
     // (RAL-108: in_review is included so "Merge / rebase" forces a fresh rebase
     // even on an already-done review). Two concurrent requests can both pass
@@ -3475,10 +3562,12 @@ pub(crate) fn kickoff_merge(
         kickoff_started.elapsed().as_millis()
     );
     let sid = id.to_string();
+    let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
         let _permit = sem.acquire();
-        let token = cancellations.register(&format!("guardian:{sid}"));
-        run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
+        if !token.is_cancelled() {
+            run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
+        }
         cancellations.remove(&format!("guardian:{sid}"));
     });
     Ok(StartMergeOutcome::Merging)
@@ -3490,16 +3579,17 @@ pub(crate) fn kickoff_merge(
 /// key namespace -- duplicated here rather than reused because that helper
 /// takes a `&Daemon`, which this module has no handle to (only the
 /// individual `store`/`cancellations`/`runner`/`sem` handles it needs).
-fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
+fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let started = std::time::Instant::now();
     while cancellations.is_active(key) {
         if started.elapsed() >= TIMEOUT {
-            break;
+            return false;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    true
 }
 
 /// Terminate every tmux-backed agent session belonging to this review.
@@ -3509,7 +3599,7 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) {
 /// Windows, [`crate::tmux::Tmux::kill_session`] also closes the confined job
 /// object, terminating the pane's entire process tree rather than merely
 /// removing the tmux session name.
-fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
+pub(crate) fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
     let prefix = format!("ralphus_guardian-{id}_");
     let count = crate::tmux::Tmux::resolve()
         .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
@@ -3537,23 +3627,17 @@ fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str
     });
 }
 
-/// Stop any in-flight merge worker for `id` (cancel token + the same bounded
-/// wait as [`restart_guardian_merge`]/[`stop_guardian_merge`]) before a plain
-/// cancel writes `cancelled` to the DB.
+/// Signal any in-flight merge worker for `id` to stop before plain cancellation
+/// writes `cancelled` to the DB.
 ///
-/// Without this, `Store::cancel_guardian` only flips the DB column: a live
-/// merge worker's `cancel: &CancelToken` is never tripped, so it never kills
-/// its resolver agent's tmux session, keeps running every remaining branch to
-/// completion, and its own end-of-pass `set_guardian_status(InReview, ...)`
-/// (unconditional -- there's no `WHERE status='cancelled'` guard) overwrites
-/// the `cancelled` status straight back to `in_review`. Call this first so
-/// the worker has already exited (or been given its best bounded chance to)
-/// by the time the DB write happens, mirroring why `restart_guardian_merge`/
-/// `stop_guardian_merge` both cancel-and-wait before touching guardian state.
+/// Plain cancellation deliberately does not wait for the worker: a slow remote
+/// operation or subprocess cleanup must not delay the user's acknowledgement.
+/// `Store::set_guardian_status` atomically preserves a cancelled status, so a
+/// late worker cannot revive the review. Restart and resumable-stop flows still
+/// use [`wait_for_merge_worker_stop`] because they may reuse its worktrees.
 pub fn stop_merge_worker_for_cancel(cancellations: &Cancellations, id: &str) {
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
-    wait_for_merge_worker_stop(cancellations, &key);
 }
 
 /// Stop an in-flight merge for `id` (if any) and start a fresh one, safely.
@@ -3576,7 +3660,7 @@ pub fn restart_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    wait_for_merge_worker_stop(&cancellations, &key);
+    let _ = wait_for_merge_worker_stop(&cancellations, &key);
     if let Err(e) = store.lock().reset_guardian_to_collecting(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
@@ -3596,13 +3680,11 @@ pub fn restart_guardian_merge(
 /// dormant. Staging the ready prefix now catches it up immediately instead
 /// of waiting on that last cell or the periodic maintenance sweep.
 ///
-/// There is no live worker to cancel-and-wait for first, unlike
-/// [`restart_guardian_merge`]: a cancelled review's merge worker already
-/// exited before the `cancelled` status was written (see
-/// `stop_merge_worker_for_cancel`). `claim_guardian_merge` still gates the
-/// `collecting` → `merging` transition, so a concurrent trigger (another
-/// reopen call, a task completing at the same moment) can't double-run the
-/// staged pass.
+/// A cancelled review can still be winding down after its cancellation reply
+/// has returned. Wait for that worker here, where a fresh merge could reuse
+/// the same worktrees; if it does not stop within the bounded budget, leave
+/// the review cancelled and ask the caller to retry instead of overlapping two
+/// workers.
 pub fn reopen_cancelled_guardian_merge(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
@@ -3610,6 +3692,16 @@ pub fn reopen_cancelled_guardian_merge(
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Reply {
+    let key = format!("guardian:{id}");
+    if !wait_for_merge_worker_stop(&cancellations, &key) {
+        return reply(
+            409,
+            &error_body(
+                "merge_still_stopping",
+                "the cancelled merge is still stopping; retry reopening shortly",
+            ),
+        );
+    }
     if let Err(e) = store.lock().reopen_cancelled_guardian(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
@@ -3620,10 +3712,12 @@ pub fn reopen_cancelled_guardian_merge(
         return reply(202, "{\"status\":\"merging\"}");
     }
     let sid = id.to_string();
+    let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
         let _permit = sem.acquire();
-        let token = cancellations.register(&format!("guardian:{sid}"));
-        run_merge_staged(&store, runner.as_ref(), &sid, &token);
+        if !token.is_cancelled() {
+            run_merge_staged(&store, runner.as_ref(), &sid, &token);
+        }
         cancellations.remove(&format!("guardian:{sid}"));
     });
     reply(202, "{\"status\":\"merging\"}")
@@ -3648,7 +3742,7 @@ pub fn stop_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    wait_for_merge_worker_stop(&cancellations, &key);
+    let _ = wait_for_merge_worker_stop(&cancellations, &key);
     match store.lock().stop_guardian_merge(id) {
         Ok(status) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -4584,17 +4678,36 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         log_merge_cancelled(store, id);
         return;
     }
-    let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, runner, id, root, combined_str, cancel) {
-            Ok(n) => n,
-            Err(e) => {
-                set_status(GuardianStatus::MergeFailed, Some(&e));
-                return;
-            }
-        }
+    // Every project's branches are rebased by this point, so the merge itself
+    // is done. The check gates below run against a finished stack, and their
+    // result is advisory: it is recorded on the post-merge phase and surfaced
+    // on the board, but it never turns a correct rebase back into a failure.
+    // Matches `run_merge_shared`; see `run_commit_checks` for why gates run
+    // *during* the merge still fail it.
+    //
+    // Known difference from `run_merge_shared`: that path moves the review to
+    // `in_review` before running these, so the board stops saying "merging"
+    // the moment the branches are done. This multi-project path still holds
+    // `merging` until the gates finish. Behaviour is safe either way -- both
+    // states block a competing merge claim -- but the status shown here is
+    // more pessimistic than it needs to be.
+    let _ = store.lock().start_guardian_post_merge(id);
+    let outcome = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
+        final_checks(store, runner, id, root, combined_str, cancel)
     } else {
-        None
+        Ok(None)
     };
+    let note = outcome.as_ref().ok().and_then(Clone::clone);
+    {
+        let failure = outcome.as_ref().err().map(String::as_str);
+        let detail = match &outcome {
+            Ok(n) => n.as_deref(),
+            Err(e) => Some(e.as_str()),
+        };
+        let _ = store
+            .lock()
+            .finish_guardian_post_merge(id, failure.is_none(), detail);
+    }
     // RAL-92: baseline the freshly-built review-branch tips so this build is
     // never read as a reviewer's manual push on the next maintenance sweep.
     snapshot_review_heads(store, id);
@@ -5052,17 +5165,29 @@ pub fn run_merge_cancellable(
         return;
     }
     // Run final check gates against the last combined worktree (all-projects pass).
-    let note = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
-        match final_checks(store, runner, id, root, combined_str, cancel) {
-            Ok(n) => n,
-            Err(e) => {
-                set_status(GuardianStatus::MergeFailed, Some(&e));
-                return;
-            }
-        }
+    // Every project's branches are rebased by this point, so the merge itself
+    // is done. The check gates below run against a finished stack, and their
+    // result is advisory: it is recorded on the post-merge phase and surfaced
+    // on the board, but it never turns a correct rebase back into a failure.
+    // Matches `run_merge_shared`; see `run_commit_checks` for why gates run
+    // *during* the merge still fail it.
+    let _ = store.lock().start_guardian_post_merge(id);
+    let outcome = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
+        final_checks(store, runner, id, root, combined_str, cancel)
     } else {
-        None
+        Ok(None)
     };
+    let note = outcome.as_ref().ok().and_then(Clone::clone);
+    {
+        let failure = outcome.as_ref().err().map(String::as_str);
+        let detail = match &outcome {
+            Ok(n) => n.as_deref(),
+            Err(e) => Some(e.as_str()),
+        };
+        let _ = store
+            .lock()
+            .finish_guardian_post_merge(id, failure.is_none(), detail);
+    }
     // RAL-92: record the freshly-built review-branch tip of every branch as the
     // baseline for manual-push detection, so this build (or a base-shift rebuild)
     // is never itself detected as a reviewer's manual push.
@@ -5233,16 +5358,81 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
         let _ = guard.set_guardian_combined_worktree(id, &wt_str);
     }
+    // Every branch is rebased; what follows runs for minutes without changing
+    // any branch's status, so this is the last point the board hears anything
+    // unless each remaining phase announces itself. Bracket them individually
+    // from here down.
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!(
+            "review {id} branches merged ({} of them); starting post-merge phases",
+            branches.len()
+        ),
+        serde_json::json!({
+            "phase": "post_merge",
+            "state": "started",
+            "branch_count": branches.len(),
+            "combined_branch": combined_branch,
+        }),
+    );
+
+    let readme_started = std::time::Instant::now();
     regenerate_readme(store, root);
-    match final_checks(store, runner, id, root, &wt_str, cancel) {
-        Ok(note) => {
-            // RAL-208: the LLM change summary is no longer regenerated here on
-            // every stack rebuild -- `run_merge` requests a (debounced) regen
-            // once, after every project in this merge has finished, so it is
-            // never re-triggered by a rebuild that didn't add/remove/enable/
-            // disable a branch (a feedback restack, a manual-push rebase, a
-            // base-shift rebuild).
-            // RAL-27: generate manual review commands once the stack is ready.
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!(
+            "review {id} readme regeneration finished in {}ms",
+            elapsed_ms(readme_started)
+        ),
+        serde_json::json!({
+            "phase": "regenerate_readme",
+            "state": "finished",
+            "elapsed_ms": elapsed_ms(readme_started),
+        }),
+    );
+
+    // The merge is finished here: every branch has been rebased onto the one
+    // before it and the combined branch is built. Everything below is
+    // *post-merge* work against a stack that is already done, so the review
+    // moves to `in_review` now rather than sitting in `merging` for the several
+    // minutes those jobs take.
+    //
+    // RAL-92: baseline the shared review branch's tip (all branches share it
+    // here) so the daemon's own build is not read as a manual push.
+    snapshot_review_heads(store, id);
+    set_status(GuardianStatus::InReview, None);
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!(
+            "review {id} merge complete ({} branches); post-merge checks starting",
+            branches.len()
+        ),
+        serde_json::json!({
+            "phase": "post_merge",
+            "state": "started",
+            "branch_count": branches.len(),
+        }),
+    );
+    let _ = store.lock().start_guardian_post_merge(id);
+
+    // Two independent post-merge jobs: the check gates run the project's own
+    // build/test command, and manual-commands generation asks an agent to write
+    // verification steps from the same diff. Neither reads the other's output
+    // and both take minutes, so they run concurrently rather than end to end.
+    //
+    // Both are joined before returning -- not to gate the merge, which already
+    // completed above, but because the combined worktree they are both reading
+    // is reused by the next merge of this review and must not have work still
+    // running inside it.
+    let post_merge_started = std::time::Instant::now();
+    let checks_outcome = std::thread::scope(|scope| {
+        let manual = scope.spawn(|| {
             generate_manual_commands(
                 store,
                 runner,
@@ -5253,13 +5443,57 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 Some(&wt),
                 cancel,
             );
-            // RAL-92: baseline the shared review branch's tip (all branches share
-            // it here) so the daemon's own build is not read as a manual push.
-            snapshot_review_heads(store, id);
-            set_status(GuardianStatus::InReview, note.as_deref());
-        }
-        Err(e) => set_status(GuardianStatus::MergeFailed, Some(&e)),
-    }
+        });
+        let outcome = final_checks(store, runner, id, root, &wt_str, cancel);
+        let _ = manual.join();
+        outcome
+    });
+
+    // A failed gate is advisory: it is recorded and surfaced, but the review
+    // stays `in_review` and remains approvable. The merge it would once have
+    // failed has already succeeded, and re-running a gate is not a reason to
+    // throw away a correctly rebased stack.
+    // On success `detail` carries the gate's own note (e.g. which project
+    // default build command ran), which the old code passed to `set_status`.
+    let failure = checks_outcome.as_ref().err().map(String::as_str);
+    let detail = match &checks_outcome {
+        Ok(note) => note.as_deref(),
+        Err(e) => Some(e.as_str()),
+    };
+    let _ = store
+        .lock()
+        .finish_guardian_post_merge(id, failure.is_none(), detail);
+    phase_note(
+        store,
+        id,
+        if failure.is_none() {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        },
+        match failure {
+            None => format!(
+                "review {id} post-merge checks passed in {}ms",
+                elapsed_ms(post_merge_started)
+            ),
+            Some(e) => format!(
+                "review {id} post-merge checks reported a failure after {}ms: {e}",
+                elapsed_ms(post_merge_started)
+            ),
+        },
+        serde_json::json!({
+            "phase": "post_merge",
+            "state": if failure.is_none() { "ok" } else { "failed" },
+            "elapsed_ms": elapsed_ms(post_merge_started),
+            "error": failure,
+            "advisory": true,
+        }),
+    );
+    // RAL-208: the LLM change summary is no longer regenerated here on every
+    // stack rebuild -- `run_merge` requests a (debounced) regen once, after
+    // every project in this merge has finished, so it is never re-triggered by
+    // a rebuild that didn't add/remove/enable/disable a branch (a feedback
+    // restack, a manual-push rebase, a base-shift rebuild).
 }
 
 /// What a [`run_feedback`] pass actually did to the target branch's own
@@ -6670,6 +6904,45 @@ pub fn review_maintenance(
                         &store.lock(),
                         "automatic PR commit sync failed",
                         serde_json::json!({"error": e}),
+                    );
+                cancellations.remove(&format!("guardian:{id}"));
+                return;
+            }
+            // Hold off while a stack is visibly mid-merge on the forge.
+            //
+            // Merging a stack merges its PRs one at a time, and ralphus does
+            // not learn of them all at once -- each is a separate forge
+            // observation, so a stack merged in one action can be detected
+            // minutes apart. Every one of those merges also advances the base
+            // branch, and `rebuild_on_base_shift` would happily start a
+            // multi-minute rebuild off the first of them.
+            //
+            // That rebuild is pure waste: the remaining PRs are about to merge
+            // too, and once they have, `check_pr_merges` approves the review
+            // outright without rebuilding anything. Observed as a 5m27s rebase
+            // of two branches that both turned out to be empty. Waiting a cycle
+            // costs nothing -- the review is idle either way.
+            let stack_partially_merged = {
+                let prs = store
+                    .lock()
+                    .list_pull_requests_for_guardian(&id)
+                    .unwrap_or_default();
+                let merged = prs.iter().filter(|p| p.state == "merged").count();
+                let open = prs.iter().filter(|p| p.state == "open").count();
+                merged > 0 && open > 0
+            };
+            if stack_partially_merged {
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::INFO)
+                    .scope("guardian")
+                    .guardian(&id)
+                    .emit(
+                        &store.lock(),
+                        format!(
+                            "review {id} rebuild deferred: its PR stack is part-merged, \
+                             waiting for the rest before deciding to rebase"
+                        ),
+                        serde_json::json!({"deferred": "stack_partially_merged"}),
                     );
                 cancellations.remove(&format!("guardian:{id}"));
                 return;
@@ -9781,6 +10054,44 @@ fn manual_commands_prompt(tail: &str) -> String {
     format!("{focus}{format}\n\n{tail}")
 }
 
+/// Emit one merge-pipeline phase record: stderr and Cartographer together via
+/// [`crate::cartographer::Note`].
+///
+/// Every phase of a merge that can run for more than a moment is expected to
+/// call this on entry and on exit. That is not only a logging-policy
+/// obligation: [`crate::events`] is fed *exclusively* by
+/// [`Store::cartographer_log`], and the board consumes that stream over
+/// `GET /api/events` as its primary live-update trigger, with only a 60s
+/// interval behind it as a fallback. A phase that emits nothing therefore
+/// leaves every board watching that review with no push signal at all for the
+/// phase's entire duration, which reads as a frozen review rather than a
+/// working one.
+///
+/// Phase-level, never per-iteration: a record per branch inside a stack's
+/// rebase loop would flood Cartographer on a large stack for no added signal.
+fn phase_note(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    level: crate::logging::LogLevel,
+    message: String,
+    payload: serde_json::Value,
+) {
+    crate::cartographer::Note::new("guardian")
+        .level(level)
+        .scope("guardian")
+        .guardian(id)
+        .emit(&store.lock(), message, payload);
+}
+
+/// Milliseconds elapsed since `started`, for a phase record's `elapsed_ms`.
+///
+/// Recorded on every phase completion so the cost of a slow phase is
+/// answerable from Cartographer alone, instead of by timing log timestamps by
+/// hand or inspecting the OS process list.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Generate LLM-suggested shell commands for manually testing or verifying
 /// the changes in the review branch (RAL-27).
 ///
@@ -9809,6 +10120,16 @@ fn generate_manual_commands(
         // large and would blow OS command-line limits in harness backends.
         let stat = wt.git(&["diff", "--stat", base_sha]).unwrap_or_default();
         if stat.trim().is_empty() {
+            phase_note(
+                store,
+                id,
+                crate::logging::LogLevel::INFO,
+                format!(
+                    "review {id} manual-commands generation skipped: the review worktree \
+                     has no changes over the base"
+                ),
+                serde_json::json!({"phase": "manual_commands", "skipped": "no_changes"}),
+            );
             return;
         }
         // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
@@ -9829,7 +10150,19 @@ fn generate_manual_commands(
         // RAL-201: same `root.git(...)` fix as above.
         let files = match root.git(&["diff", "--name-only", &format!("{base_sha}..{tip_ref}")]) {
             Ok(s) if !s.trim().is_empty() => s,
-            _ => return,
+            _ => {
+                phase_note(
+                    store,
+                    id,
+                    crate::logging::LogLevel::INFO,
+                    format!(
+                        "review {id} manual-commands generation skipped: no changed files \
+                         between {base_sha} and {tip_ref}"
+                    ),
+                    serde_json::json!({"phase": "manual_commands", "skipped": "no_changed_files"}),
+                );
+                return;
+            }
         };
         let log = root
             .git(&["log", "--format=%s", &format!("{base_sha}..{tip_ref}")])
@@ -9944,6 +10277,24 @@ fn generate_manual_commands(
     // the guardian-level Live-View start time (plain overwrite, so a
     // regeneration always shows the latest generation's start).
     let _ = store.lock().stamp_guardian_manual_checks_started_at(id);
+    // This agent run is the single longest phase of a merge -- routinely ten
+    // minutes on a real stack. Announce it before blocking on it, so a board
+    // watching this review learns the merge is alive and what it is doing
+    // rather than going silent until the agent returns. The store lock is
+    // taken and released inside `phase_note`, never held across the run.
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!("review {id} manual-commands generation started agent={agent} model={model:?}"),
+        serde_json::json!({
+            "phase": "manual_commands",
+            "state": "started",
+            "agent": agent,
+            "model": model,
+        }),
+    );
+    let started = std::time::Instant::now();
     let result = runner.run_cancellable(&spec, cancel);
     // Generation has actually finished running -- stamp the guardian-level
     // Live-View end time regardless of outcome, mirroring the started-at stamp
@@ -9962,6 +10313,24 @@ fn generate_manual_commands(
     }
 
     if !result.is_done() || result.summary.trim().is_empty() {
+        // WARNING, not INFO: the merge still reaches `in_review`, but the
+        // review lands without the manual checks it was supposed to carry, and
+        // nothing else reports that.
+        phase_note(
+            store,
+            id,
+            crate::logging::LogLevel::WARNING,
+            format!(
+                "review {id} manual-commands generation produced nothing after {}ms",
+                elapsed_ms(started)
+            ),
+            serde_json::json!({
+                "phase": "manual_commands",
+                "state": "empty",
+                "elapsed_ms": elapsed_ms(started),
+                "cancelled": cancel.is_cancelled(),
+            }),
+        );
         return;
     }
 
@@ -9976,6 +10345,24 @@ fn generate_manual_commands(
             model.as_deref(),
         );
     }
+    phase_note(
+        store,
+        id,
+        crate::logging::LogLevel::INFO,
+        format!(
+            "review {id} manual-commands generation finished in {}ms with {} command(s)",
+            elapsed_ms(started),
+            commands.len()
+        ),
+        serde_json::json!({
+            "phase": "manual_commands",
+            "state": "finished",
+            "elapsed_ms": elapsed_ms(started),
+            "command_count": commands.len(),
+            "agent": agent,
+            "model": model,
+        }),
+    );
 }
 
 /// Prompt asked of the resolver agent for "set it for me" (RAL-164): propose

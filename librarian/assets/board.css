@@ -2,7 +2,7 @@
         --bg: #0d1117; --panel: #161b22; --panel-2: #1c2129; --border: #30363d;
         --text: #e6edf3; --muted: #8b949e; --accent: #4aa3ff; --danger: #f85149;
         --running: #4aa3ff; --done: #3fb950; --failed: #f85149; --pending: #8b949e;
-        --queued: #a371f7; --cancelled: #6e7681; --teal: #39c5cf;
+        --queued: #a371f7; --materializing: #58a6ff; --cancelled: #6e7681; --teal: #39c5cf;
         --ignored: #c9a227;
         --warn: #d29922;
         --unverified: #e3b341;
@@ -140,6 +140,7 @@
       .p-done { color: var(--done); border-color: var(--done); }
       .p-failed { color: var(--failed); border-color: var(--failed); }
       .p-pending { color: var(--pending); } .p-queued { color: var(--queued); border-color: var(--queued); }
+      .p-materializing { color: var(--materializing); border-color: var(--materializing); }
       .p-cancelled { color: var(--cancelled); }
       .p-waiting { color: var(--waiting); border-color: var(--waiting); }
       .p-warn { color: var(--warn); border-color: var(--warn); }
@@ -156,6 +157,7 @@
 
       .detail-pane { padding: 16px 18px; }
       .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+      .materializing-graph { color: var(--materializing); cursor: help; }
       .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
       .dhead .k { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
       h3.section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 18px 0 8px; }

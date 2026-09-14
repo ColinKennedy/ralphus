@@ -1828,6 +1828,41 @@ pub fn derive_triage_pools(
     Ok(created)
 }
 
+/// Re-check every Triage pool touched by `squad_id` after one of its tasks
+/// completes. Cells enter a pool at submission time so they remain visible as
+/// scheduled candidates, but its count threshold must not create a review
+/// until enough cells have actually completed successfully.
+pub(crate) fn fire_ready_triage_thresholds(
+    store: &Store,
+    squad_id: &str,
+) -> std::result::Result<Vec<String>, ReviewError> {
+    let mut keys = HashSet::new();
+    for (project, triage_type, row) in store
+        .all_pooled_cells()
+        .map_err(|e| ReviewError::new(e.to_string()))?
+    {
+        if row.squad_id == squad_id {
+            keys.insert((project, triage_type));
+        }
+    }
+
+    let mut created = Vec::new();
+    for (project, triage_type) in keys {
+        let count = store
+            .triage_pool_count(&project, &triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        let threshold = store
+            .get_triage_pool_threshold(&project, &triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if threshold.is_some_and(|t| count >= t) {
+            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+                created.push(gid);
+            }
+        }
+    }
+    Ok(created)
+}
+
 /// Drain the `(project, triage_type)` pool and, if it wasn't already emptied
 /// by a concurrent caller (the scheduler's cron tick, or another submission's
 /// own threshold check), create a fresh review guardian from its cells.
@@ -1888,9 +1923,9 @@ pub(crate) fn create_review_from_triage_project_sweep(
 }
 
 /// Shared tail of [`create_review_from_triage_pool`]/
-/// [`create_review_from_triage_project_sweep`]: filter out any cell whose
-/// proof has definitively failed, and -- if anything viable remains -- build
-/// one fresh review guardian from it. `pool_key` is used only for logging
+/// [`create_review_from_triage_project_sweep`]: retain only completed cells
+/// and -- if anything eligible remains -- build one fresh review guardian
+/// from them. `pool_key` is used only for logging
 /// (the Cartographer note and its payload); the *real* project identity
 /// always resolves off [`crate::triage::base_project_key`].
 fn build_review_from_drained_pool(
@@ -1899,17 +1934,15 @@ fn build_review_from_drained_pool(
     triage_type: &str,
     drained: Vec<crate::triage::TriagePoolCellRow>,
 ) -> std::result::Result<Option<String>, ReviewError> {
-    // Defense in depth: `drain_triage_pool` already excludes a failed cell,
-    // but a failed cell must never reach a review under any circumstance
-    // (RAL-318 bug 2), so re-check here too in case some future code path
-    // ever inserts into `triage_pool_cells` without going through the same
-    // drain filter (e.g. a hypothetical manual "force-fire" admin action).
+    // Defense in depth: `drain_triage_pool` already selects only completed
+    // cells. Keep that invariant here in case a future caller supplies rows
+    // without going through the drain filter.
     let mut viable = Vec::with_capacity(drained.len());
     for cell in drained {
         let effective = store
             .effective_state_for_cell(&cell.squad_id, cell.task_idx, cell.idx)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        if effective.as_deref() != Some("failed") {
+        if effective.as_deref() == Some("done") {
             viable.push(cell);
         }
     }
@@ -2361,8 +2394,8 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_reviews_with_prefetch, derive_triage_pools, plan, rebase_onto,
-        repair_arbiter_review_project_roots, repair_review_project_identities,
+        derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
+        rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
         repair_triage_pool_keys, require_auto_build_declaration,
         require_auto_build_declaration_early, review_branch_order, rows_from_file,
         set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
@@ -2370,6 +2403,18 @@ mod tests {
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
+
+    fn completed_pool_cell(store: &mut Store) -> String {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        squad_id
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -3459,12 +3504,14 @@ print(json.dumps(result))
 
     #[test]
     fn create_review_from_triage_pool_creates_an_arbiter_origin_guardian_and_drains_the_pool() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
             .unwrap();
         store
-            .record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3512,8 +3559,9 @@ print(json.dumps(result))
         store
             .record_triage_pool_cell("proj", "security", &failed_squad, 0, 0, "b-failed", "main")
             .unwrap();
+        let ok_squad = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-ok", 0, 0, "b-ok", "main")
+            .record_triage_pool_cell("proj", "security", &ok_squad, 0, 0, "b-ok", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3586,12 +3634,13 @@ print(json.dumps(result))
             "[review]\ndefault_machine = \"ib:A\"\ndefault_maximum_budget_usd = 2.5\n",
         )
         .unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3672,12 +3721,13 @@ print(json.dumps(result))
             "[review]\nauto_fix_pr_errors = true\nauto_fix_prompt_template = \"pooled: <<prompt>>\"\n",
         )
         .unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3804,14 +3854,15 @@ print(json.dumps(result))
     #[test]
     fn repair_triage_pool_keys_rekeys_a_stale_path_based_pool_and_fires_when_now_past_threshold() {
         let root = temp_repo();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
 
         let stale_key = root.to_string_lossy().replace('\\', "/");
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell(&stale_key, "bug", "squad-x", 0, 0, "b1", "main")
+            .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
             .unwrap();
         store
             .set_triage_pool_threshold(&stale_key, "bug", Some(1))
@@ -3992,10 +4043,14 @@ print(json.dumps(result))
             "pool key must resolve to the registered project's name (RAL-318 bug 3), not its raw worktree path"
         );
         assert_eq!(triage_type, "security");
+        assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 0);
+
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 1);
 
-        // A second submission of the same file re-pools (a fresh squad_id),
-        // and with a threshold of 2 now configured, this second call fires.
+        // A second completed candidate brings the configured threshold to two.
         store
             .set_triage_pool_threshold(&project, &triage_type, Some(2))
             .unwrap();
@@ -4004,6 +4059,14 @@ print(json.dumps(result))
             .set_cell_triage_types(&squad_id_2, 0, 0, &["security".to_string()])
             .unwrap();
         let created = derive_triage_pools(&store, &squad_id_2, &file).unwrap();
+        assert!(
+            created.is_empty(),
+            "pending work must not fire the threshold"
+        );
+        store
+            .set_cell_state(&squad_id_2, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id_2).unwrap();
         assert_eq!(created.len(), 1);
         let g = store.get_guardian(&created[0]).unwrap();
         assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
@@ -4064,6 +4127,14 @@ print(json.dumps(result))
             ]
         );
         let project = keys[0].0.clone();
+        // A pooled cell is only *counted* once it has actually finished --
+        // pooling records the candidate, the count gates a threshold. Mark it
+        // done so this test measures per-type independence rather than the
+        // counting rule (which `triage_pool_count_only_includes_a_cell_after_its_proof_passes`
+        // covers on its own).
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count(&project, "bug").unwrap(), 1);
         assert_eq!(
             store.triage_pool_count(&project, "investigation").unwrap(),
@@ -4128,6 +4199,13 @@ print(json.dumps(result))
             store.triage_pool_keys().unwrap(),
             vec![("proj::core".to_string(), "bug".to_string())]
         );
+        // Pooling records a candidate; only a finished cell is *counted*
+        // toward a threshold. Each squad below is marked done so the counts
+        // in this test measure subproject-overlap bucketing, not the
+        // done-gating rule.
+        store
+            .set_cell_state(&squad_a, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
 
         // An overlapping-but-not-identical set ({core, utils} vs {core})
         // still shares the "core" pool.
@@ -4149,6 +4227,9 @@ print(json.dumps(result))
                 .unwrap()
                 .is_empty()
         );
+        store
+            .set_cell_state(&squad_b, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(
             store.triage_pool_count("proj::core", "bug").unwrap(),
             2,
@@ -4169,6 +4250,9 @@ print(json.dumps(result))
                 .unwrap()
                 .is_empty()
         );
+        store
+            .set_cell_state(&squad_c, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count("proj::steam", "bug").unwrap(), 1);
         assert_eq!(
             store.triage_pool_count("proj::core", "bug").unwrap(),
@@ -4280,8 +4364,7 @@ print(json.dumps(result))
         store
             .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
             .unwrap();
-        // Fire immediately: threshold of 1 on the pool this submission's own
-        // "work" cell resolves to.
+        // The threshold is configured before the candidate is submitted.
         let triage_project =
             crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
         store
@@ -4289,7 +4372,16 @@ print(json.dumps(result))
             .unwrap();
 
         let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
-        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        assert!(created.is_empty(), "pending work must not create a review");
+
+        // Completing the Triage candidate makes it eligible and re-checks the
+        // threshold. Its non-Triage worktree sibling still gates merge
+        // readiness below.
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id).unwrap();
+        assert_eq!(created.len(), 1, "completed work fires threshold of 1");
         let gid = created[0].clone();
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.branches.len(), 1);
@@ -4298,9 +4390,6 @@ print(json.dumps(result))
         // "work" (task 0, cell 0) finishes -- branch must stay `pending`:
         // "finalize" (task 0, cell 1), the worktree sibling that never
         // itself opted into Triage, hasn't finished yet.
-        store
-            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(
             n, 0,
@@ -4364,7 +4453,13 @@ print(json.dumps(result))
             .unwrap();
 
         let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
-        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        assert!(created.is_empty(), "pending work must not create a review");
+
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id).unwrap();
+        assert_eq!(created.len(), 1, "completed work fires threshold of 1");
         let gid = created[0].clone();
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.branches.len(), 1);
@@ -4373,9 +4468,6 @@ print(json.dumps(result))
         // "work" (root cwd) finishes -- branch must stay `pending`:
         // "finalize" (nested `sub` cwd, same worktree, no triage/review of
         // its own) hasn't finished yet.
-        store
-            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(
             n, 0,

@@ -1255,6 +1255,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
             "--auto-compact-threshold [tokens]",
             "--command [cmd]",
             "--cwd [path]",
+            "--maximum-context [tokens]",
             "--maximum-tool-output-tokens [tokens]",
             "--model [name]",
             "--prompt [text]",

@@ -1952,6 +1952,18 @@ fn run_cell_worker(
         }
     };
     let mut spec = RunnerSpec::from_row(squad_id, row);
+    let proof_awareness = {
+        let guard = store.lock();
+        guard
+            .proof_specs(squad_id, row.task_idx, "cell", row.idx)
+            .unwrap_or_default()
+    };
+    if let Some(guidance) = cell_proof_awareness_context(&proof_awareness) {
+        spec.system_prompt = Some(match spec.system_prompt {
+            Some(existing) => format!("{existing}\n\n{guidance}"),
+            None => guidance,
+        });
+    }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
     spec.prompt = spec
@@ -2863,6 +2875,16 @@ fn run_task_finalizer(
     // Guard dropped above; now check per-task review readiness without holding
     // the lock.
     if did_write && state == NodeState::Done {
+        {
+            let guard = store.lock();
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, squad_id) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] failed to re-check thresholds after task {task_idx} in {squad_id} completed: {}",
+                    e.message
+                );
+            }
+        }
         try_start_ready_reviews_for_task(
             store,
             squad_id,
@@ -3298,6 +3320,124 @@ struct ProofOutcome {
     steps_passed: usize,
 }
 
+/// Build the immutable proof context immediately before a prompt proof starts.
+///
+/// The scheduler, rather than the task author, owns this text: it is derived
+/// from the ordered proof rows and their current persisted outcomes. It is
+/// delivered both as the final system-prompt section and as a suffix to the
+/// proof request so an agent has the same scope reminder in both places.
+#[allow(clippy::too_many_arguments)]
+fn proof_execution_context(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    scope: &str,
+    cell_idx: i64,
+    specs: &[crate::store::ProofSpecRow],
+    position: usize,
+    current_id: Option<&str>,
+) -> String {
+    let earlier = {
+        let guard = store.lock();
+        specs[..position]
+            .iter()
+            .enumerate()
+            .map(|(prior_position, (prior_idx, prior_id, ..))| {
+                let state = guard
+                    .proof_state(squad_id, task_idx, scope, cell_idx, *prior_idx)
+                    .ok()
+                    .flatten();
+                (
+                    proof_context_name(prior_id.as_deref(), prior_position),
+                    proof_context_status(state.as_deref()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let current = proof_context_name(current_id, position);
+    let earlier_text = if earlier.is_empty() {
+        "There are no earlier proofs in this scope.".to_string()
+    } else {
+        let rows = earlier
+            .iter()
+            .map(|(name, status)| format!("- `{name}`: {status}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Earlier proof results:\n{rows}")
+    };
+
+    format!(
+        "## Ralphus proof execution context\n\n\
+         You are proof {} of {}: `{current}`.\n\n\
+         {earlier_text}\n\n\
+         Your responsibility is to verify all `{current}`-related requests for this proof. \
+         When you are given specific `{current}`-related tests or checks, focus only on \
+         those and on additional `{current}`-related checks needed to diagnose or make \
+         those checks pass.\n\n\
+         Earlier proof results are authoritative for this invocation; focus your work on \
+         the current proof.",
+        position + 1,
+        specs.len(),
+    )
+}
+
+fn proof_context_name(id: Option<&str>, position: usize) -> String {
+    id.map(str::to_string)
+        .unwrap_or_else(|| format!("proof-{}", position + 1))
+}
+
+fn proof_context_status(state: Option<&str>) -> &'static str {
+    match state {
+        Some("done") => "PASS",
+        Some("failed") => "FAIL",
+        Some("cancelled") => "CANCELLED",
+        Some("ignored") => "IGNORED",
+        Some("running") => "RUNNING",
+        Some("pending") => "PENDING",
+        Some(_) | None => "NOT RECORDED",
+    }
+}
+
+/// Build the "don't bother re-covering this ground" guidance appended to a
+/// cell's system prompt when the cell has its own cell-scope proof steps.
+/// Unconditional whenever such proofs exist — like
+/// `NON_INTERACTIVE_SYSTEM_PROMPT`/`GHOST_SYSTEM_PROMPT`, this is ralphus
+/// policy (don't waste a cell's turn re-verifying what its proofs already
+/// cover), not something a task/cell can opt out of.
+///
+/// Only proof kinds the scheduler actually executes count ("command",
+/// "prompt") — "brain"/"approval"/"unknown" are deferred and never run (see
+/// `run_proofs`'s `"brain" | "approval" | "unknown" => continue` arm), so
+/// naming them here would promise a check that never happens. Returns `None`
+/// when there is nothing to mention, so a cell with no qualifying cell-scope
+/// proofs is unaffected.
+fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<String> {
+    let names: Vec<String> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, kind, ..))| kind == "command" || kind == "prompt")
+        .map(|(position, (_, id, ..))| proof_context_name(id.as_deref(), position))
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let rows = names
+        .iter()
+        .map(|name| format!("- `{name}`: will check {name}-related work once this cell finishes"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "This cell is followed by proof step(s) that will check your work once you \
+         finish:\n{rows}\n\n\
+         Focus your turn on completing the task itself. You may still run checks you \
+         are confident are lightweight and fast — static analysis, linters, compile \
+         checks, and auto-formatters usually qualify — but skip anything you are not \
+         sure is fast, or that you know is slow (such as a full test suite): you do \
+         not need to cover ground the proof step(s) above already own, since they \
+         run right after you and will catch it."
+    ))
+}
+
 /// Run the `command` and `prompt` proof steps of one scope, updating each
 /// step's state. `all_ok` is false if any of them fails. Other proof kinds
 /// (`brain` / `approval`) are still deferred and left pending.
@@ -3349,16 +3489,17 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
-    for (
-        idx,
-        kind,
-        spec,
-        proof_model,
-        proof_timeout,
-        proof_budget,
-        proof_maximum_tool_output_tokens,
-    ) in specs
-    {
+    for (position, row) in specs.iter().cloned().enumerate() {
+        let (
+            idx,
+            proof_id,
+            kind,
+            spec,
+            proof_model,
+            proof_timeout,
+            proof_budget,
+            proof_maximum_tool_output_tokens,
+        ) = row;
         if cancel.is_cancelled() {
             return ProofOutcome {
                 all_ok,
@@ -3550,18 +3691,30 @@ fn run_proofs(
                 set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
                 let proof_span =
                     otel::start_span("scheduler.proof_prompt", &cx, SpanKind::Internal);
+                let proof_context = proof_execution_context(
+                    store,
+                    squad_id,
+                    task_idx,
+                    scope,
+                    cell_idx,
+                    &specs,
+                    position,
+                    proof_id.as_deref(),
+                );
+                let prompt = format!("{spec}\n\n{proof_context}");
                 let mut runner_spec = RunnerSpec::for_proof(
                     squad_id,
                     task_name,
                     &format!("proof-{scope}-{idx}"),
                     cwd,
-                    &spec,
+                    &prompt,
                     &selection.backend,
                     model,
                     proof_timeout.and_then(|s| u64::try_from(s).ok()),
                     proof_budget.and_then(|b| u64::try_from(b).ok()),
                     proof_maximum_tool_output_tokens.and_then(|v| u64::try_from(v).ok()),
                 );
+                runner_spec.system_prompt = Some(proof_context);
                 runner_spec.executable = selection.executable.clone();
                 runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
                 runner_spec.env_overrides = std::mem::take(&mut env_overrides);
@@ -3831,7 +3984,12 @@ mod tests {
                 .clone()
                 .or_else(|| spec.prompt.clone())
                 .unwrap_or_default();
-            if self.fail_on.as_deref() == Some(text.as_str()) || fake_exit_code_fails(&text) {
+            if self
+                .fail_on
+                .as_deref()
+                .is_some_and(|needle| text == needle || text.starts_with(&format!("{needle}\n\n")))
+                || fake_exit_code_fails(&text)
+            {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
@@ -5933,6 +6091,172 @@ mod tests {
         assert_eq!(v.output.as_deref(), Some("ok"));
     }
 
+    /// Captures the generated prompt and system-prompt context for prompt
+    /// proofs without invoking an external agent backend.
+    /// `(prompt, system_prompt)` pairs a prompt-proof invocation was run with.
+    type SeenProofPrompts = Vec<(String, Option<String>)>;
+
+    struct ProofContextRecorder {
+        seen: Arc<Mutex<SeenProofPrompts>>,
+    }
+
+    impl Runner for ProofContextRecorder {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            if spec.proof {
+                self.seen.lock().unwrap().push((
+                    spec.prompt.clone().unwrap_or_default(),
+                    spec.system_prompt.clone(),
+                ));
+            }
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: spec.proof.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_proof_gets_immutable_context_with_earlier_proof_results() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"do\"\n\
+                    [[task.proof]]\nid=\"rust\"\nprompt=\"run cargo checks\"\n\
+                    [[task.proof]]\nid=\"web\"\nprompt=\"run npm checks\"\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            &ProofContextRecorder {
+                seen: Arc::clone(&seen),
+            },
+            &id,
+        );
+
+        let captured = seen.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let (web_prompt, web_system) = &captured[1];
+        let expected = "Earlier proof results:\n- `rust`: PASS";
+        assert!(web_prompt.contains(expected), "{web_prompt}");
+        assert!(
+            web_prompt.contains("verify all `web`-related requests"),
+            "{web_prompt}"
+        );
+        let web_system = web_system.as_deref().expect("prompt proof has context");
+        assert!(web_system.contains(expected), "{web_system}");
+        assert!(
+            web_system.ends_with("Earlier proof results are authoritative for this invocation; focus your work on the current proof."),
+            "{web_system}"
+        );
+    }
+
+    /// Records every spec (proof or not) it was invoked with, so a test can
+    /// inspect the effective `system_prompt` the *cell body itself* (not just
+    /// its proofs) was dispatched with.
+    struct CellSystemPromptRecorder {
+        seen: Arc<Mutex<Vec<(bool, Option<String>)>>>,
+    }
+
+    impl Runner for CellSystemPromptRecorder {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((spec.proof, spec.system_prompt.clone()));
+            RunnerResult {
+                status: "done".to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: spec.proof.then_some(true),
+                agent_session_id: None,
+                ghost: None,
+            }
+        }
+    }
+
+    #[test]
+    fn cell_system_prompt_gets_proof_awareness_guidance_when_cell_has_proofs() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do the work\"\n\
+                    [[task.cell.proof]]\nid=\"rust\"\nprompt=\"run cargo checks\"\n\
+                    [[task.cell.proof]]\nid=\"web\"\nprompt=\"run npm checks\"\n";
+        let (store, id) = store_with(toml);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            &CellSystemPromptRecorder {
+                seen: Arc::clone(&seen),
+            },
+            &id,
+        );
+
+        let captured = seen.lock().unwrap();
+        let (_, cell_system_prompt) = captured
+            .iter()
+            .find(|(is_proof, _)| !is_proof)
+            .expect("the cell body itself must be recorded");
+        let cell_system_prompt = cell_system_prompt
+            .as_deref()
+            .expect("cell has qualifying proofs, so guidance must be injected");
+        assert!(
+            cell_system_prompt.contains(
+                "This cell is followed by proof step(s) that will check your work once you finish:"
+            ),
+            "{cell_system_prompt}"
+        );
+        assert!(
+            cell_system_prompt
+                .contains("- `rust`: will check rust-related work once this cell finishes"),
+            "{cell_system_prompt}"
+        );
+        assert!(
+            cell_system_prompt
+                .contains("- `web`: will check web-related work once this cell finishes"),
+            "{cell_system_prompt}"
+        );
+    }
+
+    #[test]
+    fn cell_system_prompt_has_no_proof_awareness_guidance_when_cell_has_no_proofs() {
+        let (store, id) = store_with(ONE_CELL);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            &CellSystemPromptRecorder {
+                seen: Arc::clone(&seen),
+            },
+            &id,
+        );
+
+        let captured = seen.lock().unwrap();
+        let (_, cell_system_prompt) = captured
+            .iter()
+            .find(|(is_proof, _)| !is_proof)
+            .expect("the cell body itself must be recorded");
+        if let Some(sp) = cell_system_prompt {
+            assert!(
+                !sp.contains("followed by proof step"),
+                "cell with no proofs must not get proof-awareness guidance: {sp}"
+            );
+        }
+    }
+
     #[test]
     fn prompt_proof_persists_token_and_cost_usage() {
         // Regression (RAL-185 Phase 0): a `prompt`-kind proof's LLM spend was
@@ -6944,7 +7268,11 @@ mod tests {
             "cell body must run on first pass"
         );
         assert!(
-            calls.lock().unwrap().contains(&"check-output".to_string()),
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("check-output\n\n## Ralphus proof execution context")),
             "prompt proof must run on first pass"
         );
 
@@ -6968,7 +7296,9 @@ mod tests {
             "cell body must NOT re-run after restart_cell_proof; got: {recorded:?}"
         );
         assert!(
-            recorded.contains(&"check-output".to_string()),
+            recorded
+                .iter()
+                .any(|call| call.starts_with("check-output\n\n## Ralphus proof execution context")),
             "prompt proof must re-run; got: {recorded:?}"
         );
         assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
@@ -7009,7 +7339,9 @@ mod tests {
             "cell body must NOT re-run after restart_task_proof; got: {recorded:?}"
         );
         assert!(
-            recorded.contains(&"task-check".to_string()),
+            recorded
+                .iter()
+                .any(|call| call.starts_with("task-check\n\n## Ralphus proof execution context")),
             "task prompt proof must re-run; got: {recorded:?}"
         );
         assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);

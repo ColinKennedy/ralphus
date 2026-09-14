@@ -224,22 +224,17 @@
           // pipe-pane capture never engaged — the `/pane` snapshot is shown
           // instead, so the box never dead-ends on "Waiting for output…". A
           // failed probe leaves `live` null so the tape-growth fallback decides.
-          /** @type {boolean|null} */
-          let live = null;
-          /** @type {string|undefined} */
-          let paneContent;
+          // Fired now but awaited after the tape fetch below: `/pane` and
+          // `/pane-transcript` are independent requests (the daemon-side
+          // `/pane` handler can shell out to tmux, which is the slower of the
+          // two), so kicking both off together instead of one-after-another
+          // roughly halves this box's per-tick latency.
           const liveUrl = peekUrlFor(key);
-          if (liveUrl) {
-            try {
-              const lr = await fetch(liveUrl);
-              if (lr.ok) {
-                /** @type {PeekPaneResponse} */
-                const ld = await lr.json();
-                live = ld.active ?? null;
-                if (typeof ld.content === "string") paneContent = ld.content;
-              }
-            } catch (_) { /* leave live=null / paneContent undefined; fallbacks decide */ }
-          }
+          const livePromise = liveUrl
+            ? fetch(liveUrl)
+                .then((lr) => (lr.ok ? /** @type {Promise<PeekPaneResponse|null>} */ (lr.json()) : null))
+                .catch(() => null)
+            : Promise.resolve(null);
 
           // Content: page the transcript tape when one exists. Seed the tail on
           // first open (probe total, then fetch the last chunk); afterwards
@@ -273,6 +268,18 @@
           } else {
             // No transcript available — render the /pane snapshot instead.
             delete peekTape[key];
+          }
+
+          // A failed/absent probe leaves `live` null so the tape-growth
+          // fallback (below, via `nextPeekPaneState`) decides instead.
+          /** @type {boolean|null} */
+          let live = null;
+          /** @type {string|undefined} */
+          let paneContent;
+          const ld = await livePromise;
+          if (ld) {
+            live = ld.active ?? null;
+            if (typeof ld.content === "string") paneContent = ld.content;
           }
 
           /** @type {PeekPaneState} */
@@ -694,7 +701,13 @@
         // up once the selection is released.
         if (userIsSelecting()) return;
         const keys = Object.keys(peekOpen).filter((k) => peekOpen[k]);
-        for (const key of keys) await fetchPeek(key, false);
+        // Concurrent, not sequential (RAL-397 made each box's fetchPeek() issue
+        // up to two round trips instead of one -- with N open boxes, a
+        // sequential for/await loop compounded that into 2N+ round trips paid
+        // one at a time, turning "instant" into a multi-second stall as more
+        // boxes were opened). Every box's fetch is independent, so run them
+        // together and let the slowest one bound the tick instead of the sum.
+        await Promise.all(keys.map((key) => fetchPeek(key, false)));
       }
       /**
        * Closes the graph node context menu, if open.

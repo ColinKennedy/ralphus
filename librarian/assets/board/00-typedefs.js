@@ -310,6 +310,10 @@
        * @property {number} [merge_attempt] - RAL-193: current merge-attempt counter, bumped once per rebase/re-merge.
        * @property {number|null} [manual_checks_started_at_ms] - RAL-259: epoch-ms when this review's manual-checks generation agent most recently began work, or null if generation hasn't started yet. Persists after generation finishes.
        * @property {number|null} [manual_checks_finished_at_ms] - epoch-ms when this review's manual-checks generation agent most recently finished work, or null if generation hasn't completed yet. Shown alongside `manual_checks_started_at_ms` once the Live View shows a historical record.
+       * @property {string|null} [post_merge_status] - the post-merge phase's rolled-up state: "running" while the check gates and/or manual-checks generation are still working against an already-finished stack, then "ok" or "failed"; null for a review that has never completed a merge. The review's own status is `in_review` throughout — a merge is complete once its branches are rebased, and these jobs run after it. "failed" is advisory and never blocks approval or PR submission.
+       * @property {string|null} [post_merge_detail] - the post-merge phase's note: what failed when `post_merge_status` is "failed", otherwise the gate's own summary (e.g. which build command ran). Null when there is nothing to report.
+       * @property {number|null} [post_merge_started_at_ms] - epoch-ms when the post-merge phase most recently started, or null if it has never run.
+       * @property {number|null} [post_merge_finished_at_ms] - epoch-ms when the post-merge phase most recently finished, or null while it is still running.
        * @property {number} [attempt_tokens_in] - RAL-193: input tokens spent on this review's own resolver/proof calls during the current merge attempt only.
        * @property {number} [attempt_tokens_out] - RAL-193: output tokens, current merge attempt only.
        * @property {number} [attempt_cost_usd] - RAL-193: USD cost, current merge attempt only.

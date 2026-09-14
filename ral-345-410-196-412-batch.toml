@@ -1,0 +1,349 @@
+[[review]]
+id                   = "ralphus:new-review/ral-345-410-196-412"
+name                 = "RAL-345 / RAL-410 / RAL-196 / RAL-412"
+upstream             = "staging"
+agent                = "pi-openrouter-deepseek"
+proof_scope          = "nothing"
+skip_auto_build      = true
+auto_submit_pr_stack = true
+auto_fix_pr_errors   = true
+
+[[task]]
+name    = "RAL-345"
+project = "ralphus"
+agent   = "pi-openrouter-deepseek"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-345: work"
+  maximum_context        = 180000
+  auto_compact_threshold = 140000
+  maximum_tool_output_tokens = 12000
+  cwd                    = "<<ralphus:new-worktree/RAL-345-multi-select-project-filter?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-345-410-196-412>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-345: Add multi-select project filter to Tasks and Squads tabs
+
+## Summary
+
+Add a project filter to the Tasks and Squads tabs that lets a user add or remove any number of project names, rendered the same way existing label-lists are (a bordered chip per selection with an "X" on the left to remove it). All projects are shown by default (no filter applied); a dropdown lets the user pick a registered project by name, listed alphabetically, to add to the filter set.
+
+## Values
+
+Users working across many registered projects need to narrow the Tasks/Squads views down to just the project(s) they currently care about, without losing everything else from view permanently or having to re-select every time they switch tabs.
+
+## Risks
+
+- Must reuse the existing label-list chip pattern exactly (border-box + left-side "X") rather than introducing a visually inconsistent filter control — check `librarian/assets/board/*.js` for the current label-list implementation before building a new one.
+- Any color used for the chip/border must come from `docs/colors.md` — no hardcoded hex values (see `librarian/AGENTS.md`).
+- "Keep current selection in-memory" implies no persistence across page reloads; confirm this is intentional and not just deferred scope, since users may expect the filter to survive a refresh.
+- Alphabetical project list needs to stay in sync as projects are registered/removed — verify there's a live registered-projects source to bind the dropdown to rather than a stale snapshot.
+
+## Acceptance Criteria
+
+- [ ] Tasks tab and Squads tab each get the project filter; all projects shown by default.
+- [ ] Dropdown lists registered projects alphabetically by name.
+- [ ] Filter supports multi-selection; each selected project renders as a removable chip with an "X".
+- [ ] Selection is kept in-memory for the session (not necessarily persisted across reloads).
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+## Technical Notes
+
+- Existing label-list chip styling lives in `librarian/assets/board/*.js` and `librarian/assets/board.css` — reuse rather than reinvent.
+
+Additional clarified requirements: a squad matches when any of its tasks belongs to a selected project. Persist project selections using the existing status-filter persistence mechanism. Also upgrade the unrelated Triage tab's existing single-select project filter to the same multi-select pattern. Combine project selection with existing status/search filtering using AND.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run the applicable formatter(s) for this change. If formatting changes files, apply them and re-run the formatter check. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "lint"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run the relevant lint and type-check commands for this change. Fix only issues caused by this task and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected checks pass."
+
+    [[task.cell.proof]]
+    id     = "test"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run focused tests for this change. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`, because this dogfooding environment can lock daemon/librarian executables. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-345: finalize"
+  maximum_context        = 130000
+  auto_compact_threshold = 100000
+  maximum_tool_output_tokens = 8000
+  cwd                    = "<<ralphus:new-worktree/RAL-345-multi-select-project-filter?upstream=staging>>"
+  depends_on             = ["work"]
+  agent                  = "pi-openrouter-deepseek"
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+[[task]]
+name    = "RAL-410"
+project = "ralphus"
+agent   = "pi-openrouter-deepseek"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-410: work"
+  maximum_context        = 200000
+  auto_compact_threshold = 150000
+  maximum_tool_output_tokens = 15000
+  cwd                    = "<<ralphus:new-worktree/RAL-410-endpoint-cli-parity?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-345-410-196-412>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-410: CI check for endpoint-to-CLI parity
+
+## Summary
+
+Add a CI/CD check that verifies every daemon API endpoint has a corresponding CLI equivalent, or carries an inline comment explaining why it deliberately doesn't. This mirrors the existing `mcp/tests/parity.rs` pattern (RAL-301) that enforces CLI↔MCP-tool parity with a documented-reason exclusion list, but for endpoint↔CLI coverage.
+
+## Values
+
+Without this check, new daemon endpoints can silently ship without CLI support, leaving the CLI surface incomplete and forcing users to fall back to raw HTTP calls. An automated gate keeps the CLI a reliable, complete client of the daemon API as the API grows.
+
+## Risks
+
+- Endpoints that are intentionally internal-only (e.g. used only by the librarian's proxy) need a clear, low-friction way to be excluded rather than forcing an artificial CLI command.
+- Keeping the endpoint list and CLI command list in sync as both evolve could require nontrivial static analysis or a maintained manifest.
+- False positives could block unrelated PRs if the check is too strict or misses legitimate exclusions.
+
+## Acceptance Criteria
+
+- [ ] A CI check enumerates all daemon HTTP API endpoints (per `docs/daemon-api.md`) and all CLI leaf subcommands.
+- [ ] Every endpoint either maps to a CLI command or has a documented-reason exclusion (mirroring the exclusion-list pattern in `mcp/src/exclusions.rs`).
+- [ ] The check runs as part of `.github/workflows/ci.yml`.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+## Dependencies
+
+- Related prior art: RAL-301 (MCP tool parity check, `mcp/tests/parity.rs`).
+
+Use a fast static, bidirectional CI check. Every daemon endpoint and CLI command must be accounted for; intentionally unmatched entries need an inline, substantive, reason-required exclusion, ideally adjacent to the relevant static definition.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo fmt --all -- --check`. If it fails, run `cargo fmt --all`, then re-run the check. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "clippy"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo clippy --all-targets -- -D warnings`. If it fails, fix only issues caused by this task and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "test"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run focused CLI, daemon, and MCP parity tests relevant to this change. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`, because this dogfooding environment can lock daemon/librarian executables. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-410: finalize"
+  maximum_context        = 130000
+  auto_compact_threshold = 100000
+  maximum_tool_output_tokens = 8000
+  cwd                    = "<<ralphus:new-worktree/RAL-410-endpoint-cli-parity?upstream=staging>>"
+  depends_on             = ["work"]
+  agent                  = "pi-openrouter-deepseek"
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+[[task]]
+name    = "RAL-196"
+project = "ralphus"
+agent   = "pi-openrouter-deepseek"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-196: work"
+  maximum_context        = 180000
+  auto_compact_threshold = 140000
+  maximum_tool_output_tokens = 12000
+  cwd                    = "<<ralphus:new-worktree/RAL-196-draft-review-prs?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-345-410-196-412>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-196: Allow review PRs to be submitted as drafts
+
+## Summary
+
+When submitting PRs from a Guardian review (see RAL-195), give the user the option to open them as draft PRs instead of ready-for-review PRs. The default is a per-project setting owned by the project registrar (the project's `.ralphus.toml` config) — e.g. a `[github] draft_by_default` key — so a project can decide "PRs from this repo start as drafts" once, without every reviewer having to remember to set a flag. Individual reviews can override that project default at submit time (force-draft or force-ready-for-review for that one submission), so the project-level setting is a default, not a hard rule.
+
+## Values
+
+Reviewers often want to push a review's branches up as PRs early — to trigger CI, share a link, or get eyes on work-in-progress — without signaling that the stack is ready for final review. Draft PRs are GitHub's built-in mechanism for this. Different projects have different norms (some always want drafts first, some never use them), so the decision belongs at the project level by default — but a reviewer submitting one specific review still needs the ability to deviate from that norm without changing the project-wide setting for everyone else.
+
+## Risks
+
+- Needs to compose cleanly with RAL-195's stacked-PR submission — draft state must apply consistently across the whole stack, not just the first/last PR.
+- `gh pr create --draft` (or the equivalent stack subcommand flag) behavior should be verified against whatever `gh stack submit` supports, since draft support for the new stack commands may differ from plain `gh pr create`.
+- Config precedence must be unambiguous: per-review override at submit time always wins over the project registrar's default; the project default only applies when the reviewer doesn't explicitly choose.
+- Should not be the only way to submit — non-draft remains a first-class option regardless of the project default.
+
+## Acceptance Criteria
+
+- [ ] Project registrar can set a project-level default (draft vs. ready-for-review) for PRs submitted from reviews in that project, via `.ralphus.toml`.
+- [ ] At submit time, a reviewer can override the project default for that specific review's submission (either direction).
+- [ ] When no override is given, the project default is used; when an override is given, it wins.
+- [ ] Draft PRs created this way are indistinguishable from ones a human marked as draft via the GitHub GUI.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+## Dependencies
+
+Depends on RAL-195 (GitHub stacked PR integration) for the underlying submit path.
+
+Implement provider-specific project defaults as `[github] draft_by_default` and `[gitlab] draft_by_default`, using the established global → per-project config → explicit per-call override precedence. Add `draft: Option<bool>` to the submit request. GitHub must use the REST API `draft` field; GitLab must create a real draft MR by managing the `Draft:` title prefix. This must work for both normal REST stacked-base chaining and any optional stacked submission path, without using gh/glab for forge calls.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo fmt --all -- --check`. If it fails, run `cargo fmt --all`, then re-run the check. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "clippy"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo clippy --all-targets -- -D warnings`. If it fails, fix only issues caused by this task and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "test"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run focused daemon and CLI tests for this change, including GitHub and GitLab parity and PR-stack regression coverage. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`, because this dogfooding environment can lock daemon/librarian executables. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-196: finalize"
+  maximum_context        = 130000
+  auto_compact_threshold = 100000
+  maximum_tool_output_tokens = 8000
+  cwd                    = "<<ralphus:new-worktree/RAL-196-draft-review-prs?upstream=staging>>"
+  depends_on             = ["work"]
+  agent                  = "pi-openrouter-deepseek"
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."
+
+[[task]]
+name    = "RAL-412"
+project = "ralphus"
+agent   = "pi-openrouter-deepseek"
+
+  [[task.cell]]
+  id                     = "work"
+  name                   = "RAL-412: work"
+  maximum_context        = 200000
+  auto_compact_threshold = 150000
+  maximum_tool_output_tokens = 15000
+  cwd                    = "<<ralphus:new-worktree/RAL-412-semantic-auto-review-ordering?upstream=staging>>"
+  review                 = "<<ralphus:new-review/ral-345-410-196-412>>"
+  system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the ticket completely, follow all applicable AGENTS.md instructions, run relevant formatters, linters, and tests, and keep changes in this worktree."
+  system_prompt_position = "append"
+  prompt                 = """
+Your working directory is a git worktree checked out for this ticket's branch.
+
+# RAL-412: Order automatic review worktrees semantically
+
+## Summary
+
+When the arbiter drains an automatic-review pool—whether the minimum threshold is met or a scheduled pass includes remaining candidates—it should choose the review worktree order by relatedness of the candidates' intended work rather than pool membership order. Provide the arbiter with bounded prompt context for every candidate cell, ask it for a deterministic proposed ordering that places related changes together, and apply that ordering when the automatic review is created.
+
+## Values
+
+Keeping closely related changes adjacent makes a review easier to follow and reduces unnecessary context switching while preserving automatic review creation for both full and straggler pools.
+
+## Risks
+
+- Candidate prompts can be individually or collectively too large for a single arbiter request, so prompt extraction and aggregate context must be capped without losing useful intent.
+- The arbiter response may be malformed, incomplete, or contain duplicate/unknown candidates; a safe fallback order is required.
+- Semantic ordering must not disturb the existing linear review branch stack or omit any pooled candidate.
+
+## Acceptance Criteria
+
+- [ ] An automatic review created after either a threshold drain or scheduled straggler drain asks the arbiter to order all pooled candidates using their cell prompt context.
+- [ ] Each candidate contributes a bounded prompt excerpt, preferring concise leading summary text where appropriate, and the combined arbiter input is capped to a reasonable configured or documented limit.
+- [ ] The resulting review worktrees and branch stack follow the arbiter's valid proposed order, with related work placed together when the arbiter identifies it.
+- [ ] Invalid, incomplete, or unusable ordering output safely falls back to the existing deterministic order while retaining every candidate exactly once.
+- [ ] Regression tests cover both pool-drain paths, prompt-size limits, valid semantic ordering, and fallback behavior without breaking the review's linear PR/MR stack.
+- [ ] Auto-formatters run, linting passes, and relevant tests pass.
+
+## Technical Notes
+
+- Send one bounded aggregate request containing labeled context for every candidate; do not issue pairwise comparisons or one arbiter request per candidate.
+- The arbiter should return an order over stable candidate identifiers so the result can be validated as a permutation of the drained pool before review worktrees are created.
+
+## Out of Scope
+
+- Changing which candidates qualify for a pool or the threshold/cron drain policy.
+- Reordering an already-created review.
+
+Use the existing Arbiter `maximum_budget_usd` cap. Adopt a documented fixed aggregate prompt-context limit, rather than adding schema/configuration. Request stable candidate cell IDs and accept the response only if it is an exact permutation of the drained pool; request failure, budget exhaustion, malformed, incomplete, duplicate, or unknown IDs must safely preserve the current deterministic ordering and every candidate exactly once.
+"""
+
+    [[task.cell.proof]]
+    id     = "fmt"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo fmt --all -- --check`. If it fails, run `cargo fmt --all`, then re-run the check. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "clippy"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run `cargo clippy --all-targets -- -D warnings`. If it fails, fix only issues caused by this task and re-run. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if it passes."
+
+    [[task.cell.proof]]
+    id     = "test"
+    agent  = "pi-openrouter-deepseek"
+    system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository."
+    system_prompt_position = "append"
+    prompt = "Run focused daemon triage/arbiter/review tests for this change, including both drain paths and invalid-order fallback. Do not run `cargo test --all-targets` or `cargo nextest run --all-targets`, because this dogfooding environment can lock daemon/librarian executables. Use `cargo nextest run -p ralphus-daemon --lib` for daemon coverage. Do NOT commit or push. End with `RALPHUS_PROOF: PASS` only if all selected tests pass."
+
+  [[task.cell]]
+  id                     = "finalize"
+  name                   = "RAL-412: finalize"
+  maximum_context        = 130000
+  auto_compact_threshold = 100000
+  maximum_tool_output_tokens = 8000
+  cwd                    = "<<ralphus:new-worktree/RAL-412-semantic-auto-review-ordering?upstream=staging>>"
+  depends_on             = ["work"]
+  agent                  = "pi-openrouter-deepseek"
+  system_prompt          = "Stage only relevant source files, commit them, and push the commit if a remote exists. Do not run checks."
+  system_prompt_position = "append"
+  prompt                 = "Stage only relevant source files, commit them, and push the commit if a remote exists."

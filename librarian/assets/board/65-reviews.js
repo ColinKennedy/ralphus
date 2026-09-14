@@ -408,6 +408,36 @@
         const tip = "Found: conflict blocks detected in the worktree\nFixed: files resolved in the working tree, not yet staged\nCommitted: files whose conflict resolutions are staged and committed to the branch";
         return `<div class="kv-row" data-tip="${tip}"><span class="k">conflicts</span><span>${found} found · ${fixed} fixed · ${committed} committed${resolving}</span></div>`;
       }
+      /**
+       * One combined badge for the review's post-merge phase — the check gates
+       * and manual-checks generation that run *after* the merge is complete.
+       *
+       * A merge finishes when its branches are rebased, so the review already
+       * reads `in_review` while this is still running; this badge is what says
+       * there is work outstanding. A failure here is advisory — it is reported
+       * but never blocks approval or PR submission — so it uses `--warn`
+       * rather than `--failed`, which is reserved for states that stop a
+       * review progressing (docs/colors.md).
+       * @param {GuardianView} g the review to describe
+       * @returns {string} the badge markup, or "" when the phase has never run
+       */
+      function postMergeBadge(g) {
+        const status = g.post_merge_status;
+        if (!status) return "";
+        const started = g.post_merge_started_at_ms;
+        const finished = g.post_merge_finished_at_ms;
+        const secs = started && finished ? Math.max(0, Math.round((finished - started) / 1000)) : null;
+        const detail = g.post_merge_detail ? `\n\n${g.post_merge_detail}` : "";
+        const base = "Check gates and manual-checks generation run after the merge is already finished, so the review is usable while they work.\nA failure here is advisory: it is recorded but never blocks Approve or PR submission.";
+        if (status === "running") {
+          return `<span class="badge mono" style="color:var(--running);border-color:var(--running)" data-tip="Post-merge checks are still running — the build/test gate, the manual-checks generation, or both.\n${base}">post-merge: running…</span>`;
+        }
+        const ok = status === "ok";
+        const color = ok ? "var(--done)" : "var(--warn)";
+        const label = ok ? "post-merge: ok" : "post-merge: failed";
+        const took = secs === null ? "" : ` (${secs}s)`;
+        return `<span class="badge mono" style="color:${color};border-color:${color}" data-tip="${ok ? "Post-merge checks passed." : "A post-merge check reported a failure. The merge itself succeeded and the review is still approvable."}\n${base}${esc(detail)}">${label}${took}</span>`;
+      }
       // RAL-193: this review's own agent cost -- conflict-resolution and
       // proof LLM calls made by the guardian merge machinery -- scoped to
       // the current merge attempt and cumulatively across every
@@ -763,8 +793,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           label: resuming ? "Resume rebase" : "Merge / rebase",
           enabled: true,
           tip: resuming
-            ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept."
-            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+            ? "Resume the stopped rebase from where it left off — rebuilds the review stack from the first remaining worktree.\nA review left stopped mid-rebase is paused, not cancelled: branches and worktrees are kept.\nThis also gives each open PR one fresh automatic CI-fix attempt."
+            : "Start the Guardian: rebase each branch onto the prior in the stack, resolve conflicts with the AI agent, and run check gates.\nThis also gives each open PR one fresh automatic CI-fix attempt.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         };
       }
 
@@ -932,6 +962,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             <span style="flex:1"></span>${watchersHtml(`guardian:${g.id}`)}<button class="icon-btn" data-click="openEditReviewDetails" data-guardian-id="${esc(g.id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings, and environment overrides — all in one place.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Edit Details</button><button class="icon-btn" data-click="openReviewLogs" data-guardian-id="${esc(g.id)}" data-tip="View the audit log for this review — state changes, branch merge events, and notes.">📄 Logs</button><button class="btn squadbtn" data-click="openReviewTitleMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — cancel this review.">⋯</button></div>
           ${mergeProgress(g)}
           ${conflictProgress(g)}
+          ${postMergeBadge(g) ? `<div class="kv-row"><span class="k">post-merge</span><span class="v">${postMergeBadge(g)}</span></div>` : ""}
           ${reviewCostSummary(g)}
           <div class="kv-row"><span class="k">review id</span><span class="mono" style="cursor:pointer" data-tip="The unique identifier for this Guardian review.\nUse this ID in API calls, daemon logs, or to find the review worktree on disk.\nClick to copy the full ID." data-copy="${esc(g.id)}" onclick="copyText(event)">${esc(g.id)}</span></div>
           ${g.squad_id ? `<div class="kv-row"><span class="k">from squad</span><span class="v"><a href="#" data-click="gotoSquad" data-squad-id="${esc(g.squad_id)}" style="color:var(--accent)" data-tip="Switch to the Squads tab and open this squad.">${esc(g.squad_id)}</a></span></div>` : ""}
@@ -1872,12 +1903,27 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           // A non-2xx already surfaced the red error toast inside
           // `guardianAction`; the reload and the pending-state clear below
           // still run, so the button comes back rather than staying stuck.
-          await guardianAction(`/api/guardians/${id}/${path}`);
-          await tick();
+          const resp = await guardianAction(`/api/guardians/${id}/${path}`);
+          // `kickoff_merge` claims the review before it answers, so once this
+          // resolves the daemon is already in `merging` -- reflect that locally
+          // straight away. What the pending state must not do is outlive the
+          // daemon's answer: `tick()` reloads the whole board and ends in
+          // `pollReviews`, which waits on every open PR's drift check, so
+          // holding the button pending across it leaves it reading "Starting…"
+          // for tens of seconds after the rebase has already begun.
+          //
+          // The button stays correctly disabled without the pending flag,
+          // because `merging` is not in `MERGE_STARTABLE`.
+          if (resp && resp.ok) {
+            const g = (guardians || []).find((x) => x.id === id);
+            if (g) g.status = "merging";
+          }
         } finally {
           pendingMergeActions.delete(id);
           if (!userIsSelecting()) renderReviewDetail();
         }
+        // Unawaited on purpose -- see above; matches `stopMerge`'s own call.
+        tick();
       }
       /**
        * Stops an in-progress rebase at its next checkpoint, leaving the review
