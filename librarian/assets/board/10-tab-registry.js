@@ -23,6 +23,25 @@
       let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
+      /**
+       * RAL-421: live "what would confirming do?" previews for the Triage
+       * tab's pool-threshold editor -- keyed `JSON.stringify([project, triageType])`,
+       * present only after the human clicks Preview on a row and cleared on
+       * Confirm/Cancel (or when the row disappears from the pool list). The
+       * daemon serves the estimate from its pool state at request time, so
+       * it is rough by design; the Confirm handler posts exactly the
+       * previewed `proposed_threshold` rather than re-reading the input.
+       * @type {{[key: string]: TriagePoolThresholdPreview}}
+       */
+      let triageThresholdPreviews = {};
+      /**
+       * RAL-421: the same live-preview state for the Projects-tab
+       * auto-review-thresholds popup, keyed by triage type (`"__add__"`
+       * holds the not-yet-added row's preview). Cleared on Confirm/Cancel
+       * or when the popup closes.
+       * @type {{[key: string]: TriagePoolThresholdPreview}}
+       */
+      let projectTriageThresholdPreviews = {};
       /** @type {string|null} the project (display name) scoped by the open Projects-tab "auto-review thresholds" popup, or null when closed. */
       let projectTriageModalProject = null;
       /** Message from the last failed action inside the open Projects-tab Triage-threshold popup. */

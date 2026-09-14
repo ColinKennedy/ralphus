@@ -1483,11 +1483,12 @@ fn add_new_branches(
 /// classification) is pooled into every one of them independently -- then
 /// check whether any of those pools' count thresholds has now fired (a cron
 /// schedule can also fire one independently -- see `crate::scheduler`'s
-/// Triage tick). A firing pool is drained and turned into a fresh review
-/// guardian through the same Collecting -> Approved -> Deployed pipeline
-/// [`derive_reviews`] uses, flagged [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`].
-/// Returns the created guardian ids (empty when no cell opts into Triage, or
-/// no pool fired).
+/// Triage tick). A firing pool is drained in threshold-sized batches
+/// (RAL-421 -- see [`fire_triage_pool_in_threshold_batches`]), each full
+/// batch its own fresh review guardian, through the same Collecting ->
+/// Approved -> Deployed pipeline [`derive_reviews`] uses, flagged
+/// [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`]. Returns the created
+/// guardian ids (empty when no cell opts into Triage, or no pool fired).
 ///
 /// Each cell's resolved Triage type(s) must already be persisted (see
 /// `Store::set_cell_triage_types`) -- classification itself
@@ -1496,12 +1497,13 @@ fn add_new_branches(
 /// pooled with an unknown type (should not happen in the normal submit path).
 ///
 /// Race-safety: the threshold-check here and the scheduler's independent
-/// cron-check race on the same pool, but both ultimately call
-/// [`Store::drain_triage_pool`], a single atomic `DELETE ... RETURNING`
-/// executed while holding the daemon's one `crate::store_lock::StoreHandle` (same
-/// reliance every other cumulative-then-act sequence in this module makes) --
-/// whichever caller drains first empties the pool for the other, so no cell
-/// is ever double-counted across two forced reviews.
+/// cron-check race on the same pool, but both ultimately drain through
+/// [`Store::drain_triage_pool_batch`]/[`Store::drain_triage_pool`], each a
+/// serialized read-then-delete sequence executed while holding the daemon's
+/// one `crate::store_lock::StoreHandle` (same reliance every other
+/// cumulative-then-act sequence in this module makes) -- whichever caller
+/// drains a cell first removes it for the other, so no cell is ever
+/// double-counted across two forced reviews.
 ///
 /// # Errors
 /// Returns [`ReviewError`] for the same class of problems [`derive_reviews`]
@@ -1693,9 +1695,73 @@ pub fn derive_triage_pools(
             .get_triage_pool_threshold(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
         if threshold.is_some_and(|t| count >= t) {
-            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
-                created.push(gid);
-            }
+            // RAL-421: a firing pool drains in threshold-sized batches --
+            // each full batch becomes its own review, and only the final
+            // remainder (fewer than `threshold` viable cells) stays pooled.
+            // The drain only ever touches this exact pool key, never a
+            // sibling subproject or triage type.
+            let created_here = fire_triage_pool_in_threshold_batches(
+                store,
+                &project,
+                &triage_type,
+                threshold.unwrap(),
+            )
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+            created.extend(created_here);
+        }
+    }
+    Ok(created)
+}
+
+/// Drain `(project, triage_type)` in threshold-sized batches (RAL-421),
+/// creating one fresh review guardian per batch, until fewer than
+/// `threshold` viable cells remain pooled. A pool of 10 with `threshold = 3`
+/// fires as three batches of 3 (three reviews), leaving its final 1 cell
+/// pooled for the next round. Returns every guardian id created.
+///
+/// The whole set-and-drain sequence runs under the caller's single store
+/// lock hold, and each batch goes through the atomic
+/// [`Store::drain_triage_pool_batch`] -- so a concurrent caller firing the
+/// same pool (the scheduler's cron tick, or another submission's own count
+/// check) drains leftover batches rather than double-draining the same
+/// cells, and an already-emptied pool simply produces zero batches. This is
+/// exactly what makes two racing firings of one pool settle on one set of
+/// reviews from one set of cells (concurrent empty-pool safety).
+///
+/// # Errors
+/// Returns [`ReviewError`] on any store failure while creating a guardian
+/// or attaching its branches.
+pub(crate) fn fire_triage_pool_in_threshold_batches(
+    store: &Store,
+    project: &str,
+    triage_type: &str,
+    threshold: i64,
+) -> std::result::Result<Vec<String>, ReviewError> {
+    let threshold = threshold.max(1);
+    let mut created = Vec::new();
+    loop {
+        // Only drain while a *full* threshold-sized batch is guaranteed:
+        // the partial remainder (fewer than `threshold` viable cells) stays
+        // pooled for the next round -- a sub-threshold pool never drains
+        // and never creates a review. Count and drain share one store-lock
+        // hold, so nothing can change the count between the two calls.
+        let count = store
+            .triage_pool_count(project, triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        if count < threshold {
+            break;
+        }
+        let batch = store
+            .drain_triage_pool_batch(project, triage_type, threshold)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+        // Defense in depth: a concurrent caller cannot have drained this
+        // pool under the lock we hold, but if a batch ever comes back
+        // short or empty, stop rather than spin.
+        if batch.is_empty() || batch.len() < (threshold as usize) {
+            break;
+        }
+        if let Some(gid) = build_review_from_drained_pool(store, project, triage_type, batch)? {
+            created.push(gid);
         }
     }
     Ok(created)
@@ -1706,6 +1772,13 @@ pub fn derive_triage_pools(
 /// own threshold check), create a fresh review guardian from its cells.
 /// Returns `None` when the pool was already empty by the time this drained it
 /// -- not an error, just "someone else already fired it".
+///
+/// This is the whole-pool drain a cron schedule firing uses: the schedule
+/// owns its exact `(project, triage_type)` key (including any subproject
+/// component), so everything pooled under that key goes into a single
+/// review (RAL-421 complete pool identity) -- unlike
+/// [`fire_triage_pool_in_threshold_batches`], which is what the
+/// count-threshold path uses and drains in threshold-sized batches.
 ///
 /// `project` may be a plain project key or a RAL-346 `base::subproject`
 /// composite key -- either way the guardian's `git_root`/project identity
@@ -1724,40 +1797,6 @@ pub(crate) fn create_review_from_triage_pool(
         .drain_triage_pool(project, triage_type)
         .map_err(|e| ReviewError::new(e.to_string()))?;
     build_review_from_drained_pool(store, project, triage_type, drained)
-}
-
-/// RAL-346: the Arbiter's cron straggler sweep. Unlike
-/// [`create_review_from_triage_pool`] (which fires exactly one pool key --
-/// the coherent, threshold-driven unit of work), this drains *every* pool
-/// key sharing `base_project`'s namespace for `triage_type` (the plain
-/// `base_project` key plus every `base_project::subproject` composite key --
-/// see [`crate::triage::project_pool_keys`]) and combines them into one
-/// review, so straggler work sitting in per-subproject pools that never hit
-/// their own count threshold (e.g. one bug fix each in `core`, `utils`, and
-/// `steam`) doesn't get stranded indefinitely just because a schedule was
-/// only ever registered against the project's plain base key. Called by
-/// [`crate::triage::run_schedule_tick`] instead of
-/// [`create_review_from_triage_pool`] when a configured cron schedule fires.
-/// Returns `None` when every matching pool was already empty.
-///
-/// # Errors
-/// Returns [`ReviewError`] on any store failure while creating the guardian
-/// or attaching its branches.
-pub(crate) fn create_review_from_triage_project_sweep(
-    store: &Store,
-    base_project: &str,
-    triage_type: &str,
-) -> std::result::Result<Option<String>, ReviewError> {
-    let keys = crate::triage::project_pool_keys(store, base_project, triage_type);
-    let mut drained = Vec::new();
-    for key in &keys {
-        drained.extend(
-            store
-                .drain_triage_pool(key, triage_type)
-                .map_err(|e| ReviewError::new(e.to_string()))?,
-        );
-    }
-    build_review_from_drained_pool(store, base_project, triage_type, drained)
 }
 
 /// Shared tail of [`create_review_from_triage_pool`]/
@@ -2209,12 +2248,22 @@ pub fn repair_triage_pool_keys(store: &Store) {
             Err(_) => continue,
         };
         if threshold.is_some_and(|t| count >= t) {
-            match create_review_from_triage_pool(store, &project, &triage_type) {
-                Ok(Some(gid)) => crate::rlog!(
-                    INFO,
-                    "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
-                ),
-                Ok(None) => {}
+            // RAL-421: fire in threshold-sized batches, exactly like the
+            // submit-time and confirm-time count paths do.
+            match fire_triage_pool_in_threshold_batches(
+                store,
+                &project,
+                &triage_type,
+                threshold.unwrap(),
+            ) {
+                Ok(gids) => {
+                    for gid in gids {
+                        crate::rlog!(
+                            INFO,
+                            "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
+                        );
+                    }
+                }
                 Err(e) => crate::rlog!(
                     ERROR,
                     "ralphus [triage] pool-key repair: failed to fire ({project}, {triage_type}): {e}"
@@ -2234,9 +2283,10 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, plan, rebase_onto, repair_arbiter_review_project_roots,
-        repair_review_project_identities, repair_triage_pool_keys, require_auto_build_declaration,
-        review_branch_order, set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
+        derive_triage_pools, fire_triage_pool_in_threshold_batches, plan, rebase_onto,
+        repair_arbiter_review_project_roots, repair_review_project_identities,
+        repair_triage_pool_keys, require_auto_build_declaration, review_branch_order,
+        set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
         workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::{Store, TaskRow};
@@ -3219,6 +3269,116 @@ print(json.dumps(result))
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// RAL-421: a firing threshold drains a pool in threshold-sized batches,
+    /// each batch its own review, leaving only the final sub-threshold
+    /// remainder pooled.
+    #[test]
+    fn fire_triage_pool_in_threshold_batches_creates_one_review_per_full_batch() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..7 {
+            let squad = format!("squad-{i}");
+            let branch = format!("b{i}");
+            store
+                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
+                .unwrap();
+        }
+        let gids = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 3).unwrap();
+        assert_eq!(
+            gids.len(),
+            2,
+            "7 cells at a threshold of 3 must drain as two full batches of 3"
+        );
+        let first = store.get_guardian(&gids[0]).unwrap();
+        let second = store.get_guardian(&gids[1]).unwrap();
+        assert_ne!(first.id, second.id, "each batch is its own review");
+        assert_eq!(
+            first.branches.len(),
+            3,
+            "the first review carries exactly one batch's cells"
+        );
+        assert_eq!(second.branches.len(), 3);
+        for gid in &gids {
+            assert_eq!(
+                store.get_guardian(gid).unwrap().origin,
+                crate::guardian::GUARDIAN_ORIGIN_ARBITER
+            );
+        }
+        assert_eq!(
+            store.triage_pool_count("proj", "bug").unwrap(),
+            1,
+            "the final sub-threshold cell stays pooled for the next round"
+        );
+    }
+
+    /// RAL-421: concurrent empty-pool safety at the review level -- two
+    /// racing firings of one pool settle on one set of reviews from one set
+    /// of cells; the second caller simply finds the pool already drained.
+    #[test]
+    fn fire_triage_pool_in_threshold_batches_twice_never_double_creates() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            let squad = format!("squad-{i}");
+            let branch = format!("b{i}");
+            store
+                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
+                .unwrap();
+        }
+        let first = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2).unwrap();
+        // The second caller (e.g. the scheduler's cron tick racing this
+        // same pool) sees whatever the first left behind -- here, the 1-cell
+        // remainder, which is below the threshold, so nothing more fires.
+        let second = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2).unwrap();
+        assert_eq!(first.len(), 2, "5 cells / threshold 2 = two full batches");
+        assert!(
+            second.is_empty(),
+            "a second firing must not create new reviews"
+        );
+        assert_eq!(store.triage_pool_count("proj", "bug").unwrap(), 1);
+        // And a third firing immediately after the same remainder is still
+        // there -- still nothing: below the threshold, never re-created.
+        assert!(
+            fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// RAL-421: complete pool identity on the threshold path -- firing one
+    /// project's subproject pool must not touch the plain pool, the other
+    /// subproject pool, or another triage type's pool under the same key.
+    #[test]
+    fn fire_triage_pool_in_threshold_batches_never_crosses_pool_boundaries() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "feature", "squad-4", 0, 0, "b4", "main")
+            .unwrap();
+
+        let gids = fire_triage_pool_in_threshold_batches(&store, "proj::core", "bug", 1).unwrap();
+        assert_eq!(gids.len(), 1);
+        let g = store.get_guardian(&gids[0]).unwrap();
+        assert_eq!(
+            g.branches
+                .iter()
+                .map(|b| b.branch.clone())
+                .collect::<Vec<_>>(),
+            vec!["b2".to_string()],
+            "the review carries only the fired subproject key's branch"
+        );
+        // Every sibling pool is untouched.
+        assert_eq!(store.triage_pool_count("proj", "bug").unwrap(), 1);
+        assert_eq!(store.triage_pool_count("proj::utils", "bug").unwrap(), 1);
+        assert_eq!(store.triage_pool_count("proj", "feature").unwrap(), 1);
     }
 
     #[test]

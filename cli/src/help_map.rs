@@ -758,8 +758,8 @@ const TRIAGE_POOL_CHILDREN: &[HelpNode] = &[
     node(
         "threshold",
         &["project [str]", "triage_type [str]"],
-        &["--threshold [integer]", "--clear"],
-        "Set (or --clear) the count threshold for a (project, triage_type) pool -- once it holds this many cells, it drains into a fresh review (RAL-318).",
+        &["--threshold [integer]", "--clear", "--preview"],
+        "Set (or --clear) the count threshold for a (project, triage_type) pool (RAL-318). The CLI never prompts: invoking this command IS the confirmation -- a pool already holding at least this many cells drains immediately in threshold-sized batches (one review per batch), leaving only a sub-threshold remainder pooled (RAL-421). Pass --preview to see what confirming would drain right now without changing anything.",
         false,
         false,
         &[],

@@ -26,6 +26,9 @@ pub enum TriagePoolCommand {
         triage_type: String,
         /// `None` clears a previously configured threshold.
         threshold: Option<i64>,
+        /// `--preview`: compute and print what confirming would drain,
+        /// without persisting anything (RAL-421).
+        preview: bool,
     },
     UsageError(String),
 }
@@ -80,6 +83,11 @@ fn parse_pool(args: &[String]) -> TriagePoolCommand {
                     "threshold requires either --threshold <n> or --clear".to_string(),
                 );
             }
+            // RAL-421: `--preview` turns the command into a non-mutating
+            // estimate -- print what confirming would drain and exit 0
+            // without touching the store. The CLI itself never prompts;
+            // invoking the command WITHOUT `--preview` is the confirmation.
+            let preview = scanner.take_bool("--preview");
             let rest = scanner.remaining();
             let mut rest = rest.into_iter();
             let (Some(project), Some(triage_type)) = (rest.next(), rest.next()) else {
@@ -91,6 +99,7 @@ fn parse_pool(args: &[String]) -> TriagePoolCommand {
                 project,
                 triage_type,
                 threshold,
+                preview,
             }
         }
         Some(other) => {
@@ -195,19 +204,49 @@ fn dispatch_pool(cmd: TriagePoolCommand, opts: &GlobalOpts) -> i32 {
             project,
             triage_type,
             threshold,
-        } => match client.set_triage_pool_threshold(&project, &triage_type, threshold) {
-            Ok(_) => {
-                match threshold {
-                    Some(t) => println!("set threshold for ({project}, {triage_type}) to {t}"),
-                    None => println!("cleared threshold for ({project}, {triage_type})"),
+            preview,
+        } => {
+            if preview {
+                return match client.preview_triage_pool_threshold(&project, &triage_type, threshold)
+                {
+                    Ok(payload) => {
+                        print!("{}", render_triage_threshold_preview(&payload));
+                        0
+                    }
+                    Err(e) => {
+                        CommandError::Daemon(e).print(false, None);
+                        2
+                    }
+                };
+            }
+            match client.set_triage_pool_threshold(&project, &triage_type, threshold) {
+                Ok(payload) => {
+                    match threshold {
+                        Some(t) => {
+                            let reviews = payload["reviews_created"].as_i64().unwrap_or_default();
+                            let drained = payload["cells_drained"].as_i64().unwrap_or_default();
+                            let left = payload["cells_left"].as_i64().unwrap_or_default();
+                            if reviews > 0 {
+                                println!(
+                                    "set threshold for ({project}, {triage_type}) to {t}: drained {drained} cell(s) as {reviews} review(s), {left} cell(s) still pooled"
+                                );
+                            } else {
+                                println!(
+                                    "set threshold for ({project}, {triage_type}) to {t} ({} pooled cell(s), none eligible yet)",
+                                    left
+                                );
+                            }
+                        }
+                        None => println!("cleared threshold for ({project}, {triage_type})"),
+                    }
+                    0
                 }
-                0
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    1
+                }
             }
-            Err(e) => {
-                CommandError::Daemon(e).print(false, None);
-                1
-            }
-        },
+        }
     }
 }
 
@@ -291,6 +330,34 @@ fn render_triage_pool_list(payload: &Value) {
             threshold
         );
     }
+}
+
+/// Prints the non-mutating preview of a proposed threshold (RAL-421): what
+/// confirming would drain right now, in rough terms. The daemon computed the
+/// estimate from the pool's current viable count under its store lock;
+/// between this call and a later confirm the pool can change, so this is an
+/// estimate, never a reservation.
+fn render_triage_threshold_preview(payload: &Value) -> String {
+    let project = payload["project"].as_str().unwrap_or_default();
+    let triage_type = payload["triage_type"].as_str().unwrap_or_default();
+    let pooled = payload["pooled"].as_i64().unwrap_or_default();
+    if payload["clearing"].as_bool().unwrap_or_default() {
+        return format!(
+            "clearing the threshold for ({project}, {triage_type}) would not drain anything; {pooled} cell(s) currently pooled"
+        );
+    }
+    let proposed = payload["proposed_threshold"].as_i64().unwrap_or_default();
+    let batches = payload["full_batches"].as_i64().unwrap_or_default();
+    let drained = payload["cells_drained"].as_i64().unwrap_or_default();
+    let left = payload["cells_left"].as_i64().unwrap_or_default();
+    if batches == 0 {
+        return format!(
+            "({project}, {triage_type}): {pooled} cell(s) pooled -- below the proposed threshold {proposed}, so confirming would just record it; no review would be created now"
+        );
+    }
+    format!(
+        "({project}, {triage_type}): proposed threshold {proposed} with {pooled} cell(s) currently pooled -- confirming would drain {drained} cell(s) as {batches} review(s), leaving {left} cell(s) pooled. Nothing changed yet."
+    )
 }
 
 fn render_triage_type_list(payload: &Value) {
@@ -429,10 +496,12 @@ mod tests {
                 project,
                 triage_type,
                 threshold,
+                preview,
             }) => {
                 assert_eq!(project, "proj");
                 assert_eq!(triage_type, "bug");
                 assert_eq!(threshold, Some(4));
+                assert!(!preview, "without --preview, the command confirms");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -445,10 +514,57 @@ mod tests {
                 project,
                 triage_type,
                 threshold,
+                preview,
             }) => {
                 assert_eq!(project, "proj");
                 assert_eq!(triage_type, "bug");
                 assert_eq!(threshold, None);
+                assert!(!preview);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// RAL-421: `--preview` turns the threshold command into a non-mutating
+    /// estimate -- parsed as a flag on the same subcommand, never a new one.
+    #[test]
+    fn parses_pool_threshold_preview_flag() {
+        match parse(&v(&[
+            "pool",
+            "threshold",
+            "proj",
+            "bug",
+            "--threshold",
+            "4",
+            "--preview",
+        ])) {
+            TriageCommand::Pool(TriagePoolCommand::Threshold {
+                project,
+                triage_type,
+                threshold,
+                preview,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(triage_type, "bug");
+                assert_eq!(threshold, Some(4));
+                assert!(preview);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // `--preview` composes with `--clear` too: "what would clearing do?"
+        match parse(&v(&[
+            "pool",
+            "threshold",
+            "proj",
+            "bug",
+            "--clear",
+            "--preview",
+        ])) {
+            TriageCommand::Pool(TriagePoolCommand::Threshold {
+                threshold, preview, ..
+            }) => {
+                assert_eq!(threshold, None);
+                assert!(preview);
             }
             other => panic!("unexpected: {other:?}"),
         }

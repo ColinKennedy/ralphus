@@ -193,7 +193,9 @@
       CLICK_HANDLERS.checkMachine = (e, ds) => checkMachine(ds.scheme || "");
       CLICK_HANDLERS.removeMachine = (e, ds) => removeMachine(ds.scheme || "");
       CLICK_HANDLERS.removeTriageType = (e, ds) => removeTriageType(ds.name || "");
-      CLICK_HANDLERS.savePoolThreshold = (e, ds) => savePoolThreshold(e, ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.previewPoolThreshold = (e, ds) => previewPoolThreshold(e, ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.confirmPoolThreshold = (e, ds) => confirmPoolThreshold(ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.cancelPoolThresholdPreview = (e, ds) => cancelPoolThresholdPreview(ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.removeTriageSchedule = (e, ds) => removeTriageSchedule(ds.id || "");
       CLICK_HANDLERS.removeUser = (e, ds) => removeUser(ds.name || "");
       CLICK_HANDLERS.saveUserEdit = (e, ds) => saveUserEdit(ds.name || "");
@@ -212,7 +214,12 @@
       CLICK_HANDLERS.startProjectForkEdit = (e, ds) => startProjectForkEdit(ds.user || "");
       CLICK_HANDLERS.saveProjectForkEdit = (e, ds) => saveProjectForkEdit(ds.user || "");
       CLICK_HANDLERS.removeProjectFork = (e, ds) => removeProjectFork(ds.user || "");
-      CLICK_HANDLERS.saveProjectTriageThreshold = (e, ds) => saveProjectTriageThreshold(e, ds.triageType || "");
+      CLICK_HANDLERS.previewProjectTriageThreshold = (e, ds) => previewProjectTriageThreshold(e, ds.triageType || "");
+      CLICK_HANDLERS.confirmProjectTriageThreshold = (e, ds) => confirmProjectTriageThreshold(ds.triageType || "");
+      CLICK_HANDLERS.cancelProjectTriageThresholdPreview = (e, ds) => cancelProjectTriageThresholdPreview(ds.triageType || "");
+      CLICK_HANDLERS.previewAddProjectTriageThreshold = (e) => previewAddProjectTriageThreshold();
+      CLICK_HANDLERS.confirmAddProjectTriageThreshold = (e) => confirmAddProjectTriageThreshold();
+      CLICK_HANDLERS.cancelAddProjectTriageThreshold = (e) => cancelAddProjectTriageThreshold();
       CLICK_HANDLERS.queueToggleCollapse = (e, ds) => queueToggleCollapse(e, ds.key || "");
       CLICK_HANDLERS.queueHeaderClick = (e, ds) => queueHeaderClick(e, ds.key || "");
       CTX_HANDLERS.queueHeaderMenu = (e, ds) => queueHeaderMenu(e, ds.kind || "", ds.squadId || "", Number(ds.ti), ds.key || "");
