@@ -75,12 +75,22 @@
       // accurate regardless of which tab is active.
       // RALPHUS-TASKS-POLL-SEQ:BEGIN
       /**
-       * Monotonic sequence shared by `updateCounter`/`pollTasks` (RAL-390) --
-       * each call captures its number at start; only the call still holding
-       * the latest ticket when its data lands is allowed to write
-       * `squads`/the daemon-status counter or render, regardless of which
-       * fetch resolves first. Same latest-wins pattern `reviewPollSeq`
-       * already proved out for `pollReviews` (RAL-382).
+       * Monotonic render-ownership ticket for `pollTasks` (RAL-390): each
+       * `pollTasks` call claims a number at start, and only the call still
+       * holding the latest one when its data lands may write `squads` or
+       * render, regardless of which fetch resolves first. Same latest-wins
+       * pattern `reviewPollSeq` already proved out for `pollReviews`
+       * (RAL-382).
+       *
+       * `updateCounter` *observes* this ticket without claiming it. It must
+       * never claim one: it refreshes the counter but renders nothing, so a
+       * claim would let it supersede an in-flight `pollTasks` — which then
+       * abandons itself on the `seq !== tasksPollSeq` check and skips its
+       * render, while `updateCounter` writes the fresh `squads` and paints
+       * nothing. The result was a board holding correct data behind a stale
+       * DOM until an unrelated event forced a render, which is why clicking
+       * a squad away and back "fixed" a status badge that had stopped
+       * updating on its own.
        */
       let tasksPollSeq = 0;
       /**
@@ -127,6 +137,43 @@
         return tasksFetchInFlight;
       }
       /**
+       * The in-flight `/api/task-index` request `updateCounter` shares, and
+       * its generation counter -- the same dedup `fetchTasksShared` above
+       * does for `/api/tasks`, deliberately kept as a separate pair rather
+       * than factored into a shared helper, so the RAL-406 invalidation
+       * logic guarding the squad-status path stays exactly as written and
+       * tested.
+       * @type {Promise<any>|null}
+       */
+      let taskIndexFetchInFlight = null;
+      /** Generation counter for `taskIndexFetchInFlight`, mirroring `tasksFetchGeneration`. */
+      let taskIndexFetchGeneration = 0;
+      /**
+       * Fetches and parses `/api/task-index`, reusing the current in-flight
+       * request if one is already running instead of starting a duplicate.
+       *
+       * `updateCounter` reads this compact endpoint rather than `/api/tasks`:
+       * it needs `daemon.running`/`max_concurrent` and a squad list carrying
+       * ids, labels and task names, all of which the index carries, while the
+       * full board view is ~9x larger (6.2MB vs 684KB against a real squad
+       * history). The Squads tab's own `pollTasks` still reads `/api/tasks`,
+       * since it renders the per-cell detail only that response has.
+       * @returns {Promise<any>}
+       */
+      function fetchTaskIndexShared() {
+        if (!taskIndexFetchInFlight) {
+          const gen = ++taskIndexFetchGeneration;
+          taskIndexFetchInFlight = (async () => {
+            try {
+              return await (await fetch("/api/task-index")).json();
+            } finally {
+              if (taskIndexFetchGeneration === gen) taskIndexFetchInFlight = null;
+            }
+          })();
+        }
+        return taskIndexFetchInFlight;
+      }
+      /**
        * Discards the current in-flight `/api/tasks` request (if any) so the
        * next `fetchTasksShared` caller issues a brand-new one instead of
        * piggybacking on it (RAL-406). A squad/task/cell mutation (cancel,
@@ -141,18 +188,31 @@
        * callers from reusing it.
        * @returns {void}
        */
-      function invalidateTasksFetch() { tasksFetchInFlight = null; }
+      function invalidateTasksFetch() { tasksFetchInFlight = null; taskIndexFetchInFlight = null; }
       // RALPHUS-TASKS-POLL-SEQ:END
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
-       * Fetches /api/tasks for the daemon status counter and `squads` cache, without triggering task-view rendering.
-       * RAL-390: shares one in-flight request and a monotonic ticket with `pollTasks` -- see the `tasksPollSeq` declaration above.
+       * Fetches the daemon status counter and `squads` cache from
+       * `/api/task-index`, without triggering task-view rendering.
+       *
+       * Reads the compact index rather than `/api/tasks` -- see
+       * `fetchTaskIndexShared` for the size argument. This runs on every tab
+       * *except* Squads and Tasks (whose own polls refresh the counter from
+       * the response they already fetch), so on the Reviews tab it was
+       * pulling the full 6.2MB board on every pushed event batch purely to
+       * repaint two integers. `pollTasksTab` already writes this same
+       * `/api/task-index` shape into `squads`, so the cache stays consistent
+       * with what the Tasks tab puts there.
+       *
+       * RAL-390: observes (never claims) `pollTasks`'s render-ownership
+       * ticket -- see the `tasksPollSeq` declaration above for why claiming
+       * one silently dropped renders.
        * @returns {Promise<void>}
        */
       async function updateCounter() {
-        const seq = ++tasksPollSeq;
+        const seq = tasksPollSeq;
         try {
-          const d = await fetchTasksShared();
+          const d = await fetchTaskIndexShared();
           if (seq !== tasksPollSeq) return; // superseded -- a newer poll's data wins
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           squads = d.squads || [];
@@ -181,7 +241,19 @@
         // rather than as a sequential chain that sums four round-trips.
         // `updateCounter` joins them for the same reason: every tab's branch
         // awaited it before starting its own fetch, for no dependency.
-        await Promise.all([pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(), updateCounter()]);
+        //
+        // It is skipped entirely on the two tabs whose own poll below reads
+        // the counter and the `squads` cache out of the same response it
+        // would have fetched. Keeping it there cost a second, serial
+        // `/api/tasks` round-trip on the critical path of every
+        // post-mutation refresh -- a cancel/restart calls `tick()` the
+        // moment its POST returns, so that duplicate was doubling the delay
+        // before the board showed the new status.
+        const selfCountingTab = tab === "squads" || tab === "tasks";
+        await Promise.all([
+          pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(),
+          ...(selfCountingTab ? [] : [updateCounter()]),
+        ]);
         if (tab === "reviews") { await pollReviews(); }
         else if (tab === "resources") { await pollResources(); }
         else if (tab === "queue") { if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
@@ -235,18 +307,41 @@
           await refreshBanner();
           return;
         }
+        // The Squads tab's own poll already refreshes the daemon-status
+        // counter and the `squads` cache from the very same `/api/tasks`
+        // response, so `updateCounter` here would be a second, redundant
+        // round-trip against an endpoint that takes seconds on a large squad
+        // history -- and, worse, a racing one (see `tasksPollSeq`). Going
+        // straight to `pollTasks` is both cheaper and the only path that
+        // actually repaints. It runs for every batch, not just one carrying
+        // a squad id: a guardian-only batch can still change what this tab
+        // renders (a cell's review badge), and the old `hasSquadChange` gate
+        // meant those batches refreshed the data without ever painting it.
+        if (tab === "squads") {
+          await pollTasks();
+          await refreshBanner();
+          return;
+        }
         await updateCounter();
-        if (tab === "reviews" && kinds.has("guardian")) {
+        if (tab === "reviews") {
+          // Deliberately not gated on `kinds.has("guardian")`. A branch
+          // becomes ready when the cells behind it finish, and a cell-state
+          // Cartographer row carries no `guardian_id` -- so it arrives
+          // classified "squad" (see `EventKind::for_row` in
+          // `daemon/src/events.rs`), and the old guardian-only gate dropped
+          // exactly the events that flip a branch's status badge. Those
+          // badges then sat stale until the 60s reconciliation tick or a
+          // manual click away and back.
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
-        } else if (tab === "queue" && kinds.has("squad") && (queueUI.autoUpdate || !queueLoaded)) {
+        } else if (tab === "queue" && (hasSquadChange || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
+          // `hasSquadChange` covers a row that carries a squad id but was
+          // classified "guardian" because it also carries a guardian id.
           await pollQueue();
         } else if (tab === "cartographer") {
           // Every event is Cartographer-worthy by construction -- always
           // refresh this tab's own view of the log, regardless of kind.
           await pollCartographer();
-        } else if (tab === "squads" && hasSquadChange) {
-          await pollTasks();
         }
         await refreshBanner();
       }

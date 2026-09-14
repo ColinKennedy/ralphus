@@ -33,11 +33,12 @@ import { selTransition } from "./board-sel-transition.mjs";
 
 // ---------- updateCounter / pollTasks: shared in-flight request + ticket ----------
 
-test("updateCounter: concurrent calls share one in-flight /api/tasks request instead of firing a duplicate", async () => {
+test("updateCounter: concurrent calls share one in-flight /api/task-index request instead of firing a duplicate", async () => {
   const poll = makeTasksPoll();
   const promiseA = poll.updateCounter();
   const promiseB = poll.updateCounter();
   assert.equal(poll.pendingFetches.length, 1, "the second call must not fire its own duplicate fetch");
+  assert.equal(poll.pendingFetches[0].url, "/api/task-index", "the counter reads the compact index, not the full board");
 
   resolveJson(poll.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "s-1" }] });
   await Promise.all([promiseA, promiseB]);
@@ -60,18 +61,54 @@ test("pollTasks: concurrent calls share one in-flight fetch, and only the later-
   assert.equal(poll.calls.renderAll, 1, "only the latest-ticket caller renders, not both");
 });
 
-test("pollTasks and updateCounter share one in-flight /api/tasks request across functions too", async () => {
-  // Mirrors the real collision: an SSE-pushed pollTasks() and a tick()-driven
-  // updateCounter() (or vice versa) can both fire for the Squads tab at once,
-  // since both hit /api/tasks and write the same `squads` global.
+test("pollTasks and updateCounter read different endpoints, so neither is starved by the other's payload", async () => {
+  // These two deliberately no longer share a request. `updateCounter` reads
+  // the compact `/api/task-index` (684KB) for the chrome counter, while
+  // `pollTasks` reads the full `/api/tasks` board (6.2MB) it needs to render
+  // per-cell detail. They also no longer run on the same tab: `tick()` skips
+  // `updateCounter` on Squads/Tasks precisely because those tabs' own polls
+  // already refresh the counter from the response they fetch anyway.
   const poll = makeTasksPoll();
   const counterPromise = poll.updateCounter();
   const tasksPromise = poll.pollTasks();
-  assert.equal(poll.pendingFetches.length, 1, "the two functions must share one /api/tasks request, not fire one each");
+  assert.deepEqual(
+    poll.pendingFetches.map((f) => f.url).sort(),
+    ["/api/task-index", "/api/tasks"],
+    "each function fetches its own endpoint",
+  );
 
-  resolveJson(poll.pendingFetches[0], { daemon: { running: 3, max_concurrent: 4 }, squads: [{ id: "s-fresh" }] });
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 3, max_concurrent: 4 }, squads: [{ id: "s-index" }] });
+  resolveJson(poll.pendingFetches[1], { daemon: { running: 3, max_concurrent: 4 }, squads: [{ id: "s-fresh" }] });
   await Promise.all([counterPromise, tasksPromise]);
+  // `pollTasks` holds the later ticket, so the full board's data is what
+  // survives in `squads` -- the counter's compact copy must not clobber it.
   assert.deepEqual(poll.state().squads, [{ id: "s-fresh" }]);
+});
+
+test("updateCounter starting after an in-flight pollTasks must not cancel its render", async () => {
+  // The regression behind "the status badge only updates if I click the squad
+  // away and back": `updateCounter` used to claim a `tasksPollSeq` ticket of
+  // its own. Because it refreshes the counter but renders nothing, claiming
+  // one superseded the in-flight `pollTasks`, which then abandoned itself on
+  // the ticket check and skipped its render -- leaving fresh data in `squads`
+  // behind a stale DOM, with no further event scheduled to repaint it.
+  //
+  // This is the exact ordering `tick()` and an SSE-driven refresh produce
+  // when they overlap, and it is the reverse of the ordering the
+  // "share one in-flight request across functions" test above covers.
+  const poll = makeTasksPoll();
+  const tasksPromise = poll.pollTasks();       // claims the render ticket
+  const counterPromise = poll.updateCounter(); // must observe it, not claim it
+
+  // `/api/tasks` (pollTasks) resolves last, so if updateCounter had claimed a
+  // ticket it would have superseded the render before it ever ran.
+  resolveJson(poll.pendingFetches[1], { daemon: { running: 2, max_concurrent: 4 }, squads: [{ id: "s-1", state: "cancelled" }] });
+  await counterPromise;
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 2, max_concurrent: 4 }, squads: [{ id: "s-1", state: "cancelled" }] });
+  await Promise.all([tasksPromise, counterPromise]);
+
+  assert.deepEqual(poll.state().squads, [{ id: "s-1", state: "cancelled" }]);
+  assert.equal(poll.calls.renderAll, 1, "the pollTasks render must survive an overlapping updateCounter");
 });
 
 test("a request after the previous one has already settled is not coalesced -- dedup clears once the in-flight request lands", async () => {
