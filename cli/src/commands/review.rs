@@ -935,6 +935,9 @@ fn review_status_verdict(g: &Value) -> String {
     if status == "merging" {
         return "merging".to_string();
     }
+    if status == "finalizing" {
+        return "finalizing".to_string();
+    }
     status.to_string()
 }
 

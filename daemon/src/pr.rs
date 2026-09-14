@@ -5429,6 +5429,81 @@ pub fn compute_sync_status(
     store: &crate::store_lock::StoreHandle,
     pr_id: &str,
 ) -> std::result::Result<PrSyncStatus, String> {
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "pr",
+            message: "PR sync status check starting",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"pr_id": pr_id}),
+            admin_only: false,
+        });
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] PR sync status check starting pr_id={pr_id}"
+    );
+
+    // RAL-422: the completion record must fire even on early-return errors,
+    // so the cartographer log stays paired. The heavy work is wrapped; the
+    // outer scope only logs and returns.
+    let (result, guardian_id_str): (std::result::Result<PrSyncStatus, String>, Option<String>) =
+        match compute_sync_status_inner(store, pr_id) {
+            Ok(status) => {
+                let gid = store
+                    .lock()
+                    .get_pull_request(pr_id)
+                    .ok()
+                    .map(|pr| pr.guardian_id);
+                (Ok(status), gid)
+            }
+            Err(e) => (Err(e), None),
+        };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let level = if result.is_ok() {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level,
+            source: "pr",
+            message: &format!("PR sync status check completed ({:.1}s)", elapsed),
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: guardian_id_str.as_deref(),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "pr_id": pr_id,
+                "elapsed_s": elapsed,
+                "ok": result.is_ok(),
+                "error": result.as_ref().err(),
+            }),
+            admin_only: false,
+        });
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] PR sync status check completed pr_id={pr_id} elapsed={elapsed:.1}s"
+    );
+    result
+}
+
+fn compute_sync_status_inner(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<PrSyncStatus, String> {
     let pr = store
         .lock()
         .get_pull_request(pr_id)
@@ -6867,6 +6942,41 @@ mod tests {
         assert!(status.in_sync, "{status:?}");
         assert!(!status.pr_ahead && !status.worktree_ahead, "{status:?}");
         assert!(status.remote_sha.is_some() && status.remote_sha == status.local_sha);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// RAL-422: the sync-status poll is part of the merge pipeline's silent
+    /// maintenance phase, so it must leave paired start/completion records
+    /// (with elapsed time) in the Cartographer log -- asserted here through
+    /// the same query the board's timeline renders.
+    #[test]
+    fn compute_sync_status_emits_start_and_completion_records() {
+        let (root, remote_dir, store, pr_id) = sync_status_fixture();
+        let status = compute_sync_status(&store, &pr_id).unwrap();
+        assert!(status.in_sync, "{status:?}");
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                q: Some("PR sync status check".to_string()),
+                ..crate::cartographer::CartographerFilter::recent(10)
+            })
+            .unwrap();
+        let messages = page
+            .rows
+            .iter()
+            .map(|r| r.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages.contains(&"PR sync status check starting"),
+            "expected a start record: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("PR sync status check completed")),
+            "expected a completion record with the elapsed duration: {messages:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }

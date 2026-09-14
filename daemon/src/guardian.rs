@@ -164,6 +164,8 @@ pub enum GuardianStatus {
     /// distinct from [`Self::Cancelled`]: the review and its branches are kept
     /// and the rebase can be started again from its next checkpoint.
     MergeStopped,
+    /// Stack built; running final checks and manual command generation before review.
+    Finalizing,
     /// Stack built; awaiting human review.
     InReview,
     /// Approved by a human.
@@ -183,6 +185,7 @@ impl GuardianStatus {
             Self::Merging => "merging",
             Self::MergeFailed => "merge_failed",
             Self::MergeStopped => "merge_stopped",
+            Self::Finalizing => "finalizing",
             Self::InReview => "in_review",
             Self::Approved => "approved",
             Self::Cancelled => "cancelled",
@@ -196,6 +199,7 @@ impl GuardianStatus {
             "merging" => Self::Merging,
             "merge_failed" => Self::MergeFailed,
             "merge_stopped" => Self::MergeStopped,
+            "finalizing" => Self::Finalizing,
             "in_review" => Self::InReview,
             "approved" => Self::Approved,
             "cancelled" => Self::Cancelled,
@@ -1752,8 +1756,10 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        if (from_status == "merging" || from_status == "merge_stopped")
-            || (to_status == "merging" || to_status == "merge_stopped")
+        if (from_status == "merging"
+            || from_status == "merge_stopped"
+            || from_status == "finalizing")
+            || (to_status == "merging" || to_status == "merge_stopped" || to_status == "finalizing")
         {
             return Err(StoreError::InvalidTransition(
                 "cannot move a branch while the source or destination review has a merge/rebase in progress or stopped mid-rebase"
@@ -4000,7 +4006,7 @@ impl Store {
             .count();
         let checks_state: &'static str = if !manual_commands.is_empty() {
             "ready"
-        } else if row.status == "merging"
+        } else if (row.status == "merging" || row.status == "finalizing")
             && !enabled_branches.is_empty()
             && enabled_done == enabled_branches.len()
             && enabled_failed == 0
@@ -4352,6 +4358,7 @@ impl Store {
             Some(
                 GuardianStatus::Collecting
                 | GuardianStatus::Merging
+                | GuardianStatus::Finalizing
                 | GuardianStatus::MergeFailed
                 | GuardianStatus::MergeStopped
                 | GuardianStatus::InReview
@@ -4432,13 +4439,13 @@ impl Store {
     pub fn stop_guardian_merge(&self, id: &str) -> Result<GuardianStatus> {
         let n = self.conn.execute(
             "UPDATE guardians SET status='merge_stopped', detail=NULL, updated_at_ms=? \
-             WHERE id=? AND status='merging'",
+             WHERE id=? AND status IN ('merging','finalizing')",
             params![crate::store::now_ms(), id],
         )?;
         if n == 0 {
             let _ = self.guardian_status_str(id)?; // propagate NotFound if missing
             return Err(StoreError::InvalidTransition(
-                "can only stop a guardian that is currently merging".into(),
+                "can only stop a guardian that is currently merging or finalizing".into(),
             ));
         }
         let _ = self.log_event(
@@ -5137,6 +5144,24 @@ mod tests {
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.checks_state, "generating");
 
+        // finalizing is the same narrow window under new name (RAL-422): the
+        // merge worker now runs check gates and manual-commands generation
+        // while the review reports `finalizing`, so the board must keep
+        // showing "generating" there too -- not drop back to "waiting".
+        store
+            .set_guardian_status(&id, GuardianStatus::Finalizing, None)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.checks_state, "generating");
+        store
+            .set_branch_status(&id, &bid, MergeStatus::InProgress, None)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.checks_state, "waiting");
+        store
+            .set_branch_status(&id, &bid, MergeStatus::Done, None)
+            .unwrap();
+
         // commands persisted -> "ready", regardless of status.
         store
             .set_guardian_manual_commands(
@@ -5784,6 +5809,17 @@ mod tests {
         );
 
         // merge_stopped is distinct from cancelled and is cancellable.
+        // RAL-422: `finalizing` (the post-branch check-gate/manual-commands
+        // window) must be stoppable the same way `merging` is -- the board's
+        // Stop button stays live through finalize.
+        store
+            .set_guardian_status(&id, GuardianStatus::Finalizing, None)
+            .unwrap();
+        assert_eq!(
+            store.stop_guardian_merge(&id).unwrap(),
+            GuardianStatus::MergeStopped
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merge_stopped");
         assert_eq!(
             store.cancel_guardian(&id).unwrap(),
             GuardianStatus::Cancelled

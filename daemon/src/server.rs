@@ -11218,7 +11218,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             );
         }
     }
-    if status.as_deref() == Some("merging") {
+    if status.as_deref() == Some("merging") || status.as_deref() == Some("finalizing") {
         let runner = guardian_agent_runner(daemon);
         let restarted = crate::guardian_merge::restart_guardian_merge(
             daemon.store_handle(),
@@ -11560,7 +11560,7 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 
     let mut base_change: Option<ChangeBaseStatus> = None;
-    if status == "merging" {
+    if status == "merging" || status == "finalizing" {
         if rebase_relevant {
             let runner = guardian_agent_runner(daemon);
             let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -12628,7 +12628,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return store_error(&e);
     }
     let has_branches = !guardian.branches.is_empty();
-    let was_merging = guardian.status == "merging";
+    let was_merging = guardian.status == "merging" || guardian.status == "finalizing";
     drop(store);
     // RAL-277: synchronous by contract; a 2xx response means the complete
     // multi-branch PR/MR chain has already been retargeted on the forge.
