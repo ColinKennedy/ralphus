@@ -5451,6 +5451,59 @@ pub fn compute_sync_status(
         "ralphus [pr] PR sync status check starting pr_id={pr_id}"
     );
 
+    // RAL-422: the completion record must fire even on early-return errors,
+    // so the cartographer log stays paired. The heavy work is wrapped; the
+    // outer scope only logs and returns.
+    let (result, guardian_id_str): (std::result::Result<PrSyncStatus, String>, Option<String>) =
+        match compute_sync_status_inner(store, pr_id) {
+            Ok(status) => {
+                let gid = store
+                    .lock()
+                    .get_pull_request(pr_id)
+                    .ok()
+                    .map(|pr| pr.guardian_id);
+                (Ok(status), gid)
+            }
+            Err(e) => (Err(e), None),
+        };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let level = if result.is_ok() {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    {
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level,
+            source: "pr",
+            message: &format!("PR sync status check completed ({:.1}s)", elapsed),
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: guardian_id_str.as_deref(),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "pr_id": pr_id,
+                "elapsed_s": elapsed,
+                "ok": result.is_ok(),
+                "error": result.as_ref().err(),
+            }),
+            admin_only: false,
+        });
+    }
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] PR sync status check completed pr_id={pr_id} elapsed={elapsed:.1}s"
+    );
+    result
+}
+
+fn compute_sync_status_inner(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<PrSyncStatus, String> {
     let pr = store
         .lock()
         .get_pull_request(pr_id)
@@ -5492,50 +5545,21 @@ pub fn compute_sync_status(
             .map(|s| s.trim().to_string())
     };
 
-    let result = {
-        let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
-            &root,
-            remote_sha.as_deref(),
-            local_sha.as_deref(),
-            pr.last_pushed_sha.as_deref(),
-        );
-
-        Ok(PrSyncStatus {
-            remote_sha,
-            local_sha,
-            last_pushed_sha: pr.last_pushed_sha,
-            in_sync,
-            pr_ahead,
-            worktree_ahead,
-        })
-    };
-    let elapsed = t0.elapsed().as_secs_f64();
-    {
-        let level = if result.is_ok() {
-            crate::logging::LogLevel::INFO
-        } else {
-            crate::logging::LogLevel::WARNING
-        };
-        let guard = store.lock();
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level,
-            source: "pr",
-            message: &format!("PR sync status check completed ({:.1}s)", elapsed),
-            scope: Some("guardian"),
-            squad_id: None,
-            guardian_id: Some(&pr.guardian_id),
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"pr_id": pr_id, "elapsed_s": elapsed, "ok": result.is_ok()}),
-            admin_only: false,
-        });
-    }
-    crate::rlog!(
-        INFO,
-        "ralphus [pr] PR sync status check completed pr_id={pr_id} elapsed={elapsed:.1}s"
+    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+        &root,
+        remote_sha.as_deref(),
+        local_sha.as_deref(),
+        pr.last_pushed_sha.as_deref(),
     );
-    result
+
+    Ok(PrSyncStatus {
+        remote_sha,
+        local_sha,
+        last_pushed_sha: pr.last_pushed_sha,
+        in_sync,
+        pr_ahead,
+        worktree_ahead,
+    })
 }
 
 /// Pull the PR branch's fetched commits into its owning review worktree,
