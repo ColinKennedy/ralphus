@@ -676,6 +676,7 @@ the review worktree.",
 
 // ---- other top-level groups' children -------------------------------------
 
+// ralphus[ignore-endpoint-cli]: reads built-in agent names + configured [agent.profiles.*] from the local .ralphus.toml; GET /api/agents is a board picker for unsubmitted forms
 const AGENT_CHILDREN: &[HelpNode] = &[node(
     "list",
     &[],
@@ -696,6 +697,7 @@ const CHECK_CHILDREN: &[HelpNode] = &[node(
     &[],
 )];
 
+// ralphus[ignore-endpoint-cli]: configures local git repo settings/hooks; no daemon round trip
 const INITIALIZE_CHILDREN: &[HelpNode] = &[node(
     "git",
     &[],
@@ -1366,6 +1368,7 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+// ralphus[ignore-endpoint-cli]: prints the CLI's own compiled help_map registered_leaves tree; no daemon call
 const SHOW_CHILDREN: &[HelpNode] = &[node(
     "help-map",
     &[],
@@ -1484,6 +1487,7 @@ const PROOF_CHILDREN: &[HelpNode] = &[
 ];
 
 const QUICK_START_BACKENDS: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "claude-code",
         &[],
@@ -1493,6 +1497,7 @@ const QUICK_START_BACKENDS: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "codex",
         &[],
@@ -1502,6 +1507,7 @@ const QUICK_START_BACKENDS: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "pi",
         &[],
@@ -1514,6 +1520,7 @@ const QUICK_START_BACKENDS: &[HelpNode] = &[
 ];
 
 const QUICK_START_REVIEWER_BACKENDS: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "claude-code",
         &["target [str, optional]"],
@@ -1523,6 +1530,7 @@ const QUICK_START_REVIEWER_BACKENDS: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "codex",
         &["target [str, optional]"],
@@ -1532,6 +1540,7 @@ const QUICK_START_REVIEWER_BACKENDS: &[HelpNode] = &[
         false,
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: interactive end-to-end launch (runtime boot + submit + board watch), not a daemon endpoint client -- MCP excludes the same leaves (mcp/src/exclusions.rs)
     node(
         "pi",
         &["target [str, optional]"],
@@ -1648,6 +1657,7 @@ pub const ROOT: HelpNode = node(
             false,
             &[],
         ),
+        // ralphus[ignore-endpoint-cli]: emits a local shell completion script; no daemon call
         node(
             "completion",
             &[],
@@ -1658,6 +1668,7 @@ placeholder message; Python's `shell` argument is not read.)",
             true, // ("completion",)
             &[],
         ),
+        // ralphus[ignore-endpoint-cli]: prints merged local config (global + .ralphus.toml); no daemon call
         node(
             "configuration",
             &[],
@@ -1716,6 +1727,7 @@ tailing and --wait-until-valid are not yet ported).",
             true, // ("listen",)
             &[],
         ),
+        // ralphus[ignore-endpoint-cli]: prints the local ralphus.lic license status via the auth crate; no daemon call
         node(
             "license",
             &[],
@@ -1861,6 +1873,7 @@ classification categories (RAL-318).",
             false,
             TRIAGE_CHILDREN,
         ),
+        // ralphus[ignore-endpoint-cli]: prints the built-in tutorial text bundled in the CLI binary
         node(
             "tutor",
             &[],
