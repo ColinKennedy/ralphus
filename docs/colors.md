@@ -143,6 +143,18 @@ cell/task/proof — so no new color was added. Once a PR is no longer `open`
 existing PR-lifecycle coloring (`--accent`/`--done`/`--cancelled`/`--failed`)
 documented for `TT_PR_COLORS`/`PR_STATE_COLORS`.
 
+### PR draft state — no color (RAL-353)
+The Tasks tab's PR filter (`ttRowMatchesPrFilter`) and the " · draft" text
+a `PullRequestView`/`PrIndexRow` whose `draft` is true appends to its badge
+deliberately introduce **no** color role: draft (WIP) is a lifecycle
+qualifier, not a status hue, and a draft open PR still shows its real CI
+color while it also waits on the draft's own conversion. Draft state is
+persisted from the forge's own `draft` field at create/adopt time and
+refreshed by every CI probe (which reads it from the same response), and
+`null` (a legacy row never polled since the column existed) renders exactly
+like not-draft. GitHub and GitLab both expose the field through their REST
+APIs, so the two forges behave identically here.
+
 ### Log severity — Cartographer only (RAL-98)
 Cartographer's event table (the global log, a squad's Logs "events" tab, and a
 review's Logs button) colors rows by `level`, a concept distinct from entity

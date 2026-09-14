@@ -406,6 +406,9 @@
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
        * @property {Set<string>} project - RAL-345: task project names to include; empty means "no filter" (every project shown)
+       * @property {boolean} pr - RAL-353: require at least one associated pull request
+       * @property {"any"|"draft"|"non-draft"} prDraft - RAL-353: the chosen draft-status dimension; "any" disables it
+       * @property {"any"|"passing"|"failing"} prCi - RAL-353: the chosen CI-status dimension; "any" disables it
        */
       /**
        * @returns {TaskTabFilters}
@@ -414,7 +417,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, project: new Set() }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, project: new Set(), pr: false, prDraft: "any", prCi: "any" }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -958,9 +961,47 @@
         }
       }
       /**
+       * RAL-353: whether a built row survives the Tasks toolbar's PR-state
+       * filter -- the composable "has a PR / draft status / CI status"
+       * triple local-decisioned by the ticket. The filter is active when any
+       * of the three dimensions is non-default; a task then matches when at
+       * least one of its associated PRs satisfies every active dimension
+       * (e.g. Draft + Failing means it has at least one failing draft PR).
+       * A PR whose `draft` is null (recorded before the column existed and
+       * never polled since) counts as not-draft, matching the daemon-side
+       * convention documented on `PullRequestView.draft`; CI "passing"/
+       * "failing" match the forge-reported `ci_status` string exactly, so
+       * pending/unknown/never-polled PRs match neither (only "any").
+       * @param {TtRow} row
+       * @param {TaskTabFilters} filters
+       * @returns {boolean}
+       */
+      function ttRowMatchesPrFilter(row, filters) {
+        // Missing/undefined dimensions count as "any" -- older callers that
+        // build a filter object without the RAL-353 fields must not suddenly
+        // be filtered to PR-carrying tasks only.
+        const wantHasPr = filters.pr === true;
+        const wantDraft = filters.prDraft != null && filters.prDraft !== "any";
+        const wantCi = filters.prCi != null && filters.prCi !== "any";
+        if (!wantHasPr && !wantDraft && !wantCi) return true;
+        const prs = row.prs || [];
+        if (!prs.length) return false;
+        return prs.some((p) => {
+          if (wantDraft && filters.prDraft === "draft" && p.draft !== true) return false;
+          if (wantDraft && filters.prDraft === "non-draft" && p.draft === true) return false;
+          if (wantCi && filters.prCi === "failing" && p.ci_status !== "failing") return false;
+          if (wantCi && filters.prCi === "passing" && p.ci_status !== "passing") return false;
+          return true;
+        });
+      }
+      /**
        * Whether a built row survives the toolbar's filters (RAL-362 §2):
        * name substring, status set, hidden-squad/hidden-task inclusion
-       * (RAL-365), "needs me", and project set (RAL-345; empty means every project passes).
+       * (RAL-365), "needs me", project set (RAL-345; empty means every
+       * project passes), and the PR-state filter (RAL-353; inactive by
+       * default). Re-run on every Tasks-tab poll, so a refreshed, async
+       * pull-request index (new CI verdict, newly-observed draft state, a
+       * brand-new PR row) re-evaluates the visible rows automatically.
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @param {Set<string>} hiddenSquadIds
@@ -974,6 +1015,7 @@
         if (!filters.showHidden && (hiddenSquadIds.has(row.squadId) || (hiddenTaskKeys && hiddenTaskKeys.has(row.key)))) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
         if (filters.project.size && !filters.project.has(row.task.project)) return false;
+        if (!ttRowMatchesPrFilter(row, filters)) return false;
         return true;
       }
       /**

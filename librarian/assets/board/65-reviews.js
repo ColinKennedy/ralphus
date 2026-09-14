@@ -642,14 +642,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             </div>`;
         }
         const badgeColor = prColorVar(p);
-        const ciTip = p.state === "open" && p.ci_status
-          ? ` data-tip="CI/CD status: ${esc(p.ci_status)}."`
+        const stateNote = p.state === "open" && p.ci_status
+          ? ` CI/CD status: ${esc(p.ci_status)}.`
           : "";
-        const badgeLabel = p.state === "open" && p.ci_status ? `${esc(p.state)} · ${esc(p.ci_status)}` : esc(p.state);
-        return `<div class="pr-card" style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px" data-tip="Pull/merge request submitted via ${esc(p.forge)}.">
+        const draftNote = p.draft ? " Draft (work-in-progress) on the forge." : "";
+        const badgeTip = `${stateNote}${draftNote}`.trim();
+        const badgeLabel = (p.state === "open" && p.ci_status ? `${esc(p.state)} · ${esc(p.ci_status)}` : esc(p.state)) + (p.draft ? " · draft" : "");
+        return `<div class="pr-card" style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:4px" data-tip="Pull/merge request submitted via ${esc(p.forge)}.${draftNote}">
             <div class="row" style="justify-content:space-between;gap:6px">
               <span>${esc(p.forge)} ${link} <span class="mono" style="color:var(--muted);font-size:11px">${esc(p.branch_alias)} → ${esc(p.base_ref)}</span></span>
-              <span class="badge" style="font-size:11px;color:${badgeColor};border-color:${badgeColor}"${ciTip}>${badgeLabel}</span>
+              <span class="badge" style="font-size:11px;color:${badgeColor};border-color:${badgeColor}"${badgeTip ? ` data-tip="${esc(badgeTip)}"` : ""}>${badgeLabel}</span>
             </div>
             ${drift}
           </div>`;
@@ -670,7 +672,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (!pr || !pr.pr_url) return "";
         const color = prColorVar(pr);
         const ciNote = pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
-        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+        const draftNote = pr.draft ? " Draft (work-in-progress) on the forge." : "";
+        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${draftNote}">${esc(pr.forge)} #${pr.pr_number ?? "?"}${pr.draft ? ` · draft` : ""}</a>`;
       }
       /**
        * Renders the PR status section for one stacked branch (RAL-190+):

@@ -2642,6 +2642,18 @@ impl Store {
             // observed as anything other than `failing` (i.e. a fresh
             // failure gets a fresh attempt).
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempted_at_ms INTEGER",
+            // RAL-353: whether the forge currently reports this PR/MR as a
+            // draft (WIP). Recorded from the forge's own `draft` field at
+            // create/adopt time and refreshed by every CI probe
+            // (`forge::check_pr_ci_status_probe`), which reads it from the
+            // same PR response that yields the CI verdict -- so the Tasks
+            // tab's "has pull request / draft status" filter can run
+            // entirely off the cached index, and the two observations can
+            // never disagree about which forge response they came from.
+            // NULL only for rows recorded before this column existed;
+            // the board treats NULL as not-draft (matching how the
+            // "non-draft" filter reads it).
+            "ALTER TABLE guardian_pull_requests ADD COLUMN draft INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

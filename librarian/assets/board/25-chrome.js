@@ -345,6 +345,9 @@
           if (taskTabFilters.project.size) p.set("project", [...taskTabFilters.project].join(","));
           if (taskTabFilters.needsMe) p.set("needsme", "1");
           if (taskTabFilters.groupBySquad) p.set("group", "1");
+          if (taskTabFilters.pr) p.set("pr", "1");
+          if (taskTabFilters.prDraft !== "any") p.set("prdraft", taskTabFilters.prDraft);
+          if (taskTabFilters.prCi !== "any") p.set("prci", taskTabFilters.prCi);
           if (taskTabExpanded.size) p.set("expanded", [...taskTabExpanded].join(","));
           const squad = taskTabSel.squadId ? findSquad(taskTabSel.squadId) : null;
           const task = squad && taskTabSel.kind ? (squad.tasks || [])[taskTabSel.taskIdx] : null;
@@ -495,6 +498,11 @@
         const pproject = p.get("project"); if (pproject !== null) taskTabFilters.project = new Set(pproject.split(",").filter(Boolean));
         taskTabFilters.needsMe = p.get("needsme") === "1";
         taskTabFilters.groupBySquad = p.get("group") === "1";
+        taskTabFilters.pr = p.get("pr") === "1";
+        const prdraft = p.get("prdraft");
+        if (prdraft === "draft" || prdraft === "non-draft") taskTabFilters.prDraft = prdraft;
+        const prci = p.get("prci");
+        if (prci === "passing" || prci === "failing") taskTabFilters.prCi = prci;
         const pexpanded = p.get("expanded"); if (pexpanded !== null) taskTabExpanded = new Set(pexpanded.split(",").filter(Boolean));
         const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
         return { tab: "tasks", uri, sel: uri ? null : selValue };
