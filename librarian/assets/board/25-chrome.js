@@ -344,6 +344,7 @@
           if (taskTabFilters.showHidden) p.set("hidden", "1");
           if (taskTabFilters.needsMe) p.set("needsme", "1");
           if (taskTabFilters.groupBySquad) p.set("group", "1");
+          if (taskTabFilters.projects.size) p.set("project", [...taskTabFilters.projects].join(","));
           if (taskTabExpanded.size) p.set("expanded", [...taskTabExpanded].join(","));
           const squad = taskTabSel.squadId ? findSquad(taskTabSel.squadId) : null;
           const task = squad && taskTabSel.kind ? (squad.tasks || [])[taskTabSel.taskIdx] : null;
@@ -356,6 +357,7 @@
           if (filters.dir !== -1) p.set("dir", "asc");
           if (filters.status.size !== STATES.length) p.set("status", [...filters.status].join(","));
           if (filters.showHidden) p.set("hidden", "1");
+          if (filters.projects.size) p.set("project", [...filters.projects].join(","));
           const squad = selectedSquadId ? findSquad(selectedSquadId) : null;
           if (squad) {
             url = hashWithSel("#/squads", p.toString(), squadSelectionUri(squad, sel));
@@ -465,6 +467,7 @@
         if (p.get("dir") === "asc") filters.dir = 1;
         const pstatus = p.get("status"); if (pstatus !== null) filters.status = new Set(pstatus.split(",").filter(Boolean));
         filters.showHidden = p.get("hidden") === "1";
+        const pproject = p.get("project"); if (pproject !== null) filters.projects = new Set(pproject.split(",").filter(Boolean));
         // A URI carries its own squad reference (`?id=`, else the SQUAD[...] label);
         // the legacy form kept it in the path. Both land in `squadId`/`uri` and are
         // decoded against the loaded squad in `pollTasks`.
@@ -491,6 +494,7 @@
         taskTabFilters.showHidden = p.get("hidden") === "1";
         taskTabFilters.needsMe = p.get("needsme") === "1";
         taskTabFilters.groupBySquad = p.get("group") === "1";
+        const pproject = p.get("project"); if (pproject !== null) taskTabFilters.projects = new Set(pproject.split(",").filter(Boolean));
         const pexpanded = p.get("expanded"); if (pexpanded !== null) taskTabExpanded = new Set(pexpanded.split(",").filter(Boolean));
         const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
         return { tab: "tasks", uri, sel: uri ? null : selValue };
@@ -534,6 +538,88 @@
        * @returns {void}
        */
       function onFilter(v) { filters.q = v.toLowerCase(); renderSquads(); syncHash(); }
+      // RAL-345: project filter -- a Set<string> of task-project names,
+      // matching `filters.status`'s idiom (a plain Set, checkbox-driven), but
+      // with "empty means no filter" semantics rather than status's
+      // "empty means hide everything", since the project universe grows over
+      // time (new registrations) and a first-time visitor must see every
+      // project without having to opt in project-by-project. Kept as its own
+      // state/render path, deliberately not shared with the Tasks tab's
+      // identical-looking `tt`-prefixed equivalent in 15-tasks.js.
+      /**
+       * Renders the Squads sidebar's project filter: a button that opens the
+       * multi-select checkbox dropdown (RAL-345), followed by one removable
+       * chip per selected project (X on the left, matching the Tasks/Triage
+       * chips). Called from `renderSquads` on every poll so the chips always
+       * reflect the live selection.
+       * @returns {void}
+       */
+      function renderProjectFilterChips() {
+        const chips = [...filters.projects].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="toggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
+        byId("project-filter").innerHTML = `<button type="button" class="btn" onclick="openProjectFilterMenu(event)" data-tip="Filter squads by project. No projects selected shows every project.">Project ▾</button>${chips}`
+          + (filters.projects.size ? `<span class="chip" onclick="clearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
+      }
+      /**
+       * Toggles one project in/out of the sidebar's visible-squads filter,
+       * from the project dropdown's checkbox list (RAL-345). The open
+       * dropdown stays open (its checkmarks update natively) so several
+       * projects can be picked in one visit; the sidebar re-renders and the
+       * selection is re-persisted to the URL hash.
+       * @param {string} name
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function toggleProjectFilter(name, on) {
+        if (on) filters.projects.add(name); else filters.projects.delete(name);
+        renderSquads();
+        syncHash();
+      }
+      /**
+       * Clears the project filter back to "no filter" (every project shown).
+       * @returns {void}
+       */
+      function clearProjectFilter() {
+        filters.projects.clear();
+        closeProjectFilterMenu();
+        renderSquads();
+        syncHash();
+      }
+      /**
+       * Builds the checkbox rows for the Squads sidebar's project dropdown, alphabetical by registered project name (RAL-345).
+       * @returns {string}
+       */
+      function projectFilterMenuRowsHtml() {
+        const names = registeredProjectNames.slice().sort((a, b) => a.localeCompare(b));
+        if (!names.length) return `<div style="color:var(--muted);cursor:default">No registered projects.</div>`;
+        return names.map((name) => `<div class="ctx-check ${filters.projects.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${filters.projects.has(name) ? "checked" : ""} onchange="toggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+      }
+      /**
+       * Opens the Squads sidebar's project dropdown (RAL-345), a `.ctx-menu`
+       * popup of project checkboxes, and dismisses any other open
+       * project/column menu first. A global click handler closes it on
+       * outside interaction; checkbox clicks keep it open so several
+       * projects can be picked in one visit.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function openProjectFilterMenu(e) {
+        e.preventDefault(); e.stopPropagation();
+        ttCloseProjectFilterMenu(); triageCloseProjectFilterMenu();
+        const existing = document.getElementById("project-filter-menu");
+        if (existing) { existing.remove(); return; }
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "project-filter-menu";
+        menu.innerHTML = projectFilterMenuRowsHtml();
+        document.body.appendChild(menu);
+        const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
+        menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
+      }
+      /**
+       * Closes the Squads sidebar's project dropdown, if open.
+       * @returns {void}
+       */
+      function closeProjectFilterMenu() { const m = document.getElementById("project-filter-menu"); if (m) m.remove(); }
       /**
        * Renders the Reviews sidebar's guardian-status checkboxes and syncs its text filter input.
        * @returns {void}
@@ -703,7 +789,9 @@
           && (r.id.toLowerCase().includes(filters.q) || (r.label || "").toLowerCase().includes(filters.q))
           // RAL-331: a hidden squad is a personal view preference, excluded
           // by default -- except the one just navigated to directly (§reveal).
-          && (filters.showHidden || !hiddenSquadIds.has(r.id) || r.id === revealedSquadId));
+          && (filters.showHidden || !hiddenSquadIds.has(r.id) || r.id === revealedSquadId)
+          // RAL-345: a squad matches when any of its tasks belongs to a selected project.
+          && (!filters.projects.size || (r.tasks || []).some((t) => filters.projects.has(t.project))));
         list.sort((a, b) => filters.sort === "name"
           ? filters.dir * (a.label || a.id).localeCompare(b.label || b.id)
           : filters.dir * (a.created_at_ms - b.created_at_ms));
@@ -717,6 +805,7 @@
        */
       function renderSquads() {
         const el = byId("squads");
+        renderProjectFilterChips();
         const list = visibleSquads();
         if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>`; return; }
         el.innerHTML = list.map((r) => `

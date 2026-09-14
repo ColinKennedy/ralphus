@@ -16,10 +16,10 @@
       let triageCandidates = [];
       /**
        * Default (empty) filters for the Triage tab's candidate list.
-       * @returns {{type: string, project: string, q: string}}
+       * @returns {{type: string, projects: Set<string>, q: string}}
        */
-      function defaultTriageCandidateFilters() { return { type: "", project: "", q: "" }; }
-      /** Client-side filters for the Triage tab's candidate list -- empty string means "no filter" for each field. */
+      function defaultTriageCandidateFilters() { return { type: "", projects: new Set(), q: "" }; }
+      /** Client-side filters for the Triage tab's candidate list -- an empty type and an empty projects set each mean "no filter" (all types / all projects); `q` is a case-insensitive substring. */
       let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
@@ -42,6 +42,8 @@
       let projectForksEditDraft = {};
       /** @type {ProjectView[]} */
       let projects = [];
+      /** @type {string[]} registered project names (RAL-345) -- the live, non-admin source for the Tasks/Squads project-filter dropdowns, refreshed from `GET /api/projects` on every poll of those tabs (reads are open to every caller, RAL-332; only mutations are admin-gated). Empty until the first such poll lands -- never a stale snapshot. */
+      let registeredProjectNames = [];
       /** @type {{[key: string]: string|null}} name -> validation error message, or null/absent if valid/unknown */
       let projectErrors = {};
       /** @type {string|null} name of the project row currently in edit mode, or null */
@@ -175,7 +177,9 @@
       // ---- Preferences tab (RAL-329: per-user hidden squads/reviews, built on RAL-328) ----
       /** The two `HiddenItem.kind` values. */
       const HIDDEN_KINDS = ["squad", "review"];
-      /** @returns {{q: string, type: Set<string>}} */
+      /**
+       * @returns {{q: string, type: Set<string>}}
+       */
       function defaultHiddenFilters() { return { q: "", type: new Set(HIDDEN_KINDS) }; }
       /** @type {HiddenItem[]} */
       let hiddenItems = [];
@@ -366,15 +370,16 @@
         jumpToTask(hit.squadId, hit.taskIdx, -1, "task");
       }
       /**
-       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean}}
+       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, projects: Set<string>}}
        */
-      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false }; }
+      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false, projects: new Set() }; }
       /**
        * @typedef {object} TaskTabFilters
        * @property {string} q
        * @property {string} sort - one of TASK_TAB_SORTS
        * @property {number} dir - 1 (asc) or -1 (desc)
        * @property {Set<string>} status
+       * @property {Set<string>} projects - RAL-345: project names whose tasks may be shown; an empty set means "every project" (no filter applied). AND-combined with `q`/`status`/`needsMe`.
        * @property {boolean} showHidden - include tasks belonging to hidden squads
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
@@ -386,7 +391,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set() }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -578,6 +583,7 @@
        * @property {number} taskIdx
        * @property {TaskView} task
        * @property {string} name
+       * @property {string} project - RAL-345: this task's resolved project name (`task.project`), for the project filter.
        * @property {string} state
        * @property {CellView[]} cells
        * @property {TtReview[]} reviews
@@ -876,8 +882,9 @@
         }
       }
       /**
-       * Whether a built row survives the toolbar's filters (RAL-362 §2):
-       * name substring, status set, hidden-squad inclusion, and "needs me".
+       * Whether a built row survives the toolbar's filters (RAL-362 §2,
+       * extended by RAL-345): name substring, status set, project set,
+       * hidden-squad inclusion, and "needs me" -- all AND-combined.
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @param {Set<string>} hiddenSquadIds
@@ -887,6 +894,7 @@
       function ttRowMatchesFilters(row, filters, hiddenSquadIds, needsMeKeys) {
         if (filters.q && !row.name.toLowerCase().includes(filters.q)) return false;
         if (!filters.status.has(row.state)) return false;
+        if (filters.projects.size && !filters.projects.has(row.project)) return false;
         if (!filters.showHidden && hiddenSquadIds.has(row.squadId)) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
         return true;
