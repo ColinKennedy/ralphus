@@ -1005,14 +1005,17 @@ fn route_for_user(
     let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
+        // ralphus[ignore-endpoint-cli]: daemon lifecycle is the `ralphus-daemon` binary's own verb (`ralphus-daemon stop`), not a task-file CLI command
         ("POST", ["api", "daemon", "shutdown"]) => shutdown(daemon, body),
         // RAL-222: mints a short-lived, single-use ticket for `/api/events`
         // (SSE), which can't carry the bearer token directly — see
         // `crate::token`'s module doc comment. Reached through the normal
         // `route()` dispatch, so it's gated by `Daemon::authorized` exactly
         // like every other route.
+        // ralphus[ignore-endpoint-cli]: SSE ticket minted for the board's live event stream only (RAL-222); the CLI has no SSE consumer
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
         ("GET", ["api", "tasks"]) => board(daemon, query),
+        // ralphus[ignore-endpoint-cli]: board 'Tasks' tab flat listing; the CLI reads per-squad views and `GET /api/tasks` instead
         ("GET", ["api", "task-index"]) => task_index(daemon),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
@@ -1025,8 +1028,11 @@ fn route_for_user(
             admin_gated(daemon, user_header, || register_project(daemon, body))
         }
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form validation on save; the CLI's `validate` uses POST /api/squads/validate on whole task files
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form branch picker for the project
         ("GET", ["api", "projects", name, "branches"]) => project_branches(daemon, name),
+        // ralphus[ignore-endpoint-cli]: board admin repair action for a missing default branch
         ("POST", ["api", "projects", name, "default-branch", "autofix"]) => {
             admin_gated(daemon, user_header, || {
                 project_autofix_default_branch(daemon, name)
@@ -1094,6 +1100,7 @@ fn route_for_user(
         ("DELETE", ["api", "machines", scheme]) => {
             admin_gated(daemon, user_header, || deregister_machine(daemon, scheme))
         }
+        // ralphus[ignore-endpoint-cli]: board 'Machines' tab connectivity probe; CLI `machine get` reads config only
         ("POST", ["api", "machines", scheme, "check"]) => {
             admin_gated(daemon, user_header, || check_machine(daemon, scheme))
         }
@@ -1129,15 +1136,19 @@ fn route_for_user(
         ("POST", ["api", "triage", "pools", "drain"]) => admin_gated(daemon, user_header, || {
             force_drain_triage_pool(daemon, body)
         }),
+        // ralphus[ignore-endpoint-cli]: board Triage tab schedule management (RAL-244/RAL-246 board-only by design)
         ("GET", ["api", "triage", "schedules"]) => {
             admin_gated(daemon, user_header, || list_triage_schedules(daemon, query))
         }
+        // ralphus[ignore-endpoint-cli]: board Triage tab schedule management (RAL-244/RAL-246 board-only by design)
         ("POST", ["api", "triage", "schedules"]) => {
             admin_gated(daemon, user_header, || add_triage_schedule(daemon, body))
         }
+        // ralphus[ignore-endpoint-cli]: board Triage tab schedule management (RAL-244/RAL-246 board-only by design)
         ("DELETE", ["api", "triage", "schedules", id]) => {
             admin_gated(daemon, user_header, || remove_triage_schedule(daemon, id))
         }
+        // ralphus[ignore-endpoint-cli]: board Triage tab candidate listing (RAL-244 board-only by design)
         ("GET", ["api", "triage", "candidates"]) => {
             admin_gated(daemon, user_header, || list_triage_candidates(daemon))
         }
@@ -1145,27 +1156,34 @@ fn route_for_user(
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
+        // ralphus[ignore-endpoint-cli]: board agent picker for unsubmitted forms; CLI `agent list` deliberately reads .ralphus.toml locally
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
         // form's agent picker -- see `crate::agent_catalog`.
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form agent catalog (id/URL/label hints)
         ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(),
         // RAL-332: the current caller's resolved identity and admin flag --
         // lets the board decide whether to show its admin-only tabs without
         // it ever needing to know its own claimed name (it deliberately
         // never sends X-Ralphus-User outside of a "visit as" override).
+        // ralphus[ignore-endpoint-cli]: board user chrome for the librarian session; the CLI never claims a board identity
         ("GET", ["api", "whoami"]) => whoami(daemon, user_header),
         // Minimal user registry (RAL-?) -- see `crate::users`'s module doc
         // comment: this is a placeholder identity layer, not authentication.
         // TODO: Replace with user auth once RAL-252 is done.
         // RAL-332: admin-only, client and server side -- nothing outside the
         // Users tab reads this.
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("GET", ["api", "users"]) => admin_gated(daemon, user_header, || list_users(daemon)),
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("POST", ["api", "users"]) => {
             admin_gated(daemon, user_header, || create_user(daemon, body))
         }
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("DELETE", ["api", "users", name]) => admin_gated(daemon, user_header, || {
             delete_user(daemon, &url_decode(name))
         }),
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("POST", ["api", "users", name, "rename"]) => admin_gated(daemon, user_header, || {
             user_rename(daemon, &url_decode(name), body)
         }),
@@ -1180,62 +1198,82 @@ fn route_for_user(
         // exception in `set_user_admin_endpoint` itself: if no admin is
         // registered yet, the very first promotion is allowed through so the
         // system isn't permanently stuck with zero admins.
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("POST", ["api", "users", name, "admin"]) => {
             set_user_admin_endpoint(daemon, user_header, &url_decode(name), body)
         }
         // RAL-332: "Edit Profile" -- an admin viewing another user's
         // Preferences page. Audit-only: does not itself read or write
         // anything, just records that it happened.
+        // ralphus[ignore-endpoint-cli]: board 'view as user' chrome
         ("POST", ["api", "users", name, "visit"]) => {
             visit_user_profile(daemon, user_header, &url_decode(name))
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("GET", ["api", "hidden"]) => list_hidden(daemon, user_header),
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "squads", "batch"]) => {
             set_squads_hidden_batch(daemon, user_header, body)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "squads", id]) => {
             set_squad_hidden(daemon, user_header, id, true)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("DELETE", ["api", "hidden", "squads", id]) => {
             set_squad_hidden(daemon, user_header, id, false)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "reviews", id]) => {
             set_review_hidden(daemon, user_header, id, true)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("DELETE", ["api", "hidden", "reviews", id]) => {
             set_review_hidden(daemon, user_header, id, false)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "tasks", "batch"]) => {
             set_tasks_hidden_batch(daemon, user_header, body)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("POST", ["api", "hidden", "tasks", squad_id, ti]) => {
             set_task_hidden(daemon, user_header, squad_id, ti, true)
         }
+        // ralphus[ignore-endpoint-cli]: board Hidden-items management (hide/show without deleting)
         ("DELETE", ["api", "hidden", "tasks", squad_id, ti]) => {
             set_task_hidden(daemon, user_header, squad_id, ti, false)
         }
         // RAL-281: user-editable list of env-var names treated as secret --
         // see `crate::secret_env_names`'s module doc comment. RAL-332:
         // admin-only, client and server side.
+        // ralphus[ignore-endpoint-cli]: board 'Secrets' tab named secret-env registry
         ("GET", ["api", "secret-env-names"]) => {
             admin_gated(daemon, user_header, || list_secret_env_names(daemon))
         }
+        // ralphus[ignore-endpoint-cli]: board 'Secrets' tab named secret-env registry
         ("POST", ["api", "secret-env-names"]) => {
             admin_gated(daemon, user_header, || add_secret_env_name(daemon, body))
         }
+        // ralphus[ignore-endpoint-cli]: board 'Secrets' tab named secret-env registry
         ("POST", ["api", "secret-env-names", name, "rename"]) => {
             admin_gated(daemon, user_header, || {
                 rename_secret_env_name(daemon, name, body)
             })
         }
+        // ralphus[ignore-endpoint-cli]: board 'Secrets' tab named secret-env registry
         ("DELETE", ["api", "secret-env-names", name]) => {
             admin_gated(daemon, user_header, || delete_secret_env_name(daemon, name))
         }
+        // ralphus[ignore-endpoint-cli]: board 'Config' tab live daemon config tree; CLI `configuration` prints merged local config
         ("GET", ["api", "config", "live-view"]) => live_view_config_reply(),
+        // ralphus[ignore-endpoint-cli]: board 'Config' tab template browser
         ("GET", ["api", "config", "templates"]) => templates_config_reply(),
         ("GET", ["api", "cartographer"]) => cartographer_query(daemon, query, user_header),
+        // ralphus[ignore-endpoint-cli]: board single-row Cartographer detail; CLI `cartographer` lists rows only
         ("GET", ["api", "cartographer", id]) => cartographer_get(daemon, id, user_header),
+        // ralphus[ignore-endpoint-cli]: board ghost-paste copy action (RAL-155 clipboard)
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
+        // ralphus[ignore-endpoint-cli]: board ghost link resolution inside the board (RAL-155)
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
         // Monitor watches + the per-user mailbox view they filter.
@@ -1249,6 +1287,7 @@ fn route_for_user(
             personal_mailbox_drain(daemon, query, body)
         }
         ("GET", ["api", "watches"]) => list_watches_endpoint(daemon, query, user_header),
+        // ralphus[ignore-endpoint-cli]: board per-entity watchers list inside its view; CLI `mailbox watches` lists per user
         ("GET", ["api", "watches", entity_uri]) => watchers_endpoint(daemon, entity_uri),
         ("POST", ["api", "watches"]) => create_watch_endpoint(daemon, query, user_header, body),
         ("DELETE", ["api", "watches", entity_uri]) => {
@@ -1261,29 +1300,44 @@ fn route_for_user(
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
         ("POST", ["api", "squads"]) => submit(daemon, body, query),
         // RAL-297: Simple task form's opt-in "generation step" primitive.
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form sketch-to-task generator (RAL-374)
         ("POST", ["api", "generate"]) => generate_start(daemon, body),
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form generator status/poll (RAL-374)
         ("GET", ["api", "generate", id]) => generate_status(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board 'Simple' form generator cancel (RAL-374)
         ("POST", ["api", "generate", id, "cancel"]) => generate_cancel(daemon, id),
         ("POST", ["api", "clear"]) => clear_all(daemon, body),
         ("GET", ["api", "queue"]) => queue(daemon),
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
         ("POST", ["api", "queue", "set-position"]) => queue_set_position(daemon, body),
         ("GET", ["api", "graph"]) => global_graph(daemon, query),
+        // ralphus[ignore-endpoint-cli]: board URI-bar resolution; the CLI resolves selectors itself by fetching squad/guardian views
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
+        // RAL-420: pre-work generation cost — per-squad detail + cross-squad audit.
+        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
+        ("GET", ["api", "squads", id, "generation-costs"]) => {
+            squad_generation_cost_rows(daemon, id)
+        }
+        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
+        ("GET", ["api", "generation-costs"]) => generation_costs_audit(daemon),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
         ("GET", ["api", "squads", id, "graph"]) => squad_graph(daemon, id),
         ("POST", ["api", "squads", id, "activate"]) => activate(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board dry-run preview before cancel; CLI `squad cancel` has no preview mode
         ("POST", ["api", "squads", id, "cancel", "preview"]) => cancel_squad_preview(daemon, id),
         ("POST", ["api", "squads", id, "cancel"]) => cancel(daemon, id),
         ("POST", ["api", "squads", id, "set-status"]) => set_status(daemon, id, body),
         ("POST", ["api", "squads", id, "edit"]) => edit_squad(daemon, id, body),
         ("POST", ["api", "squads", id, "retry"]) => retry_squad(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board dry-run preview before restart; CLI `squad restart` commits directly
         ("POST", ["api", "squads", id, "restart", "preview"]) => restart_squad_preview(daemon, id),
         ("POST", ["api", "squads", id, "restart"]) => restart_squad(daemon, id, body),
+        // ralphus[ignore-endpoint-cli]: dep edges are declared in the task file, not mutated per-squad; no CLI leaf
         ("POST", ["api", "squads", id, "add-dependency"]) => add_dependency(daemon, id, body),
+        // ralphus[ignore-endpoint-cli]: board dry-run preview before cell restart
         ("POST", ["api", "squads", id, "cells", ti, si, "restart", "preview"]) => {
             restart_cell_preview(daemon, id, ti, si)
         }
@@ -1296,18 +1350,23 @@ fn route_for_user(
         ("POST", ["api", "squads", id, "tasks", ti, "proof", vi, "restart"]) => {
             restart_task_proof(daemon, id, ti, vi, body)
         }
+        // ralphus[ignore-endpoint-cli]: board dry-run preview before task restart
         ("POST", ["api", "squads", id, "tasks", ti, "restart", "preview"]) => {
             restart_task_preview(daemon, id, ti)
         }
+        // ralphus[ignore-endpoint-cli]: board-only task-level restart; the CLI restarts at squad level only
         ("POST", ["api", "squads", id, "tasks", ti, "restart"]) => {
             restart_task(daemon, id, ti, body)
         }
+        // ralphus[ignore-endpoint-cli]: board inline task rename (RAL-398); task names come from the task file
         ("POST", ["api", "squads", id, "tasks", ti, "rename"]) => {
             rename_task_route(daemon, id, ti, body)
         }
+        // ralphus[ignore-endpoint-cli]: board AI-generated task rename suggestion
         ("POST", ["api", "squads", id, "tasks", ti, "suggest-name"]) => {
             suggest_task_name(daemon, id, ti, body)
         }
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "env"]) => set_squad_env(daemon, id, body),
         // RAL-324: each `POST .../env` route below has a read-only `GET` twin
         // on the same path serving that surface's resolved environment with
@@ -1332,23 +1391,31 @@ fn route_for_user(
         // ambiguous to a reader (they are not to the matcher, which is
         // length-sensitive -- but keeping them adjacent and ordered narrow-first
         // makes the layering obvious).
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "tasks", ti, "proof", vi, "env"]) => {
             set_task_proof_step_env(daemon, id, ti, vi, body)
         }
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "tasks", ti, "proof", "env"]) => {
             set_task_proof_env(daemon, id, ti, body)
         }
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "tasks", ti, "env"]) => set_task_env(daemon, id, ti, body),
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "cells", ti, si, "proof", vi, "env"]) => {
             set_cell_proof_step_env(daemon, id, ti, si, vi, body)
         }
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "cells", ti, si, "proof", "env"]) => {
             set_cell_proof_env(daemon, id, ti, si, body)
         }
+        // ralphus[ignore-endpoint-cli]: board env-overrides editor; CLI `* env` views are read-only by design (RAL-324)
         ("POST", ["api", "squads", id, "cells", ti, si, "env"]) => {
             set_cell_env(daemon, id, ti, si, body)
         }
+        // ralphus[ignore-endpoint-cli]: board Solo toggle for one-off task runs
         ("POST", ["api", "squads", id, "tasks", ti, "solo"]) => solo_task(daemon, id, ti),
+        // ralphus[ignore-endpoint-cli]: board Solo toggle for one-off task runs
         ("POST", ["api", "squads", id, "tasks", ti, "unsolo"]) => unsolo_task(daemon, id, ti),
         ("POST", ["api", "squads", id, "cells", ti, si, "open-terminal"]) => {
             open_terminal(daemon, id, ti, si, query)
@@ -1362,6 +1429,7 @@ fn route_for_user(
         ("GET", ["api", "squads", id, "cells", ti, si, "pane"]) => {
             cell_pane(daemon, id, ti, si, query)
         }
+        // ralphus[ignore-endpoint-cli]: board terminal transcript viewer for the cell pane (RAL-154)
         ("GET", ["api", "squads", id, "cells", ti, si, "pane-transcript"]) => {
             cell_pane_transcript(daemon, id, ti, si, query)
         }
@@ -1377,6 +1445,7 @@ fn route_for_user(
                 cell_system_prompt(daemon, id, ti, si)
             })
         }
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1389,6 +1458,7 @@ fn route_for_user(
                 "terminal-log-attempts",
             ],
         ) => cell_terminal_log_attempts(daemon, id, ti, si),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt detail (RAL-154)
         (
             "GET",
             [
@@ -1402,6 +1472,7 @@ fn route_for_user(
                 attempt,
             ],
         ) => cell_terminal_log_attempt(daemon, id, ti, si, attempt),
+        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn; the CLI is deliberately headless
         (
             "POST",
             [
@@ -1430,6 +1501,7 @@ fn route_for_user(
                 "pane",
             ],
         ) => proof_pane(daemon, id, task_idx, scope, cell_idx, proof_idx, query),
+        // ralphus[ignore-endpoint-cli]: board terminal transcript viewer for the proof pane (RAL-154)
         (
             "GET",
             [
@@ -1458,6 +1530,7 @@ fn route_for_user(
                 "debug-events",
             ],
         ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1488,6 +1561,7 @@ fn route_for_user(
                 "terminal-log-attempts",
             ],
         ) => proof_terminal_log_attempts(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt detail (RAL-154)
         (
             "GET",
             [
@@ -1511,10 +1585,12 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
         ("POST", ["api", "guardians", id, "rename"]) => guardian_rename(daemon, id, body),
         ("POST", ["api", "guardians", id, "settings"]) => guardian_settings(daemon, id, body),
+        // ralphus[ignore-endpoint-cli]: board batched save of guardian settings fields; the CLI edits via `review settings`
         ("POST", ["api", "guardians", id, "details"]) => guardian_details(daemon, id, body),
         ("POST", ["api", "guardians", id, "squash"]) => guardian_squash(daemon, id, body),
         ("DELETE", ["api", "guardians", id]) => guardian_delete(daemon, id),
         ("POST", ["api", "guardians", id, "branches"]) => guardian_add_branch(daemon, id, body),
+        // ralphus[ignore-endpoint-cli]: board-only non-rebasing reorder; CLI `review reorder` uses /branches/arrange
         ("POST", ["api", "guardians", id, "branches", "reorder"]) => {
             guardian_reorder(daemon, id, body)
         }
@@ -1525,6 +1601,7 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "branches", branch_id, "feedback"]) => {
             guardian_feedback(daemon, user_header, id, branch_id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board feedback thread per branch; CLI `review feedback` shows single-step replies
         ("GET", ["api", "guardians", id, "branches", branch_id, "messages"]) => {
             guardian_branch_messages(daemon, id, branch_id)
         }
@@ -1548,6 +1625,7 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "branches", branch_id, "link_cell"]) => {
             guardian_link_cell(daemon, id, branch_id, body)
         }
+        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn; the CLI is deliberately headless
         (
             "POST",
             [
@@ -1581,9 +1659,11 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "manual-checks-env"]) => {
             set_guardian_manual_checks_env(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board branch worktree pane view
         ("GET", ["api", "guardians", id, "branches", branch_id, "pane"]) => {
             guardian_branch_pane(daemon, id, branch_id, query)
         }
+        // ralphus[ignore-endpoint-cli]: board terminal transcript viewer for the branch pane (RAL-154)
         (
             "GET",
             [
@@ -1595,9 +1675,11 @@ fn route_for_user(
                 "pane-transcript",
             ],
         ) => guardian_branch_pane_transcript(daemon, id, branch_id, query),
+        // ralphus[ignore-endpoint-cli]: board conflict-resolution view for the branch
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board debug-event timeline for the branch
         (
             "GET",
             [
@@ -1609,6 +1691,7 @@ fn route_for_user(
                 "debug-events",
             ],
         ) => guardian_branch_debug_events(daemon, id, branch_id),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1633,6 +1716,7 @@ fn route_for_user(
                 "terminal-log-attempts",
             ],
         ) => guardian_branch_terminal_log_attempts(daemon, id, branch_id),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt detail (RAL-154)
         (
             "GET",
             [
@@ -1645,15 +1729,19 @@ fn route_for_user(
                 attempt,
             ],
         ) => guardian_branch_terminal_log_attempt(daemon, id, branch_id, attempt),
+        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn for manual checks; CLI is deliberately headless
         ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
             open_guardian_manual_checks_terminal(daemon, id, query)
         }
+        // ralphus[ignore-endpoint-cli]: board manual-checks pane view
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
             guardian_manual_checks_pane(daemon, id, query)
         }
+        // ralphus[ignore-endpoint-cli]: board terminal transcript viewer for the manual-checks pane (RAL-154)
         ("GET", ["api", "guardians", id, "manual-checks", "pane-transcript"]) => {
             guardian_manual_checks_pane_transcript(daemon, id, query)
         }
+        // ralphus[ignore-endpoint-cli]: board debug-event timeline for manual checks
         ("GET", ["api", "guardians", id, "manual-checks", "debug-events"]) => {
             guardian_manual_checks_debug_events(daemon, id)
         }
@@ -1662,6 +1750,7 @@ fn route_for_user(
                 guardian_manual_checks_system_prompt(daemon, id)
             })
         }
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1672,6 +1761,7 @@ fn route_for_user(
                 "terminal-log-attempts",
             ],
         ) => guardian_manual_checks_terminal_log_attempts(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt detail (RAL-154)
         (
             "GET",
             [
@@ -1691,12 +1781,15 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "approve"]) => guardian_approve(daemon, id),
         ("POST", ["api", "guardians", id, "cancel"]) => guardian_cancel(daemon, id),
         ("POST", ["api", "guardians", id, "reopen"]) => guardian_reopen(daemon, id),
+        // ralphus[ignore-endpoint-cli]: daemon-host GUI execution for manual checks; CLI `review checks run` is deliberately headless
         ("POST", ["api", "guardians", id, "run-manual-commands"]) => {
             guardian_run_manual_commands(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: daemon-host GUI execution of a hint action; CLI `review action run` is deliberately headless
         ("POST", ["api", "guardians", id, "run-action-hint"]) => {
             guardian_run_action_hint(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board inline 'resolve this residue for me' action
         ("POST", ["api", "guardians", id, "resolve-input"]) => {
             guardian_resolve_input(daemon, id, body)
         }
@@ -1707,15 +1800,18 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "pull-requests", "unlink"]) => {
             guardian_unlink_prs(daemon, id)
         }
+        // ralphus[ignore-endpoint-cli]: board PR-stack visualizer for the guardian
         ("GET", ["api", "guardians", id, "pull-request-stacks"]) => {
             guardian_list_pr_stacks(daemon, id)
         }
         ("GET", ["api", "pull-requests"]) => pr_find(daemon, query),
         // RAL-362: must precede the generic `pr_id` arm below -- "index" would
         // otherwise be captured as a (nonexistent) PR id.
+        // ralphus[ignore-endpoint-cli]: board 'Tasks' tab PR index with per-merge-status grouping
         ("GET", ["api", "pull-requests", "index"]) => pr_index_list(daemon),
         // RAL-366: must precede the generic `pr_id` arm below, same reasoning
         // as `"index"` above.
+        // ralphus[ignore-endpoint-cli]: board debug listing of the forge cache
         ("GET", ["api", "pull-requests", "forge-cache-index"]) => pr_forge_cache_index(daemon),
         ("GET", ["api", "pull-requests", pr_id]) => pr_get(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
@@ -1723,8 +1819,10 @@ fn route_for_user(
         ("POST", ["api", "pull-requests", pr_id, "action-feedback"]) => {
             pr_action_feedback(daemon, user_header, pr_id)
         }
+        // ralphus[ignore-endpoint-cli]: board drift indicator between guardian branch and PR
         ("GET", ["api", "pull-requests", pr_id, "sync-status"]) => pr_sync_status(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id, "pull-from-pr"]) => pr_pull_from_pr(daemon, pr_id),
+        // ralphus[ignore-endpoint-cli]: board on-demand CI-status refresh for a PR
         ("POST", ["api", "pull-requests", pr_id, "refresh-ci"]) => pr_refresh_ci(daemon, pr_id),
         _ => error(
             404,
