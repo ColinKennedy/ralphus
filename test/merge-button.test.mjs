@@ -10,8 +10,12 @@
 //
 // What is pinned here: the button reports a pending, disabled state the
 // instant it is clicked; the label and tooltip stay honest about which of
-// start/resume/restart is happening; and the toast wording acknowledges the
-// *request* rather than claiming the rebase is done.
+// start/resume/restart is happening; the toast wording acknowledges the
+// *request* rather than claiming the rebase is done; and since RAL-423 the
+// pending state clears on the daemon's response (the kickoff transition
+// lands synchronously before it answers), with that response's own status
+// patched into the local guardian copy -- the follow-up reload is fired and
+// forgotten rather than awaited.
 //
 // Run with `npm test` (node --test). See ./board-merge-button.mjs for how the
 // view logic is loaded out of the real board.html.
@@ -136,7 +140,24 @@ test("mergeReview marks the button pending and toasts before awaiting the daemon
   );
   assert.ok(pendingAt < awaitAt, "the pending state must not wait on the daemon");
   assert.ok(toastAt < awaitAt, "the toast must not wait on the daemon");
-  assert.ok(toastAt < tickAt, "the toast must not wait on the board reload");
+});
+
+test("mergeReview clears pending on the daemon's response, not after the reload", () => {
+  const body = boardSource.slice(boardSource.indexOf("async function mergeReview(id, status)"));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  const awaitAt = fn.indexOf("await guardianAction(");
+  const clearAt = fn.indexOf("pendingMergeActions.delete(id)");
+  const tickAt = fn.indexOf("tick();");
+  assert.ok(awaitAt > -1 && clearAt > -1 && tickAt > -1, "mergeReview shape changed");
+  assert.equal(fn.indexOf("await tick()"), -1, "the reload must be fired and forgotten, not awaited");
+  assert.ok(clearAt > awaitAt, "the pending state must clear right after the daemon answers");
+  // The daemon's claim precedes its response (`kickoff_merge` transitions
+  // the guardian synchronously), so the response body's own status drives
+  // what the button shows until the reload lands -- without the patch the
+  // button would flip back to startable in the gap between the response
+  // and the reload.
+  assert.ok(fn.indexOf('body.status === "merging"') > -1, "the local status must reflect a claimed merge");
+  assert.ok(fn.indexOf('body.status === "approved"') > -1, "the local status must reflect an already-merged review");
 });
 
 // The daemon claims the review before it answers, so once `guardianAction`

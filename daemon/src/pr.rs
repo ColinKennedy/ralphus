@@ -955,6 +955,56 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert only the branch-drift half of the RAL-366 cache row for one PR
+    /// (RAL-423): the poller's *drift pass* refreshes `in_sync`/`pr_ahead`/
+    /// `worktree_ahead`/`remote_sha`/`local_sha` while holding that PR's own
+    /// fetch lock, and must drop every such lock before its *comment pass*
+    /// issues forge network calls. The status/etag columns are deliberately
+    /// untouched here -- `ok`/`last_error`/etags describe the forge-comment
+    /// probe, which the comment pass owns (and which runs after the drift
+    /// locks are released); a drift-only write must neither make a row read
+    /// as freshly "checked" when its comment probe hasn't run this cycle,
+    /// nor transiently flip its status, nor evict a prior pass's etags. On a
+    /// fresh row (first poll ever) the placeholder `status='unknown'` is
+    /// corrected moments later by the same poll's comment-pass upsert.
+    pub(crate) fn upsert_pr_forge_cache_drift(
+        &self,
+        pr_id: &str,
+        in_sync: bool,
+        pr_ahead: bool,
+        worktree_ahead: bool,
+        remote_sha: Option<&str>,
+        local_sha: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(
+                pr_id, last_checked_at_ms, status, last_error,
+                in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha,
+                etag_conversation, etag_review
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(pr_id) DO UPDATE SET
+                in_sync            = excluded.in_sync,
+                pr_ahead           = excluded.pr_ahead,
+                worktree_ahead     = excluded.worktree_ahead,
+                remote_sha         = excluded.remote_sha,
+                local_sha          = excluded.local_sha",
+            params![
+                pr_id,
+                now_ms(),
+                "unknown",
+                None::<&str>,
+                in_sync,
+                pr_ahead,
+                worktree_ahead,
+                remote_sha,
+                local_sha,
+                None::<&str>,
+                None::<&str>,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Read this PR's own stored ETags (RAL-366), if a prior poll pass ever
     /// recorded one -- so the next conditional fetch can send
     /// `If-None-Match` and cost no forge quota when nothing changed.
@@ -5814,7 +5864,11 @@ fn submit_pull_requests_inner(
 
 /// One lock per `(repository root, PR)`, serializing repeat/concurrent
 /// `git fetch` + `rev-parse` pairs in [`compute_sync_status`] for the *same*
-/// PR.
+/// PR. Also used by the RAL-366 forge-cache poller's drift pass, which
+/// acquires a PR's entry via `try_lock` and releases it again before making
+/// any forge *comment* network call for that PR (RAL-423) -- so a poller
+/// pass can never extend an interactive [`compute_sync_status`] wait beyond
+/// that PR's own git fetch.
 ///
 /// Originally this was one lock per repository root: `git fetch` with no
 /// explicit destination writes `FETCH_HEAD`, a single file shared by the
@@ -13149,6 +13203,131 @@ mod tests {
         );
         assert_eq!(cache.local_sha.as_deref(), Some("stale-local"));
         assert_eq!(cache.in_sync, Some(true));
+    }
+
+    #[test]
+    fn poller_holds_no_pr_fetch_lock_across_the_comment_network_pass() {
+        // Regression (RAL-423): the RAL-366 poller used to acquire every open
+        // PR's drift-check lock with `try_lock` and then hold the whole set
+        // across the loop that made the per-PR forge comment fetches (two
+        // network round-trips each), so an interactive `sync-status` for any
+        // one of those PRs could block behind *every other* PR's comment
+        // calls -- minutes, not the milliseconds of that PR's own git fetch.
+        // The fix splits the poller into a drift pass that owns the locks and
+        // a comment pass that runs with none held.
+        //
+        // This test proves the split behaviorally: a local forge server
+        // *holds* the comment request open once it arrives, the poller is
+        // allowed to run until it is provably inside that comment pass, and
+        // only then is a concurrent `compute_sync_status` for the same PR
+        // timed. It must complete while the comment call is still held open.
+        // Under the old shape the probe would block on this PR's fetch lock
+        // until the comment pass finished (which only happens when this test
+        // releases it below), so the 10s probe timeout fires.
+        let (root, store, pr_id, _sha) = cache_poll_fixture("cache-comment-split");
+        let guardian_id = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
+
+        // The forge server: answers ordinary requests with an empty JSON
+        // array (the GitHub conversation/review list shapes both parse as),
+        // but holds the *first* comment-API request open until released --
+        // signalling that it has been reached -- pinning the poller inside
+        // its comment pass for as long as the test needs.
+        let forge = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let forge_addr = forge.server_addr().to_string();
+        let (comment_reached_tx, comment_reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let forge_arc = Arc::new(forge);
+        std::thread::spawn(move || {
+            let mut held = false;
+            loop {
+                let req = match forge_arc.recv_timeout(std::time::Duration::from_secs(20)) {
+                    Ok(Some(r)) => r,
+                    Ok(None) | Err(_) => break,
+                };
+                let url = req.url().to_string();
+                let is_comment = url.contains("/issues/") || url.contains("/pulls/");
+                if is_comment && !held {
+                    held = true;
+                    let _ = comment_reached_tx.send(());
+                    let _ = release_rx.recv();
+                }
+                req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                    .unwrap();
+            }
+        });
+
+        // The git remote must stay host-parseable (so a forge kind + repo
+        // resolve for the comment client) but must *not* be reachable: point
+        // it at 127.0.0.1 port 1 (tcpmux -- never bound here, never in the
+        // OS's ephemeral range that other tests' `Server::http(127.0.0.1:0)`
+        // listeners draw from, so no parallel test can steal it), so the
+        // poller's `git fetch` fails in milliseconds with connection refused
+        // instead of touching a real network. The comment API calls, by
+        // contrast, go to `forge_addr` via the config's `[forge] api_base`,
+        // where the server above holds them open.
+        let remote_url = "http://127.0.0.1:1/acme/widget.git";
+        g(&root, &["remote", "set-url", "origin", remote_url]);
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"github\"\napi_base = \"http://{forge_addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Run the poller to completion on a background thread.
+        let store2 = Arc::clone(&store);
+        let poller = std::thread::spawn(move || {
+            refresh_pr_forge_cache_for_guardian(&store2, &guardian_id);
+        });
+
+        // Wait until the poller is *inside* its comment pass: the forge
+        // server has received the comment request and is holding it.
+        let reached = match comment_reached_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(()) => true,
+            Err(_) => false,
+        };
+        assert!(
+            reached,
+            "the poller never reached its comment pass; did the pre-pass drift \
+             fetch to the unreachable remote hang?"
+        );
+
+        // Now time an interactive drift check for the same PR, on its own
+        // thread so a regression that makes it block again fails with an
+        // assertion instead of hanging the suite. The 8s budget is generous
+        // but deliberate: on Windows, even a connection-refused loopback
+        // connect costs ~2s in git before it reports (SYN retransmit), and a
+        // loaded dev box can add more -- the *regression* backstop is the 10s
+        // receiver below, which fires when the probe never completes at all
+        // (i.e. it blocked on the poller's comment pass).
+        let store3 = Arc::clone(&store);
+        let (check_tx, check_rx) = std::sync::mpsc::channel::<u64>();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let _ = compute_sync_status(&store3, &pr_id).unwrap();
+            let _ = check_tx.send(t0.elapsed().as_millis() as u64);
+        });
+        match check_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(elapsed_ms) => assert!(
+                elapsed_ms < 8000,
+                "sync-status for the PR the poller is actively comment-polling took \
+                 {elapsed_ms}ms -- it blocked on the comment pass. The poller must \
+                 drop every PR fetch lock before its comment network fetches (RAL-423)."
+            ),
+            Err(_) => {
+                let _ = release_tx.send(());
+                panic!(
+                    "compute_sync_status was still blocked 10s into the poller's comment \
+                     pass. The poller must drop every PR fetch lock before its comment \
+                     network fetches (RAL-423)."
+                );
+            }
+        }
+
+        // Let the comment pass finish so the poller thread terminates.
+        let _ = release_tx.send(());
+        poller.join().unwrap();
     }
 
     #[test]
