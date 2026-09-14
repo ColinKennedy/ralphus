@@ -9718,6 +9718,7 @@ fn reply(status: u16, body: &str) -> Reply {
     Reply {
         status,
         body: body.to_string(),
+        server_timing: None,
     }
 }
 

@@ -72,6 +72,7 @@ doesn't go through tmux/psmux at all.
 | `guardian_merge.rs` | Stacked rebase + conflict resolution | Mostly `CapturingRunner`-based (no subprocess); 1 live-Ollama test, `#[ignore]`d by default |
 | `reviews_derive.rs` | Full review flow end-to-end | 1 live-Ollama test, `#[ignore]`d by default; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
 | `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test, `#[ignore]`d by default |
+| `board_cold_load_perf.rs` | RAL-414: board endpoint cold-load budget vs. realistic fixtures | 4 always-run smoke tests + 4 `#[ignore]`d heavy tests; the heavy tests run every PR in the `perf-tests` CI job (`.github/workflows/ci.yml`), not the `rust` job's default `Test` step |
 
 **Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash
