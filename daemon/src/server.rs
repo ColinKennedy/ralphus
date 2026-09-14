@@ -10671,7 +10671,17 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         let store_handle = daemon.store_handle();
         {
             let guard = store_handle.lock();
-            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, id) {
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(
+                &guard,
+                id,
+                |cands| {
+                    crate::arbiter::order_pooled_candidates(
+                        &guard,
+                        &crate::arbiter::Arbiter::current(),
+                        cands,
+                    )
+                },
+            ) {
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] failed to re-check thresholds after manual completion in {id}: {}",
