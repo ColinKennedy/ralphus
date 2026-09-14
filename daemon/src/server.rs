@@ -1886,6 +1886,39 @@ fn filter_and_sort_squads(
 }
 
 /// `?status=queued,running&name=foo&sort=name` — see [`filter_and_sort_squads`].
+/// Drop the agent prompt text from a board listing.
+///
+/// Measured against a real history, `cell.prompt`, `cell.system_prompt` and
+/// `proof.system_prompt` were 4.89MB of this endpoint's 6.23MB — 79% of the
+/// whole response — because agent prompts run to multiple KB each and there
+/// are hundreds of cells and proof steps. Nothing that renders a *list*
+/// reads them: the board's sidebar, graph, go-to search, running-cells
+/// dropdown and worktree linkage all use shallow fields, and the CLI's only
+/// consumer of this endpoint (`selector::lookup_squad_id`) reads `id` and
+/// `label`. The one place prompt text is shown is the details pane, for the
+/// single selected cell or proof step, which reads it from
+/// `GET /api/squads/{id}` instead.
+///
+/// Deliberately applied here rather than on `CellView`/`ProofView`
+/// themselves: the per-squad endpoint serializes the same types and must
+/// keep carrying the full text.
+fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
+    for squad in squads.iter_mut() {
+        for task in &mut squad.tasks {
+            for proof in &mut task.proof {
+                proof.system_prompt = None;
+            }
+            for cell in &mut task.cells {
+                cell.prompt = None;
+                cell.system_prompt = None;
+                for proof in &mut cell.proof {
+                    proof.system_prompt = None;
+                }
+            }
+        }
+    }
+}
+
 fn board(daemon: &Daemon, query: &str) -> Reply {
     // Served from the read pool, not the writer lock. This is the single
     // largest response the daemon produces (megabytes once a real squad
@@ -1912,8 +1945,9 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
     let status = query_filter(query, "status");
     let name = query_filter(query, "name");
     let sort = query_filter(query, "sort");
-    let squads =
+    let mut squads =
         filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
+    strip_prompt_text(&mut squads);
     let serialize_started = Instant::now();
     let reply = json(
         200,
