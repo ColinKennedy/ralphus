@@ -732,7 +732,7 @@ use; see `READ_ONLY_NOTE`.
     - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
         - pool  {Inspect and configure Triage auto-review pools (RAL-318).}
             - (read-only-safe) list  {List every Triage pool key with pooled cells and/or a configured count threshold, plus its resolved project name (RAL-318).}
-            - threshold project [str] triage_type [str] --clear --preview --threshold [integer]  {Set (or --clear) the count threshold for a (project, triage_type) pool (RAL-318). The CLI never prompts: invoking this command IS the confirmation -- a pool already holding at least this many cells drains immediately in threshold-sized batches (one review per batch), leaving only a sub-threshold remainder pooled (RAL-421). Pass --preview to see what confirming would drain right now without changing anything.}
+            - threshold project [str] triage_type [str] --clear --threshold [integer]  {Set (or --clear) the count threshold for a (project, triage_type) pool -- once it holds this many cells, it drains into a fresh review (RAL-318).}
         - type  {Register and inspect Triage types (RAL-318).}
             - deregister name [str]  {Remove a Triage type. The built-in "unclassified" type can never be deregistered.}
             - (read-only-safe) get name [str]  {Show one registered Triage type by exact name.}
