@@ -310,6 +310,51 @@ jobs:
       - name: pytest
         run: uv run pytest
 
+  perf-tests:
+    name: Board cold-load performance budget (RAL-414)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      # Real HTTP requests against realistic (200+ squad / 600+ worktree)
+      # fixtures, asserted against a wall-clock budget -- see
+      # daemon/tests/board_cold_load_perf.rs's module doc comment. These are
+      # `#[ignore]`d in the default suite (the `rust` job's `Test` step)
+      # since they're deliberately heavier than the rest of the workspace
+      # suite; this job is where they actually run every PR.
+      - name: Rust board cold-load perf tests
+        env:
+          RALPHUS_BOARD_TIMING: "1"
+        run: cargo nextest run -p ralphus-daemon --test board_cold_load_perf --run-ignored only --test-threads 1
+      - name: Build ralphus-librarian (needed by the browser-side perf test)
+        run: cargo build -p ralphus-librarian
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      # `docs` extra pulls in playwright -- the `python-test`/`python-lint`
+      # jobs deliberately skip it (see cli-py/pyproject.toml), so this job
+      # installs it itself rather than widening those jobs' scope.
+      - name: Sync dependencies (incl. playwright)
+        run: uv sync --dev --extra docs
+        working-directory: cli-py
+      - name: Install Chromium
+        run: uv run playwright install --with-deps chromium
+        working-directory: cli-py
+      # Browser-side cold-navigation timing for the Squads/Tasks/Retirements/
+      # Projects tabs against the same load scale as the Rust test above --
+      # see cli-py/tests/test_board_cold_load_perf.py's module doc comment.
+      - name: Python board cold-load perf tests
+        run: uv run pytest -m heavy
+        working-directory: cli-py
+
   bench-patience:
     name: Bench patience comment lint
     runs-on: ubuntu-latest
