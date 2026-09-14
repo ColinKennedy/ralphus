@@ -128,7 +128,7 @@
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
       // "Cancel review" appears in the same states everywhere.
-      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "merge_stopped", "in_review", "approved"];
+      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "merge_stopped", "finalizing", "in_review", "approved"];
       /**
        * Renders a colored status dot for a guardian/branch/merge state.
        * @param {string} s
@@ -752,6 +752,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       /** @type {Record<string, string>} Why the button is unavailable, keyed by the review's status. */
       const MERGE_DISABLED_REASON = {
         merging: "A rebase is already in progress — wait for it to finish, or press Stop to halt it mid-rebase.\nTo restart from scratch, stop then merge, or cancel the running merge first.",
+        finalizing: "This review is finalizing — check gates and manual-command generation are finishing up after the last branch's rebase. Wait for it to complete.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
@@ -891,9 +892,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : "";
           // RAL-118: move this branch into a different review's stack. Gated the
           // same as enableToggle (canReorder) plus an explicit exclusion of
-          // "merging" -- the server enforces the real gate, but hiding the
-          // button while a rebase is in flight avoids a guaranteed 409.
-          const moveBtn = (canReorder && g.status !== "merging")
+          // "merging"/"finalizing" -- the server enforces the real gate, but
+          // hiding the button while a rebase/finalize is in flight avoids a
+          // guaranteed 409.
+          const moveBtn = (canReorder && g.status !== "merging" && g.status !== "finalizing")
             ? `<button class="icon-btn" data-click="openMoveBranchMenu" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}" style="font-size:11px;padding:1px 5px" data-tip="Move this branch to a different review.\nWho/when: a change needs to ship independently of the review it started in -- e.g. this review is stalled but this one branch is ready, or another review needs just this branch.\nBoth reviews rebuild afterward: this one renumbers its remaining branches, the destination review rebases this one into its own stack.\nBlocked while either review has an active merge/rebase in progress.\nThis cannot be undone.">⇄</button>`
             : "";
           const isBranchSel = selectedBranch[g.id] === b.branch;
@@ -1028,7 +1030,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${(() => {
               // RAL-249: halt an in-progress rebase at its next checkpoint,
               // keeping the review resumable — distinct from "Cancel review".
-              const canStop = g.status === "merging";
+              const canStop = g.status === "merging" || g.status === "finalizing";
               if (!canStop) return "";
               return `<button class="btn" data-click="stopMerge" data-guardian-id="${esc(g.id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop</button>`;
             })()}
@@ -1049,7 +1051,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               // RAL-273: only meaningful once a stack is actually built and
               // open against the forge -- same scope as the 5-minute
               // background poll (in_review/merging).
-              const canSync = ["in_review", "merging"].includes(g.status);
+              const canSync = ["in_review", "merging", "finalizing"].includes(g.status);
               const syncTip = canSync
                 ? "Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack."
                 : "Not available — a stack reorder can only be detected once this review has an open PR stack (status in_review or merging).";

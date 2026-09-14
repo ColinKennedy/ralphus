@@ -129,6 +129,80 @@ pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
     format!("reviewer-{branch_id}")
 }
 
+// ---------------------------------------------------------------------------
+// Phase instrumentation helpers (RAL-422)
+// ---------------------------------------------------------------------------
+
+/// Write a paired start/completion record for a merge pipeline phase.
+/// `action` is called in between; its return value is passed through.
+fn log_phase<T>(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    phase: &str,
+    payload: serde_json::Value,
+    action: impl FnOnce() -> T,
+) -> T {
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(&guard, format!("{phase} starting"), payload);
+    }
+    let result = action();
+    let elapsed = t0.elapsed().as_secs_f64();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                format!("{phase} completed"),
+                serde_json::json!({"elapsed_s": elapsed}),
+            );
+    }
+    result
+}
+
+/// Heartbeat thread that writes a liveness record every `interval_sec`. The
+/// store lock is only held for the brief write, never across the whole interval.
+fn start_heartbeat(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    phase: &str,
+    interval_sec: u64,
+) -> Arc<AtomicBool> {
+    let store_clone = Arc::clone(store);
+    let id = id.to_string();
+    let phase = phase.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let mut count = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval_sec));
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            count += 1;
+            let guard = store_clone.lock();
+            // `Note::emit` writes the paired stderr line + structured row, so
+            // each tick is a live record on both sinks (RAL-422).
+            crate::cartographer::Note::new("guardian")
+                .guardian(&id)
+                .scope("guardian")
+                .emit(
+                    &guard,
+                    format!("{phase} still running (tick {count})"),
+                    serde_json::json!({"heartbeat_no": count, "phase": phase}),
+                );
+        }
+    });
+    stop
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartMergeOutcome {
@@ -2643,6 +2717,31 @@ fn run_commit_checks(
         )
     };
     if skip_auto_build {
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .emit(
+                    &guard,
+                    "commit checks skipped",
+                    serde_json::json!({"reason": "skip_auto_build"}),
+                );
+        }
+        return Ok(());
+    }
+    if checks.is_empty() {
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("branch")
+                .emit(
+                    &guard,
+                    "commit checks skipped",
+                    serde_json::json!({"reason": "no checks"}),
+                );
+        }
         return Ok(());
     }
     // RAL-191: check gates run under the branch's resolved environment, same as
@@ -2671,11 +2770,29 @@ fn run_commit_checks(
         );
     }
     let checks_started = std::time::Instant::now();
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &guard,
+                "commit checks starting",
+                serde_json::json!({"branch": branch, "count": checks.len(), "commands": checks}),
+            );
+    }
+    // RAL-422: a per-command failure or cancellation ends the phase like a
+    // normal completion -- the finish record (with `ok: false`) carries the
+    // reason, so a phase that failed is never indistinguishable from one that
+    // never finished.
+    let mut outcome: Option<String> = None;
     for cmd in &checks {
         // RAL-239: a review cancelled while a check gate is running must not
         // let the next queued check start against this worktree.
         if cancel.is_cancelled() {
-            return Err("cancelled".to_string());
+            outcome = Some("cancelled".to_string());
+            break;
         }
         if !wt.run_command_with_env(cmd, &env, cancel).0 {
             phase_note(
@@ -2691,10 +2808,11 @@ fn run_commit_checks(
                     "elapsed_ms": elapsed_ms(checks_started),
                 }),
             );
-            return Err(format!("check failed after '{branch}': {cmd}"));
+            outcome = Some(format!("check failed after '{branch}': {cmd}"));
+            break;
         }
     }
-    if !checks.is_empty() {
+    if outcome.is_none() {
         phase_note(
             store,
             id,
@@ -2711,32 +2829,57 @@ fn run_commit_checks(
             }),
         );
     }
-    let wt_str = wt.root().to_string_lossy().into_owned();
-    if !checks.is_empty() {
-        let uri = crate::ghost::review_uri(id, Some(branch_id));
-        let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
-        let revision = crate::ghost::current_revision(&wt_str);
+    let elapsed = t0.elapsed().as_secs_f64();
+    let level = if outcome.is_none() {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    {
         let guard = store.lock();
-        if guard
-            .upsert_ghost(
-                &uri,
-                crate::ghost::KIND_REVIEW,
-                None,
-                Some(id),
-                &note,
-                revision.as_deref(),
-            )
-            .is_ok()
-        {
-            crate::cartographer::Note::new("guardian")
-                .guardian(id)
-                .scope("branch")
-                .emit(
-                    &guard,
-                    "ghost check-outcome note recorded",
-                    serde_json::json!({"branch": branch, "checks": checks.len()}),
-                );
-        }
+        crate::cartographer::Note::new("guardian")
+            .level(level)
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &guard,
+                format!("commit checks completed ({:.1}s)", elapsed),
+                serde_json::json!({
+                    "branch": branch,
+                    "count": checks.len(),
+                    "elapsed_s": elapsed,
+                    "ok": outcome.is_none(),
+                    "error": outcome,
+                }),
+            );
+    }
+    if let Some(e) = outcome {
+        return Err(e);
+    }
+    let wt_str = wt.root().to_string_lossy().into_owned();
+    let uri = crate::ghost::review_uri(id, Some(branch_id));
+    let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
+    let revision = crate::ghost::current_revision(&wt_str);
+    let guard = store.lock();
+    if guard
+        .upsert_ghost(
+            &uri,
+            crate::ghost::KIND_REVIEW,
+            None,
+            Some(id),
+            &note,
+            revision.as_deref(),
+        )
+        .is_ok()
+    {
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &guard,
+                "ghost check-outcome note recorded",
+                serde_json::json!({"branch": branch, "checks": checks.len()}),
+            );
     }
     Ok(())
 }
@@ -3112,8 +3255,50 @@ fn claim_combined_review_ref_by_id(
     root: &Workspace,
     id: &str,
 ) -> std::result::Result<String, String> {
-    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
-    claim_combined_review_ref(store, root, &guardian)
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                "claim combined review ref starting",
+                serde_json::json!({}),
+            );
+    }
+    let guardian = {
+        let guard = store.lock();
+        guard.get_guardian(id).map_err(|e| e.to_string())
+    };
+    let result = match guardian {
+        Ok(g) => claim_combined_review_ref(store, root, &g),
+        Err(e) => Err(e),
+    };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let level = if result.is_ok() {
+        crate::logging::LogLevel::INFO
+    } else {
+        crate::logging::LogLevel::WARNING
+    };
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(level)
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                format!("claim combined review ref completed ({:.1}s)", elapsed),
+                serde_json::json!({
+                    "ok": result.is_ok(),
+                    "elapsed_s": elapsed,
+                    "name": result.as_ref().ok(),
+                    "error": result.as_ref().err(),
+                }),
+            );
+    }
+    result
 }
 
 /// Every readable review-branch name this review has claimed, restricted to
@@ -4747,9 +4932,10 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
     // Known difference from `run_merge_shared`: that path moves the review to
     // `in_review` before running these, so the board stops saying "merging"
     // the moment the branches are done. This multi-project path still holds
-    // `merging` until the gates finish. Behaviour is safe either way -- both
-    // states block a competing merge claim -- but the status shown here is
-    // more pessimistic than it needs to be.
+    // `finalizing` (RAL-422) until the gates finish. Behaviour is safe either
+    // way -- both states block a competing merge claim -- but the status shown
+    // here is more pessimistic than it needs to be.
+    set_status(GuardianStatus::Finalizing, None);
     let _ = store.lock().start_guardian_post_merge(id);
     let outcome = if let (Some(combined_str), Some(root)) = (&last_combined, &last_root) {
         final_checks(store, runner, id, root, combined_str, cancel)
@@ -5223,6 +5409,7 @@ pub fn run_merge_cancellable(
         log_merge_cancelled(store, id);
         return;
     }
+    set_status(GuardianStatus::Finalizing, None);
     // Run final check gates against the last combined worktree (all-projects pass).
     // Every project's branches are rebased by this point, so the merge itself
     // is done. The check gates below run against a finished stack, and their
@@ -5412,6 +5599,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         log_merge_cancelled(store, id);
         return;
     }
+    set_status(GuardianStatus::Finalizing, None);
     {
         let guard = store.lock();
         let _ = guard.set_guardian_review_branch(id, &combined_branch);
@@ -6908,7 +7096,7 @@ pub fn review_maintenance(
             .filter(|g| {
                 matches!(
                     g.status.as_str(),
-                    "in_review" | "merge_failed" | "merging" | "merge_stopped"
+                    "in_review" | "merge_failed" | "merging" | "merge_stopped" | "finalizing"
                 )
             })
             .map(|g| (g.id, g.status))
@@ -7676,10 +7864,71 @@ fn final_checks(
     };
 
     if skip_auto_build {
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("guardian")
+                .emit(
+                    &guard,
+                    "final checks skipped",
+                    serde_json::json!({"reason": "skip_auto_build", "checks_count": checks.len()}),
+                );
+        }
         return Ok((!checks.is_empty()).then(|| "check gates skipped (opt-out)".to_string()));
     }
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(&guard, "final checks starting", serde_json::json!({"checks_count": checks.len(), "has_auto_build": auto_build.is_some()}));
+    }
+    let hb = start_heartbeat(store, id, "final checks", 30);
+    let result = final_checks_inner(
+        store,
+        runner,
+        id,
+        root,
+        combined_str,
+        &env,
+        &checks,
+        auto_build.as_ref(),
+        cancel,
+    );
+    hb.store(true, Ordering::Relaxed);
+    let elapsed = t0.elapsed().as_secs_f64();
+    {
+        let level = if result.is_ok() {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        };
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(level)
+            .guardian(id)
+            .scope("guardian")
+            .emit(&guard, format!("final checks completed ({:.1}s)", elapsed), serde_json::json!({"ok": result.is_ok(), "elapsed_s": elapsed, "note": result.as_ref().ok(), "error": result.as_ref().err()}));
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_checks_inner(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    checks: &[String],
+    auto_build: Option<&crate::guardian::GuardianAutoBuild>,
+    cancel: &CancelToken,
+) -> std::result::Result<Option<String>, String> {
     if !checks.is_empty() {
-        for cmd in &checks {
+        for cmd in checks {
             // RAL-239: same reasoning as `run_commit_checks` -- don't start the
             // next final check gate once the review has been cancelled.
             if cancel.is_cancelled() {
@@ -7687,7 +7936,7 @@ fn final_checks(
             }
             if !root
                 .at(combined_str)
-                .run_command_with_env(cmd, &env, cancel)
+                .run_command_with_env(cmd, env, cancel)
                 .0
             {
                 return Err(format!("check failed: {cmd}"));
@@ -7703,7 +7952,7 @@ fn final_checks(
     // build step and should never block a review from reaching `InReview`.
     if let Some(def) = auto_build {
         if let Some(note) =
-            run_review_auto_build(store, runner, id, root, combined_str, &env, &def, cancel)
+            run_review_auto_build(store, runner, id, root, combined_str, env, def, cancel)
         {
             return Ok(Some(note));
         }
@@ -7711,16 +7960,52 @@ fn final_checks(
     // RAL-101: no explicit checks or review auto_build -- fall back to the
     // project's default build/test command, if one is configured, so
     // "in review" still means "testable" rather than "merged and never built".
-    match store.lock().resolve_review_config(root.root()).auto_build {
+    // Hoisted out of the match below: the scrutinee guard stays alive across
+    // the whole `match`, and the arms re-lock the store to write their phase
+    // records -- re-entering the guard there would deadlock.
+    let project_auto_build = {
+        let guard = store.lock();
+        guard.resolve_review_config(root.root()).auto_build
+    };
+    match project_auto_build {
         Some(cmd) => {
-            if !root
-                .at(combined_str)
-                .run_command_with_env(&cmd, &env, cancel)
-                .0
             {
-                return Err(format!("auto-build failed: {cmd}"));
+                let guard = store.lock();
+                crate::cartographer::Note::new("guardian")
+                    .guardian(id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "final checks: project auto_build starting",
+                        serde_json::json!({"command": &cmd}),
+                    );
             }
-            Ok(Some(format!("auto-built via project default: {cmd}")))
+            let ok = root
+                .at(combined_str)
+                .run_command_with_env(&cmd, env, cancel)
+                .0;
+            {
+                let level = if ok {
+                    crate::logging::LogLevel::INFO
+                } else {
+                    crate::logging::LogLevel::WARNING
+                };
+                let guard = store.lock();
+                crate::cartographer::Note::new("guardian")
+                    .level(level)
+                    .guardian(id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "final checks: project auto_build completed",
+                        serde_json::json!({"command": &cmd, "ok": ok}),
+                    );
+            }
+            if ok {
+                Ok(Some(format!("auto-built via project default: {cmd}")))
+            } else {
+                Err(format!("auto-build failed: {cmd}"))
+            }
         }
         None => Ok(None),
     }
@@ -7749,10 +8034,23 @@ fn run_review_auto_build(
     cancel: &CancelToken,
 ) -> Option<String> {
     if let Some(cmd) = def.command.as_deref() {
+        let t0 = std::time::Instant::now();
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .guardian(id)
+                .scope("guardian")
+                .emit(
+                    &guard,
+                    "review auto_build starting",
+                    serde_json::json!({"command": cmd}),
+                );
+        }
         let ok = root
             .at(combined_str)
             .run_command_with_env(cmd, env, cancel)
             .0;
+        let elapsed = t0.elapsed().as_secs_f64();
         let _ = store
             .lock()
             .cartographer_log(crate::cartographer::CartographerEntry {
@@ -7773,7 +8071,7 @@ fn run_review_auto_build(
                 cell_id: None,
                 task: None,
                 log_path: None,
-                payload: serde_json::json!({"command": cmd}),
+                payload: serde_json::json!({"command": cmd, "elapsed_s": elapsed}),
                 admin_only: false,
             });
         if !ok {
@@ -7858,9 +8156,11 @@ fn run_review_auto_build(
         allow_personal_memory: false,
         hide_thinking: false,
     };
+    let t0 = std::time::Instant::now();
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
     let ok = result.is_done();
+    let elapsed = t0.elapsed().as_secs_f64();
     let _ = store
         .lock()
         .cartographer_log(crate::cartographer::CartographerEntry {
@@ -7881,7 +8181,7 @@ fn run_review_auto_build(
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({"summary": result.summary}),
+            payload: serde_json::json!({"summary": result.summary, "elapsed_s": elapsed}),
             admin_only: false,
         });
     if !ok {
@@ -8125,35 +8425,56 @@ fn rebuild_combined(
 /// Best-effort: a write failure here must never fail the review itself, so
 /// errors are swallowed rather than propagated.
 fn regenerate_readme(store: &crate::store_lock::StoreHandle, root: &Workspace) {
-    let guardians = store.lock().list_guardians().unwrap_or_default();
-    let mut mappings: Vec<(String, String)> = Vec::new();
-    for gv in guardians
-        .iter()
-        .filter(|gv| Path::new(&gv.git_root) == root.root())
-    {
-        let short_id = crate::short_paths::guardian_short_id(&gv.id);
-        for b in &gv.branches {
-            let Some(wt) = &b.worktree else { continue };
-            let Some(name) = Path::new(wt).file_name() else {
-                continue;
-            };
-            mappings.push((
-                format!("g/{short_id}/{}", name.to_string_lossy()),
-                b.branch.clone(),
-            ));
-        }
-        if gv.combined_worktree.is_some() {
-            mappings.push((
-                format!("g/{short_id}/review"),
-                format!("combined review for guardian \"{}\"", gv.name),
-            ));
-        }
+    let id = {
+        let guard = store.lock();
+        guard
+            .list_guardians()
+            .unwrap_or_default()
+            .iter()
+            .find(|gv| Path::new(&gv.git_root) == root.root())
+            .map(|gv| gv.id.clone())
+            .unwrap_or_default()
+    };
+    if id.is_empty() {
+        return;
     }
-    mappings.sort();
-    let readme = crate::short_paths::render_readme(&mappings);
-    let _ = root.write_file(
-        Path::new(".git").join(".ralphus").join("README.md"),
-        &readme,
+    log_phase(
+        store,
+        &id,
+        "regenerate readme",
+        serde_json::Value::Null,
+        || {
+            let guardians = store.lock().list_guardians().unwrap_or_default();
+            let mut mappings: Vec<(String, String)> = Vec::new();
+            for gv in guardians
+                .iter()
+                .filter(|gv| Path::new(&gv.git_root) == root.root())
+            {
+                let short_id = crate::short_paths::guardian_short_id(&gv.id);
+                for b in &gv.branches {
+                    let Some(wt) = &b.worktree else { continue };
+                    let Some(name) = Path::new(wt).file_name() else {
+                        continue;
+                    };
+                    mappings.push((
+                        format!("g/{short_id}/{}", name.to_string_lossy()),
+                        b.branch.clone(),
+                    ));
+                }
+                if gv.combined_worktree.is_some() {
+                    mappings.push((
+                        format!("g/{short_id}/review"),
+                        format!("combined review for guardian \"{}\"", gv.name),
+                    ));
+                }
+            }
+            mappings.sort();
+            let readme = crate::short_paths::render_readme(&mappings);
+            let _ = root.write_file(
+                Path::new(".git").join(".ralphus").join("README.md"),
+                &readme,
+            );
+        },
     );
 }
 
@@ -9020,7 +9341,7 @@ pub(crate) fn collect_base_fetch_targets(
     for g in guardians {
         if !matches!(
             g.status.as_str(),
-            "in_review" | "merge_failed" | "merging" | "merge_stopped"
+            "in_review" | "merge_failed" | "merging" | "merge_stopped" | "finalizing"
         ) {
             continue;
         }
@@ -10227,6 +10548,17 @@ fn generate_manual_commands(
                 ),
                 serde_json::json!({"phase": "manual_commands", "skipped": "no_changes"}),
             );
+            {
+                let guard = store.lock();
+                crate::cartographer::Note::new("guardian")
+                    .guardian(id)
+                    .scope("guardian")
+                    .emit(
+                        &guard,
+                        "manual-commands generation skipped",
+                        serde_json::json!({"reason": "no diff stat", "worktree": true}),
+                    );
+            }
             return;
         }
         // RAL-201: was `git(root.root(), ...)`, a direct bypass of `root`'s
@@ -10258,6 +10590,17 @@ fn generate_manual_commands(
                     ),
                     serde_json::json!({"phase": "manual_commands", "skipped": "no_changed_files"}),
                 );
+                {
+                    let guard = store.lock();
+                    crate::cartographer::Note::new("guardian")
+                        .guardian(id)
+                        .scope("guardian")
+                        .emit(
+                            &guard,
+                            "manual-commands generation skipped",
+                            serde_json::json!({"reason": "no changed files", "worktree": false}),
+                        );
+                }
                 return;
             }
         };
@@ -10371,6 +10714,22 @@ fn generate_manual_commands(
         }
     });
 
+    let t0 = std::time::Instant::now();
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                "manual-commands generation starting",
+                serde_json::json!({
+                    "agent": agent,
+                    "model": model,
+                }),
+            );
+    }
+    let hb = start_heartbeat(store, id, "manual-commands generation", 30);
     // RAL-259: the manual-checks generation agent is beginning to run — stamp
     // the guardian-level Live-View start time (plain overwrite, so a
     // regeneration always shows the latest generation's start).
@@ -10394,12 +10753,14 @@ fn generate_manual_commands(
     );
     let started = std::time::Instant::now();
     let result = runner.run_cancellable(&spec, cancel);
+    hb.store(true, Ordering::Relaxed);
     // Generation has actually finished running -- stamp the guardian-level
     // Live-View end time regardless of outcome, mirroring the started-at stamp
     // above (plain overwrite, so a regeneration always shows the latest run's
     // finish).
     let _ = store.lock().stamp_guardian_manual_checks_finished_at(id);
     let _ = record_guardian_call_cost(store, id, None, "manual_commands", &result);
+    let elapsed = t0.elapsed().as_secs_f64();
 
     stop.store(true, Ordering::Relaxed);
     let _ = watcher.join();
@@ -10410,7 +10771,32 @@ fn generate_manual_commands(
             .set_guardian_manual_commands_session_id(id, sid);
     }
 
-    if !result.is_done() || result.summary.trim().is_empty() {
+    let ok = result.is_done() && !result.summary.trim().is_empty();
+    {
+        let level = if ok {
+            crate::logging::LogLevel::INFO
+        } else {
+            crate::logging::LogLevel::WARNING
+        };
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .level(level)
+            .guardian(id)
+            .scope("guardian")
+            .emit(
+                &guard,
+                format!("manual-commands generation completed ({:.1}s)", elapsed),
+                serde_json::json!({
+                    "ok": ok,
+                    "elapsed_s": elapsed,
+                    "agent": agent,
+                    "model": model,
+                    "error": result.error,
+                }),
+            );
+    }
+
+    if !ok {
         // WARNING, not INFO: the merge still reaches `in_review`, but the
         // review lands without the manual checks it was supposed to carry, and
         // nothing else reports that.
@@ -15057,6 +15443,439 @@ mod tests {
             "expected a Cartographer entry for the failed agent auto_build"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-422: merge-pipeline phase instrumentation records (paired rlog! /
+    // Cartographer start+completion) and the SSE event-bus push they feed.
+    // -----------------------------------------------------------------------
+
+    /// The messages of every Cartographer record `guardian_id` has written.
+    fn phase_messages(store: &crate::store_lock::StoreHandle, id: &str) -> Vec<String> {
+        store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                guardian_id: Some(id.to_string()),
+                ..crate::cartographer::CartographerFilter::recent(200)
+            })
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.message.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn run_commit_checks_emits_start_completion_and_skip_records() {
+        let (base, repo, fwt) = make_repo("cc-phase-records");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let (id, branch_id) = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_guardian_checks(&id, &["exit 0".to_string()])
+                .unwrap();
+            (id, branch_id)
+        };
+        let wt = Workspace::local(&fwt);
+        assert!(
+            run_commit_checks(
+                &store,
+                &id,
+                &branch_id,
+                &wt,
+                "feature/a",
+                &CancelToken::never()
+            )
+            .is_ok()
+        );
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter().any(|m| m == "commit checks starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("commit checks completed")),
+            "{msgs:?}"
+        );
+
+        // No checks configured -> early-return skip record.
+        store.lock().set_guardian_checks(&id, &[]).unwrap();
+        assert!(
+            run_commit_checks(
+                &store,
+                &id,
+                &branch_id,
+                &wt,
+                "feature/a",
+                &CancelToken::never()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            phase_messages(&store, &id)
+                .into_iter()
+                .filter(|m| m == "commit checks skipped")
+                .count(),
+            1
+        );
+
+        // Opted out -> the other skip record.
+        store
+            .lock()
+            .set_guardian_checks(&id, &["exit 0".to_string()])
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_skip_auto_build(&id, true)
+            .unwrap();
+        assert!(
+            run_commit_checks(
+                &store,
+                &id,
+                &branch_id,
+                &wt,
+                "feature/a",
+                &CancelToken::never()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            phase_messages(&store, &id)
+                .into_iter()
+                .filter(|m| m == "commit checks skipped")
+                .count(),
+            2
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_commit_checks_failure_emits_a_completion_record() {
+        let (base, repo, fwt) = make_repo("cc-phase-fail");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let (id, branch_id) = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            let branch_id = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_guardian_checks(&id, &["exit 3".to_string()])
+                .unwrap();
+            (id, branch_id)
+        };
+        let result = run_commit_checks(
+            &store,
+            &id,
+            &branch_id,
+            &Workspace::local(&fwt),
+            "feature/a",
+            &CancelToken::never(),
+        );
+        assert!(result.is_err(), "exit 3 must fail the gate: {result:?}");
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("commit checks completed")),
+            "a failed phase must still emit its completion record: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn final_checks_emits_start_completion_and_project_autobuild_records() {
+        let (base, repo, _fwt) = make_repo("finalchecks-phase-records");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[review]\nauto_build = \"exit 0\"\n",
+        )
+        .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap()
+        };
+        let result = final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter().any(|m| m == "final checks starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m.starts_with("final checks completed")),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "final checks: project auto_build starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m == "final checks: project auto_build completed"),
+            "{msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn final_checks_failure_still_emits_the_completion_record() {
+        let (base, repo, _fwt) = make_repo("finalchecks-phase-fail");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_checks(&id, &["exit 3".to_string()])
+                .unwrap();
+            id
+        };
+        let result = final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        );
+        assert!(result.is_err(), "exit 3 must fail the gate: {result:?}");
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter().any(|m| m.starts_with("final checks completed")),
+            "a failed finalize must still emit its completion record: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generate_manual_commands_emits_skip_start_and_completion_records() {
+        let (base, repo, fwt) = make_repo("mc-phase-records");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap()
+        };
+        let base_sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_sha = base_sha.trim().to_string();
+        // Empty diff (worktree-less path, tip == base) -> early skip record.
+        generate_manual_commands(
+            &store,
+            &FixedValueRunner("{\"manual_commands\": [\"echo hi\"]}"),
+            &id,
+            &Workspace::local(&repo),
+            &base_sha,
+            &base_sha,
+            None,
+            &CancelToken::never(),
+        );
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "manual-commands generation skipped"),
+            "an unchanged tree must record the skip: {msgs:?}"
+        );
+
+        // Real run with a worktree and changed files -> start + completion,
+        // including the resolved agent/model.
+        generate_manual_commands(
+            &store,
+            &FixedValueRunner("{\"manual_commands\": [\"echo hi\"]}"),
+            &id,
+            &Workspace::local(&repo),
+            &base_sha,
+            "feature/a",
+            Some(&Workspace::local(&fwt)),
+            &CancelToken::never(),
+        );
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "manual-commands generation starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("manual-commands generation completed")),
+            "{msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generate_manual_commands_failure_emits_an_unresolvable_agent_record() {
+        let (base, repo, _fwt) = make_repo("mc-phase-fail");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_resolver(&id, Some("no-such-agent"), None)
+                .unwrap();
+            id
+        };
+        let base_sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let base_sha = base_sha.trim().to_string();
+        generate_manual_commands(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &base_sha,
+            "feature/a",
+            None,
+            &CancelToken::never(),
+        );
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("unresolvable resolver agent")),
+            "the failure path must leave its own record, not silence: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn regenerate_readme_emits_start_and_completion_records() {
+        let (base, repo, _fwt) = make_repo("readme-phase-records");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap();
+            guard
+                .set_guardian_combined_worktree(&id, &repo.join("wt").to_string_lossy())
+                .unwrap();
+            id
+        };
+        regenerate_readme(&store, &Workspace::local(&repo));
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter().any(|m| m == "regenerate readme starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| m == "regenerate readme completed"),
+            "{msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claim_combined_review_ref_by_id_emits_start_and_completion_records() {
+        let (base, repo, _fwt) = make_repo("claim-phase-records");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap()
+        };
+        let name = claim_combined_review_ref_by_id(&store, &Workspace::local(&repo), &id);
+        assert!(name.is_ok(), "claim must succeed offline: {name:?}");
+        let msgs = phase_messages(&store, &id);
+        assert!(
+            msgs.iter()
+                .any(|m| m == "claim combined review ref starting"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.starts_with("claim combined review ref completed")),
+            "{msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The board's SSE stream is fed straight from the same Cartographer
+    /// writes the phase records make (`Store::cartographer_log` ->
+    /// `EventBus::publish`), so a subscriber that was listening *before* a
+    /// phase ran must see that phase's records arrive without any polling
+    /// window. This is the push-side proof the AC asks for: the daemon does
+    /// not need a 60s board poll to render the phase.
+    #[test]
+    fn phase_records_are_published_to_the_sse_event_bus() {
+        let (base, repo, _fwt) = make_repo("phase-event-bus");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .create_guardian("r", "main", &repo.to_string_lossy())
+                .unwrap()
+        };
+        let (sub_id, rx) = store.lock().event_bus().subscribe();
+        let result = final_checks(
+            &store,
+            &FixedValueRunner("unused"),
+            &id,
+            &Workspace::local(&repo),
+            &repo.to_string_lossy(),
+            &CancelToken::never(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let mut saw_phase_event = false;
+        for _ in 0..64 {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    let msg = ev.row.message.as_str();
+                    if msg.starts_with("final checks")
+                        && ev.row.guardian_id.as_deref() == Some(id.as_str())
+                    {
+                        saw_phase_event = true;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_phase_event,
+            "the phase's own record must arrive on the SSE bus, not just in SQL"
+        );
+        store.lock().event_bus().unsubscribe(sub_id);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

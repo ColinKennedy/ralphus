@@ -11560,7 +11560,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             );
         }
     }
-    if status.as_deref() == Some("merging") {
+    if status.as_deref() == Some("merging") || status.as_deref() == Some("finalizing") {
         let runner = guardian_agent_runner(daemon);
         let restarted = crate::guardian_merge::restart_guardian_merge(
             daemon.store_handle(),
@@ -11905,18 +11905,17 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 
     let mut base_change: Option<ChangeBaseStatus> = None;
-    // `merging`/`in_review`/`merge_failed` are exactly the non-`collecting`
-    // statuses `kickoff_merge` itself will still claim from (see
-    // `claim_guardian_merge`) -- but its per-branch cell-readiness gate
-    // (`guardian_unfinished_linked_branches`) only ever runs while the
-    // guardian is genuinely `collecting`. A details edit on a review sitting
-    // in one of these three statuses must therefore always go through
-    // `restart_guardian_merge`, which resets to `collecting` first so that
-    // gate re-applies -- calling `kickoff_merge` directly here would walk
-    // straight into a branch whose upstream cell never finished (RAL-424:
+    // `merging`/`in_review`/`merge_failed`/`finalizing` are the non-`collecting`
+    // statuses a merge is still active in (see `claim_guardian_merge`) -- but
+    // its per-branch cell-readiness gate (`guardian_unfinished_linked_branches`)
+    // only ever runs while the guardian is genuinely `collecting`. A details
+    // edit on a review sitting in one of these statuses must therefore always
+    // go through `restart_guardian_merge`, which resets to `collecting` first
+    // so that gate re-applies -- calling `kickoff_merge` directly here would
+    // walk straight into a branch whose upstream cell never finished (RAL-424:
     // exactly what happened to a triage-created review edited while
     // `merge_failed`).
-    if matches!(status.as_str(), "merging" | "in_review" | "merge_failed") {
+    if matches!(status.as_str(), "merging" | "in_review" | "merge_failed" | "finalizing") {
         if rebase_relevant {
             let runner = guardian_agent_runner(daemon);
             let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -13047,7 +13046,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return store_error(&e);
     }
     let has_branches = !guardian.branches.is_empty();
-    let was_merging = guardian.status == "merging";
+    let was_merging = guardian.status == "merging" || guardian.status == "finalizing";
     drop(store);
     // RAL-277: synchronous by contract; a 2xx response means the complete
     // multi-branch PR/MR chain has already been retargeted on the forge.

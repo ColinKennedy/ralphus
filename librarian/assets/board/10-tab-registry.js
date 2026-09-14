@@ -796,7 +796,7 @@
         return [...map.values()];
       }
       /** RAL-362 §3: review statuses in most-attention-wanting-first order, for picking which review a multi-review task's badge is tinted by. */
-      const TT_REVIEW_ATTENTION_RANK = ["merge_failed", "merge_stopped", "in_review", "collecting", "merging", "proof_pending", "conflict_resolved", "approved", "deployed", "cancelled"];
+      const TT_REVIEW_ATTENTION_RANK = ["merge_failed", "merge_stopped", "in_review", "collecting", "merging", "finalizing", "proof_pending", "conflict_resolved", "approved", "deployed", "cancelled"];
       /**
        * Picks the single most-attention-wanting review out of a task's own
        * review union, for the row's Review badge.
