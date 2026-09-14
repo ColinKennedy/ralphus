@@ -131,6 +131,7 @@
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
        * @property {TaskView[]} tasks
+       * @property {string[]} [projects] - Every distinct `TaskView.project` among this squad's tasks, precomputed server-side so the sidebar's project filter needs no per-task data.
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every cell/proof subprocess this squad spawns from now on, until unset. Empty/absent for the vast majority of squads.
        * @property {GenerationUsage} [generation_cost] - RAL-420: this squad's own pre-work generation cost — the retained usage of the agent/model calls the Simple form made before submission (Generate proof steps / manual checks / auto-build steps, plus the suggest-name fallback), attributed to this squad at submit time and folded into its normal totals exactly once. Absent for the vast majority of squads (only Simple-tab submissions that used the Generate buttons or the suggest-name fallback have rows).

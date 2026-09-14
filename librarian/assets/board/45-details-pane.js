@@ -1328,16 +1328,20 @@
       /**
        * Toggles the header's "running work" dropdown, listing every in-flight cell/proof/review.
        * @param {MouseEvent} e
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function toggleRunning(e) {
+      async function toggleRunning(e) {
         e.stopPropagation();
         const m = byId("running-menu");
         if (!m.classList.contains("hidden")) { m.classList.add("hidden"); return; }
+        // The "Running X / Y" counter itself comes from the daemon's
+        // semaphore and is always live; only this dropdown's contents need
+        // per-cell state, so they are fetched when it opens.
+        await loadTaskIndex();
         /** @type {string[]} */
         const rows = [];
         // Running cells
-        for (const r of squads) {
+        for (const r of taskIndex) {
           for (let ti = 0; ti < r.tasks.length; ti++) {
             const t = r.tasks[ti];
             for (let si = 0; si < t.cells.length; si++) {
