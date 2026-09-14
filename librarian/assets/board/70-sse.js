@@ -182,6 +182,10 @@
         // `updateCounter` joins them for the same reason: every tab's branch
         // awaited it before starting its own fetch, for no dependency.
         await Promise.all([pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(), updateCounter()]);
+        // RAL-345: the Tasks/Squads project-filter dropdowns bind to the live
+        // registered-project list (`registeredProjectNames`), refreshed on every
+        // poll of those tabs so a newly registered project shows up without a reload.
+        if (tab === "squads" || tab === "tasks") await refreshRegisteredProjectNames();
         if (tab === "reviews") { await pollReviews(); }
         else if (tab === "resources") { await pollResources(); }
         else if (tab === "queue") { if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
@@ -193,8 +197,8 @@
         else if (tab === "secrets") { await pollSecretEnvNames(); }
         else if (tab === "worktree-retirement") { await pollWorktreeRetirements(); }
         else if (tab === "prefs") { await pollPrefs(); }
-        else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
-        else { await ensureProjectsLoadedForFilters(); await pollTasks(); }
+        else if (tab === "tasks") { await pollTasksTab(); }
+        else { await pollTasks(); }
         await refreshBanner();
       }
 
@@ -236,6 +240,10 @@
           return;
         }
         await updateCounter();
+        // RAL-345: same live registered-project refresh as `tick()`, so an
+        // SSE-driven poll of the Tasks/Squads tabs (no full tick involved)
+        // also keeps the project-filter dropdowns current.
+        if (tab === "squads" || tab === "tasks") await refreshRegisteredProjectNames();
         if (tab === "reviews" && kinds.has("guardian")) {
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
