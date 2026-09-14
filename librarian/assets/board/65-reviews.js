@@ -1876,14 +1876,25 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        *
        * Feedback first, reload second. The daemon answers this in
        * milliseconds (a DB state transition plus a thread spawn -- see
-       * `guardian_merge::kickoff_merge`), but the `tick()` behind it reloads
-       * the whole board, and the rebase it starts then runs for minutes. So
-       * the button goes pending and the acknowledgement toast goes up before
-       * the request is even sent: neither waits on the round-trip, and
-       * nothing here claims the rebase has finished. The pending state is
-       * held through the reload too, so the button can't be pressed again in
-       * the gap between the daemon's write landing and the board picking up
-       * the new status.
+       * `guardian_merge::kickoff_merge`) and the transition lands
+       * *synchronously before the response is sent*: `202 {"status":"merging"}`
+       * when a fresh rebase was claimed, `202 {"status":"deferred"}` when it
+       * was deferred until every enabled branch is ready, `200
+       * {"status":"approved"}` when the review's work was already merged
+       * (RAL-300), or `409` when a rebase is already in progress. So the
+       * button goes pending and the acknowledgement toast goes up before the
+       * request is even sent -- neither waits on the round-trip, and nothing
+       * here claims the rebase has finished.
+       *
+       * The pending state clears the moment the daemon's response arrives,
+       * not when the follow-up reload lands (RAL-423): the response's own
+       * status is patched into the local guardian copy first, so the button
+       * immediately shows the real post-kickoff state ("Merge / rebase" with
+       * the "a rebase is already in progress" tip, disabled) instead of the
+       * stale pre-kickoff status for the whole reload window. The reload
+       * (`tick()`) is fired and forgotten for the same reason; the daemon's
+       * atomic claim is the real double-submission backstop regardless (a
+       * repeat kickoff for a claimed review 409s `already_in_progress`).
        * @param {string} id
        * @param {string} status
        * @returns {Promise<void>}
@@ -1909,23 +1920,26 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         showInfoToast(mergeRequestedToast(status));
         try {
           const path = status === "merging" ? "cancel_and_merge" : "merge";
-          // A non-2xx already surfaced the red error toast inside
-          // `guardianAction`; the reload and the pending-state clear below
-          // still run, so the button comes back rather than staying stuck.
           const resp = await guardianAction(`/api/guardians/${id}/${path}`);
-          // `kickoff_merge` claims the review before it answers, so once this
-          // resolves the daemon is already in `merging` -- reflect that locally
-          // straight away. What the pending state must not do is outlive the
-          // daemon's answer: `tick()` reloads the whole board and ends in
-          // `pollReviews`, which waits on every open PR's drift check, so
-          // holding the button pending across it leaves it reading "Starting…"
-          // for tens of seconds after the rebase has already begun.
+          // The daemon's transition preceded this response, so the response
+          // body is authoritative for what the button should show next.
+          // Patch the local copy so the pane re-renders the real
+          // post-kickoff state immediately; if the reload below is slow the
+          // button still can't be double-pressed. 202 "deferred" is left
+          // alone -- no transition happened, so the guard stays startable.
           //
-          // The button stays correctly disabled without the pending flag,
-          // because `merging` is not in `MERGE_STARTABLE`.
-          if (resp && resp.ok) {
+          // What the pending state must not do is outlive the daemon's
+          // answer: `tick()` reloads the whole board and ends in
+          // `pollReviews`, which waits on every open PR's drift check, so
+          // holding the button pending across the reload leaves it reading
+          // "Starting…" for tens of seconds after the rebase has already
+          // begun. The button stays correctly disabled without the pending
+          // flag, because `merging` is not in `MERGE_STARTABLE`.
+          const body = resp ? await resp.json().catch(() => null) : null;
+          if (body && typeof body === "object") {
             const g = (guardians || []).find((x) => x.id === id);
-            if (g) g.status = "merging";
+            if (g && body.status === "merging") g.status = "merging";
+            else if (g && body.status === "approved") g.status = "approved";
           }
         } finally {
           pendingMergeActions.delete(id);

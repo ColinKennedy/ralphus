@@ -2347,7 +2347,6 @@ directions:
    poller's forge round-trips. (Before this split, it did: `sync-status` took
    an order of magnitude longer than its own work, and because each blocked
    request holds a read-pool worker, unrelated reads starved behind it.)
-
 Forge comment fetches are conditional (`If-None-Match`/`ETag`), so an
 unchanged PR costs no forge quota on repeat polls, and a `429`/`403`
 response backs the affected forge client off for a cooldown window
@@ -2462,7 +2461,11 @@ automatically). Both can be `false` and `in_sync` `true` when they match
 exactly. `502` if the guardian/PR can't be resolved. Write-through (RAL-366):
 a successful call also refreshes this PR's drift fields in
 `GET .../forge-cache-index`, the same "refresh now" write-through
-`GET .../comments` does for its half.
+`GET .../comments` does for its half. The call never waits longer than
+one `git fetch` of this PR's own branch behind the background poller
+(RAL-423): the poller holds this PR's drift-check lock only while the
+poller itself fetches that same branch, and releases it before any of its
+forge comment round-trips.
 
 ### `POST /api/pull-requests/{pr_id}/refresh-ci`
 Live-polls the forge for this one PR's current CI/mergeability status

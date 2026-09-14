@@ -853,18 +853,24 @@
        * value in place until the next poll. Skips (rather than piling up a
        * second concurrent request) a PR whose previous fetch hasn't resolved
        * yet -- the daemon's per-PR `git fetch` can take several seconds, well
-       * past this poll's own interval.
+       * past this poll's own interval. RAL-423: each request takes a
+       * per-PR monotonic ticket on departure, and a response whose ticket no
+       * longer matches abandons itself, so an earlier poll's slow response
+       * can never overwrite a newer one.
        * @param {string} prId
        * @returns {Promise<void>}
        */
       async function fetchPrSyncStatus(prId) {
         if (prSyncStatusInFlight.has(prId)) return;
         prSyncStatusInFlight.add(prId);
+        const ticket = (prSyncStatusTickets[prId] || 0) + 1;
+        prSyncStatusTickets[prId] = ticket;
         try {
           const res = await fetch(`/api/pull-requests/${prId}/sync-status`);
           if (!res.ok) return;
           /** @type {PrSyncStatus} */
           const data = await res.json();
+          if (ticket !== prSyncStatusTickets[prId]) return; // superseded -- a newer poll owns this PR's cache slot
           prSyncStatus[prId] = data;
         } catch (e) { /* transient -- the next poll retries */ }
         finally { prSyncStatusInFlight.delete(prId); }
@@ -874,12 +880,18 @@
        * badge/link (which only needs pr_url/pr_number/ci_status, all present
        * on this response) can render immediately. Also kicks off a live
        * drift check (RAL-190) for each still-open one that has a recorded
-       * forge number, but does NOT wait on it -- `fetchPrSyncStatus` does its
-       * own `git fetch` per PR, serialized per repo on the daemon side, which
+       * forge number, but does NOT wait on it. Only polled for the open
+       * review, mirroring `pollBranchConflicts`.
+       *
+       * RAL-423: the drift checks are fired and forgotten rather than
+       * awaited. `GET /api/pull-requests/{id}/sync-status` performs a real
+       * `git fetch` per PR, serialized per repo on the daemon side, which
        * can take many seconds per PR and has nothing to do with whether the
-       * badge itself is ready to show. It writes into `prSyncStatus`
-       * independently and the next poll tick picks it up whenever it lands.
-       * Only polled for the open review, mirroring `pollBranchConflicts`.
+       * badge itself is ready to show -- the caller rendered from the
+       * `prSyncStatus` cache before this even returned, and each response
+       * lands in that cache as it arrives. `fetchPrSyncStatus`'s per-PR
+       * ticket keeps an early poll's slow response from overwriting a later
+       * one.
        * @param {string} gid
        * @returns {Promise<void>}
        */
