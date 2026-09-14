@@ -1442,6 +1442,19 @@ impl Store {
     /// EXISTS` a non-done contributor (rather than the old `EXISTS` a done
     /// one) means the branch is only marked `ready` once every one of them —
     /// explicit or implicit — has finished, not just the first.
+    ///
+    /// RAL-314: both subqueries scope their cell match to rows recorded
+    /// against THIS guardian (`cells.review_guardian_id`), falling back to
+    /// the bare branch-string join only for rows with no guardian recorded
+    /// (a pre-RAL-314 row or one attached via the manual
+    /// `POST /api/guardians/{id}/branches` path). Without that scope a
+    /// resubmission that reuses the same branch name — a squad retried under
+    /// a new squad id reuses the same `review_branch`, exactly as
+    /// [`Self::guardian_unfinished_linked_branches`] documents — leaves the
+    /// superseded attempt's non-`done` (e.g. `cancelled`) cell rows matching
+    /// the plain string join, so the `NOT EXISTS` below sees a non-done
+    /// contributor forever and the branch is stuck `pending` even though the
+    /// current attempt's own cells are all `done`.
     pub fn mark_ready_branches_with_done_cells(&self, guardian_id: &str) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE guardian_branches
@@ -1450,10 +1463,13 @@ impl Store {
                AND EXISTS (
                    SELECT 1 FROM cells s
                    WHERE s.review_branch = guardian_branches.branch
+                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
                )
                AND NOT EXISTS (
                    SELECT 1 FROM cells s
-                   WHERE s.review_branch = guardian_branches.branch AND s.state != 'done'
+                   WHERE s.review_branch = guardian_branches.branch
+                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
+                     AND s.state != 'done'
                )",
             params![guardian_id],
         )?;
@@ -7319,6 +7335,87 @@ mod tests {
         assert_eq!(
             store.guardian_unfinished_linked_branches(&id).unwrap(),
             vec!["feat".to_string()]
+        );
+    }
+
+    #[test]
+    fn mark_ready_branches_ignores_stale_cancelled_cells_from_other_guardians() {
+        // RAL-345-style resubmission: a cancelled earlier attempt reuses the
+        // same branch string, leaving `cancelled` cell rows (recorded against
+        // a *different*, superseded guardian) sharing `review_branch` with the
+        // current attempt's `done` rows. `mark_ready_branches_with_done_cells`
+        // must scope its contributor check to THIS guardian's cells
+        // (RAL-314 `review_guardian_id`) instead of letting the other
+        // guardian's stale non-`done` rows keep the branch `pending` forever.
+        let mut store = Store::open_in_memory().unwrap();
+
+        // Superseded attempt (a cancelled guardian, like RAL-345's first
+        // squad-000000000150 run): cancelled cell recorded against it.
+        let cancelled_guardian = store.create_guardian("old", "main", "/repo").unwrap();
+        store
+            .add_guardian_branch(&cancelled_guardian, "feat")
+            .unwrap();
+        let cancelled_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Cancelled);
+        store
+            .set_cell_review_guardian(&cancelled_squad, 0, 0, &cancelled_guardian)
+            .unwrap();
+
+        // Current attempt: done cell recorded against *this* guardian.
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let done_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        store
+            .set_cell_review_guardian(&done_squad, 0, 0, &id)
+            .unwrap();
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            1,
+            "the current attempt's cell is done and the stale cancelled row \
+             belongs to a different guardian -- the branch must be promoted"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn mark_ready_branches_stays_pending_for_a_same_guardian_unfinished_cell() {
+        // Guards the fix above from over-correcting: a non-`done` cell that
+        // really is recorded against THIS guardian (an implicit worktree
+        // sibling, RAL-159) must still hold the branch at `pending`.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let done_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        store
+            .set_cell_review_guardian(&done_squad, 0, 0, &id)
+            .unwrap();
+        let pending_squad = insert_cell_for_branch(&mut store, "feat", NodeState::Pending);
+        store
+            .set_cell_review_guardian(&pending_squad, 0, 0, &id)
+            .unwrap();
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            0,
+            "one of THIS guardian's cells is still pending -- must not promote"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "pending"
+        );
+
+        // Finish the sibling: now it promotes.
+        store
+            .set_cell_state(&pending_squad, 0, 0, NodeState::Done)
+            .unwrap();
+        assert_eq!(store.mark_ready_branches_with_done_cells(&id).unwrap(), 1);
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "ready"
         );
     }
 

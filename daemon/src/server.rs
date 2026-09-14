@@ -4457,30 +4457,14 @@ fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     }
     let id = daemon.generation_jobs.start();
     let jobs = daemon.generation_jobs.clone();
-    let store = daemon.store_handle();
     let job_id = id.clone();
-    let kind = req.kind.clone();
-    let agent = req.agent.clone();
-    let model = req.model.clone();
     let cancellations = daemon.cancellations_handle();
     let cancel_id = id.clone();
     std::thread::spawn(move || {
         let token = cancellations.register(&cancel_id);
-        let started_at_ms = crate::store::now_ms();
-        let (job, usage_result) = crate::generation::run_generation(&req, &token);
+        let (job, _) = crate::generation::run_generation(&req, &token);
         cancellations.remove(&cancel_id);
         jobs.finish(&job_id, job.clone());
-        record_generation_call_cost(
-            &store,
-            None,
-            &job_id,
-            &kind,
-            generation_call_status(&job, &token),
-            &usage_result,
-            &agent,
-            model.as_deref(),
-            started_at_ms,
-        );
     });
     json(202, &GenerateStartResponse { id })
 }
@@ -5906,20 +5890,8 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             model: req.model,
             prompt_context: req.prompt_context,
         };
-        let started_at_ms = crate::store::now_ms();
-        let (result, usage_result) = crate::generation::run_generation(&gen_req, &token);
+        let (result, _) = crate::generation::run_generation(&gen_req, &token);
         cancellations.remove(&cancel_id);
-        record_generation_call_cost(
-            &store,
-            Some(&squad_id),
-            &cancel_id,
-            "task_name",
-            generation_call_status(&result, &token),
-            &usage_result,
-            &gen_req.agent,
-            gen_req.model.as_deref(),
-            started_at_ms,
-        );
         let (name, label) = match result {
             crate::generation::GenerationJob::Done { items } if !items.is_empty() => {
                 let item = &items[0];
