@@ -8313,6 +8313,44 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// A cell's primary intent text for the RAL-412 semantic-ordering
+    /// request: its `prompt` when it has one, otherwise its `command` — the
+    /// same prompt-or-command fallback `submit` uses when it queues a cell
+    /// for Triage classification (`crate::arbiter::PendingClassification`).
+    /// `None` when the cell has neither (or when the stored text is blank) —
+    /// the candidate then participates in the ordering by id only, with an
+    /// empty context excerpt.
+    ///
+    /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
+    /// not exist; `crate::reviews::build_review_from_drained_pool` treats
+    /// that as "no context" rather than aborting the review.
+    pub fn get_cell_prompt_context(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT prompt, command FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, cell_idx],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(prompt, command)| {
+                let text = prompt
+                    .clone()
+                    .unwrap_or_else(|| command.clone().unwrap_or_default());
+                (!text.trim().is_empty()).then_some(text)
+            })
+            .ok_or(StoreError::NotFound)
+    }
+
     /// A cell's currently stored `agent` program (RAL-341). Used by
     /// `edit_squad`'s `"cell"` arm to resolve the *effective* agent a
     /// `system_prompt` edit would run under when the caller isn't also

@@ -3033,6 +3033,13 @@ fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
             &project,
             &req.triage_type,
             t,
+            |cands| {
+                crate::arbiter::order_pooled_candidates(
+                    &store,
+                    &crate::arbiter::Arbiter::current(),
+                    cands,
+                )
+            },
         ) {
             Ok(gids) => (gids.len() as i64, gids.len() as i64 * t),
             Err(e) => {

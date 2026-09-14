@@ -26,6 +26,18 @@
 //! inference simply leaves the cell [`crate::triage::SubprojectResolution::
 //! Unresolved`] -- see that type's doc comment for the full three-state
 //! model.
+//!
+//! RAL-412 adds a third, independent Arbiter responsibility:
+//! [`order_pooled_candidates`] proposes a semantic order for the cells a
+//! drained `(project, triage_type)` pool will build one automatic review
+//! from. `crate::reviews::build_review_from_drained_pool` calls it exactly
+//! once per review (the shared tail of the threshold-drain and cron-drain
+//! paths), with one bounded, labeled aggregate request covering every
+//! candidate. The reply is accepted only when it is an exact permutation of
+//! the pool's stable candidate ids; any failure -- budget cap, transport
+//! error, malformed/incomplete/duplicate/unknown ids -- leaves the caller's
+//! deterministic pool order untouched. It shares the same
+//! `[arbiter] maximum_budget_usd` cap as `classify` and `infer_subprojects`.
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -521,7 +533,13 @@ pub fn spawn_triage_followup(
             resolve_pending_subprojects(&store_handle, &arbiter, &squad_id, p);
         }
         let guard = store_handle.lock();
-        if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file) {
+        if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file, |cands| {
+            crate::arbiter::order_pooled_candidates(
+                &guard,
+                &crate::arbiter::Arbiter::current(),
+                cands,
+            )
+        }) {
             crate::rlog!(
                 WARNING,
                 "ralphus [arbiter] background triage pooling for squad {squad_id} failed: {}",
@@ -645,6 +663,273 @@ pub fn health_check(store: &Store, arbiter: &Arbiter) -> Result<String, String> 
         serde_json::json!({ "agent": arbiter.agent, "model": arbiter.model }),
     );
     Ok(reply.trim().to_string())
+}
+
+// ── RAL-412: semantic ordering of a drained pool ─────────────────────────────
+
+/// Max characters of one candidate's prompt/command *excerpt* carried into a
+/// pool-ordering request ([`build_ordering_user_message`]). A cell's prompt
+/// states its intent up front, so truncation prefers that concise leading
+/// summary text over the tail (see [`ordering_excerpt`]), which is also what
+/// makes the truncation useful: the first lines carry the signal.
+pub const ORDERING_EXCERPT_CHARS: usize = 600;
+
+/// Hard cap on the combined candidate content of one pool-ordering request
+/// (RAL-412: "the combined arbiter input is capped to a reasonable
+/// configured or documented limit"). Deliberately a documented fixed
+/// constant rather than schema/config: per-candidate budget is
+/// `TOTAL / n` bounded by [`ORDERING_EXCERPT_CHARS`], so the aggregate
+/// content stays under this cap for every pool up to
+/// `TOTAL / ORDERING_EXCERPT_FLOOR_CHARS` candidates. Beyond that (a
+/// pathological pool), the per-candidate floor below wins and the aggregate
+/// grows at `FLOOR * n` -- every candidate still contributes context, at
+/// the cost of the headroom cap.
+pub const ORDERING_TOTAL_CONTENT_CHARS: usize = 12_000;
+
+/// Per-candidate excerpt floor once a pool is large enough that
+/// `TOTAL / n` would shrink below it: every candidate — even in a huge
+/// straggler sweep — still contributes at least this much prompt context to
+/// the ordering request.
+pub const ORDERING_EXCERPT_FLOOR_CHARS: usize = 64;
+
+/// One drained pool candidate's labeled context for the RAL-412 ordering
+/// request. The Arbiter is never shown raw pool/row identity (squad ids and
+/// branch names are review bookkeeping, not intent) — it sees only the
+/// stable [`ordering_candidate_id`] plus a bounded excerpt of the cell's
+/// prompt/command context, which is exactly the signal a reviewer needs to
+/// group related work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderingCandidate {
+    /// The stable candidate identifier the Arbiter is asked to echo back
+    /// (see [`ordering_candidate_id`]).
+    pub id: String,
+    /// The cell's own `sid`, for Cartographer notes.
+    pub cell_id: String,
+    /// The cell's prompt/command text; may be empty when the row is
+    /// unreadable, in which case the candidate participates in the ordering
+    /// by id only.
+    pub context: String,
+}
+
+/// The stable, human-addressable candidate id an ordering reply must name —
+/// `squad_id/t{task_idx}:c{idx}`. Unambiguous across the whole pool (unlike
+/// a cell's `sid`, which can repeat between squads) and printable, so the
+/// Arbiter can echo it verbatim and the reply can be validated as an exact
+/// permutation of the drained pool.
+#[must_use]
+pub fn ordering_candidate_id(squad_id: &str, task_idx: i64, idx: i64) -> String {
+    format!("{squad_id}/t{task_idx}:c{idx}")
+}
+
+/// The per-candidate prompt-excerpt budget for an ordering request covering
+/// `candidate_count` candidates: equal shares of
+/// [`ORDERING_TOTAL_CONTENT_CHARS`], clamped into
+/// `[ORDERING_EXCERPT_FLOOR_CHARS, ORDERING_EXCERPT_CHARS]`.
+#[must_use]
+pub fn ordering_content_budget(candidate_count: usize) -> usize {
+    if candidate_count == 0 {
+        return 0;
+    }
+    (ORDERING_TOTAL_CONTENT_CHARS / candidate_count)
+        .clamp(ORDERING_EXCERPT_FLOOR_CHARS, ORDERING_EXCERPT_CHARS)
+}
+
+/// The bounded leading excerpt of one candidate's context — the first
+/// `budget` characters (prompts summarize their intent up front), with a
+/// trailing ellipsis when truncated, and surrounding whitespace trimmed.
+#[must_use]
+pub fn ordering_excerpt(context: &str, budget: usize) -> String {
+    let trimmed = context.trim();
+    if trimmed.chars().count() <= budget {
+        return trimmed.to_string();
+    }
+    let mut excerpt: String = trimmed.chars().take(budget).collect::<String>();
+    excerpt.push_str(" …[truncated]");
+    excerpt
+}
+
+/// The RAL-412 ordering system prompt: static across requests, only the
+/// labeled candidate list varies.
+fn ordering_system_prompt() -> String {
+    "You are the Arbiter, sequencing a set of candidate units of work into one \
+     review's order. Order the candidates so that closely related work sits \
+     adjacent: changes to the same area, feature, subsystem, or theme cluster \
+     together. The order becomes the review's branch stack, so prefer a \
+     coherent story over a strict priority sort."
+        .to_string()
+}
+
+/// Build the Arbiter's user message for one pool-ordering request: every
+/// candidate's bounded, labeled excerpt in one aggregate message (RAL-412:
+/// one request for the whole pool, never one query per candidate or
+/// pairwise comparisons). Pairing each labeled excerpt with a strict
+/// reply-format instruction keeps the response parseable as a permutation.
+#[must_use]
+pub fn build_ordering_user_message(candidates: &[OrderingCandidate]) -> String {
+    let budget = ordering_content_budget(candidates.len());
+    let list = candidates
+        .iter()
+        .map(|c| format!("- {}: {}", c.id, ordering_excerpt(&c.context, budget)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "These are the pooled candidate units of work for one automatic review, each \
+         labeled with its stable <id>. Examine each candidate's prompt/command context \
+         and propose ONE review order that places closely related work together.\n\n\
+         {list}\n\nReply with ONLY a comma-separated list of the <id>s in your proposed \
+         order, every id exactly once, and nothing else -- no explanations, no \
+         numbering, no surrounding quotes or punctuation beyond the commas."
+    )
+}
+
+/// Parse the Arbiter's proposed ordering reply against the pool's stable
+/// candidate ids. The reply is accepted only when it names **every**
+/// expected id **exactly once**, in reply order — a strict permutation of
+/// the drained pool — the contract `crate::reviews` relies on to reorder
+/// review branches without omitting or duplicating a candidate (RAL-412:
+/// "accept the response only if it is an exact permutation of the drained
+/// pool"). Empty pieces are skipped (trailing commas, blank lines); every
+/// non-empty piece must be a not-yet-placed expected id — an unknown id,
+/// a duplicate, or any stray prose rejects the whole reply. `None` means
+/// "not a valid permutation" and the caller falls back to the deterministic
+/// pool order.
+#[must_use]
+pub fn parse_ordering_reply(reply: &str, expected_ids: &[&str]) -> Option<Vec<String>> {
+    let mut remaining: std::collections::HashSet<String> =
+        expected_ids.iter().map(|id| id.to_string()).collect();
+    let mut ordered: Vec<String> = Vec::with_capacity(expected_ids.len());
+    // Tolerate newlines/semicolons as separators alongside commas, and
+    // surrounding quotes/brackets/punctuation, without relaxing the
+    // exact-permutation check.
+    let normalized = reply.replace("\n", ",").replace(";", ",");
+    for piece in normalized.split(',') {
+        let picked = piece.trim().trim_matches(|c: char| {
+            c == '"'
+                || c == '\''
+                || c == '.'
+                || c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+                || c.is_whitespace()
+        });
+        if picked.is_empty() {
+            continue;
+        }
+        let found: Option<String> = remaining.iter().find(|id| id.as_str() == picked).cloned();
+        let id = found?;
+        remaining.remove(&id);
+        ordered.push(id);
+    }
+    remaining.is_empty().then_some(ordered)
+}
+
+/// Ask the configured Arbiter to propose a semantic review order for a
+/// drained Triage pool (RAL-412): one bounded aggregate request carrying
+/// every candidate's labeled prompt excerpt, answered with a proposed
+/// order over the pool's stable candidate ids.
+///
+/// Returns `None` — meaning "keep the caller's deterministic pool order" —
+/// on every failure path, exactly like `classify`'s `UNCLASSIFIED_TYPE`
+/// fallback: a one/zero-candidate pool (trivially correct order, no call),
+/// the `[arbiter] maximum_budget_usd` cap already being reached, an
+/// unsupported backend or transport/provida error, or a reply that is not
+/// an exact permutation of the pool (malformed, incomplete, duplicated, or
+/// unknown ids). Every outcome is logged as a Cartographer `Note` (see
+/// `crate::cartographer`).
+///
+/// The live call runs while the caller's store lock is held — the shared
+/// tail of the drain paths (`crate::reviews::build_review_from_drained_pool`)
+/// is always invoked from a context that already holds the daemon's single
+/// `Store` mutex across the whole set-and-drain-create sequence, and the
+/// request itself is a single bounded round-trip, on the same footing as
+/// `health_check`'s user-triggered lock-held call (unlike the hot per-cell
+/// `classify` path, which deliberately drops the lock around its call).
+#[must_use]
+pub fn order_pooled_candidates(
+    store: &Store,
+    arbiter: &Arbiter,
+    candidates: &[OrderingCandidate],
+) -> Option<Vec<String>> {
+    let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    // A one-candidate pool has exactly one valid order; don't spend an
+    // Arbiter round-trip (or a cent of its budget) on it.
+    if candidates.len() <= 1 {
+        return Some(ids);
+    }
+    if over_budget(store, arbiter) {
+        crate::cartographer::Note::new("arbiter").emit(
+            store,
+            "Arbiter pool ordering skipped: maximum_budget_usd cap already reached; \
+             review uses the deterministic pool order",
+            serde_json::json!({ "candidates": ids, "reason": "over_budget" }),
+        );
+        return None;
+    }
+    let system = ordering_system_prompt();
+    let user = build_ordering_user_message(candidates);
+    let messages = [ChatMessage {
+        role: "user",
+        content: user,
+        image: None,
+    }];
+    let (reply, usage) = match chat_client::call_direct_with_usage(
+        &arbiter.agent,
+        arbiter.model.as_deref(),
+        &system,
+        &messages,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::cartographer::Note::new("arbiter").emit(
+                store,
+                format!(
+                    "Arbiter pool ordering call failed: {e}; review uses the deterministic pool order"
+                ),
+                serde_json::json!({
+                    "candidates": ids,
+                    "reason": format!("call_failed: {e}"),
+                }),
+            );
+            return None;
+        }
+    };
+    let cost = estimate_cost_usd(
+        &arbiter.agent,
+        arbiter.model.as_deref().unwrap_or_default(),
+        usage,
+    );
+    let _ = store.record_arbiter_cost(
+        "pool_ordering",
+        usage.tokens_in as i64,
+        usage.tokens_out as i64,
+        cost,
+    );
+    let expected: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+    let Some(ordered) = parse_ordering_reply(&reply, &expected) else {
+        crate::cartographer::Note::new("arbiter").emit(
+            store,
+            format!(
+                "Arbiter pool ordering reply {reply:?} is not an exact permutation of the \
+                 drained pool; review uses the deterministic pool order"
+            ),
+            serde_json::json!({
+                "candidates": ids,
+                "reason": "invalid_permutation",
+                "reply": reply,
+            }),
+        );
+        return None;
+    };
+    crate::cartographer::Note::new("arbiter").emit(
+        store,
+        format!(
+            "Arbiter proposed semantic review order [{}]",
+            ordered.join(", ")
+        ),
+        serde_json::json!({ "candidates": ids, "order": ordered }),
+    );
+    Some(ordered)
 }
 
 // ── Store-side cost ledger ───────────────────────────────────────────────────
@@ -993,6 +1278,193 @@ mod tests {
                 &["core".to_string()]
             )
             .is_none()
+        );
+    }
+
+    // ── RAL-412: semantic ordering of a drained pool ────────────────────────
+
+    fn candidate(id: &str, context: &str) -> OrderingCandidate {
+        OrderingCandidate {
+            id: id.to_string(),
+            cell_id: format!("cell-of-{id}"),
+            context: context.to_string(),
+        }
+    }
+
+    #[test]
+    fn ordering_content_budget_scales_with_pool_size_and_stays_capped() {
+        assert_eq!(ordering_content_budget(0), 0);
+        // Small pools get each candidate's full excerpt.
+        assert_eq!(ordering_content_budget(3), ORDERING_EXCERPT_CHARS);
+        // A mid-size pool shares the aggregate cap evenly.
+        let mid = ordering_content_budget(40);
+        assert!(mid < ORDERING_EXCERPT_CHARS);
+        assert_eq!(mid, ORDERING_TOTAL_CONTENT_CHARS / 40);
+        // A pathological pool still leaves every candidate a floor.
+        assert_eq!(ordering_content_budget(250), ORDERING_EXCERPT_FLOOR_CHARS);
+        // The aggregate stays within the documented cap while the floor doesn't
+        // preempt it.
+        for n in 1..=(ORDERING_TOTAL_CONTENT_CHARS / ORDERING_EXCERPT_FLOOR_CHARS) {
+            assert!(
+                ordering_content_budget(n) * n <= ORDERING_TOTAL_CONTENT_CHARS,
+                "budget({n}) * {n} exceeds the aggregate cap"
+            );
+        }
+    }
+
+    #[test]
+    fn ordering_excerpt_truncates_to_leading_chars_with_an_ellipsis() {
+        let short = "fix the core module";
+        assert_eq!(ordering_excerpt(short, 600), short);
+        assert_eq!(ordering_excerpt("  \n{}", 5), "{}", "whitespace trimmed");
+        let long = "a".repeat(1_000);
+        let excerpt = ordering_excerpt(&long, 600);
+        assert_eq!(
+            excerpt.chars().count(),
+            600 + " …[truncated]".chars().count()
+        );
+        assert!(
+            excerpt.starts_with("aaaa"),
+            "keeps the leading summary text"
+        );
+        assert!(excerpt.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn build_ordering_user_message_labels_every_candidate_with_a_bounded_excerpt() {
+        let cands = vec![
+            candidate("squad-1/t0:c0", &"x".repeat(9_999)),
+            candidate("squad-1/t1:c2", "short prompt"),
+        ];
+        let msg = build_ordering_user_message(&cands);
+        assert!(
+            msg.contains("squad-1/t0:c0"),
+            "labels the truncated candidate"
+        );
+        assert!(msg.contains("squad-1/t1:c2"));
+        assert!(msg.contains("short prompt"));
+        assert!(msg.contains("…[truncated]"));
+        assert!(
+            msg.contains("exactly once"),
+            "instructs a strict permutation"
+        );
+    }
+
+    #[test]
+    fn parse_ordering_reply_accepts_an_exact_permutation() {
+        let ids = ["squad-1/t0:c0", "squad-1/t1:c2", "squad-2/t0:c0"];
+        // Comma-separated, in a genuinely different order.
+        assert_eq!(
+            parse_ordering_reply("squad-2/t0:c0, squad-1/t0:c0, squad-1/t1:c2", &ids),
+            Some(vec![
+                "squad-2/t0:c0".to_string(),
+                "squad-1/t0:c0".to_string(),
+                "squad-1/t1:c2".to_string(),
+            ])
+        );
+        // Tolerates newlines, quotes, and trailing punctuation between items.
+        assert_eq!(
+            parse_ordering_reply("\"squad-1/t1:c2\"\nsquad-1/t0:c0; squad-2/t0:c0.", &ids),
+            Some(vec![
+                "squad-1/t1:c2".to_string(),
+                "squad-1/t0:c0".to_string(),
+                "squad-2/t0:c0".to_string(),
+            ])
+        );
+        // The pool's own order is a valid permutation too.
+        assert!(parse_ordering_reply(&ids.join(", "), &ids).is_some());
+    }
+
+    #[test]
+    fn parse_ordering_reply_rejects_missing_duplicate_unknown_and_malformed() {
+        let ids = ["squad-1/t0:c0", "squad-1/t1:c2", "squad-2/t0:c0"];
+        // Incomplete: one id never named.
+        assert!(parse_ordering_reply("squad-1/t0:c0, squad-1/t1:c2", &ids).is_none());
+        // Duplicate: one id placed twice, another never.
+        assert!(
+            parse_ordering_reply(
+                "squad-1/t0:c0, squad-1/t0:c0, squad-1/t1:c2, squad-2/t0:c0",
+                &ids
+            )
+            .is_none()
+        );
+        // Unknown id mixed in, even once.
+        assert!(
+            parse_ordering_reply(
+                "squad-1/t0:c0, made-up-id, squad-1/t1:c2, squad-2/t0:c0",
+                &ids
+            )
+            .is_none()
+        );
+        // Stray prose is not an exact permutation either.
+        assert!(
+            parse_ordering_reply(
+                "Here is my order: squad-1/t0:c0, squad-1/t1:c2, squad-2/t0:c0",
+                &ids
+            )
+            .is_none()
+        );
+        // Empty / whitespace-only reply.
+        assert!(parse_ordering_reply("", &ids).is_none());
+        assert!(parse_ordering_reply("\n  \n", &ids).is_none());
+        // Case matters: a respelled id is an unknown id.
+        assert!(
+            parse_ordering_reply("Squad-1/T0:C0, squad-1/t1:c2, squad-2/t0:c0", &ids).is_none()
+        );
+    }
+
+    #[test]
+    fn order_pooled_candidates_trivially_orders_a_single_candidate_without_any_call() {
+        let s = store();
+        // An unsupported backend proves no call is attempted: had the
+        // function tried to reach the Arbiter it would fail and return None.
+        let arbiter = Arbiter {
+            agent: "codex".to_string(), // not headlessly callable
+            model: None,
+            maximum_budget_usd: None,
+        };
+        let cands = vec![candidate("squad-1/t0:c0", "do work")];
+        assert_eq!(
+            order_pooled_candidates(&s, &arbiter, &cands),
+            Some(vec!["squad-1/t0:c0".to_string()])
+        );
+    }
+
+    #[test]
+    fn order_pooled_candidates_returns_none_when_over_budget() {
+        let s = store();
+        let arbiter = Arbiter {
+            agent: "ollama".to_string(),
+            model: None,
+            maximum_budget_usd: Some(0.0),
+        };
+        s.record_arbiter_cost("classification", 1, 1, 0.0001)
+            .unwrap();
+        let cands = vec![
+            candidate("squad-1/t0:c0", "a"),
+            candidate("squad-1/t1:c2", "b"),
+        ];
+        assert!(
+            order_pooled_candidates(&s, &arbiter, &cands).is_none(),
+            "over the shared Arbiter budget cap must skip the call, not spend further"
+        );
+    }
+
+    #[test]
+    fn order_pooled_candidates_returns_none_for_unsupported_backend() {
+        let s = store();
+        let arbiter = Arbiter {
+            agent: "claude-code".to_string(), // not headlessly callable
+            model: None,
+            maximum_budget_usd: None,
+        };
+        let cands = vec![
+            candidate("squad-1/t0:c0", "a"),
+            candidate("squad-1/t1:c2", "b"),
+        ];
+        assert!(
+            order_pooled_candidates(&s, &arbiter, &cands).is_none(),
+            "a failed Arbiter call must fall back, never reorder"
         );
     }
 }
