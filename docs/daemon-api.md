@@ -2005,6 +2005,19 @@ own `match_pr_branch_name`/`effective_match_pr_branch_name` setting (see
 setting for this submission only, without changing the review's persisted
 default.
 
+`draft` (RAL-196, optional boolean, same shape as `use_worktree_branch_name`:
+it applies to both a stacked and a whole-stack request, and a single
+whole-stack value spans every branch that call creates) opens the
+submission's PR(s)/MR(s) as drafts (work-in-progress) when `true`, or forces
+them ready-for-review when `false` — either way overriding the project's
+provider-specific `[github] draft_by_default` / `[gitlab] draft_by_default`
+setting for this submission only, without changing the project default.
+Omitted (or the default unset, which resolves to `false`), the project
+default applies. GitHub drafts are the REST `draft` field; GitLab drafts are
+managed through its `Draft: ` title prefix, so either is indistinguishable
+from a draft a human marked by hand, and an adoption that discovers a
+pre-existing PR/MR in the wrong state toggles it to match this submission.
+
 RAL-378: all of the above -- the convention, `match_pr_branch_name` and
 `use_worktree_branch_name` -- describe how a PR branch is *derived* from the
 task branch, and so apply only when the review has `separate_pr_branch: true`.
