@@ -516,6 +516,7 @@ fn drive_stream_json(
         }
         return Ok(BackendOutcome {
             summary: state.result_summary,
+            turns: state.turns,
             tokens_in: state.tokens_in,
             tokens_out: state.tokens_out,
             cache_creation_tokens: state.cache_creation_tokens,
@@ -552,6 +553,7 @@ fn drive_stream_json(
 
     Ok(BackendOutcome {
         summary: state.result_summary,
+        turns: state.turns,
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
         cache_creation_tokens: state.cache_creation_tokens,
@@ -579,6 +581,10 @@ struct ParseState {
     /// rejections can arrive as a zero-token "successful" result whose text is
     /// the only indication that no model invocation happened.
     result_error: Option<String>,
+    /// RAL-352: completed `assistant` events -- one per user/assistant
+    /// exchange (each response event is both sides of the exchange).
+    /// Compaction/tool-result events never increment it.
+    turns: i64,
     tokens_in: i64,
     tokens_out: i64,
     cache_creation_tokens: i64,
@@ -728,6 +734,9 @@ fn process_event(
             // RAL-339: this event fires once per assistant turn, making it
             // the natural "turns since previous compaction" tick.
             state.thrash.record_assistant_turn();
+            // RAL-352: the same event is one exchanged user/assistant message
+            // (the response event represents both sides).
+            state.turns += 1;
             let already_streamed = state.printed_text_delta;
             if state.printed_text_delta {
                 finish_delta_line();
@@ -783,6 +792,11 @@ fn process_event(
                         "cache_creation_tokens": cc,
                         "cache_read_tokens": cr,
                         "cost_usd": live_cost,
+                        // RAL-352: the completed-turn count, already
+                        // incremented at the top of this arm -- the daemon
+                        // folds it into the cell row for a live agent-turn
+                        // counter.
+                        "turns": state.turns,
                     }),
                 );
             }

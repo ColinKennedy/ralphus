@@ -42,6 +42,7 @@ const exported = [
   "ttCellUsage",
   "ttFmtTokens",
   "ttFmtCache",
+  "ttFmtTurns",
   "ttFmtCost",
   "ttTaskReviews",
   "TT_REVIEW_ATTENTION_RANK",

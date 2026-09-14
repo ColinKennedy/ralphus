@@ -21,6 +21,13 @@ impl std::error::Error for BackendError {}
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BackendOutcome {
     pub summary: String,
+    /// RAL-352: how many user/assistant message exchanges this invocation
+    /// completed -- each agent response event counts as one exchanged
+    /// message (both sides of the exchange), and system messages/tool-call
+    /// rounds are never separate turns. `0` when a backend reports no
+    /// conversational structure at all (e.g. the hand-rolled native tool
+    /// loop, which performs one text exchange per `run`).
+    pub turns: i64,
     pub tokens_in: i64,
     pub tokens_out: i64,
     /// RAL-326: prompt-cache *write* tokens -- input the provider billed at

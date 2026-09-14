@@ -607,6 +607,7 @@ fn drive_json_events(
         }
         return Ok(BackendOutcome {
             summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+            turns: state.turns,
             tokens_in: state.tokens_in,
             tokens_out: state.tokens_out,
             cache_creation_tokens: state.cache_creation_tokens,
@@ -635,6 +636,7 @@ fn drive_json_events(
 
     Ok(BackendOutcome {
         summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+        turns: state.turns,
         tokens_in: state.tokens_in,
         tokens_out: state.tokens_out,
         cache_creation_tokens: state.cache_creation_tokens,
@@ -654,6 +656,11 @@ fn drive_json_events(
 struct ParseState {
     agent_session_id: Option<String>,
     latest_assistant_message: String,
+    /// RAL-352: completed assistant `message_end` events -- one per
+    /// user/assistant exchange (each response event is both sides of the
+    /// exchange). System/session/compaction events never increment it, and
+    /// a tool-call round inside one exchange never adds an extra turn.
+    turns: i64,
     tokens_in: i64,
     tokens_out: i64,
     cache_creation_tokens: i64,
@@ -717,7 +724,16 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                         "tokens_out": tokens_out,
                         "cache_creation_tokens": cache_creation_tokens,
                         "cache_read_tokens": cache_read_tokens,
-                        "cost_usd": cost_usd
+                        "cost_usd": cost_usd,
+                        // RAL-352: the completed-turn count so far -- the
+                        // daemon folds it into the cell row for a live
+                        // agent-turn counter; the count of the turn
+                        // currently streaming is reported once its
+                        // `message_end` arrives (see `ParseState::turns`),
+                        // so this trails the in-progress turn by at most
+                        // one and the durable result file carries the
+                        // authoritative final total.
+                        "turns": state.turns,
                     }),
                 );
             }
@@ -733,6 +749,9 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                 // RAL-339: this fires once per assistant turn -- the natural
                 // "turns since previous compaction" tick.
                 state.thrash.record_assistant_turn();
+                // RAL-352: the same event is one exchanged user/assistant
+                // message (the response event represents both sides).
+                state.turns += 1;
                 let text = extract_message_text(&event["message"]);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;

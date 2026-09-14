@@ -342,6 +342,10 @@ fn run_with_backend(
     let mut total_compaction_input_tokens = 0i64;
     let mut total_compaction_count = 0i64;
     let mut total_cost_usd = 0.0f64;
+    // RAL-352: exchanged-message total across every attempt/nudge -- `None`
+    // (not the sum) for a run that never reached a `ModelBackend` at all, so
+    // command-only cells keep reporting no applicable turn count.
+    let mut total_turns: Option<i64> = None;
     let mut agent_session_id: Option<String> = None;
 
     for attempt in 0..MAX_ASYNC_ATTEMPTS {
@@ -372,6 +376,7 @@ fn run_with_backend(
         total_compaction_input_tokens += outcome.compaction_input_tokens;
         total_compaction_count += outcome.compaction_count;
         total_cost_usd += outcome.cost_usd;
+        total_turns = Some(total_turns.unwrap_or(0) + outcome.turns);
         agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
 
         // RAL-339: the backend already killed its child process at the
@@ -391,6 +396,7 @@ fn run_with_backend(
                 total_cache_read_tokens,
                 total_compaction_input_tokens,
                 total_compaction_count,
+                total_turns.unwrap_or(0),
                 total_cost_usd,
                 agent_session_id,
             );
@@ -432,6 +438,7 @@ fn run_with_backend(
                     proofed: None,
                     agent_session_id,
                     ghost: None,
+                    turns: total_turns,
                 };
             }
             bg_nudge_attempt += 1;
@@ -490,6 +497,7 @@ fn run_with_backend(
                         proofed: None,
                         agent_session_id,
                         ghost: None,
+                        turns: total_turns,
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -501,6 +509,7 @@ fn run_with_backend(
             total_compaction_input_tokens += outcome.compaction_input_tokens;
             total_compaction_count += outcome.compaction_count;
             total_cost_usd += outcome.cost_usd;
+            total_turns = Some(total_turns.unwrap_or(0) + outcome.turns);
             agent_session_id = outcome.agent_session_id.clone().or(agent_session_id);
             if let Some(detail) = outcome.compaction_thrash {
                 return thrash_cell_result(
@@ -513,6 +522,7 @@ fn run_with_backend(
                     total_cache_read_tokens,
                     total_compaction_input_tokens,
                     total_compaction_count,
+                    total_turns.unwrap_or(0),
                     total_cost_usd,
                     agent_session_id,
                 );
@@ -555,6 +565,7 @@ fn run_with_backend(
                     proofed: Some(false),
                     agent_session_id,
                     ghost: None,
+                    turns: total_turns,
                 };
             }
             return CellResult {
@@ -574,6 +585,7 @@ fn run_with_backend(
                 proofed: None,
                 agent_session_id,
                 ghost: None,
+                turns: total_turns,
             };
         }
 
@@ -606,6 +618,7 @@ fn run_with_backend(
                 proofed: Some(verdict.unwrap_or(false)),
                 agent_session_id,
                 ghost: None,
+                turns: total_turns,
             };
         }
 
@@ -629,6 +642,7 @@ fn run_with_backend(
                 proofed: None,
                 agent_session_id,
                 ghost: None,
+                turns: total_turns,
             };
         }
 
@@ -665,6 +679,7 @@ fn run_with_backend(
             proofed: None,
             agent_session_id,
             ghost,
+            turns: total_turns,
         };
     }
 
@@ -687,6 +702,7 @@ fn thrash_cell_result(
     cache_read_tokens: i64,
     compaction_input_tokens: i64,
     compaction_count: i64,
+    turns: i64,
     cost_usd: f64,
     agent_session_id: Option<String>,
 ) -> CellResult {
@@ -717,6 +733,7 @@ fn thrash_cell_result(
         error: Some(crate::thrash::thrash_error_message(&spec.agent, detail)),
         proofed: None,
         agent_session_id,
+        turns: Some(turns),
         ghost: None,
     }
 }

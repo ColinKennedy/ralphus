@@ -249,6 +249,33 @@
        * @param {SquadView} r
        * @returns {string}
        */
+      /**
+       * RAL-352: the squad's computed total agent-turn count -- every cell,
+       * every cell-scope proof step, and every task-scope proof step, summed
+       * on demand. Constituents without a `turns` attribute (command-mode
+       * cells/proofs) are skipped, so a squad whose *only* rows are
+       * command-mode reports no applicable total (null).
+       * @param {SquadView} r
+       * @returns {number|null}
+       */
+      function squadTurns(r) {
+        let total = 0;
+        let any = false;
+        const take = (/** @type {number|null|undefined} */ n) => { if (n !== undefined && n !== null) { total += n; any = true; } };
+        for (const t of r.tasks || []) {
+          for (const p of t.proof || []) take(p.turns);
+          for (const c of t.cells || []) {
+            take(c.turns);
+            for (const p of c.proof || []) take(p.turns);
+          }
+        }
+        return any ? total : null;
+      }
+      /**
+       * Renders the squad-level details pane.
+       * @param {SquadView} r
+       * @returns {string}
+       */
       function squadView(r) {
         const rReviews = r.reviews || [];
         const reviews = rReviews.length
@@ -262,11 +289,13 @@
               `<span class="k">${esc(t.state)}</span>` +
               `<button class="btn" data-click="pick" data-kind="task" data-ti="${ti}" data-tip="Jump to this task's detail pane — view its cells and proof steps.">Go</button></div>`).join("")
           : `<h3 class="section">tasks</h3><div class="kv-row"><span class="v">None</span></div>`;
+        const totalTurns = squadTurns(r);
         return `<div class="dhead"><span class="k">▶ squad</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(r.id)}${copyBtn(r.id)}</span></div>
           <div class="kv-row"><span class="k">label</span><span class="v">${esc(r.label || "—")}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v"${isDowntimeWaiting(r) ? ` data-tip="${WAITING_TIP}"` : ""}>${pill(squadDisplayState(r))}${["pending","queued"].includes(r.state) ? "" : squadLogsBtn(r.id) + squadTimelineBtn(r.id)}</span></div>
           ${timingRows(r.started_at_ms, r.finished_at_ms)}
+          <div class="kv-row" data-tip="${SQUAD_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           <div class="kv-row"><span class="k">watchers</span><span class="v">${watchersHtml(`squad:${r.id}`)}</span></div>
           ${tasks}
           ${reviews}
@@ -718,6 +747,7 @@
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(v.state)}${outOfDateBadge(v.env_out_of_date)}</span></div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(proofModel || "—", proofModelTip)}</div>
           <div class="kv-row" data-tip="${PROOF_TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(v)}${estimatedBadge(v.cost_is_estimated)}</span></div>
+          ${v.turns != null ? `<div class="kv-row" data-tip="${TURNS_TIP}"><span class="k">turns</span><span class="v">${v.turns}</span></div>` : ""}
           <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(v, proofModel)}</span></div>
           <div class="kv-row" data-tip="${PROOF_LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="${proofCartoElId}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(proofCartoKey)}" data-carto-kind="proof" data-el-id="${esc(proofCartoElId)}" data-squad-id="${esc(r.id)}" data-tip="${PROOF_LIFETIME_COST_TIP}">Σ load total</button></span></div>
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
@@ -914,6 +944,7 @@
           <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>
           ${upstreamRow}
           <div class="kv-row" data-tip="${TOKENS_COST_TIP}"><span class="k">tokens</span><span class="v">${usageSummary(s)}${s.maximum_budget_usd ? ` <span style="color:var(--muted)">/ cap $${s.maximum_budget_usd.toFixed(4)}</span>` : ""}${estimatedBadge(s.cost_is_estimated)}</span></div>
+          ${s.turns != null ? `<div class="kv-row" data-tip="${TURNS_TIP}"><span class="k">turns</span><span class="v">${s.turns}</span></div>` : ""}
           <div class="kv-row" data-tip="${COMPACTION_TIP}"><span class="k">compaction</span><span class="v">${compactionSummary(s, s.model)}</span></div>
           <div class="kv-row" data-tip="${LIFETIME_COST_TIP}"><span class="k">lifetime</span><span class="v"><span id="cum-cost-${esc(s.id)}">—</span> <button class="btn" data-click="loadCumulativeCost" data-carto-key="${esc(s.id)}" data-carto-kind="cell" data-el-id="cum-cost-${esc(s.id)}" data-squad-id="${esc(r.id)}" data-tip="${LIFETIME_COST_TIP}">Σ load total</button></span></div>
           ${contextLimitsRow(s)}

@@ -149,6 +149,7 @@ impl Runner for CapturingRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }

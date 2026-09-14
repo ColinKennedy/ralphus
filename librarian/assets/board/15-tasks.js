@@ -159,6 +159,7 @@
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
         review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
         time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
+        turns: "Agent-turn count (RAL-352): completed user/assistant message exchanges, summed over this task's cells, cell proof steps, and task-scope proof steps -- each response event counts as both sides of one exchange, so it is the number of back-and-forth messages, not API calls.\nA dash means no contributor has a conversational count (a command-only task, or a legacy row that hasn't re-run). Command-mode cells never contribute one.\nWhile a cell is running this updates live as each turn completes.",
         tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
         cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
         cost: "Total cost in USD, aggregated the same way as Tokens.\nA dash means no backend reported a cost for this task; a \"~\" prefix means at least one contributing figure is a mid-run estimate, not final accounting.",
@@ -603,6 +604,7 @@
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
           + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.finishedAtMs, row.state))
+          + ttColCell("turns", ttFmtTurns(row.usage))
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
           + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
@@ -634,6 +636,7 @@
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
           + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.state))
+          + ttColCell("turns", ttFmtTurns(cu))
           + ttColCell("tokens", ttFmtTokens(cu))
           + ttColCell("cache", ttFmtCache(cu))
           + ttColCell("cost", ttCostCellHtml(cu, ttCellUsageItems(cell)))
@@ -669,6 +672,7 @@
           + ttColCell("cells", "")
           + ttColCell("review", "")
           + ttColCell("time", "")
+          + ttColCell("turns", `<span data-tip="${esc(tip(ttFmtTurns(agg)))}${agg.anyTurns ? ` (${agg.turns} across the rows shown)` : ""}">${ttFmtTurns(agg)}</span>`)
           + ttColCell("tokens", `<span data-tip="${esc(tip(ttFmtTokens(agg)))}">${ttFmtTokens(agg)}</span>`)
           + ttColCell("cache", `<span data-tip="${esc(tip(ttFmtCache(agg)))}">${ttFmtCache(agg)}</span>`)
           + ttColCell("cost", `<span data-tip="${esc(tip(ttFmtCost(agg)))}">${agg.anyCost ? (agg.estimated ? "~" : "") + "$" + agg.cost.toFixed(2) : "–"}</span>`)
