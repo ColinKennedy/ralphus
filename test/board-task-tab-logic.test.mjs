@@ -425,7 +425,7 @@ test("ttRowMatchesPrFilter has-PR combines with CI: any PR that is failing", () 
 
 test("ttRowMatchesFilters wires the PR-state filter into the row predicate", () => {
   const row = prRow([pr({ draft: true })]);
-  const base = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, project: new Set() };
+  const base = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, projects: new Set() };
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "any", prCi: "any" }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "draft", prCi: "any" }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "non-draft", prCi: "any" }, new Set(), new Set()), false);

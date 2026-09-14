@@ -528,7 +528,6 @@
         if (p.get("dir") === "desc") taskTabFilters.dir = -1;
         const pstatus = p.get("status"); if (pstatus !== null) taskTabFilters.status = new Set(pstatus.split(",").filter(Boolean));
         taskTabFilters.showHidden = p.get("hidden") === "1";
-        const pproject = p.get("project"); if (pproject !== null) taskTabFilters.project = new Set(pproject.split(",").filter(Boolean));
         taskTabFilters.needsMe = p.get("needsme") === "1";
         taskTabFilters.groupBySquad = p.get("group") === "1";
         taskTabFilters.pr = p.get("pr") === "1";
@@ -850,7 +849,6 @@
       function renderSquads() {
         renderProjectFilterChips();
         const el = byId("squads");
-        renderProjectFilterChips();
         const list = visibleSquads();
         if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>`; return; }
         el.innerHTML = list.map((r) => `

@@ -194,8 +194,8 @@
         else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
         else if (tab === "worktree-retirement") { await updateCounter(); await pollWorktreeRetirements(); }
         else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
-        else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
-        else { await ensureProjectsLoadedForFilters(); await pollTasks(); }
+        else if (tab === "tasks") { await pollTasksTab(); }
+        else { await pollTasks(); }
         await refreshBanner();
       }
 
