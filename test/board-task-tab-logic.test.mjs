@@ -335,19 +335,23 @@ test("ttCompareRows sorts squad by label, falling back to task index within the 
   assert.ok(ttCompareRows(a, b, "squad") > 0);
 });
 
-test("ttRowMatchesFilters applies the name filter, status set, hidden-squad exclusion, needs-me, and project set together", () => {
-  const row = { key: "s1:0", name: "Fix bug", state: "running", squadId: "s1", task: { project: "acme" } };
-  const filters = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, project: new Set() };
+test("ttRowMatchesFilters applies the name filter, status set, project set, hidden-squad exclusion, needs-me, and PR filter together", () => {
+  const row = { key: "s1:0", name: "Fix bug", state: "running", project: "alpha", squadId: "s1" };
+  const filters = { q: "", status: new Set(["running"]), projects: new Set(), showHidden: false, needsMe: false, pr: false, prDraft: "any", prCi: "any" };
   assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...filters, q: "nope" }, new Set(), new Set()), false);
   assert.equal(ttRowMatchesFilters(row, { ...filters, status: new Set(["done"]) }, new Set(), new Set()), false);
+  // RAL-345: an empty projects set means "no filter" -- a row from any (or no) project shows; a non-empty set must contain the row's project.
+  assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["beta"]) }, new Set(), new Set()), false);
+  assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["alpha", "beta"]) }, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set() }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, filters, new Set(["s1"]), new Set()), false);
   assert.equal(ttRowMatchesFilters(row, { ...filters, showHidden: true }, new Set(["s1"]), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...filters, needsMe: true }, new Set(), new Set()), false);
   assert.equal(ttRowMatchesFilters(row, { ...filters, needsMe: true }, new Set(), new Set(["s1:0"])), true);
-  // RAL-345: an empty project set means "no filter"; a non-empty one is an inclusion check.
-  assert.equal(ttRowMatchesFilters(row, { ...filters, project: new Set(["acme"]) }, new Set(), new Set()), true);
-  assert.equal(ttRowMatchesFilters(row, { ...filters, project: new Set(["other"]) }, new Set(), new Set()), false);
+  // RAL-345: an empty projects set means "no filter"; a non-empty one is an inclusion check.
+  assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["alpha"]) }, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["other"]) }, new Set(), new Set()), false);
 });
 
 // ---------- RAL-353 PR-state filter ----------
@@ -421,7 +425,7 @@ test("ttRowMatchesPrFilter has-PR combines with CI: any PR that is failing", () 
 
 test("ttRowMatchesFilters wires the PR-state filter into the row predicate", () => {
   const row = prRow([pr({ draft: true })]);
-  const base = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, project: new Set() };
+  const base = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, projects: new Set() };
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "any", prCi: "any" }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "draft", prCi: "any" }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "non-draft", prCi: "any" }, new Set(), new Set()), false);
