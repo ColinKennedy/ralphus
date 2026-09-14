@@ -108,6 +108,7 @@ impl Runner for StageDoneRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -168,6 +169,7 @@ impl Runner for LossyRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -215,6 +217,7 @@ impl Runner for MarkerStrippingRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -239,6 +242,7 @@ impl Runner for FeedbackRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -275,6 +279,7 @@ impl Runner for RaceInjectingRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -301,6 +306,7 @@ impl Runner for SilentNoOpFeedbackRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -325,6 +331,7 @@ impl Runner for NamedFeedbackRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -362,6 +369,7 @@ impl Runner for AutoFixRunner {
             proofed: Some(true),
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -2281,6 +2289,7 @@ impl Runner for FailingAutoBuildRunner {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             };
         }
         RunnerResult::failure("only auto_build is faked in this test")
@@ -2422,6 +2431,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -3841,6 +3851,7 @@ command = "cargo test --workspace"
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 };
             }
 
@@ -3887,6 +3898,7 @@ command = "cargo test --workspace"
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -4343,6 +4355,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -4523,6 +4536,7 @@ impl Runner for PartialResolutionRunner {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -4656,6 +4670,7 @@ impl Runner for NeverResolvesRunner {
             proofed: None,
             agent_session_id,
             ghost: None,
+            turns: None,
         }
     }
 }
@@ -5866,6 +5881,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }

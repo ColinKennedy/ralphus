@@ -179,6 +179,10 @@ impl ModelBackend for AgentBackend {
 
         Ok(BackendOutcome {
             summary: result.text,
+            // RAL-352: one run() call is one user-prompt -> final-answer
+            // exchange, however many tool-loop iterations it contained --
+            // the response event represents both sides of the exchange.
+            turns: 1,
             tokens_in: result.tokens_in,
             tokens_out: result.tokens_out,
             // RAL-326: this tool loop never attaches `cache_control` to any

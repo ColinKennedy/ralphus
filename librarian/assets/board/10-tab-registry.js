@@ -470,6 +470,7 @@
         { key: "cells", label: "Cells", width: 150, min: 90, flex: false, sortable: false, hideable: true, groupable: false, align: "left" },
         { key: "review", label: "Review / PR", width: 170, min: 120, flex: false, sortable: false, hideable: true, groupable: false, align: "right" },
         { key: "time", label: "Time", width: 100, min: 80, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
+        { key: "turns", label: "Turns", width: 70, min: 54, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
         { key: "tokens", label: "Tokens", width: 90, min: 70, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
         { key: "cache", label: "Cache", width: 130, min: 90, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
         { key: "cost", label: "Cost", width: 90, min: 70, flex: false, sortable: true, hideable: true, groupable: false, align: "right" },
@@ -600,6 +601,8 @@
        * @property {number} tokensOut
        * @property {number} cacheCreate
        * @property {number} cacheRead
+       * @property {number} turns - summed exchanged user/assistant messages (each response event is both sides); only constituents carrying a `turns` attribute contribute
+       * @property {boolean} anyTurns - true once at least one constituent carried a `turns` attribute (command-mode items carry none)
        * @property {number} cost
        * @property {boolean} anyCost - true once at least one constituent reported a nonzero cost_usd
        * @property {boolean} estimated - true once any constituent has cost_is_estimated
@@ -610,6 +613,7 @@
        * @property {number} [tokens_out]
        * @property {number} [cache_creation_tokens]
        * @property {number} [cache_read_tokens]
+       * @property {number} [turns] - RAL-352: complete user/assistant exchanges. Absent for command-mode cells/proofs, which have no conversational count
        * @property {number} [cost_usd]
        * @property {boolean} [cost_is_estimated]
        */
@@ -654,12 +658,16 @@
        * @returns {TtUsage}
        */
       function ttUsageOf(items) {
-        const u = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false };
+        const u = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false, turns: 0, anyTurns: false };
         for (const it of items) {
           u.tokensIn += it.tokens_in || 0;
           u.tokensOut += it.tokens_out || 0;
           u.cacheCreate += it.cache_creation_tokens || 0;
           u.cacheRead += it.cache_read_tokens || 0;
+          // RAL-352: only constituents that carry a `turns` attribute at all
+          // contribute -- a command-mode cell/proof (attribute absent) must
+          // neither add 0 nor mark the aggregate as zero-turn.
+          if (it.turns !== undefined && it.turns !== null) { u.turns += it.turns; u.anyTurns = true; }
           if (it.cost_usd) { u.cost += it.cost_usd; u.anyCost = true; }
           if (it.cost_is_estimated) u.estimated = true;
         }
@@ -708,6 +716,14 @@
        * @returns {string}
        */
       function ttFmtCache(u) { return (u.cacheCreate || u.cacheRead) ? `${u.cacheCreate} / ${u.cacheRead}` : "–"; }
+      /**
+       * Formats the Turns column (RAL-352): the summed exchanged-message
+       * count, or a dash when no constituent carried a conversational count
+       * at all (a command-only task).
+       * @param {TtUsage} u
+       * @returns {string}
+       */
+      function ttFmtTurns(u) { return u.anyTurns ? String(u.turns) : "–"; }
       /**
        * Formats the Cost column: a dash when no constituent reported a real
        * cost figure (never "$0.00" -- RAL-362 §3), else "$0.42", prefixed
@@ -921,7 +937,9 @@
       /**
        * Compares two Tasks-tab rows for the active sort key. Tokens/Cache
        * sort by the SUM of their displayed pair (RAL-362 §3) even though both
-       * numbers stay visible in the cell.
+       * numbers stay visible in the cell; Turns sorts by the summed
+       * exchanged-message count (0 when no constituent had one -- a
+       * dash-rendering command-only task sorts as 0, RAL-352).
        * @param {TtRow} a
        * @param {TtRow} b
        * @param {string} sortKey
@@ -932,6 +950,7 @@
           case "name": return a.name.localeCompare(b.name);
           case "squad": return (a.squadLabel || a.squadId).localeCompare(b.squadLabel || b.squadId) || (a.taskIdx - b.taskIdx);
           case "time": return (a.sortTimeMs ?? -1) - (b.sortTimeMs ?? -1);
+          case "turns": return (a.usage.turns || 0) - (b.usage.turns || 0);
           case "tokens": return (a.usage.tokensIn + a.usage.tokensOut) - (b.usage.tokensIn + b.usage.tokensOut);
           case "cache": return (a.usage.cacheCreate + a.usage.cacheRead) - (b.usage.cacheCreate + b.usage.cacheRead);
           case "cost": return a.usage.cost - b.usage.cost;
@@ -976,10 +995,11 @@
        * @returns {TtUsage}
        */
       function ttGroupAggregate(rows) {
-        const acc = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false };
+        const acc = { tokensIn: 0, tokensOut: 0, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false, turns: 0, anyTurns: false };
         for (const r of rows) {
           acc.tokensIn += r.usage.tokensIn; acc.tokensOut += r.usage.tokensOut;
           acc.cacheCreate += r.usage.cacheCreate; acc.cacheRead += r.usage.cacheRead;
+          acc.turns += r.usage.turns; if (r.usage.anyTurns) acc.anyTurns = true;
           if (r.usage.anyCost) { acc.cost += r.usage.cost; acc.anyCost = true; }
           if (r.usage.estimated) acc.estimated = true;
         }

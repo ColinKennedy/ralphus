@@ -266,6 +266,13 @@ pub struct CellResult {
     /// unreported by this backend/version" -- not "no compaction happened".
     #[serde(default)]
     pub compaction_count: i64,
+    /// RAL-352: number of user/assistant message exchanges this run
+    /// completed (see `crate::backend::BackendOutcome::turns`). `None` for
+    /// a command-only run (a plain `command` cell/proof has no
+    /// conversational count at all, not a count of zero -- the serializer
+    /// omits the key so the board never renders a turn-count attribute for
+    /// command mode).
+    pub turns: Option<i64>,
     #[serde(default)]
     pub cost_usd: f64,
     /// RAL-326: set when `cost_usd`/the token counts are a *live snapshot*
@@ -301,6 +308,7 @@ impl CellResult {
             error: None,
             proofed: None,
             agent_session_id: None,
+            turns: None,
             ghost: None,
         }
     }
@@ -321,6 +329,7 @@ impl CellResult {
             error: Some(error.into()),
             proofed: None,
             agent_session_id: None,
+            turns: None,
             ghost: None,
         }
     }
@@ -340,6 +349,7 @@ impl CellResult {
         cache_read_tokens: i64,
         compaction_input_tokens: i64,
         compaction_count: i64,
+        turns: i64,
         cost_usd: f64,
         agent_session_id: Option<String>,
     ) -> Self {
@@ -351,6 +361,7 @@ impl CellResult {
             cache_read_tokens,
             compaction_input_tokens,
             compaction_count,
+            turns: Some(turns),
             cost_usd,
             // A detach carries whatever the live snapshot held at the detach
             // point, never a terminal usage event -- so it is an estimate by

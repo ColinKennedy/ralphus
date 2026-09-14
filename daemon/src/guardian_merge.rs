@@ -10261,6 +10261,7 @@ mod tests {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            turns: None,
         }
     }
 
@@ -10436,6 +10437,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -13184,6 +13186,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -13653,6 +13656,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }

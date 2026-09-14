@@ -476,6 +476,8 @@
       // reason. This is a display-only relabeling — the underlying state is
       // still "pending" (filters, menus, and the API all use the real state).
       const WAITING_TIP = "Waiting for the configured scheduler down-time window to end before this squad can be picked up.\nShown instead of \"pending\" when the daemon is currently inside a down-time window (see [daemon] in .ralphus.toml).\nIn-progress squads are never paused — this only affects new automatic pickups.";
+      const SQUAD_TURNS_TIP = "RAL-352: completed user/assistant message exchanges across this whole squad — every cell, every cell-scope proof step, and every task-scope proof step, each response event counting as both sides of one exchange.\nA dash means no constituent has a conversational count (a command-only squad, or one whose cells haven't re-run since RAL-352). Task-scope proofs are included.\nWhile a cell runs, this updates live as each turn completes.";
+      const TURNS_TIP = "RAL-352: completed user/assistant message exchanges (each response event counts as both sides of one exchange, so this is the back-and-forth message count, not API calls).\nOmitted entirely for command-mode cells/proof steps — they have no conversational count at all, not a count of zero.\nWhile this runs, it updates live as each turn completes.";
       const DEFAULT_AGENT = "claude";
       // RAL-160: token/cost figures shown in the cell detail pane reflect
       // only this cell's current squad — a restart overwrites them rather

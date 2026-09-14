@@ -69,6 +69,10 @@ struct RunnerEvent {
 /// [`SubprocessRunner`] already does locally.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LiveUsage {
+    /// RAL-352: completed agent exchanges observed in the payloads so far
+    /// (the runner emits it alongside the usage figures). `0` for a backend
+    /// with no live snapshot path at all.
+    pub turns: i64,
     pub tokens_in: i64,
     pub tokens_out: i64,
     /// RAL-326: prompt-cache write/read tokens, carried alongside (never
@@ -723,6 +727,13 @@ pub struct RunnerResult {
     /// happened".
     #[serde(default)]
     pub compaction_count: i64,
+    /// RAL-352: completed user/assistant message exchanges (each response
+    /// event represents both sides of the exchange). `None` for a
+    /// command-only run -- there is no conversational count at all, not a
+    /// count of zero; the serializer omits the key so the board never
+    /// shows a turn-count attribute for command mode.
+    #[serde(default)]
+    pub turns: Option<i64>,
     /// Cost in USD.
     #[serde(default)]
     pub cost_usd: f64,
@@ -776,6 +787,7 @@ impl RunnerResult {
             error: Some(error.into()),
             proofed: None,
             agent_session_id: None,
+            turns: None,
             ghost: None,
         }
     }
@@ -813,6 +825,7 @@ impl RunnerResult {
             )),
             proofed: None,
             agent_session_id: None,
+            turns: Some(usage.turns),
             ghost: None,
         }
     }
@@ -842,6 +855,7 @@ impl RunnerResult {
             error: None,
             proofed: None,
             agent_session_id,
+            turns: Some(usage.turns),
             ghost: None,
         }
     }
@@ -2412,7 +2426,17 @@ pub(crate) fn forward_runner_event(
             .get("cache_read_tokens")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        // RAL-352: absent from a pre-RAL-352 runner's payload -- treat as no
+        // live turn information rather than a real zero, but a live snapshot
+        // without it can't regress an already-persisted count (it only ever
+        // writes through `set_cell_live_usage` once the cell row exists).
+        let turns = event
+            .payload
+            .get("turns")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
         let usage = LiveUsage {
+            turns,
             tokens_in,
             tokens_out,
             cache_creation_tokens,
@@ -2504,6 +2528,13 @@ fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
         && result.cache_read_tokens == 0
         && result.cost_usd == 0.0
     {
+        // RAL-352: the lost-run turn count, when the live stream saw any --
+        // `> 0` keeps a command cell (whose live snapshot never fires, so
+        // `live.turns` stays at the `0` default) from acquiring a
+        // count-of-zero attribute it must not have.
+        if result.turns.is_none() && live.turns > 0 {
+            result.turns = Some(live.turns);
+        }
         result.tokens_in = live.tokens_in;
         result.tokens_out = live.tokens_out;
         result.cache_creation_tokens = live.cache_creation_tokens;
@@ -3110,6 +3141,7 @@ mod tests {
             proofed: Some(true),
             agent_session_id: None,
             ghost: None,
+            turns: None,
         };
         assert!(r.proof_passed());
 
@@ -3435,6 +3467,7 @@ prompt = "make it build"
                     "cache_creation_tokens": 11,
                     "cache_read_tokens": 13,
                     "cost_usd": 1.25,
+                    "turns": tokens_in + 1,
                 },
             })
             .to_string();
@@ -3444,6 +3477,7 @@ prompt = "make it build"
             assert_eq!(
                 fwd.live_usage,
                 Some(LiveUsage {
+                    turns: tokens_in + 1,
                     tokens_in,
                     tokens_out: 7,
                     cache_creation_tokens: 11,
@@ -3685,6 +3719,7 @@ prompt = "make it build"
         // Without the backfill, the zeroed failure result overwrites those
         // tokens and the board reports 0 forever.
         let live = LiveUsage {
+            turns: 12,
             tokens_in: 8_685_138,
             tokens_out: 49_415,
             cache_creation_tokens: 320_114,
@@ -3699,6 +3734,10 @@ prompt = "make it build"
         assert_eq!(lost.cache_read_tokens, 7_204_990);
         // Codex reports no cost anywhere, so this stays 0 — rendered "N/A".
         assert_eq!(lost.cost_usd, 0.0);
+        // RAL-352: the completed-turn count observed live before the pane
+        // died must survive the zeroed failure result the same way the
+        // tokens do.
+        assert_eq!(lost.turns, Some(12));
         // RAL-326: a backfilled snapshot is never the backend's own final
         // accounting, so it must carry the estimate marker the board badges.
         assert!(lost.cost_is_estimated);
@@ -3707,6 +3746,7 @@ prompt = "make it build"
     #[test]
     fn backfill_live_usage_never_overwrites_a_results_own_figures() {
         let live = LiveUsage {
+            turns: 4,
             tokens_in: 10,
             tokens_out: 2,
             cache_creation_tokens: 0,
@@ -3732,6 +3772,7 @@ prompt = "make it build"
         // `cost_exceeded` already carries real figures: a no-op.
         let mut capped = RunnerResult::cost_exceeded(
             LiveUsage {
+                turns: 2,
                 tokens_in: 99,
                 tokens_out: 9,
                 cache_creation_tokens: 4,
@@ -3751,6 +3792,9 @@ prompt = "make it build"
             ),
             (99, 9, 4, 5, 1.5)
         );
+        // RAL-352: the live turn count carried by the cap-firing snapshot
+        // survives untouched -- the backfill never overwrites it.
+        assert_eq!(capped.turns, Some(2));
     }
 
     #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]

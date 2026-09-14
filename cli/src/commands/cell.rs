@@ -485,6 +485,16 @@ fn render_cell_detail(s: &Value) {
             s["compaction_input_tokens"].to_string(),
         ),
         ("compaction_count", s["compaction_count"].to_string()),
+        // RAL-352: completed user/assistant exchanges for this cell (each
+        // response event is both sides of the exchange). Omitted entirely
+        // for command-mode cells, which have no conversational count.
+        (
+            "turns",
+            s["turns"]
+                .as_i64()
+                .map(|n| n.to_string())
+                .unwrap_or("—".to_string()),
+        ),
         (label, value),
     ]);
     for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {

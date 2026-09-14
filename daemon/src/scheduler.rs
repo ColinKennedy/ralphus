@@ -3849,6 +3849,7 @@ mod tests {
                     proofed: spec.proof.then_some(true),
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 }
             }
         }
@@ -3886,6 +3887,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: spec.resume_agent_session_id.clone(),
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -4025,6 +4027,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                     cost_usd: 0.25,
+                    turns: 0,
                 },
                 Some("sess-detach-1".to_string()),
             )
@@ -4123,6 +4126,7 @@ mod tests {
                                 cache_creation_tokens: 0,
                                 cache_read_tokens: 0,
                                 cost_usd: 0.01,
+                                turns: 0,
                             },
                             Some("sess-a".to_string()),
                         );
@@ -4142,6 +4146,7 @@ mod tests {
                         proofed: None,
                         agent_session_id: None,
                         ghost: None,
+                        turns: None,
                     }
                 }
                 Some("y") => {
@@ -4171,6 +4176,7 @@ mod tests {
                         proofed: None,
                         agent_session_id: None,
                         ghost: None,
+                        turns: None,
                     }
                 }
                 other => panic!("unexpected command {other:?}"),
@@ -4384,6 +4390,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -4996,6 +5003,7 @@ mod tests {
                             proofed: None,
                             agent_session_id: None,
                             ghost: None,
+                            turns: None,
                         }
                     }
                 } else {
@@ -5016,6 +5024,7 @@ mod tests {
                         proofed: None,
                         agent_session_id: None,
                         ghost: None,
+                        turns: None,
                     }
                 }
             }
@@ -5140,6 +5149,7 @@ mod tests {
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 };
             }
             if spec.cell_id.starts_with("proof-") {
@@ -5162,6 +5172,7 @@ mod tests {
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -5182,6 +5193,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -5318,6 +5330,7 @@ mod tests {
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -5341,6 +5354,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -5467,6 +5481,7 @@ mod tests {
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 }
             }
         }
@@ -6067,6 +6082,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -6137,6 +6153,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -6286,6 +6303,7 @@ mod tests {
                     proofed: spec.proof.then_some(true),
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 }
             }
         }
@@ -6408,6 +6426,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -6900,6 +6919,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -7152,6 +7172,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -7293,6 +7314,7 @@ mod tests {
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -7661,6 +7683,7 @@ mod tests {
                     None
                 },
                 ghost: None,
+                turns: None,
             }
         }
     }
@@ -7831,6 +7854,7 @@ mod tests {
                     None
                 },
                 ghost: None,
+                turns: None,
             }
         }
     }

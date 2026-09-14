@@ -69,6 +69,10 @@ impl ModelBackend for HarnessBackend {
 
         Ok(BackendOutcome {
             summary: tail(&stdout, SUMMARY_TAIL_CHARS),
+            // RAL-352: one external harness invocation is one exchanged
+            // message -- there is no finer-grained conversational structure
+            // to observe, and it is an agent backend, not a command.
+            turns: 1,
             tokens_in: 0,
             tokens_out: 0,
             // An external harness's stdout is opaque text, so there is no

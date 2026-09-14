@@ -701,6 +701,8 @@ struct TaskIndexCell {
     cache_read_tokens: i64,
     compaction_input_tokens: i64,
     compaction_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turns: Option<i64>,
     cost_usd: f64,
     cost_is_estimated: bool,
     error: Option<String>,
@@ -722,6 +724,8 @@ struct TaskIndexProof {
     cache_read_tokens: i64,
     compaction_input_tokens: i64,
     compaction_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turns: Option<i64>,
     cost_usd: f64,
     cost_is_estimated: bool,
 }
@@ -738,6 +742,7 @@ impl From<crate::store::ProofView> for TaskIndexProof {
             cache_read_tokens: value.cache_read_tokens,
             compaction_input_tokens: value.compaction_input_tokens,
             compaction_count: value.compaction_count,
+            turns: value.turns,
             cost_usd: value.cost_usd,
             cost_is_estimated: value.cost_is_estimated,
         }
@@ -758,6 +763,7 @@ impl From<crate::store::CellView> for TaskIndexCell {
             cache_read_tokens: value.cache_read_tokens,
             compaction_input_tokens: value.compaction_input_tokens,
             compaction_count: value.compaction_count,
+            turns: value.turns,
             cost_usd: value.cost_usd,
             cost_is_estimated: value.cost_is_estimated,
             error: value.error,
@@ -19416,6 +19422,7 @@ command = "true"
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 }
             }
         }
@@ -19567,6 +19574,7 @@ command = "true"
                     proofed: None,
                     agent_session_id: None,
                     ghost: None,
+                    turns: None,
                 }
             }
         }

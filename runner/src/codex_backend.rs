@@ -312,6 +312,10 @@ fn drive_thread_events(
 
     let mut agent_session_id: Option<String> = None;
     let mut latest_agent_message = String::new();
+    // RAL-352: completed `turn.completed` events -- one per user/assistant
+    // exchange (each response event is both sides of the exchange).
+    // `turn.failed`/`error`/`item.completed` never increment it.
+    let mut turns = 0i64;
     let mut tokens_in = 0i64;
     let mut tokens_out = 0i64;
     // Codex exposes no cache-write tier at all (see the `turn.completed` arm
@@ -370,6 +374,9 @@ fn drive_thread_events(
             }
             Some("turn.completed") => {
                 saw_turn = true;
+                // RAL-352: every completed turn is one exchanged message,
+                // including the turn a compaction was (possibly) inferred on.
+                turns += 1;
                 // Raw (pre-split) input_tokens: compaction inference below
                 // compares this turn-over-turn, which needs the same total
                 // Codex itself measures the auto-compact threshold against.
@@ -471,6 +478,7 @@ fn drive_thread_events(
         }
         return Ok(BackendOutcome {
             summary: latest_agent_message,
+            turns,
             tokens_in,
             tokens_out,
             cache_creation_tokens,
@@ -503,6 +511,7 @@ fn drive_thread_events(
 
     Ok(BackendOutcome {
         summary: latest_agent_message,
+        turns,
         tokens_in,
         tokens_out,
         cache_creation_tokens,

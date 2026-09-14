@@ -17,6 +17,7 @@ const {
   ttTaskUsage,
   ttFmtTokens,
   ttFmtCache,
+  ttFmtTurns,
   ttFmtCost,
   ttTaskReviews,
   ttPickReviewBadge,
@@ -285,6 +286,45 @@ test("ttCompareRows sorts Cache by the SUM of the write/read pair", () => {
   const a = { usage: { cacheCreate: 1, cacheRead: 1 } };
   const b = { usage: { cacheCreate: 10, cacheRead: 10 } };
   assert.ok(ttCompareRows(a, b, "cache") < 0);
+});
+
+// ---------- RAL-352 turns ----------
+
+test("ttUsageOf sums turns only from constituents that carry the attribute (command-mode items contribute nothing)", () => {
+  const u = ttUsageOf([{ turns: 4 }, { cost_usd: 0.5 }, { turns: 2 }, { tokens_in: 3 }]);
+  assert.equal(u.turns, 6);
+  assert.equal(u.anyTurns, true);
+  assert.equal(ttFmtTurns(u), "6");
+});
+
+test("ttUsageOf reports no applicable turns when nothing carries the attribute", () => {
+  const u = ttUsageOf([{ tokens_in: 1 }, { cost_usd: 0.5 }]);
+  assert.equal(u.anyTurns, false);
+  assert.equal(ttFmtTurns(u), "–");
+});
+
+test("ttUsageOf treats an explicit zero-turn agent row as zero, not as no-count", () => {
+  const u = ttUsageOf([{ turns: 0 }, { tokens_in: 1 }]);
+  assert.equal(u.anyTurns, true);
+  assert.equal(ttFmtTurns(u), "0");
+});
+
+test("ttCompareRows sorts Turns numerically, treating no-count as zero", () => {
+  const a = { usage: { turns: 0, anyTurns: false } };
+  const b = { usage: { turns: 7, anyTurns: true } };
+  assert.ok(ttCompareRows(a, b, "turns") < 0);
+  assert.ok(ttCompareRows(b, b, "turns") === 0);
+});
+
+test("ttGroupAggregate sums turns and tracks anyTurns across the group's rows", () => {
+  const rows = [
+    { usage: { turns: 3, anyTurns: true } },
+    { usage: { turns: 0, anyTurns: false } },
+    { usage: { turns: 9, anyTurns: true } },
+  ];
+  const agg = ttGroupAggregate(rows);
+  assert.equal(agg.turns, 12);
+  assert.equal(agg.anyTurns, true);
 });
 
 test("ttCompareRows sorts squad by label, falling back to task index within the same squad", () => {
