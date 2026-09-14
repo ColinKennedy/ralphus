@@ -233,6 +233,14 @@
        *   while any remain, `closeModal` fires `POST /api/generate/{id}/cancel`
        *   for each so the underlying agent subprocess is actually killed,
        *   not just abandoned.
+       * @property {string[]} generationJobIds RAL-420: every `POST
+       *   /api/generate` job id this form has obtained, in flight or already
+       *   finished (done, failed, or cancelled) -- sent as `generation_ids`
+       *   in the submit request so the daemon can attribute the retained
+       *   cost rows to the squad this submission creates (a cancelled or
+       *   failed call still spent tokens the daemon retained for audit).
+       *   Cleared on modal close/reset/successful submit like every other
+       *   modal-epoch field.
        */
       /** @type {NtSimpleState} */
       let ntSimple;
@@ -248,7 +256,7 @@
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
           skipAutoBuild: true, generateAutoBuild: true,
           proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
-          fieldErrors: [], activeGenerationIds: [],
+          fieldErrors: [], activeGenerationIds: [], generationJobIds: [],
         };
       }
       /**
@@ -867,6 +875,11 @@
           ({ id } = await startResp.json());
           if (!id) return null;
           ntSimple.activeGenerationIds.push(id);
+          // RAL-420: remember this job even after it resolves (done, failed,
+          // or cancelled) so the submit payload can echo it in
+          // `generation_ids` and the daemon can attribute its retained cost
+          // row to the squad this submission creates.
+          ntSimple.generationJobIds.push(id);
           for (let i = 0; i < 80; i++) {
             await new Promise((resolve) => setTimeout(resolve, 1500));
             const poll = await fetch(`/api/generate/${id}`);
@@ -1125,7 +1138,7 @@
           return;
         }
         /** @type {(label: string|null) => Promise<Response>} */
-        const postSquad = (label) => fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label }) });
+        const postSquad = (label) => fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label, generation_ids: ntSimple.generationJobIds }) });
         const squadLabel = naming.squadLabel === null ? null : ntSanitizeSquadLabel(naming.squadLabel);
         let resp = await postSquad(squadLabel);
         if (!resp.ok) {

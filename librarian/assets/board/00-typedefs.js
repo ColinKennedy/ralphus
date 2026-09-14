@@ -122,6 +122,46 @@
        * @property {TaskView[]} tasks
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every cell/proof subprocess this squad spawns from now on, until unset. Empty/absent for the vast majority of squads.
+       * @property {GenerationUsage} [generation_cost] - RAL-420: this squad's own pre-work generation cost — the retained usage of the agent/model calls the Simple form made before submission (Generate proof steps / manual checks / auto-build steps, plus the suggest-name fallback), attributed to this squad at submit time and folded into its normal totals exactly once. Absent for the vast majority of squads (only Simple-tab submissions that used the Generate buttons or the suggest-name fallback have rows).
+       */
+      /**
+       * RAL-420: a squad's aggregate pre-work generation cost — sums over its
+       * attributed `squad_generation_costs` rows. Absent from the wire for a
+       * squad with none.
+       * @typedef {object} GenerationUsage
+       * @property {number} count
+       * @property {number} tokens_in
+       * @property {number} tokens_out
+       * @property {number} cache_creation_tokens - prompt-cache write tokens; kept out of `tokens_in` (which stays uncached-input-only, same as CellView).
+       * @property {number} cache_read_tokens - prompt-cache read tokens; see `cache_creation_tokens`.
+       * @property {number} cost_usd
+       * @property {boolean} estimated - true once any contributing call's figures are a live mid-run snapshot rather than the backend's final accounting (the call was killed/cancelled/sat before a terminal usage event) — RAL-326's flag, aggregated.
+       */
+      /**
+       * One retained pre-work generation call (RAL-420), as served by
+       * `GET /api/squads/{id}/generation-costs` and `GET /api/generation-costs`.
+       * Rows exist from the moment the call finishes (whether it succeeded,
+       * failed, or was cancelled); `squad_id` fills in only once the call is
+       * attributed to a submitted squad, and stays null for a call whose
+       * squad was never submitted (visible in the cross-squad audit list only).
+       * @typedef {object} GenerationCostView
+       * @property {number} id
+       * @property {string} job_id
+       * @property {string|null} squad_id
+       * @property {string} kind - "proof_steps" | "manual_checks" | "auto_build_steps" | "task_name"
+       * @property {string} status - "done" | "error" | "cancelled"
+       * @property {number} tokens_in
+       * @property {number} tokens_out
+       * @property {number} cache_creation_tokens
+       * @property {number} cache_read_tokens
+       * @property {number} cost_usd
+       * @property {boolean} cost_is_estimated
+       * @property {string|null} error
+       * @property {string} agent
+       * @property {string|null} model
+       * @property {number} created_at_ms
+       * @property {number} finished_at_ms
+       * @property {number|null} attributed_at_ms
        */
       /**
        * @typedef {object} DaemonStatus

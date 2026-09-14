@@ -124,6 +124,7 @@
       CLICK_HANDLERS.addEnvOverrideAt = (e, ds) => addEnvOverrideAt(ds.apiPath || "");
       CLICK_HANDLERS.editEnvOverrideAt = (e, ds) => editEnvOverrideAt(ds.apiPath || "", ds.key || "", ds.value || "");
       CLICK_HANDLERS.loadCumulativeCost = (e, ds) => loadCumulativeCost(ds.cartoKey || "", ds.squadId || "", ds.elId || "", ds.cartoKind || "cell");
+      CLICK_HANDLERS.openGenerationCosts = (e, ds) => openGenerationCosts(e, ds.squadId || "");
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquadItem = (e, ds) => gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi));

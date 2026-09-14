@@ -35,6 +35,8 @@ where one exists.
 | POST | `/api/generate` | [Kick off a Simple-form generation step](#post-apigenerate) (RAL-297) |
 | GET | `/api/generate/{id}` | [Poll a generation job](#get-apigenerateid) (RAL-297) |
 | POST | `/api/generate/{id}/cancel` | [Kill a generation job's agent subprocess](#post-apigenerateidcancel) (RAL-297) |
+| GET | `/api/squads/{id}/generation-costs` | [Per-squad pre-work generation call detail](#get-apisquadsidgeneration-costs-ral-420) (RAL-420) |
+| GET | `/api/generation-costs` | [Cross-squad pre-work generation call audit](#get-apigeneration-costs-ral-420) (RAL-420) |
 | GET | `/api/cartographer` | [Structured event log](#get-apicartographer), filtered/paginated; `?entity=` accepts an [entity URI](#entity-uris-ral-155) |
 | GET | `/api/cartographer/{id}` | [One event's full detail](#get-apicartographerid) |
 | POST | `/api/events/ticket` | [Mint a short-lived SSE ticket](#post-apieventsticket-ral-222) |
@@ -417,8 +419,22 @@ Validate (fail-closed) and submit a TOML batch.
 
 Request:
 ```json
-{ "toml": "<raw TOML text>", "hold": false, "label": "optional human label" }
+{ "toml": "<raw TOML text>", "hold": false, "label": "optional human label",
+  "generation_ids": ["gen-…"] }
 ```
+`toml`, `hold`, and `label` are as above. `generation_ids` (RAL-420) is
+optional and board-set: the job ids of every pre-work generation call the
+Simple form ran for this squad (each `POST /api/generate` response's
+`gen-…` id, retained client-side even after the job finished — done,
+failed, or cancelled), so the daemon can attribute the retained cost rows
+(`squad_generation_costs`, `squad_id` NULL until now) to the squad this
+submission creates. Ids the daemon no longer has a row for (persistence
+lost to a restart mid-run) are silently skipped; the submit logs an
+`attributed`/`echoed` split (rlog + a Cartographer `generation` note) so
+an echo the daemon knows nothing about is audible without failing the
+submit. The post-submit `suggest-name` fallback is attributed by its own
+handler and never appears here.
+
 `400` with the error envelope (`code: "validation_failed"`, `details` = the
 validation errors) if invalid. On success `201`:
 ```json
@@ -681,6 +697,38 @@ Kills the agent subprocess backing generation job `id`, if it's still
 running -- registered under the same `Cancellations` registry a squad's own
 cells use, so this really does stop the process rather than just abandon
 polling it. Always `202`, even if `id` already finished or never existed.
+
+### `GET /api/squads/{id}/generation-costs` (RAL-420)
+The per-squad "detail" half of the pre-work generation cost audit surface:
+every generation call attributed to squad `id`, newest first. Each row is
+one finished pre-work agent/model call -- the Simple form's Generate proof
+steps / manual checks / auto-build steps buttons, or the post-submit
+`suggest-name` fallback -- with the usage the runner captured (retained
+even when the call failed or was cancelled; `cost_is_estimated` marks a
+live mid-run snapshot per RAL-326). Response `200`: a JSON array of
+`GenerationCostView` objects:
+
+```json
+[ { "id": 1, "job_id": "gen-a", "squad_id": "squad-000000000001", "kind": "proof_steps",
+    "status": "done", "tokens_in": 100, "tokens_out": 50,
+    "cache_creation_tokens": 0, "cache_read_tokens": 0, "cost_usd": 0.02,
+    "cost_is_estimated": false, "error": null, "agent": "claude-code", "model": null,
+    "created_at_ms": 1700000000000, "finished_at_ms": 1700000010000,
+    "attributed_at_ms": 1700000011000 } ]
+```
+`kind` is `"proof_steps"` | `"manual_checks"` | `"auto_build_steps"` |
+`"task_name"`; `status` is `"done"` | `"error"` | `"cancelled"`. The
+squad's totals fold these in exactly once via `SquadView.generation_cost`
+(see `GET /api/tasks`).
+
+### `GET /api/generation-costs` (RAL-420)
+The cross-squad "audit" half of the pre-work generation cost audit surface:
+every persisted generation call row, attributed or not, newest first. The
+retained-but-never-attributed rows -- a cancelled New Task modal, a job
+whose squad was never submitted -- are visible here and only here: they are
+never folded into any squad's totals. Same `GenerationCostView` shape as
+`GET /api/squads/{id}/generation-costs`, with `squad_id` `null` for the
+unclaimed rows.
 
 ### Admin flag and admin-only endpoints (RAL-332)
 
@@ -2479,6 +2527,24 @@ filename component (e.g. `"/"`). This fallback is display-only: it never
 writes back to the task's stored `project` value and has no effect on
 worktree-placeholder resolution, which still requires an explicit, registered
 `project`.
+
+A squad also carries a RAL-420 `generation_cost` field when it has one
+(absent otherwise, so the common payload is unchanged) -- its own pre-work
+generation spend as a distinct, squad-owned category:
+
+```json
+{ "count": 2, "tokens_in": 107, "tokens_out": 53,
+  "cache_creation_tokens": 0, "cache_read_tokens": 0,
+  "cost_usd": 0.02, "estimated": false }
+```
+
+`count` is the number of attributed generation calls; the token/cost fields
+are their sums; `estimated` is true when any contributing call's figures
+were a live mid-run snapshot rather than final accounting (RAL-326's flag,
+aggregated). These calls never appear as task/cell/proof rows -- they ran
+before the squad existed -- so exactly one consumer (the board's Tasks-tab
+squad group total, and the squad detail pane's "generation cost" row) folds
+the aggregate into the squad's normal totals.
 
 Each `TaskView` also carries raw nullable `agent` and `model` fields: the
 task-level values submitted in TOML, before cell inheritance is applied.
