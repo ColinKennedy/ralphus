@@ -5893,7 +5893,12 @@ pub struct CancelImpact {
 impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
-        let mut stmt = self.conn.prepare(
+        Self::cells_of_conn(&self.conn, squad_id)
+    }
+    /// [`Self::cells_of`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
+        let mut stmt = conn.prepare(
             "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
@@ -5934,7 +5939,12 @@ impl Store {
 
     /// All tasks of a squad with their dependencies, in order.
     pub fn tasks_of(&self, squad_id: &str) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn.prepare(
+        Self::tasks_of_conn(&self.conn, squad_id)
+    }
+    /// [`Self::tasks_of`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn tasks_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<TaskRow>> {
+        let mut stmt = conn.prepare(
             "SELECT idx, name, project, depends_on, soloed FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -7457,8 +7467,15 @@ impl Store {
     /// non-mutating dry-run preview and the real restart (RAL-104) so the two
     /// can never drift out of sync.
     pub fn compute_squad_restart_impact(&self, squad_id: &str) -> Result<RestartImpact> {
-        let exists: Option<String> = self
-            .conn
+        Self::compute_squad_restart_impact_conn(&self.conn, squad_id)
+    }
+    /// [`Self::compute_squad_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_squad_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> Result<RestartImpact> {
+        let exists: Option<String> = conn
             .query_row("SELECT id FROM squads WHERE id=?", params![squad_id], |r| {
                 r.get(0)
             })
@@ -7466,8 +7483,7 @@ impl Store {
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        let cells = self
-            .cells_of(squad_id)?
+        let cells = Self::cells_of_conn(conn, squad_id)?
             .into_iter()
             .map(|s| RestartImpactCell {
                 task_idx: s.task_idx,
@@ -7476,15 +7492,14 @@ impl Store {
                 cell_id: s.cell_id,
             })
             .collect();
-        let tasks = self
-            .tasks_of(squad_id)?
+        let tasks = Self::tasks_of_conn(conn, squad_id)?
             .into_iter()
             .map(|t| RestartImpactTask {
                 idx: t.idx,
                 name: t.name,
             })
             .collect();
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
         Ok(RestartImpact {
             cells,
             tasks,
@@ -7548,8 +7563,18 @@ impl Store {
         task_idx: i64,
         idx: i64,
     ) -> Result<RestartImpact> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        Self::compute_cell_restart_impact_conn(&self.conn, squad_id, task_idx, idx)
+    }
+    /// [`Self::compute_cell_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_cell_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<RestartImpact> {
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         let target = cells
             .iter()
             .position(|s| s.task_idx == task_idx && s.idx == idx)
@@ -7602,7 +7627,7 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
 
         Ok(RestartImpact {
             cells: affected_cells,
@@ -7672,8 +7697,17 @@ impl Store {
         squad_id: &str,
         task_idx: i64,
     ) -> Result<RestartImpact> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        Self::compute_task_restart_impact_conn(&self.conn, squad_id, task_idx)
+    }
+    /// [`Self::compute_task_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_task_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+    ) -> Result<RestartImpact> {
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         if !tasks.iter().any(|t| t.idx == task_idx) {
             return Err(StoreError::NotFound);
         }
@@ -7733,7 +7767,7 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
 
         Ok(RestartImpact {
             cells: affected_cells,
@@ -7861,9 +7895,15 @@ impl Store {
     /// dependent on `squad_id`, in discovery order. Does not mutate anything —
     /// shared by the dry-run preview and [`Store::dirty_dependents`] (RAL-104).
     pub fn compute_dirty_dependents(&self, squad_id: &str) -> Result<Vec<RestartImpactSquad>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, label, depends_on FROM squads")?;
+        Self::compute_dirty_dependents_conn(&self.conn, squad_id)
+    }
+    /// [`Self::compute_dirty_dependents`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_dirty_dependents_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> Result<Vec<RestartImpactSquad>> {
+        let mut stmt = conn.prepare("SELECT id, label, depends_on FROM squads")?;
         let all: Vec<(String, Option<String>, Vec<String>)> = stmt
             .query_map([], |r| {
                 Ok((
