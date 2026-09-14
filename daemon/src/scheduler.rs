@@ -6163,8 +6163,10 @@ mod tests {
     /// Records every spec (proof or not) it was invoked with, so a test can
     /// inspect the effective `system_prompt` the *cell body itself* (not just
     /// its proofs) was dispatched with.
+    type CellSystemPromptCall = (bool, Option<String>);
+
     struct CellSystemPromptRecorder {
-        seen: Arc<Mutex<Vec<(bool, Option<String>)>>>,
+        seen: Arc<Mutex<Vec<CellSystemPromptCall>>>,
     }
 
     impl Runner for CellSystemPromptRecorder {
