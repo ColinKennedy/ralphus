@@ -62,6 +62,7 @@ const exported = [
   "ttRowMatchesFilters",
   "ttRowMatchesPrFilter",
   "ttGroupAggregate",
+  "ttGroupAggregateWithGeneration",
   "ttVisibleRange",
   "ttBuildDisplayList",
 ];

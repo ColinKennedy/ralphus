@@ -34,6 +34,7 @@ const {
   ttRowMatchesFilters,
   ttRowMatchesPrFilter,
   ttGroupAggregate,
+  ttGroupAggregateWithGeneration,
   ttVisibleRange,
   ttBuildDisplayList,
 } = taskTabLogic;
@@ -436,6 +437,37 @@ test("ttGroupAggregate sums usage only across the rows passed in (post-filter sc
   assert.ok(Math.abs(agg.cost - 0.1) < 1e-9);
   assert.equal(agg.anyCost, true);
   assert.equal(agg.estimated, true);
+});
+
+test("ttGroupAggregateWithGeneration folds a squad's generation cost in exactly once and only once", () => {
+  const rows = [
+    { usage: { tokensIn: 10, tokensOut: 10, cacheCreate: 1, cacheRead: 2, cost: 0.4, anyCost: true, estimated: false, turns: 2, anyTurns: true } },
+    { usage: { tokensIn: 1, tokensOut: 1, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false, turns: 0, anyTurns: false } },
+  ];
+  const generation = { count: 3, tokens_in: 500, tokens_out: 120, cache_creation_tokens: 30, cache_read_tokens: 40, cost_usd: 0.05, estimated: false };
+  // Nothing folds in when the squad reports no generation cost (the common case).
+  assert.deepEqual(ttGroupAggregateWithGeneration(rows, undefined), ttGroupAggregate(rows));
+  assert.deepEqual(
+    ttGroupAggregateWithGeneration(rows, generation),
+    { tokensIn: 511, tokensOut: 131, cacheCreate: 31, cacheRead: 42, cost: 0.45, anyCost: true, estimated: false, turns: 2, anyTurns: true }
+  );
+  // Estimation propagates to the group aggregate when any generation call's
+  // figures are a live mid-run snapshot (RAL-326's flag, aggregated).
+  const est = ttGroupAggregateWithGeneration(rows, { ...generation, estimated: true });
+  assert.equal(est.estimated, true);
+  assert.equal(est.cost, 0.45);
+});
+
+test("ttGroupAggregateWithGeneration honors anyCost semantics for a zero-reported generation cost", () => {
+  const rows = [
+    { usage: { tokensIn: 1, tokensOut: 1, cacheCreate: 0, cacheRead: 0, cost: 0, anyCost: false, estimated: false, turns: 0, anyTurns: false } },
+  ];
+  // A generation cost of exactly $0 (backend reported no dollar figure) must
+  // not turn the squad's dash into a spurious "$0.00" -- same rule as ttUsageOf.
+  const agg = ttGroupAggregateWithGeneration(rows, { count: 1, tokens_in: 7, tokens_out: 3, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 0, estimated: false });
+  assert.equal(agg.anyCost, false);
+  assert.equal(agg.cost, 0);
+  assert.equal(agg.tokensIn, 8);
 });
 
 // ---------- virtualization ----------
