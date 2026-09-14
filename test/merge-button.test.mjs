@@ -26,6 +26,7 @@ const { MERGE_STARTABLE, mergeButtonView, mergeRequestedToast } = mergeButton;
 const ALL_STATUSES = [
   "collecting",
   "merging",
+  "finalizing",
   "in_review",
   "merge_failed",
   "merge_stopped",
@@ -90,7 +91,7 @@ test("an unknown status falls back to a disabled button with a real explanation"
 });
 
 test("statuses the daemon refuses a merge from are disabled and say why", () => {
-  for (const status of ["merging", "approved", "cancelled", "deployed"]) {
+  for (const status of ["merging", "finalizing", "approved", "cancelled", "deployed"]) {
     const view = mergeButtonView(status, false);
     assert.equal(view.enabled, false, status);
     assert.ok(view.tip.length > 0, status);
