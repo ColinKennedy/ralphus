@@ -28,9 +28,9 @@
       applyTheme(localStorage.getItem("ralphus-theme") || "dark");
 
       // ---------- resizable panes (RAL-12) ----------
-      // The squads-page sidebar/details columns and the tasks-page details column
-      // are var-driven grid tracks; a thin splitter beside each drags its width.
-      // Widths persist in localStorage.
+      // The squads-page sidebar/details columns, the tasks-page details column,
+      // and the reviews-page sidebar are var-driven grid tracks; a thin splitter
+      // beside each drags its width. Widths persist in localStorage.
       /**
        * @typedef {object} SplitCfgEntry
        * @property {string} key
@@ -48,8 +48,41 @@
         // Same idea for the flat Tasks tab's details pane, whose ceiling is
         // computed by taskDetailsMaxW() so the table pane never collapses below MIN_CENTER_W.
         "--task-details-w": { key: "ralphus-task-details-w", def: 340, min: 240 },
+        // RAL-417: the Reviews page's sidebar gets the same draggable splitter the
+        // Squads page has, but deliberately under its own preference key -- resizing
+        // the Reviews sidebar must never move the Squads sidebar (or its localStorage
+        // entry). No static max: its effective ceiling is computed dynamically by
+        // reviewsSidebarMaxW() so the review detail pane never collapses below
+        // MIN_REVIEW_DETAIL_W.
+        "--reviews-sidebar-w": { key: "ralphus-reviews-sidebar-w", def: 300, min: 180 },
       };
       const MIN_CENTER_W = 240; // guard rail for the middle graph pane, matching --sidebar-w's existing min-width pattern
+      // RALPHUS-REVIEWS-SPLIT:BEGIN
+      // RAL-417: the Reviews sidebar's ceiling -- the review detail pane (the
+      // center column) must never collapse below MIN_REVIEW_DETAIL_W. The 6px
+      // accounts for the splitter track between the two panes.
+      const MIN_REVIEW_DETAIL_W = 240;
+      /**
+       * Computes the Reviews sidebar's max width for a given viewport so the
+       * review detail pane never collapses below MIN_REVIEW_DETAIL_W.
+       * @param {number} viewportW the window's inner width, in CSS pixels
+       * @returns {number}
+       */
+      function reviewsSidebarMaxWFor(viewportW) {
+        // The floor is the sidebar's own min: on a viewport too narrow to keep
+        // the detail pane at 240px (a phone-sized window), the sidebar still
+        // never gets a ceiling below its minimum -- the small-screen media
+        // query stacks the panes at that point instead.
+        return Math.max(SPLIT_CFG["--reviews-sidebar-w"].min, viewportW - 6 - MIN_REVIEW_DETAIL_W);
+      }
+      /**
+       * Computes the Reviews sidebar's dynamic max width for the current viewport.
+       * @returns {number}
+       */
+      function reviewsSidebarMaxW() {
+        return reviewsSidebarMaxWFor(window.innerWidth);
+      }
+      // RALPHUS-REVIEWS-SPLIT:END
       /**
        * Computes the details pane's dynamic max width so the center graph pane never collapses below MIN_CENTER_W.
        * @returns {number}
@@ -71,7 +104,7 @@
        * @param {SplitCfgEntry} c
        * @returns {number}
        */
-      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : varName === "--task-details-w" ? taskDetailsMaxW() : (c.max ?? Infinity); }
+      function paneMax(varName, c) { return varName === "--details-w" ? detailsMaxW() : varName === "--task-details-w" ? taskDetailsMaxW() : varName === "--reviews-sidebar-w" ? reviewsSidebarMaxW() : (c.max ?? Infinity); }
       /** @type {{el: Element, varName: string, invert: boolean, startX: number, startW: number, min: number}|null} */
       let splitDrag = null;
       /**
@@ -115,12 +148,12 @@
         splitDrag = null;
       }
       /**
-       * Wires up mousedown-drag behavior on every `.splitter` element in the squads and tasks pages.
+       * Wires up mousedown-drag behavior on every `.splitter` element in the squads, tasks, and reviews pages.
        * @returns {void}
        */
       function initSplitters() {
         applyPaneWidths();
-        document.querySelectorAll("#squads-page .splitter, #tasks-page .splitter").forEach((sp0) => {
+        document.querySelectorAll("#squads-page .splitter, #tasks-page .splitter, #reviews-page .splitter").forEach((sp0) => {
           const el = /** @type {HTMLElement} */ (sp0);
           el.addEventListener("mousedown", (/** @type {MouseEvent} */ e) => {
             e.preventDefault();
