@@ -36,7 +36,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelToken;
-use crate::forge::{PrCiState, PrFailure};
+use crate::forge::{PrCiProbe, PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;
@@ -274,8 +274,11 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
             );
             return;
         }
-        match client.check_pr_ci_status(number) {
-            Ok(PrCiState::Passing) => {
+        match client.check_pr_ci_status_probe(number) {
+            Ok(PrCiProbe {
+                ci: PrCiState::Passing,
+                draft,
+            }) => {
                 if elapsed < SUCCESS_SETTLE_DURATION {
                     log_ci_watch(
                         store,
@@ -304,9 +307,13 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                 let _ = store
                     .lock()
                     .set_pr_ci_status(&pr.id, PrCiState::Passing.as_str(), None);
+                let _ = store.lock().set_pr_draft(&pr.id, draft);
                 return;
             }
-            Ok(PrCiState::Failing(failure)) => {
+            Ok(PrCiProbe {
+                ci: PrCiState::Failing(failure),
+                draft,
+            }) => {
                 log_ci_watch(
                     store,
                     guardian_id,
@@ -324,10 +331,19 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     PrCiState::Failing(failure.clone()).as_str(),
                     failure.job_url.as_deref(),
                 );
+                let _ = store.lock().set_pr_draft(&pr.id, draft);
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
-            Ok(PrCiState::Pending) => {}
+            Ok(PrCiProbe {
+                ci: PrCiState::Pending,
+                draft,
+            }) => {
+                // Draft is observable even while CI hasn't reached a terminal
+                // verdict -- persist it so the board's PR-state filter doesn't
+                // wait on CI to know a PR is a draft.
+                let _ = store.lock().set_pr_draft(&pr.id, draft);
+            }
             Err(e) => {
                 log_ci_watch(
                     store,
@@ -487,8 +503,8 @@ pub fn poll_open_pr_ci_status(
     };
     for pr in &open {
         let number = pr.pr_number.expect("filtered above");
-        let state = match client.check_pr_ci_status(number) {
-            Ok(s) => s,
+        let probe = match client.check_pr_ci_status_probe(number) {
+            Ok(p) => p,
             Err(e) => {
                 log_ci_watch(
                     store,
@@ -503,6 +519,7 @@ pub fn poll_open_pr_ci_status(
                 continue;
             }
         };
+        let state = probe.ci;
         let job_url = match &state {
             PrCiState::Failing(f) => f.job_url.clone(),
             _ => None,
@@ -510,6 +527,7 @@ pub fn poll_open_pr_ci_status(
         let _ = store
             .lock()
             .set_pr_ci_status(&pr.id, state.as_str(), job_url.as_deref());
+        let _ = store.lock().set_pr_draft(&pr.id, probe.draft);
         if let PrCiState::Failing(failure) = state {
             dispatch_pr_auto_fix(store, runner, &guardian, pr, &failure);
         }

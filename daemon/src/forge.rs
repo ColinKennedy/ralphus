@@ -212,6 +212,40 @@ impl PrCiState {
     }
 }
 
+/// One live probe of a PR/MR (RAL-353): its polled CI + mergeability verdict
+/// [`PrCiState`] *and* its draft (WIP) state, both read from the same forge
+/// response -- see [`ForgeClient::check_pr_ci_status_probe`]. Folding draft
+/// into the CI probe (rather than a second `GET` per poll) is deliberate:
+/// the standing CI poll and the on-demand refresh route persist draft exactly
+/// when they persist CI, at zero extra forge calls, and both fields can never
+/// disagree about which forge observation they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrCiProbe {
+    pub ci: PrCiState,
+    pub draft: bool,
+}
+
+/// Constructor helper for [`PrCiProbe`] -- lets the CI-poll halves return
+/// `Ok(probe(<state>, draft))` instead of spelling out the struct at every
+/// early-return point.
+fn probe(ci: PrCiState, draft: bool) -> PrCiProbe {
+    PrCiProbe { ci, draft }
+}
+
+/// Read a PR/MR's draft (WIP) state out of a forge response object (RAL-353).
+/// Both GitHub and GitLab report drafts through a `draft` boolean on the
+/// pull/merge-request object; GitLab's pre-15.0 field name was
+/// `work_in_progress`, accepted here as a fallback for older-forge compat.
+/// Absent/invalid reads default to `false` (not a draft) -- the same default
+/// [`CreatedPr::draft`]'s doc promises -- so a response shape that stops
+/// including the field can never flip a recorded PR into "draft" by accident.
+fn pr_object_draft(obj: &serde_json::Value) -> bool {
+    obj["draft"]
+        .as_bool()
+        .or_else(|| obj["work_in_progress"].as_bool())
+        .unwrap_or(false)
+}
+
 /// A created pull/merge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPr {
@@ -219,6 +253,11 @@ pub struct CreatedPr {
     pub number: i64,
     /// Web URL a human can open.
     pub url: String,
+    /// RAL-353: whether the forge reports the new PR/MR as a draft (WIP).
+    /// ralphus never submits drafts itself, so this is `false` on every
+    /// create path today -- but the forge still states it in the response
+    /// and it's recorded verbatim so an adoption/refresh can't clobber it.
+    pub draft: bool,
 }
 
 /// An already-open PR/MR discovered via [`ForgeClient::find_open_pull_request`]
@@ -236,6 +275,10 @@ pub struct ExistingPr {
     pub title: String,
     /// Empty when the PR/MR has no description, not absent.
     pub description: String,
+    /// RAL-353: whether the forge reports this PR/MR as a draft (WIP).
+    /// `false` on adoption when the forge doesn't say (legacy response
+    /// shapes), matching the create-side default.
+    pub draft: bool,
 }
 
 /// A registered GitHub-native PR stack (`GET/POST .../stacks`) — GitHub only,
@@ -434,7 +477,11 @@ impl ForgeClient {
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitHub PR response shape: {resp}"))?;
                 let url = resp["html_url"].as_str().unwrap_or_default().to_string();
-                Ok(CreatedPr { number, url })
+                Ok(CreatedPr {
+                    number,
+                    url,
+                    draft: pr_object_draft(&resp),
+                })
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -455,7 +502,11 @@ impl ForgeClient {
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitLab MR response shape: {resp}"))?;
                 let url = resp["web_url"].as_str().unwrap_or_default().to_string();
-                Ok(CreatedPr { number, url })
+                Ok(CreatedPr {
+                    number,
+                    url,
+                    draft: pr_object_draft(&resp),
+                })
             }
         }
     }
@@ -545,6 +596,7 @@ impl ForgeClient {
                     base,
                     title,
                     description,
+                    draft: pr_object_draft(found),
                 }
             }
             ForgeKind::GitLab => {
@@ -583,6 +635,7 @@ impl ForgeClient {
                     base,
                     title,
                     description,
+                    draft: pr_object_draft(found),
                 }
             }
         };
@@ -778,7 +831,7 @@ impl ForgeClient {
     /// pass" -- a failed required check-run/pipeline job, or a forge-verdict
     /// merge conflict, both come back as [`PrCiState::Failing`]. Logs the
     /// outbound call (start/done/error) via `rlog!`.
-    pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+    pub fn check_pr_ci_status_probe(&self, number: i64) -> Result<PrCiProbe, String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -789,11 +842,13 @@ impl ForgeClient {
         let result = self.check_pr_ci_status_inner(number);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-            Ok(state) => crate::rlog!(
+            Ok(probe) => crate::rlog!(
                 DEBUG,
-                "ralphus [forge] check pr ci status done kind={} repo={} number={number} state={state:?}",
+                "ralphus [forge] check pr ci status done kind={} repo={} number={number} state={:?} draft={}",
                 self.kind.as_str(),
-                self.repo_path
+                self.repo_path,
+                probe.ci,
+                probe.draft
             ),
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
@@ -806,14 +861,21 @@ impl ForgeClient {
         result
     }
 
-    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, String> {
+    /// The CI-verdict-only half of [`Self::check_pr_ci_status_probe`], kept
+    /// for callers that only want the verdict and for test compat with every
+    /// pre-RAL-353 assertion that compares a [`PrCiState`] directly.
+    pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        self.check_pr_ci_status_probe(number).map(|probe| probe.ci)
+    }
+
+    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiProbe, String> {
         match self.kind {
             ForgeKind::GitHub => self.check_github_pr_ci_status(number),
             ForgeKind::GitLab => self.check_gitlab_pr_ci_status(number),
         }
     }
 
-    /// GitHub half of [`Self::check_pr_ci_status`]: `mergeable_state` for the
+    /// GitHub half of [`Self::check_pr_ci_status_probe`]: `mergeable_state` for the
     /// conflict verdict (`"dirty"` -- GitHub's own term for "has conflicts"),
     /// then the head commit's check-runs for CI. `"blocked"`/`"behind"`/
     /// `"unknown"` are treated as pending rather than failing -- they mean
@@ -833,7 +895,7 @@ impl ForgeClient {
     /// in-flight legacy status (`total_count > 0`) -- conflating them once
     /// made every such PR report `Pending` forever, no matter how green its
     /// check-runs were.
-    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiProbe, String> {
         let token = self.require_token()?;
         let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
         let pr = self.get(
@@ -841,15 +903,19 @@ impl ForgeClient {
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         )?;
+        let draft = pr_object_draft(&pr);
         if pr["mergeable_state"].as_str() == Some("dirty") {
-            return Ok(PrCiState::Failing(PrFailure {
-                reason: "merge conflicts with the base branch".to_string(),
-                job_url: None,
-                log_text: None,
-            }));
+            return Ok(probe(
+                PrCiState::Failing(PrFailure {
+                    reason: "merge conflicts with the base branch".to_string(),
+                    job_url: None,
+                    log_text: None,
+                }),
+                draft,
+            ));
         }
         let Some(sha) = pr["head"]["sha"].as_str() else {
-            return Ok(PrCiState::Pending);
+            return Ok(probe(PrCiState::Pending, draft));
         };
 
         let checks_url = format!(
@@ -877,18 +943,21 @@ impl ForgeClient {
                     .as_str()
                     .or_else(|| run["output"]["summary"].as_str())
                     .map(str::to_string);
-                return Ok(PrCiState::Failing(PrFailure {
-                    reason: format!("check '{name}' failed"),
-                    job_url,
-                    log_text,
-                }));
+                return Ok(probe(
+                    PrCiState::Failing(PrFailure {
+                        reason: format!("check '{name}' failed"),
+                        job_url,
+                        log_text,
+                    }),
+                    draft,
+                ));
             }
         }
         if runs
             .iter()
             .any(|r| r["status"].as_str() != Some("completed"))
         {
-            return Ok(PrCiState::Pending);
+            return Ok(probe(PrCiState::Pending, draft));
         }
 
         let status_url = format!(
@@ -914,11 +983,14 @@ impl ForgeClient {
             let job_url = failing_context
                 .and_then(|c| c["target_url"].as_str())
                 .map(str::to_string);
-            return Ok(PrCiState::Failing(PrFailure {
-                reason,
-                job_url,
-                log_text: None,
-            }));
+            return Ok(probe(
+                PrCiState::Failing(PrFailure {
+                    reason,
+                    job_url,
+                    log_text: None,
+                }),
+                draft,
+            ));
         }
         // GitHub's combined-status endpoint defaults `state` to `"pending"`
         // whenever the commit has zero legacy commit statuses at all
@@ -936,46 +1008,53 @@ impl ForgeClient {
         if status["total_count"].as_i64().unwrap_or(0) > 0
             && status["state"].as_str() == Some("pending")
         {
-            return Ok(PrCiState::Pending);
+            return Ok(probe(PrCiState::Pending, draft));
         }
 
-        Ok(PrCiState::Passing)
+        Ok(probe(PrCiState::Passing, draft))
     }
 
-    /// GitLab half of [`Self::check_pr_ci_status`]: `merge_status` for the
+    /// GitLab half of [`Self::check_pr_ci_status_probe`]: `merge_status` for the
     /// conflict verdict, then the MR's pipeline + (on failure) that
     /// pipeline's failed job trace for CI. GitLab reports `merge_status` as
     /// `"cannot_be_merged"` for a real conflict; other non-`"can_be_merged"`
     /// values (`"unchecked"`, `"checking"`) mean GitLab hasn't finished
     /// computing it yet, so they're treated as pending, not failing.
-    fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+    fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiProbe, String> {
         let token = self.require_token()?;
         let mr_url = format!(
             "{}/projects/{}/merge_requests/{number}",
             self.api_base, self.repo_path
         );
         let mr = self.get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+        let draft = pr_object_draft(&mr);
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
-            return Ok(PrCiState::Failing(PrFailure {
-                reason: "merge conflicts with the target branch".to_string(),
-                job_url: None,
-                log_text: None,
-            }));
+            return Ok(probe(
+                PrCiState::Failing(PrFailure {
+                    reason: "merge conflicts with the target branch".to_string(),
+                    job_url: None,
+                    log_text: None,
+                }),
+                draft,
+            ));
         }
 
         let Some(pipeline_status) = mr["pipeline"]["status"].as_str() else {
             // No pipeline has run against this MR yet.
-            return Ok(PrCiState::Pending);
+            return Ok(probe(PrCiState::Pending, draft));
         };
         match pipeline_status {
-            "success" => Ok(PrCiState::Passing),
+            "success" => Ok(probe(PrCiState::Passing, draft)),
             "failed" => {
                 let Some(pipeline_id) = mr["pipeline"]["id"].as_i64() else {
-                    return Ok(PrCiState::Failing(PrFailure {
-                        reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
-                        log_text: None,
-                    }));
+                    return Ok(probe(
+                        PrCiState::Failing(PrFailure {
+                            reason: "pipeline failed".to_string(),
+                            job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                            log_text: None,
+                        }),
+                        draft,
+                    ));
                 };
                 let jobs_url = format!(
                     "{}/projects/{}/pipelines/{pipeline_id}/jobs?scope[]=failed",
@@ -987,29 +1066,38 @@ impl ForgeClient {
                     .and_then(|v| v.as_array().cloned())
                     .unwrap_or_default();
                 let Some(job) = jobs.first() else {
-                    return Ok(PrCiState::Failing(PrFailure {
-                        reason: "pipeline failed".to_string(),
-                        job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
-                        log_text: None,
-                    }));
+                    return Ok(probe(
+                        PrCiState::Failing(PrFailure {
+                            reason: "pipeline failed".to_string(),
+                            job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                            log_text: None,
+                        }),
+                        draft,
+                    ));
                 };
                 let job_name = job["name"].as_str().unwrap_or("job");
                 let job_id = job["id"].as_i64();
                 let job_url = job["web_url"].as_str().map(str::to_string);
                 let log_text = job_id.and_then(|id| self.gitlab_job_trace(id, token).ok());
-                Ok(PrCiState::Failing(PrFailure {
-                    reason: format!("job '{job_name}' failed"),
-                    job_url,
-                    log_text,
-                }))
+                Ok(probe(
+                    PrCiState::Failing(PrFailure {
+                        reason: format!("job '{job_name}' failed"),
+                        job_url,
+                        log_text,
+                    }),
+                    draft,
+                ))
             }
-            "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
-                reason: format!("pipeline {pipeline_status}"),
-                job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
-                log_text: None,
-            })),
+            "canceled" | "skipped" => Ok(probe(
+                PrCiState::Failing(PrFailure {
+                    reason: format!("pipeline {pipeline_status}"),
+                    job_url: mr["pipeline"]["web_url"].as_str().map(str::to_string),
+                    log_text: None,
+                }),
+                draft,
+            )),
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
-            _ => Ok(PrCiState::Pending),
+            _ => Ok(probe(PrCiState::Pending, draft)),
         }
     }
 
@@ -4325,6 +4413,89 @@ mod tests {
             Some("tok".to_string()),
         );
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_object_draft_reads_the_forges_own_draft_field() {
+        // GitHub's PR object and GitLab's MR object both report draft state
+        // through a `draft` boolean -- one parser serves both.
+        let github = serde_json::json!({"draft": true});
+        assert!(pr_object_draft(&github));
+        let gitlab = serde_json::json!({"draft": true});
+        assert!(pr_object_draft(&gitlab));
+        let not_draft = serde_json::json!({"draft": false});
+        assert!(!pr_object_draft(&not_draft));
+    }
+
+    #[test]
+    fn pr_object_draft_falls_back_to_gitlabs_legacy_work_in_progress_field() {
+        // GitLab renamed `work_in_progress` to `draft` in 15.0 -- older
+        // instances still answer with the legacy field, so it's read as a
+        // fallback rather than defaulting a real WIP MR to not-draft.
+        let legacy = serde_json::json!({"work_in_progress": true});
+        assert!(pr_object_draft(&legacy));
+    }
+
+    #[test]
+    fn pr_object_draft_defaults_to_not_draft_when_absent_or_non_boolean() {
+        // A response shape without the field -- or with a non-boolean value --
+        // must never flip a recorded PR into "draft".
+        let absent = serde_json::json!({});
+        assert!(!pr_object_draft(&absent));
+        let nullish = serde_json::json!({"draft": null});
+        assert!(!pr_object_draft(&nullish));
+    }
+
+    #[test]
+    fn check_pr_ci_status_probe_returns_draft_from_the_same_response_as_the_verdict() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Two probe cycles: the combined probe first, then the CI-only
+            // accessor -- each performs the same 3-request GitHub sequence.
+            for _ in 0..2 {
+                let req = server.recv().unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(
+                        r#"{"mergeable_state": "clean", "draft": true, "head": {"sha": "deadbeef"}}"#,
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+                let req = server.recv().unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(
+                        r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+                let req = server.recv().unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(r#"{"state": "success"}"#)
+                        .with_status_code(200),
+                )
+                .unwrap();
+            }
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        // The combined probe carries both fields from the one PR response;
+        // the CI-only accessor still returns exactly the verdict, keeping
+        // every pre-RAL-353 caller/test shape intact.
+        assert_eq!(
+            client.check_pr_ci_status_probe(4).unwrap(),
+            PrCiProbe {
+                ci: PrCiState::Passing,
+                draft: true
+            }
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
         handle.join().unwrap();
     }
 

@@ -60,6 +60,7 @@ const exported = [
   "ttTaskNeedsMe",
   "ttCompareRows",
   "ttRowMatchesFilters",
+  "ttRowMatchesPrFilter",
   "ttGroupAggregate",
   "ttVisibleRange",
   "ttBuildDisplayList",

@@ -11549,15 +11549,18 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
     crate::pr::start_pull_pr_commits(daemon.store_handle(), runner, pr_id)
 }
 
-/// Live-poll the forge for this PR's current CI/mergeability status on
-/// demand (RAL-402) -- a complement to `ci_watch::poll_open_pr_ci_status`'s
-/// standing, per-guardian-throttled poll, not a replacement for it: lets the
-/// board refresh a single PR's badge color immediately (e.g. from the Tasks
-/// tab's "Check PR" action) instead of waiting for the next standing-poll
-/// tick. Persists the result the same way the standing poll does
-/// (`Store::set_pr_ci_status`), so it's also picked up by the next
-/// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
-/// go through the same `ForgeClient::check_pr_ci_status`.
+/// Live-poll the forge for this PR's current CI/mergeability + draft status
+/// on demand (RAL-402, extended by RAL-353 to refresh draft too) -- a
+/// complement to `ci_watch::poll_open_pr_ci_status`'s standing,
+/// per-guardian-throttled poll, not a replacement for it: lets the board
+/// refresh a single PR's badge color immediately (e.g. from the Tasks tab's
+/// "Check PR" action) instead of waiting for the next standing-poll tick.
+/// Persists the result the same way the standing poll does
+/// (`Store::set_pr_ci_status`/`Store::set_pr_draft`), so it's also picked
+/// up by the next `GET /api/pull-requests/index` poll -- and the Tasks tab's
+/// PR filter re-runs its row predicate over the fresh data on that poll.
+/// Identical for GitHub/GitLab -- both go through the same
+/// `ForgeClient::check_pr_ci_status_probe`.
 fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     let store = daemon.lock();
     let pr = match store.get_pull_request(pr_id) {
@@ -11577,10 +11580,11 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
-    let state = match client.check_pr_ci_status(pr_number) {
-        Ok(s) => s,
+    let probe = match client.check_pr_ci_status_probe(pr_number) {
+        Ok(p) => p,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
+    let state = probe.ci;
     let job_url = match &state {
         crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
         _ => None,
@@ -11588,6 +11592,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
         return store_error(&e);
     }
+    let _ = store.set_pr_draft(pr_id, probe.draft);
     match store.get_pull_request(pr_id) {
         Ok(pr) => json(200, &pr),
         Err(e) => store_error(&e),
@@ -22012,6 +22017,33 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains(&pr_id));
         assert!(r.body.contains("\"ci_status\":\"passing\""));
+    }
+
+    #[test]
+    fn pr_index_lists_pr_draft_state() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request_ex(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/draft",
+                "main",
+                "Draft work",
+                "",
+                Some(43),
+                Some("https://github.com/acme/widget/pull/43"),
+                Some("stack-1"),
+                true,
+            )
+            .unwrap();
+        let r = route(&d, "GET", "/api/pull-requests/index", "");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains(&pr_id));
+        assert!(r.body.contains("\"draft\":true"));
     }
 
     #[test]

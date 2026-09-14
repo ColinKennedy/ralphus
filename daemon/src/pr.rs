@@ -127,6 +127,14 @@ pub struct PullRequestView {
     /// `None` if never attempted for the current failure (or the PR isn't
     /// currently failing).
     pub auto_fix_attempted_at_ms: Option<i64>,
+    /// RAL-353: whether the forge currently reports this PR/MR as a draft
+    /// (WIP). Written at create/adopt time from the forge's own `draft`
+    /// field, then kept fresh by every CI probe
+    /// (`crate::forge::ForgeClient::check_pr_ci_status_probe`, which reads it
+    /// from the same response as the CI verdict). `None` for a row recorded
+    /// before the column existed and never polled since -- the board treats
+    /// that as not-draft.
+    pub draft: Option<bool>,
 }
 
 /// One past "submit a stack" call for a review (RAL-302): every PR row that
@@ -203,6 +211,8 @@ pub struct PrIndexRow {
     pub source_cell_idx: Option<i64>,
     /// RAL-395: see [`PullRequestView::ci_status`].
     pub ci_status: Option<String>,
+    /// RAL-353: see [`PullRequestView::draft`].
+    pub draft: Option<bool>,
 }
 
 struct PrRow {
@@ -228,6 +238,7 @@ struct PrRow {
     ci_status: Option<String>,
     ci_failure_job_url: Option<String>,
     auto_fix_attempted_at_ms: Option<i64>,
+    draft: Option<bool>,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -255,11 +266,12 @@ impl From<PrRow> for PullRequestView {
             ci_status: r.ci_status,
             ci_failure_job_url: r.ci_failure_job_url,
             auto_fix_attempted_at_ms: r.auto_fix_attempted_at_ms,
+            draft: r.draft,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -285,6 +297,7 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         ci_status: r.get(19)?,
         ci_failure_job_url: r.get(20)?,
         auto_fix_attempted_at_ms: r.get(21)?,
+        draft: r.get(22)?,
     })
 }
 
@@ -316,6 +329,7 @@ impl Store {
             pr_number,
             pr_url,
             None,
+            false,
         )
     }
 
@@ -323,7 +337,9 @@ impl Store {
     /// (RAL-302): the same value passed for every PR row created by one
     /// "submit a stack" call, so those sibling rows are queryable as a single
     /// past submission later, even if some of them are since dropped
-    /// (see [`Self::drop_pull_request`]).
+    /// (see [`Self::drop_pull_request`]). `draft` (RAL-353) is the forge's
+    /// own draft (WIP) state from the create/adopt response, recorded verbatim
+    /// so an adoption/refresh can't clobber it.
     #[allow(clippy::too_many_arguments)]
     pub fn create_pull_request_ex(
         &self,
@@ -338,6 +354,7 @@ impl Store {
         pr_number: Option<i64>,
         pr_url: Option<&str>,
         stack_id: Option<&str>,
+        draft: bool,
     ) -> Result<String> {
         let id = self.next_id("guardian_pr_seq", "pr")?;
         let now = now_ms();
@@ -345,8 +362,8 @@ impl Store {
             "INSERT INTO guardian_pull_requests(
                 id, guardian_id, branch_id, forge, repo, branch_alias, base_ref,
                 title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms,
-                stack_id
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)",
+                stack_id, draft
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?)",
             params![
                 id,
                 guardian_id,
@@ -362,6 +379,7 @@ impl Store {
                 now,
                 now,
                 stack_id,
+                draft,
             ],
         )?;
         Ok(id)
@@ -447,7 +465,8 @@ impl Store {
                     s.squad_id AS source_squad_id,
                     s.task_idx AS source_task_idx,
                     s.idx AS source_cell_idx,
-                    pr.ci_status
+                    pr.ci_status,
+                    pr.draft
              FROM guardian_pull_requests pr
              LEFT JOIN guardian_branches gb ON gb.id = pr.branch_id
              LEFT JOIN cells s ON s.rowid = (
@@ -475,6 +494,7 @@ impl Store {
                     source_task_idx: r.get(12)?,
                     source_cell_idx: r.get(13)?,
                     ci_status: r.get(14)?,
+                    draft: r.get(15)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -754,6 +774,23 @@ impl Store {
                  auto_fix_attempted_at_ms = CASE WHEN ?='failing' THEN auto_fix_attempted_at_ms ELSE NULL END
              WHERE id=?",
             params![status, job_url, now_ms(), status, id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-353: record a PR/MR's current draft (WIP) state as observed from
+    /// the forge -- written at create/adopt time and refreshed by every CI
+    /// probe (`crate::forge::ForgeClient::check_pr_ci_status_probe`), which
+    /// reads it from the same PR response that yields the CI verdict, so the
+    /// two can never disagree about which forge observation they came from.
+    pub fn set_pr_draft(&self, id: &str, draft: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET draft=?, updated_at_ms=? WHERE id=?",
+            params![draft, now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -2364,6 +2401,7 @@ fn maybe_promote_fork_root(
         Some(created.number),
         Some(&created.url),
         successor_pr.stack_id.as_deref(),
+        created.draft,
     );
     let _ = store.lock().update_pull_request_ex(
         &successor_pr.id,
@@ -4127,6 +4165,7 @@ fn submit_stacked_branch_pr(
                     crate::forge::CreatedPr {
                         number: existing.number,
                         url: existing.url,
+                        draft: existing.draft,
                     },
                     existing.base,
                     existing.title,
@@ -4161,6 +4200,7 @@ fn submit_stacked_branch_pr(
             Some(created_pr.number),
             Some(&created_pr.url),
             Some(stack_id),
+            created_pr.draft,
         )
         .map_err(|e| e.to_string())?;
     if let Some(sha) = &pushed_sha {
@@ -6386,6 +6426,7 @@ mod tests {
             ci_status: None,
             ci_failure_job_url: None,
             auto_fix_attempted_at_ms: None,
+            draft: None,
         }
     }
 
@@ -11455,5 +11496,117 @@ mod tests {
         );
         assert_eq!(cache.local_sha.as_deref(), Some("stale-local"));
         assert_eq!(cache.in_sync, Some(true));
+    }
+
+    #[test]
+    fn create_pull_request_ex_persists_the_forges_own_draft_state() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let id = s
+            .create_pull_request_ex(
+                &gid,
+                None,
+                "github",
+                "acme/widget",
+                "feature/x",
+                "main",
+                "X",
+                "",
+                Some(9),
+                Some("https://example.invalid/pr/9"),
+                Some("stack-1"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().draft, Some(true));
+    }
+
+    #[test]
+    fn create_pull_request_plain_wrapper_records_no_draft() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let id = s
+            .create_pull_request(
+                &gid,
+                None,
+                "github",
+                "acme/widget",
+                "feature/x",
+                "main",
+                "X",
+                "",
+                Some(9),
+                Some("https://example.invalid/pr/9"),
+            )
+            .unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().draft, Some(false));
+    }
+
+    #[test]
+    fn set_pr_draft_records_and_overwrites_the_forge_observed_state() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let id = s
+            .create_pull_request(
+                &gid,
+                None,
+                "github",
+                "acme/widget",
+                "feature/x",
+                "main",
+                "X",
+                "",
+                None,
+                None,
+            )
+            .unwrap();
+        // Simulate a legacy row recorded before the `draft` column existed
+        // (the plain wrapper writes Some(false) today): force the column back
+        // to NULL the way an old DB's migration would leave it, and confirm
+        // it reads back as None -- the board treats that as not-draft.
+        s.conn
+            .execute(
+                "UPDATE guardian_pull_requests SET draft=NULL WHERE id=?",
+                params![id],
+            )
+            .unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().draft, None);
+        s.set_pr_draft(&id, true).unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().draft, Some(true));
+        s.set_pr_draft(&id, false).unwrap();
+        assert_eq!(s.get_pull_request(&id).unwrap().draft, Some(false));
+    }
+
+    #[test]
+    fn list_pull_requests_index_carries_draft_state() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        s.add_guardian_branch(&gid, "feature/x").unwrap();
+        let bid = s.get_guardian(&gid).unwrap().branches[0].id.clone();
+        let id = s
+            .create_pull_request_ex(
+                &gid,
+                Some(&bid),
+                "github",
+                "acme/widget",
+                "feature/x",
+                "main",
+                "X",
+                "",
+                Some(9),
+                Some("https://example.invalid/pr/9"),
+                None,
+                true,
+            )
+            .unwrap();
+        s.set_pr_ci_status(&id, "failing", None).unwrap();
+        let row = s
+            .list_pull_requests_index()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(row.draft, Some(true));
+        assert_eq!(row.ci_status, Some("failing".to_string()));
     }
 }
