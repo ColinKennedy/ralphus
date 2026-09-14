@@ -202,7 +202,8 @@
         // entry even though periodic auto-update is off by default.
         if (name === "queue") queueLoaded = false;
         syncHash(push);
-        tick();
+        // RAL-414: dormant unless `?ralphusTiming=1` -- see `85-perf-timing.js`.
+        (/** @type {any} */ (window).RalphusTiming || { timeNav: (/** @type {any} */ _, /** @type {any} */ fn) => fn() }).timeNav(name, tick);
       }
       /**
        * Shows or hides the admin-only tab buttons (RAL-332) to match

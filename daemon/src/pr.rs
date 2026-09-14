@@ -7048,6 +7048,7 @@ fn reply(status: u16, body: &serde_json::Value) -> Reply {
     Reply {
         status,
         body: body.to_string(),
+        server_timing: None,
     }
 }
 

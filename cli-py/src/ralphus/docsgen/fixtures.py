@@ -60,6 +60,9 @@ __all__ = [
     "guardian",
     "hidden_item_entry",
     "machine_provider",
+    "many_projects",
+    "many_squads_with_tasks",
+    "many_worktree_retirement_rows",
     "message",
     "project",
     "proof_step",
@@ -68,6 +71,7 @@ __all__ = [
     "secret_env_name_entry",
     "squad",
     "task",
+    "task_index_squads_from",
     "triage_pool_entry",
     "triage_schedule_entry",
     "triage_type_entry",
@@ -1290,3 +1294,228 @@ PREFS_ROUTES: Routes = {
     "/api/queue": {"items": []},
     "/api/hidden": {"hidden": list(PREFS_HIDDEN_ITEMS)},
 }
+
+# ---------------------------------------------------------------------------
+# RAL-414: load-scale generators for cold-navigation performance tests
+# (cli-py/tests/test_board_cold_load_perf.py). Every generator above this
+# point is deliberately sized for pixel-stable doc screenshots (a handful of
+# rows); these instead produce hundreds of rows, to exercise the same board
+# tabs under realistic load. Still pure/deterministic -- no `random`, no
+# wall-clock-derived data -- same "isolated representative fixtures" spirit,
+# just bigger.
+# ---------------------------------------------------------------------------
+
+#: Lifecycle states `daemon/src/guardian_merge.rs`'s `WorktreeRetirementEntry`
+#: doc comment enumerates, in the same order the board's own
+#: `RETIREMENT_STATES` (librarian/assets/board/81-worktree-retirement.js) lists
+#: them -- see `WORKTREE_RETIREMENT_ROWS` above for the one-row-per-state
+#: version this mirrors at load scale.
+_RETIREMENT_STATES: tuple[str, ...] = (
+    "scheduled",
+    "eligible",
+    "claimed",
+    "failed",
+    "deferred",
+    "opted_out",
+    "retired",
+)
+
+
+def many_worktree_retirement_rows(n: int = 650) -> tuple[Json, ...]:
+    """``n`` worktree-retirement rows, deterministically cycled across every
+    lifecycle state in ``_RETIREMENT_STATES`` (not ``n`` copies of one state),
+    so the Retirements tab's load test exercises every state's distinct
+    detail-column rendering (claim/error/retry-hint text) at scale.
+    """
+    rows = []
+    for i in range(n):
+        state = _RETIREMENT_STATES[i % len(_RETIREMENT_STATES)]
+        guardian_id = f"guardian-heavy-{i:06d}"
+        name = f"heavy-retirement-{i:06d}"
+        eligible_at_ms = 1_783_000_000_000 + i * 1_000
+        extra: Json = {}
+        if state == "claimed":
+            extra = {"claim_kind": "merge", "claim_owner": "colin", "claim_state": "running"}
+        elif state == "failed":
+            extra = {
+                "error": "permission denied removing worktree",
+                "last_attempt_ms": eligible_at_ms + 500,
+            }
+        elif state == "deferred":
+            extra = {
+                "error": "machine provider is mid-snapshot, try again later",
+                "last_attempt_ms": eligible_at_ms + 500,
+                "retry_at_ms": eligible_at_ms + 100_000,
+            }
+        elif state == "opted_out":
+            extra = {
+                "error": "static machine retirement policy excludes this provider",
+                "last_attempt_ms": eligible_at_ms + 500,
+            }
+        elif state == "retired":
+            extra = {"last_attempt_ms": eligible_at_ms + 500}
+        rows.append(
+            worktree_retirement_entry(
+                guardian_id,
+                name,
+                project_root=_REPO,
+                path=f"{_REPO}-worktrees/{name}-review",
+                state=state,
+                eligible_at_ms=eligible_at_ms,
+                **extra,
+            )
+        )
+    return tuple(rows)
+
+
+#: Squad/task states cycled deterministically by `many_squads_with_tasks`,
+#: mirroring `librarian/assets/board/05-engines.js`'s `STATES` constant.
+_HEAVY_SQUAD_STATES: tuple[str, ...] = (
+    "running",
+    "done",
+    "failed",
+    "pending",
+    "queued",
+    "cancelled",
+)
+_HEAVY_TASK_STATES: tuple[str, ...] = ("running", "done", "failed", "pending")
+
+
+def many_squads_with_tasks(num_squads: int = 250, tasks_per_squad: int = 4) -> tuple[Json, ...]:
+    """``num_squads`` squads x ``tasks_per_squad`` tasks (one cell each),
+    matching ``TASKS_SQUADS``' rich shape (the real ``/api/tasks``
+    ``SquadView`` -- ``squad()``/``task()``/``cell()``). States cycle
+    deterministically across ``_HEAVY_SQUAD_STATES``/``_HEAVY_TASK_STATES``
+    for a realistic mix at load scale, not ``n`` copies of one state.
+
+    This is the Squads tab's own load fixture. The Tasks tab's
+    ``/api/task-index`` needs a *different* wire shape (``TaskIndexBoard`` in
+    ``daemon/src/server.rs`` -- no prompt/command/depends_on/created_at_ms,
+    but it adds cache/compaction/cost_is_estimated/started_at_ms/
+    finished_at_ms fields the rich shape never carries); see
+    ``task_index_squads_from`` below, which derives that shape from this same
+    fixture so both tabs' load tests share one 250x4 source of truth.
+    """
+    squads = []
+    for i in range(num_squads):
+        tasks = []
+        for t in range(tasks_per_squad):
+            state = _HEAVY_TASK_STATES[(i + t) % len(_HEAVY_TASK_STATES)]
+            cells = (
+                cell(
+                    f"cell-{i:06d}-{t}-0",
+                    f"heavy-cell-{i:06d}-{t}",
+                    cwd=_REPO,
+                    agent="claude",
+                    model="claude-sonnet-5",
+                    prompt=f"do heavy task work for squad {i}, task {t}",
+                    state=state,
+                    tokens_in=1_000 + t,
+                    tokens_out=200 + t,
+                    cost_usd=0.01,
+                ),
+            )
+            tasks.append(
+                task(
+                    f"heavy-task-{i:06d}-{t}",
+                    project="ralphus",
+                    state=state,
+                    cells=cells,
+                )
+            )
+        squads.append(
+            squad(
+                f"squad-heavy-{i:06d}",
+                state=_HEAVY_SQUAD_STATES[i % len(_HEAVY_SQUAD_STATES)],
+                created_at_ms=1_783_000_000_000 + i * 1_000,
+                label=f"heavy-squad-{i:06d}",
+                tasks=tuple(tasks),
+            )
+        )
+    return tuple(squads)
+
+
+def _task_index_proof(p: Json) -> Json:
+    return {
+        "id": p["id"],
+        "kind": p["kind"],
+        "state": p["state"],
+        "tokens_in": p.get("tokens_in", 0),
+        "tokens_out": p.get("tokens_out", 0),
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "compaction_input_tokens": 0,
+        "compaction_count": 0,
+        "cost_usd": p.get("cost_usd", 0.0),
+        "cost_is_estimated": False,
+    }
+
+
+def _task_index_cell(c: Json) -> Json:
+    return {
+        "id": c["id"],
+        "name": c.get("name"),
+        "agent": c.get("agent", "claude"),
+        "model": c.get("model"),
+        "state": c["state"],
+        "tokens_in": c.get("tokens_in", 0),
+        "tokens_out": c.get("tokens_out", 0),
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "compaction_input_tokens": 0,
+        "compaction_count": 0,
+        "cost_usd": c.get("cost_usd", 0.0),
+        "cost_is_estimated": False,
+        "error": c.get("error"),
+        "proof": [_task_index_proof(p) for p in c.get("proof", [])],
+        "reviews": c.get("reviews", []),
+        "triage_types": [],
+        "started_at_ms": None,
+        "finished_at_ms": None,
+    }
+
+
+def _task_index_task(t: Json) -> Json:
+    return {
+        "name": t["name"],
+        "project": t["project"],
+        "agent": None,
+        "model": None,
+        "state": t["state"],
+        "error": None,
+        "cells": [_task_index_cell(c) for c in t.get("cells", [])],
+        "proof": [_task_index_proof(p) for p in t.get("proof", [])],
+        "started_at_ms": None,
+        "finished_at_ms": None,
+    }
+
+
+def task_index_squads_from(squads: tuple[Json, ...]) -> tuple[Json, ...]:
+    """Derives the compact ``/api/task-index`` ``TaskIndexBoard`` shape
+    (``daemon/src/server.rs``'s ``TaskIndexSquad``/``TaskIndexTask``/
+    ``TaskIndexCell``/``TaskIndexProof``) from the rich ``/api/tasks``
+    ``SquadView`` shape ``many_squads_with_tasks`` returns -- see that
+    function's docstring for why the two differ.
+    """
+    return tuple(
+        {
+            "id": s["id"],
+            "label": s.get("label"),
+            "state": s["state"],
+            "tasks": [_task_index_task(t) for t in s.get("tasks", [])],
+        }
+        for s in squads
+    )
+
+
+def many_projects(n: int = 300) -> tuple[Json, ...]:
+    """``n`` registered projects matching ``PROJECTS_ROWS``' shape via ``project()``."""
+    return tuple(
+        project(
+            f"heavy-project-{i:06d}",
+            description=f"load-test project #{i:06d}",
+            path=f"C:/repo/heavy-project-{i:06d}",
+            created_at_ms=1_783_000_000_000 + i * 1_000,
+        )
+        for i in range(n)
+    )
