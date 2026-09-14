@@ -29,6 +29,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeTasksPoll, makeWhoAmIPoll, resolveJson } from "./board-tasks-poll.mjs";
+import { selTransition } from "./board-sel-transition.mjs";
 
 // ---------- updateCounter / pollTasks: shared in-flight request + ticket ----------
 
@@ -163,6 +164,87 @@ test("invalidateTasksFetch: does not clobber a newer in-flight request that alre
   resolveJson(poll.pendingFetches[1], { daemon: { running: 0, max_concurrent: 2 }, squads: [{ id: "s-1", state: "cancelled" }] });
   await Promise.all([freshPromise, thirdPromise]);
   assert.deepEqual(poll.state().squads, [{ id: "s-1", state: "cancelled" }]);
+});
+
+// ---------- RAL-419: selection caches riding the poll ----------
+
+function squadView(id, tasks = []) {
+  return { id, label: id, state: "done", created_at_ms: 1, tasks };
+}
+
+test("RAL-419: a refresh prunes dead-squad entries and reconciles the live selection", async () => {
+  const poll = makeTasksPoll({ selectedSquadId: "s-alive" });
+  poll.state().squadSelCache["s-deleted"] = { kind: "cell", taskIdx: 0, cellIdx: 0, proofIdx: -1 };
+  poll.state().squadSelCache["s-alive"] = { kind: "squad", taskIdx: 0, cellIdx: 0, proofIdx: -1 };
+  poll.state().squadNodeCache["s-deleted"] = ["cell:0:0:-1"];
+  const promise = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 1 }, squads: [squadView("s-alive")] });
+  await promise;
+  const s = poll.state();
+  assert.equal(s.squadSelCache["s-deleted"], undefined, "the deleted squad's entry is pruned");
+  assert.equal(s.squadNodeCache["s-deleted"], undefined, "the deleted squad's node keys are pruned too");
+  assert.deepEqual(s.squadSelCache["s-alive"], { kind: "squad", taskIdx: 0, cellIdx: 0, proofIdx: -1 }, "the surviving squad's entry stays");
+  assert.deepEqual(poll.calls.pruned[0], ["s-alive"], "prune is fed the fresh full squad-id list");
+});
+
+test("RAL-419: a refresh that removes the selected node drops the live selection to its nearest surviving parent and clears the stale entry", async () => {
+  const poll = makeTasksPoll({ selectedSquadId: "s-alive" });
+  const seed = poll.state().sel;
+  seed.kind = "cell"; seed.taskIdx = 0; seed.cellIdx = 7; seed.proofIdx = -1; // dangling: cell 7 does not exist
+  poll.state().squadSelCache["s-alive"] = { kind: "cell", taskIdx: 0, cellIdx: 7, proofIdx: -1 };
+  poll.state().squadNodeCache["s-alive"] = ["cell:0:7:-1"];
+  const squad = squadView("s-alive", [{
+    name: "t0", project: "p", agent: null, model: null, state: "done", soloed: false,
+    cells: [{ id: "c0", cwd: ".", agent: "claude", model: null, state: "done" }],
+  }]);
+  const promise = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 1 }, squads: [squad] });
+  await promise;
+  const s = poll.state();
+  assert.deepEqual(s.sel, { kind: "task", taskIdx: 0, cellIdx: -1, proofIdx: -1 }, "falls back to the nearest surviving parent (the task)");
+  assert.equal(s.squadSelCache["s-alive"], undefined, "the stale cache entry is cleared");
+  assert.equal(s.squadNodeCache["s-alive"], undefined, "the stale node keys are cleared");
+  assert.equal(s.nodeMultiSel.size, 0, "no dead multi keys ride along");
+});
+
+test("RAL-419: no selection + squads present routes to restoreInitialSquadSelection (last-focused restore)", async () => {
+  const poll = makeTasksPoll({
+    selectedSquadId: null,
+    selectionOps: { applySquadFocus: (id) => { poll.calls.appliedFocus.push(id); } },
+  });
+  const promise = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 1 }, squads: [squadView("s-1")] });
+  await promise;
+  assert.deepEqual(poll.calls.appliedFocus, ["s-1"], "first paint with squads but no selection must restore the initial squad");
+});
+
+test("RAL-419: a resolved pending hash updates the per-squad cache after resolution", async () => {
+  const target = squadView("s-9", [{ name: "t0", project: "p", agent: null, model: null, state: "done", soloed: false, cells: [{ id: "c0", cwd: ".", agent: "claude", model: null, state: "done" }] }]);
+  let settledWith = null;
+  const ops = {
+    squadForPendingHash: (ph) => (ph.squadId === target.id ? target : undefined),
+    selForPendingHash: (ph, squad) => { settledWith = squad; return { kind: "cell", taskIdx: 0, cellIdx: 0, proofIdx: -1 }; },
+  };
+  const poll = makeTasksPoll({ pendingHash: { tab: "squads", squadId: target.id }, selectedSquadId: null, selectionOps: ops });
+  const promise = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 1 }, squads: [target] });
+  await promise;
+  const s = poll.state();
+  assert.equal(settledWith, target, "settlement must pass the resolved squad view");
+  assert.deepEqual(s.sel, { kind: "cell", taskIdx: 0, cellIdx: 0, proofIdx: -1 }, "the hash's authoritative selection drives the details pane");
+  assert.deepEqual(s.squadSelCache[target.id], { kind: "cell", taskIdx: 0, cellIdx: 0, proofIdx: -1 }, "the cache is updated from the resolved selection, not before it");
+});
+
+test("RAL-419: a pending hash whose target squad never loads falls back to the initial restore path", async () => {
+  const poll = makeTasksPoll({
+    pendingHash: { tab: "squads", squadId: "s-gone" },
+    selectedSquadId: null,
+    selectionOps: { applySquadFocus: (id) => { poll.calls.appliedFocus.push(id); } },
+  });
+  const promise = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], { daemon: { running: 0, max_concurrent: 1 }, squads: [squadView("s-1")] });
+  await promise;
+  assert.deepEqual(poll.calls.appliedFocus, ["s-1"], "falls back to the initial restore path");
 });
 
 // ---------- pollWhoAmI: its own ticket ----------

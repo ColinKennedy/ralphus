@@ -167,6 +167,7 @@
           nodeMultiSel = item ? new Set([item.key]) : new Set();
         }
         sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi };
+        storeSquadSelection(selectedSquadId, sel, [...nodeMultiSel]);
         editing = false;
         renderGraph();
         renderDetails();
@@ -551,7 +552,12 @@
        * @param {string} id
        * @returns {void}
        */
-      function gotoSquad(id) { clearNodeMultiSel(); selectedSquadId = id; revealedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false; showTab("squads", true); }
+      function gotoSquad(id) {
+        selectedSquadId = id; revealedSquadId = id; sel = squadLevelSel();
+        nodeMultiSel = new Set();
+        storeSquadSelection(id, sel, []);
+        editing = false; showTab("squads", true);
+      }
       /**
        * Navigates to the Squads tab and selects a specific task/cell/proof item within a squad.
        * @param {string} squadId
@@ -561,7 +567,13 @@
        * @param {number} vi
        * @returns {void}
        */
-      function gotoSquadItem(squadId, kind, ti, si, vi) { clearNodeMultiSel(); selectedSquadId = squadId; revealedSquadId = squadId; sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi }; editing = false; showTab("squads", true); }
+      function gotoSquadItem(squadId, kind, ti, si, vi) {
+        const item = graphNodeItem(squadId, /** @type {"task"|"cell"|"proof"} */ (kind), ti, si, vi);
+        nodeMultiSel = item ? new Set([item.key]) : new Set();
+        selectedSquadId = squadId; revealedSquadId = squadId; sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi };
+        storeSquadSelection(squadId, sel, [...nodeMultiSel]);
+        editing = false; showTab("squads", true);
+      }
       /**
        * Builds the tooltip text for an inherited resolved value in the details pane.
        * @param {string} field

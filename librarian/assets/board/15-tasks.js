@@ -1356,6 +1356,202 @@
       let multiSel = new Set();
       /** @type {Set<string>} multi-selected task/cell/proof nodes in the current graph */
       let nodeMultiSel = new Set();
+
+      // RAL-419: per-squad graph-selection cache. A squad's primary selection
+      // (`sel`) and its graph-node multi-selection (`nodeMultiSel`) are snapshotted
+      // here every time they change, so switching squads and coming back restores the
+      // exact prior view -- and the same snapshot is persisted to localStorage so a
+      // browser refresh restores it too. The pure decision logic (restore-vs-explicit
+      // transition, stale-node reconciliation) lives in the RALPHUS-SEL-TRANSITION
+      // region below; these globals and the storage layer are the glue around it.
+      const SQUAD_SELECTION_STORAGE_KEY = "ralphus-squad-selection";
+      /**
+       * Reads the persisted RAL-419 selection blob; corrupt/missing data yields empty state.
+       * @returns {{sel?: {[key: string]: SelStateTasks}, nodes?: {[key: string]: string[]}, last?: string|null}}
+       */
+      function loadSquadSelectionBlob() {
+        try {
+          const raw = JSON.parse(localStorage.getItem(SQUAD_SELECTION_STORAGE_KEY) || "{}");
+          return raw && typeof raw === "object" ? raw : {};
+        } catch (_) { return {}; }
+      }
+      /**
+       * Loads the per-squad primary-selection cache from localStorage (RAL-419).
+       * @returns {{[key: string]: SelStateTasks}}
+       */
+      function loadSquadSelCache() { const b = loadSquadSelectionBlob(); return b.sel && typeof b.sel === "object" ? b.sel : {}; }
+      /**
+       * Loads the per-squad graph-node multi-selection cache from localStorage (RAL-419).
+       * @returns {{[key: string]: string[]}}
+       */
+      function loadSquadNodeCache() { const b = loadSquadSelectionBlob(); return b.nodes && typeof b.nodes === "object" ? b.nodes : {}; }
+      /**
+       * Loads the last-focused squad id from localStorage (a browser refresh returns to it, RAL-419).
+       * @returns {string|null}
+       */
+      function loadLastSquadId() { const v = loadSquadSelectionBlob().last; return typeof v === "string" && v ? v : null; }
+      /**
+       * Persists the in-memory per-squad selection caches; a quota/security failure
+       * just means selection survives only for this session.
+       * @returns {void}
+       */
+      function persistSquadSelectionState() {
+        try {
+          localStorage.setItem(SQUAD_SELECTION_STORAGE_KEY, JSON.stringify({ sel: squadSelCache, nodes: squadNodeCache, last: lastSquadId }));
+        } catch (_) { /* keep the in-memory caches working for this session */ }
+      }
+      // RALPHUS-SEL-STORAGE:BEGIN
+      /**
+       * Snapshots a squad's primary selection + node keys into the per-squad caches
+       * and persists them (RAL-419). `squadId` may be null when called from a context
+       * with no focused squad yet.
+       * @param {string|null} squadId
+       * @param {SelStateTasks} s
+       * @param {Iterable<string>} nodeKeys
+       * @returns {void}
+       */
+      function storeSquadSelection(squadId, s, nodeKeys) {
+        if (!squadId) return;
+        squadSelCache[squadId] = snapshotSel(s);
+        squadNodeCache[squadId] = [...nodeKeys];
+        lastSquadId = squadId;
+        persistSquadSelectionState();
+      }
+      /**
+       * Removes a stale per-squad selection entry and persists the removal (RAL-419).
+       * @param {string|null|undefined} squadId
+       * @returns {void}
+       */
+      function clearSquadSelection(squadId) {
+        if (!squadId) return;
+        delete squadSelCache[squadId];
+        delete squadNodeCache[squadId];
+        persistSquadSelectionState();
+      }
+      // RALPHUS-SEL-STORAGE:END
+      /** @type {{[key: string]: SelStateTasks}} squad id -> last primary selection shown for that squad (RAL-419) */
+      let squadSelCache = loadSquadSelCache();
+      /** @type {{[key: string]: string[]}} squad id -> last graph-node multi-selection keys shown for that squad (RAL-419) */
+      let squadNodeCache = loadSquadNodeCache();
+      /** @type {string|null} last squad focused this session (persisted), so a browser refresh lands back on it (RAL-419) */
+      let lastSquadId = loadLastSquadId();
+
+      // RALPHUS-SEL-TRANSITION:BEGIN
+      // Pure, DOM-free decision logic for the Squads tab's per-squad selection cache.
+      // test/board-sel-transition.mjs slices this exact region out of the shipped
+      // source and exercises it under `node --test`, so these functions must stay
+      // free of DOM/fetch/localStorage/module-level state -- state goes in, state
+      // comes out, and every result is deterministic on the inputs.
+      /**
+       * The selection shown when a squad has no restored child selection.
+       * @returns {SelStateTasks}
+       */
+      function squadLevelSel() {
+        return { kind: "squad", taskIdx: 0, cellIdx: 0, proofIdx: -1 };
+      }
+      /**
+       * Copies a selection into a fresh, cacheable snapshot (normalizing a missing
+       * proof index to -1, the shape every consumer reads).
+       * @param {SelStateTasks} s
+       * @returns {SelStateTasks}
+       */
+      function snapshotSel(s) {
+        return { kind: s.kind, taskIdx: s.taskIdx, cellIdx: s.cellIdx, proofIdx: s.proofIdx ?? -1 };
+      }
+      /**
+       * Validates one selection against a squad's *current* graph and walks up to the
+       * nearest surviving parent when the named entity is gone: a proof step falls
+       * back to its cell, then its task, then the squad banner. `stale` is true
+       * exactly when the requested entity no longer exists (so the caller can clear
+       * the cache entry that produced the dangling reference).
+       * @param {SquadView|undefined} squad
+       * @param {SelStateTasks} sel
+       * @returns {{sel: SelStateTasks, stale: boolean}}
+       */
+      function reconcileSquadSelection(squad, sel) {
+        if (!sel || !sel.kind || sel.kind === "squad") return { sel: snapshotSel(sel || squadLevelSel()), stale: false };
+        if (!squad) return { sel: squadLevelSel(), stale: true };
+        const ti = sel.taskIdx ?? 0;
+        const task = (squad.tasks || [])[ti];
+        if (!task) return { sel: squadLevelSel(), stale: true };
+        if (sel.kind === "task") return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: false };
+        const cells = task.cells || [];
+        const cell = cells[sel.cellIdx ?? -1];
+        if (sel.kind === "cell") {
+          return cell
+            ? { sel: snapshotSel(sel), stale: false }
+            : { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
+        }
+        // "proof": a task-scope step has cellIdx === -1, a cell-scope step names its cell.
+        const steps = sel.cellIdx === -1 ? (task.proof || []) : cell ? (cell.proof || []) : [];
+        if (steps[sel.proofIdx ?? 0]) return { sel: snapshotSel(sel), stale: false };
+        if (sel.cellIdx === -1) return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
+        if (cell) return { sel: { kind: "cell", taskIdx: ti, cellIdx: sel.cellIdx, proofIdx: -1 }, stale: true };
+        return { sel: { kind: "task", taskIdx: ti, cellIdx: -1, proofIdx: -1 }, stale: true };
+      }
+      /**
+       * Whether one graph-node key ("kind:ti:si:vi", the format `graphNodeKey` in
+       * 35-terminal-logs.js produces and RAL-419 persists) still names a node in the
+       * squad's current graph. This twin exists so the standalone
+       * RALPHUS-SEL-TRANSITION tests can validate persisted keys without depending on
+       * the rest of the board -- keep the formats in lockstep.
+       * @param {SquadView|undefined} squad
+       * @param {string} key
+       * @returns {boolean}
+       */
+      function nodeKeyValid(squad, key) {
+        if (!squad || typeof key !== "string") return false;
+        const parts = key.split(":");
+        const [k, ti, si, vi] = parts;
+        if (parts.length !== 4 || (k !== "task" && k !== "cell" && k !== "proof")) return false;
+        const nTi = Number(ti), nSi = Number(si), nVi = Number(vi);
+        if (!Number.isInteger(nTi) || nTi < 0 || !Number.isInteger(nSi) || !Number.isInteger(nVi)) return false;
+        const task = (squad.tasks || [])[nTi];
+        if (!task) return false;
+        if (k === "task") return true;
+        const cells = task.cells || [];
+        if (k === "cell") return Boolean(cells[nSi]);
+        // proof: cellIdx -1 means a task-scope step, otherwise a cell-scope one.
+        if (nSi < 0) return Boolean((task.proof || [])[nVi]);
+        const cell = cells[nSi];
+        return Boolean(cell && cell.proof?.[nVi]);
+      }
+      /**
+       * Decides what the Squads sidebar shows when squad `squadId` is focused:
+       * focusing a *different* squad is a return, so its cached selection (reconciled
+       * against the current graph) is restored; focusing the squad already on screen
+       * is an explicit click and selects the squad banner. Multi-node keys are kept
+       * only when they still name live nodes.
+       * @param {{[key: string]: SelStateTasks}} cache
+       * @param {{[key: string]: string[]}} nodeCache
+       * @param {string} squadId
+       * @param {SquadView|undefined} squad
+       * @param {string|null} currentSquadId
+       * @returns {{sel: SelStateTasks, nodeKeys: string[], stale: boolean}}
+       */
+      function transitionSquadSelection(cache, nodeCache, squadId, squad, currentSquadId) {
+        if (squadId === currentSquadId) return { sel: squadLevelSel(), nodeKeys: [], stale: false };
+        const cached = cache[squadId];
+        if (!cached || !cached.kind || cached.kind === "squad") return { sel: squadLevelSel(), nodeKeys: [], stale: false };
+        const rec = reconcileSquadSelection(squad, cached);
+        if (rec.stale) return { sel: rec.sel, nodeKeys: [], stale: true };
+        const keys = (nodeCache[squadId] || []).filter((key) => nodeKeyValid(squad, key));
+        return { sel: rec.sel, nodeKeys: keys, stale: false };
+      }
+      /**
+       * Drops cache entries for squads that no longer exist, so the persisted blob
+       * cannot grow without bound as old squads are deleted.
+       * @param {{[key: string]: SelStateTasks}} cache
+       * @param {{[key: string]: string[]}} nodeCache
+       * @param {string[]} aliveIds
+       * @returns {void}
+       */
+      function pruneSquadSelCache(cache, nodeCache, aliveIds) {
+        const alive = new Set(aliveIds);
+        for (const id of Object.keys(cache)) if (!alive.has(id)) delete cache[id];
+        for (const id of Object.keys(nodeCache)) if (!alive.has(id)) delete nodeCache[id];
+      }
+      // RALPHUS-SEL-TRANSITION:END
       // RAL-328/RAL-331/RAL-365: the current user's hidden-item set,
       // refreshed by pollHidden() every tick regardless of active tab
       // (goto-search and both sidebars need it). Hiding is a personal view

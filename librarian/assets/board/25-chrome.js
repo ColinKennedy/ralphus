@@ -848,11 +848,34 @@
           </div>`).join("");
       }
       /**
-       * Selects a squad and shows its details pane.
+       * Selects a squad and shows its details pane — an explicit navigation, so the
+       * squad banner is selected (RAL-419: programmatic "open this squad" jumps never
+       * revive a cached child selection).
        * @param {string} id
        * @returns {void}
        */
-      function selectSquad(id) { clearNodeMultiSel(); selectedSquadId = id; revealedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false; renderAll(); syncHash(); }
+      function selectSquad(id) { applySquadFocus(id, true); renderAll(); syncHash(); }
+      /**
+       * Applies the RAL-419 focus semantics for squad `id`: focusing a *different*
+       * squad is a return, so its cached selection (reconciled against its current
+       * graph) is restored; focusing the squad already on screen is an explicit click
+       * and selects the squad banner. Records the result in the per-squad caches and
+       * persisted state (a stale entry is cleared instead). Does not render — callers
+       * render.
+       * @param {string} id
+       * @param {boolean} [explicit]
+       * @returns {void}
+       */
+      function applySquadFocus(id, explicit = false) {
+        const t = transitionSquadSelection(squadSelCache, squadNodeCache, id, findSquad(id), explicit ? id : selectedSquadId);
+        selectedSquadId = id;
+        revealedSquadId = id;
+        sel = t.sel;
+        nodeMultiSel = new Set(t.nodeKeys);
+        editing = false;
+        if (t.stale) clearSquadSelection(id);
+        else storeSquadSelection(id, t.sel, t.nodeKeys);
+      }
       /**
        * Promotes a held (queued) squad to pending so the scheduler can pick it up.
        * @param {MouseEvent} e
@@ -879,7 +902,7 @@
         } else {
           multiSel = new Set([id]); anchorId = id;
         }
-        selectedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false;
+        applySquadFocus(id);
         renderAll(); syncHash(true);
       }
       /**

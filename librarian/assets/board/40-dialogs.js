@@ -457,13 +457,20 @@
        * @param {string} id
        * @returns {void}
        */
-      function focusSel(id) { clearNodeMultiSel(); selectedSquadId = id; sel = { kind: "squad", taskIdx: 0, cellIdx: 0 }; editing = false; renderAll(); syncHash(); }
+      function focusSel(id) { applySquadFocus(id); renderAll(); syncHash(); }
       /**
        * Removes one squad from the multi-selection.
        * @param {string} id
        * @returns {void}
        */
-      function unpickSel(id) { multiSel.delete(id); if (selectedSquadId === id) selectedSquadId = [...multiSel][0] || null; renderAll(); }
+      function unpickSel(id) {
+        multiSel.delete(id);
+        if (selectedSquadId === id) {
+          const next = [...multiSel][0];
+          if (next) applySquadFocus(next); else selectedSquadId = null;
+        }
+        renderAll();
+      }
       /**
        * Cancels every multi-selected squad.
        * @returns {Promise<void>}

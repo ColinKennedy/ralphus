@@ -380,6 +380,51 @@
           hiddenTaskKeys = new Set(d.hidden.filter((h) => h.kind === "task" && h.squad_id != null && h.task_idx != null).map((h) => `${h.squad_id}:${h.task_idx}`));
         } catch (e) { /* transient -- the next tick retries */ }
       }
+      // RALPHUS-POLL-TASKS-HELPERS:BEGIN
+      /**
+       * RAL-419: resolves a pending hash route's selection against the loaded squad,
+       * reconciling a dangling index to its nearest surviving parent. The result is
+       * recorded in the per-squad caches *after* resolution (never before), so a
+       * later sidebar return restores exactly what the authoritative hash produced.
+       * @param {ParsedHash} ph
+       * @param {SquadView} squad
+       * @returns {SelStateTasks}
+       */
+      function resolvePendingSquadSelection(ph, squad) {
+        const wanted = selForPendingHash(ph, squad);
+        const rec = reconcileSquadSelection(squad, wanted);
+        if (rec.stale) clearSquadSelection(squad.id);
+        else storeSquadSelection(squad.id, rec.sel, []);
+        return rec.sel;
+      }
+      /**
+       * RAL-419: a poll/SSE refresh can rewrite the graph under the live selection.
+       * When the selected entity no longer exists, fall back to its nearest surviving
+       * parent, clear the stale cache entry, and drop the (now meaningless) node
+       * multi-selection. No-op while editing or with no focused squad.
+       * @returns {void}
+       */
+      function reconcileLiveSelection() {
+        if (!selectedSquadId || editing) return;
+        const squad = findSquad(selectedSquadId);
+        if (!squad) return; // squad deleted -- the UI's existing empty state stays; pruneSquadSelCache already cleaned its entries
+        const rec = reconcileSquadSelection(squad, sel);
+        if (!rec.stale) return;
+        sel = rec.sel;
+        nodeMultiSel = new Set();
+        clearSquadSelection(selectedSquadId);
+      }
+      /**
+       * RAL-419: first paint with no selection — return to the last-focused squad
+       * (restoring its cached selection) when it still exists, else the first listed
+       * squad. Callers render.
+       * @returns {void}
+       */
+      function restoreInitialSquadSelection() {
+        const id = (lastSquadId && findSquad(lastSquadId)) ? lastSquadId : squads[0].id;
+        applySquadFocus(id);
+      }
+      // RALPHUS-POLL-TASKS-HELPERS:END
       // RALPHUS-POLL-TASKS:BEGIN
       /**
        * Polls `/api/tasks` and re-renders the Squads tab, applying any pending hash-derived selection.
@@ -401,15 +446,23 @@
           const wantSquad = pendingHash ? squadForPendingHash(pendingHash) : undefined;
           if (pendingHash && wantSquad) {
             const want = pendingHash; pendingHash = null;
-            clearNodeMultiSel();
+            const resolved = resolvePendingSquadSelection(want, wantSquad);
             selectedSquadId = wantSquad.id;
             revealedSquadId = wantSquad.id;
-            sel = selForPendingHash(want, wantSquad);
+            sel = resolved;
+            nodeMultiSel = new Set();
             renderSortChips(); renderStatusFilters(); renderAll();
-          } else if (!selectedSquadId && squads.length) { pendingHash = null; selectSquad(squads[0].id); }
-          else if (userIsSelecting()) { /* keep the user's text selection intact */ }
-          else if (!editing) renderAll();
-          else renderSquads();
+          } else {
+            // RAL-419: a poll/SSE refresh can rewrite the graph under the current
+            // selection (or delete squads outright) — reconcile the live selection
+            // against the fresh data and prune caches for squads that no longer exist.
+            pruneSquadSelCache(squadSelCache, squadNodeCache, squads.map((r) => r.id));
+            reconcileLiveSelection();
+            if (!selectedSquadId && squads.length) { pendingHash = null; restoreInitialSquadSelection(); renderAll(); syncHash(); }
+            else if (userIsSelecting()) { /* keep the user's text selection intact */ }
+            else if (!editing) renderAll();
+            else renderSquads();
+          }
         } catch (e) {
           if (seq !== tasksPollSeq) return;
           byId("conn").className = "dot off";
