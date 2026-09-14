@@ -3345,7 +3345,9 @@ fn force_drain_triage_pool(daemon: &Daemon, body: &str) -> Reply {
     };
     let store = daemon.lock();
     let project = crate::triage::resolve_pool_key_input(&store, &req.project);
-    match crate::reviews::create_review_from_triage_pool(&store, &project, &req.triage_type) {
+    match crate::reviews::create_review_from_triage_pool(&store, &project, &req.triage_type, |cands| {
+        crate::arbiter::order_pooled_candidates(&store, &crate::arbiter::Arbiter::current(), cands)
+    }) {
         Ok(Some(guardian_id)) => json(200, &DrainTriagePoolResponse { guardian_id }),
         Ok(None) => error(
             409,
