@@ -565,10 +565,69 @@
             else if (!editing) renderAll();
             else renderSquads();
           }
+          hydrateSelectedSquadPrompts(seq);
         } catch (e) {
           if (seq !== tasksPollSeq) return;
           byId("conn").className = "dot off";
           byId("updated").textContent = "daemon unreachable";
+        }
+      }
+      /**
+       * Backfills the agent prompt text for the selected squad only.
+       *
+       * `GET /api/tasks` deliberately omits `cell.prompt`,
+       * `cell.system_prompt` and `proof.system_prompt` -- they were 79% of
+       * that response (4.89MB of 6.23MB against a real history) and the only
+       * thing that renders them is the details pane, for the one selected
+       * cell or proof step. `GET /api/squads/{id}` still carries the full
+       * text, so this fetches just the focused squad (~10KB) and copies the
+       * text onto the already-rendered rows.
+       *
+       * Only the text is copied, never whole objects: everything else on
+       * those rows came from the newer board response and must not be
+       * reverted to this fetch's older view of the same squad.
+       * @param {number} seq - the caller's `tasksPollSeq` ticket, so a
+       *   superseded poll's late-arriving detail can't repaint over a newer one.
+       * @returns {Promise<void>}
+       */
+      async function hydrateSelectedSquadPrompts(seq) {
+        const id = selectedSquadId;
+        if (!id || !squads.some((r) => r.id === id)) return;
+        /** @type {SquadView|null} */
+        let detail = null;
+        try {
+          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+          if (!res.ok) return;
+          detail = await res.json();
+        } catch (e) { return; /* transient -- the next poll retries */ }
+        if (seq !== tasksPollSeq || selectedSquadId !== id || !detail) return;
+        const target = squads.find((r) => r.id === id);
+        if (!target) return;
+        /**
+         * @param {ProofView[]|undefined} from
+         * @param {ProofView[]|undefined} to
+         * @returns {void}
+         */
+        const copyProofs = (from, to) => {
+          (from || []).forEach((p, vi) => {
+            const dst = (to || [])[vi];
+            if (dst) dst.system_prompt = p.system_prompt;
+          });
+        };
+        (detail.tasks || []).forEach((dt, ti) => {
+          const tt = (target.tasks || [])[ti];
+          if (!tt) return;
+          copyProofs(dt.proof, tt.proof);
+          (dt.cells || []).forEach((dc, si) => {
+            const tc = (tt.cells || [])[si];
+            if (!tc) return;
+            tc.prompt = dc.prompt;
+            tc.system_prompt = dc.system_prompt;
+            copyProofs(dc.proof, tc.proof);
+          });
+        });
+        if (!userIsSelecting() && !editing) {
+          preserveUserState(document.getElementById("details"), renderDetails);
         }
       }
       // RALPHUS-POLL-TASKS:END
