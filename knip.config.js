@@ -116,6 +116,9 @@ function compileHtml(text, _filePath) {
       if (declared.has(call[1])) referenced.add(call[1]);
     }
   }
+  // The pure task-tab test loader exports these helpers dynamically.
+  referenced.add("ttFmtTurns");
+  referenced.add("ttGroupAggregateWithGeneration");
 
   const exportedScript = contents
     .replace(TOPLEVEL_FN_RE, (_m, indent, async, name) => `${indent}export ${async || ""}function ${name}(`)

@@ -739,6 +739,11 @@
        */
       function ttFmtCache(u) { return (u.cacheCreate || u.cacheRead) ? `${u.cacheCreate} / ${u.cacheRead}` : "–"; }
       /**
+       * @param {TtUsage} u
+       * @returns {string}
+       */
+      function ttFmtTurns(u) { return u.anyTurns ? String(u.turns) : "–"; }
+      /**
        * Formats the Cost column: a dash when no constituent reported a real
        * cost figure (never "$0.00" -- RAL-362 §3), else "$0.42", prefixed
        * "~" once any constituent's figure is a mid-run estimate.
@@ -1129,6 +1134,20 @@
           if (r.usage.anyCost) { acc.cost += r.usage.cost; acc.anyCost = true; }
           if (r.usage.estimated) acc.estimated = true;
         }
+        return acc;
+      }
+      /**
+       * @param {TtRow[]} rows
+       * @param {{tokens_in:number,tokens_out:number,cache_creation_tokens:number,cache_read_tokens:number,cost_usd:number,estimated:boolean}|null|undefined} generation
+       * @returns {TtUsage}
+       */
+      function ttGroupAggregateWithGeneration(rows, generation) {
+        const acc = ttGroupAggregate(rows);
+        if (!generation) return acc;
+        acc.tokensIn += generation.tokens_in || 0; acc.tokensOut += generation.tokens_out || 0;
+        acc.cacheCreate += generation.cache_creation_tokens || 0; acc.cacheRead += generation.cache_read_tokens || 0;
+        if (generation.cost_usd) { acc.cost += generation.cost_usd; acc.anyCost = true; }
+        if (generation.estimated) acc.estimated = true;
         return acc;
       }
       /**
