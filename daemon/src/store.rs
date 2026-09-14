@@ -1585,7 +1585,8 @@ impl Store {
                 pr_url         TEXT,
                 state          TEXT NOT NULL DEFAULT 'open',
                 created_at_ms  INTEGER NOT NULL,
-                updated_at_ms  INTEGER NOT NULL
+                updated_at_ms  INTEGER NOT NULL,
+                draft          INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_pr_guardian ON guardian_pull_requests(guardian_id);
             CREATE INDEX IF NOT EXISTS idx_pr_lookup ON guardian_pull_requests(forge, repo, pr_number);
@@ -2646,6 +2647,10 @@ impl Store {
             // observed as anything other than `failing` (i.e. a fresh
             // failure gets a fresh attempt).
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempted_at_ms INTEGER",
+            // RAL-353: the draft/WIP state returned by the forge when a PR/MR
+            // is created, adopted, or polled. Nullable preserves the unknown
+            // state for rows written before this field was available.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN draft INTEGER",
             // RAL-<pending>: the preflight error from the background
             // materialization follow-up (worktree creation + review
             // derivation, see `server::submit`'s doc comment) when a squad
