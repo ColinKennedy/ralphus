@@ -155,5 +155,9 @@ export default {
   // are never imported by anything — without this knip would report them as
   // unused files. The shell itself is the entry and must NOT be covered by
   // this ignore.
-  ignore: ["librarian/assets/board/**", "librarian/assets/vendor/**"],
+  ignore: [
+    "librarian/assets/board/**",
+    "librarian/assets/vendor/**",
+    "vendor/psmux/tests/**",
+  ],
 };
