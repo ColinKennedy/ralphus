@@ -21,7 +21,14 @@ fn execute_pool(cmd: TriagePoolCommand, client: &DaemonClient) -> ExecResult {
             project,
             triage_type,
             threshold,
-        } => Ok(client.set_triage_pool_threshold(&project, &triage_type, threshold)?),
+            preview,
+        } => {
+            if preview {
+                Ok(client.preview_triage_pool_threshold(&project, &triage_type, threshold)?)
+            } else {
+                Ok(client.set_triage_pool_threshold(&project, &triage_type, threshold)?)
+            }
+        }
     }
 }
 

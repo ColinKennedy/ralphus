@@ -517,6 +517,26 @@
        * @property {number|null} threshold
        */
       /**
+       * RAL-421: the non-mutating "rough preview" of a proposed pool
+       * threshold -- what confirming it would drain *right now*. The daemon
+       * computes it from the pool's viable count under its store lock at
+       * request time, so it is an estimate, never a reservation: between
+       * preview and confirm another submission may pool, or a cron may fire.
+       * `clearing` means the proposed change removes the count trigger (no
+       * drain); otherwise `full_batches` whole threshold-sized batches would
+       * become reviews, `cells_drained` of them in total, and only the
+       * `cells_left` sub-threshold remainder would stay pooled.
+       * @typedef {object} TriagePoolThresholdPreview
+       * @property {string} project - The resolved pool key the confirm would persist under.
+       * @property {string} triage_type
+       * @property {number|null} proposed_threshold - null when clearing.
+       * @property {boolean} clearing
+       * @property {number} pooled - Viable pooled-cell count right now (failed cells never count).
+       * @property {number} full_batches - Whole threshold-sized batches a confirm would drain now (0 when clearing or below threshold).
+       * @property {number} cells_drained - `full_batches * proposed_threshold`.
+       * @property {number} cells_left - Sub-threshold remainder that would stay pooled.
+       */
+      /**
        * One cron-based drain trigger for a `(project, triage_type)` pool key
        * (RAL-318). `anchor_date_ms`/`last_checked_ms` are UTC epoch-ms over
        * the wire -- convert to/from the viewer's local timezone at the UI

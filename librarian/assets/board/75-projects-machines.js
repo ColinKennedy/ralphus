@@ -415,40 +415,101 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const table = `<table class="proj-table"><thead><tr>`
           + `<th data-tip="The project a pooled cell's owning task declared.">Project</th>`
           + `<th data-tip="The Triage type these pooled cells classified into, or were inline-declared as.">Type</th>`
-          + `<th data-tip="Cells currently pooled for this (project, type) key, waiting for a count threshold or cron schedule to drain them into one fresh review.">Pooled</th>`
-          + `<th data-tip="Draining this pool creates a review once it holds this many cells -- 'first to fire wins' against this key's schedules, and the pool resets afterward. Blank means no count-based trigger; only this key's schedules (if any) can drain it.">Threshold</th>`
+          + `<th data-tip="Cells currently pooled for this (project, type) key, waiting for a count threshold or cron schedule to drain them into fresh review(s).">Pooled</th>`
+          + `<th data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled; 'first to fire wins' against this key's schedules. Blank means no count-based trigger; only this key's schedules (if any) can drain it.">Threshold</th>`
           + `</tr></thead><tbody>${rows}</tbody></table>`;
         return `<div style="margin-bottom:24px">
-            <div style="font-weight:600;margin-bottom:8px" data-tip="Current pool state (RAL-318): cells opted into Triage are pooled per (project, triage type) until a count threshold or cron schedule drains them into one fresh review.\nTo configure a threshold before any cell has been pooled yet, use the ⋯ button on that project's row in the Projects tab instead.">Pools</div>
+            <div style="font-weight:600;margin-bottom:8px" data-tip="Current pool state (RAL-318): cells opted into Triage are pooled per (project, triage type) until a count threshold or cron schedule drains them into fresh review(s) -- a threshold fires in threshold-sized batches (one review per batch), a cron fires the whole pool of its exact key as one review, and neither ever crosses a project, subproject, or type boundary (RAL-421).\nTo configure a threshold before any cell has been pooled yet, use the ⋯ button on that project's row in the Projects tab instead.">Pools</div>
             ${table}
           </div>`;
       }
       /**
-       * Renders one pool key's row, including its inline threshold editor.
+       * Renders one pool key's row, including its inline threshold editor
+       * with the RAL-421 Preview -> Confirm flow: typing a number never
+       * mutates anything; the Preview button fetches the non-mutating
+       * estimate and only then offers Confirm (persist + drain in
+       * threshold-sized batches) or Cancel.
        * @param {TriagePoolView} p
        * @returns {string}
        */
       function triagePoolRowHtml(p) {
         const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
+        const preview = triageThresholdPreviews[triagePreviewKey(p.project, p.triage_type)];
+        const confirmLine = preview ? triageThresholdConfirmLine(preview) : "";
         return `<tr>
             <td>${esc(p.project)}</td>
             <td><span class="proj-name">${esc(p.triage_type)}</span></td>
             <td>${p.count}</td>
             <td><div class="row" style="gap:4px">
-              <input type="number" min="1" step="1" class="mono pool-threshold-input" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many cells. Clear the field and press Set to remove the count-based trigger." />
-              <button class="btn" style="padding:2px 8px;font-size:11px" data-click="savePoolThreshold" data-project="${esc(p.project)}" data-triage-type="${esc(p.triage_type)}" data-tip="Save this pool's count threshold.">Set</button>
-            </div></td>
+              <input type="number" min="1" step="1" class="mono pool-threshold-input" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled. Clear the field and press Preview to see what removing the count-based trigger would do." />
+              <button class="btn" style="padding:2px 8px;font-size:11px" data-click="previewPoolThreshold" data-project="${esc(p.project)}" data-triage-type="${esc(p.triage_type)}" data-tip="Preview what confirming this threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
+            </div>${confirmLine}</td>
           </tr>`;
       }
+      // RALPHUS-TRIAGE-PREVIEW:BEGIN
       /**
-       * Reads this row's threshold input and saves it (or, if left blank,
-       * clears any configured count threshold) for the given pool key.
+       * RAL-421: the map key for one pool's preview entry --
+       * `JSON.stringify([project, triageType])` so a project key carrying the
+       * subproject separator (`::`) or a path-looking alphabet can never
+       * collide across rows.
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {string}
+       */
+      function triagePreviewKey(project, triageType) {
+        return JSON.stringify([project, triageType]);
+      }
+      /**
+       * RAL-421: the one-sentence summary a preview resolves to -- what
+       * confirming would do. Pure (no DOM/fetch) so
+       * test/board-triage-confirm.test.mjs can slice the real shipped code
+       * out and exercise it.
+       * @param {TriagePoolThresholdPreview} preview
+       * @returns {string}
+       */
+      function triageThresholdPreviewEffect(preview) {
+        if (preview.clearing) {
+          return "clears this pool's count trigger - no review is created now";
+        }
+        if (preview.full_batches === 0) {
+          return `sets the threshold to ${preview.proposed_threshold} - only ${preview.pooled} cell(s) pooled, no review is created now`;
+        }
+        return `sets the threshold to ${preview.proposed_threshold} - ${preview.cells_drained} cell(s) drain now as ${preview.full_batches} review(s), ${preview.cells_left} cell(s) stay pooled`;
+      }
+      /**
+       * RAL-421: the inline Confirm/Cancel line shown under a threshold
+       * editor once Preview has populated `preview`. Clicking Confirm posts
+       * exactly the previewed `proposed_threshold` (never re-read from the
+       * input, which may have drifted) to the threshold route, which
+       * persists it and drains the now-eligible pool in threshold-sized
+       * batches; Cancel discards the preview without changing anything.
+       * @param {TriagePoolThresholdPreview} preview
+       * @param {string} [confirmHandler] - `data-click` handler name, defaults to the Triage tab's own confirm.
+       * @param {string} [cancelHandler] - `data-click` handler name, defaults to the Triage tab's own cancel.
+       * @returns {string}
+       */
+      function triageThresholdConfirmLine(preview, confirmHandler = "confirmPoolThreshold", cancelHandler = "cancelPoolThresholdPreview") {
+        const confirmLabel = preview.clearing ? "Confirm" : "Confirm & drain";
+        return `<div class="row" style="gap:4px;margin:4px 0 0;max-width:440px" data-tip="Preview before you commit: confirming sends one request that persists the threshold and immediately drains the now-eligible pool in threshold-sized batches -- each batch becomes its own review, which starts Guardian-agent (LLM) work, so nothing happens until you Confirm. Cancel discards the preview without changing anything.">
+            <span style="color:var(--muted);font-size:11px">${esc(triageThresholdPreviewEffect(preview))}.</span>
+            <button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="${confirmHandler}" data-project="${esc(preview.project)}" data-triage-type="${esc(preview.triage_type)}" data-tip="Persist the threshold and drain the pool now, exactly as previewed.">${confirmLabel}</button>
+            <button class="btn" style="padding:2px 8px;font-size:11px" data-click="${cancelHandler}" data-project="${esc(preview.project)}" data-triage-type="${esc(preview.triage_type)}" data-tip="Discard this preview; nothing was changed.">Cancel</button>
+          </div>`;
+      }
+      // RALPHUS-TRIAGE-PREVIEW:END
+      // RALPHUS-TRIAGE-TAB-HANDLERS:BEGIN
+      /**
+       * Reads this row's threshold input and fetches the non-mutating
+       * rough preview for it (RAL-421) -- the same request shape as the
+       * confirm POST, hitting the `/preview` twin that never persists,
+       * drains, or creates a review. The stored preview then drives the
+       * Confirm/Cancel line rendered by {@link triageThresholdConfirmLine}.
        * @param {MouseEvent} e
        * @param {string} project
        * @param {string} triageType
        * @returns {Promise<void>}
        */
-      async function savePoolThreshold(e, project, triageType) {
+      async function previewPoolThreshold(e, project, triageType) {
         const row = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("tr"));
         const input = row ? /** @type {HTMLInputElement|null} */ (row.querySelector(".pool-threshold-input")) : null;
         const raw = input ? input.value.trim() : "";
@@ -458,15 +519,53 @@ Work submitted against it will fail — fix the machine or deregister the provid
           return;
         }
         try {
-          const r = await fetch("/api/triage/pools/threshold", {
+          const r = await fetch("/api/triage/pools/threshold/preview", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ project, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
           });
-          triageError = r.ok ? "" : await responseError(r, "set threshold failed");
+          if (!r.ok) { triageError = await responseError(r, "preview failed"); renderTriage(); return; }
+          triageThresholdPreviews[triagePreviewKey(project, triageType)] = /** @type {TriagePoolThresholdPreview} */ (await r.json());
+          triageError = "";
         } catch (err) { triageError = "daemon unreachable"; }
+        renderTriage();
+      }
+      /**
+       * Persists the previewed threshold and drains the now-eligible pool
+       * in threshold-sized batches (RAL-421). The threshold value is taken
+       * from the stored preview -- the exact thing the human confirmed --
+       * never re-read from the input.
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {Promise<void>}
+       */
+      async function confirmPoolThreshold(project, triageType) {
+        const key = triagePreviewKey(project, triageType);
+        const preview = triageThresholdPreviews[key];
+        if (!preview) return;
+        try {
+          const r = await fetch("/api/triage/pools/threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project, triage_type: triageType, threshold: preview.proposed_threshold }),
+          });
+          triageError = r.ok ? "" : await responseError(r, "confirm failed");
+        } catch (err) { triageError = "daemon unreachable"; }
+        delete triageThresholdPreviews[key];
         await pollTriage();
       }
+      /**
+       * Discards one Triage-tab row's preview without changing anything
+       * (RAL-421).
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {void}
+       */
+      function cancelPoolThresholdPreview(project, triageType) {
+        delete triageThresholdPreviews[triagePreviewKey(project, triageType)];
+        renderTriage();
+      }
+      // RALPHUS-TRIAGE-TAB-HANDLERS:END
       /**
        * Renders the configured cron schedules table plus its add-schedule form.
        * @returns {string}
@@ -1553,6 +1652,10 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function closeProjectTriageModal() {
         projectTriageModalProject = null;
+        // RAL-421: live previews die with their popup -- closing discards
+        // them, so a later reopen starts from a clean "nothing confirmed"
+        // slate and can never confirm a stale preview against a moved pool.
+        projectTriageThresholdPreviews = {};
         closeModal();
       }
       // RALPHUS-TRIAGE-POOL-MATCH:BEGIN
@@ -1621,26 +1724,34 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const rowsHtml = rows.length
           ? rows.map((p) => {
               const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
+              const preview = projectTriageThresholdPreviews[p.triage_type];
+              const confirmLine = preview
+                ? triageThresholdConfirmLine(preview, "confirmProjectTriageThreshold", "cancelProjectTriageThresholdPreview")
+                : "";
               return `<tr>
                   <td><span class="proj-name">${esc(p.triage_type)}</span></td>
                   <td>${p.count}</td>
                   <td><div class="row" style="gap:4px">
-                    <input type="number" min="1" step="1" class="mono ptm-threshold-input" id="ptm-threshold-${esc(p.triage_type)}" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many ${esc(p.triage_type)} cells for ${esc(projectName)}. Clear the field and press Set to remove the count-based trigger." />
-                    <button class="btn" style="padding:2px 8px;font-size:11px" data-click="saveProjectTriageThreshold" data-triage-type="${esc(p.triage_type)}" data-tip="Save this threshold.">Set</button>
-                  </div></td>
+                    <input type="number" min="1" step="1" class="mono ptm-threshold-input" id="ptm-threshold-${esc(p.triage_type)}" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many ${esc(p.triage_type)} cells for ${esc(projectName)}, in threshold-sized batches (each batch its own review; a sub-threshold remainder stays pooled). Clear the field and press Preview to see what removing the count-based trigger would do." />
+                    <button class="btn" style="padding:2px 8px;font-size:11px" data-click="previewProjectTriageThreshold" data-triage-type="${esc(p.triage_type)}" data-tip="Preview what confirming this threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
+                  </div>${confirmLine}</td>
                 </tr>`;
             }).join("")
           : `<tr><td colspan="3" class="empty">No thresholds configured yet.</td></tr>`;
         const usedTypes = new Set(rows.map((p) => p.triage_type));
         const addableTypes = triageTypes.filter((t) => !usedTypes.has(t.name));
+        const addPreview = projectTriageThresholdPreviews["__add__"];
+        const addConfirmLine = addPreview
+          ? triageThresholdConfirmLine(addPreview, "confirmAddProjectTriageThreshold", "cancelAddProjectTriageThreshold")
+          : "";
         const addSection = addableTypes.length
           ? `<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px">
               <select id="ptm-add-type" style="width:180px" data-tip="Which registered Triage type this threshold applies to. Register new types on the Triage tab.">
                 ${addableTypes.map((t) => `<option value="${esc(t.name)}">${esc(t.label || t.name)}</option>`).join("")}
               </select>
-              <input type="number" min="1" step="1" id="ptm-add-threshold" placeholder="count" style="width:90px" data-tip="Draining this pool creates a review once it holds this many cells of this type for this project." />
-              <button class="btn primary" onclick="addProjectTriageThreshold()" data-tip="Configure this pool's count threshold, even before any cell of this type has been pooled yet for this project.">Set</button>
-            </div>`
+              <input type="number" min="1" step="1" id="ptm-add-threshold" placeholder="count" style="width:90px" data-tip="Draining this pool creates a review once it holds this many cells of this type for this project, in threshold-sized batches." />
+              <button class="btn" data-click="previewAddProjectTriageThreshold" data-tip="Preview what confirming this new threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
+            </div>${addConfirmLine}`
           : `<div class="empty" style="margin-top:12px">Every registered Triage type already has a threshold row above.</div>`;
         const err = projectTriageModalError ? `<div class="verr" style="margin-top:8px">${esc(projectTriageModalError)}</div>` : "";
         const orphanedBanner = orphaned.length
@@ -1654,7 +1765,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeProjectTriageModal()"><div class="modal" style="width:560px;max-width:94vw">
             <h2>Auto-review thresholds — ${esc(projectName)}</h2>
-            <div class="k" style="margin-bottom:8px" data-tip="How many Triage-classified cells of a given type must accumulate for this project before the Arbiter automatically drains that pool into a fresh review. This races any cron schedules configured for the same (project, type) key on the Triage tab -- whichever fires first drains the pool.">How many cells of a given Triage type must accumulate for ${esc(projectName)} before a review is created automatically.</div>
+            <div class="k" style="margin-bottom:8px" data-tip="How many Triage-classified cells of a given type must accumulate for this project before the Arbiter automatically drains that pool into review(s), in threshold-sized batches -- each full batch becomes its own review, a sub-threshold remainder stays pooled, and only this exact (project, type) key is ever touched. This races any cron schedules configured for the same key on the Triage tab -- whichever fires first drains the pool.">How many cells of a given Triage type must accumulate for ${esc(projectName)} before a review is created automatically.</div>
             ${orphanedBanner}
             <table class="proj-table"><thead><tr>
               <th>Type</th><th data-tip="Cells currently pooled for this project + type, waiting for this threshold (or a cron schedule) to fire.">Pooled</th><th data-tip="Draining this pool creates a review once it holds this many cells.">Threshold</th>
@@ -1673,7 +1784,17 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @param {string} triageType
        * @returns {Promise<void>}
        */
-      async function saveProjectTriageThreshold(e, triageType) {
+      /**
+       * Fetches the non-mutating rough preview for one row of the open
+       * Projects-tab Triage-threshold popup (RAL-421) -- same request shape
+       * as the confirm POST, hitting the `/preview` twin that never
+       * persists, drains, or creates a review. The stored preview then
+       * drives the Confirm/Cancel line in the row.
+       * @param {MouseEvent} e
+       * @param {string} triageType
+       * @returns {Promise<void>}
+       */
+      async function previewProjectTriageThreshold(e, triageType) {
         const projectName = projectTriageModalProject;
         if (!projectName) return;
         const input = /** @type {HTMLInputElement|null} */ (document.getElementById(`ptm-threshold-${triageType}`));
@@ -1684,22 +1805,57 @@ Work submitted against it will fail — fix the machine or deregister the provid
           return;
         }
         try {
-          const r = await fetch("/api/triage/pools/threshold", {
+          const r = await fetch("/api/triage/pools/threshold/preview", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: raw === "" ? null : Number(raw) }),
           });
-          projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
+          if (!r.ok) { projectTriageModalError = await responseError(r, "preview failed"); renderProjectTriageModal(); return; }
+          projectTriageThresholdPreviews[triageType] = /** @type {TriagePoolThresholdPreview} */ (await r.json());
+          projectTriageModalError = "";
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
+        renderProjectTriageModal();
+      }
+      /**
+       * Persists one row's previewed threshold and drains the now-eligible
+       * pool in threshold-sized batches (RAL-421). The threshold value is
+       * taken from the stored preview, never re-read from the input.
+       * @param {string} triageType
+       * @returns {Promise<void>}
+       */
+      async function confirmProjectTriageThreshold(triageType) {
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
+        const preview = projectTriageThresholdPreviews[triageType];
+        if (!preview) return;
+        try {
+          const r = await fetch("/api/triage/pools/threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: preview.proposed_threshold }),
+          });
+          projectTriageModalError = r.ok ? "" : await responseError(r, "confirm failed");
+        } catch (err) { projectTriageModalError = "daemon unreachable"; }
+        delete projectTriageThresholdPreviews[triageType];
         await pollTriageForProjectModal();
         renderProjectTriageModal();
       }
       /**
-       * Adds a threshold row to the open Projects-tab Triage-threshold popup
-       * for a Triage type the current project doesn't have one for yet.
+       * Discards one popup row's preview without changing anything (RAL-421).
+       * @param {string} triageType
+       * @returns {void}
+       */
+      function cancelProjectTriageThresholdPreview(triageType) {
+        delete projectTriageThresholdPreviews[triageType];
+        renderProjectTriageModal();
+      }
+      /**
+       * Fetches the non-mutating rough preview for a not-yet-added
+       * threshold row (RAL-421) -- the picker's type and the entered count,
+       * going through the same `/preview` twin the existing rows use.
        * @returns {Promise<void>}
        */
-      async function addProjectTriageThreshold() {
+      async function previewAddProjectTriageThreshold() {
         const projectName = projectTriageModalProject;
         if (!projectName) return;
         const typeSel = /** @type {HTMLSelectElement|null} */ (document.getElementById("ptm-add-type"));
@@ -1712,14 +1868,45 @@ Work submitted against it will fail — fix the machine or deregister the provid
           return;
         }
         try {
-          const r = await fetch("/api/triage/pools/threshold", {
+          const r = await fetch("/api/triage/pools/threshold/preview", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ project: projectName, triage_type: triageType, threshold: Number(raw) }),
           });
-          projectTriageModalError = r.ok ? "" : await responseError(r, "set threshold failed");
+          if (!r.ok) { projectTriageModalError = await responseError(r, "preview failed"); renderProjectTriageModal(); return; }
+          projectTriageThresholdPreviews["__add__"] = /** @type {TriagePoolThresholdPreview} */ (await r.json());
+          projectTriageModalError = "";
         } catch (err) { projectTriageModalError = "daemon unreachable"; }
+        renderProjectTriageModal();
+      }
+      /**
+       * Persists the add-row's previewed threshold and drains the
+       * now-eligible pool in threshold-sized batches (RAL-421).
+       * @returns {Promise<void>}
+       */
+      async function confirmAddProjectTriageThreshold() {
+        const projectName = projectTriageModalProject;
+        if (!projectName) return;
+        const preview = projectTriageThresholdPreviews["__add__"];
+        if (!preview) return;
+        try {
+          const r = await fetch("/api/triage/pools/threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project: projectName, triage_type: preview.triage_type, threshold: preview.proposed_threshold }),
+          });
+          projectTriageModalError = r.ok ? "" : await responseError(r, "confirm failed");
+        } catch (err) { projectTriageModalError = "daemon unreachable"; }
+        delete projectTriageThresholdPreviews["__add__"];
         await pollTriageForProjectModal();
+        renderProjectTriageModal();
+      }
+      /**
+       * Discards the add-row's preview without changing anything (RAL-421).
+       * @returns {void}
+       */
+      function cancelAddProjectTriageThreshold() {
+        delete projectTriageThresholdPreviews["__add__"];
         renderProjectTriageModal();
       }
 

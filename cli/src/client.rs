@@ -633,6 +633,23 @@ impl DaemonClient {
         )
     }
 
+    /// `ralphus triage pool threshold --preview` (RAL-421): the non-mutating
+    /// rough preview for a proposed threshold -- what confirming it would
+    /// drain right now. Same request shape as
+    /// [`Self::set_triage_pool_threshold`], hitting the `/preview` twin that
+    /// never persists, drains, or creates a review.
+    pub fn preview_triage_pool_threshold(
+        &self,
+        project: &str,
+        triage_type: &str,
+        threshold: Option<i64>,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/triage/pools/threshold/preview",
+            Some(json!({"project": project, "triage_type": triage_type, "threshold": threshold})),
+        )
+    }
+
     /// `ralphus check health`'s live Arbiter round-trip (RAL-318).
     pub fn health_arbiter(&self) -> Result<Value, DaemonError> {
         self.post("/api/health/arbiter", None)
