@@ -8046,6 +8046,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
+    /// RAL-422: the sync-status poll is part of the merge pipeline's silent
+    /// maintenance phase, so it must leave paired start/completion records
+    /// (with elapsed time) in the Cartographer log -- asserted here through
+    /// the same query the board's timeline renders.
+    #[test]
+    fn compute_sync_status_emits_start_and_completion_records() {
+        let (root, remote_dir, store, pr_id) = sync_status_fixture();
+        let status = compute_sync_status(&store, &pr_id).unwrap();
+        assert!(status.in_sync, "{status:?}");
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                q: Some("PR sync status check".to_string()),
+                ..crate::cartographer::CartographerFilter::recent(10)
+            })
+            .unwrap();
+        let messages = page
+            .rows
+            .iter()
+            .map(|r| r.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages.contains(&"PR sync status check starting"),
+            "expected a start record: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("PR sync status check completed")),
+            "expected a completion record with the elapsed duration: {messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
     #[test]
     fn compute_sync_status_detects_pr_ahead_after_reviewer_push() {
         let (root, remote_dir, store, pr_id) = sync_status_fixture();
