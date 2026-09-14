@@ -47,7 +47,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelToken;
-use crate::forge::{PrCiState, PrFailure};
+use crate::forge::{FailedCheck, PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;

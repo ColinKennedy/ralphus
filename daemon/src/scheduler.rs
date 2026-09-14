@@ -6122,6 +6122,7 @@ mod tests {
                 error: None,
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
+                turns: None,
                 ghost: None,
             }
         }
@@ -6186,6 +6187,7 @@ mod tests {
                 error: None,
                 proofed: spec.proof.then_some(true),
                 agent_session_id: None,
+                turns: None,
                 ghost: None,
             }
         }

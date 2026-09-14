@@ -319,6 +319,8 @@ pub struct CreatedPr {
     pub number: i64,
     /// Web URL a human can open.
     pub url: String,
+    /// Whether the forge created the PR/MR as a draft.
+    pub draft: bool,
 }
 
 /// An already-open PR/MR discovered via [`ForgeClient::find_open_pull_request`]
@@ -329,6 +331,8 @@ pub struct CreatedPr {
 pub struct ExistingPr {
     pub number: i64,
     pub url: String,
+    /// Whether the already-open PR/MR is a draft.
+    pub draft: bool,
     /// The base ref (GitHub) / target branch (GitLab) currently recorded on
     /// the forge — may differ from what a caller was about to request; the
     /// normal base-resync path reconciles that afterward.
@@ -534,7 +538,11 @@ impl ForgeClient {
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitHub PR response shape: {resp}"))?;
                 let url = resp["html_url"].as_str().unwrap_or_default().to_string();
-                Ok(CreatedPr { number, url })
+                Ok(CreatedPr {
+                    number,
+                    url,
+                    draft: pr_object_draft(&resp),
+                })
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -555,7 +563,11 @@ impl ForgeClient {
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitLab MR response shape: {resp}"))?;
                 let url = resp["web_url"].as_str().unwrap_or_default().to_string();
-                Ok(CreatedPr { number, url })
+                Ok(CreatedPr {
+                    number,
+                    url,
+                    draft: pr_object_draft(&resp),
+                })
             }
         }
     }
@@ -642,6 +654,7 @@ impl ForgeClient {
                 ExistingPr {
                     number,
                     url,
+                    draft: pr_object_draft(found),
                     base,
                     title,
                     description,
@@ -680,6 +693,7 @@ impl ForgeClient {
                 ExistingPr {
                     number,
                     url,
+                    draft: pr_object_draft(found),
                     base,
                     title,
                     description,

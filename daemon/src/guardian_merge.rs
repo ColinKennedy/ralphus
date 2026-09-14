@@ -11221,8 +11221,8 @@ mod tests {
                 error: None,
                 proofed: None,
                 agent_session_id: None,
-                ghost: None,
                 turns: None,
+                ghost: None,
             }
         }
     }
@@ -11370,6 +11370,7 @@ mod tests {
                 error: None,
                 proofed: None,
                 agent_session_id: None,
+                turns: None,
                 ghost: None,
             }
         }

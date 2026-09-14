@@ -100,6 +100,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         error: None,
         proofed: Some(committed),
         agent_session_id: None,
+        turns: None,
         ghost: None,
     })
 }
@@ -453,8 +454,8 @@ impl Runner for AutoFixRunner {
             error: None,
             proofed: Some(true),
             agent_session_id: None,
-            ghost: None,
             turns: None,
+            ghost: None,
         }
     }
 }
@@ -4331,6 +4332,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             error: None,
             proofed: Some(true),
             agent_session_id: None,
+            turns: None,
             ghost: None,
         }
     }
