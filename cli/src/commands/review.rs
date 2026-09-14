@@ -223,6 +223,12 @@ pub enum ReviewPrCommand {
         /// passed, overriding the review's own `match_pr_branch_name`
         /// setting for this submission only; `None` defers to it.
         use_worktree_branch_name: Option<bool>,
+        /// RAL-196: `Some(true)` when `--draft` is passed, `Some(false)` when
+        /// `--ready-for-review` is passed — either overrides the project's
+        /// provider-specific `[github]`/`[gitlab] draft_by_default` for this
+        /// submission only (see [`crate::pr::PrRequest::draft`]); `None`
+        /// (neither flag) defers to that project default. Mutually exclusive.
+        draft: Option<bool>,
         /// RAL-338: downgrades a definite "no forge relationship" fork
         /// pre-flight result from a hard error to a logged warning. Ignored
         /// for a project with no registered fork.
@@ -646,6 +652,25 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
             let use_worktree_branch_name = scanner
                 .take_bool("--use-worktree-branch-name")
                 .then_some(true);
+            // RAL-196: `--draft` and `--ready-for-review` are the two ways to
+            // force a direction for this submission, overriding the project's
+            // `[github]`/`[gitlab] draft_by_default` for this call only.
+            // They are mutually exclusive; passing neither defers to the
+            // project default.
+            let draft_flag = scanner.take_bool("--draft");
+            let ready_for_review_flag = scanner.take_bool("--ready-for-review");
+            if draft_flag && ready_for_review_flag {
+                return ReviewPrCommand::UsageError(
+                    "submit accepts at most one of --draft or --ready-for-review".to_string(),
+                );
+            }
+            let draft = if draft_flag {
+                Some(true)
+            } else if ready_for_review_flag {
+                Some(false)
+            } else {
+                None
+            };
             let allow_unlinked_fork = scanner.take_bool("--allow-unlinked-fork");
             if position.is_some() == combined {
                 return ReviewPrCommand::UsageError(
@@ -661,6 +686,7 @@ fn parse_pr(args: &[String]) -> ReviewPrCommand {
                     title,
                     description,
                     use_worktree_branch_name,
+                    draft,
                     allow_unlinked_fork,
                 },
                 None => {
@@ -1712,6 +1738,7 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
             title,
             description,
             use_worktree_branch_name,
+            draft,
             allow_unlinked_fork,
         } => run_and_report(opts, Some("ralphus review list --pr-ready"), || {
             let mut pr_spec = serde_json::Map::new();
@@ -1732,6 +1759,9 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
                     "use_worktree_branch_name".to_string(),
                     Value::Bool(use_worktree_branch_name),
                 );
+            }
+            if let Some(draft) = draft {
+                pr_spec.insert("draft".to_string(), Value::Bool(draft));
             }
             let resolved =
                 resolve_guardian_selector(client, &selector, "ralphus review list --pr-ready")?;
@@ -3159,6 +3189,66 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(use_worktree_branch_name, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_submit_draft_flag() {
+        // RAL-196: `--draft` forces this submission's PR(s)/MR(s) open as
+        // drafts, regardless of the project's `draft_by_default`.
+        match parse(&v(&["pr", "submit", "g1", "--combined", "--draft"])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit { draft, .. }) => {
+                assert_eq!(draft, Some(true));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pr_submit_ready_for_review_flag() {
+        // RAL-196: `--ready-for-review` is the other direction -- force this
+        // submission ready even when the project defaults to drafts.
+        match parse(&v(&[
+            "pr",
+            "submit",
+            "g1",
+            "--combined",
+            "--ready-for-review",
+        ])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit { draft, .. }) => {
+                assert_eq!(draft, Some(false));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_submit_neither_draft_flag_defers_to_project_default() {
+        // RAL-196: no `--draft`/`--ready-for-review` means the project's
+        // `[github]`/`[gitlab] draft_by_default` applies (the daemon resolves
+        // it); the CLI passes no override.
+        match parse(&v(&["pr", "submit", "g1", "--combined"])) {
+            ReviewCommand::Pr(ReviewPrCommand::Submit { draft, .. }) => {
+                assert_eq!(draft, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_submit_rejects_both_draft_flags() {
+        match parse(&v(&[
+            "pr",
+            "submit",
+            "g1",
+            "--combined",
+            "--draft",
+            "--ready-for-review",
+        ])) {
+            ReviewCommand::Pr(ReviewPrCommand::UsageError(m)) => {
+                assert!(m.contains("at most one of --draft or --ready-for-review"))
             }
             other => panic!("unexpected: {other:?}"),
         }

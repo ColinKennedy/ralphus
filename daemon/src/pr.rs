@@ -1226,6 +1226,16 @@ pub struct PrRequest {
     /// changing the review's persisted default.
     #[serde(default)]
     pub use_worktree_branch_name: Option<bool>,
+    /// RAL-196: `Some(true)` opens this submission's PR(s)/MR(s) as drafts,
+    /// `Some(false)` forces them ready-for-review -- either way overriding
+    /// the project's provider-specific `[github]`/`[gitlab] draft_by_default`
+    /// for this submission only, without changing the project default.
+    /// `None` (omitted) defers to that project default (which is `false`
+    /// when unset). On a whole-stack request (`branch_id: None`) a single
+    /// value applies to every branch this call creates, same as
+    /// `use_worktree_branch_name`.
+    #[serde(default)]
+    pub draft: Option<bool>,
 }
 
 /// The PR branch alias `submit_stacked_branch_pr` pushes to.
@@ -2610,7 +2620,17 @@ fn maybe_promote_fork_root(
     };
     let fork_client = &routing.fork_client;
 
-    let created = match route.create_pull_request(&successor_pr.title, &successor_pr.description) {
+    let created = match route.create_pull_request(
+        &successor_pr.title,
+        &successor_pr.description,
+        // RAL-196: promotion re-files the same PR at the parent -- keep the
+        // draft state the superseded fork-internal PR was created with (a
+        // stack submitted as drafts stays drafts across a promotion).
+        // `None` (a row recorded before the draft column, or one whose forge
+        // response never stated it) promotes ready-for-review, matching
+        // `submit_stacked_branch_pr`'s own default.
+        successor_pr.draft.unwrap_or(false),
+    ) {
         Ok(created) => created,
         Err(e) => {
             crate::rlog!(
@@ -4602,9 +4622,18 @@ fn submit_stacked_branch_pr(
     trace_context: Option<&str>,
     stack_id: &str,
     fork_routing: Option<&ForkRouting>,
+    // RAL-196: the project's effective provider-specific `draft_by_default`
+    // (global → per-project config resolved at the review root) -- what a
+    // submission with no `req.draft` override falls back to.
+    draft_by_default: bool,
 ) -> std::result::Result<PullRequestView, String> {
     let branch_id = branch.id.as_str();
     let position = branch.position;
+    // RAL-196: the effective draft state for this creation -- the
+    // submission's own override (if any) always wins; otherwise the project
+    // default (which is `false` when unset). One value per branch, applied
+    // consistently to every PR this submission creates.
+    let draft = req.draft.unwrap_or(draft_by_default);
     let review_ref = branch
         .review_branch
         .clone()
@@ -4713,11 +4742,30 @@ fn submit_stacked_branch_pr(
                     existing.number,
                     existing.base
                 );
+                // RAL-196: the adopted PR/MR's draft state must match what
+                // this submission asked for (a whole-stack submission as
+                // drafts must not leave a sibling PR ready-for-review). The
+                // forge toggle is best-effort -- on failure the recorded row
+                // keeps the forge's actual state and the mismatch is logged.
+                let mut adopted_draft = existing.draft;
+                if existing.draft != draft {
+                    match route.update_draft(existing.number, draft) {
+                        Ok(()) => adopted_draft = draft,
+                        Err(e) => crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} branch {branch_id} adopting PR/MR #{} \
+                             requested draft={draft} but the forge reports draft={} and the toggle \
+                             failed; recording what the forge has: {e}",
+                            existing.number,
+                            existing.draft
+                        ),
+                    }
+                }
                 (
                     crate::forge::CreatedPr {
                         number: existing.number,
                         url: existing.url,
-                        draft: existing.draft,
+                        draft: adopted_draft,
                     },
                     existing.base,
                     existing.title,
@@ -4734,7 +4782,7 @@ fn submit_stacked_branch_pr(
                     &route.client,
                     trace_context,
                 );
-                let created = route.create_pull_request(&title, &description)?;
+                let created = route.create_pull_request(&title, &description, draft)?;
                 (created, base, title, description, false)
             }
         };
@@ -5097,6 +5145,12 @@ fn submit_stack_for_guardian(
     stack_id: &str,
     use_worktree_branch_name: Option<bool>,
     fork_routing: Option<&ForkRouting>,
+    // RAL-196: `Some(true)`/`Some(false)` make *every* branch this whole-stack
+    // call creates a draft / ready-for-review (the whole-stack request's own
+    // `draft` override); `None` defers each branch to `draft_by_default`.
+    whole_stack_draft: Option<bool>,
+    // RAL-196: the project's effective provider-specific `draft_by_default`.
+    draft_by_default: bool,
 ) -> std::result::Result<StackSubmitOutcome, String> {
     let mut open_by_branch = open_prs_by_branch(existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
@@ -5122,6 +5176,7 @@ fn submit_stack_for_guardian(
             title: None,
             description: None,
             use_worktree_branch_name,
+            draft: whole_stack_draft,
         };
         match submit_stacked_branch_pr(
             store,
@@ -5140,6 +5195,7 @@ fn submit_stack_for_guardian(
             trace_context,
             stack_id,
             fork_routing,
+            draft_by_default,
         ) {
             Ok(pr) => created.push(pr),
             Err(e) => failed.push((branch.id.clone(), e)),
@@ -5494,6 +5550,11 @@ fn auto_submit_terminal_branches(
         None => crate::forge::resolve_remote_for(&root, &parent_remote_name, &forge_cfg)?,
     };
     let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
+    // RAL-196: auto-submitted branches follow the project default (there is
+    // no human submitting to override it) -- resolve it the same way the
+    // manual path does so `submit_stack_for_guardian` opens them as drafts
+    // when the project says so.
+    let pr_draft_by_default = crate::config::resolve_pr_draft_by_default(&root, client.kind());
 
     let mut ordered_enabled: Vec<&BranchView> = guardian
         .branches
@@ -5533,6 +5594,8 @@ fn auto_submit_terminal_branches(
         &stack_id,
         None,
         fork_routing.as_ref(),
+        None,
+        pr_draft_by_default,
     )
 }
 
@@ -5859,6 +5922,13 @@ fn submit_pull_requests_inner(
         None => crate::forge::resolve_remote_for(&root, &parent_remote_name, &forge_cfg)?,
     };
     let pr_branch_convention = forge_cfg.resolved_pr_branch_convention().to_string();
+    // RAL-196: the project's effective provider-specific draft-by-default
+    // (global → per-project config layered at the review root). Every branch
+    // this call creates falls back to it unless its request overrides it.
+    // `client.kind()` — the fork's kind in fork mode — is the provider, so
+    // the right `[github]`/`[gitlab]` table is consulted regardless of
+    // whether the submission routes through a fork.
+    let pr_draft_by_default = crate::config::resolve_pr_draft_by_default(&root, client.kind());
 
     let mut ordered_enabled: Vec<&BranchView> =
         guardian.branches.iter().filter(|b| b.enabled).collect();
@@ -5894,6 +5964,13 @@ fn submit_pull_requests_inner(
         .iter()
         .find(|r| r.branch_id.is_none())
         .and_then(|r| r.use_worktree_branch_name);
+    // RAL-196: same shape as RAL-307's override above -- the whole-stack
+    // request's own `draft` override (if the caller set one) applies to every
+    // branch this call creates; `None` defers each to `pr_draft_by_default`.
+    let whole_stack_draft = requests
+        .iter()
+        .find(|r| r.branch_id.is_none())
+        .and_then(|r| r.draft);
 
     // RAL-302: one id per call to `submit_pull_requests_inner`, stamped on
     // every PR row this call creates (stacked and/or whole-stack), so a past
@@ -5928,6 +6005,7 @@ fn submit_pull_requests_inner(
             trace_context,
             &stack_id,
             fork_routing.as_ref(),
+            pr_draft_by_default,
         )?;
         created.push(pr);
     }
@@ -5950,6 +6028,8 @@ fn submit_pull_requests_inner(
             &stack_id,
             whole_stack_use_worktree_branch_name,
             fork_routing.as_ref(),
+            whole_stack_draft,
+            pr_draft_by_default,
         )?;
         created.extend(stack_prs);
         // An explicit "submit the whole stack" request is a user action, not
@@ -11127,6 +11207,7 @@ mod tests {
                 title: Some(format!("Title {i}")),
                 description: Some(format!("Description {i}")),
                 use_worktree_branch_name: None,
+                draft: None,
             };
             submit_stacked_branch_pr(
                 &store,
@@ -11145,6 +11226,7 @@ mod tests {
                 None,
                 "stack-1",
                 Some(&routing),
+                false,
             )
             .unwrap();
         }
@@ -11341,6 +11423,7 @@ mod tests {
                 title: Some("Title".to_string()),
                 description: Some("Description".to_string()),
                 use_worktree_branch_name: None,
+                draft: None,
             };
             submit_stacked_branch_pr(
                 &store,
@@ -11359,6 +11442,7 @@ mod tests {
                 None,
                 "stack-1",
                 None,
+                false,
             )
             .unwrap();
 
@@ -11558,6 +11642,8 @@ mod tests {
             "stack-1",
             None,
             None,
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -11612,6 +11698,8 @@ mod tests {
             "stack-2",
             None,
             None,
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -11770,6 +11858,7 @@ mod tests {
             title: Some("Title".to_string()),
             description: Some("Description".to_string()),
             use_worktree_branch_name: None,
+            draft: None,
         };
 
         let pr = submit_stacked_branch_pr(
@@ -11789,6 +11878,7 @@ mod tests {
             None,
             "stack-1",
             None,
+            false,
         )
         .expect("submission must reconcile the diverged remote alias instead of erroring");
 
@@ -12086,6 +12176,7 @@ mod tests {
             title: None,
             description: None,
             use_worktree_branch_name: None,
+            draft: None,
         };
 
         let pr = submit_stacked_branch_pr(
@@ -12105,6 +12196,7 @@ mod tests {
             None,
             "stack-1",
             None,
+            false,
         )
         .expect("submission must adopt the pre-existing open PR instead of erroring");
 
@@ -12112,6 +12204,254 @@ mod tests {
         assert_eq!(pr.base_ref, "predecessor-review");
         assert_eq!(pr.title, "Existing title");
         assert_eq!(pr.description, "Existing body");
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_toggles_an_adopted_prs_draft_state_when_asked() {
+        // RAL-196: adopting a pre-existing open PR whose forge state differs
+        // from what this submission asked for must toggle it (a whole-stack
+        // submission as drafts must not leave a sibling PR ready-for-review).
+        // The discovered PR is reported ready-for-review (no `draft` in the
+        // find response), the request asks for a draft, so the submission
+        // must PATCH it to draft and record that -- and must not create a
+        // duplicate.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(req.url().starts_with("/repos/acme/w/pulls?"));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"predecessor-review"},"title":"Existing title","body":"Existing body"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/w/pulls/21");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["draft"], serde_json::json!(true));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"draft": true}"#).with_status_code(200),
+            )
+            .unwrap();
+            // No creation POST must follow -- the adopted PR is enough.
+        });
+
+        let root = tmp_dir("adopt-toggle-draft-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        let remote_dir = tmp_dir("adopt-toggle-draft-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: None,
+            description: None,
+            use_worktree_branch_name: None,
+            // RAL-196: the whole point -- this submission asks for drafts.
+            draft: Some(true),
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            false,
+        )
+        .expect("submission must adopt the pre-existing PR and toggle it to draft");
+
+        assert_eq!(pr.pr_number, Some(21));
+        // The recorded draft state is the post-toggle one, not the stale
+        // ready-for-review state the find query reported.
+        assert_eq!(pr.draft, Some(true));
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn submit_stacked_branch_pr_create_carries_the_requested_draft_override() {
+        // RAL-196: the create path (no pre-existing PR to adopt) must send
+        // the request's `draft` override -- not the caller's default -- down
+        // to the forge API. Here the request asks for a draft while the
+        // project default would open it ready-for-review, so the creation
+        // POST must carry `"draft": true` and the populated row must record
+        // the forge's own draft state back.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(req.url().starts_with("/repos/acme/w/pulls?"));
+            // No pre-existing PR/MR for this head -- the create path runs.
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/w/pulls");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["draft"], serde_json::json!(true));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"number": 41, "html_url": "http://x/41", "draft": true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+
+        let root = tmp_dir("create-draft-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        let remote_dir = tmp_dir("create-draft-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            // Both set so title synthesis skips its template fetch and the
+            // mock below only ever sees the find GET and the create POST.
+            title: Some("t".to_string()),
+            description: Some("d".to_string()),
+            use_worktree_branch_name: None,
+            // RAL-196: forces this creation to draft even though the passed
+            // project default (`draft_by_default = false` below) would open
+            // it ready-for-review.
+            draft: Some(true),
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            // RAL-196: the caller-side project default this submission
+            // overrides (what `resolve_pr_draft_by_default` would resolve;
+            // here `false`, open ready-for-review).
+            false,
+        )
+        .expect("submission must create the PR as a draft");
+
+        assert_eq!(pr.pr_number, Some(41));
+        assert_eq!(pr.draft, Some(true));
 
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -12202,6 +12542,7 @@ mod tests {
             title: Some("Title".to_string()),
             description: Some("Description".to_string()),
             use_worktree_branch_name: None,
+            draft: None,
         };
 
         submit_stacked_branch_pr(
@@ -12221,6 +12562,7 @@ mod tests {
             None,
             "stack-1",
             None,
+            false,
         )
         .unwrap();
 
