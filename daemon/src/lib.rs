@@ -33,6 +33,7 @@ pub mod machines;
 pub mod mailbox;
 pub mod monitor;
 pub mod otel;
+pub mod perf_timing;
 pub mod plan;
 pub mod pr;
 pub mod procreg;
