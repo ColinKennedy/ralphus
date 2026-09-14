@@ -501,6 +501,7 @@
         else if (tab === "users") tabPoll = pollUsers();
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
+        else if (tab === "health") tabPoll = pollHealth();
         else if (tab === "prefs") tabPoll = pollPrefs();
         else if (tab === "tasks") tabPoll = refreshRegisteredProjectNames().then(() => pollTasksTab());
         else tabPoll = refreshRegisteredProjectNames().then(() => pollTasks());

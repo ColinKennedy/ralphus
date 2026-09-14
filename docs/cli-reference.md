@@ -227,7 +227,23 @@ is reachability/config-shape only and free to run.
 `--json` (the global flag, not a per-subcommand one) emits the same
 `checks`/`file_issues`/`failed` payload as machine-readable JSON, with each
 check's `section`/`status`/`detail`/`impact`/`remediation`/`provenance`
-fields intact.
+fields intact, plus (RAL-416) an `id` naming the stable
+`ralphus_core::health_catalog` entry each result belongs to.
+
+#### Check catalog (RAL-416)
+
+`check catalog` lists every check `ralphus_core::health_catalog` knows about
+-- `id`, section, daemon/remote applicability, Free/OnDemand cost tier,
+Required/Optional/FallbackOnly requirement level, and a summary `impact` --
+without running any probes. Instant and side-effect-free, unlike `check
+health`; useful for discovering what a `check health --json` result's `id`
+refers to, or for a board/report surface to render section groupings ahead
+of a real check pass. `--json` emits the catalog verbatim as
+`{"catalog": [...]}`; without it, entries print grouped by section the same
+way `check health`'s human output does. See
+[`docs/dependencies.md`](dependencies.md) for the catalog's own design and
+the daemon's hourly Free-tier background sweep
+(`daemon/src/health_sweep.rs`) that runs a subset of it automatically.
 
 ## squad
 

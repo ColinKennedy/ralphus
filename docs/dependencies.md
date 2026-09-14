@@ -5,6 +5,15 @@ section 1; someone **running** the compiled binaries needs section 2. Section
 3 covers dependencies gated behind an opt-in feature or mode, documented in
 full elsewhere — this is just the index.
 
+**RAL-416 health catalog:** every runtime dependency below that `ralphus
+check health` actually validates has a stable entry in
+`ralphus_core::health_catalog` -- a catalog id, its daemon/remote
+applicability, Free/OnDemand cost tier, and Required/Optional/FallbackOnly
+requirement level. Browse it directly with `ralphus check catalog` (no
+probes run) rather than cross-referencing this doc by hand; a `catalog id
+\`<id>\`` marker next to a dependency's prose below (e.g. `git`, `tmux`)
+names the exact entry that backs it.
+
 **Platform support:** Linux and Windows are fully supported and get CI's full
 fmt/clippy/test suite. macOS is supported as a daemon host on an
 **experimental** basis (RAL-398) — it already runs the same `cfg(unix)` code
@@ -56,8 +65,9 @@ to point at an alternate binary name or path. `git` must be resolvable on
 `ralphus check health`'s repo-detection probe (`cli/src/health.rs`). No
 version constraint is currently known to matter.
 
-`ralphus check health`'s `git` check (Harness section) only treats a missing
-binary as a hard `fail` when at least one registered project actually uses
+`ralphus check health`'s `git` check (Harness section, catalog id `git` --
+RAL-416's `ralphus_core::health_catalog`) only treats a missing binary as a
+hard `fail` when at least one registered project actually uses
 `vcs = "git"` (or project state can't be determined at all, e.g. the daemon
 is unreachable) — RAL-415. A project registered with a non-Git `vcs` kind
 skips its own git-repo-validity check too (reported `SKIP`, not `FAIL`),
@@ -141,11 +151,13 @@ no corresponding `tmux ls` session and kill them.
 **tmux (macOS / Linux)** — real upstream tmux, no known version constraint.
 
 `ralphus check health`'s Harness section (`cli/src/health.rs`'s `check_tmux`,
-RAL-415) resolves tmux/psmux the same way the daemon does
+RAL-415, catalog id `tmux`) resolves tmux/psmux the same way the daemon does
 (`ralphus_daemon::tmux::resolve_tmux_program_with_source`) and reports both
 the resolved binary and which resolution source won (`RALPHUS_TMUX_CMD`
 override, embedded vendored build, or `PATH`) — a missing binary is a hard
-`fail`, since every live cell session depends on it.
+`fail`, since every live cell session depends on it. This same probe backs
+the daemon's hourly Free-tier health sweep (`daemon/src/health_sweep.rs`,
+RAL-416).
 
 ### Agent backend CLIs — some are subprocesses, some are HTTP, know which is which
 
@@ -182,9 +194,10 @@ cached from a prior interactive `gh auth login` / `glab auth login`. Neither
 binary is required: any failure (not installed, not logged in, unexpected
 output) is treated as "no token from this source," not an error.
 `ralphus check health`'s Harness section (`cli/src/health.rs`'s `check_gh`/
-`check_glab`, RAL-415) probes for both on `PATH` and always reports `pass`
-either way, explaining this fallback role in the detail text — a missing
-`gh`/`glab` never fails `check health`.
+`check_glab`, RAL-415, catalog id `gh` / catalog id `glab` — RAL-416 classifies both as
+`FallbackOnly` requirement level) probes for both on `PATH` and always
+reports `pass` either way, explaining this fallback role in the detail text
+— a missing `gh`/`glab` never fails `check health`.
 
 ### OS-integration binaries — best-effort, platform-gated
 
@@ -207,9 +220,9 @@ graceful fallback — none of these block core functionality if missing:
   contract).
 - **Cross-platform, optional:** `$VISUAL`/`$EDITOR` (user-configured, for
   viewing terminal-log snapshots — falls back to `open`/`xdg-open`/`cmd
-  start` if unset), `nvidia-smi` (optional GPU memory sampling in
-  `daemon/src/resources.rs` — any failure, including "not an NVIDIA
-  machine," yields an empty result rather than an error).
+  start` if unset), `nvidia-smi` (catalog id `nvidia-smi`; optional GPU
+  memory sampling in `daemon/src/resources.rs` — any failure, including "not
+  an NVIDIA machine," yields an empty result rather than an error).
 
 ### ssh / rsync / tar — only for the SSH machine provider
 
@@ -220,6 +233,19 @@ when available or a `tar | ssh tar -x` fallback otherwise (Windows ships
 OpenSSH + bsdtar but not `rsync`). Registering a machine to use this
 provider is an explicit admin action (`POST /api/machines`), never something
 a submitted task file can trigger itself.
+
+`--all-remotes` (`ralphus check health --all-remotes`, or the board's Health
+tab) checks every configured `[machine.targets.*]` entry against this
+provider (`daemon/src/health_targets.rs`) — RAL-416's `ralphus_core::health_catalog`
+gives each of those sub-checks its own catalog id (`remote-resolve`,
+`remote-ssh-reachable`, `remote-capabilities`, `remote-root`,
+`remote-git-version`, `remote-git-identity-name`, `remote-git-identity-email`,
+`remote-push-credentials`, `remote-runner`), every one of them `OnDemand`
+(never part of the daemon's hourly background sweep — see
+`daemon/src/health_sweep.rs`'s module doc comment). `remote-push-credentials`
+and `remote-runner` are *documented-unverified*: both always report a `warn`
+explaining why no safe, non-mutating check exists yet, rather than a real
+pass/fail.
 
 ## 3. Optional / conditional dependencies
 

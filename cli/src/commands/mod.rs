@@ -169,6 +169,11 @@ pub enum Command {
     },
     Clear(misc::ClearArgs),
     Check(misc::CheckArgs),
+    /// RAL-416: `ralphus check catalog` -- lists every check
+    /// `ralphus_core::health_catalog` knows about (id, section,
+    /// applicability, cost tier, requirement level, impact) without running
+    /// any probes. Read-only and instant, unlike `check health`.
+    CheckCatalog,
     Completion,
     Configuration,
     Task(task::TaskCommand),
@@ -323,6 +328,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Check(args) => misc::cmd_check(opts, args),
         Command::Completion => misc::cmd_completion(),
         Command::Configuration => misc::cmd_configuration(opts),
+        Command::CheckCatalog => misc::cmd_check_catalog(opts),
         Command::TutorShow => {
             println!("{}", crate::tutor::task_tutor());
             0
