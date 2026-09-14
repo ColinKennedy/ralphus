@@ -484,6 +484,9 @@
         // above, not after them -- none of the four is reviews/tasks/etc.
         // data, so a slow whoami/hidden/watches/mailbox must never delay the
         // tab the user is actually looking at from painting.
+        // RAL-345: the Tasks/Squads project-filter dropdowns bind to the live
+        // registered-project list (`registeredProjectNames`), refreshed on every
+        // poll of those tabs so a newly registered project shows up without a reload.
         // `findLinkedCells` runs inside the Reviews tab's synchronous render,
         // so the index it reads has to be in place before `pollReviews`.
         /** @type {Promise<void>} */
@@ -499,8 +502,8 @@
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
         else if (tab === "prefs") tabPoll = pollPrefs();
-        else if (tab === "tasks") tabPoll = ensureProjectsLoadedForFilters().then(() => pollTasksTab());
-        else tabPoll = ensureProjectsLoadedForFilters().then(() => pollTasks());
+        else if (tab === "tasks") tabPoll = refreshRegisteredProjectNames().then(() => pollTasksTab());
+        else tabPoll = refreshRegisteredProjectNames().then(() => pollTasks());
         await Promise.all([globalPolls, tabPoll]);
         await refreshBanner();
       }
@@ -538,6 +541,10 @@
        */
       async function applySseRefresh(kinds, guardianIds, hasSquadChange) {
         if (tab === "tasks") {
+          // RAL-345: an SSE-driven poll of this tab doesn't go through
+          // `tick()`, so refresh the registered-project list here too --
+          // keeps the project-filter dropdown current between full ticks.
+          await refreshRegisteredProjectNames();
           await pollTasksTab();
           await refreshBanner();
           return;
@@ -553,6 +560,10 @@
         // renders (a cell's review badge), and the old `hasSquadChange` gate
         // meant those batches refreshed the data without ever painting it.
         if (tab === "squads") {
+          // RAL-345: same as the Tasks-tab path above -- the project-filter
+          // dropdown binds to the live registered-project list, refreshed on
+          // SSE-driven polls too (no full tick involved).
+          await refreshRegisteredProjectNames();
           await pollTasks();
           await refreshBanner();
           return;
