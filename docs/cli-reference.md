@@ -565,7 +565,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
@@ -709,7 +709,7 @@ use; see `READ_ONLY_NOTE`.
     - triage  {Register and inspect Triage types -- the Arbiter subsystem's automatic-review classification categories (RAL-318).}
         - pool  {Inspect and configure Triage auto-review pools (RAL-318).}
             - (read-only-safe) list  {List every Triage pool key with pooled cells and/or a configured count threshold, plus its resolved project name (RAL-318).}
-            - threshold project [str] triage_type [str] --clear --threshold [integer]  {Set (or --clear) the count threshold for a (project, triage_type) pool -- once it holds this many cells, it drains into a fresh review (RAL-318).}
+            - threshold project [str] triage_type [str] --clear --preview --threshold [integer]  {Set (or --clear) the count threshold for a (project, triage_type) pool (RAL-318). The CLI never prompts: invoking this command IS the confirmation -- a pool already holding at least this many cells drains immediately in threshold-sized batches (one review per batch), leaving only a sub-threshold remainder pooled (RAL-421). Pass --preview to see what confirming would drain right now without changing anything.}
         - type  {Register and inspect Triage types (RAL-318).}
             - deregister name [str]  {Remove a Triage type. The built-in "unclassified" type can never be deregistered.}
             - (read-only-safe) get name [str]  {Show one registered Triage type by exact name.}
