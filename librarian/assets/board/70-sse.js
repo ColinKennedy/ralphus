@@ -180,6 +180,9 @@
         await pollHidden();
         await pollWatches();
         await pollMailbox();
+        // RAL-345: the Tasks/Squads project-filter dropdowns bind to the
+        // live registered-project list, refreshed on every poll of those tabs.
+        if (tab === "squads" || tab === "tasks") await refreshRegisteredProjectNames();
         if (tab === "reviews") { await updateCounter(); await pollReviews(); }
         else if (tab === "resources") { await updateCounter(); await pollResources(); }
         else if (tab === "queue") { await updateCounter(); if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
@@ -231,6 +234,10 @@
           return;
         }
         await updateCounter();
+        // RAL-345: same live registered-project refresh as `tick()`, so an
+        // SSE-driven poll of the Tasks/Squads tabs (no full tick involved)
+        // also keeps the project-filter dropdowns current.
+        if (tab === "squads" || tab === "tasks") await refreshRegisteredProjectNames();
         if (tab === "reviews" && kinds.has("guardian")) {
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);

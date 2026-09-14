@@ -666,7 +666,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const q = triageCandidateFilters.q.trim().toLowerCase();
         return triageCandidates.filter((c) =>
           (!triageCandidateFilters.type || c.triage_types.includes(triageCandidateFilters.type))
-          && (!triageCandidateFilters.project.size || triageCandidateFilters.project.has(c.project))
+          && (!triageCandidateFilters.projects.size || triageCandidateFilters.projects.has(c.project))
           && (!q
             || c.task_name.toLowerCase().includes(q)
             || c.cell_id.toLowerCase().includes(q)
@@ -757,35 +757,39 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function onTriageCandidateNameFilter(v) { triageCandidateFilters.q = v; renderTriage(); }
       // RAL-345: the Triage candidate list's project filter, upgraded from a
-      // single-select `<select>` to the same multi-select checkbox-list
-      // dropdown idiom as the Tasks/Squads tabs' project filters -- its own
-      // state/render path (triageCandidateFilters.project), not shared with
-      // either. Its options stay derived from `triageCandidates` (projects
-      // that actually have a candidate), unlike Tasks/Squads which list every
-      // registered project -- a project with zero candidates was never a
-      // useful choice in this dropdown, before or after this change.
+      // single-choice `<select>` to the same multi-select checkbox dropdown +
+      // removable chips the Tasks/Squads tabs use. "Empty means no filter"
+      // (every project shown). Its project-name source is the candidate list
+      // itself -- a project with no current candidates was never a useful
+      // choice, and the menu re-fills on every poll while it stays open.
       /**
        * Distinct project names present among the currently loaded Triage candidates, alphabetical.
        * @returns {string[]}
        */
       function triageCandidateProjectNames() { return [...new Set(triageCandidates.map((c) => c.project))].sort(); }
       /**
-       * Renders the Triage candidate list's project-filter dropdown trigger and its removable chips (RAL-345) -- chip markup matches the Tasks/Squads tabs' `.filter-chip` exactly, per the ticket's "same as existing label-lists" instruction.
+       * Renders the Triage candidate list's project filter: a button that
+       * opens the multi-select checkbox dropdown (RAL-345), followed by one
+       * removable chip per selected project (X on the left, matching the
+       * Tasks/Squads chips).
        * @returns {string}
        */
       function triageProjectFilterHtml() {
-        const chips = [...triageCandidateFilters.project].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="triageToggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
+        const chips = [...triageCandidateFilters.projects].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="triageToggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
         return `<button type="button" class="btn" onclick="triageOpenProjectFilterMenu(event)" style="font-size:12px;padding:2px 8px" data-tip="Filter candidates by project. No projects selected shows every project.">Project ▾</button>${chips}`
-          + (triageCandidateFilters.project.size ? `<span class="chip" onclick="triageClearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
+          + (triageCandidateFilters.projects.size ? `<span class="chip" onclick="triageClearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
       }
       /**
-       * Toggles one project in/out of the Triage candidate list's filter, from the project dropdown's checkbox list. Updates the open dropdown's checkmarks in place rather than closing it.
+       * Toggles one project in/out of the Triage candidate list's filter,
+       * from the project dropdown's checkbox list (RAL-345). The open
+       * dropdown stays open (its checkmarks update natively) so several
+       * projects can be picked in one visit; the candidate list re-renders.
        * @param {string} name
        * @param {boolean} on
        * @returns {void}
        */
       function triageToggleProjectFilter(name, on) {
-        if (on) triageCandidateFilters.project.add(name); else triageCandidateFilters.project.delete(name);
+        if (on) triageCandidateFilters.projects.add(name); else triageCandidateFilters.projects.delete(name);
         renderTriage();
         const menu = document.getElementById("triage-project-filter-menu");
         if (menu) menu.innerHTML = triageProjectFilterMenuRowsHtml();
@@ -795,26 +799,33 @@ Work submitted against it will fail — fix the machine or deregister the provid
        * @returns {void}
        */
       function triageClearProjectFilter() {
-        triageCandidateFilters.project = new Set();
+        triageCandidateFilters.projects.clear();
         triageCloseProjectFilterMenu();
         renderTriage();
       }
       /**
-       * Builds the checkbox rows for the Triage candidate list's project-filter dropdown.
+       * Builds the checkbox rows for the Triage candidate list's project dropdown, alphabetical.
        * @returns {string}
        */
       function triageProjectFilterMenuRowsHtml() {
         const names = triageCandidateProjectNames();
         if (!names.length) return `<div style="color:var(--muted);cursor:default">No candidate projects.</div>`;
-        return names.map((name) => `<div class="ctx-check ${triageCandidateFilters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${triageCandidateFilters.project.has(name) ? "checked" : ""} onchange="triageToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+        return names.map((name) => `<div class="ctx-check ${triageCandidateFilters.projects.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${triageCandidateFilters.projects.has(name) ? "checked" : ""} onchange="triageToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
       /**
-       * Opens the Triage candidate list's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
+       * Opens the Triage candidate list's project dropdown (RAL-345), a
+       * `.ctx-menu` popup of project checkboxes, and dismisses any other
+       * open project menu first. A global click handler closes it on outside
+       * interaction; checkbox clicks keep it open so several projects can be
+       * picked in one visit.
        * @param {MouseEvent} e
        * @returns {void}
        */
       function triageOpenProjectFilterMenu(e) {
-        e.preventDefault(); e.stopPropagation(); triageCloseProjectFilterMenu();
+        e.preventDefault(); e.stopPropagation();
+        closeProjectFilterMenu(); ttCloseProjectFilterMenu();
+        const existing = document.getElementById("triage-project-filter-menu");
+        if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "triage-project-filter-menu";
         menu.innerHTML = triageProjectFilterMenuRowsHtml();
@@ -823,9 +834,28 @@ Work submitted against it will fail — fix the machine or deregister the provid
         menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
       }
-      /** Closes the Triage candidate list's project-filter dropdown, if open. @returns {void} */
+      /**
+       * Closes the Triage candidate list's project dropdown, if open.
+       * @returns {void}
+       */
       function triageCloseProjectFilterMenu() { const m = document.getElementById("triage-project-filter-menu"); if (m) m.remove(); }
-      document.addEventListener("click", triageCloseProjectFilterMenu);
+      /**
+       * Global dismiss for the three project-filter dropdowns (RAL-345): a
+       * click that lands inside one of the open menus leaves it alone (so
+       * checkbox rows can be picked several at a time); anything else closes
+       * all three. Trigger clicks never reach here -- each open handler
+       * stops propagation.
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function closeProjectFilterMenusOnOutsideClick(e) {
+        const target = /** @type {Element|null} */ (e.target);
+        if (target instanceof Element && target.closest("#project-filter-menu, #tt-project-filter-menu, #triage-project-filter-menu")) return;
+        closeProjectFilterMenu();
+        ttCloseProjectFilterMenu();
+        triageCloseProjectFilterMenu();
+      }
+      document.addEventListener("click", closeProjectFilterMenusOnOutsideClick);
 
       /**
        * Polls `/api/users` and re-renders the Users tab.
@@ -1431,20 +1461,21 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function refreshProjects() { projectsValidated = false; pollProjects(); }
       /**
-       * Lazily seeds `projects` for the Tasks/Squads project-filter dropdowns
-       * (RAL-345), which need the registered-projects list even though
-       * neither tab otherwise polls `/api/projects`. Unlike `pollProjects`,
-       * this never validates paths or re-renders the Projects tab -- it's a
-       * cheap one-time fetch, a no-op once `projects` is non-empty (the
-       * Projects tab's own `pollProjects` keeps it current from then on).
+       * Refreshes `registeredProjectNames` from `GET /api/projects` for the
+       * Tasks/Squads project-filter dropdowns (RAL-345). Unlike
+       * `pollProjects` this never validates paths or re-renders the Projects
+       * tab -- it is a cheap name-list fetch, called on every poll of the
+       * Tasks/Squads tabs so the dropdowns stay live as projects are
+       * registered or removed (reads are open to every caller, RAL-332;
+       * only mutations are admin-gated). Silent on failure -- a transient
+       * error just leaves the previous names in place until the next poll.
        * @returns {Promise<void>}
        */
-      async function ensureProjectsLoadedForFilters() {
-        if (projects.length) return;
+      async function refreshRegisteredProjectNames() {
         try {
-          const d = await (await fetch("/api/projects")).json();
-          projects = (d.projects || []).slice().sort((/** @type {ProjectView} */ a, /** @type {ProjectView} */ b) => a.name.localeCompare(b.name));
-        } catch (e) { /* transient -- the next tick retries */ }
+          const d = /** @type {{projects?: {name: string}[]}} */ (await (await fetch("/api/projects")).json());
+          registeredProjectNames = (d.projects || []).map((p) => p.name).sort((a, b) => a.localeCompare(b));
+        } catch (e) { /* transient -- the next poll retries */ }
       }
       /**
        * Re-checks one registered project's on-disk path/vcs validity.
