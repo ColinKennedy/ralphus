@@ -29,13 +29,19 @@
 //!   rather than a `task` child.
 //!
 //! Chip formatting: every positional's chip is `name [type]` (declared
-//! order) -- `[type]` is `str`/`integer`/`float`/`path`, with `, optional`
-//! appended for an optional positional and a repeatable positional spelled
-//! `name [type...]`; an optional flag that takes a value gets a `[hint]`
-//! suffix (`--status [states]`), a boolean flag gets none, a repeatable flag
-//! gets `[value...]`, and a `--flag/--no-flag` tri-state (this crate's
-//! `take_tri_bool`, mirroring Python's `argparse.BooleanOptionalAction`) is
-//! rendered as one combined chip.
+//! order) -- `[type]` is `id`/`str`/`integer`/`float`/`path`, with
+//! `, optional` appended for an optional positional and a repeatable
+//! positional spelled `name [type...]`; an optional flag that takes a value
+//! gets a `[hint]` suffix (`--status [states]`), a boolean flag gets none, a
+//! repeatable flag gets `[value...]`, and a `--flag/--no-flag` tri-state
+//! (this crate's `take_tri_bool`, mirroring Python's
+//! `argparse.BooleanOptionalAction`) is rendered as one combined chip.
+//! `id` marks an argument that takes the exact opaque identifier ralphus
+//! assigned the entity (`squad-000000000001`, `guardian-000000000001`, ...)
+//! -- see [`ID_ARGUMENT_NOTE`]. Chips backed by the selector grammar (legacy
+//! path/name forms *and* URIs) stay authored as `[str]` but are *displayed*
+//! as `[uri]` ([`display_chip`] upgrades them by name) -- see
+//! [`URI_ARGUMENT_NOTE`].
 //!
 //! `quick-start` is excluded from the AI-oriented generated map, mirroring
 //! Python's `_HIDDEN_COMMANDS`, but is present in the user-facing command
@@ -134,7 +140,12 @@ before and after the subcommand: `ralphus --json status` and `ralphus status --j
 equivalent.";
 
 /// Syntax and examples for arguments displayed as `[uri]`.
-pub const URI_ARGUMENT_NOTE: &str = "`[uri]` arguments use the EntityUri grammar: `squad:<squad_id>` (e.g. `squad:squad-1`); `task:<squad_id>:<task_idx>` (e.g. `task:squad-1:2`); `cell:<squad_id>:<task_idx>:<cell_idx>` (e.g. `cell:squad-1:2:0`); `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>` (e.g. `proof:squad-1:2:cell:0:1`; use `task` and `-1` for a task-scoped proof); and `guardian:<guardian_id>` (e.g. `guardian:g-1`) for a review. `selector` also accepts its documented name and index forms in addition to these URIs.";
+pub const URI_ARGUMENT_NOTE: &str = "`[uri]` arguments use the EntityUri grammar: `squad:<squad_id>` (e.g. `squad:squad-1`); `task:<squad_id>:<task_idx>` (e.g. `task:squad-1:2`); `cell:<squad_id>:<task_idx>:<cell_idx>` (e.g. `cell:squad-1:2:0`); `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>` (e.g. `proof:squad-1:2:cell:0:1`; use `task` and `-1` for a task-scoped proof); and `guardian:<guardian_id>` (e.g. `guardian:g-1`) for a review. `selector`, `cell`, and `to_review` chips also accept the documented legacy selector forms in addition to these URIs: `<squad_id>/<task>/<cell>` item paths, plain ids, `@<name>`, and `~`/`#` branch suffixes.";
+
+/// Syntax for arguments displayed as `[id]` -- the exact opaque identifier
+/// ralphus assigned an entity, passed straight to the daemon's id-keyed
+/// endpoint rather than resolved like a selector (RAL-431).
+pub const ID_ARGUMENT_NOTE: &str = "`[id]` arguments take the exact opaque identifier ralphus assigned the entity -- the `id` field shown in `status`/`show` output, e.g. `squad-000000000001`, `guardian-000000000001`, `branch-000000000278`, or `pr-000000000001`. Unlike a `[uri]` argument, an `[id]` is not resolved: labels, names, indices, and the `squad:`/`ralphus:` URI forms are NOT accepted -- pass the id string verbatim.";
 
 // ---- review subgroups (defined separately to keep REVIEW_CHILDREN readable) --
 
@@ -162,7 +173,7 @@ const REVIEW_UPSTREAM_CHILDREN: &[HelpNode] = &[
 const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     node(
         "comments",
-        &["pr_id [str]"],
+        &["pr_id [id]"],
         &[],
         "List a PR's comments/notes.",
         false,
@@ -189,7 +200,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "pull-feedback",
-        &["pr_id [str]"],
+        &["pr_id [id]"],
         &[],
         "Action a PR's un-actioned feedback into the owning review worktree.",
         false,
@@ -198,7 +209,7 @@ const REVIEW_PR_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "pull-from-pr",
-        &["pr_id [str]"],
+        &["pr_id [id]"],
         &[],
         "Pull a reviewer's commits pushed directly to the PR branch back into the owning review \
 worktree, resolving conflicts and restacking downstream branches (RAL-190).",
@@ -208,7 +219,7 @@ worktree, resolving conflicts and restacking downstream branches (RAL-190).",
     ),
     node(
         "show",
-        &["pr_id [str]"],
+        &["pr_id [id]"],
         &[],
         "Show one PR row.",
         false,
@@ -247,7 +258,7 @@ were just unlinked (RAL-317).",
     ),
     node(
         "update",
-        &["pr_id [str]"],
+        &["pr_id [id]"],
         &[
             "--branch-alias [name]",
             "--pr-number [integer]",
@@ -1125,7 +1136,7 @@ const QUEUE_CHILDREN: &[HelpNode] = &[
 const SQUAD_CHILDREN: &[HelpNode] = &[
     node(
         "activate",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Promote a held (queued) squad to pending.",
         false,
@@ -1134,7 +1145,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "cancel",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Cancel a squad.",
         false,
@@ -1143,7 +1154,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "delete",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &["--yes"],
         "Permanently delete a squad.",
         false,
@@ -1152,7 +1163,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "edit",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &["--label [text]"],
         "Edit a squad's fields.",
         false,
@@ -1161,7 +1172,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "env",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "List a squad's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.",
         false,
@@ -1183,7 +1194,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "logs",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Show a squad's state-transition audit log.",
         false,
@@ -1192,7 +1203,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "rename",
-        &["squad_id [str]", "label [str]"],
+        &["squad_id [id]", "label [str]"],
         &[],
         "Rename a squad's label.",
         false,
@@ -1201,7 +1212,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "restart",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Restart a whole squad, dirtying every squad that depends on it.",
         false,
@@ -1210,7 +1221,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "retry",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Re-run with the same parameters (reset to pending).",
         false,
@@ -1219,7 +1230,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "set-status",
-        &["squad_id [str]", "state [str]"],
+        &["squad_id [id]", "state [str]"],
         &[],
         "Manually override a squad's status.",
         false,
@@ -1228,7 +1239,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "show",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &[],
         "Show a single squad's detail.",
         false,
@@ -1237,7 +1248,7 @@ const SQUAD_CHILDREN: &[HelpNode] = &[
     ),
     node(
         "timeline",
-        &["squad_id [str]"],
+        &["squad_id [id]"],
         &["--write [path]"],
         "Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).",
         false,
@@ -1616,14 +1627,14 @@ pub const ROOT: HelpNode = node(
                 "--cell [str]",
                 "--entity [str]",
                 "--for [str]",
-                "--guardian [str]",
+                "--guardian [id]",
                 "--level [str]",
                 "--limit [integer]",
                 "--offset [integer]",
                 "--q [str]",
                 "--scope [str]",
                 "--source [str]",
-                "--squad [str]",
+                "--squad [id]",
                 "--task [str]",
             ],
             "Query the structured Cartographer event log (RAL-98/RAL-155).",
@@ -1681,7 +1692,7 @@ placeholder message; Python's `shell` argument is not read.)",
         ),
         node(
             "graph",
-            &["squad_id [str, optional]"],
+            &["squad_id [id, optional]"],
             &["--all", "--dot"],
             "Render the task-order dependency graph. (Rust port simplifies Python's \
 --global/--format ascii|dot choice to plain --dot/--all boolean flags.)",
@@ -1775,7 +1786,7 @@ tailing and --wait-until-valid are not yet ported).",
         ),
         node(
             "retry",
-            &["squad_id [str]"],
+            &["squad_id [id]"],
             &[],
             "Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; \
 Python's per-selector --environment/--env-file overrides are not yet ported.)",
@@ -1821,7 +1832,7 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
         ),
         node(
             "status",
-            &["squad_id [str, optional]"],
+            &["squad_id [id, optional]"],
             &["--concurrency"],
             "Show squad status from the daemon.",
             false,
@@ -2038,9 +2049,20 @@ fn signature(n: &HelpNode) -> String {
     }
 }
 
+/// Renders one chip for display. Chips backed by the selector grammar
+/// (legacy path/name forms *and* ralphus/EntityUri URIs) display as `[uri]`
+/// even though the tree authors them as `[str]` -- named `selector`,
+/// `entity_uri`, `--entity`, `--for`, plus `cell` (`review link-cell`) and
+/// `to_review` (`review move-branch`), which resolve through the same
+/// selectors (see [`URI_ARGUMENT_NOTE`]). Constrained-identifier chips are
+/// authored in the tree as `[id]` and pass through unchanged (see
+/// [`ID_ARGUMENT_NOTE`]).
 fn display_chip(chip: &str) -> String {
     let name = chip.split_whitespace().next().unwrap_or(chip);
-    if matches!(name, "selector" | "entity_uri" | "--entity" | "--for") {
+    if matches!(
+        name,
+        "selector" | "entity_uri" | "--entity" | "--for" | "cell" | "to_review"
+    ) {
         chip.replacen("[str", "[uri", 1)
     } else {
         chip.to_string()
@@ -2051,6 +2073,10 @@ fn has_uri_chip(chips: impl IntoIterator<Item = &'static str>) -> bool {
     chips
         .into_iter()
         .any(|chip| display_chip(chip).contains("[uri"))
+}
+
+fn has_id_chip(chips: impl IntoIterator<Item = &'static str>) -> bool {
+    chips.into_iter().any(|chip| chip.contains("[id"))
 }
 
 fn command_path(path: &[&str]) -> String {
@@ -2120,6 +2146,16 @@ pub fn command_help(path: &[&str]) -> Option<String> {
     ) {
         out.push_str("\nURI ARGUMENTS:\n    ");
         out.push_str(URI_ARGUMENT_NOTE);
+        out.push('\n');
+    }
+    if has_id_chip(
+        node.positionals
+            .iter()
+            .copied()
+            .chain(node.options.iter().copied()),
+    ) {
+        out.push_str("\nID ARGUMENTS:\n    ");
+        out.push_str(ID_ARGUMENT_NOTE);
         out.push('\n');
     }
     if !node.children.is_empty() || path.is_empty() {
@@ -2193,9 +2229,19 @@ pub fn chip_description(chip: &str, option: bool) -> String {
             "selector" => {
                 format!("Entity selector or URI identifying the target, {SELECTOR_GRAMMAR}.")
             }
-            "squad_id" => {
-                "Squad identifier or accepted squad selector, e.g. squad-000000000001.".to_string()
+            "cell" => "Squad-family selector that must resolve to exactly one cell: a \
+                 `<squad_id>/<task>/<cell>` item path (e.g. `squad-1/2/0`) or a \
+                 `cell:<squad_id>:<task_idx>:<cell_idx>` URI (e.g. `cell:squad-1:2:0`)."
+                .to_string(),
+            "to_review" => {
+                "Destination review selector: a review id (e.g. `g-2`) or `@<name>`, each \
+                 optionally with a `~`/`#` branch suffix, or a `guardian:<guardian_id>` URI \
+                 (e.g. `guardian:g-2`)."
+                    .to_string()
             }
+            "squad_id" => "Exact squad identifier as shown in `status`/`squad list` output, e.g. \
+                 squad-000000000001 -- not a selector or URI."
+                .to_string(),
             "entity_uri" => {
                 format!("Entity URI addressing any node uniformly: {ENTITY_URI_GRAMMAR}.")
             }
@@ -2382,15 +2428,15 @@ pub fn generate_read_only_safe() -> String {
     out
 }
 
-/// The eight guidance notes, blank-line separated, followed by [`generate()`]'s
+/// The nine guidance notes, blank-line separated, followed by [`generate()`]'s
 /// tree -- ports `helpmap.py::main()`'s exact print sequence (plus
-/// [`SUBMIT_RETRY_NOTE`], added after the Python port). This is what
-/// `ralphus show help-map` prints.
+/// [`SUBMIT_RETRY_NOTE`] and [`ID_ARGUMENT_NOTE`], added after the Python
+/// port). This is what `ralphus show help-map` prints.
 #[must_use]
 pub fn full_output() -> String {
     crate::program_name::substitute_backticked_invocations(&format!(
         "{SUBAGENT_NOTE}\n\n{READ_ONLY_NOTE}\n\n{PROJECT_LOOKUP_NOTE}\n\n{SUBMIT_VALIDATE_NOTE}\n\n\
-{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{URI_ARGUMENT_NOTE}\n\n{}",
+{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{URI_ARGUMENT_NOTE}\n\n{ID_ARGUMENT_NOTE}\n\n{}",
         generate()
     ))
 }
@@ -2507,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn full_output_prints_all_eight_notes_before_the_tree() {
+    fn full_output_prints_all_nine_notes_before_the_tree() {
         let text = full_output();
         assert!(text.starts_with(SUBAGENT_NOTE));
         for note in [
@@ -2519,6 +2565,7 @@ mod tests {
             SUBMIT_RETRY_NOTE,
             JSON_NOTE,
             URI_ARGUMENT_NOTE,
+            ID_ARGUMENT_NOTE,
         ] {
             assert!(
                 text.contains(&crate::program_name::substitute_backticked_invocations(
@@ -2546,6 +2593,13 @@ mod tests {
                 "URI argument still rendered as a string: {raw_uri_chip}"
             );
         }
+        // `review link-cell`'s `cell` and `review move-branch`'s `to_review`
+        // resolve through the squad/guardian selectors, so they must render as
+        // `[uri]`, not `[str]` (RAL-431).
+        assert!(map.contains("link-cell selector [uri] cell [uri]"));
+        assert!(!map.contains("link-cell selector [uri] cell [str]"));
+        assert!(map.contains("move-branch selector [uri] to_review [uri]"));
+        assert!(!map.contains("to_review [str]"));
 
         let full = full_output();
         for example in [
@@ -2728,6 +2782,40 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn constrained_id_arguments_use_id_chips_and_document_the_format() {
+        let map = generate();
+        // squad_id positionals (`squad *`, `status`, `graph`) are exact opaque
+        // ids, not selectors/URIs (RAL-431).
+        assert!(map.contains("show squad_id [id]"));
+        assert!(!map.contains("squad_id [str]"));
+        assert!(!map.contains("pr_id [str]"));
+        assert!(map.contains("show pr_id [id]"));
+        assert!(map.contains("--squad [id]"));
+        assert!(map.contains("--guardian [id]"));
+
+        let command = command_help(&["squad", "show"]).expect("squad show help");
+        assert!(command.contains("squad_id [id]"));
+        assert!(command.contains("ID ARGUMENTS:"));
+        assert!(command.contains("squad-000000000001"));
+
+        let pr_show = command_help(&["review", "pr", "show"]).expect("review pr show help");
+        assert!(pr_show.contains("pr_id [id]"));
+        assert!(pr_show.contains("ID ARGUMENTS:"));
+
+        // The selector-backed second positionals keep the `[uri]` label.
+        let link_cell = command_help(&["review", "link-cell"]).expect("link-cell help");
+        assert!(link_cell.contains("cell [uri]"));
+        assert!(link_cell.contains("URI ARGUMENTS:"));
+        let move_branch = command_help(&["review", "move-branch"]).expect("move-branch help");
+        assert!(move_branch.contains("to_review [uri]"));
+        assert!(move_branch.contains("URI ARGUMENTS:"));
+
+        let full = full_output();
+        assert!(full.contains(ID_ARGUMENT_NOTE));
+        assert!(full.contains("pr-000000000001"));
+        assert!(full.contains("branch-000000000278"));
+    }
     #[test]
     fn help_after_passthrough_separator_is_not_intercepted() {
         let argv = ["quick-start", "manager", "codex", "--", "--help"]
