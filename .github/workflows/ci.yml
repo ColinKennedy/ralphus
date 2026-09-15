@@ -291,6 +291,10 @@ jobs:
         run: python -m unittest scripts/test_check_project_review_settings_ui_parity.py
       - name: Check project review-settings TOML / UI parity
         run: python scripts/check_project_review_settings_ui_parity.py
+      - name: Test daemon endpoint / CLI leaf parity checker
+        run: python -m unittest scripts/test_check_endpoint_cli_parity.py
+      - name: Check daemon endpoint / CLI leaf parity
+        run: python scripts/check_endpoint_cli_parity.py
 
   docs:
     name: Docs (screenshot coverage lint)
