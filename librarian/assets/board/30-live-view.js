@@ -235,6 +235,56 @@
         return null;
       }
       /**
+       * Resolves a peek key to the daemon API URL for that step's exact
+       * effective system prompt (RAL-428) — the admin-only System Prompt tab's
+       * data source. Sibling to {@link peekUrlFor}/{@link peekTranscriptUrlFor},
+       * one URL per peek kind, all four wired. Every one of these endpoints is
+       * admin-gated daemon-side too — the board merely hides the tab for
+       * non-admins, and stale (demoted-admin) state falls back to terminal.
+       * @param {string} key
+       * @returns {string|null}
+       */
+      function systemPromptUrlFor(key) {
+        const [kind, ...rest] = key.split("|");
+        if (kind === "cell") { const [squadId, ti, si] = rest; return `/api/squads/${squadId}/cells/${ti}/${si}/system-prompt`; }
+        if (kind === "proof") { const [squadId, ti, scope, si, vi] = rest; return `/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/system-prompt`; }
+        if (kind === "guardian") { const [gid, branchId] = rest; return `/api/guardians/${gid}/branches/${branchId}/system-prompt`; }
+        if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/system-prompt`; }
+        return null;
+      }
+      /**
+       * One peek box's System Prompt tab state (RAL-428): the fetched prompt
+       * text, or — when there is none to show — why. `"loading"` is not this
+       * type; it is the literal string the map holds while a fetch is in
+       * flight. An entirely absent entry means the tab was never opened.
+       * @typedef {object} PromptTabState
+       * @property {string} [text] - The step's exact effective system prompt, once fetched.
+       * @property {string} [error] - Why there is no text (a command cell, a step never yet dispatched, or a failed fetch) — shown verbatim in place of the prompt.
+       */
+      /**
+       * The System Prompt tab's loaded text, or null when there is none (not
+       * yet fetched, still loading, or the step has no prompt). The copy
+       * control reads this so copying on the prompt tab copies the prompt
+       * text, never a "Loading…"/error placeholder.
+       * @param {PromptTabState|"loading"|undefined} state
+       * @returns {string|null}
+       */
+      function peekPromptText(state) {
+        return state !== undefined && typeof state !== "string" && typeof state.text === "string" ? state.text : null;
+      }
+      /**
+       * The System Prompt tab's display string for a given state — the loaded
+       * text, else the reason it's unavailable, else a "Loading…" placeholder
+       * (both the not-yet-opened and in-flight cases).
+       * @param {PromptTabState|"loading"|undefined} state
+       * @returns {string}
+       */
+      function peekPromptDisplay(state) {
+        if (state === undefined || state === "loading") return "Loading…";
+        if (typeof state.error === "string") return state.error;
+        return state.text ?? "(no system prompt)";
+      }
+      /**
        * Folds one poll's liveness observation into a peek box's next state
        * (RAL-397 Phase 2G-A — the content itself comes from the transcript
        * tape, no longer from `/pane`, so this decides only ended/liveness).
@@ -752,6 +802,7 @@
           delete peekEnded[key];
           delete peekMissingStrikes[key];
           delete peekLastActivity[key];
+          delete peekSystemPrompt[key]; // RAL-428: refetch the System Prompt tab on the next open
         }
         terminalMenuOpen[key] = false; // pressing the primary button should collapse the actions dropdown too
         if (sel.kind) renderDetails();
@@ -788,6 +839,67 @@
         peekShowDebug[key] = checked;
         if (peekTape[key] === undefined) return;
         renderPeekTape(key);
+      }
+      /**
+       * Switches which tab a peek box shows — "terminal" (the default,
+       * transcript-tape live view, RAL-397 Phase 2G-A) or "prompt" (the
+       * step's exact system prompt, RAL-428). Only admins ever get the tab
+       * buttons that reach this handler; a stale "prompt" selection from a
+       * demoted admin falls back to the terminal tab anyway (see `peekBox`).
+       * The choice is per-key session state (`peekTab[key]`, retained across
+       * open/close like Show Debug Messages, cleared on reload); the active
+       * tab re-renders the owning pane in place. First visit to the prompt
+       * tab fetches the text lazily (idempotent thereafter — an effective
+       * system prompt is fixed at dispatch time, so it is never refetched
+       * while the box stays open, mirroring the attempt-history list).
+       * Switching back to terminal leaves the tape polling untouched; the
+       * next poll tick repopulates terminal content in place.
+       * @param {string} key
+       * @param {"terminal"|"prompt"} tab
+       * @returns {void}
+       */
+      function switchPeekTab(key, tab) {
+        if (tab !== "terminal" && tab !== "prompt") tab = "terminal";
+        peekTab[key] = tab;
+        if (tab === "prompt") void ensurePeekSystemPrompt(key);
+        if (sel.kind) renderDetails();
+        if (selectedGuardian) renderReviewDetail();
+      }
+      /**
+       * Ensures peek key `key`'s System Prompt tab text has been fetched
+       * once (idempotent — a loaded or failed state is never refetched, since
+       * an effective system prompt is fixed at dispatch time), then patches
+       * the tab's `<pre>` in place if the box is currently showing it.
+       * Absent/failed states leave the server's human-readable reason (or a
+       * fallback) in the tab. Never rejects: every failure paths into an
+       * `error` state so the tab always renders something.
+       * @param {string} key
+       * @returns {Promise<void>}
+       */
+      async function ensurePeekSystemPrompt(key) {
+        if (peekSystemPrompt[key] !== undefined) return;
+        const url = systemPromptUrlFor(key);
+        if (!url) {
+          peekSystemPrompt[key] = { error: "This view has no system prompt." };
+          return;
+        }
+        peekSystemPrompt[key] = "loading";
+        try {
+          const resp = await fetch(url);
+          const data = resp.ok
+            ? /** @type {SystemPromptReply|null} */ (await resp.json())
+            : null;
+          if (data && data.available && typeof data.system_prompt === "string") {
+            peekSystemPrompt[key] = { text: data.system_prompt };
+          } else if (data && typeof data.reason === "string") {
+            peekSystemPrompt[key] = { error: data.reason };
+          } else {
+            peekSystemPrompt[key] = { error: "This step has no system prompt." };
+          }
+        } catch (_) {
+          peekSystemPrompt[key] = { error: "Could not load the system prompt (network error)." };
+        }
+        setPeekPreText(`peek-prompt-${peekCssKey(key)}`, peekPromptDisplay(peekSystemPrompt[key]));
       }
       /**
        * Fetches the operator-configured default for the "Show Debug

@@ -103,6 +103,8 @@ where one exists.
 | POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
 | GET | `/api/squads/{id}/cells/{ti}/{si}/debug-events` | [This cell's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | GET | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/debug-events` | Same, for a proof step's resolved cell |
+| GET | `/api/squads/{id}/cells/{ti}/{si}/system-prompt` | [This cell's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
+| GET | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/system-prompt` | Same, for one proof step |
 | DELETE | `/api/squads/{id}` | Permanently delete a squad |
 
 **Guardians (reviews)**
@@ -137,6 +139,8 @@ where one exists.
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/system-prompt` | [The branch resolver's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
+| GET | `/api/guardians/{id}/manual-checks/system-prompt` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
@@ -3195,6 +3199,47 @@ Four equivalent routes, one per entity kind, matching the same
   }
 ]
 ```
+
+### `GET /api/squads/{id}/cells/{ti}/{si}/system-prompt` (and its siblings) (RAL-428)
+The **exact effective system prompt** a step's agent received: ralphus's
+own hidden instructions plus the step's authored system prompt, exactly as
+composed by `runner::RunnerSpec::effective_system_prompt()` at dispatch
+time. Backs the admin-only **System Prompt** tab of the board's shared
+live terminal viewer (review worktrees and squad-detail cells/proofs);
+non-admin boards never call these routes and the daemon rejects non-admin
+callers regardless. Out of scope: the initial user prompt / other agent
+inputs — this is the system prompt only.
+
+Four equivalent routes, one per entity kind:
+- `GET /api/squads/{id}/cells/{ti}/{si}/system-prompt` — the persisted
+  dispatch-time prompt written by the scheduler when the cell was
+  dispatched (`cells.effective_system_prompt`).
+- `GET /api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/system-prompt` — same, for one `prompt`-kind proof step
+  (`proofs.effective_system_prompt`).
+- `GET /api/guardians/{id}/branches/{branch_id}/system-prompt` —
+  **derived, not stored**: the manual resolution phases never persist
+  their own prompt, so the daemon recomposes it from the branch's current
+  `merge_status` exactly the way the merge worker builds its `RunnerSpec`
+  -- the conflict-resolution fix pass while pending/ready/in_progress, the
+  dedicated final-proof pass while `proof_pending`, and ralphus's defaults
+  only (the feedback-actioning revision, which carries no authored prompt)
+  while `actioning`.
+- `GET /api/guardians/{id}/manual-checks/system-prompt` — ralphus's
+  defaults only, matching the manual-checks generation spec's (authored,
+  proof-less) `RunnerSpec`.
+
+`200` with a loaded prompt (a `command` cell/step, or one never yet
+dispatched, instead gets `{"available": false}` and a `reason`):
+
+```json
+{
+  "available": true,
+  "system_prompt": "My step's authored system prompt\n\n## Background\nYou are running unattended..."
+}
+```
+
+`404` when the squad/task/cell, proof step, guardian, or branch does not
+exist; `403` for a non-admin caller.
 
 ### `GET /api/ghosts/{owner_uri}`
 Fetch one "ghost" (RAL-136) — a short, best-effort handoff note a task
