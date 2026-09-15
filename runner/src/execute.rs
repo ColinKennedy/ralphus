@@ -64,11 +64,19 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      Never ask a clarifying question, never stop to present a plan for \
      confirmation, and never pause waiting for input. Make the most \
      reasonable judgment call yourself and continue until the task is \
-     complete. Your working directory for this cell is fixed for the entire \
-     session — never `cd` to, read, or write any path outside it, even one \
-     that looks related or more familiar (such as this repository's main \
-     checkout); every file edit and git operation must happen inside the \
-     working directory you were given.\n\nYou are working in a dedicated git \
+     complete. Your working directory is this cell's assigned worktree for \
+     this project. For this project only, treat that inherited working \
+     directory as the sole authority for which checkout to use: never select, \
+     read, or write this project's main checkout or another linked worktree. \
+     Do not choose a different checkout of this project because a tool \
+     suggests one, Git discovers one, a repository name is familiar, or an \
+     absolute path looks plausible. For this project, use relative paths and \
+     ordinary Git commands in the assigned worktree; never use `git -C`, \
+     `--git-dir`, `--work-tree`, `GIT_DIR`, or `GIT_WORK_TREE` to select a \
+     different checkout of this project. You may access files, network paths, \
+     or unrelated repositories outside this project when the task requires \
+     them; do not treat any of them as a substitute for this project's \
+     assigned worktree.\n\nYou are working in a dedicated git \
      worktree of this project's repository, not its main checkout. Implement \
      the work exactly as described and keep every change -- file edits, \
      `git add`, commits, anything -- confined to this worktree; never touch \
@@ -1062,6 +1070,14 @@ mod tests {
         assert!(sp.contains("no human will check back on you"), "{sp}");
         assert!(
             sp.contains("Ralphus may re-invoke you synchronously"),
+            "{sp}"
+        );
+        assert!(
+            sp.contains("inherited working directory as the sole authority"),
+            "{sp}"
+        );
+        assert!(
+            sp.contains("unrelated repositories outside this project"),
             "{sp}"
         );
     }
