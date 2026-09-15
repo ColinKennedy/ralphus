@@ -362,7 +362,17 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      worktree of this project's repository, not its main checkout. Implement \
      the work exactly as described and keep every change -- file edits, \
      `git add`, commits, anything -- confined to this worktree; never touch \
-     the main checkout or any other worktree, even to look something up.";
+     the main checkout or any other worktree, even to look something up. \
+     This branch's git upstream is configured to point at its review's \
+     shared base branch, purely so ralphus can diff against it -- `git \
+     status`/`git push` may describe that tracked branch as \"your branch's \
+     upstream,\" but it is not this branch's own remote copy. Never push \
+     directly to it, whether with a bare `git push` or by naming it \
+     explicitly; that lands your commit straight on the shared base branch, \
+     bypassing the review this branch is meant to go through. Only push to a \
+     same-named branch of your own (e.g. `git push <remote> \
+     HEAD:<this-branch-name>`), and only if explicitly instructed to push at \
+     all.";
 
 fn combine_system_prompts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     let combined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n\n");
@@ -416,11 +426,15 @@ pub(crate) fn effective_cell_system_prompt(
 
 pub(crate) fn effective_proof_system_prompt(spec_system_prompt: Option<&str>) -> String {
     combine_system_prompts([
-        spec_system_prompt,
         Some(NON_INTERACTIVE_SYSTEM_PROMPT),
         Some(TOOLS_SYSTEM_PROMPT),
         Some(ASYNC_SYSTEM_PROMPT),
         Some(PROOF_SYSTEM_PROMPT),
+        // Proof specs receive this only from the scheduler's runtime-managed
+        // context, after the proof's earlier results are known. Keep it last
+        // so its scoped verification instruction narrows the generic proof
+        // guidance above.
+        spec_system_prompt,
     ])
     .expect("proof prompts always include ralphus system instructions")
 }
@@ -1283,6 +1297,74 @@ impl TranscriptTailer {
     }
 }
 
+/// Forward marker lines from one transcript chunk and fold the live fields
+/// needed by the tmux attempt into its in-memory state. Returns whether the
+/// chunk contained the completion sentinel.
+struct TranscriptEventTarget<'a> {
+    pane_event_fallback: bool,
+    cartographer: Option<&'a crate::store_lock::StoreHandle>,
+    squad_id: &'a str,
+    cell_id: &'a str,
+    task: &'a str,
+}
+
+fn consume_transcript_lines(
+    lines: &[String],
+    target: &TranscriptEventTarget<'_>,
+    resumable_agent_session_id: &mut Option<String>,
+    current_usage: &mut LiveUsage,
+) -> bool {
+    let mut done = false;
+    for line in lines {
+        if line_is_done_sentinel(line) {
+            done = true;
+        }
+        if target.pane_event_fallback {
+            continue;
+        }
+        if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
+            let forwarded = forward_runner_event(
+                target.cartographer,
+                target.squad_id,
+                target.cell_id,
+                target.task,
+                json,
+            );
+            if let Some(session_id) = forwarded.agent_session_id {
+                *resumable_agent_session_id = Some(session_id);
+            }
+            if let Some(usage) = forwarded.live_usage {
+                *current_usage = usage;
+            }
+        }
+    }
+    done
+}
+
+/// Drain every byte currently available after the completion sentinel has
+/// been observed. A single poll is deliberately capped, so a burst larger
+/// than that cap can otherwise leave late runner events unforwarded when the
+/// shallow pane sees completion before the transcript tail catches up.
+fn drain_transcript_to_current_end(
+    tailer: &mut TranscriptTailer,
+    target: &TranscriptEventTarget<'_>,
+    resumable_agent_session_id: &mut Option<String>,
+    current_usage: &mut LiveUsage,
+) {
+    loop {
+        let drained = tailer.drain();
+        consume_transcript_lines(
+            &drained.lines,
+            target,
+            resumable_agent_session_id,
+            current_usage,
+        );
+        if !drained.saw_new_bytes {
+            break;
+        }
+    }
+}
+
 impl Runner for SubprocessRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         self.run_cancellable(spec, &CancelToken::never())
@@ -1886,34 +1968,23 @@ impl SubprocessRunner {
                     transcript_ever_produced_bytes = true;
                     self.note_live_activity(session_name);
                 }
-                let mut done = false;
-                for line in &drained.lines {
-                    if line_is_done_sentinel(line) {
-                        done = true;
-                    }
-                    // Once the pane fallback owns event parsing the two
-                    // sources are mutually exclusive, so the same marker can
-                    // never be forwarded twice. Sentinel detection above stays
-                    // active either way — it is an idempotent boolean.
-                    if pane_event_fallback {
-                        continue;
-                    }
-                    if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
-                        let fwd = forward_runner_event(
-                            self.cartographer.as_ref(),
-                            &attempt_spec.squad_id,
-                            &attempt_spec.cell_id,
-                            &attempt_spec.task,
-                            json,
-                        );
-                        if let Some(sid) = fwd.agent_session_id {
-                            *resumable_agent_session_id = Some(sid);
-                        }
-                        if let Some(usage) = fwd.live_usage {
-                            current_usage = usage;
-                        }
-                    }
-                }
+                // Once the pane fallback owns event parsing the two sources
+                // are mutually exclusive, so the same marker can never be
+                // forwarded twice. Sentinel detection stays active either
+                // way because it is an idempotent boolean.
+                let transcript_target = TranscriptEventTarget {
+                    pane_event_fallback,
+                    cartographer: self.cartographer.as_ref(),
+                    squad_id: &attempt_spec.squad_id,
+                    cell_id: &attempt_spec.cell_id,
+                    task: &attempt_spec.task,
+                };
+                let mut done = consume_transcript_lines(
+                    &drained.lines,
+                    &transcript_target,
+                    resumable_agent_session_id,
+                    &mut current_usage,
+                );
 
                 // A small `capture_pane` (visible window only, not the former
                 // deep 10_000-line scan events used to come from) still runs
@@ -2022,6 +2093,24 @@ impl SubprocessRunner {
             std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
         };
 
+        // The completion safety net can observe the pane's final sentinel
+        // while the capped transcript tailer is still working through a
+        // large burst. Catch it up before stopping the pipe so every marker
+        // already written by the runner reaches Cartographer.
+        let transcript_target = TranscriptEventTarget {
+            pane_event_fallback,
+            cartographer: self.cartographer.as_ref(),
+            squad_id: &attempt_spec.squad_id,
+            cell_id: &attempt_spec.cell_id,
+            task: &attempt_spec.task,
+        };
+        drain_transcript_to_current_end(
+            &mut tailer,
+            &transcript_target,
+            resumable_agent_session_id,
+            &mut current_usage,
+        );
+
         // RAL-397 Phase 2C: best-effort clean stop before the forceful
         // process-tree kill below -- not load-bearing (the job-object
         // confinement `kill_session` relies on, RAL-321, already tears down
@@ -2030,6 +2119,14 @@ impl SubprocessRunner {
         // killed outright. A no-op when this attempt never started a pipe
         // (transcript_path was `None`).
         tmux.stop_pipe_pane(session_name);
+        // Closing the tee lets its final buffered write settle. Consume those
+        // bytes before removing the session and transcript producer.
+        drain_transcript_to_current_end(
+            &mut tailer,
+            &transcript_target,
+            resumable_agent_session_id,
+            &mut current_usage,
+        );
         let _ = tmux.kill_session(session_name);
         let _ = std::fs::remove_file(spec_path);
         let _ = std::fs::remove_file(result_path);
@@ -2632,14 +2729,13 @@ mod tests {
         assert!(!pane_shows_done_sentinel("still working on it...\n"));
     }
 
-    /// Asserts the structure of the fully assembled unattended-cell system
-    /// prompt (caller-authored fragment + ralphus fragments joined with blank
-    /// lines), the form the board shows and the backend receives -- not just
-    /// the individual constants.
-    fn assert_assembled_prompt_sections(sp: &str, caller_first_line: &str) {
+    /// Asserts the structure of the fully assembled unattended system prompt
+    /// the board shows and the backend receives, not just its individual
+    /// fragments.
+    fn assert_assembled_prompt_sections(sp: &str, expected_first_line: &str) {
         assert!(
-            sp.starts_with(caller_first_line),
-            "caller-authored fragment must come first: {sp}"
+            sp.starts_with(expected_first_line),
+            "unexpected opening system-prompt section: {sp}"
         );
         let background = sp.find("## Background\n").expect("Background section");
         let tools = sp
@@ -2695,9 +2791,10 @@ mod tests {
         let sp = effective_proof_system_prompt(Some(
             "Do NOT commit and do NOT push under any circumstances.",
         ));
-        assert_assembled_prompt_sections(
-            &sp,
-            "Do NOT commit and do NOT push under any circumstances.",
+        assert_assembled_prompt_sections(&sp, "## Background");
+        assert!(
+            sp.ends_with("Do NOT commit and do NOT push under any circumstances."),
+            "runtime proof context must be appended after the generic proof guidance: {sp}"
         );
         // Proof steps get the verdict contract, not the ghost handoff.
         assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");
@@ -4923,6 +5020,61 @@ prompt = "make it build"
         let second = tailer.drain();
         assert!(second.saw_new_bytes);
         assert_eq!(second.lines, vec!["line c".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn completion_catchup_forwards_events_beyond_one_drain_cap() {
+        let path = unique_raw_path("completion-catchup");
+        let _ = std::fs::remove_file(&path);
+        let (store, squad_id) = store_with_one_cell();
+        let first = serde_json::json!({
+            "source": "pi",
+            "message": "first compaction",
+            "level": "warning",
+        });
+        let second = serde_json::json!({
+            "source": "pi",
+            "message": "second compaction",
+            "level": "warning",
+        });
+        let mut bytes = format!("{EVENT_MARKER}{first}\n").into_bytes();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            usize::try_from(MAX_TRANSCRIPT_DRAIN_BYTES_PER_POLL).unwrap(),
+        ));
+        bytes.extend_from_slice(format!("\n{EVENT_MARKER}{second}\n").as_bytes());
+        std::fs::write(&path, bytes).expect("write oversized transcript");
+
+        let mut tailer = TranscriptTailer::at_path(path.clone());
+        let initial = tailer.drain();
+        assert!(
+            !initial
+                .lines
+                .iter()
+                .any(|line| line.contains("second compaction")),
+            "the regression requires the second event to sit beyond one capped drain"
+        );
+        let mut session_id = None;
+        let mut usage = LiveUsage::default();
+        let target = TranscriptEventTarget {
+            pane_event_fallback: false,
+            cartographer: Some(&store),
+            squad_id: &squad_id,
+            cell_id: "worker",
+            task: "build",
+        };
+        consume_transcript_lines(&initial.lines, &target, &mut session_id, &mut usage);
+        drain_transcript_to_current_end(&mut tailer, &target, &mut session_id, &mut usage);
+
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
+            .unwrap();
+        let messages: Vec<&str> = page.rows.iter().map(|row| row.message.as_str()).collect();
+        assert!(messages.contains(&"first compaction"), "{messages:?}");
+        assert!(messages.contains(&"second compaction"), "{messages:?}");
 
         let _ = std::fs::remove_file(&path);
     }

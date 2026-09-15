@@ -18,6 +18,20 @@ use std::path::{Path, PathBuf};
 
 use ralphus_core::cors::CorsConfig;
 
+/// The subset of `[daemon]` configuration the librarian must honor so its
+/// exporter agrees with the daemon's process-wide tracing switch.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DaemonConfig {
+    #[serde(default)]
+    opentelemetry: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    daemon: Option<DaemonConfig>,
+}
+
 fn global_config_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("RALPHUS_CONFIG_HOME") {
         return Some(PathBuf::from(dir).join("config.toml"));
@@ -59,4 +73,51 @@ pub fn load_cors_config() -> CorsConfig {
         .map(|s| ralphus_core::cors::from_toml_str(&s))
         .unwrap_or_default();
     global.merge(local)
+}
+
+/// Whether OpenTelemetry export is enabled by the effective `[daemon]`
+/// configuration. It defaults to enabled; the collector endpoint is still a
+/// separate requirement before an exporter makes any network request.
+#[must_use]
+pub fn opentelemetry_enabled() -> bool {
+    fn read(path: &Path) -> Option<bool> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+            .and_then(|file| file.daemon)
+            .and_then(|daemon| daemon.opentelemetry)
+    }
+
+    let global = global_config_path().as_deref().and_then(read);
+    let local = std::env::current_dir()
+        .ok()
+        .as_deref()
+        .and_then(find_project_config)
+        .as_deref()
+        .and_then(read);
+    local.or(global).unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opentelemetry_defaults_to_enabled() {
+        assert!(
+            ConfigFile::default()
+                .daemon
+                .and_then(|daemon| daemon.opentelemetry)
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn opentelemetry_parses_disabled() {
+        let config: ConfigFile = toml::from_str("[daemon]\nopentelemetry = false\n").unwrap();
+        assert_eq!(
+            config.daemon.and_then(|daemon| daemon.opentelemetry),
+            Some(false)
+        );
+    }
 }

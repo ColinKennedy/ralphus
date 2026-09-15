@@ -1217,6 +1217,7 @@ impl DaemonClient {
         prompt: Option<&str>,
         command: Option<&str>,
         auto_compact_threshold: Option<&str>,
+        maximum_context: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
         system_prompt: Option<&str>,
     ) -> Result<Value, DaemonError> {
@@ -1230,6 +1231,11 @@ impl DaemonClient {
             &mut body,
             "auto_compact_threshold",
             auto_compact_threshold.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "maximum_context",
+            maximum_context.map(str::to_string),
         );
         set_if_some(
             &mut body,

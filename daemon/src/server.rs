@@ -115,6 +115,92 @@ pub struct Daemon {
     /// buttons -- see `crate::generation`'s module doc comment for why this
     /// is fire-and-forget-plus-poll rather than a blocking HTTP call.
     generation_jobs: crate::generation::GenerationJobs,
+    /// How `submit`'s materialization follow-up (worktree creation + review
+    /// derivation, RAL-<pending>) is run — see [`BackgroundWork`]'s doc
+    /// comment. Defaults to [`BackgroundWork::Immediate`] in [`Daemon::new`]
+    /// so every existing in-process test (`route()`, `serve_with`) keeps its
+    /// current synchronous, zero-edits behavior; only `serve()` (the real
+    /// production entry point) opts into [`BackgroundWork::Threaded`].
+    background: BackgroundWork,
+}
+
+/// How to run a unit of background follow-up work spawned from a request
+/// handler (today: only `submit`'s materialization step, RAL-<pending>).
+///
+/// Introduced because `submit()`'s worktree creation + review derivation
+/// (`crate::reviews::derive_reviews_with_prefetch`, which does real `git
+/// worktree add`/`git fetch` calls) used to run synchronously inside the
+/// HTTP request, which meant a multi-task submission could take long enough
+/// to blow through the CLI's request timeout while also holding up every
+/// other request queued behind the daemon's single store lock. Mirrors the
+/// same "defer the slow part to a background thread, don't block the HTTP
+/// response" shape `crate::arbiter::spawn_triage_followup` already
+/// established for Triage classification/pooling.
+///
+/// `daemon/src/server.rs`'s `mod tests` has 150+ call sites that submit via
+/// `route()` and then assert on review-derivation results in the same call
+/// — unlike Triage (whose tests bypass `submit()` and call
+/// `derive_triage_pools` directly), review derivation is exercised
+/// synchronously through `route()` pervasively. A bare `std::thread::spawn`
+/// would make all of those flaky. `Immediate` (the default for every
+/// `Daemon::new()`-built daemon, i.e. every test) keeps `route()` returning
+/// only once the work is done, exactly like before this existed — zero test
+/// edits. `Deferred` is for tests that want to assert the pre-materialization
+/// state and the post-materialization state as two separate steps: drain the
+/// queue explicitly between them.
+pub enum BackgroundWork {
+    /// Production (`serve()`): a real `std::thread::spawn`, so the HTTP
+    /// response returns before the work runs.
+    Threaded,
+    /// Default for `Daemon::new()`: run inline, on the calling thread, before
+    /// returning — preserves every existing test's synchronous assertions.
+    Immediate,
+    /// Opt-in test mode: capture the closure instead of running it, so a test
+    /// can assert intermediate state, then call [`BackgroundWork::drain`].
+    Deferred(DeferredQueue),
+}
+
+/// Closures captured by [`BackgroundWork::Deferred`], run in submission order
+/// by [`BackgroundWork::drain`]. Factored out to appease
+/// `clippy::type_complexity`.
+type DeferredQueue = Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
+impl BackgroundWork {
+    /// Run (or defer) `f` per this mode — see the type's doc comment.
+    pub fn spawn(&self, f: impl FnOnce() + Send + 'static) {
+        match self {
+            Self::Threaded => {
+                std::thread::spawn(f);
+            }
+            Self::Immediate => f(),
+            Self::Deferred(queue) => queue
+                .lock()
+                .expect("BackgroundWork::Deferred queue mutex poisoned")
+                .push(Box::new(f)),
+        }
+    }
+
+    /// Test-only: build a fresh `Deferred` mode with an empty queue.
+    #[must_use]
+    pub fn deferred() -> Self {
+        Self::Deferred(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Test-only: run every closure captured by a `Deferred` mode so far, in
+    /// submission order, then clear the queue. A no-op for `Threaded`/
+    /// `Immediate` (nothing is ever captured in those modes).
+    pub fn drain(&self) {
+        if let Self::Deferred(queue) = self {
+            let pending: Vec<_> = queue
+                .lock()
+                .expect("BackgroundWork::Deferred queue mutex poisoned")
+                .drain(..)
+                .collect();
+            for f in pending {
+                f();
+            }
+        }
+    }
 }
 
 impl Daemon {
@@ -141,7 +227,23 @@ impl Daemon {
             active_terminal_sessions: Mutex::new(std::collections::HashSet::new()),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
             generation_jobs: crate::generation::GenerationJobs::new(),
+            background: BackgroundWork::Immediate,
         }
+    }
+
+    /// Override how `submit`'s materialization follow-up runs (see
+    /// [`BackgroundWork`]'s doc comment). Only `serve()` calls this
+    /// (`BackgroundWork::Threaded`); every other `Daemon` (tests) keeps
+    /// `Daemon::new`'s `Immediate` default.
+    #[must_use]
+    pub fn with_background_work(mut self, mode: BackgroundWork) -> Self {
+        self.background = mode;
+        self
+    }
+
+    /// This daemon's configured [`BackgroundWork`] mode.
+    fn background(&self) -> &BackgroundWork {
+        &self.background
     }
 
     /// Require `token` on every HTTP route (via `Authorization: Bearer
@@ -368,19 +470,6 @@ struct SubmitBody {
     hold: bool,
     #[serde(default)]
     label: Option<String>,
-    /// RAL-420: the job ids of every pre-work generation call the submitting
-    /// board ran for this squad (the Simple form's Generate buttons — each
-    /// `POST /api/generate` response's `gen-…` id, retained client-side even
-    /// after the job finished, done, failed, or cancelled). The daemon
-    /// retained those calls' usage in `squad_generation_costs` with `squad_id`
-    /// NULL; this submit claims exactly those rows for the squad it just
-    /// created (`attribute_generation_costs`). Jobs whose rows the daemon no
-    /// longer knows (e.g. lost to a daemon restart mid-run) are skipped, and
-    /// the caller surfaces a distinct "attributed 0" log. The post-submit
-    /// `suggest-name` fallback never appears here — its row is attributed by
-    /// the suggest-name handler itself.
-    #[serde(default)]
-    generation_ids: Vec<String>,
 }
 
 fn default_vcs() -> String {
@@ -714,8 +803,6 @@ struct TaskIndexCell {
     cache_read_tokens: i64,
     compaction_input_tokens: i64,
     compaction_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    turns: Option<i64>,
     cost_usd: f64,
     cost_is_estimated: bool,
     error: Option<String>,
@@ -737,8 +824,6 @@ struct TaskIndexProof {
     cache_read_tokens: i64,
     compaction_input_tokens: i64,
     compaction_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    turns: Option<i64>,
     cost_usd: f64,
     cost_is_estimated: bool,
 }
@@ -755,7 +840,6 @@ impl From<crate::store::ProofView> for TaskIndexProof {
             cache_read_tokens: value.cache_read_tokens,
             compaction_input_tokens: value.compaction_input_tokens,
             compaction_count: value.compaction_count,
-            turns: value.turns,
             cost_usd: value.cost_usd,
             cost_is_estimated: value.cost_is_estimated,
         }
@@ -776,7 +860,6 @@ impl From<crate::store::CellView> for TaskIndexCell {
             cache_read_tokens: value.cache_read_tokens,
             compaction_input_tokens: value.compaction_input_tokens,
             compaction_count: value.compaction_count,
-            turns: value.turns,
             cost_usd: value.cost_usd,
             cost_is_estimated: value.cost_is_estimated,
             error: value.error,
@@ -990,11 +1073,6 @@ fn route_for_user(
         ("GET", ["api", "triage", "pools"]) => {
             admin_gated(daemon, user_header, || list_triage_pools(daemon))
         }
-        ("POST", ["api", "triage", "pools", "threshold", "preview"]) => {
-            admin_gated(daemon, user_header, || {
-                preview_triage_pool_threshold(daemon, body)
-            })
-        }
         ("POST", ["api", "triage", "pools", "threshold"]) => {
             admin_gated(daemon, user_header, || {
                 set_triage_pool_threshold(daemon, body)
@@ -1142,11 +1220,6 @@ fn route_for_user(
         ("GET", ["api", "graph"]) => global_graph(daemon, query),
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
-        // RAL-420: pre-work generation cost — per-squad detail + cross-squad audit.
-        ("GET", ["api", "squads", id, "generation-costs"]) => {
-            squad_generation_cost_rows(daemon, id)
-        }
-        ("GET", ["api", "generation-costs"]) => generation_costs_audit(daemon),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
@@ -1553,7 +1626,7 @@ fn route_for_user(
         ("POST", ["api", "pull-requests", pr_id]) => pr_update(daemon, pr_id, body),
         ("GET", ["api", "pull-requests", pr_id, "comments"]) => pr_comments(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id, "action-feedback"]) => {
-            pr_action_feedback(daemon, pr_id)
+            pr_action_feedback(daemon, user_header, pr_id)
         }
         ("GET", ["api", "pull-requests", pr_id, "sync-status"]) => pr_sync_status(daemon, pr_id),
         ("POST", ["api", "pull-requests", pr_id, "pull-from-pr"]) => pr_pull_from_pr(daemon, pr_id),
@@ -2951,57 +3024,8 @@ struct SetTriagePoolThresholdBody {
     threshold: Option<i64>,
 }
 
-/// `POST /api/triage/pools/threshold/preview` body (RAL-421): same shape as
-/// `SetTriagePoolThresholdBody` -- this is "what would confirming do?" for
-/// the same proposed change.
-#[derive(Deserialize)]
-struct PreviewTriagePoolThresholdBody {
-    project: String,
-    triage_type: String,
-    #[serde(default)]
-    threshold: Option<i64>,
-}
-
-/// The non-mutating rough preview for a proposed pool threshold (RAL-421):
-/// what confirming it would drain *right now*. Deliberately "rough" -- the
-/// pool can change between preview and confirm (another submission pooling,
-/// a cron firing, ...) -- so the UI must treat it as an estimate, never as
-/// a reservation. `full_batches` is the number of whole threshold-sized
-/// batches (`pooled / threshold`), each of which would become its own
-/// review; the sub-threshold remainder (`cells_left`) stays pooled.
-#[derive(Serialize)]
-struct TriagePoolThresholdPreview {
-    /// The pool key the proposed threshold resolves to -- the same key the
-    /// confirm call will persist under.
-    project: String,
-    triage_type: String,
-    proposed_threshold: Option<i64>,
-    /// Whether this preview is for clearing the threshold (no drain).
-    clearing: bool,
-    /// Viable pooled-cell count right now (failed cells never count).
-    pooled: i64,
-    /// Whole threshold-sized batches a confirm would drain now (`0` when
-    /// clearing, or when `pooled < threshold`).
-    full_batches: i64,
-    /// `full_batches * threshold` -- cells a confirm would drain now.
-    cells_drained: i64,
-    /// Cells that would remain pooled after the drain (`0` when clearing).
-    cells_left: i64,
-}
-
 /// `POST /api/triage/pools/threshold`: set (or clear) a pool's count
-/// threshold **and, once confirmed, atomically drain any pool now eligible**
-/// (RAL-421). This is the confirm endpoint: it persists the threshold under
-/// the daemon's single store-lock hold, then fires the pool in
-/// threshold-sized batches -- each full batch becomes its own review, and
-/// only the final sub-threshold remainder stays pooled. Passing
-/// `threshold: null` (clear) never fires anything. The UI calls the
-/// non-mutating `/preview` twin first and only POSTs here after the human
-/// confirms, so no mutation and no Guardian-agent (LLM) work ever starts
-/// from the act of typing a number.
-///
-/// Responds with what the confirm actually did:
-/// `{ "ok": true, "reviews_created": N, "cells_drained": M, "cells_left": L }`.
+/// threshold.
 fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<SetTriagePoolThresholdBody>(body) else {
         return error(
@@ -3024,89 +3048,9 @@ fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
     let store = daemon.lock();
     let project = crate::triage::resolve_pool_key_input(&store, &req.project);
     match store.set_triage_pool_threshold(&project, &req.triage_type, req.threshold) {
-        Ok(()) => {}
-        Err(e) => return store_error(&e),
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Err(e) => store_error(&e),
     }
-    let (reviews_created, cells_drained) = match req.threshold {
-        Some(t) => match crate::reviews::fire_triage_pool_in_threshold_batches(
-            &store,
-            &project,
-            &req.triage_type,
-            t,
-        ) {
-            Ok(gids) => (gids.len() as i64, gids.len() as i64 * t),
-            Err(e) => {
-                return error(
-                    500,
-                    "internal",
-                    &format!("threshold confirmed but draining the pool failed: {e}"),
-                    vec![],
-                );
-            }
-        },
-        None => (0, 0),
-    };
-    let cells_left = store
-        .triage_pool_count(&project, &req.triage_type)
-        .unwrap_or_default();
-    json(
-        200,
-        &serde_json::json!({
-            "ok": true,
-            "reviews_created": reviews_created,
-            "cells_drained": cells_drained,
-            "cells_left": cells_left,
-        }),
-    )
-}
-
-/// `POST /api/triage/pools/threshold/preview`: non-mutating rough preview
-/// for a proposed threshold (RAL-421) -- see [`TriagePoolThresholdPreview`].
-/// Reads only; never writes a threshold and never drains or creates a
-/// review, so it is safe to call from a keystroke handler or a periodic
-/// poll.
-fn preview_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
-    let Ok(req) = serde_json::from_str::<PreviewTriagePoolThresholdBody>(body) else {
-        return error(
-            400,
-            "bad_request",
-            "body must include \"project\" and \"triage_type\" strings",
-            vec![],
-        );
-    };
-    if let Some(t) = req.threshold {
-        if t < 1 {
-            return error(
-                400,
-                "invalid_value",
-                "'threshold' must be at least 1",
-                vec![],
-            );
-        }
-    }
-    let store = daemon.lock();
-    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
-    let pooled = match store.triage_pool_count(&project, &req.triage_type) {
-        Ok(c) => c,
-        Err(e) => return store_error(&e),
-    };
-    let (full_batches, cells_drained) = req.threshold.map_or((0, 0), |t| {
-        let full = pooled / t;
-        (full, full * t)
-    });
-    json(
-        200,
-        &TriagePoolThresholdPreview {
-            project,
-            triage_type: req.triage_type,
-            proposed_threshold: req.threshold,
-            clearing: req.threshold.is_none(),
-            pooled,
-            full_batches,
-            cells_drained,
-            cells_left: pooled - cells_drained,
-        },
-    )
 }
 
 /// `GET /api/triage/schedules[?project=...&triage_type=...]`: every
@@ -4481,107 +4425,6 @@ struct GenerateStartResponse {
     id: String,
 }
 
-/// RAL-420: derive the retained-cost-row status for a finished generation
-/// job: `"done"` when the job produced its items (a cancel that landed after
-/// the work already finished still counts as done -- the spend bought a
-/// usable result), `"cancelled"` when the caller's cancel token was tripped,
-/// and `"error"` otherwise (a call that completed or died without a usable
-/// result -- its runner-captured tokens/cost are still retained for audit).
-#[must_use]
-fn generation_call_status(
-    job: &crate::generation::GenerationJob,
-    cancel: &crate::cancel::CancelToken,
-) -> &'static str {
-    match job {
-        crate::generation::GenerationJob::Done { .. } => "done",
-        _ if cancel.is_cancelled() => "cancelled",
-        _ => "error",
-    }
-}
-
-/// RAL-420: persist one finished pre-work generation call's usage (the
-/// Simple form's Generate buttons, or the post-submit `suggest-name`
-/// fallback) into `squad_generation_costs` and log it (rlog + a Cartographer
-/// note) -- the retention half of "account for squad generation cost".
-/// `squad_id` is `None` for a pre-submit job (the owning squad does not
-/// exist yet; `submit`'s `attribute_generation_costs` fills it in at
-/// submission) and `Some(squad)` for a call whose squad was already known up
-/// front (the RAL-398 `suggest-name` fallback), which is attributed
-/// immediately. The runner's captured usage -- including the last live
-/// snapshot of a killed/cancelled/failed call (`cost_is_estimated`) -- is
-/// retained exactly as reported, whatever the outcome: a failed or cancelled
-/// job is still an audit event and still spent tokens, so a cancelled New
-/// Task modal never silently discards spend it already incurred.
-#[allow(clippy::too_many_arguments)]
-fn record_generation_call_cost(
-    store: &StoreHandle,
-    squad_id: Option<&str>,
-    job_id: &str,
-    kind: &str,
-    status: &str,
-    result: &crate::runner::RunnerResult,
-    agent: &str,
-    model: Option<&str>,
-    started_at_ms: i64,
-) {
-    let guard = store.lock();
-    let finished_at_ms = crate::store::now_ms();
-    let _ = guard.record_generation_cost(
-        squad_id,
-        job_id,
-        kind,
-        status,
-        result.tokens_in,
-        result.tokens_out,
-        result.cache_creation_tokens,
-        result.cache_read_tokens,
-        result.cost_usd,
-        result.cost_is_estimated,
-        result.error.as_deref(),
-        agent,
-        model,
-        started_at_ms,
-        finished_at_ms,
-    );
-    let level = if status == "done" {
-        crate::logging::LogLevel::INFO
-    } else {
-        crate::logging::LogLevel::WARNING
-    };
-    let squad_tag = squad_id.unwrap_or("pre-submit");
-    let log_line = format!(
-        "ralphus [generation] squad={squad_tag} job={job_id} kind={kind} status={status} \
-         in={} out={} cost=${:.6} estimated={}",
-        result.tokens_in, result.tokens_out, result.cost_usd, result.cost_is_estimated,
-    );
-    match status {
-        "done" => crate::rlog!(INFO, "{}", log_line),
-        _ => crate::rlog!(WARNING, "{}", log_line),
-    }
-    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-        level,
-        source: "generation",
-        message: "generation cost recorded",
-        scope: squad_id.map(|_| "squad"),
-        squad_id,
-        guardian_id: None,
-        cell_id: None,
-        task: None,
-        log_path: None,
-        payload: serde_json::json!({
-            "job_id": job_id,
-            "kind": kind,
-            "status": status,
-            "squad_id": squad_tag,
-            "tokens_in": result.tokens_in,
-            "tokens_out": result.tokens_out,
-            "cost_usd": result.cost_usd,
-            "cost_is_estimated": result.cost_is_estimated,
-        }),
-        admin_only: false,
-    });
-}
-
 /// `POST /api/generate` (RAL-297): kicks off one "generation step" (Simple
 /// form's opt-in "Generate Proofs"/"Generate Manual Checks"/"Generate
 /// Auto-Build Steps") on a background thread and returns `202` immediately
@@ -4592,10 +4435,6 @@ fn record_generation_call_cost(
 /// `Cancellations` registry -- the same one `crate::scheduler` registers a
 /// squad's cells under -- for the lifetime of the background thread, so
 /// cancelling a generation job really does kill its agent subprocess.
-/// RAL-420: the same thread persists the call's usage to
-/// `squad_generation_costs` (unattributed -- `squad_id` NULL) and logs it,
-/// so a cancelled or failed call's cost survives even though the owning
-/// squad may never be submitted.
 fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     let req: crate::generation::GenerateRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -4618,30 +4457,14 @@ fn generate_start(daemon: &Daemon, body: &str) -> Reply {
     }
     let id = daemon.generation_jobs.start();
     let jobs = daemon.generation_jobs.clone();
-    let store = daemon.store_handle();
     let job_id = id.clone();
-    let kind = req.kind.clone();
-    let agent = req.agent.clone();
-    let model = req.model.clone();
     let cancellations = daemon.cancellations_handle();
     let cancel_id = id.clone();
     std::thread::spawn(move || {
         let token = cancellations.register(&cancel_id);
-        let started_at_ms = crate::store::now_ms();
-        let (job, usage_result) = crate::generation::run_generation(&req, &token);
+        let (job, _) = crate::generation::run_generation(&req, &token);
         cancellations.remove(&cancel_id);
         jobs.finish(&job_id, job.clone());
-        record_generation_call_cost(
-            &store,
-            None,
-            &job_id,
-            &kind,
-            generation_call_status(&job, &token),
-            &usage_result,
-            &agent,
-            model.as_deref(),
-            started_at_ms,
-        );
     });
     json(202, &GenerateStartResponse { id })
 }
@@ -4689,7 +4512,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         );
     }
 
-    let file = match toml::from_str(&req.toml) {
+    let mut file = match toml::from_str(&req.toml) {
         Ok(f) => f,
         Err(e) => {
             return error(
@@ -4710,6 +4533,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
             profile_errors,
         );
     }
+    crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
 
     // RAL-318: an inline `triage_type` must name a registered Triage type --
     // `core::validate` only checked its structure (non-empty, requires
@@ -4733,6 +4557,17 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         return error(400, "project_validation_failed", &msg, vec![]);
     }
 
+    // Review build declarations can be resolved from registered project
+    // configuration without materializing a worktree. Reject them here so a
+    // submit never succeeds only to fail asynchronously during materialization.
+    let review_preflight = {
+        let store = daemon.lock();
+        crate::reviews::preflight_auto_build_declarations(&store, &file)
+    };
+    if let Err(e) = review_preflight {
+        return error(400, "review_validation_failed", &e.message, vec![]);
+    }
+
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
     // daemon can see the registry.
@@ -4753,62 +4588,44 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         }
     }
 
-    // RAL-<pending>: fetch every registered-remote project's bare
-    // `?upstream=`/declared review `upstream` BEFORE taking the long-held
-    // lock below -- `git fetch` is a real network call (bounded to
-    // `GIT_TIMEOUT`, but that's still up to a minute against a dead
-    // remote), and the daemon's single global `Mutex<Store>` must never be
-    // held for that long: `store` below stays locked for the rest of this
-    // submit, including `derive_reviews`, so every other request (every
-    // board read, every other squad's dispatch) would otherwise queue
-    // behind this one submission for as long as the fetch takes. See
-    // `crate::worktrees::resolve_placeholders_with_prefetch`'s doc comment
-    // for the full picture, including why a miss here still resolves
-    // correctly (just not for free).
-    let prefetched_upstreams = {
-        let guard = daemon.lock();
-        let targets = crate::reviews::collect_remote_upstream_prefetch_targets(&guard, &file);
-        drop(guard);
-        let mut resolved = std::collections::HashMap::new();
-        for (project, upstream) in targets {
-            match crate::worktrees::resolve_registered_remote_upstream(
-                std::path::Path::new(&project.path),
-                &project,
-                &upstream,
-            ) {
-                Ok(remote_upstream) => {
-                    resolved.insert((project.name.clone(), upstream), remote_upstream);
-                }
-                // Not fatal here -- the locked pass below retries the same
-                // fetch live and surfaces the real error through the normal
-                // validation-failure path if it's still broken.
-                Err(e) => crate::rlog!(
-                    WARNING,
-                    "ralphus [submit] could not prefetch \"?upstream={upstream}\" for project \
-                     \"{}\": {e}",
-                    project.name
-                ),
-            }
-        }
-        resolved
-    };
-
+    // RAL-<pending>: insert the squad synchronously (cheap: DB writes only),
+    // land it in `materializing`, and defer everything that can be slow --
+    // the `?upstream=` prefetch (a real `git fetch`), review derivation (real
+    // `git worktree add` calls), Triage pooling, and auto-watch -- to a
+    // background follow-up (`run_submit_followup`, below) so this request
+    // returns immediately no matter how many worktrees the batch needs. This
+    // used to all run inline, holding the daemon's single global
+    // `Mutex<Store>` for as long as the slowest `git worktree add`/`git
+    // fetch` took, which stalled every other request (every board read,
+    // every other squad's dispatch) queued behind the same lock, and could
+    // outrun the CLI's own request timeout on a large batch. Mirrors the
+    // same "defer the slow part" shape `crate::arbiter::spawn_triage_followup`
+    // already established for Triage -- see [`BackgroundWork`]'s doc comment
+    // for the production-vs-test split that keeps this from making the
+    // ~150 existing `route()`-based submit tests flaky.
     let mut store = daemon.lock();
     let squad_id = match store.insert_squad(&file, req.label.as_deref(), req.hold) {
         Ok(id) => id,
         Err(e) => return store_error(&e),
     };
+    // Not the hold-derived `pending`/`queued` state `insert_squad` just
+    // wrote -- this squad's worktrees don't exist and its reviews haven't
+    // been derived yet, so it must not be schedulable. `Store::list_ready`
+    // only selects `state='pending'`, so `materializing` is already excluded
+    // with no scheduler change needed; `run_submit_followup` flips this
+    // forward to `pending`/`queued` on success, or `failed` on error.
+    if let Err(e) = store.set_squad_state(&squad_id, SquadState::Materializing) {
+        return store_error(&e);
+    }
     // RAL-318: resolve every Triage-opted-in cell's type before it reaches
     // the pool. A cell with its own inline `triage_type` (already validated
     // as registered above) resolves for free, right here -- just a store
     // write, no git or LLM call. A cell with none needs a real Arbiter
     // classification call, which is NOT run here -- it's deferred, along
-    // with Triage pooling itself (see below), to a background thread
-    // (`crate::arbiter::spawn_triage_followup`, spawned below, once this
-    // squad can no longer be rolled back) instead, since running a live,
-    // sometimes multi-second LLM round-trip inline would make every "Auto
-    // Review" submission (the Simple tab's default) as slow as that call --
-    // see `crate::arbiter::classify`'s doc comment.
+    // with Triage pooling itself, to `run_submit_followup` below, since
+    // running a live, sometimes multi-second LLM round-trip inline would
+    // make every "Auto Review" submission (the Simple tab's default) as slow
+    // as that call -- see `crate::arbiter::classify`'s doc comment.
     let mut pending_classifications = Vec::new();
     let mut pending_subprojects = Vec::new();
     let mut has_triage = false;
@@ -4871,161 +4688,196 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
             }
         }
     }
+    drop(store);
 
-    // Derive per-project review guardians. A preflight failure (bad worktree, no
-    // upstream for a `<<upstream>>` base) rolls the squad back and rejects the submit.
+    let store_handle = daemon.store_handle();
+    let followup_squad_id = squad_id.clone();
+    let hold = req.hold;
+    let acting_user = resolve_acting_user(query);
+    daemon.background().spawn(move || {
+        run_submit_followup(
+            &store_handle,
+            followup_squad_id,
+            file,
+            hold,
+            pending_classifications,
+            pending_subprojects,
+            has_triage,
+            acting_user,
+        );
+    });
+
+    json(
+        201,
+        &SubmitResponse {
+            squad_id,
+            state: SquadState::Materializing.as_str(),
+        },
+    )
+}
+
+/// The background half of `submit` (RAL-<pending>, see [`BackgroundWork`]'s
+/// doc comment): everything that can be slow (`git fetch`/`git worktree
+/// add`) or depends on review derivation having already run. `squad_id`
+/// already exists and was already returned to the submitter in
+/// `materializing` state by the time this runs -- unlike the old inline
+/// path, a failure here can no longer roll the squad back (the caller may
+/// already be depending on that id existing), so it lands the squad in
+/// `failed` with the error persisted (`Store::set_squad_error`) and pushed
+/// to the mailbox (`notify_watchers_with_context`), rather than silently
+/// deleting it.
+#[allow(clippy::too_many_arguments)]
+fn run_submit_followup(
+    store_handle: &StoreHandle,
+    squad_id: String,
+    file: ralphus_core::schema::TaskFile,
+    hold: bool,
+    pending_classifications: Vec<crate::arbiter::PendingClassification>,
+    pending_subprojects: Vec<crate::arbiter::PendingSubprojectResolution>,
+    has_triage: bool,
+    acting_user: Option<String>,
+) {
+    // Fetch every registered-remote project's bare `?upstream=`/declared
+    // review `upstream` BEFORE taking the lock below -- see
+    // `crate::worktrees::resolve_placeholders_with_prefetch`'s doc comment
+    // for why (a dead remote's `git fetch` must never stall the store lock),
+    // and why a miss here still resolves correctly (just not for free).
+    let prefetched_upstreams = {
+        let guard = store_handle.lock();
+        let targets = crate::reviews::collect_remote_upstream_prefetch_targets(&guard, &file);
+        drop(guard);
+        let mut resolved = std::collections::HashMap::new();
+        for (project, upstream) in targets {
+            match crate::worktrees::resolve_registered_remote_upstream(
+                std::path::Path::new(&project.path),
+                &project,
+                &upstream,
+            ) {
+                Ok(remote_upstream) => {
+                    resolved.insert((project.name.clone(), upstream), remote_upstream);
+                }
+                // Not fatal here -- the locked pass below retries the same
+                // fetch live and surfaces the real error through the normal
+                // failure path if it's still broken.
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [submit] could not prefetch \"?upstream={upstream}\" for project \
+                     \"{}\": {e}",
+                    project.name
+                ),
+            }
+        }
+        resolved
+    };
+
+    let guard = store_handle.lock();
     if let Err(e) = crate::reviews::derive_reviews_with_prefetch(
-        &store,
+        &guard,
         &squad_id,
         &file,
         &prefetched_upstreams,
     ) {
-        let _ = store.delete_squad(&squad_id);
-        return error(400, "review_preflight_failed", &e.message, vec![]);
-    }
-    // RAL-420: the squad is committed past this point (no more rollback
-    // paths delete it below), so now -- and only now -- is it safe to claim
-    // the retained pre-work generation rows this submit echoed. Unclaimed
-    // rows (a `gen-…` id the board sent but the daemon never persisted, e.g.
-    // a job whose background thread died before its write, or whose
-    // persistence was lost when the daemon restarted mid-run) are skipped;
-    // the count logged below makes a submit that echoed ids the daemon knows
-    // nothing about audible. Best-effort: a store error here must not fail
-    // the submit itself (the squad exists either way; the rows stay
-    // unclaimed, visible in the cross-squad audit surface), so the error is
-    // logged and swallowed.
-    let attributed = store
-        .attribute_generation_costs(&squad_id, &req.generation_ids)
-        .unwrap_or_else(|e| {
-            crate::rlog!(
-                WARNING,
-                "ralphus [generation] attribution failed squad={squad_id}: {e}"
-            );
-            0usize
-        });
-    if attributed == 0 && !req.generation_ids.is_empty() {
+        let _ = guard.set_squad_error(&squad_id, Some(&e.message));
+        let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
         crate::rlog!(
             WARNING,
-            "ralphus [generation] submit echoed {} generation id(s) but the daemon attributed none squad={squad_id}",
-            req.generation_ids.len()
+            "ralphus [submit] background materialization for squad {squad_id} failed: {}",
+            e.message
         );
-    } else if attributed > 0 {
-        crate::rlog!(
-            INFO,
-            "ralphus [generation] attributed {attributed} pre-work generation call(s) to squad={squad_id}"
-        );
+        crate::cartographer::Note::new("submit")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(&squad_id)
+            .scope("review")
+            .emit(
+                &guard,
+                format!("background materialization failed: {}", e.message),
+                serde_json::json!({ "error": e.message }),
+            );
+        // Unlike a scheduler-driven runtime failure, the submitter already
+        // got a 201 for this squad id and isn't polling it -- push a mailbox
+        // message (mirrors `scheduler.rs`'s `enqueue_cell_failure_mailbox`)
+        // so a watcher learns about it without having to notice the squad
+        // never left `materializing`.
+        let event_uri = format!("squad:{squad_id}");
+        if let Ok(message_id) = guard.notify_watchers_with_context(
+            crate::monitor::NotifiableEventKind::SquadFailed,
+            &event_uri,
+            crate::mailbox::MailboxPriority::Urgent,
+            &format!("squad {squad_id} failed to materialize: {}", e.message),
+            Some(&squad_id),
+            None,
+            None,
+        ) {
+            crate::cartographer::Note::new("submit")
+                .squad(&squad_id)
+                .scope("mailbox")
+                .emit(
+                    &guard,
+                    "mailbox message enqueued for materialization failure",
+                    serde_json::json!({ "message_id": message_id, "priority": "urgent" }),
+                );
+        }
+        return;
     }
-    let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
-        level: if attributed > 0 {
-            crate::logging::LogLevel::INFO
-        } else {
-            crate::logging::LogLevel::WARNING
-        },
-        source: "generation",
-        message: "generation costs attributed",
-        scope: Some("squad"),
-        squad_id: Some(&squad_id),
-        guardian_id: None,
-        cell_id: None,
-        task: None,
-        log_path: None,
-        payload: serde_json::json!({
-            "squad_id": squad_id,
-            "attributed": attributed,
-            "echoed": req.generation_ids.len(),
-        }),
-        admin_only: false,
-    });
+    drop(guard);
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
-    // (a real, sometimes multi-second `git worktree add`, see
-    // `worktrees::resolve_placeholders`'s doc comment) `derive_triage_pools`
-    // does to get there -- is NOT run here. It used to run synchronously at
-    // this point for any already-typed (inline `triage_type`) cell, which
-    // meant a plain "Auto Review" submission (the Simple tab's default: one
-    // `triage = true` cell, no inline type) still paid that same
-    // worktree-creation cost inline even though its classification was
-    // already deferred. It's handed off, for every Triage-opted cell
-    // regardless of typed/pending, to the same background thread as
-    // classification (`spawn_triage_followup` below) instead. A preflight
-    // failure there (bad worktree, no upstream) no longer rolls this squad
-    // back -- it's logged (rlog + a Cartographer note, see
-    // `spawn_triage_followup`) rather than rejecting the submit, the same
-    // posture `crate::arbiter::classify` already takes toward its own
-    // failures (fall back rather than block).
-    // The squad is committed past this point (no more rollback paths below),
-    // so it's now safe to hand Triage classification/pooling off to the
-    // background follow-up thread.
+    // `derive_triage_pools` does to get there -- runs only now that review
+    // derivation above has succeeded, for every Triage-opted cell regardless
+    // of typed/pending. A preflight failure there (bad worktree, no
+    // upstream) doesn't fail this squad -- it's logged (rlog + a
+    // Cartographer note, see `spawn_triage_followup`'s doc comment) rather
+    // than failing the submission, the same posture `crate::arbiter::classify`
+    // already takes toward its own failures (fall back rather than block).
+    // Already running on a background thread here, so this call's own
+    // internal `std::thread::spawn` (unaffected by `BackgroundWork` -- see
+    // its doc comment) just adds one more hop, matching today's behavior.
     crate::arbiter::spawn_triage_followup(
-        daemon.store_handle(),
+        store_handle.clone(),
         squad_id.clone(),
-        file.clone(),
+        file,
         pending_classifications,
         pending_subprojects,
         has_triage,
     );
-    let state = if req.hold {
+
+    let final_state = if hold {
         SquadState::Queued
     } else {
         SquadState::Pending
     };
+    let guard = store_handle.lock();
+    let _ = guard.set_squad_state(&squad_id, final_state);
+
     // RAL-320: auto-watch-on-submit -- a user who has opted in via
     // `auto_watch` (`crate::users::set_user_preferences`) is watched to
     // their own squad automatically, using their `default_notify_tiers`, so
-    // they don't have to separately `watch` every squad they submit.
-    if let Some(user) = resolve_acting_user(query) {
-        if let Ok(Some(u)) = store.get_user(&user) {
+    // they don't have to separately `watch` every squad they submit. Moved
+    // here (from the old inline `submit` path) since `guardians_for_squad`
+    // only has rows once review derivation above has actually run.
+    if let Some(user) = acting_user {
+        if let Ok(Some(u)) = guard.get_user(&user) {
             if u.auto_watch {
                 let entity_uri = crate::entity_uri::EntityUri::Squad {
                     squad_id: squad_id.clone(),
                 }
                 .to_string();
-                let _ = store.create_watch(&user, &entity_uri, &u.default_notify_tiers);
-                if let Ok(guardian_ids) = store.guardians_for_squad(&squad_id) {
+                let _ = guard.create_watch(&user, &entity_uri, &u.default_notify_tiers);
+                if let Ok(guardian_ids) = guard.guardians_for_squad(&squad_id) {
                     for guardian_id in guardian_ids {
                         let entity_uri =
                             crate::entity_uri::EntityUri::Guardian { guardian_id }.to_string();
-                        let _ = store.create_watch(&user, &entity_uri, &u.default_notify_tiers);
+                        let _ = guard.create_watch(&user, &entity_uri, &u.default_notify_tiers);
                     }
                 }
             }
         }
     }
-    json(
-        201,
-        &SubmitResponse {
-            squad_id,
-            state: state.as_str(),
-        },
-    )
 }
 
 fn get_squad(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().get_squad(id) {
         Ok(squad) => json(200, &squad),
-        Err(e) => store_error(&e),
-    }
-}
-
-/// `GET /api/squads/{id}/generation-costs` (RAL-420): the per-squad "detail"
-/// half of the pre-work generation cost audit surface — every generation
-/// call attributed to this squad, newest first, each with its retained
-/// tokens/cost figures, outcome status, and timestamps.
-fn squad_generation_cost_rows(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().squad_generation_costs(id) {
-        Ok(rows) => json(200, &rows),
-        Err(e) => store_error(&e),
-    }
-}
-
-/// `GET /api/generation-costs` (RAL-420): the cross-squad "audit" half of
-/// the pre-work generation cost audit surface — every persisted generation
-/// call row, attributed or not, newest first. The retained-but-never-
-/// attributed rows (a cancelled New Task modal, a job whose squad was never
-/// submitted) are visible here and only here.
-fn generation_costs_audit(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_generation_costs() {
-        Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
 }
@@ -6038,24 +5890,9 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             model: req.model,
             prompt_context: req.prompt_context,
         };
-        let started_at_ms = crate::store::now_ms();
-        let (job, usage_result) = crate::generation::run_generation(&gen_req, &token);
+        let (result, _) = crate::generation::run_generation(&gen_req, &token);
         cancellations.remove(&cancel_id);
-        // RAL-420: this call's squad is known up front, so the retained row
-        // is attributed immediately (unlike the Simple form's Generate
-        // buttons, whose rows `attribute_generation_costs` claims at submit).
-        record_generation_call_cost(
-            &store,
-            Some(&squad_id),
-            &cancel_id,
-            "task_name",
-            generation_call_status(&job, &token),
-            &usage_result,
-            &gen_req.agent,
-            gen_req.model.as_deref(),
-            started_at_ms,
-        );
-        let (name, label) = match job {
+        let (name, label) = match result {
             crate::generation::GenerationJob::Done { items } if !items.is_empty() => {
                 let item = &items[0];
                 match crate::generation::slugify_task_name(&item.value) {
@@ -6129,6 +5966,8 @@ struct EditBody {
     #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
+    maximum_context: Option<String>,
+    #[serde(default)]
     maximum_tool_output_tokens: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
@@ -6188,6 +6027,32 @@ fn nullable_i64_field_edit(
             Err(_) => Err(format!("{field}: invalid integer '{s}'")),
         },
     }
+}
+
+/// Reject a `maximum_context` edit up front when the agent that would run
+/// the edited node has no delivery mechanism for the cap (RAL-304), mirroring
+/// `core::validate`'s submit-time rule rather than storing a value the
+/// backend would silently never apply -- the same shape as the
+/// `reject_unsupported_maximum_tool_output_tokens` guard in `edit_squad`'s
+/// `"cell"` arm.
+///
+/// A custom agent profile name (not in `RESERVED_AGENT_NAMES`) is deferred the
+/// way `core` defers it: resolving a profile's backend needs the cwd/config
+/// this edit path doesn't have on hand.
+fn reject_unsupported_maximum_context(agent: &str) -> Option<Reply> {
+    if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&agent)
+        && !ralphus_core::schema::agent_supports_maximum_context(agent)
+    {
+        return Some(error(
+            400,
+            "bad_request",
+            &format!(
+                "'maximum_context' is only supported for the 'codex'/'pi' agents right now, not '{agent}'"
+            ),
+            vec![],
+        ));
+    }
+    None
 }
 
 /// Reject a `maximum_tool_output_tokens` edit up front when the agent that
@@ -6284,6 +6149,11 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
+            let maximum_context =
+                match nullable_i64_field_edit("maximum_context", req.maximum_context.as_ref()) {
+                    Ok(v) => v,
+                    Err(msg) => return error(400, "bad_request", &msg, vec![]),
+                };
             let maximum_tool_output_tokens = match nullable_i64_field_edit(
                 "maximum_tool_output_tokens",
                 req.maximum_tool_output_tokens.as_ref(),
@@ -6324,6 +6194,21 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             // Same up-front rejection as `system_prompt` above, for the same
             // reason: a cap the cell's agent can't deliver is silently inert.
             // Clearing the field back out (`Some(None)`) needs no check.
+            if let Some(Some(_)) = maximum_context {
+                let effective_agent = match new_agent {
+                    Some(a) => a.to_string(),
+                    None => match daemon.lock().get_cell_agent(id, req.task_idx, req.cell_idx) {
+                        Ok(a) => a,
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if let Some(reply) = reject_unsupported_maximum_context(&effective_agent) {
+                    return reply;
+                }
+            }
+            // Same up-front rejection as `system_prompt` above, for the same
+            // reason: a cap the cell's agent can't deliver is silently inert.
+            // Clearing the field back out (`Some(None)`) needs no check.
             if let Some(Some(_)) = maximum_tool_output_tokens {
                 let effective_agent = match new_agent {
                     Some(a) => a.to_string(),
@@ -6344,6 +6229,7 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 prompt,
                 command,
                 auto_compact_threshold,
+                maximum_context,
                 maximum_tool_output_tokens,
                 system_prompt,
             };
@@ -8511,13 +8397,17 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
             vec![],
         );
     };
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
+    let (cell_id, task) = {
+        let store = daemon.lock();
+        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        let task = match store.get_task_name(id, task_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        (cell_id, task)
     };
     capture_pane_reply(daemon, id, &task, &cell_id, query)
 }
@@ -8534,13 +8424,17 @@ fn cell_pane_transcript(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &s
             vec![],
         );
     };
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
+    let (cell_id, task) = {
+        let store = daemon.lock();
+        let cell_id = match store.get_cell_id(id, task_idx, cell_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        let task = match store.get_task_name(id, task_idx) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        (cell_id, task)
     };
     pane_transcript_range_reply(id, &task, &cell_id, query)
 }
@@ -10592,6 +10486,16 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "done" {
         drop(store);
         let store_handle = daemon.store_handle();
+        {
+            let guard = store_handle.lock();
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, id) {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] failed to re-check thresholds after manual completion in {id}: {}",
+                    e.message
+                );
+            }
+        }
         let cells = store_handle.lock().cells_of(id);
         if let Ok(cells) = cells {
             crate::scheduler::try_start_ready_reviews_for_task(
@@ -11560,7 +11464,18 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 
     let mut base_change: Option<ChangeBaseStatus> = None;
-    if status == "merging" {
+    // `merging`/`in_review`/`merge_failed` are exactly the non-`collecting`
+    // statuses `kickoff_merge` itself will still claim from (see
+    // `claim_guardian_merge`) -- but its per-branch cell-readiness gate
+    // (`guardian_unfinished_linked_branches`) only ever runs while the
+    // guardian is genuinely `collecting`. A details edit on a review sitting
+    // in one of these three statuses must therefore always go through
+    // `restart_guardian_merge`, which resets to `collecting` first so that
+    // gate re-applies -- calling `kickoff_merge` directly here would walk
+    // straight into a branch whose upstream cell never finished (RAL-424:
+    // exactly what happened to a triage-created review edited while
+    // `merge_failed`).
+    if matches!(status.as_str(), "merging" | "in_review" | "merge_failed") {
         if rebase_relevant {
             let runner = guardian_agent_runner(daemon);
             let restarted = crate::guardian_merge::restart_guardian_merge(
@@ -11591,7 +11506,10 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 action: None,
             });
         }
-    } else if rebase_relevant && has_branches && status != "approved" && status != "deployed" {
+    } else if rebase_relevant && has_branches && status == "collecting" {
+        // Only a guardian that is genuinely `collecting` is safe for a direct
+        // `kickoff_merge` call: its readiness gate fires unconditionally in
+        // this state, so there is nothing to reset first.
         let runner = guardian_agent_runner(daemon);
         if let Ok(crate::guardian_merge::StartMergeOutcome::Merging) =
             crate::guardian_merge::kickoff_merge(
@@ -11825,38 +11743,72 @@ struct PrCommentItem {
 /// notes/comments be queried"), flagging which ones have already been
 /// actioned into the worktree so the UI can highlight what's new.
 fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
-    let store = daemon.lock();
-    let pr = match store.get_pull_request(pr_id) {
-        Ok(pr) => pr,
-        Err(e) => return store_error(&e),
-    };
-    let guardian = match store.get_guardian(&pr.guardian_id) {
-        Ok(g) => g,
-        Err(e) => return store_error(&e),
+    // Scoped so the store guard is released before anything below reaches for
+    // the forge. Two reasons, and both are load-bearing:
+    //
+    // `forge_client_for_pr` takes the store lock itself, and the daemon's mutex
+    // is not reentrant -- holding it across that call deadlocks the daemon
+    // outright. And the forge round-trip that follows is a network call: this
+    // is the *global* store lock, so holding it there blocks every other
+    // request, on every endpoint, for as long as the forge takes to answer.
+    let (pr, guardian) = {
+        let store = daemon.lock();
+        let pr = match store.get_pull_request(pr_id) {
+            Ok(pr) => pr,
+            Err(e) => return store_error(&e),
+        };
+        let guardian = match store.get_guardian(&pr.guardian_id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        (pr, guardian)
     };
     let Some(pr_number) = pr.pr_number else {
         return error(409, "no_pr_number", "PR has no recorded number yet", vec![]);
     };
     let root = Path::new(&guardian.git_root);
+    // Resolved through the same PR-aware routing the cache poller uses, rather
+    // than a plain `resolve_remote` on the guardian's base branch. Under fork
+    // routing (RAL-338) those two disagree -- a PR's comments live on whichever
+    // repo its own `repo` field names, which need not be the base branch's
+    // remote -- so the old call could read a different repo than the poller,
+    // and the two would then report different answers for the same PR.
     let forge_cfg = crate::config::resolve_forge(root);
-    let client = match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
-        Ok(c) => c,
-        Err(e) => return error(502, "forge_error", &e, vec![]),
+    let client = match crate::pr::forge_client_for_pr(
+        &daemon.store_handle(),
+        root,
+        &guardian.base_branch,
+        &forge_cfg,
+        &pr.repo,
+    ) {
+        Some(c) => c,
+        None => {
+            return error(
+                502,
+                "forge_error",
+                "no forge client could be resolved for this PR's repo",
+                vec![],
+            );
+        }
     };
     let comments = match client.list_pr_comments(pr_number) {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
-    // RAL-366: write through into the cache the background poller reads
-    // from, so a human explicitly checking comments here also refreshes the
-    // list-view's cached count instead of leaving it to the next poll cycle.
-    // Only the conversation endpoint's rows are written -- this route never
-    // calls GitHub's separate inline-review-comments endpoint, unlike the
-    // poller's own conditional fetch.
-    let _ = store.replace_pr_forge_comments(pr_id, "conversation", &comments);
-    let _ =
-        store.upsert_pr_forge_cache(pr_id, true, None, None, None, None, None, None, None, None);
-    let actioned = store.actioned_pr_comment_ids(pr_id).unwrap_or_default();
+    // Deliberately does NOT write through into the forge cache.
+    //
+    // `list_pr_comments` returns GitHub's conversation and inline-review
+    // comments merged into one list, and a `PrComment` does not record which
+    // endpoint it came from. Filing all of them under `'conversation'` would
+    // double-count every inline comment against the `'review'` rows the poller
+    // stores separately, inflating the very count this cache exists to report.
+    //
+    // The caller still gets the live answer below; the cache stays the
+    // poller's to own, and it refreshes on its own cycle.
+    let actioned = daemon
+        .lock()
+        .actioned_pr_comment_ids(pr_id)
+        .unwrap_or_default();
     let items: Vec<PrCommentItem> = comments
         .into_iter()
         .map(|c| PrCommentItem {
@@ -11871,34 +11823,56 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
 }
 
 /// Kick off actioning this PR's un-actioned feedback into the owning review
-/// worktree in the background (RAL-117's "Pull in PR feedback" button).
-fn pr_action_feedback(daemon: &Daemon, pr_id: &str) -> Reply {
+/// worktree in the background (RAL-117's "Pull in PR feedback" button, also
+/// reachable from a PR badge's right-click menu). Resolves the requesting
+/// user the same best-effort way `guardian_feedback` resolves `submitted_by`
+/// for human chat feedback -- an unresolvable ambient `[daemon].default_user`
+/// must not block the action, it just means the posted message falls back to
+/// `pr::MANUAL_PR_FEEDBACK_AUTHOR` instead of a named person.
+fn pr_action_feedback(daemon: &Daemon, user_header: Option<&str>, pr_id: &str) -> Reply {
+    let submitted_by = current_user(daemon, user_header).ok().flatten();
     let runner: Arc<dyn Runner> =
         Arc::new(SubprocessRunner::from_env().with_cartographer(daemon.store_handle()));
-    crate::pr::start_action_pr_feedback(daemon.store_handle(), runner, pr_id)
+    crate::pr::start_action_pr_feedback(daemon.store_handle(), runner, pr_id, submitted_by)
 }
 
 /// Live drift check between this PR's remote branch and its owning review
 /// worktree (RAL-190) — see [`crate::pr::PrSyncStatus`].
 fn pr_sync_status(daemon: &Daemon, pr_id: &str) -> Reply {
-    match crate::pr::compute_sync_status(&daemon.store_handle(), pr_id) {
-        Ok(status) => {
+    // The board calls this once per open PR of the selected review, so it is
+    // allowed to reuse the cache poller's recent remote-tip observation rather
+    // than performing a `git fetch` per row. The worktree side is still read
+    // live on every call, so the only thing that can lag is a push made to the
+    // PR branch within the cache's own freshness window.
+    match crate::pr::compute_sync_status_cached(&daemon.store_handle(), pr_id) {
+        Ok((status, fetched_live)) => {
             // RAL-366: write through into the cache the background poller
             // reads from, so a human's explicit "refresh now" also updates
             // the list-view's cached drift instead of leaving it stale until
             // the next poll cycle.
-            let _ = daemon.lock().upsert_pr_forge_cache(
-                pr_id,
-                true,
-                None,
-                Some(status.in_sync),
-                Some(status.pr_ahead),
-                Some(status.worktree_ahead),
-                status.remote_sha.as_deref(),
-                status.local_sha.as_deref(),
-                None,
-                None,
-            );
+            //
+            // Only the drift half is passed -- this route never fetches
+            // comments, so `None` for that half leaves its stored timestamp
+            // and status untouched rather than claiming they were just
+            // verified.
+            //
+            // And only when the remote tip was actually fetched: writing back
+            // a reading that came *from* the cache would renew its own
+            // freshness without re-verifying anything, letting one stale
+            // observation keep itself alive forever.
+            if fetched_live {
+                let _ = daemon.lock().upsert_pr_forge_cache(
+                    pr_id,
+                    Some(Ok(crate::pr::DriftObservation {
+                        in_sync: status.in_sync,
+                        pr_ahead: status.pr_ahead,
+                        worktree_ahead: status.worktree_ahead,
+                        remote_sha: status.remote_sha.as_deref(),
+                        local_sha: status.local_sha.as_deref(),
+                    })),
+                    None,
+                );
+            }
             json(200, &status)
         }
         Err(e) => error(502, "forge_error", &e, vec![]),
@@ -11914,18 +11888,15 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
     crate::pr::start_pull_pr_commits(daemon.store_handle(), runner, pr_id)
 }
 
-/// Live-poll the forge for this PR's current CI/mergeability + draft status
-/// on demand (RAL-402, extended by RAL-353 to refresh draft too) -- a
-/// complement to `ci_watch::poll_open_pr_ci_status`'s standing,
-/// per-guardian-throttled poll, not a replacement for it: lets the board
-/// refresh a single PR's badge color immediately (e.g. from the Tasks tab's
-/// "Check PR" action) instead of waiting for the next standing-poll tick.
-/// Persists the result the same way the standing poll does
-/// (`Store::set_pr_ci_status`/`Store::set_pr_draft`), so it's also picked
-/// up by the next `GET /api/pull-requests/index` poll -- and the Tasks tab's
-/// PR filter re-runs its row predicate over the fresh data on that poll.
-/// Identical for GitHub/GitLab -- both go through the same
-/// `ForgeClient::check_pr_ci_status_probe`.
+/// Live-poll the forge for this PR's current CI/mergeability status on
+/// demand (RAL-402) -- a complement to `ci_watch::poll_open_pr_ci_status`'s
+/// standing, per-guardian-throttled poll, not a replacement for it: lets the
+/// board refresh a single PR's badge color immediately (e.g. from the Tasks
+/// tab's "Check PR" action) instead of waiting for the next standing-poll
+/// tick. Persists the result the same way the standing poll does
+/// (`Store::set_pr_ci_status`), so it's also picked up by the next
+/// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
+/// go through the same `ForgeClient::check_pr_ci_status`.
 fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     let store = daemon.lock();
     let pr = match store.get_pull_request(pr_id) {
@@ -11945,11 +11916,10 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
         Ok(c) => c,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
-    let probe = match client.check_pr_ci_status_probe(pr_number) {
-        Ok(p) => p,
+    let state = match client.check_pr_ci_status(pr_number) {
+        Ok(s) => s,
         Err(e) => return error(502, "forge_error", &e, vec![]),
     };
-    let state = probe.ci;
     let job_url = match &state {
         crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
         _ => None,
@@ -11957,7 +11927,6 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
         return store_error(&e);
     }
-    let _ = store.set_pr_draft(pr_id, probe.draft);
     match store.get_pull_request(pr_id) {
         Ok(pr) => json(200, &pr),
         Err(e) => store_error(&e),
@@ -12194,18 +12163,27 @@ fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
 }
 
 fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
-    // Stop any live merge worker first -- otherwise it keeps running
-    // in-flight resolver agents to completion and its own end-of-pass
-    // status write clobbers `cancelled` back to `in_review`. See
-    // `stop_merge_worker_for_cancel`'s doc comment.
+    // Signal the worker before the state transition so active subprocesses
+    // begin their normal cancellation path. Do not wait for it here: the
+    // store's cancelled-status guard prevents a late worker from reviving the
+    // review, and an acknowledgement must not wait behind slow cleanup.
     crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
     match daemon.lock().cancel_guardian(id) {
-        Ok(status) => json(
-            200,
-            &StateResponse {
-                state: status.as_str(),
-            },
-        ),
+        Ok(status) => {
+            // Tmux teardown can require a process query. It belongs to the
+            // cancellation cleanup path, not the HTTP acknowledgement path.
+            let store = daemon.store_handle();
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                crate::guardian_merge::kill_guardian_agent_sessions(&store, &id);
+            });
+            json(
+                200,
+                &StateResponse {
+                    state: status.as_str(),
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -12778,6 +12756,7 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         return store_error(&e);
     }
     drop(store);
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     // RAL-279: force_start only fires while status == "collecting", which
     // precedes PR submission, so this is a no-op today -- kept for
     // correctness/future-proofing if that invariant ever changes (see the
@@ -12922,6 +12901,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
 }
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_merge(
         daemon.store_handle(),
@@ -12930,6 +12910,43 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
     )
+}
+
+/// An explicit rebase request gives the CI watcher another chance to fix an
+/// unchanged failure after the rebuild. Background polling retains its
+/// one-attempt cap until a person makes this request.
+fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
+    let reset = daemon.lock().reset_open_pr_auto_fix_attempts(id);
+    match reset {
+        Ok(0) => {}
+        Ok(count) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [server] review {id} manual rebase reset auto-fix attempts for {count} open PR(s)"
+            );
+            let _ = daemon
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "server",
+                    message: "manual rebase reset PR auto-fix attempts",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"reset_count": count}),
+                    admin_only: false,
+                });
+        }
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [server] review {id} could not reset PR auto-fix attempts before manual rebase: {e}"
+            );
+        }
+    }
 }
 
 /// Stop an in-progress rebase (status `merging`) at its next checkpoint,
@@ -12954,6 +12971,7 @@ fn guardian_stop(daemon: &Daemon, id: &str) -> Reply {
 /// threads shared (RAL-213's second bug: `cancel_and_merge` was already
 /// unsafe before this fix).
 fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
+    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::restart_guardian_merge(
         daemon.store_handle(),
@@ -13252,7 +13270,11 @@ pub fn serve<A: ToSocketAddrs>(
         "ralphus [token] auth token ready at {}",
         crate::token_path().display()
     );
-    let daemon = Arc::new(Daemon::new(store, max_concurrent).with_token(token));
+    let daemon = Arc::new(
+        Daemon::new(store, max_concurrent)
+            .with_token(token)
+            .with_background_work(BackgroundWork::Threaded),
+    );
 
     // The remote Open Agent terminal relay (RAL-355 Phase 10) listens one
     // port above the main API, on the same host it bound to -- so a remote
@@ -14482,7 +14504,14 @@ mod tests {
         let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
         assert_eq!(r.status, 201);
         assert!(r.body.contains("squad-000000000001"));
-        assert!(r.body.contains("\"state\":\"pending\""));
+        // The reply is built before the materialization follow-up runs, so it
+        // reports `materializing` rather than the state the squad ends up in.
+        assert!(r.body.contains("\"state\":\"materializing\""));
+        assert_eq!(
+            d.lock().get_squad("squad-000000000001").unwrap().state,
+            SquadState::Pending.as_str(),
+            "an un-held submission must settle in pending once materialized"
+        );
 
         let board = route(&d, "GET", "/api/tasks", "");
         assert_eq!(board.status, 200);
@@ -15640,6 +15669,25 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     }
 
     #[test]
+    fn submit_rejects_review_without_a_build_declaration_before_materializing() {
+        let d = daemon();
+        let repo = tmp_git_repo("review-build-preflight");
+        let project = register_body("proj", &repo.to_string_lossy(), "");
+        assert_eq!(route(&d, "POST", "/api/projects", &project).status, 201);
+
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\n\
+                    prompt=\"p\"\nreview=\"<<ralphus:new-review/r>>\"\n\
+                    [[review]]\nid=\"ralphus:new-review/r\"\n";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("review_validation_failed"), "{}", r.body);
+        assert!(r.body.contains("auto_build"), "{}", r.body);
+        assert!(d.lock().list_squads().unwrap().is_empty());
+    }
+
+    #[test]
     fn submit_accepts_a_registered_remote_machine_and_persists_it_on_the_cell() {
         // Phase 2: a registered machine now submits successfully, and the
         // resolved value is stored on the cell so the scheduler's router can
@@ -16091,7 +16139,16 @@ machine=\"incredibuild:B\"
         let body =
             serde_json::to_string(&serde_json::json!({ "toml": GOOD, "hold": true })).unwrap();
         let r = route(&d, "POST", "/api/squads", &body);
-        assert!(r.body.contains("\"state\":\"queued\""));
+        // `submit` always answers `materializing`: the reply is built before
+        // the follow-up that creates worktrees and derives reviews has run, so
+        // it cannot report the hold-derived state yet. `queued` is what the
+        // squad settles into once that follow-up completes.
+        assert!(r.body.contains("\"state\":\"materializing\""));
+        assert_eq!(
+            d.lock().get_squad("squad-000000000001").unwrap().state,
+            SquadState::Queued.as_str(),
+            "a held submission must settle in queued, not pending"
+        );
 
         let act = route(&d, "POST", "/api/squads/squad-000000000001/activate", "");
         assert_eq!(act.status, 200);
@@ -16316,6 +16373,98 @@ agent=\"claude-code\"
     }
 
     #[test]
+    fn edit_cell_maximum_context_set_and_clear() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"codex\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"maximum_context\":100000"), "{}", r.body);
+
+        // Present-but-empty clears it back to NULL, which `CellView` omits
+        // from the JSON entirely (`skip_serializing_if = "Option::is_none"`)
+        // rather than rendering as `null`.
+        let clear = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_omitted_maximum_context_is_untouched() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+agent=\"codex\"
+maximum_context=100000
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "model": "sonnet"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"maximum_context\":100000"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_rejected_for_unsupported_agent() {
+        // GOOD's cell resolves to the default "claude", which has no
+        // context-window delivery mechanism (RAL-304).
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("maximum_context"), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_accepted_with_supporting_agent_in_same_call() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "agent": "codex", "maximum_context": "100000"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_maximum_context_clear_does_not_require_agent_support() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "maximum_context": ""
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
     fn edit_cell_omitted_maximum_tool_output_tokens_is_untouched() {
         let d = daemon();
         let toml = "[[task]]
@@ -16395,6 +16544,9 @@ agent=\"claude-code\"
             ("maximum_tool_output_tokens", "0"),
             ("maximum_tool_output_tokens", "-5"),
             ("maximum_tool_output_tokens", "lots"),
+            ("maximum_context", "0"),
+            ("maximum_context", "-5"),
+            ("maximum_context", "lots"),
             ("auto_compact_threshold", "0"),
             ("auto_compact_threshold", "-5"),
             ("auto_compact_threshold", "lots"),
@@ -18556,167 +18708,6 @@ command = "true"
         assert_eq!(r.status, 400);
     }
 
-    // ── RAL-420: pre-work generation cost ─────────────────────────────────
-
-    /// Seed `record_generation_cost` rows the way `generate_start`'s
-    /// background thread does: unattributed (the owning squad has not been
-    /// submitted yet).
-    fn seed_retained_generation_rows(d: &Daemon, ids: &[(&str, &str, &str)]) {
-        let store = d.store_handle();
-        for (job_id, kind, status) in ids {
-            let (tokens_in, tokens_out, cost, estimated) = match *status {
-                "done" => (100i64, 50i64, 0.02, false),
-                "cancelled" => (7i64, 3i64, 0.0, true),
-                _ => (30i64, 10i64, 0.005, false),
-            };
-            let _ = store.lock().record_generation_cost(
-                None,
-                job_id,
-                kind,
-                status,
-                tokens_in,
-                tokens_out,
-                0,
-                0,
-                cost,
-                estimated,
-                if *status == "done" {
-                    None
-                } else {
-                    Some("boom")
-                },
-                "claude-code",
-                None,
-                1_000,
-                2_000,
-            );
-        }
-    }
-
-    #[test]
-    fn generation_cost_submit_attributes_retained_rows_and_logs() {
-        let d = daemon();
-        seed_retained_generation_rows(
-            &d,
-            &[
-                ("gen-a", "proof_steps", "done"),
-                ("gen-b", "manual_checks", "cancelled"),
-            ],
-        );
-        // The board echoes every job id it ever obtained, including ids the
-        // daemon no longer knows (lost to a restart mid-run / a background
-        // thread that died before its write) and the cancelled call.
-        let mut body = serde_json::json!({ "toml": GOOD });
-        body["generation_ids"] = serde_json::json!([
-            "gen-a".to_string(),
-            "gen-b".to_string(),
-            "gen-unknown".to_string(),
-        ]);
-        let r = route(&d, "POST", "/api/squads", &body.to_string());
-        assert_eq!(r.status, 201, "{}", r.body);
-
-        // Per-squad detail: both retained rows are now this squad's.
-        let detail = route(
-            &d,
-            "GET",
-            "/api/squads/squad-000000000001/generation-costs",
-            "",
-        );
-        assert_eq!(detail.status, 200);
-        assert!(
-            detail.body.contains("\"squad_id\":\"squad-000000000001\""),
-            "{}",
-            detail.body
-        );
-        assert!(detail.body.contains("\"gen-a\""));
-        assert!(detail.body.contains("\"gen-b\""));
-        assert!(detail.body.contains("\"status\":\"cancelled\""));
-        assert!(!detail.body.contains("gen-unknown"));
-
-        // The audit surface shows the same two rows (both now attributed).
-        let audit = route(&d, "GET", "/api/generation-costs", "");
-        assert_eq!(audit.status, 200);
-        assert!(audit.body.contains("\"gen-a\""));
-        assert!(audit.body.contains("\"gen-b\""));
-        assert!(!audit.body.contains("gen-unknown"));
-
-        // The squad's own totals fold the generation cost in exactly once
-        // (summed up in `SquadView.generation_cost`).
-        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
-        assert!(squad.body.contains("\"generation_cost\""), "{}", squad.body);
-        assert!(squad.body.contains("\"count\":2"));
-        assert!(squad.body.contains("\"estimated\":true"));
-
-        // Logging: the submit logged its attribution as a Cartographer row
-        // (source "generation"), carrying the echoed-vs-attributed split so
-        // a submit that echoed ids the daemon knew nothing about is audible.
-        let filter = crate::cartographer::CartographerFilter {
-            source: Some("generation".to_string()),
-            ..crate::cartographer::CartographerFilter::recent(50)
-        };
-        let page = d.lock().cartographer_query(&filter).unwrap();
-        let row = page
-            .rows
-            .iter()
-            .find(|r| r.message == "generation costs attributed")
-            .unwrap();
-        assert_eq!(row.payload["attributed"].as_i64(), Some(2));
-        assert_eq!(row.payload["echoed"].as_i64(), Some(3));
-    }
-
-    #[test]
-    fn generation_cost_audit_lists_never_attributed_rows() {
-        let d = daemon();
-        // A generation call whose New Task modal was cancelled before any
-        // submit: its row is retained with `squad_id` NULL and visible in
-        // the cross-squad audit list and only there.
-        seed_retained_generation_rows(&d, &[("gen-orphan", "auto_build_steps", "cancelled")]);
-        let audit = route(&d, "GET", "/api/generation-costs", "");
-        assert_eq!(audit.status, 200);
-        assert!(audit.body.contains("\"gen-orphan\""));
-        assert!(audit.body.contains("\"squad_id\":null"), "{}", audit.body);
-        // No squad exists (nothing was submitted), so no squad view or
-        // per-squad detail can show it -- it never inflates any squad's totals.
-        let detail = route(
-            &d,
-            "GET",
-            "/api/squads/squad-000000000001/generation-costs",
-            "",
-        );
-        assert_eq!(detail.status, 200);
-        assert!(detail.body.contains("[]"), "{}", detail.body);
-        let r = route(&d, "GET", "/api/squads/squad-000000000001", "");
-        assert_eq!(r.status, 404);
-    }
-
-    #[test]
-    fn generation_cost_submit_with_unknown_ids_logs_attributed_zero() {
-        let d = daemon();
-        // A submit echoing job ids the daemon has no rows for (persistence
-        // lost to a restart mid-run) still succeeds -- attribution is
-        // best-effort -- but the log row records the 0-vs-echoed split.
-        let mut body = serde_json::json!({ "toml": GOOD });
-        body["generation_ids"] = serde_json::json!(["gen-ghost".to_string()]);
-        let r = route(&d, "POST", "/api/squads", &body.to_string());
-        assert_eq!(r.status, 201, "{}", r.body);
-        let filter = crate::cartographer::CartographerFilter {
-            source: Some("generation".to_string()),
-            ..crate::cartographer::CartographerFilter::recent(50)
-        };
-        let page = d.lock().cartographer_query(&filter).unwrap();
-        let row = page
-            .rows
-            .iter()
-            .find(|r| r.message == "generation costs attributed")
-            .unwrap();
-        assert_eq!(row.payload["attributed"].as_i64(), Some(0));
-        assert_eq!(row.payload["echoed"].as_i64(), Some(1));
-        assert_eq!(row.level, "warning");
-        // The squad is clean: no generation-cost aggregate at all.
-        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
-        assert!(!squad.body.contains("generation_cost"), "{}", squad.body);
-    }
-
     #[test]
     fn set_status_cell() {
         let d = daemon();
@@ -19952,8 +19943,8 @@ command = "true"
                     error: None,
                     proofed: None,
                     agent_session_id: None,
-                    ghost: None,
                     turns: None,
+                    ghost: None,
                 }
             }
         }
@@ -20104,8 +20095,8 @@ command = "true"
                     error: None,
                     proofed: None,
                     agent_session_id: None,
-                    ghost: None,
                     turns: None,
+                    ghost: None,
                 }
             }
         }
@@ -22334,6 +22325,39 @@ command = "true"
     }
 
     #[test]
+    fn manual_merge_resets_open_pr_auto_fix_attempts() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        d.lock().mark_pr_auto_fix_attempted(&pr_id).unwrap();
+
+        let reply = route(&d, "POST", &format!("/api/guardians/{gid}/merge"), "");
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(
+            d.lock()
+                .get_pull_request(&pr_id)
+                .unwrap()
+                .auto_fix_attempted_at_ms,
+            None,
+            "an explicit Merge / rebase request resets the CI watcher's retry budget"
+        );
+    }
+
+    #[test]
     fn unlink_prs_drops_open_rows_clears_stack_number_and_keeps_history() {
         let d = daemon();
         let gid = make_guardian(&d);
@@ -22543,33 +22567,6 @@ command = "true"
         assert_eq!(r.status, 200);
         assert!(r.body.contains(&pr_id));
         assert!(r.body.contains("\"ci_status\":\"passing\""));
-    }
-
-    #[test]
-    fn pr_index_lists_pr_draft_state() {
-        let d = daemon();
-        let gid = make_guardian(&d);
-        let pr_id = d
-            .lock()
-            .create_pull_request_ex(
-                &gid,
-                Some("branch-000000000001"),
-                "github",
-                "acme/widget",
-                "feature/draft",
-                "main",
-                "Draft work",
-                "",
-                Some(43),
-                Some("https://github.com/acme/widget/pull/43"),
-                Some("stack-1"),
-                true,
-            )
-            .unwrap();
-        let r = route(&d, "GET", "/api/pull-requests/index", "");
-        assert_eq!(r.status, 200);
-        assert!(r.body.contains(&pr_id));
-        assert!(r.body.contains("\"draft\":true"));
     }
 
     #[test]
@@ -22967,6 +22964,53 @@ command = "true"
         );
     }
 
+    /// RAL-424 regression: `kickoff_merge`'s per-branch cell-readiness gate
+    /// (`guardian_unfinished_linked_branches`) only ever runs while the
+    /// guardian is genuinely `collecting`. A `merge_failed` review's details
+    /// edit used to call `kickoff_merge` directly -- skipping that gate --
+    /// and would walk straight into rebasing a branch whose upstream cell
+    /// hadn't finished yet. This hit live: a triage-created review with a
+    /// still-`pending` cell was edited while `merge_failed`, and the rebase
+    /// attempted (and correctly failed on) the empty branch that pending
+    /// cell was supposed to produce. `guardian_details` must instead always
+    /// restart through `restart_guardian_merge`, which resets the guardian to
+    /// `collecting` first so the gate re-applies and the merge defers instead.
+    #[test]
+    fn guardian_details_on_merge_failed_review_defers_instead_of_merging_an_unfinished_branch() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let squad_id = submit_squad(&d);
+        d.lock()
+            .set_cell_review_branch(&squad_id, 0, 0, "feat")
+            .unwrap();
+        // Left at its post-submit default of `pending`: this cell's task
+        // never ran, so the branch it's meant to produce doesn't exist yet.
+        d.lock().add_guardian_branch(&gid, "feat").unwrap();
+        d.lock()
+            .set_guardian_status(
+                &gid,
+                crate::guardian::GuardianStatus::MergeFailed,
+                Some("boom"),
+            )
+            .unwrap();
+
+        let rebase_relevant = serde_json::json!({"skip_auto_build": true}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/details"),
+            &rebase_relevant,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            v["guardian"]["status"], "collecting",
+            "a merge_failed review with a not-yet-finished branch must defer \
+             (not merge) when its details are edited: {}",
+            r.body
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RAL-188: GET /api/resolve?uri=
     // -----------------------------------------------------------------------
@@ -23216,6 +23260,28 @@ command=\"cargo test\"
         assert!(r.body.contains("never be deregistered"));
     }
 
+    /// Pool a cell for `(project, triage_type)` against a real, finished
+    /// squad.
+    ///
+    /// `triage_pool_count` resolves each pooled cell's effective state and
+    /// only counts finished ones, so a pool row pointing at a squad id that
+    /// was never inserted resolves to no state and counts zero. These route
+    /// tests care about the pool API's shape, not the done-gating rule
+    /// (`triage.rs` covers that), so they need a cell that genuinely finished.
+    fn pool_a_finished_cell(d: &Daemon, project: &str, triage_type: &str, branch: &str) -> String {
+        let squad_id = submit_squad(d);
+        {
+            let store = d.lock();
+            store
+                .record_triage_pool_cell(project, triage_type, &squad_id, 0, 0, branch, "main")
+                .unwrap();
+            store
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+        }
+        squad_id
+    }
+
     #[test]
     fn triage_pool_and_schedule_routes() {
         let d = daemon();
@@ -23226,9 +23292,7 @@ command=\"cargo test\"
 
         // Populate a pool row directly via the store (submit-time pooling is
         // exercised in `reviews.rs`'s own tests).
-        d.lock()
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
+        pool_a_finished_cell(&d, "proj", "security", "b1");
         let r = route(&d, "GET", "/api/triage/pools", "");
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"count\":1"));
@@ -23311,9 +23375,7 @@ command=\"cargo test\"
 
         // A cell pooled under the project's resolved name must land in the
         // very same row the path-set threshold configured.
-        d.lock()
-            .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
+        pool_a_finished_cell(&d, "proj", "bug", "b1");
 
         let r = route(&d, "GET", "/api/triage/pools", "");
         assert_eq!(r.status, 200, "{}", r.body);
@@ -23328,143 +23390,6 @@ command=\"cargo test\"
         assert_eq!(pools[0]["project"], "proj");
         assert_eq!(pools[0]["count"], 1);
         assert_eq!(pools[0]["threshold"], 3);
-    }
-
-    /// RAL-421: the preview twin of the threshold route is non-mutating --
-    /// it estimates what a confirm would drain (threshold-sized batches)
-    /// without writing the threshold, draining the pool, or creating a
-    /// review, so calling it can never start Guardian-agent (LLM) work.
-    #[test]
-    fn triage_pool_threshold_preview_route_is_non_mutating_and_estimates_batches() {
-        let d = daemon();
-        for i in 0..7 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            d.lock()
-                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        let r = route(
-            &d,
-            "POST",
-            "/api/triage/pools/threshold/preview",
-            r#"{"project":"proj","triage_type":"bug","threshold":3}"#,
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"project\":\"proj\""), "{}", r.body);
-        assert!(r.body.contains("\"proposed_threshold\":3"), "{}", r.body);
-        assert!(r.body.contains("\"pooled\":7"), "{}", r.body);
-        assert!(r.body.contains("\"full_batches\":2"), "{}", r.body);
-        assert!(r.body.contains("\"cells_drained\":6"), "{}", r.body);
-        assert!(r.body.contains("\"cells_left\":1"), "{}", r.body);
-        assert!(r.body.contains("\"clearing\":false"), "{}", r.body);
-
-        // Nothing was persisted, drained, or reviewed.
-        assert!(
-            d.lock()
-                .get_triage_pool_threshold("proj", "bug")
-                .unwrap()
-                .is_none(),
-            "a preview must never write the threshold"
-        );
-        assert_eq!(
-            d.lock().triage_pool_count("proj", "bug").unwrap(),
-            7,
-            "a preview must never drain the pool"
-        );
-        assert!(
-            d.lock().list_guardians().unwrap().is_empty(),
-            "a preview must never create a review (no LLM work)"
-        );
-    }
-
-    /// RAL-421: a clearing preview reports that confirming would only
-    /// remove the count trigger, never drain anything.
-    #[test]
-    fn triage_pool_threshold_preview_route_reports_clear_without_draining() {
-        let d = daemon();
-        for i in 0..3 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            d.lock()
-                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        let r = route(
-            &d,
-            "POST",
-            "/api/triage/pools/threshold/preview",
-            r#"{"project":"proj","triage_type":"bug","threshold":null}"#,
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"clearing\":true"), "{}", r.body);
-        assert!(r.body.contains("\"full_batches\":0"), "{}", r.body);
-        assert!(r.body.contains("\"cells_drained\":0"), "{}", r.body);
-        assert!(r.body.contains("\"cells_left\":3"), "{}", r.body);
-        assert_eq!(d.lock().triage_pool_count("proj", "bug").unwrap(), 3);
-    }
-
-    /// RAL-421: the preview route rejects the same invalid thresholds the
-    /// confirm route does -- consistency keeps the UI honest before it ever
-    /// shows a Confirm button.
-    #[test]
-    fn triage_pool_threshold_preview_route_rejects_a_threshold_below_one() {
-        let d = daemon();
-        let r = route(
-            &d,
-            "POST",
-            "/api/triage/pools/threshold/preview",
-            r#"{"project":"proj","triage_type":"bug","threshold":0}"#,
-        );
-        assert_eq!(r.status, 400);
-        assert!(r.body.contains("invalid_value"));
-    }
-
-    /// RAL-421: confirming a threshold persists it AND atomically drains
-    /// the pool in threshold-sized batches -- one review per full batch,
-    /// remainder left pooled -- in a single request, and reports what it
-    /// did so the UI can follow up without another round-trip.
-    #[test]
-    fn triage_pool_threshold_confirm_route_persists_and_drains_in_batches() {
-        let d = daemon();
-        for i in 0..7 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            d.lock()
-                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        let r = route(
-            &d,
-            "POST",
-            "/api/triage/pools/threshold",
-            r#"{"project":"proj","triage_type":"bug","threshold":3}"#,
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"reviews_created\":2"), "{}", r.body);
-        assert!(r.body.contains("\"cells_drained\":6"), "{}", r.body);
-        assert!(r.body.contains("\"cells_left\":1"), "{}", r.body);
-
-        let guard = d.lock();
-        assert_eq!(
-            guard.get_triage_pool_threshold("proj", "bug").unwrap(),
-            Some(3),
-            "the confirmed threshold must be persisted"
-        );
-        assert_eq!(
-            guard.triage_pool_count("proj", "bug").unwrap(),
-            1,
-            "only the sub-threshold remainder stays pooled"
-        );
-        let guardians = guard.list_guardians().unwrap();
-        assert_eq!(
-            guardians.len(),
-            2,
-            "one review per full threshold-sized batch"
-        );
-        for g in guardians {
-            assert_eq!(g.branches.len(), 3, "each review carries exactly one batch");
-        }
     }
 
     #[test]

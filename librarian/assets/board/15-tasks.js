@@ -124,7 +124,6 @@
        */
       function renderTasksTab() {
         renderTtProjectFilter();
-        renderTtPrFilter();
         ttAllRows = ttBuildRows();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
         const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys));
@@ -158,9 +157,8 @@
         name: "Task name. Click the row to select it; the chevron (when present) expands its cells.",
         squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
-        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA draft pull request carries a \" · draft\" qualifier (the forge's own WIP state).\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
+        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
         time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
-        turns: "Agent-turn count (RAL-352): completed user/assistant message exchanges, summed over this task's cells, cell proof steps, and task-scope proof steps -- each response event counts as both sides of one exchange, so it is the number of back-and-forth messages, not API calls.\nA dash means no contributor has a conversational count (a command-only task, or a legacy row that hasn't re-run). Command-mode cells never contribute one.\nWhile a cell is running this updates live as each turn completes.",
         tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
         cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
         cost: "Total cost in USD, aggregated the same way as Tokens.\nA dash means no backend reported a cost for this task; a \"~\" prefix means at least one contributing figure is a mid-run estimate, not final accounting.",
@@ -527,9 +525,8 @@
           const label = pr.pr_number ? `#${pr.pr_number}` : "PR";
           const extra = prPick.count > 1 ? ` +${prPick.count - 1}` : "";
           const ciNote = pr.state === "open" && pr.ci_status ? ` (CI: ${esc(pr.ci_status)})` : "";
-          const draftSuffix = pr.draft ? `<span style="color:var(--muted)"> · draft</span>` : "";
-          const draftTip = pr.draft ? " Draft (work-in-progress) on the forge." : "";
-          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}${draftTip}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge.">${esc(label)}${draftSuffix}${extra}</span>`);
+          const canQueryForge = pr.state === "open" && pr.pr_number != null;
+          parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge. Right-click to refresh its status or pull in feedback.">${esc(label)}${extra}</span>`);
         } else if (reviewBadge && (reviewBadge.review.status === "approved" || reviewBadge.review.status === "merging")) {
           parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
         }
@@ -607,7 +604,6 @@
           + ttColCell("cells", ttCellsBarHtml(row.cells))
           + ttColCell("review", ttReviewPrBadgesHtml(row.reviewBadge, row.prPick))
           + ttColCell("time", ttTimeCellHtml(row.startedAtMs, row.finishedAtMs, row.state))
-          + ttColCell("turns", ttFmtTurns(row.usage))
           + ttColCell("tokens", ttFmtTokens(row.usage))
           + ttColCell("cache", ttFmtCache(row.usage))
           + ttColCell("cost", ttCostCellHtml(row.usage, ttTaskUsageItems(row.task)))
@@ -639,7 +635,6 @@
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
           + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.state))
-          + ttColCell("turns", ttFmtTurns(cu))
           + ttColCell("tokens", ttFmtTokens(cu))
           + ttColCell("cache", ttFmtCache(cu))
           + ttColCell("cost", ttCostCellHtml(cu, ttCellUsageItems(cell)))
@@ -657,19 +652,16 @@
         const squad = findSquad(squadId);
         const label = squad ? (squad.label || squad.id) : squadId;
         const squadState = squad ? squadDisplayState(squad) : "pending";
-        const agg = ttGroupAggregateWithGeneration(groupRows, squad ? squad.generation_cost : undefined);
+        const agg = ttGroupAggregate(groupRows);
         const allForSquad = ttAllRows.filter((r) => r.squadId === squadId);
         const filteredOut = allForSquad.length !== groupRows.length;
         /**
          * @param {string} formatted
          * @returns {string}
          */
-        const tip = (formatted) => {
-          const genNote = squad && squad.generation_cost ? " plus the squad's own pre-work generation calls, folded in exactly once" : "";
-          return filteredOut
-            ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest)${genNote}.`
-            : `${formatted} across all ${groupRows.length} tasks in this squad${genNote}.`;
-        };
+        const tip = (formatted) => filteredOut
+          ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
+          : `${formatted} across all ${groupRows.length} tasks in this squad.`;
         return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
           + ttColCell("sel", "")
           + ttColCell("star", "")
@@ -678,7 +670,6 @@
           + ttColCell("cells", "")
           + ttColCell("review", "")
           + ttColCell("time", "")
-          + ttColCell("turns", `<span data-tip="${esc(tip(ttFmtTurns(agg)))}${agg.anyTurns ? ` (${agg.turns} across the rows shown)` : ""}">${ttFmtTurns(agg)}</span>`)
           + ttColCell("tokens", `<span data-tip="${esc(tip(ttFmtTokens(agg)))}">${ttFmtTokens(agg)}</span>`)
           + ttColCell("cache", `<span data-tip="${esc(tip(ttFmtCache(agg)))}">${ttFmtCache(agg)}</span>`)
           + ttColCell("cost", `<span data-tip="${esc(tip(ttFmtCost(agg)))}">${agg.anyCost ? (agg.estimated ? "~" : "") + "$" + agg.cost.toFixed(2) : "–"}</span>`)
@@ -854,135 +845,6 @@
       /** Closes the Tasks toolbar's project-filter dropdown, if open. @returns {void} */
       function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
       document.addEventListener("click", ttCloseProjectFilterMenu);
-      // RAL-353: PR-state filter -- own state/render path, mirroring
-      // `renderTtProjectFilter`'s dropdown+chips idiom. Three composable
-      // dimensions: "has a pull request" (bool), draft status
-      // (any/draft/non-draft), and CI status (any/passing/failing). Any
-      // non-default dimension activates the filter; a task then passes when
-      // at least one of its PRs satisfies every active dimension (see
-      // `ttRowMatchesPrFilter`). Re-rendered on every `renderTasksTab()`
-      // after a `pollTasksTab()` refetch of `GET /api/pull-requests/index`,
-      // so async pull-request data arriving between polls re-evaluates the
-      // visible rows automatically.
-      /** Whether any PR-filter dimension is currently active.
-       * @returns {boolean}
-       */
-      function ttPrFilterActive() {
-        return taskTabFilters.pr || taskTabFilters.prDraft !== "any" || taskTabFilters.prCi !== "any";
-      }
-      /**
-       * Renders the Tasks toolbar's PR-filter dropdown trigger and its
-       * removable chips -- chip markup matches the project filter's `.filter-chip`.
-       * @returns {void}
-       */
-      function renderTtPrFilter() {
-        /** @type {string[]} */
-        const chips = [];
-        if (taskTabFilters.pr) chips.push(`<span class="filter-chip"><span class="x" onclick="ttToggleHasPr(false)" data-tip="Remove the requires-a-pull-request requirement -- show every task again.">✕</span>any PR</span>`);
-        if (taskTabFilters.prDraft !== "any") chips.push(`<span class="filter-chip"><span class="x" onclick="ttSetPrDraft('any')" data-tip="Stop filtering by draft status.">✕</span>${esc(taskTabFilters.prDraft)}</span>`);
-        if (taskTabFilters.prCi !== "any") chips.push(`<span class="filter-chip"><span class="x" onclick="ttSetPrCi('any')" data-tip="Stop filtering by CI status.">✕</span>ci: ${esc(taskTabFilters.prCi)}</span>`);
-        const chipsHtml = chips.join("");
-        byId("tt-pr-filter").innerHTML = `<button type="button" class="btn" onclick="ttOpenPrFilterMenu(event)" data-tip="Filter rows by their pull requests: has any, draft status, and CI status -- composable (a task matches when at least one of its PRs satisfies every chosen dimension).\nNo active dimension shows every task.">PR ▾</button>${chipsHtml}`
-          + (ttPrFilterActive() ? `<span class="chip" onclick="ttClearPrFilter()" data-tip="Clear every pull-request filter dimension.">clear</span>` : "");
-      }
-      /** The display label for a draft-status or CI-status filter value.
-       * @param {string} v
-       * @returns {string}
-       */
-      function ttPrFilterLabel(v) { return { any: "Any", draft: "Draft", "non-draft": "Non-draft", passing: "Passing", failing: "Failing" }[v] || v; }
-      /**
-       * Builds the checkbox rows for the Tasks toolbar's PR-filter dropdown
-       * (RAL-353): a has-PR row, a draft-status section, and a CI-status
-       * section -- the sections are single-choice (radio semantics), the
-       * has-PR row is independent of both.
-       * @returns {string}
-       */
-      function ttPrFilterMenuRowsHtml() {
-        const rows = [];
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">Pull request</div>`);
-        rows.push(`<div class="ctx-check ${taskTabFilters.pr ? "on" : ""}" onclick="ttToggleHasPr(!${taskTabFilters.pr || false})" data-tip="Show only tasks with at least one pull request.">${taskTabFilters.pr ? "✓" : ""} Has pull request</div>`);
-        rows.push(`<div class="ctx-sep"></div>`);
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">Draft status</div>`);
-        for (const mode of ["any", "draft", "non-draft"]) {
-          rows.push(`<div class="ctx-check ${taskTabFilters.prDraft === mode ? "on" : ""}" onclick="ttSetPrDraft('${mode}')" data-tip="${mode === "any" ? "Don't filter by draft status." : `Only tasks with a ${mode} pull request.`}">${taskTabFilters.prDraft === mode ? "✓" : ""} ${esc(ttPrFilterLabel(mode))}</div>`);
-        }
-        rows.push(`<div class="ctx-sep"></div>`);
-        rows.push(`<div style="color:var(--muted);font-size:11px;padding:3px 10px 4px;text-transform:uppercase;letter-spacing:.5px">CI status</div>`);
-        for (const mode of ["any", "passing", "failing"]) {
-          rows.push(`<div class="ctx-check ${taskTabFilters.prCi === mode ? "on" : ""}" onclick="ttSetPrCi('${mode}')" data-tip="${mode === "any" ? "Don't filter by CI status." : `Only tasks with a ${mode} pull request.`}">${taskTabFilters.prCi === mode ? "✓" : ""} ${esc(ttPrFilterLabel(mode))}</div>`);
-        }
-        return rows.join("");
-      }
-      /**
-       * Opens the Tasks toolbar's PR-filter dropdown, a `.ctx-menu` popup --
-       * stays open across individual clicks since picking several dimensions
-       * in a row is the common case.
-       * @param {MouseEvent} e
-       * @returns {void}
-       */
-      function ttOpenPrFilterMenu(e) {
-        e.preventDefault(); e.stopPropagation(); ttCloseColMenu(); ttClosePrFilterMenu();
-        const menu = document.createElement("div");
-        menu.className = "ctx-menu"; menu.id = "tt-pr-filter-menu";
-        menu.innerHTML = ttPrFilterMenuRowsHtml();
-        document.body.appendChild(menu);
-        const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect();
-        menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
-        menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
-      }
-      /** Closes the Tasks toolbar's PR-filter dropdown, if open. @returns {void} */
-      function ttClosePrFilterMenu() { const m = document.getElementById("tt-pr-filter-menu"); if (m) m.remove(); }
-      document.addEventListener("click", ttClosePrFilterMenu);
-      /**
-       * Toggles the requires-a-pull-request dimension (RAL-353). Updates the
-       * open dropdown's checkmark in place rather than closing it.
-       * @param {boolean} on
-       * @returns {void}
-       */
-      function ttToggleHasPr(on) {
-        taskTabFilters.pr = on;
-        ttRerenderPrFilter();
-      }
-      /**
-       * Sets the draft-status dimension (RAL-353) -- "any" disables it.
-       * @param {"any"|"draft"|"non-draft"} mode
-       * @returns {void}
-       */
-      function ttSetPrDraft(mode) {
-        taskTabFilters.prDraft = mode;
-        ttRerenderPrFilter();
-      }
-      /**
-       * Sets the CI-status dimension (RAL-353) -- "any" disables it.
-       * @param {"any"|"passing"|"failing"} mode
-       * @returns {void}
-       */
-      function ttSetPrCi(mode) {
-        taskTabFilters.prCi = mode;
-        ttRerenderPrFilter();
-      }
-      /** Clears every PR-filter dimension back to defaults. @returns {void} */
-      function ttClearPrFilter() {
-        taskTabFilters.pr = false;
-        taskTabFilters.prDraft = "any";
-        taskTabFilters.prCi = "any";
-        ttRerenderPrFilter();
-      }
-      /**
-       * Shared tail for the PR-filter setters: re-renders (so the chips,
-       * the visible rows, and the details pane all reflect the new filter),
-       * keeps the selection visible, syncs the URL hash, and refreshes the
-       * open dropdown's checkmarks in place.
-       * @returns {void}
-       */
-      function ttRerenderPrFilter() {
-        renderTasksTab();
-        ttScrollSelectionIntoView();
-        syncHash();
-        renderTtPrFilter();
-        const menu = document.getElementById("tt-pr-filter-menu");
-        if (menu) menu.innerHTML = ttPrFilterMenuRowsHtml();
-      }
       /**
        * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
        * @param {string} squadId
@@ -1255,7 +1117,7 @@
           const branchRows = r.branches.map((b) => {
             const pr = row.prs.find((p) => p.branch_alias === b);
             const badge = pr
-              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}${pr.draft ? " Draft (work-in-progress)." : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}${pr.draft ? `<span style="color:var(--muted)"> · draft</span>` : ""}</span>`
+              ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
               : (r.status === "approved" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Approved/merging with no PR submitted yet.">no PR</span>` : "");
             return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
           }).join("");
@@ -1359,7 +1221,6 @@
       let multiSel = new Set();
       /** @type {Set<string>} multi-selected task/cell/proof nodes in the current graph */
       let nodeMultiSel = new Set();
-
       // RAL-419: per-squad graph-selection cache. A squad's primary selection
       // (`sel`) and its graph-node multi-selection (`nodeMultiSel`) are snapshotted
       // here every time they change, so switching squads and coming back restores the

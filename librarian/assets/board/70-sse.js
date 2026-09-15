@@ -176,21 +176,23 @@
        * @returns {Promise<void>}
        */
       async function tick() {
-        await pollWhoAmI();
-        await pollHidden();
-        await pollWatches();
-        await pollMailbox();
-        if (tab === "reviews") { await updateCounter(); await pollReviews(); }
-        else if (tab === "resources") { await updateCounter(); await pollResources(); }
-        else if (tab === "queue") { await updateCounter(); if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
-        else if (tab === "cartographer") { await updateCounter(); await pollCartographer(); }
-        else if (tab === "projects") { await updateCounter(); await pollProjects(); }
-        else if (tab === "machines") { await updateCounter(); await pollMachines(); }
-        else if (tab === "triage") { await updateCounter(); await pollTriage(); }
-        else if (tab === "users") { await updateCounter(); await pollUsers(); }
-        else if (tab === "secrets") { await updateCounter(); await pollSecretEnvNames(); }
-        else if (tab === "worktree-retirement") { await updateCounter(); await pollWorktreeRetirements(); }
-        else if (tab === "prefs") { await updateCounter(); await pollPrefs(); }
+        // These four are independent of each other and of the per-tab refresh
+        // below -- none reads another's result -- so they run concurrently
+        // rather than as a sequential chain that sums four round-trips.
+        // `updateCounter` joins them for the same reason: every tab's branch
+        // awaited it before starting its own fetch, for no dependency.
+        await Promise.all([pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(), updateCounter()]);
+        if (tab === "reviews") { await pollReviews(); }
+        else if (tab === "resources") { await pollResources(); }
+        else if (tab === "queue") { if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
+        else if (tab === "cartographer") { await pollCartographer(); }
+        else if (tab === "projects") { await pollProjects(); }
+        else if (tab === "machines") { await pollMachines(); }
+        else if (tab === "triage") { await pollTriage(); }
+        else if (tab === "users") { await pollUsers(); }
+        else if (tab === "secrets") { await pollSecretEnvNames(); }
+        else if (tab === "worktree-retirement") { await pollWorktreeRetirements(); }
+        else if (tab === "prefs") { await pollPrefs(); }
         else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
         else { await ensureProjectsLoadedForFilters(); await pollTasks(); }
         await refreshBanner();
@@ -212,6 +214,8 @@
       let sseRefreshKinds = new Set();
       /** @type {Set<string>} guardian ids referenced by a pending event, since the last flush */
       let sseRefreshGuardianIds = new Set();
+      /** Whether a pending event carries a squad id, even if it is classified as a guardian event. */
+      let sseRefreshHasSquadChange = false;
       // Coalescing window: long enough to merge a burst of near-simultaneous
       // events into one refresh, short enough that push still feels instant
       // next to the old 2s poll.
@@ -222,9 +226,10 @@
        * feedback-thread refresh when the open review itself just changed.
        * @param {Set<string>} kinds
        * @param {Set<string>} guardianIds
+       * @param {boolean} hasSquadChange
        * @returns {Promise<void>}
        */
-      async function applySseRefresh(kinds, guardianIds) {
+      async function applySseRefresh(kinds, guardianIds, hasSquadChange) {
         if (tab === "tasks") {
           await pollTasksTab();
           await refreshBanner();
@@ -240,7 +245,7 @@
           // Every event is Cartographer-worthy by construction -- always
           // refresh this tab's own view of the log, regardless of kind.
           await pollCartographer();
-        } else if (tab === "squads" && kinds.has("squad")) {
+        } else if (tab === "squads" && hasSquadChange) {
           await pollTasks();
         }
         await refreshBanner();
@@ -254,12 +259,14 @@
       function scheduleSseRefresh(kind, row) {
         sseRefreshKinds.add(kind);
         if (row.guardian_id) sseRefreshGuardianIds.add(row.guardian_id);
+        if (row.squad_id) sseRefreshHasSquadChange = true;
         if (sseRefreshTimer) return;
         sseRefreshTimer = setTimeout(() => {
           const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
           const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
+          const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
           sseRefreshTimer = null;
-          applySseRefresh(kinds, guardianIds);
+          applySseRefresh(kinds, guardianIds, hasSquadChange);
         }, SSE_DEBOUNCE_MS);
       }
       // How long to wait before minting a fresh ticket and reconnecting after
@@ -530,10 +537,16 @@
         finally { prSyncStatusInFlight.delete(prId); }
       }
       /**
-       * Fetches the PRs submitted for a review and caches them, along with a
-       * live drift check (RAL-190) for each still-open one that has a
-       * recorded forge number. Only polled for the open review, mirroring
-       * `pollBranchConflicts`.
+       * Fetches the PRs submitted for a review and caches them, so the PR
+       * badge/link (which only needs pr_url/pr_number/ci_status, all present
+       * on this response) can render immediately. Also kicks off a live
+       * drift check (RAL-190) for each still-open one that has a recorded
+       * forge number, but does NOT wait on it -- `fetchPrSyncStatus` does its
+       * own `git fetch` per PR, serialized per repo on the daemon side, which
+       * can take many seconds per PR and has nothing to do with whether the
+       * badge itself is ready to show. It writes into `prSyncStatus`
+       * independently and the next poll tick picks it up whenever it lands.
+       * Only polled for the open review, mirroring `pollBranchConflicts`.
        * @param {string} gid
        * @returns {Promise<void>}
        */
@@ -545,7 +558,7 @@
           const prs = await res.json();
           pullRequests[gid] = prs;
           const open = prs.filter((p) => p.state === "open" && p.pr_number != null);
-          await Promise.all(open.map((p) => fetchPrSyncStatus(p.id)));
+          open.forEach((p) => { fetchPrSyncStatus(p.id); });
         } catch (e) { /* transient -- the next poll retries */ }
       }
       // RALPHUS-REVIEW-POLL:BEGIN

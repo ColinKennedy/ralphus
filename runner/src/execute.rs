@@ -72,7 +72,17 @@ const NON_INTERACTIVE_SYSTEM_PROMPT: &str = "## Background\nYou are running unat
      worktree of this project's repository, not its main checkout. Implement \
      the work exactly as described and keep every change -- file edits, \
      `git add`, commits, anything -- confined to this worktree; never touch \
-     the main checkout or any other worktree, even to look something up.";
+     the main checkout or any other worktree, even to look something up. \
+     This branch's git upstream is configured to point at its review's \
+     shared base branch, purely so ralphus can diff against it -- `git \
+     status`/`git push` may describe that tracked branch as \"your branch's \
+     upstream,\" but it is not this branch's own remote copy. Never push \
+     directly to it, whether with a bare `git push` or by naming it \
+     explicitly; that lands your commit straight on the shared base branch, \
+     bypassing the review this branch is meant to go through. Only push to a \
+     same-named branch of your own (e.g. `git push <remote> \
+     HEAD:<this-branch-name>`), and only if explicitly instructed to push at \
+     all.";
 
 const MAX_ASYNC_ATTEMPTS: u32 = 3;
 /// RAL-292: how many times a turn that ended with an unresolved backgrounded
@@ -312,17 +322,26 @@ fn run_with_backend(
     workspace: &Workspace,
     backend: &dyn ModelBackend,
 ) -> CellResult {
-    let system_prompt = combine_system_prompts(&[
-        spec.system_prompt.as_deref(),
-        Some(NON_INTERACTIVE_SYSTEM_PROMPT),
-        Some(TOOLS_SYSTEM_PROMPT),
-        Some(ASYNC_SYSTEM_PROMPT),
-        Some(if spec.proof {
-            PROOF_SYSTEM_PROMPT
-        } else {
-            GHOST_SYSTEM_PROMPT
-        }),
-    ]);
+    let system_prompt = if spec.proof {
+        combine_system_prompts(&[
+            Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+            Some(TOOLS_SYSTEM_PROMPT),
+            Some(ASYNC_SYSTEM_PROMPT),
+            Some(PROOF_SYSTEM_PROMPT),
+            // The daemon supplies proof `system_prompt` as immutable runtime
+            // context after it has observed earlier proof results. It belongs
+            // last so it narrows the generic proof guidance.
+            spec.system_prompt.as_deref(),
+        ])
+    } else {
+        combine_system_prompts(&[
+            spec.system_prompt.as_deref(),
+            Some(NON_INTERACTIVE_SYSTEM_PROMPT),
+            Some(TOOLS_SYSTEM_PROMPT),
+            Some(ASYNC_SYSTEM_PROMPT),
+            Some(GHOST_SYSTEM_PROMPT),
+        ])
+    };
     if let Some(sp) = &system_prompt {
         crate::cartographer::emit(
             "runner",
@@ -975,14 +994,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Asserts the structure of the fully assembled unattended-cell system
-    /// prompt (caller-authored fragment + ralphus fragments joined with blank
-    /// lines), the form the backend actually receives -- not just the
-    /// individual constants.
-    fn assert_assembled_prompt_sections(sp: &str, caller_first_line: &str) {
+    /// Asserts the structure of the fully assembled unattended system prompt
+    /// the backend receives, not just its individual fragments.
+    fn assert_assembled_prompt_sections(sp: &str, expected_first_line: &str) {
         assert!(
-            sp.starts_with(caller_first_line),
-            "caller-authored fragment must come first: {sp}"
+            sp.starts_with(expected_first_line),
+            "unexpected opening system-prompt section: {sp}"
         );
         let background = sp.find("## Background\n").expect("Background section");
         let tools = sp
@@ -1071,9 +1088,10 @@ mod tests {
             .borrow()
             .clone()
             .expect("run() should have received the assembled system prompt");
-        assert_assembled_prompt_sections(
-            &sp,
-            "Do NOT commit and do NOT push under any circumstances.",
+        assert_assembled_prompt_sections(&sp, "## Background");
+        assert!(
+            sp.ends_with("Do NOT commit and do NOT push under any circumstances."),
+            "runtime proof context must be appended after the generic proof guidance: {sp}"
         );
         // Proof steps get the verdict contract, not the ghost handoff.
         assert!(sp.contains("RALPHUS_PROOF: PASS"), "{sp}");

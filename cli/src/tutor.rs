@@ -411,6 +411,21 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 settings <selector> --auto-submit-pr-stack`, but
                 declared up front so the review is created with the
                 right behavior from its first merge.
+ auto_fix_pr_errors
+        bool    Automatically dispatch the resolver `agent` to fix a
+                failing PR/MR CI status, instead of leaving the
+                failure for a human to notice and action manually.
+                Unset inherits the project-level .ralphus.toml
+                [review] auto_fix_pr_errors default, then false.
+ auto_fix_prompt_template
+        string  Prompt template handed to the resolver agent when
+                `auto_fix_pr_errors` fires. Must contain the literal
+                `<<prompt>>` placeholder, replaced with the
+                concatenated prompts of every cell attached to the
+                branch whose PR failed. Unset inherits the
+                project-level .ralphus.toml [review]
+                auto_fix_prompt_template default, then a built-in
+                default template.
 
  [[review.auto_build]]  (zero or more per [[review]])
  Declare the build steps that run at merge/finalize time (RAL-342).
@@ -794,10 +809,11 @@ upstream = "foo"
 # The upstream branch is normally resolved from each worktree's git upstream
 # tracking branch; declared explicitly here.
 [[review]]
-id       = "ralphus:new-review/ral-batch"
-name     = "RAL batch"
-upstream = "foo"
-agent    = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
+id                 = "ralphus:new-review/ral-batch"
+name               = "RAL batch"
+upstream           = "foo"
+agent              = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
+auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR CI status automatically
 
 # Build step 1: static command (run verbatim in shell).
 [[review.auto_build]]

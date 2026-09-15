@@ -391,7 +391,7 @@
           if (filters.q) p.set("q", filters.q);
           if (filters.sort !== "date") p.set("sort", filters.sort);
           if (filters.dir !== -1) p.set("dir", "asc");
-          if (filters.status.size !== STATES.length) p.set("status", [...filters.status].join(","));
+          if (filters.status.size !== SQUAD_STATES.length) p.set("status", [...filters.status].join(","));
           if (filters.showHidden) p.set("hidden", "1");
           if (filters.project.size) p.set("project", [...filters.project].join(","));
           const squad = selectedSquadId ? findSquad(selectedSquadId) : null;
@@ -549,7 +549,7 @@
       function renderStatusFilters() {
         const el = byId("status-filters");
         /** @type {HTMLInputElement} */ (byId("filter")).value = filters.q;
-        el.innerHTML = STATES.map((s) => `<label data-tip="Show or hide ${s} squads.">${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="toggleStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
+        el.innerHTML = SQUAD_STATES.map((s) => `<label data-tip="Show or hide ${s} squads.">${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="toggleStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
           + `<span class="chip" onclick="allStatus(true)" data-tip="Show squads of every status.">all</span><span class="chip" onclick="allStatus(false)" data-tip="Hide all squads — clear the status filter entirely.">none</span>`;
         /** @type {HTMLInputElement} */ (byId("show-hidden-squads")).checked = filters.showHidden;
       }
@@ -572,7 +572,7 @@
        * @param {boolean} on
        * @returns {void}
        */
-      function allStatus(on) { filters.status = on ? new Set(STATES) : new Set(); renderStatusFilters(); renderSquads(); syncHash(); }
+      function allStatus(on) { filters.status = on ? new Set(SQUAD_STATES) : new Set(); renderStatusFilters(); renderSquads(); syncHash(); }
       /**
        * Applies a free-text squad-name/id filter.
        * @param {string} v
@@ -1466,4 +1466,3 @@
         return terminalMenuItem(key, "Resume Automation", clickAction, clickData,
           "Hand this cell back to unattended execution, continuing the exact same conversation you were just in.\nWho/when: you're done steering it in the real agent terminal and want automation to pick back up.\nIf the cell is actually still live (not detached), this is safely rejected instead of racing it.");
       }
-

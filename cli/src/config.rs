@@ -22,7 +22,7 @@ impl Default for TaskConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub log_path: Option<String>,
     pub log_level: Option<String>,
@@ -31,6 +31,20 @@ pub struct DaemonConfig {
     /// falls back to its own default); `Some(0)` means "no limit". Negative
     /// values are invalid -- `ralphus check health` warns about them.
     pub max_concurrent: Option<i64>,
+    /// Whether OpenTelemetry exporters are enabled. Defaults to `true`.
+    pub opentelemetry: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            log_path: None,
+            log_level: None,
+            keep_temporary_files: false,
+            max_concurrent: None,
+            opentelemetry: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,11 +175,12 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
                 type_name(daemon_raw)
             )),
             Some(table) => {
-                const KNOWN_DAEMON: [&str; 4] = [
+                const KNOWN_DAEMON: [&str; 5] = [
                     "log_path",
                     "log_level",
                     "keep_temporary_files",
                     "max_concurrent",
+                    "opentelemetry",
                 ];
                 for k in table.keys() {
                     if !KNOWN_DAEMON.contains(&k.as_str()) {
@@ -212,6 +227,14 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
                         issues.push(format!(
                             "key \"daemon.keep_temporary_files\" expects \"boolean\" but got a \"{}\" type",
                             type_name(ktf)
+                        ));
+                    }
+                }
+                if let Some(otel) = table.get("opentelemetry") {
+                    if otel.as_bool().is_none() {
+                        issues.push(format!(
+                            "key \"daemon.opentelemetry\" expects \"boolean\" but got a \"{}\" type",
+                            type_name(otel)
                         ));
                     }
                 }
@@ -442,6 +465,10 @@ fn apply_daemon(base: &DaemonConfig, raw: &toml::Table) -> DaemonConfig {
             .get("max_concurrent")
             .and_then(toml::Value::as_integer)
             .or(base.max_concurrent),
+        opentelemetry: section
+            .get("opentelemetry")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(base.opentelemetry),
     }
 }
 
@@ -510,6 +537,7 @@ fn load_config_with(
         ("daemon.log_level", None),
         ("daemon.keep_temporary_files", None),
         ("daemon.max_concurrent", None),
+        ("daemon.opentelemetry", None),
     ];
 
     for (path, label) in get_candidates(cwd, include_local, configuration_path_env) {
@@ -538,6 +566,9 @@ fn load_config_with(
         }
         if new_daemon.max_concurrent != daemon.max_concurrent {
             set_provenance(&mut provenance, "daemon.max_concurrent", &path);
+        }
+        if new_daemon.opentelemetry != daemon.opentelemetry {
+            set_provenance(&mut provenance, "daemon.opentelemetry", &path);
         }
         daemon = new_daemon;
 
@@ -708,6 +739,23 @@ BAD = 5
     }
 
     #[test]
+    fn validate_raw_requires_a_boolean_opentelemetry_value() {
+        let invalid: toml::Table = "[daemon]\nopentelemetry = \"false\"\n".parse().unwrap();
+        let issues = validate_raw(&invalid);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("daemon.opentelemetry") && issue.contains("boolean")),
+            "{issues:?}"
+        );
+
+        let enabled: toml::Table = "[daemon]\nopentelemetry = true\n".parse().unwrap();
+        let disabled: toml::Table = "[daemon]\nopentelemetry = false\n".parse().unwrap();
+        assert!(validate_raw(&enabled).is_empty());
+        assert!(validate_raw(&disabled).is_empty());
+    }
+
+    #[test]
     fn validate_raw_accepts_zero_max_concurrent() {
         let raw: toml::Table = "[daemon]\nmax_concurrent = 0\n".parse().unwrap();
         assert!(validate_raw(&raw).is_empty());
@@ -727,6 +775,7 @@ BAD = 5
             log_level: None,
             keep_temporary_files: false,
             max_concurrent: None,
+            opentelemetry: true,
         };
         let raw: toml::Table = "[daemon]\nlog_level = \"debug\"\n".parse().unwrap();
         let merged = apply_daemon(&base, &raw);

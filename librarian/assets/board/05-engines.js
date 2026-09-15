@@ -156,6 +156,9 @@
       CLICK_HANDLERS.onReviewClick = (e, ds) => onReviewClick(e, ds.guardianId || "");
       CLICK_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
       CTX_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
+      CTX_HANDLERS.openPrMenu = (e, ds) => openPrMenu(e, ds.prId || "", ds.prOpen === "1");
+      CLICK_HANDLERS.refreshPrStatusMenuItem = (e, ds) => refreshPrStatusMenuItem(ds.prId || "");
+      CLICK_HANDLERS.actionPrFeedbackMenuItem = (e, ds) => actionPrFeedbackMenuItem(ds.prId || "");
       CLICK_HANDLERS.openEditReviewDetailsFromMenu = (e, ds) => { closeSquadMenu(); openEditReviewDetails(ds.guardianId || ""); };
       CLICK_HANDLERS.cancelReview = (e, ds) => cancelReview(ds.guardianId || "");
       CLICK_HANDLERS.reopenReview = (e, ds) => reopenReview(ds.guardianId || "");
@@ -251,7 +254,7 @@
 
       const STATES = ["running","done","failed","pending","queued","cancelled","ignored"];
       const GUARDIAN_STATES = ["collecting","merging","merge_failed","merge_stopped","in_review","approved","cancelled","deployed"];
-      const SQUAD_STATES = ["queued","pending","running","done","failed","cancelled","ignored"];
+      const SQUAD_STATES = ["materializing","queued","pending","running","done","failed","cancelled","ignored"];
       const NODE_STATES = ["pending","running","done","failed","cancelled","ignored"];
       const IRREVERSIBLE_STATES = new Set(["done","failed","cancelled"]);
       let tab = "squads";

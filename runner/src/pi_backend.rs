@@ -15,6 +15,12 @@ use crate::tools::Workspace;
 const DEFAULT_PROGRAM: &str = "pi";
 const SUMMARY_TAIL_CHARS: usize = 2000;
 
+/// Mirrors `claude_code_backend::DEFAULT_TOOL_ARG_TRUNCATE_CHARS` -- the
+/// per-value character budget (RAL-303) used when
+/// `RunOptions::tool_arg_truncate_chars` is unset. Kept as a separate
+/// constant rather than shared because that one is private to its module.
+const DEFAULT_TOOL_ARG_TRUNCATE_CHARS: usize = 200;
+
 pub struct PiBackend {
     pub keep_temporary_files: bool,
     pub program_override: Option<String>,
@@ -179,7 +185,15 @@ impl ModelBackend for PiBackend {
                 .thrash_min_turn_gap
                 .unwrap_or(crate::thrash::DEFAULT_MIN_TURN_GAP),
         };
-        let outcome = drive_json_events(&mut child, workspace, thrash_thresholds)?;
+        let tool_arg_truncate_chars = options
+            .tool_arg_truncate_chars
+            .map_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS, |n| n as usize);
+        let outcome = drive_json_events(
+            &mut child,
+            workspace,
+            thrash_thresholds,
+            tool_arg_truncate_chars,
+        )?;
 
         if !self.keep_temporary_files {
             let _ = std::fs::remove_file(live_session_path(workspace.root()));
@@ -556,6 +570,7 @@ fn drive_json_events(
     child: &mut Child,
     workspace: &Workspace,
     thrash_thresholds: crate::thrash::ThrashThresholds,
+    tool_arg_truncate_chars: usize,
 ) -> Result<BackendOutcome, BackendError> {
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
@@ -587,7 +602,12 @@ fn drive_json_events(
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        process_event(&event, &mut state, workspace.root());
+        process_event(
+            &event,
+            &mut state,
+            workspace.root(),
+            tool_arg_truncate_chars,
+        );
         // RAL-339: stop reading at the compaction boundary itself -- a safe
         // stop point -- instead of waiting for pi's own stdout to reach EOF,
         // which could be arbitrarily many further (thrashing) turns away.
@@ -626,6 +646,13 @@ fn drive_json_events(
     let status = child.wait().map_err(|e| BackendError(format!("pi: {e}")))?;
     if let Some(t) = stderr_thread {
         let _ = t.join();
+    }
+
+    if let Some(error) = state.terminal_error {
+        return Err(BackendError(format!(
+            "pi: {}",
+            display_terminal_error(&error)
+        )));
     }
 
     if !state.saw_terminal_event {
@@ -667,6 +694,10 @@ struct ParseState {
     cache_read_tokens: i64,
     cost_usd: f64,
     saw_terminal_event: bool,
+    /// The last assistant terminal event's provider/agent error. Pi's JSON
+    /// print mode exits zero for these because they are model messages rather
+    /// than thrown CLI errors, so the event is the authoritative outcome.
+    terminal_error: Option<String>,
     printed_text_delta: bool,
     /// RAL-339: shared compaction-thrash counter for this run (see
     /// `crate::thrash`).
@@ -676,9 +707,205 @@ struct ParseState {
     /// this after every event and stops (kills the child) rather than
     /// waiting for stdout EOF.
     compaction_thrash: Option<crate::thrash::ThrashDetail>,
+    /// True while [`feed_assistant_text`] is buffering a candidate top-level
+    /// JSON object out of the streamed text (see its doc comment) rather
+    /// than printing characters straight through.
+    capturing_json: bool,
+    /// The candidate JSON object accumulated so far, including its opening
+    /// `{`. Only meaningful while `capturing_json` is set.
+    json_buffer: String,
+    /// Brace nesting depth of `json_buffer`, starting at 1 for the opening
+    /// `{` that began capture; capture ends the moment this reaches 0.
+    json_depth: i32,
+    /// Whether the scanner is currently inside a JSON string literal (so a
+    /// `{`/`}` there doesn't count toward `json_depth`).
+    json_in_string: bool,
+    /// Whether the next character in `json_buffer` is escaped (follows an
+    /// unescaped `\` inside a string) and must not be interpreted specially.
+    json_escape: bool,
 }
 
-fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
+/// Pi's `--mode json` `message_update` events stream the model's own raw
+/// text verbatim (RAL-380) -- unlike claude-code/codex, which get a distinct
+/// `tool_use`/`command_execution` event, Pi (at least fronting an
+/// OpenRouter/DeepSeek model with no native function-calling) emits its tool
+/// calls as bare JSON objects embedded directly in that text. Left alone
+/// they land in the terminal pane as raw, unreadable multi-hundred-character
+/// blobs (`{"command": "..."}`, `{"edits": [...], "path": "..."}`, ...).
+///
+/// This scans incoming deltas character-by-character, using `ParseState`'s
+/// `json_*` fields to track brace depth across delta boundaries (a blob can
+/// span many small deltas), so a candidate object starting at a top-level
+/// `{` is captured whole and, once balanced, replaced with a
+/// [`format_pi_tool_call`] summary line instead of being printed raw.
+/// Anything that isn't recognized JSON falls back to the old raw-passthrough
+/// behavior, so no content is ever silently dropped.
+fn feed_assistant_text(state: &mut ParseState, delta: &str, tool_arg_truncate_chars: usize) {
+    let mut plain_run = String::new();
+    for c in delta.chars() {
+        if !state.capturing_json {
+            if c == '{' {
+                if !plain_run.is_empty() {
+                    print_delta(&plain_run);
+                    state.printed_text_delta = true;
+                    plain_run.clear();
+                }
+                state.capturing_json = true;
+                state.json_buffer.clear();
+                state.json_buffer.push(c);
+                state.json_depth = 1;
+                state.json_in_string = false;
+                state.json_escape = false;
+            } else {
+                plain_run.push(c);
+            }
+            continue;
+        }
+
+        state.json_buffer.push(c);
+        if state.json_escape {
+            state.json_escape = false;
+        } else if state.json_in_string {
+            match c {
+                '\\' => state.json_escape = true,
+                '"' => state.json_in_string = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => state.json_in_string = true,
+                '{' => state.json_depth += 1,
+                '}' => {
+                    state.json_depth -= 1;
+                    if state.json_depth == 0 {
+                        flush_json_buffer(state, tool_arg_truncate_chars);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !plain_run.is_empty() {
+        print_delta(&plain_run);
+        state.printed_text_delta = true;
+    }
+}
+
+/// Ends capture started by [`feed_assistant_text`], printing either a
+/// formatted `[tool]` summary (recognized shape) or the raw buffered text
+/// unchanged (anything else -- preserves the pre-RAL-380 behavior as a
+/// fallback rather than ever discarding content).
+fn flush_json_buffer(state: &mut ParseState, tool_arg_truncate_chars: usize) {
+    let raw = std::mem::take(&mut state.json_buffer);
+    state.capturing_json = false;
+    let parsed = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|value| format_pi_tool_call(&value, tool_arg_truncate_chars));
+    match parsed {
+        Some(line) => {
+            if state.printed_text_delta {
+                finish_delta_line();
+                state.printed_text_delta = false;
+            }
+            eprintln!("{line}");
+        }
+        None => {
+            print_delta(&raw);
+            state.printed_text_delta = true;
+        }
+    }
+}
+
+/// Flushes any JSON capture left incomplete when a message/turn ends (the
+/// closing `}` never arrived, e.g. the candidate was ordinary prose
+/// containing a stray `{`) as plain raw text, so nothing is lost. Called at
+/// `message_end`/`agent_end` before their existing "finish the delta line"
+/// handling.
+fn finish_pi_text_stream(state: &mut ParseState) {
+    if state.capturing_json {
+        let raw = std::mem::take(&mut state.json_buffer);
+        state.capturing_json = false;
+        if !raw.is_empty() {
+            print_delta(&raw);
+            state.printed_text_delta = true;
+        }
+    }
+}
+
+/// Best-effort classification of one of Pi's bare tool-call JSON objects
+/// (see [`feed_assistant_text`]) into a `[tool] name(args)` line matching
+/// claude-code's/codex's `[tool]` convention. Pi's own tool names aren't
+/// observable from this JSON (there is no wrapping `{"name": ..., "args":
+/// ...}` -- just the bare argument object), so the names used here
+/// (`bash`/`edit`/`read`) are inferred from the argument shape, not read
+/// from Pi. Returns `None` for any object shape not recognized, so the
+/// caller falls back to printing it raw rather than mislabeling it.
+fn format_pi_tool_call(value: &Value, truncate_chars: usize) -> Option<String> {
+    let obj = value.as_object()?;
+    if let Some(command) = obj.get("command").and_then(Value::as_str) {
+        let mut args = vec![format!(
+            "command={:?}",
+            truncate_display(command, truncate_chars)
+        )];
+        if let Some(timeout) = obj.get("timeout") {
+            args.push(format!("timeout={timeout}"));
+        }
+        return Some(format!("[tool] bash({})", args.join(", ")));
+    }
+    if let (Some(edits), Some(path)) = (
+        obj.get("edits").and_then(Value::as_array),
+        obj.get("path").and_then(Value::as_str),
+    ) {
+        let edits_str = edits
+            .iter()
+            .enumerate()
+            .map(|(i, edit)| {
+                let old = truncate_display(
+                    edit.get("oldText").and_then(Value::as_str).unwrap_or(""),
+                    truncate_chars,
+                );
+                let new = truncate_display(
+                    edit.get("newText").and_then(Value::as_str).unwrap_or(""),
+                    truncate_chars,
+                );
+                format!("#{}: old_text={old:?}, new_text={new:?}", i + 1)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(format!("[tool] edit(path={path:?}, edits=[{edits_str}])"));
+    }
+    if let Some(path) = obj.get("path").and_then(Value::as_str) {
+        if obj.contains_key("offset") || obj.contains_key("limit") {
+            let mut args = vec![format!("path={path:?}")];
+            if let Some(offset) = obj.get("offset") {
+                args.push(format!("offset={offset}"));
+            }
+            if let Some(limit) = obj.get("limit") {
+                args.push(format!("limit={limit}"));
+            }
+            return Some(format!("[tool] read({})", args.join(", ")));
+        }
+    }
+    None
+}
+
+/// Truncates `text` to `truncate_chars` characters with a trailing `…`,
+/// mirroring `claude_code_backend::format_tool_input`'s per-value budget.
+fn truncate_display(text: &str, truncate_chars: usize) -> String {
+    if text.chars().count() > truncate_chars {
+        let truncated: String = text.chars().take(truncate_chars).collect();
+        format!("{truncated}…")
+    } else {
+        text.to_string()
+    }
+}
+
+fn process_event(
+    event: &Value,
+    state: &mut ParseState,
+    workspace_root: &Path,
+    tool_arg_truncate_chars: usize,
+) {
     match event["type"].as_str() {
         Some("session") => {
             if let Some(id) = event["id"].as_str() {
@@ -739,8 +966,7 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
             }
             if let Some(delta) = event["assistantMessageEvent"]["delta"].as_str() {
                 if !delta.is_empty() {
-                    print_delta(delta);
-                    state.printed_text_delta = true;
+                    feed_assistant_text(state, delta, tool_arg_truncate_chars);
                 }
             }
         }
@@ -755,9 +981,10 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                 let text = extract_message_text(&event["message"]);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
-                    state.saw_terminal_event = true;
                 }
+                record_assistant_terminal(state, &event["message"]);
             }
+            finish_pi_text_stream(state);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
@@ -773,9 +1000,10 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
                 let text = extract_message_text(last);
                 if !text.is_empty() {
                     state.latest_assistant_message = text;
-                    state.saw_terminal_event = true;
                 }
+                record_assistant_terminal(state, last);
             }
+            finish_pi_text_stream(state);
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
@@ -841,6 +1069,29 @@ fn process_event(event: &Value, state: &mut ParseState, workspace_root: &Path) {
             }
         }
         _ => {}
+    }
+}
+
+/// Record the semantic outcome of Pi's finalized assistant message. Error
+/// messages commonly have empty text and carry their useful diagnostic only
+/// in `errorMessage`; they are still terminal events and must not be replaced
+/// by the generic "without a terminal message" error.
+fn record_assistant_terminal(state: &mut ParseState, message: &Value) {
+    state.saw_terminal_event = true;
+    state.terminal_error = match message["stopReason"].as_str() {
+        Some("error") | Some("aborted") => message["errorMessage"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| message["stopReason"].as_str().map(str::to_string)),
+        _ => None,
+    };
+}
+
+fn display_terminal_error(error: &str) -> String {
+    if error.contains("in_flight_budget_exhausted") {
+        format!("$ in-flight budget full (OpenRouter; retry later): {error}")
+    } else {
+        error.to_string()
     }
 }
 
@@ -986,6 +1237,7 @@ mod tests {
             &serde_json::json!({"type":"session","id":"pi-session-1"}),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         process_event(
             &serde_json::json!({
@@ -995,6 +1247,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         process_event(
             &serde_json::json!({
@@ -1003,6 +1256,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.agent_session_id.as_deref(), Some("pi-session-1"));
         assert_eq!(state.tokens_in, 12);
@@ -1010,6 +1264,77 @@ mod tests {
         assert!((state.cost_usd - 0.56).abs() < f64::EPSILON);
         assert_eq!(state.latest_assistant_message, "hello world");
         assert!(state.saw_terminal_event);
+    }
+
+    #[test]
+    fn process_event_preserves_an_empty_terminal_error_message() {
+        let mut state = ParseState::default();
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[{"type":"text","text":""}],
+                    "stopReason":"error",
+                    "errorMessage":"402: in_flight_budget_exhausted"
+                }
+            }),
+            &mut state,
+            Path::new("."),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+
+        assert!(state.saw_terminal_event, "an empty error is still terminal");
+        assert_eq!(
+            state.terminal_error.as_deref(),
+            Some("402: in_flight_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn process_event_clears_a_recovered_terminal_error() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"context overflow"
+                }
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &serde_json::json!({
+                "type":"agent_end",
+                "messages":[{
+                    "role":"assistant",
+                    "content":[{"type":"text","text":"finished"}],
+                    "stopReason":"stop"
+                }]
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+
+        assert_eq!(state.terminal_error, None);
+        assert_eq!(state.latest_assistant_message, "finished");
+    }
+
+    #[test]
+    fn openrouter_in_flight_budget_error_gets_a_clear_label() {
+        let raw = "OpenRouter 402: in_flight_budget_exhausted; retry after 120 seconds";
+        assert_eq!(
+            display_terminal_error(raw),
+            "$ in-flight budget full (OpenRouter; retry later): OpenRouter 402: \
+             in_flight_budget_exhausted; retry after 120 seconds"
+        );
     }
 
     /// RAL-326: pi's own `Usage` splits prompt-cache tokens out of `input`
@@ -1032,6 +1357,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.tokens_in, 12, "uncached input keeps its old meaning");
         assert_eq!(state.cache_creation_tokens, 900);
@@ -1051,6 +1377,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.cache_read_tokens, 41_000);
     }
@@ -1066,6 +1393,7 @@ mod tests {
             &serde_json::json!({"type":"compaction_start","reason":"threshold"}),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         process_event(
             &serde_json::json!({
@@ -1077,6 +1405,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert_eq!(state.tokens_in, 0);
         assert_eq!(state.tokens_out, 0);
@@ -1096,11 +1425,26 @@ mod tests {
             "aborted":false,
             "result":{"tokensBefore":164975,"estimatedTokensAfter":20000}
         });
-        process_event(&compaction_end, &mut state, root);
+        process_event(
+            &compaction_end,
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
         assert_eq!(state.compaction_thrash, None);
-        process_event(&compaction_end, &mut state, root);
+        process_event(
+            &compaction_end,
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
         assert_eq!(state.compaction_thrash, None);
-        process_event(&compaction_end, &mut state, root);
+        process_event(
+            &compaction_end,
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
         let detail = state
             .compaction_thrash
             .expect("third rapid compaction should thrash");
@@ -1125,12 +1469,153 @@ mod tests {
             "message":{"role":"assistant","content":[{"type":"text","text":"working"}]}
         });
         for _ in 0..3 {
-            process_event(&compaction_end, &mut state, root);
+            process_event(
+                &compaction_end,
+                &mut state,
+                root,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
             assert_eq!(state.compaction_thrash, None);
-            process_event(&assistant_turn, &mut state, root);
-            process_event(&assistant_turn, &mut state, root);
+            process_event(
+                &assistant_turn,
+                &mut state,
+                root,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+            process_event(
+                &assistant_turn,
+                &mut state,
+                root,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
         }
         assert_eq!(state.compaction_thrash, None);
+    }
+
+    /// RAL-380: the exact shape observed in a real `pi-openrouter-deepseek`
+    /// terminal log -- a bare shell-command call with no wrapping tool name.
+    #[test]
+    fn format_pi_tool_call_recognizes_a_bash_style_command() {
+        let line = format_pi_tool_call(
+            &serde_json::json!({"command": "cargo check -p ralphus-daemon", "timeout": 900}),
+            200,
+        )
+        .expect("a command+timeout object should be recognized as a bash call");
+        assert_eq!(
+            line,
+            r#"[tool] bash(command="cargo check -p ralphus-daemon", timeout=900)"#
+        );
+    }
+
+    #[test]
+    fn format_pi_tool_call_truncates_a_long_command() {
+        let line = format_pi_tool_call(&serde_json::json!({"command": "a".repeat(250)}), 10)
+            .expect("recognized as a bash call");
+        assert_eq!(
+            line,
+            format!(r#"[tool] bash(command="{}…")"#, "a".repeat(10))
+        );
+    }
+
+    /// RAL-380: an edit call with multiple find/replace pairs in one object,
+    /// as seen for `daemon/src/store.rs` edits in the real log.
+    #[test]
+    fn format_pi_tool_call_recognizes_a_multi_edit_call() {
+        let line = format_pi_tool_call(
+            &serde_json::json!({
+                "path": "daemon/src/runner.rs",
+                "edits": [
+                    {"oldText": "turns: None,", "newText": "turns: Some(2),"},
+                    {"oldText": "foo", "newText": "bar"},
+                ]
+            }),
+            200,
+        )
+        .expect("an edits+path object should be recognized as an edit call");
+        assert_eq!(
+            line,
+            r#"[tool] edit(path="daemon/src/runner.rs", edits=[#1: old_text="turns: None,", new_text="turns: Some(2),"; #2: old_text="foo", new_text="bar"])"#
+        );
+    }
+
+    #[test]
+    fn format_pi_tool_call_recognizes_a_read_call() {
+        let line = format_pi_tool_call(
+            &serde_json::json!({"limit": 75, "offset": 12200, "path": "daemon/src/store.rs"}),
+            200,
+        )
+        .expect("a path+offset/limit object should be recognized as a read call");
+        assert_eq!(
+            line,
+            r#"[tool] read(path="daemon/src/store.rs", offset=12200, limit=75)"#
+        );
+    }
+
+    /// A `path`-only object with neither `offset`/`limit` nor `edits` isn't a
+    /// shape this classifier has evidence for -- it must fall back to `None`
+    /// (raw passthrough) rather than guess.
+    #[test]
+    fn format_pi_tool_call_does_not_classify_an_unrecognized_shape() {
+        assert_eq!(
+            format_pi_tool_call(&serde_json::json!({"path": "some/file.rs"}), 200),
+            None
+        );
+        assert_eq!(
+            format_pi_tool_call(&serde_json::json!({"foo": "bar"}), 200),
+            None
+        );
+    }
+
+    /// RAL-380: `feed_assistant_text` must capture a top-level JSON object
+    /// spanning many small deltas (Pi streams token-by-token, not whole
+    /// blobs) and clear its buffer once the object balances.
+    #[test]
+    fn feed_assistant_text_captures_a_json_blob_split_across_many_deltas() {
+        let mut state = ParseState::default();
+        for ch in r#"{"command": "echo hi"}"#.chars() {
+            feed_assistant_text(&mut state, &ch.to_string(), DEFAULT_TOOL_ARG_TRUNCATE_CHARS);
+        }
+        assert!(
+            !state.capturing_json,
+            "the object closed and should be flushed"
+        );
+        assert!(state.json_buffer.is_empty());
+    }
+
+    /// A `{` that never closes (ordinary prose, not a tool call) must not
+    /// leave the parser stuck waiting forever -- `finish_pi_text_stream`
+    /// (called at `message_end`/`agent_end`) flushes it as plain text.
+    #[test]
+    fn finish_pi_text_stream_flushes_an_unterminated_json_looking_prefix() {
+        let mut state = ParseState::default();
+        feed_assistant_text(
+            &mut state,
+            "here's a map {like this, unterminated",
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(
+            state.capturing_json,
+            "the stray open brace should still be buffering"
+        );
+        finish_pi_text_stream(&mut state);
+        assert!(!state.capturing_json);
+        assert!(state.json_buffer.is_empty());
+    }
+
+    /// Braces inside a string value (very common in Rust source edits) must
+    /// not be mistaken for structural JSON nesting.
+    #[test]
+    fn format_pi_tool_call_edit_survives_braces_inside_the_edited_text() {
+        let line = format_pi_tool_call(
+            &serde_json::json!({
+                "path": "src/lib.rs",
+                "edits": [{"oldText": "fn f() { 1 }", "newText": "fn f() { 2 }"}]
+            }),
+            200,
+        )
+        .expect("braces inside oldText/newText must not break parsing");
+        assert!(line.contains(r#"old_text="fn f() { 1 }""#));
+        assert!(line.contains(r#"new_text="fn f() { 2 }""#));
     }
 
     #[test]
@@ -1147,6 +1632,7 @@ mod tests {
             }),
             &mut state,
             root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert!(!state.saw_terminal_event);
     }
