@@ -176,6 +176,14 @@
       /* Live tmux pane peek (RAL-102): the "Read-only terminal" auto-refreshing view. */
       .peek-box { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow: hidden; }
       .peek-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+      /* RAL-428: the peek box's Terminal / System Prompt tab strip (admin-only
+         on the board; non-admins never render these). Modeled on .modal-tab:
+         muted idle text, active tab in --accent with the documented
+         selection-tint pill (rgba(74,163,255,.16), docs/colors.md "Selection"). */
+      .peek-tabs { display: flex; gap: 2px; padding: 3px 8px 0; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+      .peek-tab { background: none; border: none; color: var(--muted); font-size: 11px; padding: 4px 10px; cursor: pointer; border-radius: 6px 6px 0 0; }
+      .peek-tab:hover { color: var(--text); }
+      .peek-tab.active { color: var(--accent); background: rgba(74,163,255,.16); font-weight: 500; }
       /* RAL-139: wraps the scrollable pane so the resize handle and jump-to-bottom
          button can float above it without themselves becoming part of the
          scrolling content (they'd otherwise scroll out of view with the text). */

@@ -1317,6 +1317,15 @@ fn route_for_user(
         ("GET", ["api", "squads", id, "cells", ti, si, "debug-events"]) => {
             cell_debug_events(daemon, id, ti, si)
         }
+        // RAL-428: the admin-only System Prompt tab in the shared live
+        // terminal viewer reads the step's exact effective system prompt
+        // from these endpoints (the board never fetches them for
+        // non-admins, and the daemon enforces admin-only here regardless).
+        ("GET", ["api", "squads", id, "cells", ti, si, "system-prompt"]) => {
+            admin_gated(daemon, user_header, || {
+                cell_system_prompt(daemon, id, ti, si)
+            })
+        }
         (
             "GET",
             [
@@ -1398,6 +1407,22 @@ fn route_for_user(
                 "debug-events",
             ],
         ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        (
+            "GET",
+            [
+                "api",
+                "squads",
+                id,
+                "proofs",
+                task_idx,
+                scope,
+                cell_idx,
+                proof_idx,
+                "system-prompt",
+            ],
+        ) => admin_gated(daemon, user_header, || {
+            proof_system_prompt(daemon, id, task_idx, scope, cell_idx, proof_idx)
+        }),
         (
             "GET",
             [
@@ -1540,6 +1565,19 @@ fn route_for_user(
                 id,
                 "branches",
                 branch_id,
+                "system-prompt",
+            ],
+        ) => admin_gated(daemon, user_header, || {
+            guardian_branch_system_prompt(daemon, id, branch_id)
+        }),
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
                 "terminal-log-attempts",
             ],
         ) => guardian_branch_terminal_log_attempts(daemon, id, branch_id),
@@ -1566,6 +1604,11 @@ fn route_for_user(
         }
         ("GET", ["api", "guardians", id, "manual-checks", "debug-events"]) => {
             guardian_manual_checks_debug_events(daemon, id)
+        }
+        ("GET", ["api", "guardians", id, "manual-checks", "system-prompt"]) => {
+            admin_gated(daemon, user_header, || {
+                guardian_manual_checks_system_prompt(daemon, id)
+            })
         }
         (
             "GET",
@@ -9533,6 +9576,153 @@ fn guardian_manual_checks_debug_events(daemon: &Daemon, id: &str) -> Reply {
         crate::guardian_merge::MANUAL_COMMANDS_TASK,
         crate::guardian_merge::MANUAL_COMMANDS_SESSION,
     )
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/system-prompt` (RAL-428) -- the
+/// exact effective system prompt a task cell's agent received: ralphus's
+/// hidden instructions plus the cell's authored system prompt, persisted by
+/// the scheduler the moment it dispatches the cell (see
+/// `RunnerSpec::effective_system_prompt`). `{"available": false}` with a
+/// `reason` for a cell that has none (a `command` cell) or whose prompt has
+/// not been computed yet (never dispatched). Admin-gated at the route.
+fn cell_system_prompt(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+        Ok(_) => {}
+        Err(e) => return store_error(&e),
+    }
+    let prompt = match daemon
+        .lock()
+        .get_cell_effective_system_prompt(id, task_idx, cell_idx)
+    {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    system_prompt_reply(
+        prompt,
+        "cell has no system prompt (a command cell, or one never dispatched)",
+    )
+}
+
+/// `GET /api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/system-prompt`
+/// (RAL-428) -- the proof-step twin of `cell_system_prompt`, reading the
+/// same persisted dispatch-time effective prompt from the `proofs` table.
+/// Admin-gated at the route.
+#[allow(clippy::too_many_arguments)]
+fn proof_system_prompt(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    cell_idx: &str,
+    proof_idx: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(cell_idx_n), Ok(proof_idx_n)) = (
+        task_idx.parse::<i64>(),
+        cell_idx.parse::<i64>(),
+        proof_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell/proof index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon.lock().proof_specs(id, task_idx_n, scope, cell_idx_n) {
+        return store_error(&e);
+    }
+    if let Err(e) = daemon.lock().get_task_name(id, task_idx_n) {
+        return store_error(&e);
+    }
+    let prompt = match daemon.lock().get_proof_effective_system_prompt(
+        id,
+        task_idx_n,
+        scope,
+        cell_idx_n,
+        proof_idx_n,
+    ) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    system_prompt_reply(
+        prompt,
+        "proof step has no system prompt (a command step, or one never dispatched)",
+    )
+}
+
+/// `GET /api/guardians/{id}/branches/{branch_id}/system-prompt` (RAL-428) --
+/// the exact system prompt the branch's resolver agent receives, re-derived
+/// from the branch's current merge phase the same way the merge worker
+/// composes its `RunnerSpec` (see [`crate::guardian_merge`]): the
+/// conflict-resolution fix pass while rebasing, the dedicated final-proof
+/// pass while `proof_pending`, and the feedback-actioning revision pass
+/// (ralphus defaults only -- no authored prompt) while `actioning`. The
+/// guardian phases never persist their own copy, so unlike cells/proofs this
+/// is derived, not stored -- the derivation is exact for whatever phase the
+/// branch is in right now. Admin-gated at the route.
+fn guardian_branch_system_prompt(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    let merge_status = match daemon.lock().get_branch_merge_status(id, branch_id) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let system_prompt = match merge_status.as_deref() {
+        Some("actioning") => crate::runner::effective_cell_system_prompt(None, &[]),
+        Some("proof_pending") => crate::runner::effective_proof_system_prompt(Some(
+            crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT,
+        )),
+        Some(_) => crate::runner::effective_cell_system_prompt(
+            Some(crate::guardian_merge::CONFLICT_RESOLVER_SYSTEM_PROMPT),
+            &[],
+        ),
+        None => return error(404, "not_found", "no such branch", vec![]),
+    };
+    json(
+        200,
+        &serde_json::json!({"available": true, "system_prompt": system_prompt}),
+    )
+}
+
+/// `GET /api/guardians/{id}/manual-checks/system-prompt` (RAL-428) -- the
+/// manual-checks generation pass's exact effective system prompt: ralphus's
+/// defaults only, because the generation `RunnerSpec` carries no authored
+/// system prompt (see [`crate::guardian_merge::generate_manual_commands`]).
+/// Admin-gated at the route.
+fn guardian_manual_checks_system_prompt(daemon: &Daemon, id: &str) -> Reply {
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    let system_prompt = crate::runner::effective_cell_system_prompt(None, &[]);
+    json(
+        200,
+        &serde_json::json!({"available": true, "system_prompt": system_prompt}),
+    )
+}
+
+/// One `.../system-prompt` reply body's common shape (RAL-428): the loaded
+/// prompt text, or the `{"available": false, "reason": ...}` form for a step
+/// that has none.
+fn system_prompt_reply(prompt: Option<String>, reason: &str) -> Reply {
+    match prompt {
+        Some(p) => json(
+            200,
+            &serde_json::json!({"available": true, "system_prompt": p}),
+        ),
+        None => json(
+            200,
+            &serde_json::json!({"available": false, "reason": reason}),
+        ),
+    }
 }
 
 /// Launch the given program+args in a new interactive terminal window,
@@ -22072,6 +22262,223 @@ command = "true"
             "",
         );
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn cell_system_prompt_returns_the_persisted_effective_prompt() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        d.lock()
+            .set_cell_effective_system_prompt(
+                "squad-000000000001",
+                0,
+                0,
+                Some("custom cell prompt"),
+            )
+            .unwrap();
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/0/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], true, "{v}");
+        assert_eq!(v["system_prompt"], "custom cell prompt");
+    }
+
+    #[test]
+    fn cell_system_prompt_unavailable_for_a_command_cell() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+command=\"echo hi\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        // A command cell has no system prompt whether or not it has been
+        // dispatched yet — the scheduler persists NULL either way.
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/0/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], false, "{v}");
+        assert_eq!(
+            v["reason"],
+            "cell has no system prompt (a command cell, or one never dispatched)"
+        );
+    }
+
+    #[test]
+    fn cell_system_prompt_missing_cell_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/cells/0/9/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn proof_system_prompt_returns_the_persisted_effective_prompt() {
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+\n            [[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+\n            [[task.cell.proof]]
+command=\"c\"
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        d.lock()
+            .set_proof_effective_system_prompt(
+                "squad-000000000001",
+                0,
+                "cell",
+                0,
+                0,
+                Some("custom proof prompt"),
+            )
+            .unwrap();
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/proofs/0/cell/0/0/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], true, "{v}");
+        assert_eq!(v["system_prompt"], "custom proof prompt");
+    }
+
+    #[test]
+    fn proof_system_prompt_missing_proof_is_404() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        // GOOD has no task at index 9.
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/proofs/9/cell/0/0/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_system_prompt_derives_the_current_phases_prompt() {
+        let d = daemon();
+        let gid = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&gid, "a").unwrap();
+        let bid = d.lock().guardian_branches(&gid).unwrap()[0].id.clone();
+        let fetch = |d: &Daemon| {
+            let r = route(
+                d,
+                "GET",
+                &format!("/api/guardians/{gid}/branches/{bid}/system-prompt"),
+                "",
+            );
+            assert_eq!(r.status, 200, "{}", r.body);
+            let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            assert_eq!(v["available"], true, "{v}");
+            v["system_prompt"].as_str().map(String::from).unwrap()
+        };
+        // A fresh branch is `pending` and resolves conflicts on its first
+        // rebase, so the resolver prompt is the steady-state default.
+        let fresh = fetch(&d);
+        assert_eq!(
+            fresh,
+            crate::runner::effective_cell_system_prompt(
+                Some(crate::guardian_merge::CONFLICT_RESOLVER_SYSTEM_PROMPT),
+                &[],
+            )
+        );
+        assert!(fresh.contains("git merge-conflict resolver"));
+
+        d.lock()
+            .set_branch_status(&gid, &bid, crate::guardian::MergeStatus::ProofPending, None)
+            .unwrap();
+        let final_proof = fetch(&d);
+        assert_eq!(
+            final_proof,
+            crate::runner::effective_proof_system_prompt(Some(
+                crate::guardian_merge::FINAL_PROOF_SYSTEM_PROMPT
+            ))
+        );
+        assert!(final_proof.contains("dedicated final-proof pass"));
+
+        d.lock()
+            .set_branch_status(
+                &gid,
+                &bid,
+                crate::guardian::MergeStatus::Actioning,
+                Some("feedback"),
+            )
+            .unwrap();
+        let actioning = fetch(&d);
+        assert_eq!(
+            actioning,
+            crate::runner::effective_cell_system_prompt(None, &[])
+        );
+        assert!(!actioning.contains("git merge-conflict resolver"));
+        assert!(!actioning.contains("dedicated final-proof pass"));
+    }
+
+    #[test]
+    fn guardian_branch_system_prompt_missing_guardian_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "GET",
+            "/api/guardians/guardian-999/branches/0/system-prompt",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_system_prompt_missing_branch_is_404() {
+        let d = daemon();
+        let gid = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/branches/999/system-prompt"),
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_manual_checks_system_prompt_is_the_generation_defaults_prompt() {
+        let d = daemon();
+        let gid = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{gid}/manual-checks/system-prompt"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["available"], true, "{v}");
+        let prompt = v["system_prompt"].as_str().map(String::from).unwrap();
+        assert_eq!(
+            prompt,
+            crate::runner::effective_cell_system_prompt(None, &[])
+        );
+        assert!(!prompt.contains("git merge-conflict resolver"), "{prompt}");
     }
 
     #[test]

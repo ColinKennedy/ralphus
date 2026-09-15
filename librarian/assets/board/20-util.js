@@ -758,7 +758,14 @@
         e.stopPropagation();
         const btn = /** @type {HTMLElement} */ (e.currentTarget);
         // RAL-232/RAL-397: copy whatever is currently visible, same as this box's own text.
-        const text = peekContent[key] || "";
+        // RAL-428: admins can switch this box to the System Prompt tab, and the
+        // copy control always copies the *active* tab's content — the prompt
+        // text when that tab is showing (never a "Loading…"/error placeholder:
+        // peekPromptText returns null in those states and "" is copied), the
+        // terminal transcript otherwise. Same active-tab condition `peekBox`
+        // renders with, so what's copied always matches what's on screen.
+        const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
+        const text = promptTab ? (peekPromptText(peekSystemPrompt[key]) ?? "") : (peekContent[key] || "");
         try {
           if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
           else { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }

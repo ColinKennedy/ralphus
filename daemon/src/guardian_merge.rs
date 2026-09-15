@@ -76,6 +76,49 @@ pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
 /// the fact.
 pub(crate) const FEEDBACK_TASK: &str = "feedback";
 
+/// The static authored system prompt the conflict-resolution fix pass feeds
+/// its resolver agent (RAL-102) -- hoisted to a module constant (RAL-428) so
+/// `server.rs`'s branch `.../system-prompt` endpoint can re-derive exactly the
+/// effective prompt the resolver received: that pass runs `proof: false` with
+/// this as its only authored system prompt, so its effective prompt is
+/// `crate::runner::effective_cell_system_prompt(Some(THIS), &[])`.
+pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-conflict resolver running inside a checked-out worktree \
+             during an active `git rebase`. Your job is to eliminate every conflict marker and \
+             produce correctly merged files -- nothing more.\n\
+             \n\
+             Step-by-step:\n\
+             1. For each conflicted file named in the prompt: call read_file to get its \
+                current content.\n\
+             2. Locate every conflict block delimited by <<<<<<< ... ======= ... >>>>>>>. \
+                Understand what each side contributes and write the correct merged result — \
+                preserving the intent of both sides, with ALL markers removed.\n\
+             3. Call write_file with the fully resolved content. Repeat for every file.\n\
+             4. Once every file is marker-free, call run_bash with exactly: git add -A\n\
+             5. After git add -A succeeds, output the following line and stop:\n\
+                RALPHUS_STAGE: DONE\n\
+             \n\
+             Do NOT run formatters, linters, or tests, and do NOT attempt to fix quality \
+             issues beyond resolving the conflict markers themselves -- a dedicated \
+             proof pass runs afterward and will handle formatting/linting/testing, \
+             including auto-fixing any failures it finds. Do NOT call `git rebase --continue`, \
+             `git commit`, `git push`, or any other git command besides `git add -A`. The \
+             orchestrator advances the rebase as soon as it sees RALPHUS_STAGE: DONE in your \
+             output.";
+
+/// The static authored system prompt the dedicated final-proof pass feeds its
+/// agent (RAL-149) -- hoisted to a module constant (RAL-428) so
+/// `server.rs`'s branch `.../system-prompt` endpoint can re-derive exactly the
+/// effective prompt the final-proof agent received: that pass runs `proof: true`
+/// with this as its only authored system prompt, so its effective prompt is
+/// `crate::runner::effective_proof_system_prompt(Some(THIS))`.
+pub(crate) const FINAL_PROOF_SYSTEM_PROMPT: &str = "You are running the dedicated final-proof pass of a git rebase \
+         conflict-resolution cycle, in a checked-out worktree. Confirm the code meets the \
+         quality bar described in the prompt, fixing anything you reasonably can. If you edit \
+         any files, run `git add -A` with run_bash to stage them before you finish. Do NOT call \
+         `git rebase --continue`, `git commit`, `git push`, `git rebase --abort`, or any other \
+         rebase-affecting git command -- the orchestrator owns the rebase and has already \
+         advanced past the conflict this branch was resolving.";
+
 /// The `RunnerSpec.cell_id` for one branch's feedback-actioning session --
 /// branch-scoped (RAL-298) the same way [`RESOLVER_TASK`]'s `resolver-
 /// {branch_id}` is, so two branches under the same guardian actioning
@@ -1996,28 +2039,7 @@ fn resolve_conflicts_with_agent(
         // plus auto-fix. Running (and paying for) the same checks twice per
         // conflict-resolution cycle was the redundancy this ticket removes;
         // see the module-level RAL-168 notes.
-        let system_prompt = "You are a git merge-conflict resolver running inside a checked-out worktree \
-             during an active `git rebase`. Your job is to eliminate every conflict marker and \
-             produce correctly merged files -- nothing more.\n\
-             \n\
-             Step-by-step:\n\
-             1. For each conflicted file named in the prompt: call read_file to get its \
-                current content.\n\
-             2. Locate every conflict block delimited by <<<<<<< ... ======= ... >>>>>>>. \
-                Understand what each side contributes and write the correct merged result — \
-                preserving the intent of both sides, with ALL markers removed.\n\
-             3. Call write_file with the fully resolved content. Repeat for every file.\n\
-             4. Once every file is marker-free, call run_bash with exactly: git add -A\n\
-             5. After git add -A succeeds, output the following line and stop:\n\
-                RALPHUS_STAGE: DONE\n\
-             \n\
-             Do NOT run formatters, linters, or tests, and do NOT attempt to fix quality \
-             issues beyond resolving the conflict markers themselves -- a dedicated \
-             proof pass runs afterward and will handle formatting/linting/testing, \
-             including auto-fixing any failures it finds. Do NOT call `git rebase --continue`, \
-             `git commit`, `git push`, or any other git command besides `git add -A`. The \
-             orchestrator advances the rebase as soon as it sees RALPHUS_STAGE: DONE in your \
-             output.";
+        let system_prompt = CONFLICT_RESOLVER_SYSTEM_PROMPT;
         // This is either the commit's first pass (commit_attempts was reset to
         // 0 the last time the rebase advanced) or a retry -- in which case
         // current_commit_session_id carries the previous pass's session so the
@@ -2443,13 +2465,7 @@ fn run_final_proof(
          earlier fix pass may or may not have made changes here to satisfy the project's \
          quality bar, so do not assume what state the code is in; inspect it yourself.{quality_note}"
     );
-    let system_prompt = "You are running the dedicated final-proof pass of a git rebase \
-         conflict-resolution cycle, in a checked-out worktree. Confirm the code meets the \
-         quality bar described in the prompt, fixing anything you reasonably can. If you edit \
-         any files, run `git add -A` with run_bash to stage them before you finish. Do NOT call \
-         `git rebase --continue`, `git commit`, `git push`, `git rebase --abort`, or any other \
-         rebase-affecting git command -- the orchestrator owns the rebase and has already \
-         advanced past the conflict this branch was resolving.";
+    let system_prompt = FINAL_PROOF_SYSTEM_PROMPT;
     let spec = RunnerSpec {
         // RAL-192: keyed on the branch's stable id (not its mutable stack
         // position -- see `crate::tmux::session_name`'s doc comment) so a

@@ -94,6 +94,10 @@
         openGuardianBranchTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianBranchTerminal(ds.gid || "", ds.bid || "", ds.mode || ""); },
         openGuardianManualChecksTerminalMenuItem: (e, ds) => { closeTerminalMenu(ds.key || ""); openGuardianManualChecksTerminal(ds.gid || "", ds.mode || ""); },
         copyPeekText: (e, ds) => copyPeekText(e, ds.key || ""),
+        // RAL-428: peek box tab buttons (Terminal / System Prompt). Never
+        // reaches a non-admin — the buttons only render for admins (see
+        // `peekBox`), and `switchPeekTab` itself clamps stray values.
+        switchPeekTab: (e, ds) => switchPeekTab(ds.key || "", /** @type {"terminal"|"prompt"} */ (ds.tab || "terminal")),
         peekScrollToBottom: (e, ds) => peekScrollToBottom(ds.key || ""),
         closeHistoryAttempt: (e, ds) => closeHistoryAttempt(ds.key || ""),
         viewHistoryAttempt: (e, ds) => viewHistoryAttempt(ds.key || "", Number(ds.attempt)),
