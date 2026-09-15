@@ -228,6 +228,9 @@ jobs:
       # Make every `uv` step use the matrix's interpreter, not just whatever uv
       # first finds that satisfies requires-python (>=3.11).
       UV_PYTHON: ${{ matrix.python-version }}
+      # `rust-cache` can restore a release binary from an earlier commit, while
+      # this job deliberately builds the debug CLI below for docsgen's tests.
+      RALPHUS_CLI_BIN: ../target/debug/ralphus
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +302,9 @@ jobs:
     defaults:
       run:
         working-directory: cli-py
+    env:
+      # Use the CLI built in this job, not a cached release artifact.
+      RALPHUS_CLI_BIN: ../target/debug/ralphus
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

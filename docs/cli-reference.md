@@ -366,8 +366,8 @@ Custom backend routing belongs in `.ralphus.toml`, not in task TOML:
 
 ```toml
 [agent.profiles.openrouter-deepseek]
-backend = "codex"
-executable = "codex-openrouter"
+backend = "pi"
+model = "openrouter/deepseek/deepseek-v4-flash-0731"
 
 [agent.profiles.openrouter-deepseek.env]
 OPENROUTER_API_KEY = { from_env = "OPENROUTER_API_KEY" }
@@ -383,9 +383,9 @@ Rules:
 
 - Profile names must not collide with reserved built-in backends (`claude`, `anthropic`, `ollama`, `claude-code`, `codex`, `raw`, plus the CLI aliases).
 - `backend = "raw"` is the explicit generic external-executable backend and requires `executable`.
-- `executable` is only valid with `claude-code`, `codex`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
+- `executable` is only valid with `claude-code`, `codex`, `pi`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
 - Profile env values may be literal strings or `{ from_env = "VAR" }`; indirection is resolved in the daemon's own OS environment, so secrets never appear in task TOML or HTTP request/response bodies.
-- If a cell resolves to a custom agent profile, do not also set `model`. Current v1 rule: `if you're using a custom agent profile, you can't also set model`.
+- `model` supplies the profile's default model whenever a task or cell does not declare one. A task- or cell-level `model` overrides the profile default.
 - The old implicit fallback from an unknown `agent` name to a generic harness executable is gone. Use a named profile instead.
 
 #### What `--command` accepts (RAL-189)
@@ -565,7 +565,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
-        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
+        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
         - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
         - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}

@@ -43,7 +43,9 @@ fn main() -> ExitCode {
             eprintln!(
                 "ralphus-librarian serving on http://{bind_host}:{port} (daemon: {daemon_url})"
             );
-            let otel_provider = ralphus_librarian::otel::init("ralphus-librarian");
+            let otel_provider = ralphus_librarian::config::opentelemetry_enabled()
+                .then(|| ralphus_librarian::otel::init("ralphus-librarian"))
+                .flatten();
             let result = server::serve(port, &daemon_url);
             ralphus_librarian::otel::shutdown(otel_provider);
             match result {

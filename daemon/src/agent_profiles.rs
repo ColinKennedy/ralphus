@@ -25,6 +25,7 @@ use ralphus_core::schema::RESERVED_AGENT_NAMES;
 pub struct AgentProfile {
     pub backend: String,
     pub executable: Option<String>,
+    pub model: Option<String>,
     pub env: BTreeMap<String, String>,
     /// The resolved values of every `env` entry that was indirection via
     /// `from_env` (as opposed to a literal authored in the config file).
@@ -40,6 +41,7 @@ pub struct AgentProfile {
 pub struct ResolvedAgentSelection {
     pub backend: String,
     pub executable: Option<String>,
+    pub model: Option<String>,
     pub env: BTreeMap<String, String>,
     pub custom_profile: bool,
     /// The agent-profile `from_env`-resolved secret values in play for this
@@ -65,6 +67,8 @@ struct RawAgentProfile {
     backend: String,
     #[serde(default)]
     executable: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, RawEnvValue>,
 }
@@ -139,6 +143,7 @@ fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, Str
             AgentProfile {
                 backend: profile.backend,
                 executable: profile.executable,
+                model: profile.model,
                 env,
                 secret_values,
             },
@@ -256,6 +261,7 @@ fn resolve_agent_for_path_with(
         return Ok(ResolvedAgentSelection {
             backend: profile.backend.clone(),
             executable: profile.executable.clone(),
+            model: profile.model.clone(),
             env: profile.env.clone(),
             custom_profile: true,
             secret_values: profile.secret_values.clone(),
@@ -265,6 +271,7 @@ fn resolve_agent_for_path_with(
         return Ok(ResolvedAgentSelection {
             backend: backend.to_string(),
             executable: None,
+            model: None,
             env: BTreeMap::new(),
             custom_profile: false,
             secret_values: BTreeSet::new(),
@@ -277,7 +284,7 @@ fn resolve_agent_for_path_with(
 
 fn config_cwd_for_cell(
     store: &Store,
-    task: &ralphus_core::schema::TaskDef,
+    task_project: Option<&str>,
     cell: &ralphus_core::schema::CellDef,
 ) -> Option<PathBuf> {
     if let Some(cwd) = cell.cwd.as_deref() {
@@ -285,8 +292,7 @@ fn config_cwd_for_cell(
             return Some(PathBuf::from(cwd));
         }
     }
-    task.project
-        .as_deref()
+    task_project
         .and_then(|name| store.resolve_project(name).ok().flatten())
         .map(|p| PathBuf::from(p.path))
 }
@@ -316,7 +322,7 @@ fn validate_task_file_profiles_with(
                 .as_deref()
                 .or(task.agent.as_deref())
                 .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
-            let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
+            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
             let selection = match resolve_agent_for_path_with(agent, &cwd, configuration_path_env) {
@@ -331,20 +337,6 @@ fn validate_task_file_profiles_with(
                     continue;
                 }
             };
-            if selection.custom_profile
-                && cell.model.clone().or_else(|| task.model.clone()).is_some()
-            {
-                errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].model"),
-                    kind: ErrorKind::ConflictingKeys,
-                    // Conservative v1 rule: if you're using a custom agent profile, you can't
-                    // also set `model`. We can relax this later once there's a concrete
-                    // multi-model-per-profile use case with clear semantics.
-                    message: "if you're using a custom agent profile, you can't also set `model`"
-                        .to_string(),
-                    line: None,
-                });
-            }
             // `core`'s offline validator only rejects system_prompt for agent
             // names it recognizes itself (RESERVED_AGENT_NAMES) -- it defers on
             // any custom profile, since it can't see the profile's backend. Now
@@ -463,7 +455,7 @@ fn validate_task_file_profiles_with(
                 if cell_review_id != Some(review_id) {
                     continue;
                 }
-                let Some(cwd) = config_cwd_for_cell(store, task, cell) else {
+                let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                     continue;
                 };
                 if !seen_cwds.insert(cwd.clone()) {
@@ -484,6 +476,59 @@ fn validate_task_file_profiles_with(
     }
 
     errors
+}
+
+/// Apply a configured profile's default model to cells and reviews that did
+/// not declare a task-, cell-, or review-level model of their own.
+///
+/// This happens after profile validation and before persistence, so the
+/// selected model is durable in the cell/review row and reaches the backend
+/// exactly as if it had been authored in the task file. An authored model
+/// always wins over the profile default.
+pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
+    for task in &mut file.task {
+        for cell in &mut task.cell {
+            if cell.model.is_some() || task.model.is_some() {
+                continue;
+            }
+            let agent = cell
+                .agent
+                .as_deref()
+                .or(task.agent.as_deref())
+                .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
+            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
+                continue;
+            };
+            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
+                cell.model = selection.model;
+            }
+        }
+    }
+
+    for review in &mut file.review {
+        if review.model.is_some() {
+            continue;
+        }
+        let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
+            continue;
+        };
+        let matching_cwd = file.task.iter().find_map(|task| {
+            task.cell.iter().find_map(|cell| {
+                (cell
+                    .review
+                    .as_deref()
+                    .and_then(ralphus_core::schema::parse_cell_review_sentinel)
+                    == Some(review_id))
+                .then(|| config_cwd_for_cell(store, task.project.as_deref(), cell))
+                .flatten()
+            })
+        });
+        if let Some(cwd) = matching_cwd {
+            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
+                review.model = selection.model;
+            }
+        }
+    }
 }
 
 /// One agent-profile health finding, as returned by `GET
@@ -691,6 +736,37 @@ PATH_COPY = { from_env = "PATH" }
     }
 
     #[test]
+    fn profile_default_model_applies_unless_task_or_cell_declares_one() {
+        let project_root = tempdir("profile-default-model");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.deepseek]
+backend = "pi"
+model = "openrouter/deepseek/deepseek-v4-flash-0731"
+"#,
+        )
+        .expect("write project config");
+        let cwd = project_root.to_string_lossy().replace('\\', "/");
+        let mut file: TaskFile = toml::from_str(&format!(
+            "[[task]]\nname=\"t\"\nagent=\"deepseek\"\n[[task.cell]]\nid=\"default\"\ncwd=\"{cwd}\"\nprompt=\"p\"\n[[task.cell]]\nid=\"override\"\ncwd=\"{cwd}\"\nmodel=\"openrouter/other\"\nprompt=\"p\"\n"
+        ))
+        .expect("parse task file");
+        let store = Store::open_in_memory().expect("open store");
+
+        apply_profile_model_defaults(&store, &mut file);
+
+        assert_eq!(
+            file.task[0].cell[0].model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4-flash-0731")
+        );
+        assert_eq!(
+            file.task[0].cell[1].model.as_deref(),
+            Some("openrouter/other")
+        );
+    }
+
+    #[test]
     fn literal_env_values_are_not_treated_as_secrets() {
         let root = tempdir("literal-not-secret");
         fs::write(
@@ -779,6 +855,7 @@ backend = "claude-code"
             AgentProfile {
                 backend: "codex".to_string(),
                 executable: Some("codex-global".to_string()),
+                model: None,
                 env: BTreeMap::from([("GLOBAL_ONLY".to_string(), "1".to_string())]),
                 secret_values: BTreeSet::new(),
             },
@@ -789,6 +866,7 @@ backend = "claude-code"
             AgentProfile {
                 backend: "raw".to_string(),
                 executable: Some("project-runner".to_string()),
+                model: None,
                 env: BTreeMap::from([("PROJECT_ONLY".to_string(), "1".to_string())]),
                 secret_values: BTreeSet::new(),
             },

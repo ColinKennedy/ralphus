@@ -16,10 +16,10 @@
       let triageCandidates = [];
       /**
        * Default (empty) filters for the Triage tab's candidate list.
-       * @returns {{type: string, project: Set<string>, q: string}}
+       * @returns {{type: string, projects: Set<string>, q: string}}
        */
-      function defaultTriageCandidateFilters() { return { type: "", project: new Set(), q: "" }; }
-      /** Client-side filters for the Triage tab's candidate list -- empty string/Set means "no filter" for each field. */
+      function defaultTriageCandidateFilters() { return { type: "", projects: new Set(), q: "" }; }
+      /** Client-side filters for the Triage tab's candidate list -- an empty type and an empty projects set each mean "no filter" (all types / all projects); `q` is a case-insensitive substring. */
       let triageCandidateFilters = defaultTriageCandidateFilters();
       /** Message from the last failed Triage action, shown inline above the tab's tables. */
       let triageError = "";
@@ -61,6 +61,8 @@
       let projectForksEditDraft = {};
       /** @type {ProjectView[]} */
       let projects = [];
+      /** @type {string[]} registered project names (RAL-345) -- the live, non-admin source for the Tasks/Squads project-filter dropdowns, refreshed from `GET /api/projects` on every poll of those tabs (reads are open to every caller, RAL-332; only mutations are admin-gated). Empty until the first such poll lands -- never a stale snapshot. */
+      let registeredProjectNames = [];
       /** @type {{[key: string]: string|null}} name -> validation error message, or null/absent if valid/unknown */
       let projectErrors = {};
       /** @type {string|null} name of the project row currently in edit mode, or null */
@@ -412,9 +414,9 @@
         jumpToTask(hit.squadId, hit.taskIdx, -1, "task");
       }
       /**
-       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, project: Set<string>}}
+       * @returns {{q: string, sort: string, dir: number, status: Set<string>, showHidden: boolean, projects: Set<string>}}
        */
-      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(STATES), showHidden: false, project: new Set() }; }
+      function defaultTaskFilters() { return { q: "", sort: "date", dir: -1, status: new Set(SQUAD_STATES), showHidden: false, projects: new Set() }; }
       /**
        * @typedef {object} TaskTabFilters
        * @property {string} q
@@ -422,9 +424,9 @@
        * @property {number} dir - 1 (asc) or -1 (desc)
        * @property {Set<string>} status
        * @property {boolean} showHidden - include explicitly-hidden tasks and tasks of hidden squads (RAL-331/RAL-365)
+       * @property {Set<string>} projects - RAL-345: project names whose tasks may be shown; an empty set means "every project" (no filter applied). AND-combined with `q`/`status`/`needsMe`.
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
-       * @property {Set<string>} project - RAL-345: task project names to include; empty means "no filter" (every project shown)
        * @property {boolean} pr - RAL-353: require at least one associated pull request
        * @property {"any"|"draft"|"non-draft"} prDraft - RAL-353: the chosen draft-status dimension; "any" disables it
        * @property {"any"|"passing"|"failing"} prCi - RAL-353: the chosen CI-status dimension; "any" disables it
@@ -436,7 +438,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, project: new Set(), pr: false, prDraft: "any", prCi: "any" }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set(), pr: false, prDraft: "any", prCi: "any" }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -648,6 +650,7 @@
        * @property {number} taskIdx
        * @property {TaskView} task
        * @property {string} name
+       * @property {string} project - RAL-345: this task's resolved project name (`task.project`), for the project filter.
        * @property {string} state
        * @property {CellView[]} cells
        * @property {TtReview[]} reviews
@@ -739,9 +742,6 @@
        */
       function ttFmtCache(u) { return (u.cacheCreate || u.cacheRead) ? `${u.cacheCreate} / ${u.cacheRead}` : "–"; }
       /**
-       * Formats the Turns column (RAL-352): the summed exchanged-message
-       * count, or a dash when no constituent carried a conversational count
-       * at all (a command-only task).
        * @param {TtUsage} u
        * @returns {string}
        */
@@ -844,6 +844,79 @@
         }
         return TT_PR_COLORS[pr.state] || "--muted";
       }
+      // RALPHUS-PR-BADGE-MENU:BEGIN
+      /**
+       * Opens a PR badge's right-click menu (RAL-<new>) -- shared by the Tasks
+       * tab's row badge and the Reviews tab's branch/PR card, since both
+       * badges point at the same underlying PR row and the two on-demand
+       * actions (live status refresh, pulling in forge comments as feedback)
+       * are identical either way. `canQueryForge` mirrors `ttRunPrCheck`'s own
+       * gate: both actions need a live forge PR number and an `open` PR, so a
+       * PR without one shows a disabled, explained item instead of silently
+       * doing nothing.
+       * @param {MouseEvent} e
+       * @param {string} prId
+       * @param {boolean} canQueryForge
+       * @returns {void}
+       */
+      function openPrMenu(e, prId, canQueryForge) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        if (!prId) return;
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu";
+        const items = canQueryForge
+          ? [
+              `<div data-click="refreshPrStatusMenuItem" data-pr-id="${esc(prId)}" data-tip="Live-poll the forge right now for this PR's current CI/mergeability status, instead of waiting for the next standing poll (every 2 minutes).\nUpdates this badge's color as soon as the forge responds.">↻ Refresh status</div>`,
+              `<div data-click="actionPrFeedbackMenuItem" data-pr-id="${esc(prId)}" data-tip="Pull this PR's un-actioned forge comments into the owning review worktree as feedback -- the same path a manual reviewer's freeform feedback takes.\nWho/when: use this after Refresh status (or the PR's badge) shows new reviewer comments you want applied right away, without waiting for the next standing poll.\nAttributed to you by name in the review's chat thread, so it's clear a person asked for this.">💬 Action feedback</div>`,
+            ]
+          : [
+              `<div style="opacity:.5;cursor:not-allowed;pointer-events:none" data-tip="This PR has no recorded forge number yet, or is no longer open -- there is nothing to refresh or pull feedback from.">↻ Refresh status</div>`,
+            ];
+        menu.innerHTML = items.join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+      }
+      /**
+       * "Refresh status" menu item (RAL-<new>): on-demand CI/mergeability
+       * refresh for one PR, reusing the same endpoint `ttRunPrCheck`'s "Check
+       * PR" already calls. `tick()` re-polls whichever tab is active, so the
+       * badge repaints with the fresh color as soon as the daemon answers.
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function refreshPrStatusMenuItem(prId) {
+        closeSquadMenu();
+        const resp = await post(`/api/pull-requests/${prId}/refresh-ci`);
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          showReviewError(((e.error || {}).message) || `Refresh failed (${resp.status})`);
+          return;
+        }
+        showInfoToast("Refreshed PR status.");
+        tick();
+      }
+      /**
+       * "Action feedback" menu item (RAL-<new>): pulls this PR's un-actioned
+       * forge comments into the owning review worktree right now, instead of
+       * only via the standalone "Pull in PR feedback" button. Runs in the
+       * background on the daemon side; `tick()` picks up the chat thread /
+       * badge changes once it finishes.
+       * @param {string} prId
+       * @returns {Promise<void>}
+       */
+      async function actionPrFeedbackMenuItem(prId) {
+        closeSquadMenu();
+        const resp = await post(`/api/pull-requests/${prId}/action-feedback`);
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          showReviewError(((e.error || {}).message) || `Action feedback failed (${resp.status})`);
+          return;
+        }
+        showInfoToast("Actioning PR feedback…");
+        tick();
+      }
+      // RALPHUS-PR-BADGE-MENU:END
       /**
        * The task-level entity URI a squad/task watch is filed under (RAL-362
        * §5), matching `crate::entity_uri::EntityUri`'s `Display` grammar.
@@ -1031,9 +1104,9 @@
       function ttRowMatchesFilters(row, filters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys) {
         if (filters.q && !row.name.toLowerCase().includes(filters.q)) return false;
         if (!filters.status.has(row.state)) return false;
+        if (filters.projects && filters.projects.size && !filters.projects.has(row.project)) return false;
         if (!filters.showHidden && (hiddenSquadIds.has(row.squadId) || (hiddenTaskKeys && hiddenTaskKeys.has(row.key)))) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
-        if (filters.project.size && !filters.project.has(row.task.project)) return false;
         if (!ttRowMatchesPrFilter(row, filters)) return false;
         return true;
       }
@@ -1067,28 +1140,15 @@
         return acc;
       }
       /**
-       * Folds a squad's own pre-work generation cost (RAL-420) into the
-       * group-by-squad aggregate exactly once per squad, on top of
-       * {@link ttGroupAggregate}: pre-work generation calls are squad-owned
-       * (the Simple form's Generate buttons + the suggest-name fallback ran
-       * before any task/cell/proof row existed, so their usage never appears
-       * in a task row) -- this is the only place those figures enter a squad's
-       * normal totals. Mirrors `ttUsageOf`'s `anyCost` semantics: only a
-       * nonzero reported dollar figure renders as cost, and a `~` prefix once
-       * any contributing figure is a mid-run estimate. `generation` is the
-       * SquadView's `generation_cost` object, or null/undefined for a squad
-       * with none (the common case).
        * @param {TtRow[]} rows
-       * @param {{count: number, tokens_in: number, tokens_out: number, cache_creation_tokens: number, cache_read_tokens: number, cost_usd: number, estimated: boolean}|null|undefined} generation
+       * @param {{tokens_in:number,tokens_out:number,cache_creation_tokens:number,cache_read_tokens:number,cost_usd:number,estimated:boolean}|null|undefined} generation
        * @returns {TtUsage}
        */
       function ttGroupAggregateWithGeneration(rows, generation) {
         const acc = ttGroupAggregate(rows);
         if (!generation) return acc;
-        acc.tokensIn += generation.tokens_in || 0;
-        acc.tokensOut += generation.tokens_out || 0;
-        acc.cacheCreate += generation.cache_creation_tokens || 0;
-        acc.cacheRead += generation.cache_read_tokens || 0;
+        acc.tokensIn += generation.tokens_in || 0; acc.tokensOut += generation.tokens_out || 0;
+        acc.cacheCreate += generation.cache_creation_tokens || 0; acc.cacheRead += generation.cache_read_tokens || 0;
         if (generation.cost_usd) { acc.cost += generation.cost_usd; acc.anyCost = true; }
         if (generation.estimated) acc.estimated = true;
         return acc;
@@ -1139,4 +1199,3 @@
         return items;
       }
       // RALPHUS-TASK-TAB-LOGIC:END
-

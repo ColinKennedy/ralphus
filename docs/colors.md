@@ -34,6 +34,7 @@ role in the table below, then use it.
 | `--failed` | `#f85149` | *(shared)* | status |
 | `--pending` | `#8b949e` | *(shared)* | status |
 | `--queued` | `#a371f7` | *(shared)* | status |
+| `--materializing` | `#58a6ff` | *(shared)* | status (a newly submitted squad is creating worktrees and deriving its review plan) |
 | `--cancelled` | `#6e7681` | *(shared)* | status |
 | `--ignored` | `#c9a227` | *(shared)* | status (amber — the **only** caution color) |
 | `--teal` | `#39c5cf` | *(shared)* | semantic (dependency / linked movement) |
@@ -65,6 +66,7 @@ border. The stable state string maps 1:1 to a variable of the same name:
 | `failed` | `--failed` (red) |
 | `pending` | `--pending` (grey) |
 | `queued` | `--queued` (purple) |
+| `materializing` | `--materializing` (blue) |
 | `cancelled` | `--cancelled` (grey) |
 | `ignored` | `--ignored` (amber) |
 
@@ -309,7 +311,7 @@ at runtime, so there is still exactly one place this color is defined.
   overrides only the chrome colors (`--bg`, `--panel`, `--panel-2`, `--border`,
   `--text`, `--muted`, `--accent`).
 - Status and semantic hues (`--running`, `--done`, `--failed`, `--pending`,
-  `--queued`, `--cancelled`, `--ignored`, `--teal`, `--danger`, `--incomplete`) are **shared** —
+  `--queued`, `--materializing`, `--cancelled`, `--ignored`, `--teal`, `--danger`, `--incomplete`) are **shared** —
   they read acceptably on both backgrounds, so they are defined once.
 - When you add a new color: if it must differ between themes, add it to `:root`
   **and** to the `[data-theme="light"]` block. If a single hue works on both

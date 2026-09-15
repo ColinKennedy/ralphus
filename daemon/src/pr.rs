@@ -661,21 +661,47 @@ impl Store {
         )))
     }
 
-    /// Idempotently record that `external_comment_id` on `pr_id` has been
-    /// actioned into the owning worktree, so a later feedback-pull only picks
-    /// up genuinely new comments.
-    pub fn mark_pr_comment_actioned(&self, pr_id: &str, external_comment_id: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO guardian_pr_feedback_actioned(id, pr_id, external_comment_id, actioned_at_ms)
-             VALUES(?,?,?,?)",
-            params![
-                format!("{pr_id}:{external_comment_id}"),
-                pr_id,
-                external_comment_id,
-                now_ms()
-            ],
-        )?;
-        Ok(())
+    /// Atomically claim a batch of PR comment ids as actioned, returning only
+    /// the ids this call actually won -- an id already claimed (by an earlier
+    /// call, or one racing concurrently) is silently excluded rather than
+    /// re-actioned. Each id is inserted via its own `INSERT ... WHERE NOT
+    /// EXISTS`, a single atomic statement, so two overlapping callers that
+    /// both read the same "not yet actioned" comments from the forge can
+    /// never both win the same id: whichever statement runs second finds the
+    /// row already there and claims nothing for it.
+    ///
+    /// Callers must claim a comment *before* applying its feedback, not
+    /// after -- the same ordering [`crate::ci_watch::dispatch_pr_auto_fix`]
+    /// uses for `mark_pr_auto_fix_attempted`, and for the same reason: a
+    /// claim recorded only after the (potentially slow) feedback round
+    /// finishes leaves a window where a second caller can start applying the
+    /// same comments before the first one's claim lands.
+    pub fn try_claim_pr_comments(
+        &self,
+        pr_id: &str,
+        external_comment_ids: &[String],
+    ) -> Result<Vec<String>> {
+        let mut won = Vec::new();
+        for external_comment_id in external_comment_ids {
+            let n = self.conn.execute(
+                "INSERT INTO guardian_pr_feedback_actioned(id, pr_id, external_comment_id, actioned_at_ms)
+                 SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+                     SELECT 1 FROM guardian_pr_feedback_actioned WHERE pr_id=? AND external_comment_id=?
+                 )",
+                params![
+                    format!("{pr_id}:{external_comment_id}"),
+                    pr_id,
+                    external_comment_id,
+                    now_ms(),
+                    pr_id,
+                    external_comment_id,
+                ],
+            )?;
+            if n > 0 {
+                won.push(external_comment_id.clone());
+            }
+        }
+        Ok(won)
     }
 
     /// External comment ids already actioned for a PR.
@@ -819,37 +845,74 @@ impl Store {
     // -----------------------------------------------------------------
     // RAL-366: cached forge state (background poller)
     // -----------------------------------------------------------------
+    // See `HalfOutcome` below for how a pass reports each half.
 
-    /// Upsert the background poller's most recent forge probe of one PR
-    /// (RAL-366). `ok` is whether this poll pass actually reached the forge
-    /// (git-side drift and forge-side comment fetch are both attempted every
-    /// pass, but either can fail independently -- e.g. the fetch lock was
-    /// held by an interactive `sync-status` call this cycle, or the forge
-    /// rejected the token); `last_error` is only meaningful when `!ok`.
-    /// Every other field is `COALESCE`d against the existing row so a half
-    /// that failed (or that this pass didn't even attempt) never clobbers
-    /// the other half's last-known-good value -- only `last_checked_at_ms`/
-    /// `status`/`last_error` unconditionally reflect *this* pass.
-    #[allow(clippy::too_many_arguments)]
+    /// Upsert the background poller's most recent probe of one PR.
+    ///
+    /// A poll pass has two independent halves -- git-side drift and the
+    /// forge-side comment fetch -- and either can succeed, fail, or not be
+    /// attempted at all without the other being affected (the drift lock was
+    /// held by an interactive `sync-status` call this cycle; the forge
+    /// rejected the token). Each is therefore passed as its own
+    /// [`HalfOutcome`], and each records its own timestamp, status and error.
+    ///
+    /// This matters because the row is read to decide whether cached data is
+    /// fresh enough to serve. One shared timestamp cannot answer that: a pass
+    /// that refreshed only comments would still stamp the row "just checked",
+    /// and a caller asking about drift would be handed hours-old values
+    /// labelled as current.
+    ///
+    /// Value columns are `COALESCE`d, so a half that failed or was skipped
+    /// leaves the other half's last-known-good values untouched.
+    /// `last_checked_at_ms`/`status`/`last_error` remain as the rolled-up
+    /// "most recent of either", for callers that only want one number.
     pub(crate) fn upsert_pr_forge_cache(
         &self,
         pr_id: &str,
-        ok: bool,
-        last_error: Option<&str>,
-        in_sync: Option<bool>,
-        pr_ahead: Option<bool>,
-        worktree_ahead: Option<bool>,
-        remote_sha: Option<&str>,
-        local_sha: Option<&str>,
-        etag_conversation: Option<&str>,
-        etag_review: Option<&str>,
+        drift: HalfOutcome<DriftObservation<'_>>,
+        comments: HalfOutcome<CommentsObservation<'_>>,
     ) -> Result<()> {
+        let drift_ok = drift.as_ref().map(std::result::Result::is_ok);
+        let comments_ok = comments.as_ref().map(std::result::Result::is_ok);
+        // The rolled-up status is pessimistic on purpose: if either half this
+        // pass attempted failed, the row as a whole is not trustworthy.
+        let ok = drift_ok.unwrap_or(true) && comments_ok.unwrap_or(true);
+        let half_status = |o: Option<bool>| o.map(|ok| if ok { "ok" } else { "unknown" });
+        let drift_status = half_status(drift_ok);
+        let comments_status = half_status(comments_ok);
+        let drift_error = drift.as_ref().and_then(|r| r.as_ref().err().cloned());
+        let comments_error = comments.as_ref().and_then(|r| r.as_ref().err().cloned());
+        let last_error = drift_error.clone().or_else(|| comments_error.clone());
+        let observed = drift.and_then(std::result::Result::ok);
+        let etags = comments.and_then(std::result::Result::ok);
+        let (in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha) = match &observed {
+            Some(d) => (
+                Some(d.in_sync),
+                Some(d.pr_ahead),
+                Some(d.worktree_ahead),
+                d.remote_sha,
+                d.local_sha,
+            ),
+            None => (None, None, None, None, None),
+        };
+        let (etag_conversation, etag_review) = match &etags {
+            Some(c) => (c.etag_conversation, c.etag_review),
+            None => (None, None),
+        };
+        let stamp_if = |attempted: Option<bool>| attempted.map(|_| now_ms());
+        let drift_checked_at_ms = stamp_if(drift_ok);
+        let comments_checked_at_ms = stamp_if(comments_ok);
+        let last_error = last_error.as_deref();
+        let drift_error = drift_error.as_deref();
+        let comments_error = comments_error.as_deref();
         self.conn.execute(
             "INSERT INTO guardian_pr_forge_cache(
                 pr_id, last_checked_at_ms, status, last_error,
                 in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha,
-                etag_conversation, etag_review
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                etag_conversation, etag_review,
+                drift_checked_at_ms, drift_status, drift_error,
+                comments_checked_at_ms, comments_status, comments_error
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(pr_id) DO UPDATE SET
                 last_checked_at_ms = excluded.last_checked_at_ms,
                 status             = excluded.status,
@@ -860,7 +923,15 @@ impl Store {
                 remote_sha         = COALESCE(excluded.remote_sha, remote_sha),
                 local_sha          = COALESCE(excluded.local_sha, local_sha),
                 etag_conversation  = COALESCE(excluded.etag_conversation, etag_conversation),
-                etag_review        = COALESCE(excluded.etag_review, etag_review)",
+                etag_review        = COALESCE(excluded.etag_review, etag_review),
+                drift_checked_at_ms    = COALESCE(excluded.drift_checked_at_ms, drift_checked_at_ms),
+                drift_status           = COALESCE(excluded.drift_status, drift_status),
+                drift_error            = CASE WHEN excluded.drift_status IS NULL
+                                              THEN drift_error ELSE excluded.drift_error END,
+                comments_checked_at_ms = COALESCE(excluded.comments_checked_at_ms, comments_checked_at_ms),
+                comments_status        = COALESCE(excluded.comments_status, comments_status),
+                comments_error         = CASE WHEN excluded.comments_status IS NULL
+                                              THEN comments_error ELSE excluded.comments_error END",
             params![
                 pr_id,
                 now_ms(),
@@ -873,6 +944,12 @@ impl Store {
                 local_sha,
                 etag_conversation,
                 etag_review,
+                drift_checked_at_ms,
+                drift_status,
+                drift_error,
+                comments_checked_at_ms,
+                comments_status,
+                comments_error,
             ],
         )?;
         Ok(())
@@ -907,19 +984,57 @@ impl Store {
         endpoint: &str,
         comments: &[crate::forge::PrComment],
     ) -> Result<()> {
-        self.conn.execute(
+        // One transaction: the delete and the re-insert are a single
+        // replacement. Run loose, a failure part-way through leaves the PR
+        // showing a truncated comment set -- which reads as "reviewers
+        // withdrew their feedback", not as an error.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "DELETE FROM guardian_pr_forge_comments WHERE pr_id=? AND endpoint=?",
             params![pr_id, endpoint],
         )?;
-        for c in comments {
-            self.conn.execute(
+        {
+            let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO guardian_pr_forge_comments(
                     pr_id, endpoint, external_id, author, created_at
                  ) VALUES(?,?,?,?,?)",
-                params![pr_id, endpoint, c.external_id, c.author, c.created_at],
             )?;
+            for c in comments {
+                stmt.execute(params![
+                    pr_id,
+                    endpoint,
+                    c.external_id,
+                    c.author,
+                    c.created_at
+                ])?;
+            }
         }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Drop cached forge state for every PR that is no longer open.
+    ///
+    /// The poller only visits open PRs, so once a PR merges or closes its row
+    /// stops refreshing but keeps being returned by
+    /// [`Self::list_pr_forge_cache`] at whatever values it last held. The
+    /// `ON DELETE CASCADE` does not help: PR rows are soft-closed, not
+    /// deleted. Without this the table only ever grows, and every list view
+    /// has to filter it.
+    pub(crate) fn prune_pr_forge_cache(&self) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM guardian_pr_forge_comments WHERE pr_id IN (
+                 SELECT id FROM guardian_pull_requests WHERE state <> 'open')",
+            [],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM guardian_pr_forge_cache WHERE pr_id IN (
+                 SELECT id FROM guardian_pull_requests WHERE state <> 'open')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// This PR's cached forge state (RAL-366), if the background poller has
@@ -971,7 +1086,9 @@ const PR_FORGE_CACHE_SELECT: &str = "
         (SELECT cm.author FROM guardian_pr_forge_comments cm
           WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1),
         (SELECT cm.created_at FROM guardian_pr_forge_comments cm
-          WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1)
+          WHERE cm.pr_id = c.pr_id ORDER BY cm.created_at DESC, cm.external_id DESC LIMIT 1),
+        c.drift_checked_at_ms, c.drift_status, c.drift_error,
+        c.comments_checked_at_ms, c.comments_status, c.comments_error
     FROM guardian_pr_forge_cache c";
 
 fn map_pr_forge_cache_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrForgeCacheView> {
@@ -989,16 +1106,29 @@ fn map_pr_forge_cache_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrForgeCach
         unactioned_count: r.get(10)?,
         latest_comment_author: r.get(11)?,
         latest_comment_at: r.get(12)?,
+        drift_checked_at_ms: r.get(13)?,
+        drift_status: r.get(14)?,
+        drift_error: r.get(15)?,
+        comments_checked_at_ms: r.get(16)?,
+        comments_status: r.get(17)?,
+        comments_error: r.get(18)?,
     })
 }
 
 /// One PR's cached forge state (RAL-366): populated only by the background
-/// poller (`refresh_pr_forge_cache_once`), never by an on-demand route --
-/// [`compute_sync_status`]/`list_pr_comments` stay live and authoritative.
-/// `status` is `"ok"` (every field below reflects the most recent
-/// successfully-reached poll) or `"unknown"` (the forge/git side was
-/// unreachable on the last attempt -- see `last_error` -- though the other
-/// fields may still carry a stale-but-known value from an earlier pass).
+/// poller, plus write-throughs from the on-demand `sync-status`/`comments`
+/// routes.
+///
+/// `status`/`last_checked_at_ms`/`last_error` are a rolled-up view of two
+/// independently-refreshed halves and are only safe for a coarse "when was
+/// this row last touched" display. **Anything deciding whether cached data is
+/// fresh enough to act on must read the half it actually cares about**
+/// (`drift_*` or `comments_*`): a pass that refreshed only comments still
+/// moves `last_checked_at_ms`, so the rolled-up timestamp can read as seconds
+/// old while the drift columns are hours stale.
+///
+/// A `"unknown"` half means the last attempt failed (see its error); the
+/// values it covers may still carry a usable reading from an earlier pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct PrForgeCacheView {
     pub pr_id: String,
@@ -1014,6 +1144,52 @@ pub struct PrForgeCacheView {
     pub unactioned_count: i64,
     pub latest_comment_author: Option<String>,
     pub latest_comment_at: Option<String>,
+    /// When the git-side drift half was last *attempted*, and how it went.
+    /// `None` until a pass has attempted it at least once.
+    pub drift_checked_at_ms: Option<i64>,
+    pub drift_status: Option<String>,
+    pub drift_error: Option<String>,
+    /// When the forge-side comment half was last *attempted*, and how it went.
+    pub comments_checked_at_ms: Option<i64>,
+    pub comments_status: Option<String>,
+    pub comments_error: Option<String>,
+}
+
+impl Store {
+    /// Undo [`Self::mark_pr_auto_fix_attempted`] (RAL-395 follow-up): called
+    /// when [`crate::guardian_merge::run_feedback`] bailed out before the
+    /// resolver agent ever ran (e.g. the branch's review worktree was
+    /// transiently missing, mid-rebuild, when auto-fix raced the review's own
+    /// background merge loop) so that infrastructure hiccup doesn't
+    /// permanently consume the single-attempt-per-failure budget while CI
+    /// keeps reporting the same `"failing"` status forever.
+    pub fn clear_pr_auto_fix_attempted(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=NULL, updated_at_ms=? WHERE id=?",
+            params![now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Give every open PR in a review a fresh unattended auto-fix attempt.
+    ///
+    /// An explicit Merge / rebase is a user-directed retry boundary. It is
+    /// deliberately separate from the background CI poller's one-attempt cap:
+    /// ordinary polling must not keep spending attempts on an unchanged
+    /// failure, while a person who asks to rebuild the review has requested a
+    /// new chance to address it.
+    pub fn reset_open_pr_auto_fix_attempts(&self, guardian_id: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE guardian_pull_requests
+             SET auto_fix_attempted_at_ms=NULL, updated_at_ms=?
+             WHERE guardian_id=? AND state='open' AND auto_fix_attempted_at_ms IS NOT NULL",
+            params![now_ms(), guardian_id],
+        )?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +1820,26 @@ fn forge_parent_remote_name(
 /// Resolve [`PrRepoRouting`] for `guardian`'s project (by `guardian.git_root`
 /// unless the caller has a more specific `root`/project path for a
 /// multi-project branch, e.g. [`check_pr_merges`]'s per-branch resolution).
+/// The forge client that answers for one PR row's own repository.
+///
+/// Exposed so the on-demand routes in `server.rs` resolve the *same* client the
+/// cache poller does. Under fork routing (RAL-338) a PR's `repo` decides which
+/// repository owns it, and that need not be the remote behind the guardian's
+/// base branch -- so resolving one way here and another way there had the two
+/// reading different repositories and reporting different answers for the same
+/// PR.
+pub fn forge_client_for_pr(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    base_branch: &str,
+    forge_cfg: &crate::config::ForgeConfig,
+    repo: &str,
+) -> Option<crate::forge::ForgeClient> {
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg)
+        .client_for(repo)
+        .cloned()
+}
+
 fn resolve_pr_repo_routing(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
@@ -1712,6 +1908,9 @@ fn resync_pr_bases_inner(
     require_forge_success: bool,
 ) -> std::result::Result<usize, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Ok(0);
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
@@ -2153,6 +2352,9 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return false;
     };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return false;
+    }
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -2167,7 +2369,15 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return settle_pr_merge_states(store, id, &[]);
     }
 
-    let mut freshly_merged = Vec::new();
+    // Resolve each open PR's forge client up front (cheap, local config/DB
+    // reads); the actual forge call is the only genuinely slow part here,
+    // and is fired off concurrently below since one PR's merge state has no
+    // bearing on any other's.
+    struct MergeCheckJob<'a> {
+        pr: &'a PullRequestView,
+        client: crate::forge::ForgeClient,
+    }
+    let mut jobs = Vec::new();
     for pr in prs
         .iter()
         .filter(|pull_request| pull_request.state == "open")
@@ -2191,8 +2401,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         // whichever matches this PR's own recorded `repo`, rather than a
         // single `resolve_remote` call that can only ever match one of them.
         let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
-        let client = match routing.client_for(&pr.repo) {
-            Some(client) if client.kind().as_str() == pr.forge => client.clone(),
+        match routing.client_for(&pr.repo) {
+            Some(client) if client.kind().as_str() == pr.forge => {
+                jobs.push(MergeCheckJob {
+                    pr,
+                    client: client.clone(),
+                });
+            }
             Some(client) => {
                 log_pr_merge_check_failure(
                     store,
@@ -2206,7 +2421,6 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                         pr.repo
                     ),
                 );
-                continue;
             }
             None => {
                 log_pr_merge_check_failure(
@@ -2218,10 +2432,28 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                         pr.forge, pr.repo
                     ),
                 );
-                continue;
             }
-        };
-        poll_pr_merge_state(store, id, pr, &client, &mut freshly_merged);
+        }
+    }
+
+    let fetched: Vec<Option<std::result::Result<String, String>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|job| scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
+            })
+            .collect()
+    });
+
+    let mut freshly_merged = Vec::new();
+    for (job, result) in jobs.iter().zip(fetched) {
+        apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
@@ -2357,6 +2589,7 @@ fn maybe_promote_fork_root(
     ) {
         Ok(route) => route,
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: promotion-failure diagnostic; this branch returns before the promotion flow's structured Cartographer emit (in the success path below) is reached, and that emit lies beyond the 80-line pairing window
             crate::rlog!(
                 ERROR,
                 "ralphus [pr] review {id} cannot promote pr={}: {e}",
@@ -2485,23 +2718,40 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     for pr in prs.iter().filter(|p| p.state == "open") {
-        poll_pr_merge_state(store, id, pr, client, &mut freshly_merged);
+        let fetched = fetch_pr_merge_state(pr, client);
+        apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
 
     settle_pr_merge_states(store, id, &freshly_merged)
 }
 
-fn poll_pr_merge_state(
+/// The network half of a single PR's merge-state check: just the forge call,
+/// with no store access, so [`check_pr_merges`] can run it concurrently
+/// across independent PRs. `None` mirrors the "no PR number, nothing to
+/// check" early return.
+fn fetch_pr_merge_state(
+    pr: &PullRequestView,
+    client: &crate::forge::ForgeClient,
+) -> Option<std::result::Result<String, String>> {
+    let number = pr.pr_number?;
+    Some(client.get_pull_request_state(number))
+}
+
+/// The store-writing half of a single PR's merge-state check: apply an
+/// already-fetched forge state ([`fetch_pr_merge_state`]) to the PR row and
+/// `freshly_merged`. Kept serial (unlike the fetch) since it mutates shared
+/// state.
+fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
-    client: &crate::forge::ForgeClient,
+    fetched: Option<std::result::Result<String, String>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
-    let Some(number) = pr.pr_number else {
+    let Some(result) = fetched else {
         return;
     };
-    match client.get_pull_request_state(number) {
+    match result {
         Ok(state) if state != "open" => {
             let _ = store.lock().update_pull_request_ex(
                 &pr.id,
@@ -2679,17 +2929,24 @@ fn settle_pr_merge_states(
 /// moved, because a PR whose `last_pushed_sha` still matches its local tip is
 /// skipped before any network call.
 ///
-/// Only a settled (`in_review`) review is reconciled — a merge in flight owns
-/// the branch tips and will land them itself. Mirrors the push+record-sha
-/// pattern [`submit_pull_requests_inner`] and [`pull_pr_commits`] already use.
-/// Best-effort per PR: one push failing (most likely `guard_against_clobber`
-/// tripping because a reviewer pushed directly to the PR branch) is logged and
-/// does not stop the others.
+/// Reconciled per-branch, not per-review: a stacked branch that has finished
+/// its own rebase pass (`done`/`conflict_resolved`) is pushed as soon as it
+/// gets here even while sibling branches later in the stack are still being
+/// processed — a long-running conflict resolution elsewhere in the same
+/// stack must not hold a finished branch's PR hostage. A branch still being
+/// worked (`pending`/`in_progress`/`actioning`/...) is skipped: its worktree
+/// tip can still be rewritten again before this merge attempt settles. The
+/// combined-worktree PR (`branch_id: None`) has no single branch to check
+/// against, so it still waits for the whole review to reach `in_review`.
+/// Mirrors the push+record-sha pattern [`submit_pull_requests_inner`] and
+/// [`pull_pr_commits`] already use. Best-effort per PR: one push failing
+/// (most likely `guard_against_clobber` tripping because a reviewer pushed
+/// directly to the PR branch) is logged and does not stop the others.
 pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
-    if guardian.status.as_str() != "in_review" {
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
         return;
     }
     let prs = store
@@ -2712,12 +2969,21 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     for pr in open_prs {
         let remote_name = routing.remote_for(&pr.repo);
         let local_ref = match &pr.branch_id {
-            Some(bid) => guardian
-                .branches
-                .iter()
-                .find(|b| &b.id == bid)
-                .and_then(|b| b.review_branch.clone()),
-            None => guardian.review_branch.clone(),
+            Some(bid) => {
+                let Some(branch) = guardian.branches.iter().find(|b| &b.id == bid) else {
+                    continue;
+                };
+                if !matches!(branch.merge_status.as_str(), "done" | "conflict_resolved") {
+                    continue;
+                }
+                branch.review_branch.clone()
+            }
+            None => {
+                if guardian.status.as_str() != "in_review" {
+                    continue;
+                }
+                guardian.review_branch.clone()
+            }
         };
         let Some(local_ref) = local_ref else {
             continue;
@@ -3247,6 +3513,9 @@ pub fn poll_pr_base_drift(
     id: &str,
 ) -> std::result::Result<usize, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Ok(0);
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: resolve both candidate clients so each PR's base-drift check
@@ -3471,13 +3740,24 @@ fn poll_pr_comments(
 /// background work that must not block a request thread or the store lock on
 /// a subprocess/network call.
 ///
-/// The git fetch acquires each PR's own [`SYNC_FETCH_LOCKS`] entry via
-/// `try_lock`, never blocking: a PR whose lock is currently held by an
-/// interactive `sync-status` call is simply left out of this cycle's batch
-/// (its drift fields keep their last-known value; its comments still refresh
-/// independently) rather than making the interactive caller wait on this
-/// poller, or vice versa -- the "poller yields to foreground work"
-/// requirement.
+/// Runs as two ordered passes, and the split is load-bearing in both
+/// directions:
+///
+/// 1. *Drift* holds each PR's [`SYNC_FETCH_LOCKS`] entry, taken via `try_lock`
+///    so it never blocks. A PR whose lock an interactive `sync-status` call
+///    already holds is left out of this cycle's batch and keeps its
+///    last-known drift, so this poller never makes foreground work wait.
+/// 2. *Comments* runs only after every one of those guards has been dropped,
+///    so the reverse is true as well: `compute_sync_status` takes the same
+///    per-PR lock *blocking* (see [`fetch_remote_tip`]), and a foreground
+///    drift check therefore waits at most for one PR's own `git fetch` --
+///    never for this poller's two forge round-trips per PR.
+///
+/// Fusing the two passes into one loop is what makes an interactive
+/// `sync-status` take an order of magnitude longer than the git fetch it
+/// performs, and since each blocked request occupies a read-pool worker for
+/// its whole wait, that also starves unrelated reads queued behind it. Keep
+/// them separate.
 ///
 /// Every PR under one guardian shares the same remote
 /// ([`PrRepoRouting::remote_for`] ignores its `repo` argument once a fork is
@@ -3492,6 +3772,27 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
+    // Checked before any work: the backoff window is per forge client, and a
+    // 429 seen while polling one guardian means the next guardian on the same
+    // repo must not immediately go and ask again. Previously only the comment
+    // fetch consulted this, so a rate-limited forge still got a full round of
+    // git fetches and base-drift calls every cycle -- the retry storm the
+    // backoff exists to prevent.
+    let backed_off = {
+        let root = PathBuf::from(&guardian.git_root);
+        let forge_cfg = crate::config::resolve_forge(&root);
+        resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg)
+            .client_for("")
+            .is_some_and(is_backed_off)
+    };
+    if backed_off {
+        // ralphus[ignore-rlog-pair]: rate-limit path records the structured outcome; this routine only skips a poll
+        crate::rlog!(
+            DEBUG,
+            "ralphus [pr] review {id} forge cache poll skipped: still backing off from a rate limit"
+        );
+        return;
+    }
     let prs: Vec<PullRequestView> = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -3507,44 +3808,82 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
     let remote_name = routing.remote_for("").to_string();
 
-    let locks: Vec<Arc<Mutex<()>>> = prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
-    let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
-        locks.iter().map(|l| l.try_lock().ok()).collect();
-    let refspecs: Vec<String> = prs
-        .iter()
-        .zip(guards.iter())
-        .filter(|(_, g)| g.is_some())
-        .map(|(pr, _)| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
-        .collect();
-    if !refspecs.is_empty() {
-        let mut args: Vec<&str> = vec!["fetch", &remote_name];
-        args.extend(refspecs.iter().map(String::as_str));
-        let _ = git(&root, &args);
-    }
-
-    for (pr, guard) in prs.iter().zip(guards.iter()) {
-        let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
-        let drift = guard.is_some().then(|| {
-            let local_ref = local_ref_for_pr(&guardian, pr);
-            let local_sha = local_ref
-                .as_deref()
-                .and_then(|r| git(&root, &["rev-parse", r]).ok())
-                .map(|s| s.trim().to_string());
-            let remote_sha = git(&root, &["rev-parse", &sync_fetch_ref(&pr.id)])
-                .ok()
-                .map(|s| s.trim().to_string());
-            let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
-                &root,
-                remote_sha.as_deref(),
-                local_sha.as_deref(),
-                pr.last_pushed_sha.as_deref(),
-            );
-            (in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha)
-        });
-        let (in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha) = match drift {
-            Some((a, b, c, d, e)) => (Some(a), Some(b), Some(c), d, e),
-            None => (None, None, None, None, None),
+    // Drift pass. Every `SYNC_FETCH_LOCKS` guard this takes is confined to this
+    // block and dropped before the comment pass below issues a single forge
+    // call.
+    //
+    // That separation is the whole point of the block: `fetch_remote_tip` --
+    // reached from `compute_sync_status`, i.e. an interactive "is this PR in
+    // sync?" from the board -- takes the very same per-PR lock with a
+    // *blocking* `lock()`. Holding these guards across the comment pass's two
+    // network round-trips per PR (as one fused loop would) makes every
+    // foreground drift check queue behind this poller's forge latency instead
+    // of its own git fetch, and each blocked request holds a read-pool worker
+    // for that whole time, starving unrelated reads behind it.
+    //
+    // `try_lock` (not `lock`) is retained: a PR an interactive caller is
+    // already checking is skipped for this cycle and keeps its last-known
+    // drift, so the poller still never makes foreground work wait.
+    type DriftReading =
+        std::result::Result<(bool, bool, bool, Option<String>, Option<String>), String>;
+    let drift_by_pr: Vec<Option<DriftReading>> = {
+        let locks: Vec<Arc<Mutex<()>>> =
+            prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
+        let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
+            locks.iter().map(|l| l.try_lock().ok()).collect();
+        let refspecs: Vec<String> = prs
+            .iter()
+            .zip(guards.iter())
+            .filter(|(_, g)| g.is_some())
+            .map(|(pr, _)| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
+            .collect();
+        // Whether the batched fetch actually succeeded decides whether what
+        // follows is a fresh observation or a re-read of whatever the last
+        // successful fetch left behind. Discarding this made a network failure
+        // indistinguishable from success: `rev-parse` still resolves the
+        // *previous* cycle's sync ref, so stale drift was written back stamped
+        // as a current, successful reading.
+        let fetch_error: Option<String> = if refspecs.is_empty() {
+            None
+        } else {
+            let mut args: Vec<&str> = vec!["fetch", &remote_name];
+            args.extend(refspecs.iter().map(String::as_str));
+            git(&root, &args).err()
         };
+        prs.iter()
+            .zip(guards.iter())
+            .map(|(pr, guard)| {
+                // `None` (lock held by an interactive caller) and
+                // `Some(Err(_))` (fetch failed) are deliberately different:
+                // the first must not move the stored timestamp at all, the
+                // second moves it but records the half as unknown.
+                guard.is_some().then(|| {
+                    if let Some(e) = &fetch_error {
+                        return Err(e.clone());
+                    }
+                    let local_ref = local_ref_for_pr(&guardian, pr);
+                    let local_sha = local_ref
+                        .as_deref()
+                        .and_then(|r| git(&root, &["rev-parse", r]).ok())
+                        .map(|s| s.trim().to_string());
+                    let remote_sha = git(&root, &["rev-parse", &sync_fetch_ref(&pr.id)])
+                        .ok()
+                        .map(|s| s.trim().to_string());
+                    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+                        &root,
+                        remote_sha.as_deref(),
+                        local_sha.as_deref(),
+                        pr.last_pushed_sha.as_deref(),
+                    );
+                    Ok((in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha))
+                })
+            })
+            .collect()
+    };
+
+    // Comment pass -- no drift lock is held from here on.
+    for (pr, drift) in prs.iter().zip(drift_by_pr) {
+        let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
 
         // Fetched before either write path below so the post-write
         // comparison reflects an actual state transition, not this pass's
@@ -3589,18 +3928,28 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                 ),
             };
 
-        let _ = store.lock().upsert_pr_forge_cache(
-            &pr.id,
-            ok,
-            comment_error.as_deref(),
-            in_sync,
-            pr_ahead,
-            worktree_ahead,
-            remote_sha.as_deref(),
-            local_sha.as_deref(),
-            new_conversation_etag.as_deref(),
-            new_review_etag.as_deref(),
-        );
+        let drift_half: HalfOutcome<DriftObservation<'_>> = drift.as_ref().map(|r| match r {
+            Ok((in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha)) => {
+                Ok(DriftObservation {
+                    in_sync: *in_sync,
+                    pr_ahead: *pr_ahead,
+                    worktree_ahead: *worktree_ahead,
+                    remote_sha: remote_sha.as_deref(),
+                    local_sha: local_sha.as_deref(),
+                })
+            }
+            Err(e) => Err(e.clone()),
+        });
+        let comments_half: HalfOutcome<CommentsObservation<'_>> = Some(match &comment_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(CommentsObservation {
+                etag_conversation: new_conversation_etag.as_deref(),
+                etag_review: new_review_etag.as_deref(),
+            }),
+        });
+        let _ = store
+            .lock()
+            .upsert_pr_forge_cache(&pr.id, drift_half, comments_half);
         let new_status = if ok { "ok" } else { "unknown" };
         if previous_status.as_deref() != Some(new_status) {
             // A genuine reachability transition (first poll, forge recovered,
@@ -3656,7 +4005,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
 /// function, since they hit unrelated forge endpoints and RAL-279's existing
 /// base-drift/cascading-resync logic is already well-exercised -- merging
 /// their call sites would add risk without saving a network round-trip.
-fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle) {
+fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled: bool) {
     let ids = match store.lock().guardian_ids_with_open_pull_requests() {
         Ok(ids) => ids,
         Err(e) => {
@@ -3693,7 +4042,24 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle) {
                 );
             }
         }
-        refresh_pr_forge_cache_for_guardian(store, &id);
+        if cache_enabled {
+            refresh_pr_forge_cache_for_guardian(store, &id);
+        }
+    }
+    if cache_enabled {
+        // Once per cycle, not per guardian: PRs that merged or closed since
+        // the last pass stop being polled but keep their rows forever
+        // otherwise.
+        match store.lock().prune_pr_forge_cache() {
+            Ok(n) if n > 0 => {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [pr] pruned {n} closed PRs from the forge cache"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => crate::rlog!(WARNING, "ralphus [pr] forge cache prune failed: {e}"),
+        }
     }
 }
 
@@ -3713,13 +4079,29 @@ pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
         loop {
             let cache_cfg = crate::config::load_pr_cache_config();
             std::thread::sleep(cache_cfg.poll_interval());
-            if !cache_cfg.enabled() {
-                continue;
-            }
             if crate::config::scheduler_in_downtime() {
                 continue;
             }
-            run_pr_forge_poll_cycle(&store);
+            // `[pr_cache].enabled = false` turns off the RAL-366 cache
+            // refresh only. RAL-279's base-drift reconciliation shares this
+            // thread but is unrelated functionality with real consequences --
+            // it is what notices a forge-side base edit -- and a key named
+            // `pr_cache` must not silently disable it.
+            //
+            // Caught so one panicking cycle costs that cycle rather than the
+            // thread. Unguarded, a single unwrap anywhere in the pass would
+            // silently end base-drift reconciliation for the daemon's whole
+            // lifetime, with nothing in the UI to indicate it had stopped.
+            let cache_enabled = cache_cfg.enabled();
+            let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_pr_forge_poll_cycle(&store, cache_enabled);
+            }));
+            if pass.is_err() {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [pr] forge poll cycle panicked; the poller continues with the next cycle"
+                );
+            }
         }
     });
 }
@@ -4296,17 +4678,24 @@ fn submit_stacked_branch_pr(
     // map is seeded from *all* already-open PRs up front, not just the ones
     // submitted in this call.
     alias_by_branch.insert(branch_id.to_string(), alias);
-    // RAL-<new>: a stale `auto_submit_error` badge (RAL-317) is only ever
-    // cleared by `maybe_auto_submit_branch`'s own success path, scoped to the
-    // single branch whose terminal transition triggered that call -- so a
-    // sibling branch swept into the same auto-submit batch, or a PR fixed
-    // through any other path entirely (a manual "submit PR stack", the
-    // periodic reconcile sweep), never had its own error cleared even after
-    // succeeding here. This is the one site every PR creation/adoption
+    // RAL-<new>: `run_auto_submit_pass` clears a stale `auto_submit_error`
+    // badge (RAL-317) only for the branches its own pass covered, so a PR
+    // fixed through any other path entirely -- a manual "submit PR stack",
+    // the periodic reconcile sweep -- would keep the badge up long after the
+    // real problem is fixed. This is the one site every PR creation/adoption
     // funnels through, so clearing it here covers all of them uniformly.
     let _ = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
+    // RAL-<new>: start watching this PR's CI status the moment it exists,
+    // rather than leaving it to `ci_watch::poll_open_pr_ci_status`'s coarse,
+    // per-guardian-throttled standing poll. A stack submits one PR at a time
+    // (this whole function is a git push plus a forge API call, often tens of
+    // seconds per branch), so without this a branch submitted early in the
+    // same pass could show a known CI status well before a sibling submitted
+    // moments later -- whose first status then waited on the next standing
+    // poll, up to `ci_watch::STANDING_POLL_INTERVAL` away.
+    crate::ci_watch::start_ci_watch(store, id, branch_id);
     store
         .lock()
         .get_pull_request(&row_id)
@@ -4357,6 +4746,10 @@ enum StackAction {
 /// keeps whatever stack registration it already has (however stale) and the
 /// next reconcile pass -- run again on every terminal branch transition --
 /// retries once the chain is actually consistent.
+///
+/// `Rebuild` is likewise withheld whenever `all_branches_with_prs` merely
+/// describes *fewer* PRs than the registered stack in an otherwise identical
+/// order -- see [`is_ordered_subset`].
 fn decide_stack_action(
     all_branches_with_prs: &[(String, i64, i64)],
     recorded_stack: Option<(i64, Vec<i64>)>,
@@ -4400,12 +4793,34 @@ fn decide_stack_action(
                     all_ordered,
                 };
             }
+            if is_ordered_subset(&all_ordered, &members) {
+                return StackAction::Skip {
+                    reason: "the registered native stack already contains every expected PR in this order",
+                };
+            }
             StackAction::Rebuild {
                 stack_number,
                 all_ordered,
             }
         }
     }
+}
+
+/// Whether every PR in `expected` also appears in `members`, in the same
+/// relative order -- i.e. `expected` is a subsequence of `members`.
+///
+/// This is the signature of a *partial* view of the review: everything we can
+/// see agrees with the registered stack, the stack simply knows about PRs we
+/// do not. Dissolving a stack is destructive and unconditionally visible on
+/// every member PR's timeline, so it must never be the answer to "I can see
+/// less than the forge can". A genuine membership change reads differently:
+/// dropping a branch from a review closes its PR, and GitHub drops a closed
+/// PR from the stack on its own, so the forge's members shrink rather than
+/// ours; reordering, or gaining a mid-stack PR, breaks the relative order
+/// and still reaches `Rebuild`.
+fn is_ordered_subset(expected: &[i64], members: &[i64]) -> bool {
+    let mut remaining = members.iter();
+    expected.iter().all(|n| remaining.any(|m| m == n))
 }
 
 /// Whether `ordered_prs` (bottom-to-top, one entry per stack member) already
@@ -4509,6 +4924,12 @@ fn refresh_open_prs<'a>(
         .collect()
 }
 
+/// Created PRs alongside `(branch_id, error)` for whichever branch(es)
+/// failed to submit -- shared by [`submit_stack_for_guardian`] and
+/// [`auto_submit_terminal_branches`] so a batch failure can be attributed to
+/// the specific branch that produced it instead of the whole batch.
+type StackSubmitOutcome = (Vec<PullRequestView>, Vec<(String, String)>);
+
 /// Submit a PR for every enabled branch that doesn't already have an open
 /// one -- first dropping any recorded "open" PR that a review's upstream
 /// change has made unreachable via [`retain_prs_reachable_via_current_routing`]
@@ -4529,6 +4950,13 @@ fn refresh_open_prs<'a>(
 /// `prs` now means (RAL-190+): "submit the whole stack", not "push the
 /// squashed combined worktree as one PR" -- see the [`PrRequest`] doc
 /// comment.
+///
+/// One branch failing to submit does not stop the rest of the stack: the
+/// returned `Vec<(branch_id, error)>` names exactly which branch(es) failed
+/// so a caller can attribute each failure to its own branch instead of the
+/// whole batch. The outer `Result` is reserved for failures that aren't
+/// about any one branch (e.g. [`reconcile_native_pr_stack`]'s own DB/forge
+/// errors).
 #[allow(clippy::too_many_arguments)]
 fn submit_stack_for_guardian(
     store: &crate::store_lock::StoreHandle,
@@ -4553,11 +4981,20 @@ fn submit_stack_for_guardian(
     whole_stack_draft: Option<bool>,
     // RAL-196: the project's effective provider-specific `draft_by_default`.
     draft_by_default: bool,
-) -> std::result::Result<Vec<PullRequestView>, String> {
+) -> std::result::Result<StackSubmitOutcome, String> {
     let mut open_by_branch = open_prs_by_branch(existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
     let already_open = refresh_open_prs(store, client, open_by_branch);
     let mut created = Vec::new();
+    // One branch's PR failing to submit (e.g. GitHub's "no commits between
+    // X and Y" once a stacked branch's diff is already in its base) must
+    // never cost every *other* branch in the same batch its own attempt, and
+    // the error belongs to the branch that actually produced it -- not to
+    // whichever branch's own terminal transition happened to be the one that
+    // triggered this batch. Collecting per-branch failures here (instead of
+    // bailing out with `?` on the first one) is what lets callers like
+    // `run_auto_submit_pass` stamp each failure on its own branch.
+    let mut failed = Vec::new();
 
     for branch in ordered_enabled {
         if already_open.contains_key(branch.id.as_str()) {
@@ -4571,7 +5008,7 @@ fn submit_stack_for_guardian(
             use_worktree_branch_name,
             draft: whole_stack_draft,
         };
-        let pr = submit_stacked_branch_pr(
+        match submit_stacked_branch_pr(
             store,
             runner,
             client,
@@ -4589,24 +5026,19 @@ fn submit_stack_for_guardian(
             stack_id,
             fork_routing,
             draft_by_default,
-        )?;
-        created.push(pr);
+        ) {
+            Ok(pr) => created.push(pr),
+            Err(e) => failed.push((branch.id.clone(), e)),
+        }
     }
 
     // RAL-395: native-stack reconciliation is a shared self-heal, not
     // whole-stack-only -- see `reconcile_native_pr_stack` for why it also
     // runs from the explicit per-branch/positional submission path in
     // `submit_pull_requests_inner`.
-    reconcile_native_pr_stack(
-        store,
-        client,
-        id,
-        ordered_enabled,
-        fork_routing,
-        created.len(),
-    )?;
+    reconcile_native_pr_stack(store, client, id, fork_routing, created.len())?;
 
-    Ok(created)
+    Ok((created, failed))
 }
 
 /// Reconcile this guardian's native GitHub PR-stack grouping after a
@@ -4620,14 +5052,32 @@ fn submit_stack_for_guardian(
 /// just chained by base ref. Re-reads the guardian's PR rows fresh from the
 /// store rather than trusting a caller-held list, since branch creation may
 /// have just written new rows this same call.
+///
+/// It re-reads the review's *branches* for the same reason, and deliberately
+/// takes every enabled branch rather than the subset a caller happened to be
+/// working on. Native-stack membership is a property of the review, not of
+/// which branches have finished rebasing: `auto_submit_terminal_branches`
+/// narrows to `done`/`conflict_resolved` branches because only those can
+/// have a PR *submitted* for them, and a restack resets every enabled branch
+/// to `pending` and re-promotes them one at a time. Reconciling against that
+/// caller's narrowed list made every restack look like "the review just lost
+/// most of its PRs", which is exactly the condition [`decide_stack_action`]
+/// answers with `Rebuild` -- so each rebase dissolved the native stack on
+/// GitHub and rebuilt it from scratch as the branches trickled back in,
+/// leaving the upper PRs visibly unstacked for minutes at a time even though
+/// the review's membership and order had not changed at all.
 fn reconcile_native_pr_stack(
     store: &crate::store_lock::StoreHandle,
     client: &crate::forge::ForgeClient,
     id: &str,
-    ordered_enabled: &[&BranchView],
     fork_routing: Option<&ForkRouting>,
     created_count: usize,
 ) -> std::result::Result<(), String> {
+    let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    let mut ordered_enabled: Vec<&BranchView> =
+        guardian.branches.iter().filter(|b| b.enabled).collect();
+    ordered_enabled.sort_by_key(|b| b.position);
+    let ordered_enabled = ordered_enabled.as_slice();
     let existing_prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -4877,11 +5327,21 @@ fn reconcile_native_pr_stack(
 /// rebasing sibling has no `review_branch` yet and would fail
 /// `submit_stacked_branch_pr`'s precondition, so it is simply excluded from
 /// consideration here rather than aborting the branches that ARE ready.
+///
+/// The restriction scopes *submission* only. Native-stack membership is
+/// reconciled from the review's full enabled branch list, which
+/// [`reconcile_native_pr_stack`] reads for itself -- see its doc comment for
+/// what handing it this narrowed list used to cost.
+///
+/// Returns the created PRs alongside `Vec<(branch_id, error)>` for whichever
+/// branch(es) failed to submit -- see [`submit_stack_for_guardian`]'s own
+/// doc for why one branch's failure doesn't cost its siblings their own
+/// attempt or get misattributed to them.
 fn auto_submit_terminal_branches(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
-) -> std::result::Result<Vec<PullRequestView>, String> {
+) -> std::result::Result<StackSubmitOutcome, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
@@ -4933,7 +5393,7 @@ fn auto_submit_terminal_branches(
         .collect();
     ordered_enabled.sort_by_key(|b| b.position);
     if ordered_enabled.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let existing_prs = store
@@ -4969,24 +5429,35 @@ fn auto_submit_terminal_branches(
     )
 }
 
-/// RAL-317: called from [`crate::guardian_merge::promote_branch_terminal`]
-/// every time a branch reaches a terminal (`done`/`conflict_resolved`) merge
-/// state. A no-op unless the review's
-/// [`GuardianView::effective_auto_submit_pr_stack`] setting is on. Never
-/// fails or blocks the caller's merge transition -- errors are logged and
-/// recorded per-branch via [`Store::set_branch_auto_submit_error`] instead of
-/// propagated, and a success clears any previously-recorded error.
+/// RAL-317: run one auto-submit-PR-stack pass over a whole review.
 ///
-/// Reconciles the whole terminal portion of the review even when this branch
-/// already has a current PR. A PR row and its pushed SHA prove only that the
-/// branch was submitted; they do not prove that its forge-side base and
-/// GitHub-native stack membership still match the review.
-pub fn maybe_auto_submit_branch(
-    store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
-    id: &str,
-    branch_id: &str,
-) {
+/// Driven by [`sweep_pending_pr_auto_submits_once`] off the durable,
+/// guardian-scoped request queue that every terminal branch transition feeds
+/// through [`schedule_auto_submit_branch`]. A no-op unless the review's
+/// [`GuardianView::effective_auto_submit_pr_stack`] setting is on.
+///
+/// One pass already covers the review's whole terminal portion -- that is
+/// what [`auto_submit_terminal_branches`] does, and it reports an outcome for
+/// every branch it touched -- so this runs it once per sweep tick and stamps
+/// each branch from that single shared result. Running it once per terminal
+/// branch instead re-walked the entire review N times per tick: only the
+/// first pass could create anything, and every later one re-ran a full forge
+/// verification (a live-state GET per PR plus the native-stack read) and a
+/// full [`sync_open_pr_branches`] git sweep against the shared repository
+/// root purely to confirm work already done -- on a repository the merge
+/// worker is usually rebasing in at the same time. It also left one review's
+/// branches carrying markers stamped from N different forge snapshots.
+///
+/// Never fails or blocks its caller: every failure is logged and recorded on
+/// the branch it belongs to via [`Store::set_branch_auto_submit_error`]
+/// rather than propagated, and a success clears any previously-recorded
+/// error.
+///
+/// Reconciles the terminal portion even when every branch in it already has a
+/// current PR. A PR row and its pushed SHA prove only that the branch was
+/// submitted; they do not prove that its forge-side base and GitHub-native
+/// stack membership still match the review.
+pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, id: &str) {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return,
@@ -4994,60 +5465,109 @@ pub fn maybe_auto_submit_branch(
     if !guardian.effective_auto_submit_pr_stack {
         return;
     }
-    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
         return;
-    };
-    if !branch.enabled {
+    }
+    let covered: Vec<String> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && matches!(b.merge_status.as_str(), "done" | "conflict_resolved"))
+        .map(|b| b.id.clone())
+        .collect();
+    if covered.is_empty() {
         return;
     }
     match auto_submit_terminal_branches(store, runner, id) {
-        Ok(_) => {
-            crate::rlog!(
-                INFO,
-                "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack completed"
-            );
-            let _ = store
-                .lock()
-                .set_branch_auto_submit_error(id, branch_id, None);
-            let guard = store.lock();
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::INFO,
-                source: "pr",
-                message: "auto-submit completed",
-                scope: Some("branch"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"branch_id": branch_id}),
-                admin_only: false,
-            });
+        Ok((_created, failed)) => {
+            // Every branch this pass covered takes its own outcome from the
+            // one shared result, so a sibling's failure never stands in for a
+            // branch that succeeded -- that misattribution is what RAL-317's
+            // badge appearing on every worktree in a review came down to.
+            for branch_id in &covered {
+                match failed.iter().find(|(fbid, _)| fbid == branch_id) {
+                    Some((_, e)) => record_auto_submit_failure(store, id, branch_id, e),
+                    None => record_auto_submit_success(store, id, branch_id),
+                }
+            }
+            // A failure attributed to a branch that is not in `covered` (it
+            // left the terminal set after the list above was taken) still
+            // belongs to that branch rather than to any of these.
+            for (fbid, ferr) in failed.iter().filter(|(fbid, _)| !covered.contains(fbid)) {
+                record_auto_submit_failure(store, id, fbid, ferr);
+            }
         }
         Err(e) => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack failed: {e}"
-            );
-            let _ = store
-                .lock()
-                .set_branch_auto_submit_error(id, branch_id, Some(&e));
-            let guard = store.lock();
-            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::WARNING,
-                source: "pr",
-                message: "auto-submit failed",
-                scope: Some("branch"),
-                squad_id: None,
-                guardian_id: Some(id),
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"branch_id": branch_id, "error": e.to_string()}),
-                admin_only: false,
-            });
+            // A failure that isn't about any one branch (forge/fork
+            // resolution, a DB error): no branch owns it, and every branch
+            // the pass covered is genuinely blocked by it.
+            for branch_id in &covered {
+                record_auto_submit_failure(store, id, branch_id, &e);
+            }
         }
     }
+}
+
+/// Stamp one branch's successful auto-submit-PR-stack outcome: logs, clears
+/// the per-branch marker, and emits the matching Cartographer entry. The
+/// mirror of [`record_auto_submit_failure`], so both outcomes of a pass are
+/// recorded the same way for every branch it covered.
+fn record_auto_submit_success(store: &crate::store_lock::StoreHandle, id: &str, branch_id: &str) {
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack completed"
+    );
+    let _ = store
+        .lock()
+        .set_branch_auto_submit_error(id, branch_id, None);
+    let guard = store.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "pr",
+        message: "auto-submit completed",
+        scope: Some("branch"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({"branch_id": branch_id}),
+        admin_only: false,
+    });
+}
+
+/// Stamp one branch's auto-submit-PR-stack failure: logs, records the
+/// per-branch marker, and emits the matching Cartographer entry. Shared by
+/// [`run_auto_submit_pass`]'s two failure sources (a branch named in the
+/// pass's own per-branch `failed` list, and a whole-pass error fanned out to
+/// every branch the pass covered) so both stamp the *correct* branch
+/// identically.
+fn record_auto_submit_failure(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    branch_id: &str,
+    error: &str,
+) {
+    crate::rlog!(
+        WARNING,
+        "ralphus [pr] review {id} branch {branch_id} auto-submit-pr-stack failed: {error}"
+    );
+    let _ = store
+        .lock()
+        .set_branch_auto_submit_error(id, branch_id, Some(error));
+    let guard = store.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::WARNING,
+        source: "pr",
+        message: "auto-submit failed",
+        scope: Some("branch"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({"branch_id": branch_id, "error": error}),
+        admin_only: false,
+    });
 }
 
 /// RAL-389: trailing-debounce window that coalesces branches completing in
@@ -5108,9 +5628,10 @@ pub(crate) fn schedule_auto_submit_branch(
 static AUTO_SUBMIT_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Claim due requests and process each guardian on its own background thread.
-/// Every enabled terminal branch receives the normal stack-aware submission
-/// path, preserving the review's linear PR/MR chain.
+/// Claim due requests and run one [`run_auto_submit_pass`] per guardian on
+/// its own background thread. That single pass covers every enabled terminal
+/// branch through the normal stack-aware submission path, preserving the
+/// review's linear PR/MR chain.
 pub fn sweep_pending_pr_auto_submits_once(store: &crate::store_lock::StoreHandle) {
     let due = match store
         .lock()
@@ -5134,21 +5655,8 @@ pub fn sweep_pending_pr_auto_submits_once(store: &crate::store_lock::StoreHandle
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            let branch_ids: Vec<String> = match store.lock().get_guardian(&id) {
-                Ok(g) => g
-                    .branches
-                    .iter()
-                    .filter(|b| {
-                        b.enabled && matches!(b.merge_status.as_str(), "done" | "conflict_resolved")
-                    })
-                    .map(|b| b.id.clone())
-                    .collect(),
-                Err(_) => return,
-            };
             let runner = crate::runner::SubprocessRunner::from_env();
-            for branch_id in branch_ids {
-                maybe_auto_submit_branch(&store, &runner, &id, &branch_id);
-            }
+            run_auto_submit_pass(&store, &runner, &id);
         });
     }
 }
@@ -5185,6 +5693,9 @@ pub fn recover_pending_auto_submits_on_startup(store: &crate::store_lock::StoreH
         if !guardian.effective_auto_submit_pr_stack {
             continue;
         }
+        if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+            continue;
+        }
         let has_terminal = guardian.branches.iter().any(|branch| {
             branch.enabled && matches!(branch.merge_status.as_str(), "done" | "conflict_resolved")
         });
@@ -5205,6 +5716,12 @@ fn submit_pull_requests_inner(
     allow_unlinked_fork: bool,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return Err(format!(
+            "review {id} is {} and read-only until reopened",
+            guardian.status
+        ));
+    }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let fork_routing = resolve_fork_routing(store, &root, &guardian, &forge_cfg, user)?;
@@ -5324,7 +5841,7 @@ fn submit_pull_requests_inner(
     }
 
     if submit_whole_stack {
-        let stack_prs = submit_stack_for_guardian(
+        let (stack_prs, failed) = submit_stack_for_guardian(
             store,
             runner,
             &client,
@@ -5345,6 +5862,18 @@ fn submit_pull_requests_inner(
             pr_draft_by_default,
         )?;
         created.extend(stack_prs);
+        // An explicit "submit the whole stack" request is a user action, not
+        // a background poll -- report every branch that failed (not just the
+        // first) rather than the per-branch auto-submit path's silent
+        // per-branch attribution, so the caller sees the full picture in one
+        // response.
+        if !failed.is_empty() {
+            return Err(failed
+                .into_iter()
+                .map(|(branch_id, e)| format!("branch {branch_id}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
     } else if !created.is_empty() {
         // RAL-395: an explicit per-branch/positional request (no `branch_id:
         // null` in this call) skips `submit_stack_for_guardian` entirely, so
@@ -5354,14 +5883,7 @@ fn submit_pull_requests_inner(
         // branch) ended up with correctly chained base refs but no forge-side
         // stack object linking them. Every submission path now funnels
         // through the same reconciler.
-        reconcile_native_pr_stack(
-            store,
-            &client,
-            id,
-            &ordered_enabled,
-            fork_routing.as_ref(),
-            created.len(),
-        )?;
+        reconcile_native_pr_stack(store, &client, id, fork_routing.as_ref(), created.len())?;
     }
 
     Ok(created)
@@ -5453,11 +5975,42 @@ pub struct PrSyncStatus {
     pub worktree_ahead: bool,
 }
 
-/// Compute [`PrSyncStatus`] for `pr_id`: fetches the remote `branch_alias`
-/// tip and compares it against the owning review worktree's current tip via
-/// `git merge-base --is-ancestor` in both directions. A combined-worktree PR
-/// (`branch_id = None`) compares against the guardian's combined review
-/// branch; a stacked PR compares against its own branch's review branch.
+/// What one half of a poll pass did, as reported to
+/// [`Store::upsert_pr_forge_cache`].
+///
+/// Three distinct states, and the difference between the last two is the whole
+/// point: `None` means this pass never attempted the half (so its stored
+/// timestamp must not move), `Some(Err(_))` means it tried and failed (so the
+/// timestamp moves but the status goes `unknown` and the stale values stand).
+/// Collapsing those two into one made a skipped half indistinguishable from a
+/// freshly-verified one.
+pub(crate) type HalfOutcome<T> = Option<std::result::Result<T, String>>;
+
+/// The git-side half of a poll pass: how the PR's remote branch compares to
+/// its review worktree. Mirrors the fields of [`PrSyncStatus`].
+pub(crate) struct DriftObservation<'a> {
+    pub in_sync: bool,
+    pub pr_ahead: bool,
+    pub worktree_ahead: bool,
+    pub remote_sha: Option<&'a str>,
+    pub local_sha: Option<&'a str>,
+}
+
+/// The forge-side half of a poll pass: the ETags to send on the next
+/// conditional comment fetch. `None` for an endpoint this forge does not have
+/// or that returned no ETag.
+pub(crate) struct CommentsObservation<'a> {
+    pub etag_conversation: Option<&'a str>,
+    pub etag_review: Option<&'a str>,
+}
+
+/// How long [`compute_sync_status`] may take before it is reported as slow.
+///
+/// Its own work is one `git fetch` of a single refspec plus a few `rev-parse`
+/// calls -- a couple of seconds against a real forge. This sits well clear of
+/// that, so an ordinary call never logs and only genuine lock contention does.
+const SYNC_STATUS_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The review worktree ref a PR compares its remote branch against (RAL-190):
 /// a stacked branch's own `review_branch` when `pr.branch_id` names one,
 /// else the guardian's combined `review_branch`. Shared by
@@ -5505,10 +6058,16 @@ fn classify_sync_drift(
     }
 }
 
-pub fn compute_sync_status(
+/// The network half of [`compute_sync_status`]: fetch a PR branch's current
+/// remote tip into its private sync ref, guarded by `sync_fetch_lock` exactly
+/// like the combined function. Split out so [`sync_remote_pr_commits`] can run
+/// it concurrently across every open PR -- the remote side is independent of
+/// every other PR's -- while the local-side comparison stays serial (see that
+/// function's comment on why).
+fn fetch_remote_pr_tip(
     store: &crate::store_lock::StoreHandle,
     pr_id: &str,
-) -> std::result::Result<PrSyncStatus, String> {
+) -> std::result::Result<Option<String>, String> {
     let pr = store
         .lock()
         .get_pull_request(pr_id)
@@ -5525,37 +6084,213 @@ pub fn compute_sync_status(
     let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
+    // Held across both commands so a concurrent re-check of this same PR
+    // can't read back a fetch this one hasn't written yet. See
+    // `SYNC_FETCH_LOCKS`.
+    let fetch_lock = sync_fetch_lock(&root, pr_id);
+    let _fetching = fetch_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dest_ref = sync_fetch_ref(pr_id);
+    // `+` forces the update: a reviewer force-pushing the PR branch
+    // (an amend, a rebase onto a new base) makes its new tip a
+    // non-fast-forward from whatever this ref last pointed at, which a
+    // plain refspec would otherwise refuse to write.
+    let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
+    Ok(git(&root, &["fetch", &remote_name, &refspec])
+        .ok()
+        .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+        .map(|s| s.trim().to_string()))
+}
+
+/// The comparison logic shared by [`compute_sync_status`] and
+/// [`sync_remote_pr_commits`]: given a remote tip, a local tip, and the last
+/// SHA this daemon itself pushed, classify which side (if either) is ahead as
+/// `(pr_ahead, worktree_ahead, in_sync)`.
+///
+/// RAL-190: prefers `last_pushed_sha` -- the SHA this daemon itself last put
+/// on the PR branch -- over raw ancestry. Ancestry alone can't survive a
+/// rebase: replaying a branch onto a shifted base rewrites every commit's
+/// SHA, so neither tip stays an ancestor of the other even when nothing
+/// genuinely diverged (a clean rebase-through, or a conflict that got
+/// resolved -- however much effort that took). `last_pushed_sha` pins the
+/// fork point to "the last state both sides are known to have agreed on": if
+/// only one side has moved away from it, that side is unambiguously ahead
+/// regardless of how it got there. Ancestry is still the fallback when
+/// neither side matches the fork point (never synced yet, or both sides
+/// changed independently since) -- that's a true two-sided divergence.
+fn classify_pr_sync(
+    root: &Path,
+    remote_sha: Option<&str>,
+    local_sha: Option<&str>,
+    last_pushed: Option<&str>,
+) -> (bool, bool, bool) {
+    let is_ancestor = |ancestor: &str, descendant: &str| {
+        git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+    };
+    match (remote_sha, local_sha) {
+        (Some(r), Some(l)) if r == l => (false, false, true),
+        (Some(r), Some(l)) => match last_pushed {
+            Some(p) if p == r => (false, true, false),
+            Some(p) if p == l => (true, false, false),
+            _ => (!is_ancestor(r, l), !is_ancestor(l, r), false),
+        },
+        (Some(_), None) => (true, false, false),
+        (None, Some(_)) => (false, true, false),
+        (None, None) => (false, false, false),
+    }
+}
+
+/// This PR's cached remote branch tip, if the drift half of a poll pass
+/// recorded one recently and successfully.
+///
+/// Reads `drift_checked_at_ms`/`drift_status` -- **not** the rolled-up
+/// `last_checked_at_ms`/`status`, which also move when only the comment half
+/// ran and would therefore report a stale remote tip as fresh.
+fn fresh_cached_remote_tip(store: &crate::store_lock::StoreHandle, pr_id: &str) -> Option<String> {
+    let cache = store.lock().get_pr_forge_cache(pr_id).ok().flatten()?;
+    if cache.drift_status.as_deref() != Some("ok") {
+        return None;
+    }
+    let checked_at = cache.drift_checked_at_ms?;
+    let age_ms = now_ms().saturating_sub(checked_at);
+    if age_ms < 0 || age_ms as u128 > REMOTE_TIP_MAX_AGE.as_millis() {
+        return None;
+    }
+    cache.remote_sha
+}
+
+/// Compute [`PrSyncStatus`] for `pr_id`: fetches the remote `branch_alias`
+/// tip and compares it against the owning review worktree's current tip via
+/// `git merge-base --is-ancestor` in both directions. A combined-worktree PR
+/// (`branch_id = None`) compares against the guardian's combined review
+/// branch; a stacked PR compares against its own branch's review branch.
+///
+/// Backs `GET /api/pull-requests/{id}/sync-status`, which the board calls once
+/// per open PR of the selected review. It performs a real `git fetch` behind a
+/// per-PR lock, so it is inherently slower than a store read and is timed: a
+/// call that takes far longer than its own fetch should is reported, since the
+/// only way that happens is contention on [`SYNC_FETCH_LOCKS`] -- and a call
+/// blocked there holds one of the daemon's read-pool workers for the duration,
+/// starving unrelated reads queued behind it.
+pub fn compute_sync_status(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<PrSyncStatus, String> {
+    compute_sync_status_inner(store, pr_id, RemoteTip::Live)
+}
+
+/// [`compute_sync_status`], but allowed to reuse the cache poller's recent
+/// remote-tip observation instead of fetching one.
+///
+/// Returns the status plus **whether the remote tip was fetched live**. A
+/// caller writing the result back into the cache must honour that flag:
+/// writing a cached reading back would move its `drift_checked_at_ms` without
+/// anything having been re-verified, so a single stale observation could keep
+/// renewing its own freshness indefinitely.
+pub fn compute_sync_status_cached(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+) -> std::result::Result<(PrSyncStatus, bool), String> {
+    let served_from_cache = fresh_cached_remote_tip(store, pr_id).is_some();
+    let status = compute_sync_status_inner(store, pr_id, RemoteTip::CachedIfFresh)?;
+    Ok((status, !served_from_cache))
+}
+
+/// Where [`compute_sync_status_inner`] gets the PR's remote branch tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTip {
+    /// Fetch it from the forge now. Correct at the instant of the call, and
+    /// costs a `git fetch` behind this PR's [`SYNC_FETCH_LOCKS`] entry.
+    Live,
+    /// Reuse the cache poller's last observation when it is recent enough,
+    /// falling back to [`Self::Live`] when it is missing, stale, or was
+    /// recorded by a failed pass.
+    CachedIfFresh,
+}
+
+/// How old the cache poller's remote-tip observation may be before
+/// [`RemoteTip::CachedIfFresh`] refuses it and fetches live instead.
+///
+/// Bounds one thing only: how long a reviewer's brand-new push can go
+/// unnoticed by a list view. Everything else in the comparison is recomputed
+/// live on every call.
+const REMOTE_TIP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Shared body of [`compute_sync_status`].
+///
+/// The local tip is **always** read live, and that is the load-bearing part.
+/// Drift compares two tips, and the local one is moved by ralphus itself on
+/// every rebase, restack and feedback pass -- nothing invalidates the cache
+/// when that happens, so a cached local tip can be several rebases out of date
+/// while the row still looks recently checked. Reading it live costs one
+/// `git rev-parse`: no network, no lock, sub-millisecond.
+///
+/// Only the remote tip is ever served from cache, because only it needs a
+/// network round-trip. The worst case is therefore bounded and explainable:
+/// "a push made in the last [`REMOTE_TIP_MAX_AGE`] may not show yet", never
+/// "this comparison is against a branch state that no longer exists".
+fn compute_sync_status_inner(
+    store: &crate::store_lock::StoreHandle,
+    pr_id: &str,
+    remote_tip: RemoteTip,
+) -> std::result::Result<PrSyncStatus, String> {
+    let started = std::time::Instant::now();
+    let pr = store
+        .lock()
+        .get_pull_request(pr_id)
+        .map_err(|e| e.to_string())?;
+    let guardian = store
+        .lock()
+        .get_guardian(&pr.guardian_id)
+        .map_err(|e| e.to_string())?;
+    let root = PathBuf::from(&guardian.git_root);
+
     let local_ref = local_ref_for_pr(&guardian, &pr);
     let local_sha = local_ref
         .as_deref()
         .and_then(|r| git(&root, &["rev-parse", r]).ok())
         .map(|s| s.trim().to_string());
-    // Held across both commands so a concurrent re-check of this same PR
-    // can't read back a fetch this one hasn't written yet. See
-    // `SYNC_FETCH_LOCKS`.
-    let remote_sha = {
-        let fetch_lock = sync_fetch_lock(&root, pr_id);
-        let _fetching = fetch_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dest_ref = sync_fetch_ref(pr_id);
-        // `+` forces the update: a reviewer force-pushing the PR branch
-        // (an amend, a rebase onto a new base) makes its new tip a
-        // non-fast-forward from whatever this ref last pointed at, which a
-        // plain refspec would otherwise refuse to write.
-        let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-        git(&root, &["fetch", &remote_name, &refspec])
-            .ok()
-            .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
-            .map(|s| s.trim().to_string())
+    let cached_remote = match remote_tip {
+        RemoteTip::Live => None,
+        RemoteTip::CachedIfFresh => fresh_cached_remote_tip(store, pr_id),
+    };
+    let remote_sha = match cached_remote {
+        Some(sha) => Some(sha),
+        None => fetch_remote_pr_tip(store, pr_id)?,
     };
 
-    let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
+    let (pr_ahead, worktree_ahead, in_sync) = classify_pr_sync(
         &root,
         remote_sha.as_deref(),
         local_sha.as_deref(),
         pr.last_pushed_sha.as_deref(),
     );
+
+    // A single `git fetch` of one refspec is the dominant cost here; anything
+    // far past that is time spent waiting on `SYNC_FETCH_LOCKS`, not working.
+    // Reported at WARNING because it is invisible from the endpoint's own
+    // response and is exactly what makes the board look frozen.
+    let elapsed = started.elapsed();
+    if elapsed >= SYNC_STATUS_SLOW_THRESHOLD {
+        crate::cartographer::Note::new("pr")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(&pr.guardian_id)
+            .emit(
+                &store.lock(),
+                format!(
+                    "review {} pr={pr_id} sync-status took {}ms -- likely contention on \
+                     this PR's fetch lock",
+                    pr.guardian_id,
+                    elapsed.as_millis()
+                ),
+                serde_json::json!({
+                    "pr_id": pr_id,
+                    "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                }),
+            );
+    }
 
     Ok(PrSyncStatus {
         remote_sha,
@@ -5705,9 +6440,57 @@ pub fn sync_remote_pr_commits(
             .unwrap_or(i64::MAX)
     });
 
+    // Every open PR's remote tip is independent of every other PR's -- fetch
+    // them all at once instead of one at a time, cutting this from N
+    // sequential network round trips to one. The local-side comparison and
+    // the actual pull stay serial below, in stack order: pulling a lower
+    // branch restacks its descendants' worktrees, so a descendant's local
+    // tip is only meaningful once every earlier branch has already been
+    // pulled.
+    let remote_tips: Vec<std::result::Result<Option<String>, String>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = pr_ids
+                .iter()
+                .map(|pr| scope.spawn(|| fetch_remote_pr_tip(store, &pr.id)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("remote PR fetch panicked".to_string()))
+                })
+                .collect()
+        });
+
     let mut pulled = 0;
-    for pr in pr_ids {
-        if !compute_sync_status(store, &pr.id)?.pr_ahead {
+    for (pr, remote_sha) in pr_ids.iter().zip(remote_tips) {
+        let remote_sha = remote_sha?;
+        let guardian = store
+            .lock()
+            .get_guardian(&pr.guardian_id)
+            .map_err(|e| e.to_string())?;
+        let root = PathBuf::from(&guardian.git_root);
+        let local_ref = if let Some(bid) = &pr.branch_id {
+            guardian
+                .branches
+                .iter()
+                .find(|b| &b.id == bid)
+                .and_then(|b| b.review_branch.clone())
+        } else {
+            guardian.review_branch.clone()
+        };
+        let local_sha = local_ref
+            .as_deref()
+            .and_then(|r| git(&root, &["rev-parse", r]).ok())
+            .map(|s| s.trim().to_string());
+        let (pr_ahead, _, _) = classify_pr_sync(
+            &root,
+            remote_sha.as_deref(),
+            local_sha.as_deref(),
+            pr.last_pushed_sha.as_deref(),
+        );
+        if !pr_ahead {
             continue;
         }
         if pull_pr_commits(store, runner, &pr.id)
@@ -5778,6 +6561,13 @@ pub fn start_pull_pr_commits(
     reply(202, &serde_json::json!({"status": "pulling_pr_commits"}))
 }
 
+/// Fallback `author` for [`action_pr_feedback`] when no requester identity
+/// resolved at the HTTP boundary (e.g. no `X-Ralphus-User` header and no
+/// `[daemon].default_user` configured) -- distinct from
+/// [`crate::ci_watch::AUTO_FIX_AUTHOR`] so a manual, person-initiated action
+/// never renders under the automated system's own name.
+const MANUAL_PR_FEEDBACK_AUTHOR: &str = "Manual (PR feedback)";
+
 /// Fetch un-actioned comments/notes on the PR recorded as `pr_id`, aggregate
 /// them into one feedback string, and apply them into the owning review
 /// worktree by delegating to `guardian_merge::run_feedback` for the
@@ -5805,10 +6595,17 @@ pub fn start_pull_pr_commits(
 /// button and predates RAL-117), so its own `RunnerSpec` calls still start
 /// unlinked traces — only the PR-specific steps around it (the forge comment
 /// fetch and the push-back) are covered here.
+///
+/// `submitted_by` is the registered user who triggered this action (resolved
+/// at the HTTP boundary, same as [`guardian_merge::start_feedback`]) -- it is
+/// posted as this round's message `author`/`submitted_by` (RAL-379
+/// semantics) so the board's chat thread clearly shows a person asked for
+/// this, never something that reads as coming from an automated system.
 pub fn action_pr_feedback(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
+    submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
     let cx = crate::otel::context_from_traceparent(None);
     let span = crate::otel::start_span("pr.action_feedback", &cx, SpanKind::Internal);
@@ -5816,7 +6613,7 @@ pub fn action_pr_feedback(
 
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(INFO, "ralphus [pr] pr {pr_id} actioning feedback");
-    let result = action_pr_feedback_inner(store, runner, pr_id);
+    let result = action_pr_feedback_inner(store, runner, pr_id, submitted_by);
     match &result {
         Ok(n) => {
             span.set_status(Status::Ok);
@@ -5836,6 +6633,7 @@ fn action_pr_feedback_inner(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     pr_id: &str,
+    submitted_by: Option<&str>,
 ) -> std::result::Result<usize, String> {
     let pr = store
         .lock()
@@ -5862,34 +6660,11 @@ fn action_pr_feedback_inner(
         .pr_number
         .ok_or_else(|| "PR has no recorded number yet".to_string())?;
 
-    let comments = client.list_pr_comments(pr_number)?;
-    let already = store
-        .lock()
-        .actioned_pr_comment_ids(pr_id)
-        .map_err(|e| e.to_string())?;
-    let fresh: Vec<_> = comments
-        .into_iter()
-        .filter(|c| !already.contains(&c.external_id))
-        .collect();
-    // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-    crate::rlog!(
-        DEBUG,
-        "ralphus [pr] pr {pr_id} comments fresh={} already_actioned={}",
-        fresh.len(),
-        already.len()
-    );
-    if fresh.is_empty() {
-        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-        crate::rlog!(DEBUG, "ralphus [pr] pr {pr_id} no new comments to action");
-        return Ok(0);
-    }
-
-    let feedback = fresh
-        .iter()
-        .map(|c| format!("{}: {}", c.author, c.body))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-
+    // Resolved before claiming any comments below (see `try_claim_pr_comments`'s
+    // doc comment on claim-before-apply ordering): this lookup can fail (e.g.
+    // the branch was removed from the guardian since the PR was filed), and a
+    // claim taken before that failure would strand those comments as
+    // permanently "actioned" without ever having actually been applied.
     let (position, branch_id) = match &pr.branch_id {
         Some(bid) => guardian
             .branches
@@ -5906,85 +6681,180 @@ fn action_pr_feedback_inner(
             .ok_or_else(|| "guardian has no enabled branches".to_string())?,
     };
 
+    let comments = client.list_pr_comments(pr_number)?;
+    // RAL-<new>: claim before applying, not after -- see `try_claim_pr_comments`'s
+    // doc comment. Whatever this call wins is exactly what it (and only it)
+    // is responsible for applying; any id it doesn't win was already claimed
+    // by an earlier, or concurrently overlapping, call.
+    let all_ids: Vec<String> = comments.iter().map(|c| c.external_id.clone()).collect();
+    let claimed = store
+        .lock()
+        .try_claim_pr_comments(pr_id, &all_ids)
+        .map_err(|e| e.to_string())?;
+    let fresh: Vec<_> = comments
+        .into_iter()
+        .filter(|c| claimed.contains(&c.external_id))
+        .collect();
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
-        "ralphus [pr] pr {pr_id} feedback applying {} comment(s) to guardian={} position={position}",
+        "ralphus [pr] pr {pr_id} comments fresh={} already_actioned={}",
         fresh.len(),
-        pr.guardian_id
+        all_ids.len() - fresh.len()
     );
-    let outcome = guardian_merge::run_feedback(
-        store,
-        runner,
-        &pr.guardian_id,
-        &branch_id,
-        &feedback,
-        // RAL-380: this feedback is synthesized from several forge comments,
-        // not one stored "reviewer" message -- there is nothing to mark.
-        None,
-        false,
-        &crate::cancel::CancelToken::never(),
-    );
-
-    for c in &fresh {
-        let _ = store.lock().mark_pr_comment_actioned(pr_id, &c.external_id);
-    }
-
-    if pr.branch_id.is_some() {
-        // `run_feedback` already committed (amend-aware) and pushed this
-        // exact branch's own review ref -- just record the sha it pushed
-        // rather than re-pushing (and re-guarding-against-clobber) the
-        // identical ref a second time.
-        if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
-            let _ = store.lock().update_pull_request_ex(
-                pr_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(Some(sha.as_str())),
-                None,
-            );
-        } else if outcome.committed {
-            return Err("feedback applied but push back to the PR branch failed".to_string());
-        }
+    // RAL-<new>: unlike the old version of this function, an empty `fresh`
+    // no longer early-returns -- "Action feedback" is a manual override a
+    // person clicks expecting *something* to happen, and a PR can easily
+    // have zero un-actioned comments while still having failing CI (see the
+    // live-CI-fix step below). Bailing out here on comments alone silently
+    // did nothing for that case.
+    if fresh.is_empty() {
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(DEBUG, "ralphus [pr] pr {pr_id} no new comments to action");
     } else {
-        // A whole-stack PR tracks the COMBINED branch, which `run_feedback`
-        // never pushes (it only pushes the specific branch it edited, here
-        // the topmost enabled one) -- push it back separately, as before.
-        let updated = store
+        let feedback = fresh
+            .iter()
+            .map(|c| format!("{}: {}", c.author, c.body))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        // RAL-<new>: post this round into the branch's feedback thread the
+        // same way `guardian_merge::start_feedback` does for a human
+        // reviewer and `ci_watch::dispatch_pr_auto_fix` does for its
+        // automated fixes -- attributed to the person who triggered this
+        // action (`submitted_by`, resolved at the HTTP boundary), never to a
+        // value that could read as automated. Falls back to
+        // `MANUAL_PR_FEEDBACK_AUTHOR` only when no requester identity was
+        // resolvable at all, so the bubble still reads as a manual,
+        // person-initiated action rather than defaulting to silence.
+        // Superseding any still-pending feedback first mirrors
+        // `start_feedback`'s own invariant: an older bubble must never read
+        // as in-progress once this round has overtaken it.
+        let author = submitted_by
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(MANUAL_PR_FEEDBACK_AUTHOR);
+        let _ = store
             .lock()
-            .get_guardian(&pr.guardian_id)
-            .map_err(|e| e.to_string())?;
-        let local_ref = updated
-            .review_branch
-            .clone()
-            .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
-        guard_against_clobber(
-            &root,
-            &remote_name,
-            &pr.branch_alias,
-            &local_ref,
-            pr.last_pushed_sha.as_deref(),
-        )?;
+            .supersede_pending_branch_feedback(&pr.guardian_id, &branch_id);
+        let message_seq = store
+            .lock()
+            .add_guardian_message(
+                &pr.guardian_id,
+                "reviewer",
+                &feedback,
+                None,
+                Some(&branch_id),
+                Some(author),
+                submitted_by,
+            )
+            .ok();
+
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
-            "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
-            pr.branch_alias
+            "ralphus [pr] pr {pr_id} feedback applying {} comment(s) to guardian={} position={position}",
+            fresh.len(),
+            pr.guardian_id
         );
-        push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
-        if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
-            let _ = store.lock().update_pull_request_ex(
-                pr_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(Some(sha.trim())),
-                None,
+        let outcome = guardian_merge::run_feedback(
+            store,
+            runner,
+            &pr.guardian_id,
+            &branch_id,
+            &feedback,
+            message_seq,
+            false,
+            &crate::cancel::CancelToken::never(),
+        );
+
+        if pr.branch_id.is_some() {
+            // `run_feedback` already committed (amend-aware) and pushed this
+            // exact branch's own review ref -- just record the sha it pushed
+            // rather than re-pushing (and re-guarding-against-clobber) the
+            // identical ref a second time.
+            if let Some(sha) = outcome.pushed_sha.filter(|_| outcome.pushed) {
+                let _ = store.lock().update_pull_request_ex(
+                    pr_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(sha.as_str())),
+                    None,
+                );
+            } else if outcome.committed {
+                return Err("feedback applied but push back to the PR branch failed".to_string());
+            }
+        } else {
+            // A whole-stack PR tracks the COMBINED branch, which `run_feedback`
+            // never pushes (it only pushes the specific branch it edited, here
+            // the topmost enabled one) -- push it back separately, as before.
+            let updated = store
+                .lock()
+                .get_guardian(&pr.guardian_id)
+                .map_err(|e| e.to_string())?;
+            let local_ref = updated
+                .review_branch
+                .clone()
+                .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
+            guard_against_clobber(
+                &root,
+                &remote_name,
+                &pr.branch_alias,
+                &local_ref,
+                pr.last_pushed_sha.as_deref(),
+            )?;
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
+                pr.branch_alias
+            );
+            push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
+            if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
+                let _ = store.lock().update_pull_request_ex(
+                    pr_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(sha.trim())),
+                    None,
+                );
+            }
+        }
+    }
+
+    // RAL-<new>: "Action feedback" is a manual override -- besides pulling in
+    // comments above, also check this PR's live CI/mergeability status and,
+    // if it's currently failing, dispatch a fix right now via
+    // `ci_watch::dispatch_pr_fix_manual`, which deliberately bypasses both
+    // `auto_fix_pr_errors` (that toggle gates the *unattended* background
+    // poller, not an explicit person-initiated click) and the single-
+    // attempt-per-failure cap (a person retrying by hand is exactly the case
+    // that cap must not block). Best-effort: a transient forge error here
+    // must not undo the comment-feedback work already applied above.
+    if let Ok(state) = client.check_pr_ci_status(pr_number) {
+        let job_url = match &state {
+            crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
+            _ => None,
+        };
+        let _ = store
+            .lock()
+            .set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref());
+        if let crate::forge::PrCiState::Failing(failure) = state {
+            crate::ci_watch::dispatch_pr_fix_manual(
+                store,
+                runner,
+                &guardian,
+                &pr,
+                &branch_id,
+                &failure,
+                &client,
+                submitted_by,
             );
         }
     }
@@ -6080,10 +6950,13 @@ pub fn start_submit_pull_requests(
 }
 
 /// Kick off actioning a PR's feedback in the background; returns immediately.
+/// `submitted_by` is threaded through to [`action_pr_feedback`] for message
+/// attribution (RAL-379) -- see its doc comment.
 pub fn start_action_pr_feedback(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     pr_id: &str,
+    submitted_by: Option<String>,
 ) -> Reply {
     let pr = {
         let guard = store.lock();
@@ -6094,8 +6967,8 @@ pub fn start_action_pr_feedback(
         Err(e) => return error_reply(404, "not_found", &e.to_string()),
     };
     let pid = pr_id.to_string();
-    std::thread::spawn(
-        move || match action_pr_feedback(&store, runner.as_ref(), &pid) {
+    std::thread::spawn(move || {
+        match action_pr_feedback(&store, runner.as_ref(), &pid, submitted_by.as_deref()) {
             Ok(n) => {
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -6129,8 +7002,8 @@ pub fn start_action_pr_feedback(
                     admin_only: false,
                 });
             }
-        },
-    );
+        }
+    });
     reply(202, &serde_json::json!({"status": "actioning_feedback"}))
 }
 
@@ -6138,6 +7011,7 @@ pub fn start_action_pr_feedback(
 mod tests {
     use super::*;
     use crate::guardian::GuardianStatus;
+    use crate::guardian::MergeStatus;
     use crate::store::Store;
     use git2::build::CheckoutBuilder;
     use std::process::Command;
@@ -6329,6 +7203,7 @@ mod tests {
             inherited_env: std::collections::BTreeMap::new(),
             started_at_ms: None,
             auto_submit_error: None,
+            finished_at_ms: None,
         }
     }
 
@@ -6651,6 +7526,231 @@ mod tests {
         );
     }
 
+    /// The bug this whole guard exists for: a restack resets every enabled
+    /// branch to `pending` and promotes them back to `done` one at a time,
+    /// and each promotion fires an auto-submit. If the reconciler judges
+    /// membership from the branches that are terminal *right now*, the second
+    /// promotion presents a two-PR view of an eleven-PR review -- which is
+    /// neither a match nor an appendable prefix, so the old code answered
+    /// `Rebuild` and dissolved a stack that was completely correct. Every
+    /// intermediate view of a restack must be a no-op.
+    /// End-to-end counterpart to the pure `decide_stack_action` guards: the
+    /// reconciler must judge native-stack membership from the review's
+    /// enabled branches, never from whichever of them happen to be terminal.
+    /// Here the restack has re-promoted the bottom two branches and has not
+    /// finished the top two -- the exact shape every rebase passes through --
+    /// while all four PRs are open and correctly chained. The registered
+    /// stack is therefore already right, so
+    /// the only acceptable forge traffic is reads: the mock server fails the
+    /// test if it is ever asked to unstack or to register a new stack.
+    #[test]
+    fn reconcile_native_pr_stack_ignores_a_mid_restack_branch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut writes: Vec<String> = Vec::new();
+            loop {
+                let req = server.recv().unwrap();
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if url == "/done" {
+                    req.respond(tiny_http::Response::empty(204)).unwrap();
+                    break;
+                } else if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/widget/pulls/")
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"state":"open","base":{"ref":"x"},"updated_at":"2026-01-01T00:00:00Z"}"#,
+                        )
+                        .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get && url == "/repos/acme/widget/stacks/42"
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"number":42,"pull_requests":[{"number":10},{"number":11},{"number":12},{"number":13}]}"#,
+                        )
+                        .with_status_code(200),
+                    )
+                    .unwrap();
+                } else {
+                    writes.push(format!("{method} {url}"));
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"number":99}"#).with_status_code(200),
+                    )
+                    .unwrap();
+                }
+            }
+            writes
+        });
+
+        let root_dir = tmp_dir("mid-restack-stack-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+
+        let s = store();
+        let gid = s
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b", "c", "d"] {
+            s.add_guardian_branch(&gid, branch).unwrap();
+        }
+        s.set_guardian_forge_stack_number(&gid, 42).unwrap();
+        let branch_ids: Vec<String> = s
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        // Bottom-to-top, as the review is ordered: release <- 10 <- 11 <- 12 <- 13.
+        let chain = [
+            ("a-review", "release", 10_i64),
+            ("b-review", "a-review", 11),
+            ("c-review", "b-review", 12),
+            ("d-review", "c-review", 13),
+        ];
+        for (branch_id, (alias, base, number)) in branch_ids.iter().zip(chain) {
+            s.set_branch_review(&gid, branch_id, alias, "wt").unwrap();
+            s.create_pull_request(
+                &gid,
+                Some(branch_id),
+                "github",
+                "acme/widget",
+                alias,
+                base,
+                "Title",
+                "Description",
+                Some(number),
+                Some("http://x"),
+            )
+            .unwrap();
+        }
+        // The restack has re-promoted the bottom two branches, is working on
+        // the third, and has not reached the fourth. Two terminal branches is
+        // the smallest view that used to reach `Rebuild`: a one-branch view is
+        // below the two-PR floor and gets skipped for that reason instead.
+        for (branch_id, status) in branch_ids.iter().zip([
+            MergeStatus::Done,
+            MergeStatus::Done,
+            MergeStatus::InProgress,
+            MergeStatus::Pending,
+        ]) {
+            s.set_branch_status(&gid, branch_id, status, None).unwrap();
+        }
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        reconcile_native_pr_stack(&store, &client, &gid, None, 0).unwrap();
+
+        assert_eq!(
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
+            Some(42),
+            "a mid-restack reconcile must leave the registered stack in place"
+        );
+        // Retire the server thread: it serves reads until this sentinel and
+        // reports whatever writes it was asked for along the way.
+        let _ = ureq::get(&format!("http://{addr}/done"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call();
+        assert!(
+            handle.join().unwrap().is_empty(),
+            "reconciling a correct stack must not write to the forge"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn decide_stack_action_never_dissolves_a_stack_for_a_partial_restack_view() {
+        let full = vec![3, 6, 9, 12];
+        for partial in [vec![3, 6], vec![3, 6, 9]] {
+            let prs: Vec<(String, i64, i64)> = partial
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (format!("b-{i}"), i as i64, *n))
+                .collect();
+            assert_eq!(
+                decide_stack_action(&prs, Some((42, full.clone())), true),
+                StackAction::Skip {
+                    reason: "the registered native stack already contains every expected PR in this order",
+                },
+                "a {}-PR view of a {}-PR stack must not dissolve it",
+                partial.len(),
+                full.len()
+            );
+        }
+    }
+
+    /// The same partial view, but with the hole in the middle -- a branch
+    /// that left the terminal set to action reviewer feedback while the ones
+    /// above and below it stayed done.
+    #[test]
+    fn decide_stack_action_never_dissolves_a_stack_for_a_gapped_view() {
+        let prs = vec![
+            ("b-a".to_string(), 0, 3),
+            ("b-b".to_string(), 1, 6),
+            ("b-d".to_string(), 3, 12),
+        ];
+        assert_eq!(
+            decide_stack_action(&prs, Some((42, vec![3, 6, 9, 12])), true),
+            StackAction::Skip {
+                reason: "the registered native stack already contains every expected PR in this order",
+            }
+        );
+    }
+
+    /// The guard above must not swallow the changes a rebuild is actually
+    /// for: a reorder, and a PR appearing mid-stack.
+    #[test]
+    fn decide_stack_action_still_rebuilds_a_reordered_or_grown_stack() {
+        let reordered = vec![
+            ("b-a".to_string(), 0, 3),
+            ("b-c".to_string(), 1, 9),
+            ("b-b".to_string(), 2, 6),
+        ];
+        assert_eq!(
+            decide_stack_action(&reordered, Some((42, vec![3, 6, 9])), true),
+            StackAction::Rebuild {
+                stack_number: 42,
+                all_ordered: vec![3, 9, 6]
+            }
+        );
+
+        let grown = vec![
+            ("b-a".to_string(), 0, 3),
+            ("b-b".to_string(), 1, 6),
+            ("b-c".to_string(), 2, 9),
+        ];
+        assert_eq!(
+            decide_stack_action(&grown, Some((42, vec![3, 9])), true),
+            StackAction::Rebuild {
+                stack_number: 42,
+                all_ordered: vec![3, 6, 9]
+            }
+        );
+    }
+
+    #[test]
+    fn is_ordered_subset_requires_the_same_relative_order() {
+        assert!(is_ordered_subset(&[3, 9], &[3, 6, 9]));
+        assert!(is_ordered_subset(&[], &[3, 6]));
+        assert!(is_ordered_subset(&[3, 6], &[3, 6]));
+        assert!(!is_ordered_subset(&[9, 3], &[3, 6, 9]));
+        assert!(!is_ordered_subset(&[3, 7], &[3, 6, 9]));
+        assert!(!is_ordered_subset(&[3, 6, 9], &[3, 9]));
+    }
+
     #[test]
     fn guard_against_clobber_allows_first_push_and_blocks_divergence() {
         let root = tmp_dir("guard-root");
@@ -6814,10 +7914,18 @@ mod tests {
                 )
                 .unwrap();
             // A review with an open PR has settled; `sync_open_pr_branches`
-            // only reconciles one that has.
-            let gid = guard.get_pull_request(&pr_id).unwrap().guardian_id;
+            // only reconciles a branch that has too.
+            let pr = guard.get_pull_request(&pr_id).unwrap();
             guard
-                .set_guardian_status(&gid, GuardianStatus::InReview, None)
+                .set_guardian_status(&pr.guardian_id, GuardianStatus::InReview, None)
+                .unwrap();
+            guard
+                .set_branch_status(
+                    &pr.guardian_id,
+                    pr.branch_id.as_deref().unwrap(),
+                    MergeStatus::Done,
+                    None,
+                )
                 .unwrap();
         }
         (root, remote_dir, store, pr_id)
@@ -7515,17 +8623,22 @@ mod tests {
     }
 
     #[test]
-    fn sync_open_pr_branches_leaves_a_review_that_is_still_merging_alone() {
+    fn sync_open_pr_branches_leaves_a_branch_still_being_rebased_alone() {
         let (root, remote_dir, store, pr_id) = synced_fixture();
-        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
+        let (gid, bid) = {
+            let pr = store.lock().get_pull_request(&pr_id).unwrap();
+            (pr.guardian_id, pr.branch_id.unwrap())
+        };
+        // This branch's own pass hasn't finished -- its worktree tip can
+        // still be rewritten again before this merge attempt settles, so it
+        // is not yet the state the PR should show, independent of what the
+        // rest of the review is doing.
         store
             .lock()
-            .set_guardian_status(&gid, GuardianStatus::Merging, None)
+            .set_branch_status(&gid, &bid, MergeStatus::InProgress, None)
             .unwrap();
         let remote_before = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
 
-        // A merge in flight owns the branch tips, so a tip that has moved
-        // mid-merge is not yet the state the PR should show.
         g(&root, &["checkout", "review-branch"]);
         gwrite(&root, "half-done.txt", "wip\n");
         g(&root, &["add", "."]);
@@ -7536,6 +8649,40 @@ mod tests {
 
         let remote_after = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
         assert_eq!(remote_after, remote_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// The fix this review's dogfooding surfaced: a stacked branch that
+    /// finishes early must not have its PR held hostage by slower siblings
+    /// still working further down the same stack.
+    #[test]
+    fn sync_open_pr_branches_pushes_a_finished_branch_while_the_review_is_still_merging() {
+        let (root, remote_dir, store, pr_id) = synced_fixture();
+        let gid = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
+        // The overall review hasn't settled yet (some other branch further
+        // down the stack is still being worked), but THIS branch reached
+        // `conflict_resolved` -- its own pass is done, so its PR should not
+        // wait on the rest of the stack.
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::Merging, None)
+            .unwrap();
+
+        g(&root, &["checkout", "review-branch"]);
+        gwrite(&root, "resolved.txt", "resolved\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "conflict resolution"]);
+        g(&root, &["checkout", "main"]);
+        let new_local_sha = g(&root, &["rev-parse", "review-branch"]).trim().to_string();
+
+        sync_open_pr_branches(&store, &gid);
+
+        let pr = store.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.last_pushed_sha.as_deref(), Some(new_local_sha.as_str()));
+        let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
+        assert_eq!(remote_sha, new_local_sha);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
@@ -8831,23 +9978,21 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
-            // 1. Root PR (filed at the parent) merge-state check.
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/10");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-
-            // 2. Successor PR (filed at the fork) merge-state check -- still open.
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/alice/widget/pulls/20");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
+            // Answered in whichever order the concurrent fan-out delivers them.
+            // 1+2. Root PR (at the parent, merged) and successor (at the fork, open).
+            answer_merge_probes(
+                &server,
+                &[
+                    (
+                        "/repos/acme/widget/pulls/10",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/alice/widget/pulls/20",
+                        r#"{"state":"open","merged":false}"#,
+                    ),
+                ],
+            );
 
             // 3. Promotion: create the new cross-repo PR at the parent.
             let mut req = server.recv().unwrap();
@@ -8916,23 +10061,22 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/10");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-            // Successor's merge-state check: reconcile-first reads this
-            // before ever touching anything -- no further requests should
-            // follow since it's already filed at the parent below.
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/20");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
+            // Answered in whichever order the concurrent fan-out delivers them.
+            // Reconcile-first reads both before touching anything; no further
+            // requests should follow, since the successor is already filed at the parent.
+            answer_merge_probes(
+                &server,
+                &[
+                    (
+                        "/repos/acme/widget/pulls/10",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/acme/widget/pulls/20",
+                        r#"{"state":"open","merged":false}"#,
+                    ),
+                ],
+            );
         });
 
         let (store, gid, root_dir) = fork_promotion_fixture(&addr);
@@ -8971,25 +10115,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
+    /// Answer `check_pr_merges`'s per-PR merge-state probes in whatever order
+    /// they arrive, returning the URLs actually seen (sorted).
+    ///
+    /// Those probes are issued concurrently -- `check_pr_merges` fans them out
+    /// with `thread::scope`, since one PR's merge state has no bearing on
+    /// another's -- so the order they reach a mock server in is undefined. A
+    /// server script that `recv()`s them in a fixed sequence and asserts each
+    /// URL passes only while the machine is quiet enough for the threads to
+    /// finish in spawn order; under load it flips and the test fails.
+    ///
+    /// Worse, it *hangs* rather than fails: the assertion panics on the server
+    /// thread, so every later request finds nobody left to answer it and the
+    /// client blocks forever. Hence the deliberate non-panicking 500 below --
+    /// an unexpected request must still get a response, and the caller asserts
+    /// on the returned list once every probe has been answered.
+    fn answer_merge_probes(server: &tiny_http::Server, routes: &[(&str, &str)]) -> Vec<String> {
+        let mut seen = Vec::new();
+        for _ in 0..routes.len() {
+            let req = server.recv().unwrap();
+            let url = req.url().to_string();
+            let response = match routes.iter().find(|(route, _)| *route == url) {
+                Some((_, body)) => {
+                    tiny_http::Response::from_string(body.to_string()).with_status_code(200)
+                }
+                None => tiny_http::Response::from_string("unexpected request".to_string())
+                    .with_status_code(500),
+            };
+            req.respond(response).unwrap();
+            seen.push(url);
+        }
+        seen.sort();
+        seen
+    }
+
     #[test]
     fn a_non_fork_review_is_untouched_by_promotion() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/10");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
-                    .with_status_code(200),
+            answer_merge_probes(
+                &server,
+                &[
+                    (
+                        "/repos/acme/widget/pulls/10",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/acme/widget/pulls/20",
+                        r#"{"state":"open","merged":false}"#,
+                    ),
+                ],
             )
-            .unwrap();
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/20");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
         });
 
         // Same two-branch shape as the fork fixture, but no project/fork is
@@ -9081,7 +10258,14 @@ mod tests {
         );
         assert!(successor.superseded_by.is_none());
 
-        handle.join().unwrap();
+        assert_eq!(
+            handle.join().unwrap(),
+            vec![
+                "/repos/acme/widget/pulls/10".to_string(),
+                "/repos/acme/widget/pulls/20".to_string(),
+            ],
+            "both PRs must be probed, in whichever order the concurrent fan-out lands"
+        );
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -9093,27 +10277,24 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/pulls/10");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/alice/widget/pulls/20");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/alice/widget/pulls/30");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
-                    .with_status_code(200),
-            )
-            .unwrap();
+            // Answered in whichever order the concurrent fan-out delivers them.
+            answer_merge_probes(
+                &server,
+                &[
+                    (
+                        "/repos/acme/widget/pulls/10",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/alice/widget/pulls/20",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/alice/widget/pulls/30",
+                        r#"{"state":"open","merged":false}"#,
+                    ),
+                ],
+            );
 
             let mut req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Post);
@@ -9209,21 +10390,21 @@ mod tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
-            // 1. Root MR (filed on the fork, target_project_id -> parent) merge-state check.
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests/10");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"merged"}"#).with_status_code(200),
-            )
-            .unwrap();
-
-            // 2. Successor MR (also on the fork) merge-state check -- still open.
-            let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests/20");
-            req.respond(
-                tiny_http::Response::from_string(r#"{"state":"opened"}"#).with_status_code(200),
-            )
-            .unwrap();
+            // Answered in whichever order the concurrent fan-out delivers them.
+            // 1+2. Root MR and successor MR, both filed on the fork.
+            answer_merge_probes(
+                &server,
+                &[
+                    (
+                        "/projects/alice%2Fwidget/merge_requests/10",
+                        r#"{"state":"merged"}"#,
+                    ),
+                    (
+                        "/projects/alice%2Fwidget/merge_requests/20",
+                        r#"{"state":"opened"}"#,
+                    ),
+                ],
+            );
 
             // 3. Promotion resolves the parent's numeric GitLab project id.
             let req = server.recv().unwrap();
@@ -9778,7 +10959,7 @@ mod tests {
             )
             .unwrap();
 
-            reconcile_native_pr_stack(&store, &client, &gid, &ordered_enabled, None, 1).unwrap();
+            reconcile_native_pr_stack(&store, &client, &gid, None, 1).unwrap();
         }
 
         assert_eq!(
@@ -9957,7 +11138,7 @@ mod tests {
             guardian1.branches.iter().filter(|b| b.enabled).collect();
         ordered_enabled1.sort_by_key(|b| b.position);
         let mut alias_by_branch: HashMap<String, String> = HashMap::new();
-        let created1 = submit_stack_for_guardian(
+        let (created1, failed1) = submit_stack_for_guardian(
             &store,
             &runner,
             &client_origin,
@@ -9978,6 +11159,10 @@ mod tests {
             false,
         )
         .unwrap();
+        assert!(
+            failed1.is_empty(),
+            "round 1 should not report any per-branch failures: {failed1:?}"
+        );
         assert_eq!(
             created1.len(),
             1,
@@ -10009,7 +11194,7 @@ mod tests {
         ordered_enabled2.sort_by_key(|b| b.position);
         let existing_prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         let mut alias_by_branch = open_alias_by_branch(&existing_prs);
-        let created2 = submit_stack_for_guardian(
+        let (created2, failed2) = submit_stack_for_guardian(
             &store,
             &runner,
             &client_alt,
@@ -10030,6 +11215,10 @@ mod tests {
             false,
         )
         .unwrap();
+        assert!(
+            failed2.is_empty(),
+            "round 2 should not report any per-branch failures: {failed2:?}"
+        );
         assert_eq!(
             created2.len(),
             1,
@@ -10229,6 +11418,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
+    fn submit_stack_for_guardian_does_not_let_one_branchs_failure_touch_its_siblings() {
+        // Regression test for the "auto-submit failed" badge showing up on
+        // every branch in a review instead of just the one whose PR actually
+        // failed (e.g. GitHub's "no commits between X and Y" once a stacked
+        // branch's own diff is already in its base). Before this fix, this
+        // loop bailed out entirely via `?` on the first branch that failed
+        // to submit -- so a later branch in the same batch never even got
+        // attempted, and the batch's single error had nowhere to go but
+        // whichever branch its caller happened to be stamping, so a failure
+        // landed on branches that had not produced it.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        // A lenient dispatcher (rather than a hand-counted request sequence)
+        // so this test doesn't have to track every incidental call
+        // `submit_stacked_branch_pr` makes along the way (e.g. probing for a
+        // PR template) -- only the two calls this test actually cares about:
+        // branch A's create 422s, branch B's create succeeds.
+        let handle = std::thread::spawn(move || {
+            let mut received_any = false;
+            loop {
+                // The first `recv` is generous: under a full parallel
+                // `nextest` run this thread can be waiting behind real
+                // git2/filesystem setup work in the main thread while dozens
+                // of other tests contend for CPU, and too short a timeout
+                // here reads as "no more requests coming" and drops the
+                // listening socket before the real first request ever
+                // arrives. Once the client is mid-flow, a much shorter idle
+                // wait is enough to notice "done" without every run paying
+                // the full timeout as dead time at the end.
+                let timeout = if received_any {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_secs(30)
+                };
+                let mut req = match server.recv_timeout(timeout) {
+                    Ok(Some(r)) => r,
+                    _ => break,
+                };
+                received_any = true;
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Get && url.starts_with("/repos/acme/w/pulls?") {
+                    // `find_existing_pull_request`: report no pre-existing PR
+                    // for either branch, same as a fresh submission.
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/w/contents/")
+                {
+                    // PR-template probe: none of the candidate paths exist.
+                    req.respond(
+                        tiny_http::Response::from_string("Not Found").with_status_code(404),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Post && url == "/repos/acme/w/pulls" {
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    if body.contains("branch-a") {
+                        req.respond(
+                            tiny_http::Response::from_string(
+                                r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and branch-a"}]}"#,
+                            )
+                            .with_status_code(422),
+                        )
+                        .unwrap();
+                    } else {
+                        req.respond(
+                            tiny_http::Response::from_string(
+                                r#"{"number":77,"html_url":"http://x/77"}"#,
+                            )
+                            .with_status_code(201),
+                        )
+                        .unwrap();
+                    }
+                } else if method == tiny_http::Method::Get && url == "/repos/acme/w/pulls/77" {
+                    // `reconcile_native_pr_stack`'s `refresh_open_prs` re-checks
+                    // branch B's freshly-created PR is still open.
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"state":"open"}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else {
+                    panic!("unexpected request: {method:?} {url}");
+                }
+            }
+        });
+
+        let root = tmp_dir("split-failure-root");
+        let remote_dir = tmp_dir("split-failure-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+
+        repo.branch("branch-a", &base_commit, false).unwrap();
+        git2_checkout(&repo, "branch-a");
+        gwrite(&root, "a.txt", "a\n");
+        git2_commit_all(&repo, &sig, "commit a", &[&base_commit]);
+
+        git2_checkout(&repo, "main");
+        repo.branch("branch-b", &base_commit, false).unwrap();
+        git2_checkout(&repo, "branch-b");
+        gwrite(&root, "b.txt", "b\n");
+        git2_commit_all(&repo, &sig, "commit b", &[&base_commit]);
+
+        git2_checkout(&repo, "main");
+
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-a").unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-b").unwrap();
+        let ids_guardian = store.lock().get_guardian(&gid).unwrap();
+        let branch_a_id = ids_guardian.branches[0].id.clone();
+        let branch_b_id = ids_guardian.branches[1].id.clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_a_id, "branch-a", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_b_id, "branch-b", root.to_str().unwrap())
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let mut alias_by_branch = HashMap::new();
+
+        let (created, failed) = submit_stack_for_guardian(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            &[],
+            "{name}-pr",
+            None,
+            "stack-1",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("a per-branch failure must not fail the whole batch");
+
+        assert_eq!(created.len(), 1, "branch B must still be submitted");
+        assert_eq!(created[0].branch_id.as_deref(), Some(branch_b_id.as_str()));
+        assert_eq!(
+            failed.len(),
+            1,
+            "exactly branch A's own failure must be reported, not one per branch"
+        );
+        assert_eq!(failed[0].0, branch_a_id);
+        assert!(failed[0].1.contains("422"), "{}", failed[0].1);
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]
@@ -10604,9 +11975,8 @@ mod tests {
 
     #[test]
     fn submit_stacked_branch_pr_clears_a_stale_auto_submit_error_on_success() {
-        // RAL-317's `auto_submit_error` badge is only ever cleared by
-        // `maybe_auto_submit_branch`'s own success path, scoped to the one
-        // branch whose terminal transition triggered that specific call --
+        // RAL-317's `auto_submit_error` badge is cleared by
+        // `run_auto_submit_pass` only for the branches that pass covered --
         // so a PR that succeeds through any other route (this function, the
         // single site every creation/adoption path funnels through) must
         // clear the branch's own stale marker itself, or the board keeps
@@ -10847,12 +12217,49 @@ mod tests {
                 None,
             )
             .unwrap();
-        s.mark_pr_comment_actioned(&id, "c1").unwrap();
-        s.mark_pr_comment_actioned(&id, "c1").unwrap(); // idempotent
-        s.mark_pr_comment_actioned(&id, "c2").unwrap();
+        let won = s.try_claim_pr_comments(&id, &["c1".to_string()]).unwrap();
+        assert_eq!(won, vec!["c1".to_string()]);
+        // Re-claiming an already-claimed id wins nothing -- this is the
+        // invariant a second, overlapping caller relies on to avoid
+        // double-actioning the same comment.
+        let rewon = s.try_claim_pr_comments(&id, &["c1".to_string()]).unwrap();
+        assert!(rewon.is_empty());
+        let won2 = s.try_claim_pr_comments(&id, &["c2".to_string()]).unwrap();
+        assert_eq!(won2, vec!["c2".to_string()]);
         let ids = s.actioned_pr_comment_ids(&id).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("c1") && ids.contains("c2"));
+    }
+
+    #[test]
+    fn try_claim_pr_comments_only_lets_one_caller_win_each_id() {
+        let s = store();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let id = s
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        // Simulates two overlapping callers (e.g. a manual click racing the
+        // standing poll) both reading the same fresh comment set before
+        // either claims it.
+        let ids = vec!["c1".to_string(), "c2".to_string()];
+        let first = s.try_claim_pr_comments(&id, &ids).unwrap();
+        let second = s.try_claim_pr_comments(&id, &ids).unwrap();
+        assert_eq!(first, ids);
+        assert!(
+            second.is_empty(),
+            "a second overlapping claim must win nothing the first call already won"
+        );
     }
 
     #[test]
@@ -11152,7 +12559,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // ── RAL-317: maybe_auto_submit_branch (per-branch auto-submit trigger) ──
+    // ── RAL-317: run_auto_submit_pass (the review-scoped auto-submit pass) ──
     //
     // These deliberately never push over a real git transport or hit a real
     // (or mock-HTTP) forge -- there's no portable, hang-proof way to fake a
@@ -11164,10 +12571,10 @@ mod tests {
     // environment has no `git-daemon` to fall back on). Every existing
     // `pr.rs` test that touches `submit_stacked_branch_pr`'s push+create
     // path has the same gap, so these follow the same scope precedent:
-    // exercise `maybe_auto_submit_branch`'s own decision logic (effective-
-    // option gate, cheap local-only diff, error bookkeeping) with a real
-    // git repo but no reachable forge, rather than the full submission
-    // machinery it delegates to on a cache miss.
+    // exercise `run_auto_submit_pass`'s own decision logic (effective-option
+    // gate, which branches a pass covers, error bookkeeping) with a real git
+    // repo but no reachable forge, rather than the full submission machinery
+    // it delegates to.
 
     struct NoopRunner;
     impl Runner for NoopRunner {
@@ -11268,14 +12675,156 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_submit_branch_is_noop_when_effective_option_is_off() {
+    fn auto_submit_does_not_create_or_reconcile_a_stack_after_approval() {
+        let root = setup_auto_submit_repo("auto-submit-approved-read-only");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (id, branch_id, _tip) = setup_terminal_branch(&store, &root, true);
+        store
+            .lock()
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        store.lock().approve_guardian(&id).unwrap();
+
+        run_auto_submit_pass(&store, &NoopRunner, &id);
+
+        assert!(
+            store
+                .lock()
+                .list_pull_requests_for_guardian(&id)
+                .unwrap()
+                .is_empty(),
+            "a queued auto-submit must not create a PR after approval"
+        );
+        assert!(
+            store
+                .lock()
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .iter()
+                .find(|branch| branch.id == branch_id)
+                .unwrap()
+                .auto_submit_error
+                .is_none(),
+            "a terminal review must not receive new auto-submit bookkeeping"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_recovery_does_not_requeue_an_approved_review() {
+        let root = setup_auto_submit_repo("recovery-approved-read-only");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (id, _branch_id, _tip) = setup_terminal_branch(&store, &root, true);
+        store
+            .lock()
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        store.lock().approve_guardian(&id).unwrap();
+
+        recover_pending_auto_submits_on_startup(&store);
+
+        assert!(
+            store
+                .lock()
+                .take_due_auto_submits(i64::MAX / 2, 0)
+                .unwrap()
+                .is_empty(),
+            "startup recovery must not revive a terminal review's queue entry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-389 follow-up: the sweep runs exactly one pass per review per
+    /// tick, and that pass owns the outcome of every terminal branch it
+    /// covered -- not just one of them. Before this, the sweep called a
+    /// branch-scoped entry point once per terminal branch, and each call
+    /// re-ran the whole review (a live-state GET per PR, the native-stack
+    /// read, and a full `sync_open_pr_branches` git sweep against the shared
+    /// repository root) only to stamp its own single branch. Here a
+    /// whole-pass failure -- forge resolution, which no branch owns -- must
+    /// reach all three branches from the one pass.
+    #[test]
+    fn one_auto_submit_pass_stamps_every_branch_it_covered() {
+        let root = setup_auto_submit_repo("auto-submit-fan-out");
+        for branch in ["feature/y", "feature/z"] {
+            g(&root, &["checkout", "-b", branch, "feature/x"]);
+            gwrite(&root, "more.txt", branch);
+            g(&root, &["add", "."]);
+            g(&root, &["commit", "--message", "more"]);
+        }
+        g(&root, &["checkout", "main"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        // No git remote is configured, so `resolve_remote` fails fast (no
+        // network attempted) and the whole pass errors out.
+        let (gid, first_bid, _tip) = setup_terminal_branch(&store, &root, true);
+        for branch in ["feature/y", "feature/z"] {
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
+        }
+        let branch_ids: Vec<String> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(branch_ids.len(), 3);
+        assert_eq!(branch_ids[0], first_bid);
+        for (branch_id, branch) in branch_ids
+            .iter()
+            .zip(["feature/x", "feature/y", "feature/z"])
+        {
+            store
+                .lock()
+                .set_branch_review(&gid, branch_id, branch, "")
+                .unwrap();
+            store
+                .lock()
+                .set_branch_status(&gid, branch_id, crate::guardian::MergeStatus::Done, None)
+                .unwrap();
+        }
+
+        run_auto_submit_pass(&store, &NoopRunner, &gid);
+
+        let gv = store.lock().get_guardian(&gid).unwrap();
+        let errors: Vec<Option<String>> = branch_ids
+            .iter()
+            .map(|id| {
+                gv.branches
+                    .iter()
+                    .find(|b| &b.id == id)
+                    .unwrap()
+                    .auto_submit_error
+                    .clone()
+            })
+            .collect();
+        assert!(
+            errors.iter().all(Option::is_some),
+            "one pass must stamp every branch it covered, got {errors:?}"
+        );
+        assert!(
+            errors.windows(2).all(|w| w[0] == w[1]),
+            "every branch must carry the same whole-pass error, got {errors:?}"
+        );
+        // The branch statuses stay exactly where the merge worker left them:
+        // a submission failure is never a merge-blocking one.
+        assert_eq!(gv.status, "collecting");
+        assert!(gv.branches.iter().all(|b| b.merge_status == "done"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_submit_pass_is_noop_when_effective_option_is_off() {
         let root = setup_auto_submit_repo("auto-submit-off");
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // effective_auto_submit_pr_stack defaults to false (no override, no
         // registered project default) -- left untouched deliberately.
         let (gid, bid, _tip) = setup_terminal_branch(&store, &root, false);
 
-        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+        run_auto_submit_pass(&store, &NoopRunner, &gid);
 
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert!(prs.is_empty(), "auto-submit must be a no-op when disabled");
@@ -11293,7 +12842,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_submit_branch_reconciles_even_when_its_pr_sha_is_current() {
+    fn auto_submit_pass_reconciles_even_when_a_branchs_pr_sha_is_current() {
         let root = setup_auto_submit_repo("auto-submit-covered");
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let (gid, bid, tip) = setup_terminal_branch(&store, &root, true);
@@ -11337,7 +12886,7 @@ mod tests {
         // This guardian has no git remote configured. A current PR SHA is not
         // enough to establish stack health, so auto-submit must attempt the
         // shared reconciliation path and report that it could not do so.
-        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+        run_auto_submit_pass(&store, &NoopRunner, &gid);
 
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
@@ -11360,15 +12909,14 @@ mod tests {
     }
 
     #[test]
-    fn maybe_auto_submit_branch_records_error_on_forge_resolution_failure_without_touching_branch_status()
-     {
+    fn auto_submit_pass_records_error_on_forge_resolution_failure_without_touching_branch_status() {
         let root = setup_auto_submit_repo("auto-submit-fail");
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // No git remote configured -- `resolve_remote` fails fast (no
         // network attempted, no hang) with "could not read remote 'origin'".
         let (gid, bid, _tip) = setup_terminal_branch(&store, &root, true);
 
-        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+        run_auto_submit_pass(&store, &NoopRunner, &gid);
 
         // The failed forge resolution must never be surfaced as a merge-
         // blocking error: the branch's own terminal status (already
@@ -11427,7 +12975,7 @@ mod tests {
             )
             .unwrap();
 
-        maybe_auto_submit_branch(&store, &NoopRunner, &gid, &bid);
+        run_auto_submit_pass(&store, &NoopRunner, &gid);
         let gv = store.lock().get_guardian(&gid).unwrap();
         assert!(
             gv.branches
@@ -11555,15 +13103,17 @@ mod tests {
 
         s.upsert_pr_forge_cache(
             &pr_id,
-            true,
-            None,
-            Some(true),
-            Some(false),
-            Some(false),
-            Some("abc"),
-            Some("abc"),
-            Some("etag-1"),
-            None,
+            Some(Ok(DriftObservation {
+                in_sync: true,
+                pr_ahead: false,
+                worktree_ahead: false,
+                remote_sha: Some("abc"),
+                local_sha: Some("abc"),
+            })),
+            Some(Ok(CommentsObservation {
+                etag_conversation: Some("etag-1"),
+                etag_review: None,
+            })),
         )
         .unwrap();
 
@@ -11571,14 +13121,13 @@ mod tests {
         // omitted as `None`) must not blank out the etag a prior pass wrote.
         s.upsert_pr_forge_cache(
             &pr_id,
-            true,
-            None,
-            Some(false),
-            Some(true),
-            Some(false),
-            Some("def"),
-            Some("abc"),
-            None,
+            Some(Ok(DriftObservation {
+                in_sync: false,
+                pr_ahead: true,
+                worktree_ahead: false,
+                remote_sha: Some("def"),
+                local_sha: Some("abc"),
+            })),
             None,
         )
         .unwrap();
@@ -11599,14 +13148,13 @@ mod tests {
         let (_gid, pr_id) = make_pr(&s);
         s.upsert_pr_forge_cache(
             &pr_id,
-            true,
-            None,
-            Some(true),
-            Some(false),
-            Some(false),
-            Some("abc"),
-            Some("abc"),
-            None,
+            Some(Ok(DriftObservation {
+                in_sync: true,
+                pr_ahead: false,
+                worktree_ahead: false,
+                remote_sha: Some("abc"),
+                local_sha: Some("abc"),
+            })),
             None,
         )
         .unwrap();
@@ -11616,15 +13164,8 @@ mod tests {
         // readable rather than being wiped to `None`.
         s.upsert_pr_forge_cache(
             &pr_id,
-            false,
-            Some("forge API 503: offline"),
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            Some(Err("forge API 503: offline".to_string())),
         )
         .unwrap();
 
@@ -11661,8 +13202,15 @@ mod tests {
             ],
         )
         .unwrap();
-        s.upsert_pr_forge_cache(&pr_id, true, None, None, None, None, None, None, None, None)
-            .unwrap();
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            None,
+            Some(Ok(CommentsObservation {
+                etag_conversation: None,
+                etag_review: None,
+            })),
+        )
+        .unwrap();
 
         let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
         assert_eq!(cache.comment_count, 2);
@@ -11675,7 +13223,7 @@ mod tests {
 
         // Marking one actioned changes the *join result* on the next read --
         // never a second stored count that could drift out of step.
-        s.mark_pr_comment_actioned(&pr_id, "1").unwrap();
+        s.try_claim_pr_comments(&pr_id, &["1".to_string()]).unwrap();
         let cache = s.get_pr_forge_cache(&pr_id).unwrap().unwrap();
         assert_eq!(cache.comment_count, 2);
         assert_eq!(cache.unactioned_count, 1);
@@ -11695,8 +13243,15 @@ mod tests {
             .unwrap();
         s.replace_pr_forge_comments(&pr_id, "review", &[comment("9")])
             .unwrap();
-        s.upsert_pr_forge_cache(&pr_id, true, None, None, None, None, None, None, None, None)
-            .unwrap();
+        s.upsert_pr_forge_cache(
+            &pr_id,
+            None,
+            Some(Ok(CommentsObservation {
+                etag_conversation: None,
+                etag_review: None,
+            })),
+        )
+        .unwrap();
         assert_eq!(
             s.get_pr_forge_cache(&pr_id).unwrap().unwrap().comment_count,
             3
@@ -11719,14 +13274,13 @@ mod tests {
         let (gid, pr_id) = make_pr(&s);
         s.upsert_pr_forge_cache(
             &pr_id,
-            true,
-            None,
-            Some(true),
-            Some(false),
-            Some(false),
-            None,
-            None,
-            None,
+            Some(Ok(DriftObservation {
+                in_sync: true,
+                pr_ahead: false,
+                worktree_ahead: false,
+                remote_sha: None,
+                local_sha: None,
+            })),
             None,
         )
         .unwrap();
@@ -11810,14 +13364,13 @@ mod tests {
             .lock()
             .upsert_pr_forge_cache(
                 &pr_id,
-                true,
-                None,
-                Some(true),
-                Some(false),
-                Some(false),
-                Some("stale-remote"),
-                Some("stale-local"),
-                None,
+                Some(Ok(DriftObservation {
+                    in_sync: true,
+                    pr_ahead: false,
+                    worktree_ahead: false,
+                    remote_sha: Some("stale-remote"),
+                    local_sha: Some("stale-local"),
+                })),
                 None,
             )
             .unwrap();

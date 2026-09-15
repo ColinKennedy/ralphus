@@ -2318,21 +2318,48 @@ per-project, since one poll cycle spans every project's repos):
 
 | `.ralphus.toml [pr_cache]` key | Meaning | Unset resolves to |
 |---|---|---|
-| `enabled` | Whether the poller runs at all. `false` disables it entirely — existing cached rows are left in place, just stop refreshing. | `true` |
+| `enabled` | Whether the **cache refresh** runs. `false` leaves existing cached rows in place and stops refreshing them. It does *not* disable RAL-279's base-drift reconciliation, which shares the same thread. | `true` |
 | `poll_interval_secs` | Seconds between poll passes. Values under 5s are treated as unset (a misconfigured `0` would otherwise busy-loop the poller against every open PR's forge). | `300` (RAL-279's original base-drift-poll cadence) |
 
 The poller never consumes a scheduler concurrency permit, skips entirely
 during a configured `[daemon].downtime` window (RAL-122), and batches one
 `git fetch` per guardian's git root covering every one of that guardian's
-open PRs' branches — never one `git fetch` per PR. It acquires each PR's
-drift-check lock with a non-blocking `try_lock`: a PR an interactive
-`sync-status` call is already checking is simply left at its last-known
-value for that cycle rather than making either side wait on the other.
+open PRs' branches — never one `git fetch` per PR.
+
+Each pass runs in two ordered stages, and the ordering matters in **both**
+directions:
+
+1. **Drift** holds each PR's fetch lock, taken with a non-blocking `try_lock`.
+   A PR an interactive `sync-status` call is already checking is left at its
+   last-known value for that cycle, so the poller never makes foreground work
+   wait.
+2. **Comments** runs only once every one of those locks has been released.
+   `compute_sync_status` takes the same per-PR lock *blocking*, so a foreground
+   drift check waits at most for one PR's own `git fetch` — never for this
+   poller's forge round-trips. (Before this split, it did: `sync-status` took
+   an order of magnitude longer than its own work, and because each blocked
+   request holds a read-pool worker, unrelated reads starved behind it.)
+
 Forge comment fetches are conditional (`If-None-Match`/`ETag`), so an
 unchanged PR costs no forge quota on repeat polls, and a `429`/`403`
 response backs the affected forge client off for a cooldown window
 (honoring the forge's own `Retry-After` when it sends one) instead of
-retrying every cycle.
+retrying every cycle. The backoff is checked before a guardian's pass begins,
+so a rate-limited forge is skipped entirely rather than still receiving that
+cycle's git fetches and base-drift calls.
+
+Rows for PRs that are no longer `open` are pruned once per cycle — the poller
+only visits open PRs, so otherwise a merged PR's row would persist at
+whatever values it last held.
+
+**Freshness is per half, not per row.** A pass refreshes drift (git) and
+comments (forge) independently, and either can fail or be skipped on its own,
+so `last_checked_at_ms`/`status` are only a coarse "when was this row last
+touched". Anything deciding whether cached data is fresh enough to act on must
+read `drift_checked_at_ms`/`drift_status` or
+`comments_checked_at_ms`/`comments_status`: a pass that refreshed only
+comments still moves the rolled-up timestamp, so it can read as seconds old
+while the drift columns are hours stale.
 
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
@@ -2382,10 +2409,18 @@ resolve — see below) rather than force-pushing over a PR branch that has
 commits the review worktree doesn't, e.g. a reviewer pushed a fix directly to
 the open PR branch instead of leaving a comment (RAL-190).
 
+The posted feedback message is attributed to the caller-claimed identity sent
+in `X-Ralphus-User` (falling back to `[daemon].default_user`, same resolution
+as everywhere else), or `"Manual (PR feedback)"` if neither resolves — this
+call always reads as a person-initiated action in the board's chat thread,
+distinct from the automated CI auto-fix system's own attribution. Each
+comment is claimed atomically before being applied, so two overlapping calls
+for the same PR (e.g. a double-click) can never both apply the same comment.
+
 ### `GET /api/pull-requests/{pr_id}/sync-status`
-Live drift check between the PR's remote `branch_alias` branch and its owning
-review worktree (RAL-190) — fetches the remote branch and compares tips via
-`git merge-base --is-ancestor` in both directions:
+Drift check between the PR's remote `branch_alias` branch and its owning
+review worktree (RAL-190) — compares tips via `git merge-base --is-ancestor`
+in both directions:
 ```json
 {
   "remote_sha": "abc123...",
@@ -2396,6 +2431,20 @@ review worktree (RAL-190) — fetches the remote branch and compares tips via
   "worktree_ahead": false
 }
 ```
+**Which half is live.** The **worktree** tip is always read fresh, on every
+call — it is a local `git rev-parse`, and it is the side ralphus itself moves
+on every rebase, restack and feedback pass, so a cached value there could be
+several rebases out of date. The **remote** tip may be served from the cache
+poller's last successful observation when that is under two minutes old,
+because it is the only half needing a network round-trip; otherwise it is
+fetched. A result served from cache is not written back, so a stale
+observation can never renew its own freshness.
+
+The practical bound is therefore "a push made to the PR branch in the last two
+minutes may not show yet" — never "this comparison is against a branch state
+that no longer exists". Callers needing a guaranteed-live remote tip should
+use the pull/push flows, which fetch unconditionally.
+
 `pr_ahead` means the PR branch has commits the review worktree doesn't (a
 reviewer pushed directly to it — the board should offer "Pull PR commits");
 `worktree_ahead` means the reverse (the review worktree has commits not yet

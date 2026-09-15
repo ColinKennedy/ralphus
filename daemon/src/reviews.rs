@@ -162,15 +162,30 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
 /// checked out at `cwd`. A cell rebased onto an upstream task inherits that
 /// task's commits, so its own task finalizer must compare against the rebased
 /// upstream rather than the worktree's original creation base.
+///
+/// `baseline` is resolved to its commit SHA *now* and that SHA -- not the
+/// name given -- is what gets stored. `baseline` is routinely a branch name
+/// (e.g. an upstream task's own branch, or a remote-tracking ref), and a
+/// branch name is a moving target: anything that later advances it (another
+/// commit on that branch, a push landing on it, a fetch picking up someone
+/// else's push) would otherwise retroactively make it look like *this*
+/// worktree's own commits were "already accounted for," even though nothing
+/// about this worktree changed. Freezing the resolved commit here is what
+/// makes the marker a comparison point fixed at the moment this call ran,
+/// rather than a live pointer re-read at guard-check time.
 pub(crate) fn set_worktree_commit_baseline(
     cwd: &Path,
     baseline: &str,
 ) -> std::result::Result<(), String> {
     let branch = worktree_branch(cwd)?;
-    git(cwd, &["rev-parse", "--verify", baseline])?;
+    let resolved = git(cwd, &["rev-parse", "--verify", baseline])?;
     git(
         cwd,
-        &["config", &format!("ralphus.{branch}.baseline"), baseline],
+        &[
+            "config",
+            &format!("ralphus.{branch}.baseline"),
+            resolved.trim(),
+        ],
     )
     .map(|_| ())
 }
@@ -190,21 +205,36 @@ pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, Strin
 }
 
 /// The durable comparison ref [`worktree_has_commits_ahead_of_upstream`]
-/// reads: prefers the `ralphus.<branch>.baseline` git config key
-/// [`crate::worktrees::set_explicit_upstream`] mirrors the resolved
-/// `?upstream=` ref into, falling back to the live `@{upstream}` tracking ref
-/// when no such marker exists (a worktree materialized before this fix, or a
-/// plain checkout never routed through [`crate::worktrees::ensure_worktree`]).
+/// reads: prefers the `ralphus.<branch>.baseline` git config key, falling
+/// back to the live `@{upstream}` tracking ref when no such marker exists (a
+/// worktree materialized before this fix, or a plain checkout never routed
+/// through [`crate::worktrees::ensure_worktree`]).
 ///
-/// The fallback-only marker matters because `@{upstream}` itself is exactly
-/// what `git push -u`/`--set-upstream` overwrites: a `finalize` cell pushing a
-/// brand-new branch for the first time routinely needs `-u` (a bare `git
-/// push` fails until *some* upstream is configured), which retargets
-/// `branch.<branch>.remote`/`.merge` from the intended base branch onto the
-/// branch's own just-pushed remote copy — after which `@{upstream}` always
-/// equals `HEAD`, indistinguishable from "no progress". The
-/// `ralphus.<branch>.baseline` key lives in a config namespace git itself
-/// never writes to, so it survives that push untouched.
+/// The marker, once present, holds a *resolved commit SHA*, frozen at the
+/// moment [`crate::worktrees::ensure_worktree`] (via
+/// [`set_worktree_commit_baseline`]) last wrote it — never a live branch or
+/// remote-tracking ref name. Two independent things can otherwise move such
+/// a name out from under this check, both observed in practice:
+///
+/// - `@{upstream}` itself is exactly what `git push -u`/`--set-upstream`
+///   overwrites: a `finalize` cell pushing a brand-new branch for the first
+///   time routinely needs `-u` (a bare `git push` fails until *some*
+///   upstream is configured), which retargets `branch.<branch>.remote`/
+///   `.merge` from the intended base branch onto the branch's own
+///   just-pushed remote copy — after which `@{upstream}` always equals
+///   `HEAD`, indistinguishable from "no progress".
+/// - A remote-tracking ref used as the baseline (e.g. `refs/remotes/origin/
+///   staging`, the review's shared base branch) can itself be advanced by
+///   *anything* that pushes or fetches into it during the run — including a
+///   `finalize` cell that, seeing `git status` describe that ref as "your
+///   branch's upstream," pushes its own commit directly onto it. That push
+///   updates the local remote-tracking ref as a side effect, so a *live*
+///   name-based baseline would immediately read the task's own just-pushed
+///   commit as already "in the baseline," reporting real work as no
+///   progress at all.
+///
+/// Resolving to a SHA once, up front, is immune to both: nothing that
+/// happens to the name afterward can move the frozen comparison point.
 fn workspace_baseline_ref(workspace: &Workspace) -> std::result::Result<String, String> {
     if let Ok(branch) = workspace.git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
         let branch = branch.trim();
@@ -743,6 +773,15 @@ pub fn derive_reviews_with_prefetch(
     if cell_info.iter().all(|(_, rev_id)| rev_id.is_none()) {
         return Ok(Vec::new());
     }
+
+    // RAL-<pending>: a cheap, best-effort pass for `require_auto_build_declaration`
+    // (below) BEFORE paying for `resolve_placeholders_with_prefetch`'s real `git
+    // worktree add` calls -- a missing `[[review.auto_build]]`/`skip_auto_build`
+    // is a purely syntactic mistake and shouldn't cost a whole batch's worth of
+    // worktree creation to discover. See its own doc comment for why this only
+    // covers link-key reviews and is advisory (the real check below still runs
+    // regardless, so an imprecise answer here only costs time, never correctness).
+    require_auto_build_declaration_early(store, file, &tasks, &cells, &cell_info)?;
 
     // A review-opted-in cell's `cwd` may still be an unmaterialized
     // `ralphus:new-worktree/<branch>` placeholder (RAL-100): normally the
@@ -1369,6 +1408,94 @@ fn apply_auto_build(
     Ok(())
 }
 
+/// Preflight review build declarations before squad insertion, using only
+/// registered project configuration. It covers LINK-KEY reviews
+/// (`ralphus:new-review/<key>`, `id` starting with
+/// [`ralphus_core::schema::REVIEW_LINK_PREFIX`]) — a
+/// plain-name review's membership can still be SPLIT into multiple guardians
+/// by *resolved git root* once worktrees exist (see the "project groups" loop
+/// in [`derive_reviews_with_prefetch`]), so this function cannot safely
+/// predict its final per-guardian project set and leaves those to the late
+/// check exactly as before. A link-key review is never split that way — every
+/// cell sharing a `<key>` always folds into one guardian — so its full
+/// project set is already knowable from each referencing cell's *owning
+/// task's declared `project` name*, no worktree resolution required.
+///
+/// That declared name is then proxied through the project's *registered*
+/// root path (`Store::resolve_project`), not the eventual per-branch
+/// worktree path the late check uses, when asking
+/// `crate::config::resolve` whether a project-level `auto_build` default
+/// covers it — the two paths can differ (a worktree is a subdirectory
+/// alongside the main checkout), but `.ralphus.toml` config is layered
+/// upward from wherever you start, so both normally resolve the same files.
+/// The materialization path repeats the check against resolved worktree paths
+/// before creating a guardian.
+pub(crate) fn preflight_auto_build_declarations(
+    store: &Store,
+    file: &TaskFile,
+) -> std::result::Result<(), ReviewError> {
+    let (cells, tasks, cell_info) = rows_from_file(file);
+    require_auto_build_declaration_early(store, file, &tasks, &cells, &cell_info)
+}
+
+fn require_auto_build_declaration_early(
+    store: &Store,
+    file: &TaskFile,
+    tasks: &[TaskRow],
+    cells: &[CellRow],
+    cell_info: &CellReviewInfo,
+) -> std::result::Result<(), ReviewError> {
+    let review_map: std::collections::HashMap<&str, &ReviewDef> = file
+        .review
+        .iter()
+        .filter_map(|rv| rv.id.as_deref().map(|id| (id, rv)))
+        .collect();
+    let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
+
+    let mut projects_by_review: BTreeMap<&str, HashSet<String>> = BTreeMap::new();
+    for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
+        let Some(rev_id) = rev_id_opt else { continue };
+        if !rev_id.starts_with(ralphus_core::schema::REVIEW_LINK_PREFIX) {
+            continue; // Plain-name reviews may still split by git root later.
+        }
+        let Some(project_name) = tasks_by_idx
+            .get(&cells[pos].task_idx)
+            .and_then(|t| t.project.as_deref())
+        else {
+            continue;
+        };
+        projects_by_review
+            .entry(rev_id)
+            .or_default()
+            .insert(project_name.to_string());
+    }
+
+    for (rev_id, project_names) in projects_by_review {
+        let Some(rv) = review_map.get(rev_id) else {
+            continue;
+        };
+        if !rv.auto_build.is_empty() || rv.skip_auto_build {
+            continue;
+        }
+        let covered = !project_names.is_empty()
+            && project_names.iter().all(|name| {
+                store.resolve_project(name).ok().flatten().is_some_and(|p| {
+                    crate::config::resolve(Path::new(&p.path))
+                        .auto_build
+                        .is_some()
+                })
+            });
+        if covered {
+            continue;
+        }
+        return Err(ReviewError::new(format!(
+            "{rev_id} must declare [[review.auto_build]] or skip_auto_build = true \
+             (or configure a project-level auto_build default in .ralphus.toml)"
+        )));
+    }
+    Ok(())
+}
+
 /// RAL-342: every review must explicitly declare its finalize-time build step
 /// -- `[[review.auto_build]]` or `skip_auto_build = true` -- unless every
 /// distinct project in the group already has a project-level `auto_build`
@@ -1483,12 +1610,11 @@ fn add_new_branches(
 /// classification) is pooled into every one of them independently -- then
 /// check whether any of those pools' count thresholds has now fired (a cron
 /// schedule can also fire one independently -- see `crate::scheduler`'s
-/// Triage tick). A firing pool is drained in threshold-sized batches
-/// (RAL-421 -- see [`fire_triage_pool_in_threshold_batches`]), each full
-/// batch its own fresh review guardian, through the same Collecting ->
-/// Approved -> Deployed pipeline [`derive_reviews`] uses, flagged
-/// [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`]. Returns the created
-/// guardian ids (empty when no cell opts into Triage, or no pool fired).
+/// Triage tick). A firing pool is drained and turned into a fresh review
+/// guardian through the same Collecting -> Approved -> Deployed pipeline
+/// [`derive_reviews`] uses, flagged [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`].
+/// Returns the created guardian ids (empty when no cell opts into Triage, or
+/// no pool fired).
 ///
 /// Each cell's resolved Triage type(s) must already be persisted (see
 /// `Store::set_cell_triage_types`) -- classification itself
@@ -1497,13 +1623,12 @@ fn add_new_branches(
 /// pooled with an unknown type (should not happen in the normal submit path).
 ///
 /// Race-safety: the threshold-check here and the scheduler's independent
-/// cron-check race on the same pool, but both ultimately drain through
-/// [`Store::drain_triage_pool_batch`]/[`Store::drain_triage_pool`], each a
-/// serialized read-then-delete sequence executed while holding the daemon's
-/// one `crate::store_lock::StoreHandle` (same reliance every other
-/// cumulative-then-act sequence in this module makes) -- whichever caller
-/// drains a cell first removes it for the other, so no cell is ever
-/// double-counted across two forced reviews.
+/// cron-check race on the same pool, but both ultimately call
+/// [`Store::drain_triage_pool`], a single atomic `DELETE ... RETURNING`
+/// executed while holding the daemon's one `crate::store_lock::StoreHandle` (same
+/// reliance every other cumulative-then-act sequence in this module makes) --
+/// whichever caller drains first empties the pool for the other, so no cell
+/// is ever double-counted across two forced reviews.
 ///
 /// # Errors
 /// Returns [`ReviewError`] for the same class of problems [`derive_reviews`]
@@ -1695,73 +1820,44 @@ pub fn derive_triage_pools(
             .get_triage_pool_threshold(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
         if threshold.is_some_and(|t| count >= t) {
-            // RAL-421: a firing pool drains in threshold-sized batches --
-            // each full batch becomes its own review, and only the final
-            // remainder (fewer than `threshold` viable cells) stays pooled.
-            // The drain only ever touches this exact pool key, never a
-            // sibling subproject or triage type.
-            let created_here = fire_triage_pool_in_threshold_batches(
-                store,
-                &project,
-                &triage_type,
-                threshold.unwrap(),
-            )
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-            created.extend(created_here);
+            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+                created.push(gid);
+            }
         }
     }
     Ok(created)
 }
 
-/// Drain `(project, triage_type)` in threshold-sized batches (RAL-421),
-/// creating one fresh review guardian per batch, until fewer than
-/// `threshold` viable cells remain pooled. A pool of 10 with `threshold = 3`
-/// fires as three batches of 3 (three reviews), leaving its final 1 cell
-/// pooled for the next round. Returns every guardian id created.
-///
-/// The whole set-and-drain sequence runs under the caller's single store
-/// lock hold, and each batch goes through the atomic
-/// [`Store::drain_triage_pool_batch`] -- so a concurrent caller firing the
-/// same pool (the scheduler's cron tick, or another submission's own count
-/// check) drains leftover batches rather than double-draining the same
-/// cells, and an already-emptied pool simply produces zero batches. This is
-/// exactly what makes two racing firings of one pool settle on one set of
-/// reviews from one set of cells (concurrent empty-pool safety).
-///
-/// # Errors
-/// Returns [`ReviewError`] on any store failure while creating a guardian
-/// or attaching its branches.
-pub(crate) fn fire_triage_pool_in_threshold_batches(
+/// Re-check every Triage pool touched by `squad_id` after one of its tasks
+/// completes. Cells enter a pool at submission time so they remain visible as
+/// scheduled candidates, but its count threshold must not create a review
+/// until enough cells have actually completed successfully.
+pub(crate) fn fire_ready_triage_thresholds(
     store: &Store,
-    project: &str,
-    triage_type: &str,
-    threshold: i64,
+    squad_id: &str,
 ) -> std::result::Result<Vec<String>, ReviewError> {
-    let threshold = threshold.max(1);
+    let mut keys = HashSet::new();
+    for (project, triage_type, row) in store
+        .all_pooled_cells()
+        .map_err(|e| ReviewError::new(e.to_string()))?
+    {
+        if row.squad_id == squad_id {
+            keys.insert((project, triage_type));
+        }
+    }
+
     let mut created = Vec::new();
-    loop {
-        // Only drain while a *full* threshold-sized batch is guaranteed:
-        // the partial remainder (fewer than `threshold` viable cells) stays
-        // pooled for the next round -- a sub-threshold pool never drains
-        // and never creates a review. Count and drain share one store-lock
-        // hold, so nothing can change the count between the two calls.
+    for (project, triage_type) in keys {
         let count = store
-            .triage_pool_count(project, triage_type)
+            .triage_pool_count(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        if count < threshold {
-            break;
-        }
-        let batch = store
-            .drain_triage_pool_batch(project, triage_type, threshold)
+        let threshold = store
+            .get_triage_pool_threshold(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        // Defense in depth: a concurrent caller cannot have drained this
-        // pool under the lock we hold, but if a batch ever comes back
-        // short or empty, stop rather than spin.
-        if batch.is_empty() || batch.len() < (threshold as usize) {
-            break;
-        }
-        if let Some(gid) = build_review_from_drained_pool(store, project, triage_type, batch)? {
-            created.push(gid);
+        if threshold.is_some_and(|t| count >= t) {
+            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+                created.push(gid);
+            }
         }
     }
     Ok(created)
@@ -1772,13 +1868,6 @@ pub(crate) fn fire_triage_pool_in_threshold_batches(
 /// own threshold check), create a fresh review guardian from its cells.
 /// Returns `None` when the pool was already empty by the time this drained it
 /// -- not an error, just "someone else already fired it".
-///
-/// This is the whole-pool drain a cron schedule firing uses: the schedule
-/// owns its exact `(project, triage_type)` key (including any subproject
-/// component), so everything pooled under that key goes into a single
-/// review (RAL-421 complete pool identity) -- unlike
-/// [`fire_triage_pool_in_threshold_batches`], which is what the
-/// count-threshold path uses and drains in threshold-sized batches.
 ///
 /// `project` may be a plain project key or a RAL-346 `base::subproject`
 /// composite key -- either way the guardian's `git_root`/project identity
@@ -1799,10 +1888,44 @@ pub(crate) fn create_review_from_triage_pool(
     build_review_from_drained_pool(store, project, triage_type, drained)
 }
 
+/// RAL-346: the Arbiter's cron straggler sweep. Unlike
+/// [`create_review_from_triage_pool`] (which fires exactly one pool key --
+/// the coherent, threshold-driven unit of work), this drains *every* pool
+/// key sharing `base_project`'s namespace for `triage_type` (the plain
+/// `base_project` key plus every `base_project::subproject` composite key --
+/// see [`crate::triage::project_pool_keys`]) and combines them into one
+/// review, so straggler work sitting in per-subproject pools that never hit
+/// their own count threshold (e.g. one bug fix each in `core`, `utils`, and
+/// `steam`) doesn't get stranded indefinitely just because a schedule was
+/// only ever registered against the project's plain base key. Called by
+/// [`crate::triage::run_schedule_tick`] instead of
+/// [`create_review_from_triage_pool`] when a configured cron schedule fires.
+/// Returns `None` when every matching pool was already empty.
+///
+/// # Errors
+/// Returns [`ReviewError`] on any store failure while creating the guardian
+/// or attaching its branches.
+pub(crate) fn create_review_from_triage_project_sweep(
+    store: &Store,
+    base_project: &str,
+    triage_type: &str,
+) -> std::result::Result<Option<String>, ReviewError> {
+    let keys = crate::triage::project_pool_keys(store, base_project, triage_type);
+    let mut drained = Vec::new();
+    for key in &keys {
+        drained.extend(
+            store
+                .drain_triage_pool(key, triage_type)
+                .map_err(|e| ReviewError::new(e.to_string()))?,
+        );
+    }
+    build_review_from_drained_pool(store, base_project, triage_type, drained)
+}
+
 /// Shared tail of [`create_review_from_triage_pool`]/
-/// [`create_review_from_triage_project_sweep`]: filter out any cell whose
-/// proof has definitively failed, and -- if anything viable remains -- build
-/// one fresh review guardian from it. `pool_key` is used only for logging
+/// [`create_review_from_triage_project_sweep`]: retain only completed cells
+/// and -- if anything eligible remains -- build one fresh review guardian
+/// from them. `pool_key` is used only for logging
 /// (the Cartographer note and its payload); the *real* project identity
 /// always resolves off [`crate::triage::base_project_key`].
 fn build_review_from_drained_pool(
@@ -1811,17 +1934,15 @@ fn build_review_from_drained_pool(
     triage_type: &str,
     drained: Vec<crate::triage::TriagePoolCellRow>,
 ) -> std::result::Result<Option<String>, ReviewError> {
-    // Defense in depth: `drain_triage_pool` already excludes a failed cell,
-    // but a failed cell must never reach a review under any circumstance
-    // (RAL-318 bug 2), so re-check here too in case some future code path
-    // ever inserts into `triage_pool_cells` without going through the same
-    // drain filter (e.g. a hypothetical manual "force-fire" admin action).
+    // Defense in depth: `drain_triage_pool` already selects only completed
+    // cells. Keep that invariant here in case a future caller supplies rows
+    // without going through the drain filter.
     let mut viable = Vec::with_capacity(drained.len());
     for cell in drained {
         let effective = store
             .effective_state_for_cell(&cell.squad_id, cell.task_idx, cell.idx)
             .map_err(|e| ReviewError::new(e.to_string()))?;
-        if effective.as_deref() != Some("failed") {
+        if effective.as_deref() == Some("done") {
             viable.push(cell);
         }
     }
@@ -2248,22 +2369,12 @@ pub fn repair_triage_pool_keys(store: &Store) {
             Err(_) => continue,
         };
         if threshold.is_some_and(|t| count >= t) {
-            // RAL-421: fire in threshold-sized batches, exactly like the
-            // submit-time and confirm-time count paths do.
-            match fire_triage_pool_in_threshold_batches(
-                store,
-                &project,
-                &triage_type,
-                threshold.unwrap(),
-            ) {
-                Ok(gids) => {
-                    for gid in gids {
-                        crate::rlog!(
-                            INFO,
-                            "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
-                        );
-                    }
-                }
+            match create_review_from_triage_pool(store, &project, &triage_type) {
+                Ok(Some(gid)) => crate::rlog!(
+                    INFO,
+                    "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
+                ),
+                Ok(None) => {}
                 Err(e) => crate::rlog!(
                     ERROR,
                     "ralphus [triage] pool-key repair: failed to fire ({project}, {triage_type}): {e}"
@@ -2283,14 +2394,27 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_triage_pools, fire_triage_pool_in_threshold_batches, plan, rebase_onto,
-        repair_arbiter_review_project_roots, repair_review_project_identities,
-        repair_triage_pool_keys, require_auto_build_declaration, review_branch_order,
+        derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
+        rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
+        repair_triage_pool_keys, require_auto_build_declaration,
+        require_auto_build_declaration_early, review_branch_order, rows_from_file,
         set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
         workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
+
+    fn completed_pool_cell(store: &mut Store) -> String {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        squad_id
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -2946,6 +3070,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&uncovered);
     }
 
+    // ── RAL-<pending>: `require_auto_build_declaration_early` ────────────
+    // (the pre-`resolve_placeholders_with_prefetch` fast-fail pass) and the
+    // end-to-end proof that `derive_reviews_with_prefetch` actually runs it
+    // before paying for worktree materialization.
+
+    /// A one-task, one-cell, one-link-review TOML referencing project `"proj"`
+    /// (must already be registered on `store` by the caller), with `review_toml`
+    /// spliced verbatim into the `[[review]]` block (e.g. `"skip_auto_build = true"`,
+    /// or `""` for neither declared).
+    fn link_review_toml(review_toml: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\nproject=\"proj\"\n\n  [[task.cell]]\n  \
+             cwd=\"<<ralphus:new-worktree/feat-x?upstream=main>>\"\n  prompt=\"p\"\n  \
+             review=\"<<ralphus:new-review/k>>\"\n\n[[review]]\nid=\"ralphus:new-review/k\"\n{review_toml}\n"
+        )
+    }
+
+    #[test]
+    fn require_auto_build_declaration_early_ok_when_auto_build_declared() {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml(
+            "[[review.auto_build]]\ncommand=\"make build\"\n",
+        ))
+        .unwrap();
+        let (cells, tasks, cell_info) = rows_from_file(&file);
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
+        );
+    }
+
+    #[test]
+    fn require_auto_build_declaration_early_ok_when_skip_auto_build_declared() {
+        let file: ralphus_core::schema::TaskFile =
+            toml::from_str(&link_review_toml("skip_auto_build = true")).unwrap();
+        let (cells, tasks, cell_info) = rows_from_file(&file);
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
+        );
+    }
+
+    #[test]
+    fn require_auto_build_declaration_early_err_when_neither_declared_and_no_config_fallback() {
+        let root = temp_repo();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
+        let (cells, tasks, cell_info) = rows_from_file(&file);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let err = require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info)
+            .unwrap_err();
+        assert!(
+            err.message.contains("ralphus:new-review/k"),
+            "error must identify the pending review: {}",
+            err.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_early_ok_when_project_config_covers_it() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nauto_build = \"make build\"\n",
+        )
+        .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
+        let (cells, tasks, cell_info) = rows_from_file(&file);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        assert!(
+            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_auto_build_declaration_early_skips_plain_name_reviews() {
+        // A plain (non-link) review's final membership can still be SPLIT by
+        // *resolved* git root once worktrees exist -- this function must not
+        // guess at that early and risk a false-positive rejection; it defers
+        // entirely to the late `require_auto_build_declaration` check.
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\n  [[task.cell]]\n  \
+                    cwd=\"<<ralphus:new-worktree/feat-x?upstream=main>>\"\n  prompt=\"p\"\n  \
+                    review=\"<<review:backend>>\"\n\n[[review]]\nid=\"backend\"\n";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(toml).unwrap();
+        let (cells, tasks, cell_info) = rows_from_file(&file);
+        let root = temp_repo();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        assert!(
+            require_auto_build_declaration_early(&store, &file, &tasks, &cells, &cell_info).is_ok(),
+            "a plain-name review must be left to the late check, never rejected early"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn derive_reviews_with_prefetch_rejects_missing_auto_build_before_materializing_any_worktree() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();
+
+        let err =
+            derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new()).unwrap_err();
+        assert!(
+            err.message.contains("ralphus:new-review/k"),
+            "must fail on the missing auto_build declaration, not something else: {}",
+            err.message
+        );
+        // The real proof this runs BEFORE `resolve_placeholders_with_prefetch`:
+        // no worktree/branch was ever created for the rejected review's cell.
+        assert!(
+            !crate::worktrees::worktree_dir(&root, "feat-x").exists(),
+            "the early auto_build check must reject before any worktree is materialized"
+        );
+        assert!(
+            git(&root, &["branch", "--list", "feat-x"]).is_empty(),
+            "no branch should have been created either"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────
 
     #[test]
@@ -3243,12 +3504,14 @@ print(json.dumps(result))
 
     #[test]
     fn create_review_from_triage_pool_creates_an_arbiter_origin_guardian_and_drains_the_pool() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
             .unwrap();
         store
-            .record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3269,116 +3532,6 @@ print(json.dumps(result))
                 .unwrap()
                 .is_none()
         );
-    }
-
-    /// RAL-421: a firing threshold drains a pool in threshold-sized batches,
-    /// each batch its own review, leaving only the final sub-threshold
-    /// remainder pooled.
-    #[test]
-    fn fire_triage_pool_in_threshold_batches_creates_one_review_per_full_batch() {
-        let store = Store::open_in_memory().unwrap();
-        for i in 0..7 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            store
-                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        let gids = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 3).unwrap();
-        assert_eq!(
-            gids.len(),
-            2,
-            "7 cells at a threshold of 3 must drain as two full batches of 3"
-        );
-        let first = store.get_guardian(&gids[0]).unwrap();
-        let second = store.get_guardian(&gids[1]).unwrap();
-        assert_ne!(first.id, second.id, "each batch is its own review");
-        assert_eq!(
-            first.branches.len(),
-            3,
-            "the first review carries exactly one batch's cells"
-        );
-        assert_eq!(second.branches.len(), 3);
-        for gid in &gids {
-            assert_eq!(
-                store.get_guardian(gid).unwrap().origin,
-                crate::guardian::GUARDIAN_ORIGIN_ARBITER
-            );
-        }
-        assert_eq!(
-            store.triage_pool_count("proj", "bug").unwrap(),
-            1,
-            "the final sub-threshold cell stays pooled for the next round"
-        );
-    }
-
-    /// RAL-421: concurrent empty-pool safety at the review level -- two
-    /// racing firings of one pool settle on one set of reviews from one set
-    /// of cells; the second caller simply finds the pool already drained.
-    #[test]
-    fn fire_triage_pool_in_threshold_batches_twice_never_double_creates() {
-        let store = Store::open_in_memory().unwrap();
-        for i in 0..5 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            store
-                .record_triage_pool_cell("proj", "bug", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        let first = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2).unwrap();
-        // The second caller (e.g. the scheduler's cron tick racing this
-        // same pool) sees whatever the first left behind -- here, the 1-cell
-        // remainder, which is below the threshold, so nothing more fires.
-        let second = fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2).unwrap();
-        assert_eq!(first.len(), 2, "5 cells / threshold 2 = two full batches");
-        assert!(
-            second.is_empty(),
-            "a second firing must not create new reviews"
-        );
-        assert_eq!(store.triage_pool_count("proj", "bug").unwrap(), 1);
-        // And a third firing immediately after the same remainder is still
-        // there -- still nothing: below the threshold, never re-created.
-        assert!(
-            fire_triage_pool_in_threshold_batches(&store, "proj", "bug", 2)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// RAL-421: complete pool identity on the threshold path -- firing one
-    /// project's subproject pool must not touch the plain pool, the other
-    /// subproject pool, or another triage type's pool under the same key.
-    #[test]
-    fn fire_triage_pool_in_threshold_batches_never_crosses_pool_boundaries() {
-        let store = Store::open_in_memory().unwrap();
-        store
-            .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
-        store
-            .record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
-            .unwrap();
-        store
-            .record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
-            .unwrap();
-        store
-            .record_triage_pool_cell("proj", "feature", "squad-4", 0, 0, "b4", "main")
-            .unwrap();
-
-        let gids = fire_triage_pool_in_threshold_batches(&store, "proj::core", "bug", 1).unwrap();
-        assert_eq!(gids.len(), 1);
-        let g = store.get_guardian(&gids[0]).unwrap();
-        assert_eq!(
-            g.branches
-                .iter()
-                .map(|b| b.branch.clone())
-                .collect::<Vec<_>>(),
-            vec!["b2".to_string()],
-            "the review carries only the fired subproject key's branch"
-        );
-        // Every sibling pool is untouched.
-        assert_eq!(store.triage_pool_count("proj", "bug").unwrap(), 1);
-        assert_eq!(store.triage_pool_count("proj::utils", "bug").unwrap(), 1);
-        assert_eq!(store.triage_pool_count("proj", "feature").unwrap(), 1);
     }
 
     #[test]
@@ -3406,8 +3559,9 @@ print(json.dumps(result))
         store
             .record_triage_pool_cell("proj", "security", &failed_squad, 0, 0, "b-failed", "main")
             .unwrap();
+        let ok_squad = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-ok", 0, 0, "b-ok", "main")
+            .record_triage_pool_cell("proj", "security", &ok_squad, 0, 0, "b-ok", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3480,12 +3634,13 @@ print(json.dumps(result))
             "[review]\ndefault_machine = \"ib:A\"\ndefault_maximum_budget_usd = 2.5\n",
         )
         .unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3566,12 +3721,13 @@ print(json.dumps(result))
             "[review]\nauto_fix_pr_errors = true\nauto_fix_prompt_template = \"pooled: <<prompt>>\"\n",
         )
         .unwrap();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security")
@@ -3698,14 +3854,15 @@ print(json.dumps(result))
     #[test]
     fn repair_triage_pool_keys_rekeys_a_stale_path_based_pool_and_fires_when_now_past_threshold() {
         let root = temp_repo();
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
 
         let stale_key = root.to_string_lossy().replace('\\', "/");
+        let squad_id = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell(&stale_key, "bug", "squad-x", 0, 0, "b1", "main")
+            .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
             .unwrap();
         store
             .set_triage_pool_threshold(&stale_key, "bug", Some(1))
@@ -3886,10 +4043,14 @@ print(json.dumps(result))
             "pool key must resolve to the registered project's name (RAL-318 bug 3), not its raw worktree path"
         );
         assert_eq!(triage_type, "security");
+        assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 0);
+
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count(&project, &triage_type).unwrap(), 1);
 
-        // A second submission of the same file re-pools (a fresh squad_id),
-        // and with a threshold of 2 now configured, this second call fires.
+        // A second completed candidate brings the configured threshold to two.
         store
             .set_triage_pool_threshold(&project, &triage_type, Some(2))
             .unwrap();
@@ -3898,6 +4059,14 @@ print(json.dumps(result))
             .set_cell_triage_types(&squad_id_2, 0, 0, &["security".to_string()])
             .unwrap();
         let created = derive_triage_pools(&store, &squad_id_2, &file).unwrap();
+        assert!(
+            created.is_empty(),
+            "pending work must not fire the threshold"
+        );
+        store
+            .set_cell_state(&squad_id_2, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id_2).unwrap();
         assert_eq!(created.len(), 1);
         let g = store.get_guardian(&created[0]).unwrap();
         assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
@@ -3958,6 +4127,14 @@ print(json.dumps(result))
             ]
         );
         let project = keys[0].0.clone();
+        // A pooled cell is only *counted* once it has actually finished --
+        // pooling records the candidate, the count gates a threshold. Mark it
+        // done so this test measures per-type independence rather than the
+        // counting rule (which `triage_pool_count_only_includes_a_cell_after_its_proof_passes`
+        // covers on its own).
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count(&project, "bug").unwrap(), 1);
         assert_eq!(
             store.triage_pool_count(&project, "investigation").unwrap(),
@@ -4022,6 +4199,13 @@ print(json.dumps(result))
             store.triage_pool_keys().unwrap(),
             vec![("proj::core".to_string(), "bug".to_string())]
         );
+        // Pooling records a candidate; only a finished cell is *counted*
+        // toward a threshold. Each squad below is marked done so the counts
+        // in this test measure subproject-overlap bucketing, not the
+        // done-gating rule.
+        store
+            .set_cell_state(&squad_a, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
 
         // An overlapping-but-not-identical set ({core, utils} vs {core})
         // still shares the "core" pool.
@@ -4043,6 +4227,9 @@ print(json.dumps(result))
                 .unwrap()
                 .is_empty()
         );
+        store
+            .set_cell_state(&squad_b, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(
             store.triage_pool_count("proj::core", "bug").unwrap(),
             2,
@@ -4063,6 +4250,9 @@ print(json.dumps(result))
                 .unwrap()
                 .is_empty()
         );
+        store
+            .set_cell_state(&squad_c, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         assert_eq!(store.triage_pool_count("proj::steam", "bug").unwrap(), 1);
         assert_eq!(
             store.triage_pool_count("proj::core", "bug").unwrap(),
@@ -4174,8 +4364,7 @@ print(json.dumps(result))
         store
             .set_cell_triage_types(&squad_id, 0, 0, &["security".to_string()])
             .unwrap();
-        // Fire immediately: threshold of 1 on the pool this submission's own
-        // "work" cell resolves to.
+        // The threshold is configured before the candidate is submitted.
         let triage_project =
             crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
         store
@@ -4183,7 +4372,16 @@ print(json.dumps(result))
             .unwrap();
 
         let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
-        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        assert!(created.is_empty(), "pending work must not create a review");
+
+        // Completing the Triage candidate makes it eligible and re-checks the
+        // threshold. Its non-Triage worktree sibling still gates merge
+        // readiness below.
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id).unwrap();
+        assert_eq!(created.len(), 1, "completed work fires threshold of 1");
         let gid = created[0].clone();
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.branches.len(), 1);
@@ -4192,9 +4390,6 @@ print(json.dumps(result))
         // "work" (task 0, cell 0) finishes -- branch must stay `pending`:
         // "finalize" (task 0, cell 1), the worktree sibling that never
         // itself opted into Triage, hasn't finished yet.
-        store
-            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(
             n, 0,
@@ -4258,7 +4453,13 @@ print(json.dumps(result))
             .unwrap();
 
         let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
-        assert_eq!(created.len(), 1, "threshold of 1 fires on submit");
+        assert!(created.is_empty(), "pending work must not create a review");
+
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        let created = fire_ready_triage_thresholds(&store, &squad_id).unwrap();
+        assert_eq!(created.len(), 1, "completed work fires threshold of 1");
         let gid = created[0].clone();
         let g = store.get_guardian(&gid).unwrap();
         assert_eq!(g.branches.len(), 1);
@@ -4267,9 +4468,6 @@ print(json.dumps(result))
         // "work" (root cwd) finishes -- branch must stay `pending`:
         // "finalize" (nested `sub` cwd, same worktree, no triage/review of
         // its own) hasn't finished yet.
-        store
-            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(
             n, 0,

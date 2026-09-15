@@ -82,6 +82,15 @@ impl ValidationReport {
             line,
         });
     }
+
+    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
+        self.warnings.push(ValidationError {
+            path: path.to_string(),
+            kind,
+            message: msg.into(),
+            line,
+        });
+    }
 }
 
 /// Shared validation context: the raw source, the line index, and the report
@@ -96,6 +105,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.report.error(path, kind, msg, line);
+    }
+
+    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
+        self.report.warning(path, kind, msg, line);
     }
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
@@ -1280,7 +1293,12 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
 /// Whether neither `auto_build` nor `skip_auto_build` is set at all is NOT an
 /// error here: that's only knowable once project-level `.ralphus.toml` config
 /// is in the picture too, which is a daemon-level, submit-time check (mirrors
-/// [`check_machine`]'s core/daemon split).
+/// [`check_machine`]'s core/daemon split) -- see
+/// `daemon::reviews::require_auto_build_declaration`, which enforces it for
+/// real once a project is known. It's surfaced as a non-fatal `warning` here
+/// instead, so `ralphus validate`/`submit` can flag the common case (no
+/// project-level default configured either) without false-positiving on a
+/// submission that a project default genuinely covers.
 fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, header: Option<u32>) {
     let skip_auto_build = table
         .get("skip_auto_build")
@@ -1288,6 +1306,17 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
         .unwrap_or(false);
 
     let Some(value) = table.get("auto_build") else {
+        if !skip_auto_build {
+            ctx.warning(
+                rpath,
+                ErrorKind::MissingRequired,
+                "neither [[review.auto_build]] nor skip_auto_build = true is set -- the \
+                 daemon will reject this submission at materialization time unless every \
+                 project involved has a project-level `.ralphus.toml [review] auto_build` \
+                 default configured",
+                header,
+            );
+        }
         return;
     };
     let Some(arr) = value.as_array() else {

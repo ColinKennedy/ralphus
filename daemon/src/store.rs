@@ -56,6 +56,13 @@ pub type CellRef = (String, i64, i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SquadState {
+    /// Just submitted: the squad row exists, but its worktrees haven't been
+    /// materialized and its reviews haven't been derived yet (RAL-<pending>).
+    /// Not schedulable — [`Store::list_ready`] only selects `pending` rows,
+    /// so a `materializing` squad is invisible to the scheduler until the
+    /// background follow-up (see `server::submit`'s doc comment) flips it to
+    /// `pending`/`queued` on success, or `failed` on a preflight error.
+    Materializing,
     /// Staged but not scheduled (explicit hold).
     Queued,
     /// Schedulable; waiting for the scheduler / dependencies.
@@ -79,6 +86,7 @@ impl SquadState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Materializing => "materializing",
             Self::Queued => "queued",
             Self::Pending => "pending",
             Self::Running => "running",
@@ -93,6 +101,7 @@ impl SquadState {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
+            "materializing" => Self::Materializing,
             "queued" => Self::Queued,
             "pending" => Self::Pending,
             "running" => Self::Running,
@@ -183,9 +192,10 @@ impl NodeState {
 // ── Read views (serialized straight to the API) ──────────────────────────────
 
 /// One row from [`Store::proof_specs`]:
-/// `(idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
+/// `(idx, id, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens)`.
 pub type ProofSpecRow = (
     i64,
+    Option<String>,
     String,
     String,
     Option<String>,
@@ -254,13 +264,6 @@ pub struct ProofView {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
-    /// RAL-352: completed user/assistant message exchanges (each response
-    /// event represents both sides of the exchange). Omitted (no attribute
-    /// at all) for a command-mode step -- there is no conversational count
-    /// to report, not a count of zero -- and for any pre-RAL-352 step that
-    /// has not re-run yet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turns: Option<i64>,
     /// Cost of this step's most recent run, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -335,13 +338,6 @@ pub struct CellView {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
-    /// RAL-352: completed user/assistant message exchanges (each response
-    /// event represents both sides of the exchange). Omitted (no attribute
-    /// at all) for a command cell -- there is no conversational count to
-    /// report, not a count of zero -- and for any pre-RAL-352 cell that has
-    /// not re-run yet.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turns: Option<i64>,
     /// Cost recorded so far, USD.
     pub cost_usd: f64,
     /// RAL-326: `true` when `cost_usd` and the token counts are the last
@@ -552,60 +548,6 @@ pub struct EventView {
     pub at_ms: i64,
 }
 
-/// One persisted pre-work generation call (RAL-420) — the full audit shape
-/// of a retained cost row. Rows exist from the moment the call finishes
-/// (whether it succeeded, failed, or was cancelled), with `squad_id` filled
-/// in only once the call is attributed to a submitted squad.
-#[derive(Debug, Clone, Serialize)]
-pub struct GenerationCostView {
-    /// Stable database row id.
-    pub id: i64,
-    /// The client-visible generation job id (`gen-…`), or the server-minted
-    /// id used by a call that never had one (the post-submit `suggest-name`
-    /// job). The Simple form echoes these ids back in a submit request's
-    /// `generation_ids` so the daemon can attribute them (`POST /api/squads`).
-    pub job_id: String,
-    /// `Some` once this call has been attributed to a submitted squad;
-    /// `None` for a retained call whose squad was never submitted.
-    pub squad_id: Option<String>,
-    /// `"proof_steps"`, `"manual_checks"`, `"auto_build_steps"`, or `"task_name"`.
-    pub kind: String,
-    /// `"done"`, `"error"`, or `"cancelled"`.
-    pub status: String,
-    pub tokens_in: i64,
-    pub tokens_out: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cost_usd: f64,
-    /// RAL-326: `true` when the figures are a live mid-run snapshot (the call
-    /// was killed/cancelled/sat before a terminal usage event) rather than the
-    /// backend's own final accounting.
-    pub cost_is_estimated: bool,
-    /// The underlying runner failure detail, when the call did not succeed.
-    pub error: Option<String>,
-    pub agent: String,
-    pub model: Option<String>,
-    pub created_at_ms: i64,
-    pub finished_at_ms: i64,
-    /// When the call was attributed to a squad (or `None` if never).
-    pub attributed_at_ms: Option<i64>,
-}
-
-/// The squad-level aggregate of its attributed generation calls (RAL-420) —
-/// what a squad's normal totals fold in exactly once. Values are sums across
-/// every attributed row; `estimated` is `true` when any row's figures are a
-/// live snapshot rather than final accounting.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct GenerationUsage {
-    pub count: i64,
-    pub tokens_in: i64,
-    pub tokens_out: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cost_usd: f64,
-    pub estimated: bool,
-}
-
 /// A squad (submission) as shown in the board.
 #[derive(Debug, Clone, Serialize)]
 pub struct SquadView {
@@ -641,13 +583,12 @@ pub struct SquadView {
     /// Empty for the vast majority of squads (no overrides ever set).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_overrides: BTreeMap<String, String>,
-    /// RAL-420: this squad's own pre-work generation cost — a distinct,
-    /// squad-owned category included exactly once in normal squad totals.
-    /// `None` when the squad incurred none (the vast majority of squads;
-    /// only Simple-tab submissions that used the Generate buttons or the
-    /// post-submit `suggest-name` fallback have rows).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation_cost: Option<GenerationUsage>,
+    /// Preflight-failure detail (RAL-<pending>) for a squad that landed in
+    /// `failed` before ever running, because the background materialization
+    /// follow-up (worktree creation + review derivation, see
+    /// `server::submit`'s doc comment) errored. Mirrors [`TaskView::error`]'s
+    /// shape and lifecycle. `None` for every squad that never failed this way.
+    pub error: Option<String>,
 }
 
 /// A node in the cross-squad `[[default]] depends_on` gating graph
@@ -1291,7 +1232,6 @@ impl Store {
                 cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
                 compaction_input_tokens INTEGER NOT NULL DEFAULT 0,
                 compaction_count        INTEGER NOT NULL DEFAULT 0,
-                turns                    INTEGER,
                 cost_usd   REAL NOT NULL DEFAULT 0,
                 cost_is_estimated INTEGER NOT NULL DEFAULT 0,
                 error      TEXT,
@@ -1329,7 +1269,6 @@ impl Store {
                 timeout_sec   INTEGER,
                 budget_tokens INTEGER,
                 maximum_tool_output_tokens INTEGER,
-                turns         INTEGER,
                 queue_rank    REAL,
                 env_overrides TEXT NOT NULL DEFAULT '{}',
                 materialized_env_overrides TEXT,
@@ -1646,7 +1585,8 @@ impl Store {
                 pr_url         TEXT,
                 state          TEXT NOT NULL DEFAULT 'open',
                 created_at_ms  INTEGER NOT NULL,
-                updated_at_ms  INTEGER NOT NULL
+                updated_at_ms  INTEGER NOT NULL,
+                draft          INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_pr_guardian ON guardian_pull_requests(guardian_id);
             CREATE INDEX IF NOT EXISTS idx_pr_lookup ON guardian_pull_requests(forge, repo, pr_number);
@@ -1684,7 +1624,20 @@ impl Store {
                 remote_sha         TEXT,
                 local_sha          TEXT,
                 etag_conversation  TEXT,
-                etag_review        TEXT
+                etag_review        TEXT,
+                -- Per-half freshness. `last_checked_at_ms`/`status`/
+                -- `last_error` above are the rolled-up most-recent-of-either;
+                -- these describe each half on its own, because a pass
+                -- refreshes drift (git) and comments (forge) independently
+                -- and either can fail or be skipped alone. Without them a row
+                -- can claim to be seconds old while the half a caller
+                -- actually wants is hours stale.
+                drift_checked_at_ms    INTEGER,
+                drift_status           TEXT,
+                drift_error            TEXT,
+                comments_checked_at_ms INTEGER,
+                comments_status        TEXT,
+                comments_error         TEXT
             );
             -- RAL-366: the set of PR comments/notes last fetched by the
             -- background poller -- id/author/timestamp only, deliberately
@@ -1937,43 +1890,6 @@ impl Store {
                 cost_usd      REAL NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL
             );
-            -- RAL-420: durable ledger for every pre-work generation agent/
-            -- model call (the Simple form's \"Generate Proof Steps\"/\"Generate
-            -- Manual Checks\"/\"Generate Auto-Build Steps\" buttons plus the
-            -- RAL-398 `suggest-name` fallback): the usage the call reported,
-            -- retained even when the call failed or was cancelled, so a
-            -- cancelled New Task modal never silently discards spend it
-            -- already incurred. A row is attributed to a squad -- `squad_id`
-            -- set -- once the squad that call was made for is actually
-            -- submitted; rows whose squad never materializes stay behind with
-            -- `squad_id` NULL, retained for audit without ever inflating any
-            -- squad's totals (see `attribute_generation_costs`). Deliberately
-            -- NOT the daemon-global Arbiter ledger (`arbiter_costs`, which
-            -- owns the Arbiter's own classification/health_check spend for
-            -- the `[arbiter] maximum_budget_usd` cap) and NOT `guardian_costs`
-            -- (review-owned resolver/proof spend) -- generation cost is a
-            -- distinct, squad-owned category.
-            CREATE TABLE IF NOT EXISTS squad_generation_costs (
-                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id                TEXT NOT NULL UNIQUE,
-                squad_id              TEXT REFERENCES squads(id) ON DELETE CASCADE,
-                kind                  TEXT NOT NULL,
-                status                TEXT NOT NULL,
-                tokens_in             INTEGER NOT NULL DEFAULT 0,
-                tokens_out            INTEGER NOT NULL DEFAULT 0,
-                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
-                cost_usd              REAL NOT NULL DEFAULT 0,
-                cost_is_estimated     INTEGER NOT NULL DEFAULT 0,
-                error                 TEXT,
-                agent                 TEXT NOT NULL,
-                model                 TEXT,
-                created_at_ms         INTEGER NOT NULL,
-                finished_at_ms        INTEGER NOT NULL,
-                attributed_at_ms      INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_squad_generation_costs_squad
-                ON squad_generation_costs(squad_id);
             -- RAL-337: which squad owns a task worktree branch. A
             -- `ralphus:new-worktree/<base_branch>` placeholder is resolved
             -- against this table so a *new* squad gets its own branch
@@ -2325,15 +2241,6 @@ impl Store {
             // deliberate no-backfill (NULL for every project registered
             // earlier), as `auto_submit_pr_stack`.
             "ALTER TABLE projects ADD COLUMN separate_pr_branch INTEGER",
-            // RAL-352: per-cell/per-proof agent-turn counts -- the number of
-            // completed user/assistant message exchanges (each response event
-            // is both sides of the exchange). NULL means command-mode (no
-            // conversational count applies); a fresh row's next run or live
-            // snapshot fills the integer for agent-mode rows. Existing rows
-            // stay NULL until their next result arrives, exactly like every
-            // other usage migration here.
-            "ALTER TABLE cells ADD COLUMN turns INTEGER",
-            "ALTER TABLE proofs ADD COLUMN turns INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -2740,18 +2647,60 @@ impl Store {
             // observed as anything other than `failing` (i.e. a fresh
             // failure gets a fresh attempt).
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempted_at_ms INTEGER",
-            // RAL-353: whether the forge currently reports this PR/MR as a
-            // draft (WIP). Recorded from the forge's own `draft` field at
-            // create/adopt time and refreshed by every CI probe
-            // (`forge::check_pr_ci_status_probe`), which reads it from the
-            // same PR response that yields the CI verdict -- so the Tasks
-            // tab's "has pull request / draft status" filter can run
-            // entirely off the cached index, and the two observations can
-            // never disagree about which forge response they came from.
-            // NULL only for rows recorded before this column existed;
-            // the board treats NULL as not-draft (matching how the
-            // "non-draft" filter reads it).
+            // RAL-353: the draft/WIP state returned by the forge when a PR/MR
+            // is created, adopted, or polled. Nullable preserves the unknown
+            // state for rows written before this field was available.
             "ALTER TABLE guardian_pull_requests ADD COLUMN draft INTEGER",
+            // RAL-<pending>: the preflight error from the background
+            // materialization follow-up (worktree creation + review
+            // derivation, see `server::submit`'s doc comment) when a squad
+            // lands in `failed` before ever running -- mirrors
+            // `tasks.error`/`Store::set_task_error`. NULL for every squad
+            // that never failed at this stage (the vast majority).
+            "ALTER TABLE squads ADD COLUMN error TEXT",
+            // When a review branch's conflict-resolver agent (fix pass or
+            // final-proof call) most recently finished running, so the Review
+            // Live View can show an end time alongside `started_at_ms`, not
+            // just "ended" with no timestamp. NULL until a resolver session
+            // actually completes. Plain overwrite (not COALESCE) on each
+            // completed call within an attempt -- see
+            // `Store::stamp_branch_finished_at`.
+            "ALTER TABLE guardian_branches ADD COLUMN finished_at_ms INTEGER",
+            // Mirrors the above for the manual-checks generation pass -- see
+            // `Store::stamp_guardian_manual_checks_finished_at`.
+            "ALTER TABLE guardians ADD COLUMN manual_checks_finished_at_ms INTEGER",
+            // The post-merge phase: the check gates and manual-checks
+            // generation that run *after* a merge is already complete.
+            //
+            // A merge finishes when every branch has been rebased; these two
+            // jobs then run concurrently against the finished stack, and the
+            // review sits in `in_review` throughout rather than still claiming
+            // to be `merging`. They are deliberately a guardian *field* and not
+            // a `GuardianStatus` variant: the review's status is genuinely
+            // `in_review` while they run, and adding a status would mean
+            // auditing every match on one across the daemon, CLI, and board.
+            //
+            // `post_merge_status` is 'running', 'ok', or 'failed'; 'failed' is
+            // advisory and never blocks approval or PR submission -- it records
+            // that a gate reported a failure, nothing more.
+            // `post_merge_detail` carries what failed, NULL otherwise.
+            // Per-half freshness for `guardian_pr_forge_cache`. A poll pass
+            // refreshes drift (git) and comments (forge) independently, and
+            // either can fail or be skipped on its own, so one shared
+            // `last_checked_at_ms`/`status` pair cannot describe both without
+            // lying about one: a row could read "checked 2s ago, ok" while its
+            // drift columns were hours stale and its last git fetch had failed.
+            // `last_checked_at_ms`/`status` stay as the rolled-up view.
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_checked_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_status TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN drift_error TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_checked_at_ms INTEGER",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_status TEXT",
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN comments_error TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_status TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_detail TEXT",
+            "ALTER TABLE guardians ADD COLUMN post_merge_started_at_ms INTEGER",
+            "ALTER TABLE guardians ADD COLUMN post_merge_finished_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3139,8 +3088,8 @@ impl Store {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -3164,11 +3113,6 @@ impl Store {
                         maximum_context,
                         auto_compact_threshold,
                         maximum_tool_output_tokens,
-                        // RAL-352: an agent cell starts at 0 completed
-                        // exchanges; a command cell stays NULL (no applicable
-                        // conversational count). Either way the first run's
-                        // result overwrites it.
-                        cell.prompt.as_ref().map(|_| 0i64),
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -3705,6 +3649,19 @@ impl Store {
         Ok(())
     }
 
+    /// Set (or clear) a squad's preflight-failure message (RAL-<pending>):
+    /// the background materialization follow-up (worktree creation + review
+    /// derivation, see `server::submit`'s doc comment) writes this when it
+    /// fails a squad that already returned `201` to its submitter, mirroring
+    /// [`Self::set_task_error`] at squad granularity.
+    pub fn set_squad_error(&self, squad_id: &str, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE squads SET error=? WHERE id=?",
+            params![error, squad_id],
+        )?;
+        Ok(())
+    }
+
     /// Solo a task within a squad (RAL-157): while any task in the squad is
     /// soloed, the scheduler's dispatcher only starts cells belonging to a
     /// soloed task — every other task's not-yet-started cells stay
@@ -3963,7 +3920,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM squads WHERE id=?",
+                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error FROM squads WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -3974,6 +3931,7 @@ impl Store {
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, Option<i64>>(5)?,
                         r.get::<_, String>(6)?,
+                        r.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -3987,6 +3945,7 @@ impl Store {
             row.4,
             row.5,
             from_json_map(&row.6),
+            row.7,
         )
     }
 
@@ -3996,7 +3955,7 @@ impl Store {
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let mut stmt = self.conn.prepare(
-            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides FROM squads ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error FROM squads ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -4008,12 +3967,22 @@ impl Store {
                     r.get::<_, Option<i64>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, label, state, ts, started, finished, env)| {
-                self.build_squad_view(id, label, state, ts, started, finished, from_json_map(&env))
+            .map(|(id, label, state, ts, started, finished, env, error)| {
+                self.build_squad_view(
+                    id,
+                    label,
+                    state,
+                    ts,
+                    started,
+                    finished,
+                    from_json_map(&env),
+                    error,
+                )
             })
             .collect()
     }
@@ -4071,6 +4040,7 @@ impl Store {
         started_at_ms: Option<i64>,
         finished_at_ms: Option<i64>,
         env_overrides: BTreeMap<String, String>,
+        error: Option<String>,
     ) -> Result<SquadView> {
         let mut tstmt = self.conn.prepare(
             "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
@@ -4162,7 +4132,6 @@ impl Store {
         }
 
         let reviews = self.reviews_for_squad(&id)?;
-        let generation_cost = self.squad_generation_usage(&id)?;
         let state = effective_squad_state(&self.conn, state, &id)?;
         Ok(SquadView {
             id,
@@ -4174,217 +4143,7 @@ impl Store {
             tasks,
             reviews,
             env_overrides,
-            generation_cost,
-        })
-    }
-
-    // ── RAL-420: pre-work generation cost ─────────────────────────────────
-
-    /// Persist one finished pre-work generation call's usage (RAL-420). Called
-    /// from the background thread that ran the call, so the usage survives a
-    /// daemon restart regardless of whether the call was ever attributed to a
-    /// squad, and regardless of whether the call itself succeeded: a failed or
-    /// cancelled call still records whatever tokens/cost the runner captured
-    /// (`cost_is_estimated` marking a live-snapshot figure). `squad_id` is
-    /// `None` for a pre-submit job (the Simple form's Generate buttons — the
-    /// owning squad does not exist yet; `attribute_generation_costs` fills it
-    /// in at submit) and `Some` for a call whose squad was already known up
-    /// front (the post-submit `suggest-name` fallback), which is attributed
-    /// immediately.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_generation_cost(
-        &self,
-        squad_id: Option<&str>,
-        job_id: &str,
-        kind: &str,
-        status: &str,
-        tokens_in: i64,
-        tokens_out: i64,
-        cache_creation_tokens: i64,
-        cache_read_tokens: i64,
-        cost_usd: f64,
-        cost_is_estimated: bool,
-        error: Option<&str>,
-        agent: &str,
-        model: Option<&str>,
-        created_at_ms: i64,
-        finished_at_ms: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO squad_generation_costs \
-             (job_id, squad_id, kind, status, tokens_in, tokens_out, \
-              cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
-              error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
-                job_id,
-                squad_id,
-                kind,
-                status,
-                tokens_in,
-                tokens_out,
-                cache_creation_tokens,
-                cache_read_tokens,
-                cost_usd,
-                cost_is_estimated,
-                error,
-                agent,
-                model,
-                created_at_ms,
-                finished_at_ms,
-                if squad_id.is_some() {
-                    Some(finished_at_ms)
-                } else {
-                    None
-                },
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Attribute previously-retained generation rows to a squad (RAL-420),
-    /// called once a submit request referencing those jobs' ids succeeds. Only
-    /// rows not yet attributed are touched — a job id that was already claimed
-    /// by an earlier squad (or that names a row that never existed, e.g. a job
-    /// whose persistence was lost when the daemon died mid-run) is skipped, and
-    /// the count reflects only rows newly claimed here. Returns the number of
-    /// rows attributed; the caller logs `0` distinctly so a submit that echoed
-    /// ids the daemon knows nothing about is audible.
-    pub fn attribute_generation_costs(&self, squad_id: &str, job_ids: &[String]) -> Result<usize> {
-        if job_ids.is_empty() {
-            return Ok(0);
-        }
-        let placeholders = vec!["?"; job_ids.len()].join(",");
-        let sql = format!(
-            "UPDATE squad_generation_costs SET squad_id=?, attributed_at_ms=? \
-             WHERE squad_id IS NULL AND job_id IN ({placeholders})"
-        );
-        let attributed_at = now_ms();
-        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![
-            &squad_id as &dyn rusqlite::ToSql,
-            &attributed_at as &dyn rusqlite::ToSql,
-        ];
-        for id in job_ids {
-            bound.push(id as &dyn rusqlite::ToSql);
-        }
-        let n = self
-            .conn
-            .execute(&sql, rusqlite::params_from_iter(bound.iter()))?;
-        Ok(n)
-    }
-
-    /// One squad's attributed generation rows (RAL-420), newest first — the
-    /// per-squad "detail" half of the audit surface (`GET /api/squads/{id}/generation-costs`).
-    pub fn squad_generation_costs(&self, squad_id: &str) -> Result<Vec<GenerationCostView>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, job_id, squad_id, kind, status, tokens_in, tokens_out, \
-                    cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
-                    error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms \
-             FROM squad_generation_costs WHERE squad_id=? \
-             ORDER BY finished_at_ms DESC, id DESC",
-        )?;
-        let rows = stmt
-            .query_map(params![squad_id], |r| {
-                Ok(GenerationCostView {
-                    id: r.get::<_, i64>(0)?,
-                    job_id: r.get::<_, String>(1)?,
-                    squad_id: r.get::<_, Option<String>>(2)?,
-                    kind: r.get::<_, String>(3)?,
-                    status: r.get::<_, String>(4)?,
-                    tokens_in: r.get::<_, i64>(5)?,
-                    tokens_out: r.get::<_, i64>(6)?,
-                    cache_creation_tokens: r.get::<_, i64>(7)?,
-                    cache_read_tokens: r.get::<_, i64>(8)?,
-                    cost_usd: r.get::<_, f64>(9)?,
-                    cost_is_estimated: r.get::<_, bool>(10)?,
-                    error: r.get::<_, Option<String>>(11)?,
-                    agent: r.get::<_, String>(12)?,
-                    model: r.get::<_, Option<String>>(13)?,
-                    created_at_ms: r.get::<_, i64>(14)?,
-                    finished_at_ms: r.get::<_, i64>(15)?,
-                    attributed_at_ms: r.get::<_, Option<i64>>(16)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Every persisted generation row, attributed or not (RAL-420), newest
-    /// first — the cross-squad "audit" half of the surface
-    /// (`GET /api/generation-costs`): retained-but-never-attributed rows
-    /// (a cancelled New Task modal, a job whose squad was never submitted)
-    /// are visible here and only here.
-    pub fn list_generation_costs(&self) -> Result<Vec<GenerationCostView>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, job_id, squad_id, kind, status, tokens_in, tokens_out, \
-                    cache_creation_tokens, cache_read_tokens, cost_usd, cost_is_estimated, \
-                    error, agent, model, created_at_ms, finished_at_ms, attributed_at_ms \
-             FROM squad_generation_costs \
-             ORDER BY finished_at_ms DESC, id DESC",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(GenerationCostView {
-                    id: r.get::<_, i64>(0)?,
-                    job_id: r.get::<_, String>(1)?,
-                    squad_id: r.get::<_, Option<String>>(2)?,
-                    kind: r.get::<_, String>(3)?,
-                    status: r.get::<_, String>(4)?,
-                    tokens_in: r.get::<_, i64>(5)?,
-                    tokens_out: r.get::<_, i64>(6)?,
-                    cache_creation_tokens: r.get::<_, i64>(7)?,
-                    cache_read_tokens: r.get::<_, i64>(8)?,
-                    cost_usd: r.get::<_, f64>(9)?,
-                    cost_is_estimated: r.get::<_, bool>(10)?,
-                    error: r.get::<_, Option<String>>(11)?,
-                    agent: r.get::<_, String>(12)?,
-                    model: r.get::<_, Option<String>>(13)?,
-                    created_at_ms: r.get::<_, i64>(14)?,
-                    finished_at_ms: r.get::<_, i64>(15)?,
-                    attributed_at_ms: r.get::<_, Option<i64>>(16)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// The squad-level aggregate of its attributed generation rows (RAL-420):
-    /// what a squad's normal totals fold in exactly once. `None` when the
-    /// squad has none — its totals must not show a bogus "$0.00 generation"
-    /// line. Sums, not averages; `estimated` is `true` when any constituent
-    /// row's figures are a live snapshot.
-    pub fn squad_generation_usage(&self, squad_id: &str) -> Result<Option<GenerationUsage>> {
-        let row = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), \
-                    COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
-                    COALESCE(SUM(cost_usd),0), COALESCE(MAX(cost_is_estimated),0) \
-             FROM squad_generation_costs WHERE squad_id=?",
-            params![squad_id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, f64>(5)?,
-                    r.get::<_, bool>(6)?,
-                ))
-            },
-        )?;
-        let (count, tokens_in, tokens_out, cache_creation, cache_read, cost, estimated) = row;
-        Ok(if count == 0 {
-            None
-        } else {
-            Some(GenerationUsage {
-                count,
-                tokens_in,
-                tokens_out,
-                cache_creation_tokens: cache_creation,
-                cache_read_tokens: cache_read,
-                cost_usd: cost,
-                estimated,
-            })
+            error,
         })
     }
 
@@ -4455,7 +4214,7 @@ impl Store {
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, turns
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -4514,7 +4273,6 @@ impl Store {
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
                         compaction_input_tokens: r.get::<_, i64>(32)?,
                         compaction_count: r.get::<_, i64>(33)?,
-                        turns: r.get::<_, Option<i64>>(34)?,
                     },
                 ))
             })?
@@ -4658,7 +4416,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, turns FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -4688,7 +4446,6 @@ impl Store {
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
                         compaction_input_tokens: r.get::<_, i64>(21)?,
                         compaction_count: r.get::<_, i64>(22)?,
-                        turns: r.get::<_, Option<i64>>(23)?,
                     },
                 ))
             })?
@@ -4708,7 +4465,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, turns FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -4734,7 +4491,6 @@ impl Store {
                     maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
                     compaction_input_tokens: r.get::<_, i64>(18)?,
                     compaction_count: r.get::<_, i64>(19)?,
-                    turns: r.get::<_, Option<i64>>(20)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5790,8 +5546,8 @@ fn insert_proof(
         None
     };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -5808,9 +5564,6 @@ fn insert_proof(
             timeout_sec,
             budget_tokens,
             maximum_tool_output_tokens,
-            // RAL-352: same rule as cells -- a `prompt`-kind step starts at
-            // 0 completed exchanges; every other kind stays NULL.
-            (kind == "prompt").then_some(0i64),
             // RAL-191: the step's TOML-declared `environment` seeds the same
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
@@ -5917,6 +5670,12 @@ pub struct CellEdit<'a> {
     pub command: Option<Option<&'a str>>,
     /// Per-cell auto-compact trigger, in tokens (RAL-304).
     pub auto_compact_threshold: Option<Option<i64>>,
+    /// Per-cell context-window token limit (RAL-304). The caller
+    /// (`edit_squad`'s `"cell"` arm) rejects this up front when the cell's
+    /// effective agent has no delivery mechanism for it -- see
+    /// `ralphus_core::schema::agent_supports_maximum_context` -- before it
+    /// ever reaches the store.
+    pub maximum_context: Option<Option<i64>>,
     /// Per-cell cap on a single tool-call output, in tokens (RAL-333). The
     /// caller (`edit_squad`'s `"cell"` arm) rejects this up front when the
     /// cell's effective agent has no delivery mechanism for it -- see
@@ -6283,19 +6042,20 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
+            "SELECT idx, vid, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
             .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6414,7 +6174,7 @@ impl Store {
             .flatten()
             .unwrap_or_else(|| ("unknown".to_string(), None));
         self.conn.execute(
-            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?
+            "UPDATE proofs SET state=?, output=?, agent_session_id=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 state.as_str(),
@@ -6426,7 +6186,6 @@ impl Store {
                 usage.cache_read_tokens,
                 usage.compaction_input_tokens,
                 usage.compaction_count,
-                usage.turns,
                 usage.cost_usd,
                 usage.cost_is_estimated,
                 squad_id,
@@ -6713,6 +6472,8 @@ impl Store {
         let command_value = edit.command.flatten();
         let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
         let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
+        let maximum_context_touched = edit.maximum_context.is_some();
+        let maximum_context_value = edit.maximum_context.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
         let system_prompt_touched = edit.system_prompt.is_some();
@@ -6736,6 +6497,7 @@ impl Store {
                 system_prompt = CASE WHEN :system_prompt_touched THEN :system_prompt ELSE system_prompt END,
                 effective_system_prompt = CASE WHEN :effective_system_prompt_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
                 auto_compact_threshold = CASE WHEN :auto_compact_threshold_touched THEN :auto_compact_threshold ELSE auto_compact_threshold END,
+                maximum_context = CASE WHEN :maximum_context_touched THEN :maximum_context ELSE maximum_context END,
                 maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
@@ -6755,6 +6517,8 @@ impl Store {
                 ":effective_system_prompt": effective_system_prompt,
                 ":auto_compact_threshold_touched": auto_compact_threshold_touched,
                 ":auto_compact_threshold": auto_compact_threshold_value,
+                ":maximum_context_touched": maximum_context_touched,
+                ":maximum_context": maximum_context_value,
                 ":maximum_tool_output_tokens_touched": maximum_tool_output_tokens_touched,
                 ":maximum_tool_output_tokens": maximum_tool_output_tokens_value,
                 ":squad_id": squad_id,
@@ -7386,6 +7150,53 @@ impl Store {
                 params![now_ms(), id],
             )?;
         }
+
+        // RAL-<pending>: a squad left `materializing` after an unclean
+        // shutdown has no background follow-up left to finish it either --
+        // unlike `running`, there is no partial-progress state worth
+        // resuming (worktree resolution/review derivation either committed
+        // fully or not at all per cell, and re-running it isn't wired to
+        // anything the scheduler can pick up on its own). Land it in
+        // `failed` with a clear, actionable reason instead of leaving it
+        // invisible forever (`Store::list_ready` never selects
+        // `materializing`, so with no recovery it would simply never be
+        // looked at again). A human resubmits or runs `ralphus squad retry`.
+        let materializing_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM squads WHERE state='materializing'")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in &materializing_ids {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] squad {id}: materializing → failed (orphaned on startup)"
+            );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "squad recovered: materializing → failed (orphaned on startup)",
+                scope: Some("squad"),
+                squad_id: Some(id),
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({}),
+                admin_only: false,
+            });
+            self.conn.execute(
+                "UPDATE squads SET state='failed', error=?, updated_at_ms=? WHERE id=?",
+                params![
+                    "daemon restarted while materializing this squad (worktree creation / \
+                     review derivation never finished) -- resubmit, or run `ralphus squad retry`",
+                    now_ms(),
+                    id
+                ],
+            )?;
+        }
+
         Ok(ids)
     }
 
@@ -8265,7 +8076,7 @@ impl Store {
     ) -> Result<()> {
         let entering_terminal = i64::from(outcome.state.is_terminal());
         self.conn.execute(
-            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, turns=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
+            "UPDATE cells SET state=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, compaction_input_tokens=?, compaction_count=?, cost_usd=?, cost_is_estimated=?, error=?, agent_session_id=COALESCE(?, agent_session_id),
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
              WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
@@ -8276,7 +8087,6 @@ impl Store {
                 outcome.usage.cache_read_tokens,
                 outcome.usage.compaction_input_tokens,
                 outcome.usage.compaction_count,
-                outcome.usage.turns,
                 outcome.usage.cost_usd,
                 outcome.usage.cost_is_estimated,
                 outcome.error.as_deref(),
@@ -8683,10 +8493,9 @@ impl Store {
         usage: crate::runner::LiveUsage,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE cells SET turns=?, tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?
+            "UPDATE cells SET tokens_in=?, tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?, cost_usd=?
              WHERE squad_id=? AND sid=? AND task_idx=(SELECT idx FROM tasks WHERE squad_id=? AND name=?)",
             params![
-                usage.turns,
                 usage.tokens_in,
                 usage.tokens_out,
                 usage.cache_creation_tokens,
@@ -9557,12 +9366,6 @@ pub struct RecordedUsage {
     /// sizes unreported by this backend/version", not "no compaction
     /// happened".
     pub compaction_count: i64,
-    /// RAL-352: completed user/assistant message exchanges (each response
-    /// event represents both sides of the exchange). `None` for a
-    /// command-only run -- there is no applicable conversational count, and
-    /// the column stays NULL so the serialized view deliberately omits the
-    /// attribute (see `CellView::turns`/`ProofView::turns`).
-    pub turns: Option<i64>,
     /// Cost in USD.
     pub cost_usd: f64,
     /// `true` when the figures above are the last live mid-run snapshot
@@ -9582,7 +9385,6 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
             cache_read_tokens: r.cache_read_tokens,
             compaction_input_tokens: r.compaction_input_tokens,
             compaction_count: r.compaction_count,
-            turns: r.turns,
             cost_usd: r.cost_usd,
             cost_is_estimated: r.cost_is_estimated,
         }
@@ -12540,7 +12342,6 @@ command = "y"
                 cache_read_tokens: 7_204_990,
                 compaction_input_tokens: 115_000,
                 compaction_count: 1,
-                turns: Some(2),
                 cost_usd: 0.6807,
                 cost_is_estimated: true,
             },
@@ -12558,8 +12359,6 @@ command = "y"
         // RAL-373: the same round trip, for the columns this ticket adds.
         assert_eq!(cell.compaction_input_tokens, 115_000);
         assert_eq!(cell.compaction_count, 1);
-        // RAL-352: the exchanged-message count survives the same write path.
-        assert_eq!(cell.turns, Some(2));
         assert!(
             cell.cost_is_estimated,
             "a snapshot-derived figure must not read as a settled bill"
@@ -12594,7 +12393,6 @@ command = "y"
                     cache_read_tokens: 44,
                     compaction_input_tokens: 55,
                     compaction_count: 2,
-                    turns: Some(6),
                     cost_usd: 0.5,
                     cost_is_estimated: true,
                 },
@@ -12610,8 +12408,6 @@ command = "y"
         // RAL-373: the same round trip, for the columns this ticket adds.
         assert_eq!(step.compaction_input_tokens, 55);
         assert_eq!(step.compaction_count, 2);
-        // RAL-352: the RAL-352 proof-step column, in the same round trip.
-        assert_eq!(step.turns, Some(6));
         assert!(step.cost_is_estimated);
     }
 
@@ -14821,241 +14617,5 @@ prompt = "do b"
             .unwrap();
         store.rename_task(&id, 0, "build").unwrap();
         assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "build");
-    }
-
-    // ── RAL-420: pre-work generation cost ─────────────────────────────────┐
-
-    #[allow(clippy::too_many_arguments)]
-    fn record_gen(
-        store: &Store,
-        squad_id: Option<&str>,
-        job_id: &str,
-        kind: &str,
-        status: &str,
-        tokens_in: i64,
-        tokens_out: i64,
-        cost_usd: f64,
-        estimated: bool,
-    ) {
-        store
-            .record_generation_cost(
-                squad_id,
-                job_id,
-                kind,
-                status,
-                tokens_in,
-                tokens_out,
-                10,
-                20,
-                cost_usd,
-                estimated,
-                if status == "done" { None } else { Some("boom") },
-                "claude-code",
-                Some("sonnet"),
-                1_000,
-                2_000,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn generation_cost_rows_are_retained_unattributed_and_auditable() {
-        let mut store = Store::open_in_memory().unwrap();
-        // A pre-submit job (Simple form's Generate button) and a cancelled
-        // job whose modal was closed before any submit both land with
-        // `squad_id` NULL -- retained for audit, never inflating any squad's
-        // totals until attributed.
-        record_gen(
-            &store,
-            None,
-            "gen-a",
-            "proof_steps",
-            "done",
-            100,
-            50,
-            0.02,
-            false,
-        );
-        record_gen(
-            &store,
-            None,
-            "gen-b",
-            "manual_checks",
-            "cancelled",
-            0,
-            0,
-            0.0,
-            true,
-        );
-        let all = store.list_generation_costs().unwrap();
-        assert_eq!(all.len(), 2);
-        assert!(all.iter().all(|c| c.squad_id.is_none()));
-        assert_eq!(all[0].job_id, "gen-b"); // newest-first (finished_at_ms DESC)
-        assert_eq!(all[0].status, "cancelled");
-        assert!(all[0].cost_is_estimated);
-        assert_eq!(all[0].error.as_deref(), Some("boom"));
-        // A real squad with no attributed rows reports no generation cost at
-        // all (`None`), so its totals must not show a bogus "$0.00" line.
-        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
-        assert!(store.squad_generation_usage(&id).unwrap().is_none());
-        assert!(store.squad_generation_costs(&id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn generation_cost_attribution_claims_each_row_exactly_once() {
-        let mut store = Store::open_in_memory().unwrap();
-        record_gen(
-            &store,
-            None,
-            "gen-a",
-            "proof_steps",
-            "done",
-            100,
-            50,
-            0.02,
-            false,
-        );
-        record_gen(
-            &store,
-            None,
-            "gen-b",
-            "manual_checks",
-            "error",
-            30,
-            10,
-            0.005,
-            true,
-        );
-        // An id the daemon knows nothing about (its background thread died
-        // mid-run / persistence lost to a restart) is skipped, not fatal.
-        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
-        let echo = vec![
-            "gen-a".to_string(),
-            "gen-b".to_string(),
-            "gen-ghost".to_string(),
-        ];
-        let n = store.attribute_generation_costs(&id, &echo).unwrap();
-        assert_eq!(n, 2);
-        let rows = store.squad_generation_costs(&id).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|c| c.squad_id.is_some()));
-        assert!(rows.iter().all(|c| c.attributed_at_ms.is_some()));
-        // Attribution is one-way: a second call (retry, resubmit echo) claims
-        // nothing new, and the rows stay on the first squad.
-        let other = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
-        assert_eq!(
-            store
-                .attribute_generation_costs(&other, &["gen-a".to_string()])
-                .unwrap(),
-            0
-        );
-        assert!(store.squad_generation_costs(&other).unwrap().is_empty());
-        assert_eq!(store.squad_generation_costs(&id).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn generation_cost_squad_totals_sum_mixed_statuses_exactly_once() {
-        let mut store = Store::open_in_memory().unwrap();
-        record_gen(
-            &store,
-            None,
-            "gen-a",
-            "proof_steps",
-            "done",
-            100,
-            50,
-            0.02,
-            false,
-        );
-        record_gen(
-            &store,
-            None,
-            "gen-b",
-            "manual_checks",
-            "cancelled",
-            7,
-            3,
-            0.0,
-            true,
-        );
-        record_gen(
-            &store,
-            None,
-            "gen-c",
-            "auto_build_steps",
-            "error",
-            30,
-            10,
-            0.005,
-            false,
-        );
-        let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
-        let echo = vec![
-            "gen-a".to_string(),
-            "gen-b".to_string(),
-            "gen-c".to_string(),
-        ];
-        store.attribute_generation_costs(&id, &echo).unwrap();
-        let usage = store.squad_generation_usage(&id).unwrap().unwrap();
-        // Every retained row counts once -- done, cancelled, and error alike --
-        // sums over tokens/cost, with `estimated` true because the cancelled
-        // call's figures were a live snapshot.
-        assert_eq!(usage.count, 3);
-        assert_eq!(usage.tokens_in, 137);
-        assert_eq!(usage.tokens_out, 63);
-        assert_eq!(usage.cache_creation_tokens, 30);
-        assert_eq!(usage.cache_read_tokens, 60);
-        assert!((usage.cost_usd - 0.025).abs() < 1e-9);
-        assert!(usage.estimated);
-        // The same squad's view exposes the aggregate, and it is *not* folded
-        // into any cell/proof row (generation calls never became cells), so a
-        // consumer has exactly one place to add it.
-        let view = store.get_squad(&id).unwrap();
-        assert_eq!(view.generation_cost.map(|g| g.count), Some(3));
-        assert!(
-            view.tasks
-                .iter()
-                .all(|t| t.cells.iter().all(|c| c.cost_usd == 0.0))
-        );
-    }
-
-    #[test]
-    fn generation_cost_rows_survive_a_store_reload() {
-        let dir =
-            std::env::temp_dir().join(format!("ralphus-store-gen-cost-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("ralphus.db");
-        {
-            let mut store = Store::open(&path).unwrap();
-            record_gen(
-                &store,
-                None,
-                "gen-a",
-                "proof_steps",
-                "done",
-                100,
-                50,
-                0.02,
-                false,
-            );
-            let id = store.insert_squad(&parse(SAMPLE), None, false).unwrap();
-            assert_eq!(
-                store
-                    .attribute_generation_costs(&id, &["gen-a".to_string()])
-                    .unwrap(),
-                1
-            );
-        }
-        // A fresh Store over the same file -- the daemon-restart shape -- must
-        // see the retained rows and their attribution.
-        let store = Store::open(&path).unwrap();
-        let all = store.list_generation_costs().unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all[0].squad_id.is_some());
-        let squads = store.list_squads().unwrap();
-        assert_eq!(squads.len(), 1);
-        assert_eq!(squads[0].generation_cost.as_ref().map(|g| g.count), Some(1));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
