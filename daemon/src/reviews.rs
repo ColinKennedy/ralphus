@@ -1217,7 +1217,7 @@ fn record_review_guardian(
 ///
 /// `agent`/`model`/`proof_scope` don't need an equivalent here: they're
 /// resolved lazily against the same project config, at the point each is
-/// actually used (`guardian_merge::resolver_agent`/`resolver_model`,
+/// actually used (`guardian_merge::resolve_resolver_agent`,
 /// `guardian.rs`'s `effective_proof_scope`), so they already pick up a
 /// project default regardless of how the guardian was created.
 /// `auto_submit_pr_stack` also doesn't need one: `create_guardian_keyed`

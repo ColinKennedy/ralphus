@@ -1100,13 +1100,19 @@ fn advance_rebase(wt: &Workspace) {
 /// `.ralphus.toml`'s `[review].default_resolver_agent` (global layered under
 /// `cwd`'s project config), else `"ollama"`.
 ///
+/// Returns the *raw* name -- which may be a custom `[agent.profiles.*]` name
+/// rather than a built-in backend. Callers must put it through
+/// [`resolve_resolver_agent_from_config`] (or [`resolve_resolver_agent`])
+/// before it reaches a `RunnerSpec`; the runner has no profile knowledge and
+/// cannot interpret a profile name itself.
+///
 /// File-config only -- no database-backed project default (RAL-408), unlike
 /// [`resolve_resolver_agent`]'s own resolution for the actual conflict-
 /// resolution path. This one backs `pr.rs`'s best-effort PR-title/description
 /// synthesis only, a cosmetic LLM call rather than the thing RAL-408's
 /// project-level defaults are meant to govern, so the extra database lookup
 /// on every PR sync isn't worth the plumbing here.
-pub(crate) fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
+fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
     stored
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1119,29 +1125,71 @@ pub(crate) fn resolver_agent(stored: Option<&str>, cwd: &Path) -> String {
         })
 }
 
-/// The model the resolver runs: the review's own `stored` model, else the
-/// `RALPHUS_RESOLVER_MODEL` env override, else `.ralphus.toml`'s
-/// `[review].default_resolver_model` (global layered under `cwd`'s project
-/// config), else `qwen3:8b` for the ollama backend. claude, claude-code, and
-/// codex each pick their own default when still unset → `None`.
+/// The model the resolver runs, shared by both resolution paths:
+/// the review's own `stored` model, else the resolved agent profile's own
+/// `model`, else the `RALPHUS_RESOLVER_MODEL` env override, else
+/// `config_default` (whichever `default_resolver_model` layer the caller
+/// resolved), else `qwen3:8b` for the ollama backend. claude, claude-code,
+/// codex, and pi each pick their own default when still unset → `None`.
 ///
-/// File-config only -- see [`resolver_agent`]'s doc comment for why this
-/// doesn't also consult RAL-408's database-backed project defaults.
-pub(crate) fn resolver_model(stored: Option<&str>, agent: &str, cwd: &Path) -> Option<String> {
-    stored
+/// The profile's own `model` sits above both the env override and the
+/// project-wide default because those two are agent-blind: a
+/// `default_resolver_model = "claude-haiku-4-5"` says nothing meaningful for a
+/// profile whose backend is `pi`, while a profile's `model` is the entire
+/// reason that profile was named as the resolver agent. Cells get this same
+/// treatment at submit time via
+/// `agent_profiles::apply_profile_model_defaults`; without it here, a profile
+/// like `backend = "pi", model = "openrouter/..."` resolved to `None` and the
+/// backend CLI silently fell back to its own built-in default model.
+///
+/// A built-in backend always carries `model: None` on its selection, so this
+/// tier only ever engages for a custom profile that declares one.
+fn resolver_model_chain(
+    stored_model: Option<&str>,
+    selection: &crate::agent_profiles::ResolvedAgentSelection,
+    config_default: Option<String>,
+) -> Option<String> {
+    stored_model
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+        .or_else(|| selection.model.clone())
         .or_else(|| std::env::var("RALPHUS_RESOLVER_MODEL").ok())
-        .or_else(|| {
-            crate::config::resolve(cwd)
-                .default_resolver_model()
-                .map(ToString::to_string)
-        })
-        .or_else(|| match agent {
+        .or(config_default)
+        // Keyed off the *resolved* backend, not the raw profile name, so a
+        // custom profile that resolves to `ollama` still gets the sensible
+        // `qwen3:8b` default.
+        .or_else(|| match selection.backend.as_str() {
             "ollama" => Some("qwen3:8b".to_string()),
-            _ => None, // codex, claude, claude-code: each picks its own default
+            _ => None, // codex, claude, claude-code, pi: each picks its own default
         })
+}
+
+/// [`resolve_resolver_agent`] without a `Store`: resolves a review's resolver
+/// agent through `.ralphus.toml` agent profiles using file config only, with
+/// no database-backed project defaults (RAL-408).
+///
+/// Backs `pr.rs`'s best-effort PR-title/description synthesis, which runs from
+/// a `GuardianView` with no store handle in reach -- see [`resolver_agent`]'s
+/// doc comment for why that call site doesn't warrant the extra plumbing.
+pub(crate) fn resolve_resolver_agent_from_config(
+    stored_agent: Option<&str>,
+    stored_model: Option<&str>,
+    cwd: &Path,
+) -> Result<ResolvedResolverAgent, String> {
+    let raw = resolver_agent(stored_agent, cwd);
+    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
+    let config_default = crate::config::resolve(cwd)
+        .default_resolver_model()
+        .map(ToString::to_string);
+    let model = resolver_model_chain(stored_model, &selection, config_default);
+    Ok(ResolvedResolverAgent {
+        backend: selection.backend,
+        executable: selection.executable,
+        env: selection.env,
+        custom_profile: selection.custom_profile,
+        model,
+    })
 }
 
 /// A review's resolver agent, resolved through `.ralphus.toml` custom agent
@@ -1185,19 +1233,11 @@ fn resolve_resolver_agent(
         .or_else(|| std::env::var("RALPHUS_RESOLVER_AGENT").ok())
         .unwrap_or_else(|| db_cfg.default_resolver_agent().to_string());
     let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
-    // Keyed off the *resolved* backend, not the raw profile name, so a custom
-    // profile that resolves to `ollama` still gets the sensible `qwen3:8b`
-    // default.
-    let model = stored_model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| std::env::var("RALPHUS_RESOLVER_MODEL").ok())
-        .or_else(|| db_cfg.default_resolver_model().map(ToString::to_string))
-        .or_else(|| match selection.backend.as_str() {
-            "ollama" => Some("qwen3:8b".to_string()),
-            _ => None, // codex, claude, claude-code: each picks its own default
-        });
+    let model = resolver_model_chain(
+        stored_model,
+        &selection,
+        db_cfg.default_resolver_model().map(ToString::to_string),
+    );
     Ok(ResolvedResolverAgent {
         backend: selection.backend,
         executable: selection.executable,
@@ -10790,6 +10830,14 @@ mod tests {
     // RAL-342/RAL-338: resolver_model's project-config default tier
     // -----------------------------------------------------------------------
 
+    /// The model `resolve_resolver_agent_from_config` picks for `agent`, which
+    /// is what `pr.rs`'s PR-text synthesis puts on its `RunnerSpec`.
+    fn resolved_model(stored: Option<&str>, agent: &str, cwd: &Path) -> Option<String> {
+        resolve_resolver_agent_from_config(Some(agent), stored, cwd)
+            .expect("resolver agent resolves")
+            .model
+    }
+
     #[test]
     fn resolver_model_falls_back_to_the_project_default_when_stored_and_env_are_unset() {
         let dir = tmp_dir("resolver-model");
@@ -10800,7 +10848,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolver_model(None, "claude-code", &dir),
+            resolved_model(None, "claude-code", &dir),
             Some("claude-haiku-4-5".to_string())
         );
 
@@ -10817,7 +10865,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolver_model(Some("qwen3:8b"), "claude-code", &dir),
+            resolved_model(Some("qwen3:8b"), "claude-code", &dir),
             Some("qwen3:8b".to_string())
         );
 
@@ -10828,10 +10876,134 @@ mod tests {
     fn resolver_model_with_no_project_default_still_falls_back_to_the_ollama_default() {
         let dir = tmp_dir("resolver-model-none");
         assert_eq!(
-            resolver_model(None, "ollama", &dir),
+            resolved_model(None, "ollama", &dir),
             Some("qwen3:8b".to_string())
         );
-        assert_eq!(resolver_model(None, "claude-code", &dir), None);
+        assert_eq!(resolved_model(None, "claude-code", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // An agent profile's own `model` reaches the resolver
+    //
+    // A profile like `backend = "pi", model = "openrouter/..."` resolved to
+    // `model: None`, so the backend CLI was launched with no `--model` and
+    // silently billed against its own built-in default model instead. Written
+    // against a project-local `.ralphus.toml` (the highest-precedence profile
+    // layer) so an ambient `$RALPHUS_CONFIGURATION_PATH` cannot shadow it.
+    // -----------------------------------------------------------------------
+
+    fn dir_with_pi_profile(label: &str, extra: &str) -> PathBuf {
+        let dir = tmp_dir(label);
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            format!(
+                "[agent.profiles.pi-openrouter-deepseek]\n\
+                 backend = \"pi\"\n\
+                 model = \"openrouter/deepseek/deepseek-v4-flash-0731\"\n\
+                 \n\
+                 [agent.profiles.pi-openrouter-deepseek.env]\n\
+                 OPENROUTER_API_KEY = \"key-from-profile\"\n\
+                 {extra}"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn profile_model_is_used_when_the_review_stores_no_model_of_its_own() {
+        let dir = dir_with_pi_profile("resolver-profile-model", "");
+
+        let resolved =
+            resolve_resolver_agent_from_config(Some("pi-openrouter-deepseek"), None, &dir)
+                .expect("profile resolves");
+
+        assert_eq!(resolved.backend, "pi");
+        assert!(resolved.custom_profile);
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4-flash-0731")
+        );
+        // The profile's env must ride along too, or the backend authenticates
+        // against the wrong endpoint.
+        assert_eq!(
+            resolved.env.get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("key-from-profile")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_model_beats_an_agent_blind_project_default() {
+        // `default_resolver_model` says nothing meaningful about a `pi`
+        // profile, so it must not displace the profile's own model.
+        let dir = dir_with_pi_profile(
+            "resolver-profile-model-vs-default",
+            "\n[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n",
+        );
+
+        assert_eq!(
+            resolved_model(None, "pi-openrouter-deepseek", &dir),
+            Some("openrouter/deepseek/deepseek-v4-flash-0731".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_review_model_still_wins_over_the_profile_model() {
+        let dir = dir_with_pi_profile("resolver-profile-model-overridden", "");
+
+        assert_eq!(
+            resolved_model(
+                Some("openrouter/z-ai/glm-5.3-flash"),
+                "pi-openrouter-deepseek",
+                &dir
+            ),
+            Some("openrouter/z-ai/glm-5.3-flash".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The conflict-resolution path (database-backed project defaults, RAL-408)
+    /// must reach the same model as the file-config path above -- this is the
+    /// resolution a real review's merge actually runs through.
+    #[test]
+    fn profile_model_reaches_the_database_backed_resolver_path_too() {
+        let dir = dir_with_pi_profile("resolver-profile-model-db", "");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+
+        let resolved = resolve_resolver_agent(Some("pi-openrouter-deepseek"), None, &store, &dir)
+            .expect("profile resolves");
+
+        assert_eq!(resolved.backend, "pi");
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4-flash-0731")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_profile_without_a_model_still_resolves_to_the_backends_own_default() {
+        let dir = tmp_dir("resolver-profile-no-model");
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[agent.profiles.pi-plain]\nbackend = \"pi\"\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_resolver_agent_from_config(Some("pi-plain"), None, &dir)
+            .expect("profile resolves");
+        assert_eq!(resolved.backend, "pi");
+        assert_eq!(resolved.model, None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

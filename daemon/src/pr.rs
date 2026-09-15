@@ -1539,8 +1539,24 @@ fn synthesize_pr_text(
     };
     let fallback_description = fallback_pr_description(&commits, template);
 
-    let agent = guardian_merge::resolver_agent(guardian.resolver_agent.as_deref(), &root);
-    let model = guardian_merge::resolver_model(guardian.resolver_model.as_deref(), &agent, &root);
+    // The resolver agent may name a custom `[agent.profiles.*]` entry, which
+    // the runner cannot interpret -- resolve it to a real backend (plus its
+    // executable/model/env) before it reaches the `RunnerSpec`.
+    let resolved = match guardian_merge::resolve_resolver_agent_from_config(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        &root,
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] synthesize pr text position={position:?} skipped: {e}"
+            );
+            return (fallback_title, fallback_description);
+        }
+    };
     let template_note = template.map_or_else(String::new, |t| {
         format!(
             "\n\nThe target repository has a pull-request template you MUST \
@@ -1573,9 +1589,9 @@ fn synthesize_pr_text(
             .unwrap_or_else(|| guardian.git_root.clone()),
         prompt: Some(prompt),
         command: None,
-        agent,
-        executable: None,
-        model,
+        agent: resolved.backend,
+        executable: resolved.executable,
+        model: resolved.model,
         system_prompt: None,
         system_prompt_position: None,
         timeout_sec: None,
@@ -1588,7 +1604,11 @@ fn synthesize_pr_text(
         trace_context: trace_context.map(str::to_string),
         resume_agent_session_id: None,
         assigned_agent_session_id: None,
-        env_overrides: std::collections::BTreeMap::new(),
+        // A custom profile's `env` carries the API base/key its backend needs
+        // (RAL-191's rationale for the per-branch invocations applies equally
+        // here) -- without it a profile-backed agent authenticates against the
+        // wrong endpoint, or not at all.
+        env_overrides: resolved.env,
         machine: None,
         tool_arg_truncate_chars: None,
         thrash_max_compactions: None,
