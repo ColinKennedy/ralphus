@@ -183,17 +183,65 @@
        * Renders the right details pane for the current selection.
        * @returns {void}
        */
+      /**
+       * The last markup written to the details pane, with live running-time
+       * values masked out (see {@link detailsMemoKey}). An unchanged render
+       * skips the DOM write entirely.
+       * @type {string|null}
+       */
+      let lastDetailsHtml = null;
+      /**
+       * Comparison key for {@link lastDetailsHtml}: the markup with the text
+       * of every `data-running="1"` element blanked. Those elements hold a
+       * duration recomputed from `Date.now()` on each render and ticked in
+       * place once a second by `ttTickRunningTimes`, so they differ every
+       * time and would defeat the comparison -- while the in-place ticker
+       * keeps them correct whether or not the pane is rebuilt.
+       * @param {string} html
+       * @returns {string}
+       */
+      function detailsMemoKey(html) { return html.replace(/(data-running="1"[^>]*>)[^<]*/g, "$1"); }
+      /**
+       * Writes `html` into the details pane only if it differs from what is
+       * already there.
+       *
+       * `el.innerHTML = ...` tears down and rebuilds the whole subtree, which
+       * for a cell's multi-KB prompt and system-prompt blocks is visible as a
+       * blank-and-repaint. The pane re-renders on every pushed event now that
+       * refreshes are SSE-driven rather than a slow poll, so an unconditional
+       * write made that flicker continuous while a squad was active.
+       * @param {HTMLElement} el
+       * @param {string} html
+       * @returns {boolean} whether the DOM was actually written
+       */
+      function setDetailsHtml(el, html) {
+        const key = detailsMemoKey(html);
+        if (key === lastDetailsHtml) return false;
+        lastDetailsHtml = key;
+        el.innerHTML = html;
+        return true;
+      }
+      /**
+       * Renders the details pane for the current selection.
+       * @returns {void}
+       */
       function renderDetails() {
         const el = byId("details");
         const squad = findSquad(selectedSquadId);
-        if (!squad || !sel.kind) { el.innerHTML = `<div class="empty">Select a squad, task, cell, or proof step.</div>`; return; }
+        if (!squad || !sel.kind) { setDetailsHtml(el, `<div class="empty">Select a squad, task, cell, or proof step.</div>`); return; }
         const tabs = multiSel.size > 1 ? selectionTabs() : "";
-        if (editing) { el.innerHTML = tabs + editForm(squad); return; }
-        if (sel.kind === "squad") el.innerHTML = tabs + squadView(squad);
-        else if (sel.kind === "task") el.innerHTML = tabs + taskView(squad, squad.tasks[sel.taskIdx]);
-        else if (sel.kind === "proof") el.innerHTML = tabs + proofView(squad);
-        else el.innerHTML = tabs + cellView(squad, squad.tasks[sel.taskIdx], squad.tasks[sel.taskIdx].cells[sel.cellIdx]);
+        if (editing) { setDetailsHtml(el, tabs + editForm(squad)); return; }
+        let html;
+        if (sel.kind === "squad") html = tabs + squadView(squad);
+        else if (sel.kind === "task") html = tabs + taskView(squad, squad.tasks[sel.taskIdx]);
+        else if (sel.kind === "proof") html = tabs + proofView(squad);
+        else html = tabs + cellView(squad, squad.tasks[sel.taskIdx], squad.tasks[sel.taskIdx].cells[sel.cellIdx]);
+        if (!setDetailsHtml(el, html)) return;
         attachPeekResizeHandlers();
+        // The markup above carries a stale duration for anything still
+        // running; fill in the live values immediately rather than leaving
+        // them wrong until the next one-second tick.
+        ttTickRunningTimes();
       }
       /**
        * Renders the shared "Edit" button row shown at the bottom of the details pane.
