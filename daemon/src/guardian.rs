@@ -3525,6 +3525,25 @@ impl Store {
         Ok(rows)
     }
 
+    /// One guardian branch's live `merge_status` (RAL-428) -- the branch's
+    /// current resolver phase, which decides which system prompt text the
+    /// `GET /api/guardians/{id}/branches/{branch_id}/system-prompt` endpoint
+    /// derives. `None` when no such branch row exists.
+    pub fn get_branch_merge_status(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT merge_status FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Disable all enabled branches whose source cell is not yet `done`
     /// (or have no linked cell at all). Returns the list of disabled branch
     /// names with their source cell state (None = never submitted). Called by

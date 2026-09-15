@@ -5235,6 +5235,29 @@ impl Store {
             .optional()?)
     }
 
+    /// The effective system prompt persisted for a task cell at dispatch
+    /// time (RAL-428) -- the exact string delivered to the runner for the
+    /// board's admin-only System Prompt tab: ralphus's hidden instructions
+    /// plus the cell's authored system prompt, if any (see
+    /// [`RunnerSpec::effective_system_prompt`]). `None` means the cell has
+    /// never been dispatched, or it is a `command` cell, which has no
+    /// system prompt at all.
+    pub fn get_cell_effective_system_prompt(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self.conn
+            .query_row(
+                "SELECT effective_system_prompt FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Persist the effective read-only system prompt shown for a cell in
     /// the board details pane.
     pub fn set_cell_effective_system_prompt(
@@ -5285,6 +5308,31 @@ impl Store {
             params![to_json_map(env), squad_id, task_idx, idx],
         )?;
         Ok(())
+    }
+
+    /// The effective system prompt persisted for a proof step at dispatch
+    /// time (RAL-428) -- the exact string delivered to the runner for the
+    /// board's admin-only System Prompt tab: ralphus's hidden instructions
+    /// plus the proof's authored system prompt, if any (see
+    /// [`RunnerSpec::effective_system_prompt`]). `None` means the proof has
+    /// never been dispatched, or it is a `command` proof step, which has no
+    /// system prompt at all.
+    pub fn get_proof_effective_system_prompt(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self.conn
+            .query_row(
+                "SELECT effective_system_prompt FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Persist the effective read-only system prompt shown for a proof step in
