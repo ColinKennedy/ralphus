@@ -188,7 +188,112 @@
        * callers from reusing it.
        * @returns {void}
        */
-      function invalidateTasksFetch() { tasksFetchInFlight = null; taskIndexFetchInFlight = null; }
+      function invalidateTasksFetch() {
+        tasksFetchInFlight = null;
+        taskIndexFetchInFlight = null;
+        // A squad mutation can rewrite a prompt (the details pane's edit
+        // form), so the cached text has to be refetched rather than kept.
+        promptCacheSquadId = null;
+        promptCache = {};
+      }
+      // ---- prompt-text cache (details pane) ----
+      // `GET /api/tasks` omits `cell.prompt`/`cell.system_prompt`/
+      // `proof.system_prompt` -- 79% of that response, and only ever shown
+      // for the one selected cell or proof step. The text therefore lives
+      // here, keyed within one squad, instead of on the rows themselves:
+      // every poll replaces `squads` wholesale with a fresh array whose
+      // prompt fields are null, so anything stored on a row is lost each
+      // tick. Caching separately and re-applying *before* the first render
+      // is what keeps the details pane from blanking and repainting on
+      // every refresh.
+      /** @type {string|null} squad id the cached text belongs to. */
+      let promptCacheSquadId = null;
+      /** @type {{[key: string]: {prompt?: string, system_prompt?: string|null}}} */
+      let promptCache = {};
+      /** @type {string|null} squad id whose prompt fetch is in flight, so a poll burst issues one request rather than one each. */
+      let promptFetchInFlight = null;
+      /**
+       * Cache key for a cell.
+       * @param {number} ti
+       * @param {number} si
+       * @returns {string}
+       */
+      function promptKeyCell(ti, si) { return `t${ti}c${si}`; }
+      /**
+       * Cache key for a cell-scoped proof step.
+       * @param {number} ti
+       * @param {number} si
+       * @param {number} vi
+       * @returns {string}
+       */
+      function promptKeyCellProof(ti, si, vi) { return `t${ti}c${si}p${vi}`; }
+      /**
+       * Cache key for a task-scoped proof step.
+       * @param {number} ti
+       * @param {number} vi
+       * @returns {string}
+       */
+      function promptKeyTaskProof(ti, vi) { return `t${ti}p${vi}`; }
+      /**
+       * Copies cached prompt text back onto the current `squads` rows.
+       * Called before the first render of every poll, so the details pane
+       * paints with text already in place.
+       * @returns {void}
+       */
+      function applyPromptCache() {
+        if (!promptCacheSquadId) return;
+        const squad = squads.find((r) => r.id === promptCacheSquadId);
+        if (!squad) return;
+        (squad.tasks || []).forEach((t, ti) => {
+          (t.proof || []).forEach((v, vi) => {
+            const e = promptCache[promptKeyTaskProof(ti, vi)];
+            if (e) v.system_prompt = e.system_prompt;
+          });
+          (t.cells || []).forEach((c, si) => {
+            const e = promptCache[promptKeyCell(ti, si)];
+            if (e) { c.prompt = e.prompt; c.system_prompt = e.system_prompt; }
+            (c.proof || []).forEach((v, vi) => {
+              const pe = promptCache[promptKeyCellProof(ti, si, vi)];
+              if (pe) v.system_prompt = pe.system_prompt;
+            });
+          });
+        });
+      }
+      /**
+       * Loads one squad's prompt text from `GET /api/squads/{id}` (~10KB),
+       * unless it is already cached or in flight. Fetching is keyed on the
+       * squad, not the poll, so switching selection inside a squad costs
+       * nothing and a standing poll re-fetches nothing.
+       * @param {string|null} id
+       * @returns {Promise<boolean>} whether fresh text was loaded
+       */
+      async function ensurePromptCache(id) {
+        if (!id || promptCacheSquadId === id || promptFetchInFlight === id) return false;
+        if (!squads.some((r) => r.id === id)) return false;
+        promptFetchInFlight = id;
+        try {
+          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+          if (!res.ok) return false;
+          /** @type {SquadView} */
+          const detail = await res.json();
+          /** @type {{[key: string]: {prompt?: string, system_prompt?: string|null}}} */
+          const map = {};
+          (detail.tasks || []).forEach((t, ti) => {
+            (t.proof || []).forEach((v, vi) => { map[promptKeyTaskProof(ti, vi)] = { system_prompt: v.system_prompt }; });
+            (t.cells || []).forEach((c, si) => {
+              map[promptKeyCell(ti, si)] = { prompt: c.prompt, system_prompt: c.system_prompt };
+              (c.proof || []).forEach((v, vi) => { map[promptKeyCellProof(ti, si, vi)] = { system_prompt: v.system_prompt }; });
+            });
+          });
+          promptCache = map;
+          promptCacheSquadId = id;
+          return true;
+        } catch (e) {
+          return false; // transient -- the next poll retries
+        } finally {
+          promptFetchInFlight = null;
+        }
+      }
       // RALPHUS-TASKS-POLL-SEQ:END
       // ---- cross-squad task/cell index (on demand) ----
       // Three board features are genuinely cross-squad -- go-to search, the
@@ -582,6 +687,11 @@
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
           squads = d.squads || [];
+          // Before any render: the fresh rows carry null prompt fields, so
+          // without this the details pane paints empty and only fills in
+          // once the fetch below lands -- a visible blank-and-repaint on
+          // every single poll.
+          applyPromptCache();
           const wantSquad = pendingHash ? squadForPendingHash(pendingHash) : undefined;
           if (pendingHash && wantSquad) {
             const want = pendingHash; pendingHash = null;
@@ -602,69 +712,17 @@
             else if (!editing) renderAll();
             else renderSquads();
           }
-          hydrateSelectedSquadPrompts(seq);
+          // Fire-and-forget: only actually fetches when the focused squad
+          // changed, so a standing poll costs nothing here.
+          ensurePromptCache(selectedSquadId).then((loaded) => {
+            if (!loaded || seq !== tasksPollSeq) return;
+            applyPromptCache();
+            if (!userIsSelecting() && !editing) renderAll();
+          });
         } catch (e) {
           if (seq !== tasksPollSeq) return;
           byId("conn").className = "dot off";
           byId("updated").textContent = "daemon unreachable";
-        }
-      }
-      /**
-       * Backfills the agent prompt text for the selected squad only.
-       *
-       * `GET /api/tasks` deliberately omits `cell.prompt`,
-       * `cell.system_prompt` and `proof.system_prompt` -- they were 79% of
-       * that response (4.89MB of 6.23MB against a real history) and the only
-       * thing that renders them is the details pane, for the one selected
-       * cell or proof step. `GET /api/squads/{id}` still carries the full
-       * text, so this fetches just the focused squad (~10KB) and copies the
-       * text onto the already-rendered rows.
-       *
-       * Only the text is copied, never whole objects: everything else on
-       * those rows came from the newer board response and must not be
-       * reverted to this fetch's older view of the same squad.
-       * @param {number} seq - the caller's `tasksPollSeq` ticket, so a
-       *   superseded poll's late-arriving detail can't repaint over a newer one.
-       * @returns {Promise<void>}
-       */
-      async function hydrateSelectedSquadPrompts(seq) {
-        const id = selectedSquadId;
-        if (!id || !squads.some((r) => r.id === id)) return;
-        /** @type {SquadView|null} */
-        let detail = null;
-        try {
-          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
-          if (!res.ok) return;
-          detail = await res.json();
-        } catch (e) { return; /* transient -- the next poll retries */ }
-        if (seq !== tasksPollSeq || selectedSquadId !== id || !detail) return;
-        const target = squads.find((r) => r.id === id);
-        if (!target) return;
-        /**
-         * @param {ProofView[]|undefined} from
-         * @param {ProofView[]|undefined} to
-         * @returns {void}
-         */
-        const copyProofs = (from, to) => {
-          (from || []).forEach((p, vi) => {
-            const dst = (to || [])[vi];
-            if (dst) dst.system_prompt = p.system_prompt;
-          });
-        };
-        (detail.tasks || []).forEach((dt, ti) => {
-          const tt = (target.tasks || [])[ti];
-          if (!tt) return;
-          copyProofs(dt.proof, tt.proof);
-          (dt.cells || []).forEach((dc, si) => {
-            const tc = (tt.cells || [])[si];
-            if (!tc) return;
-            tc.prompt = dc.prompt;
-            tc.system_prompt = dc.system_prompt;
-            copyProofs(dc.proof, tc.proof);
-          });
-        });
-        if (!userIsSelecting() && !editing) {
-          preserveUserState(document.getElementById("details"), renderDetails);
         }
       }
       // RALPHUS-POLL-TASKS:END

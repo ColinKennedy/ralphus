@@ -1262,7 +1262,8 @@
               <label>agent<input id="e-agent" list="e-agent-list" value="${esc(s.agent || "")}">
                 <datalist id="e-agent-list">${agents.map((a) => `<option value="${a}">`).join("")}</datalist></label>
               <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
-              <label>prompt<textarea id="e-prompt" rows="5">${esc(s.prompt || "")}</textarea></label>
+              <label>prompt<textarea id="e-prompt" rows="5"${s.prompt == null ? " disabled" : ""}>${esc(s.prompt || "")}</textarea></label>${s.prompt == null ? `<div class="warn" style="margin:2px 0 6px" data-tip="The prompt text is fetched separately from the squad list and has not arrived yet.
+It is held back rather than shown blank, so saving cannot overwrite it with an empty value.">prompt still loading — it will not be modified by this save</div>` : ""}
             </div>
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
@@ -1314,7 +1315,13 @@
           if (val("e-mode") === "command") {
             body.command = val("e-command");
           } else {
-            body.agent = val("e-agent"); body.model = val("e-model"); body.prompt = val("e-prompt");
+            body.agent = val("e-agent"); body.model = val("e-model");
+            // Only send the prompt when it was actually loaded into the form.
+            // The board list omits prompt text (it is fetched per-squad), so a
+            // form opened before that fetch landed holds an empty textarea --
+            // submitting it would overwrite the real prompt with "".
+            const promptEl = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("e-prompt"));
+            if (promptEl && !promptEl.disabled) body.prompt = promptEl.value;
           }
         }
         try {
