@@ -1,4 +1,4 @@
-//! Parses `help_map.rs`'s chip strings (`"selector [str]"`, `"--from [index]"`,
+//! Parses `help_map.rs`'s chip strings (`"squad_id [id]"`, `"selector [str]"`, `"--from [index]"`,
 //! `"forge [github|gitlab]"`, `"file [str...]"`, `"target [str, optional]"`)
 //! into a small structured [`Chip`], shared by tool-schema generation
 //! ([`crate::tools`]) and argv construction for tool execution

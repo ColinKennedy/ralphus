@@ -3108,8 +3108,11 @@ every other Cartographer event scoped to the squad, plus terminal-log excerpts
 inlined from any `log_path`-carrying rows, sorted by `(at_ms, id)` ascending
 and rendered as one plain-text narrative. As a side effect, the rendered
 text is (best-effort) written to a temp file on the daemon's host — a fresh
-generation on every call, not a persistent export (RAL-155 Q5) — at a fixed
-per-squad path under the OS temp directory. `404` if the squad doesn't exist.
+generation on every call, not a persistent export (RAL-155 Q5) — at a
+per-process, per-squad path under the OS temp directory (within one process
+the path is fixed, so each call replaces the previous render; the pid scope
+keeps concurrent daemon instances from clobbering each other's file). `404`
+if the squad doesn't exist.
 
 ```json
 {
@@ -3139,7 +3142,7 @@ per-squad path under the OS temp directory. `404` if the squad doesn't exist.
     }
   ],
   "text": "=== ralphus uber-log timeline: squad squad-000000000001 ===\n...",
-  "file_path": "C:\\Users\\...\\Temp\\ralphus-timeline-squad-000000000001.log"
+  "file_path": "C:\\Users\\...\\Temp\\ralphus-timeline-squad-000000000001.<pid>.log"
 }
 ```
 
