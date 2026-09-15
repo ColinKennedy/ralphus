@@ -13540,7 +13540,7 @@ mod tests {
             let g = store.lock();
             let id = g.create_guardian("r", "main", "/repo").unwrap();
             g.add_guardian_branch(&id, "feature/a").unwrap();
-            g.set_guardian_resolver(&id, Some("claude-code"), None)
+            g.set_guardian_resolver(&id, Some(Some("claude-code")), None)
                 .unwrap();
             id
         };

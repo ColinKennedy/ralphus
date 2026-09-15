@@ -1284,8 +1284,11 @@ fn apply_resolver(
     let agent = members.iter().find_map(|m| m.agent.clone());
     let model = members.iter().find_map(|m| m.model.clone());
     if agent.is_some() || model.is_some() {
+        // Each column is written only when some member declares it -- a member
+        // that sets `model` alone must not wipe a `resolver_agent` naming a
+        // custom agent profile (see `Store::set_guardian_resolver`).
         store
-            .set_guardian_resolver(gid, agent.as_deref(), model.as_deref())
+            .set_guardian_resolver(gid, agent.as_deref().map(Some), model.as_deref().map(Some))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // RAL-185: where this review's own work runs. Independent of any

@@ -11347,6 +11347,14 @@ fn guardian_rename(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
+/// One `resolver_agent`/`resolver_model` field of a review-settings request,
+/// in the two-level form [`Store::set_guardian_resolver`] takes: an omitted
+/// field (`None`) leaves the stored column alone, an explicitly empty string
+/// clears it, and any other value sets it.
+fn resolver_field(raw: Option<&str>) -> Option<Option<&str>> {
+    raw.map(|s| (!s.is_empty()).then_some(s))
+}
+
 /// Update per-review settings (opt-out flags). Only the fields present in the
 /// body are changed; the updated guardian view is returned.
 fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -11370,8 +11378,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     }
     if req.resolver_agent.is_some() || req.resolver_model.is_some() {
-        let agent = req.resolver_agent.as_deref().filter(|s| !s.is_empty());
-        let model = req.resolver_model.as_deref().filter(|s| !s.is_empty());
+        // Partial update: a field the request omits is left untouched, an
+        // explicitly empty string clears it. Setting only one of the pair must
+        // not clear the other -- see `Store::set_guardian_resolver`.
+        let agent = resolver_field(req.resolver_agent.as_deref());
+        let model = resolver_field(req.resolver_model.as_deref());
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
         }
@@ -11669,8 +11680,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     }
     if req.resolver_agent.is_some() || req.resolver_model.is_some() {
-        let agent = req.resolver_agent.as_deref().filter(|s| !s.is_empty());
-        let model = req.resolver_model.as_deref().filter(|s| !s.is_empty());
+        // Partial update: a field the request omits is left untouched, an
+        // explicitly empty string clears it. Setting only one of the pair must
+        // not clear the other -- see `Store::set_guardian_resolver`.
+        let agent = resolver_field(req.resolver_agent.as_deref());
+        let model = resolver_field(req.resolver_model.as_deref());
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
         }

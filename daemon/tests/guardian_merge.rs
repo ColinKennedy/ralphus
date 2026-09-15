@@ -2185,7 +2185,7 @@ fn start_feedback_persists_reviewer_message_scoped_to_its_branch() {
     // generation always no-ops instead of racing a real API call.
     store
         .lock()
-        .set_guardian_resolver(&id, Some("claude-code"), None)
+        .set_guardian_resolver(&id, Some(Some("claude-code")), None)
         .unwrap();
     run_merge(&store, &NoopRunner, &id);
     let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
@@ -4874,7 +4874,7 @@ fn review_resolver_agent_resolves_a_custom_agent_profile() {
             .unwrap();
         g.add_guardian_branch(&id, "feature/x").unwrap();
         g.add_guardian_branch(&id, "feature/y").unwrap();
-        g.set_guardian_resolver(&id, Some("test-profile"), None)
+        g.set_guardian_resolver(&id, Some(Some("test-profile")), None)
             .unwrap();
         id
     };
