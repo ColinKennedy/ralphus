@@ -291,9 +291,10 @@ impl ReviewConfig {
     }
 
     /// The configured default conflict-resolver model, unset resolves to
-    /// `None` -- `guardian_merge::resolver_model`'s fallback chain (per-review
-    /// `model` -> `RALPHUS_RESOLVER_MODEL` -> this -> the resolved backend's
-    /// own default) still lets the backend pick when this is also unset.
+    /// `None` -- `guardian_merge::resolver_model_chain`'s fallback chain
+    /// (per-review `model` -> the resolved agent profile's own `model` ->
+    /// `RALPHUS_RESOLVER_MODEL` -> this -> the resolved backend's own default)
+    /// still lets the backend pick when this is also unset.
     #[must_use]
     pub fn default_resolver_model(&self) -> Option<&str> {
         self.default_resolver_model.as_deref()
