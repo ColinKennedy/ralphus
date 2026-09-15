@@ -65,7 +65,7 @@ function makeElements() {
  * makes out-of-order poll completion deterministic.
  */
 export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existing", userIsSelecting = () => false, editing = false, selectionOps = {} } = {}) {
-  const calls = { renderAll: 0, renderSquads: 0, fetches: [], pruned: [], appliedFocus: [], syncHash: 0 };
+  const calls = { renderAll: 0, renderDetails: 0, renderSquads: 0, fetches: [], pruned: [], appliedFocus: [], syncHash: 0 };
   /** @type {{url: string, resolve: (r: {json: () => Promise<any>}) => void, reject: (e: unknown) => void}[]} */
   const pendingFetches = [];
   const fetchImpl = (url) => {
@@ -92,6 +92,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
     formatConcurrencyStatus: (running, maxConcurrent) => `Running ${running} / ${maxConcurrent === 0 ? "unlimited" : maxConcurrent}`,
     userIsSelecting,
     renderAll: () => { calls.renderAll++; },
+    renderDetails: () => { calls.renderDetails++; },
     renderSquads: () => { calls.renderSquads++; },
     renderSortChips: () => {},
     renderStatusFilters: () => {},
@@ -101,7 +102,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
   const factory = new Function(
     "deps",
     "fetchImpl",
-    `const { byId, window, formatConcurrencyStatus, userIsSelecting, renderAll, renderSquads, renderSortChips, renderStatusFilters, syncHash, squadForPendingHash, selForPendingHash, reconcileSquadSelection, snapshotSel, pruneSquadSelCache, applySquadFocus } = deps;
+    `const { byId, window, formatConcurrencyStatus, userIsSelecting, renderAll, renderDetails, renderSquads, renderSortChips, renderStatusFilters, syncHash, squadForPendingHash, selForPendingHash, reconcileSquadSelection, snapshotSel, pruneSquadSelCache, applySquadFocus } = deps;
      const fetch = fetchImpl;
      var squads = [], pendingHash = ${JSON.stringify(pendingHash)}, selectedSquadId = ${JSON.stringify(selectedSquadId)}, editing = ${JSON.stringify(editing)};
      var squadSelCache = {}, squadNodeCache = {}, lastSquadId = null, nodeMultiSel = new Set();
@@ -119,6 +120,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
        invalidateTasksFetch,
        ensurePromptCache,
        applyPromptCache,
+       syncPromptCache,
        state: () => ({ seq: tasksPollSeq, squads, sel, nodeMultiSel, squadSelCache, squadNodeCache, lastSquadId, daemonStatus: window._daemonStatus, promptCacheSquadId }),
      };`,
   );

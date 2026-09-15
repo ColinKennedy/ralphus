@@ -235,6 +235,30 @@
        */
       function promptKeyTaskProof(ti, vi) { return `t${ti}p${vi}`; }
       /**
+       * Starts loading prompt text for the current selection if it is not
+       * already cached.
+       *
+       * Called from `renderDetails`, which every selection path funnels
+       * through, so picking a cell fetches its text immediately. Previously
+       * this only ran at the tail of `pollTasks`, so a selection made on a
+       * quiet daemon sat empty until the next poll -- up to the 60s
+       * reconciliation tick.
+       *
+       * Cheap to call on every render: it returns immediately once the
+       * squad is cached or a fetch for it is already in flight, and the
+       * re-render it triggers on success cannot recurse, since by then the
+       * cache matches the selection.
+       * @returns {void}
+       */
+      function syncPromptCache() {
+        if (!selectedSquadId || promptCacheSquadId === selectedSquadId) return;
+        ensurePromptCache(selectedSquadId).then((loaded) => {
+          if (!loaded) return;
+          applyPromptCache();
+          renderDetails();
+        });
+      }
+      /**
        * Copies cached prompt text back onto the current `squads` rows.
        * Called before the first render of every poll, so the details pane
        * paints with text already in place.

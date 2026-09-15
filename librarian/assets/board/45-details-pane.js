@@ -227,6 +227,10 @@
        */
       function renderDetails() {
         const el = byId("details");
+        // Prompt text lives in a per-squad cache fetched separately from the
+        // board list; start that fetch the moment a selection needs a squad
+        // that is not loaded yet, rather than waiting for the next poll.
+        syncPromptCache();
         const squad = findSquad(selectedSquadId);
         if (!squad || !sel.kind) { setDetailsHtml(el, `<div class="empty">Select a squad, task, cell, or proof step.</div>`); return; }
         const tabs = multiSel.size > 1 ? selectionTabs() : "";
