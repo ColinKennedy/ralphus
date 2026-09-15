@@ -138,7 +138,9 @@ this is already pointed at the just-built debug `ralphus-runner` exe for you.
 `ollama` needs a reachable Ollama server (default `http://localhost:11434/v1`);
 `claude-code`/`codex`/`pi` need the corresponding CLI installed. See
 [`docs/dependencies.md`](docs/dependencies.md) for the full breakdown of which
-agent backends need what.
+agent backends need what. On Windows, Pi supports local worktree paths,
+including `\\?\C:\...` extended-length paths, but not worktrees hosted on a
+genuine UNC share because the npm-provided `pi.cmd` launcher uses `cmd.exe`.
 
 ## Status
 

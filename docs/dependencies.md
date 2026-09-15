@@ -151,6 +151,12 @@ Only pick a `claude-code`/`codex`/`pi`/`raw` agent if the corresponding CLI is
 actually installed; `claude`/`anthropic`/`ollama` never need anything
 installed beyond network access to the model.
 
+On Windows, the Pi backend supports local worktree paths, including paths in
+the `\\?\C:\...` extended-length form. It does not support a worktree hosted
+on a genuine UNC share (`\\server\share\...` or `\\?\UNC\server\share\...`):
+the npm-provided `pi.cmd` launcher runs through `cmd.exe`, which cannot use a
+UNC path as its current directory.
+
 ### gh / glab — optional, best-effort only
 
 `daemon/src/forge.rs`'s `resolve_cli_token` shells out to `gh auth token` or
