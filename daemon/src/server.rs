@@ -1080,6 +1080,11 @@ fn route_for_user(
         ("GET", ["api", "triage", "pools"]) => {
             admin_gated(daemon, user_header, || list_triage_pools(daemon))
         }
+        ("POST", ["api", "triage", "pools", "threshold", "preview"]) => {
+            admin_gated(daemon, user_header, || {
+                preview_triage_pool_threshold(daemon, body)
+            })
+        }
         ("POST", ["api", "triage", "pools", "threshold"]) => {
             admin_gated(daemon, user_header, || {
                 set_triage_pool_threshold(daemon, body)
@@ -1263,13 +1268,6 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: board URI-bar resolution; the CLI resolves selectors itself by fetching squad/guardian views
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
-        // RAL-420: pre-work generation cost — per-squad detail + cross-squad audit.
-        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
-        ("GET", ["api", "squads", id, "generation-costs"]) => {
-            squad_generation_cost_rows(daemon, id)
-        }
-        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
-        ("GET", ["api", "generation-costs"]) => generation_costs_audit(daemon),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
@@ -3149,6 +3147,93 @@ fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
         Ok(()) => json(200, &serde_json::json!({"ok": true})),
         Err(e) => store_error(&e),
     }
+}
+
+/// `POST /api/triage/pools/threshold/preview` body (RAL-421): same shape as
+/// `SetTriagePoolThresholdBody` -- this is "what would confirming do?" for
+/// the same proposed change.
+#[derive(Deserialize)]
+struct PreviewTriagePoolThresholdBody {
+    project: String,
+    triage_type: String,
+    #[serde(default)]
+    threshold: Option<i64>,
+}
+
+/// The non-mutating rough preview for a proposed pool threshold (RAL-421):
+/// what confirming it would drain *right now*. Deliberately "rough" -- the
+/// pool can change between preview and confirm (another submission pooling,
+/// a cron firing, ...) -- so the UI must treat it as an estimate, never as
+/// a reservation. `full_batches` is the number of whole threshold-sized
+/// batches (`pooled / threshold`), each of which would become its own
+/// review; the sub-threshold remainder (`cells_left`) stays pooled.
+#[derive(Serialize)]
+struct TriagePoolThresholdPreview {
+    /// The pool key the proposed threshold resolves to -- the same key the
+    /// confirm call will persist under.
+    project: String,
+    triage_type: String,
+    proposed_threshold: Option<i64>,
+    /// Whether this preview is for clearing the threshold (no drain).
+    clearing: bool,
+    /// Viable pooled-cell count right now (failed cells never count).
+    pooled: i64,
+    /// Whole threshold-sized batches a confirm would drain now (`0` when
+    /// clearing, or when `pooled < threshold`).
+    full_batches: i64,
+    /// `full_batches * threshold` -- cells a confirm would drain now.
+    cells_drained: i64,
+    /// Cells that would remain pooled after the drain (`0` when clearing).
+    cells_left: i64,
+}
+
+/// `POST /api/triage/pools/threshold/preview`: non-mutating rough preview
+/// for a proposed threshold (RAL-421) -- see [`TriagePoolThresholdPreview`].
+/// Reads only; never writes a threshold and never drains or creates a
+/// review, so it is safe to call from a keystroke handler or a periodic
+/// poll.
+fn preview_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<PreviewTriagePoolThresholdBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"project\" and \"triage_type\" strings",
+            vec![],
+        );
+    };
+    if let Some(t) = req.threshold {
+        if t < 1 {
+            return error(
+                400,
+                "invalid_value",
+                "'threshold' must be at least 1",
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    let pooled = match store.triage_pool_count(&project, &req.triage_type) {
+        Ok(c) => c,
+        Err(e) => return store_error(&e),
+    };
+    let (full_batches, cells_drained) = req.threshold.map_or((0, 0), |t| {
+        let full = pooled / t;
+        (full, full * t)
+    });
+    json(
+        200,
+        &TriagePoolThresholdPreview {
+            project,
+            triage_type: req.triage_type,
+            proposed_threshold: req.threshold,
+            clearing: req.threshold.is_none(),
+            pooled,
+            full_batches,
+            cells_drained,
+            cells_left: pooled - cells_drained,
+        },
+    )
 }
 
 /// `GET /api/triage/schedules[?project=...&triage_type=...]`: every
@@ -23429,6 +23514,88 @@ command=\"cargo test\"
         assert_eq!(r.status, 200, "{}", r.body);
         let r = route(&d, "DELETE", &format!("/api/triage/schedules/{id}"), "");
         assert_eq!(r.status, 404);
+    }
+
+    /// RAL-421: the preview twin of the threshold route is non-mutating --
+    /// it estimates what a confirm would drain (threshold-sized batches)
+    /// without writing the threshold, draining the pool, or creating a
+    /// review, so calling it can never start Guardian-agent (LLM) work.
+    #[test]
+    fn triage_pool_threshold_preview_route_is_non_mutating_and_estimates_batches() {
+        let d = daemon();
+        for i in 0..7 {
+            pool_a_finished_cell(&d, "proj", "bug", &format!("b{i}"));
+        }
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold/preview",
+            r#"{"project":"proj","triage_type":"bug","threshold":3}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"project\":\"proj\""), "{}", r.body);
+        assert!(r.body.contains("\"proposed_threshold\":3"), "{}", r.body);
+        assert!(r.body.contains("\"pooled\":7"), "{}", r.body);
+        assert!(r.body.contains("\"full_batches\":2"), "{}", r.body);
+        assert!(r.body.contains("\"cells_drained\":6"), "{}", r.body);
+        assert!(r.body.contains("\"cells_left\":1"), "{}", r.body);
+        assert!(r.body.contains("\"clearing\":false"), "{}", r.body);
+
+        // Nothing was persisted, drained, or reviewed.
+        assert!(
+            d.lock()
+                .get_triage_pool_threshold("proj", "bug")
+                .unwrap()
+                .is_none(),
+            "a preview must never write the threshold"
+        );
+        assert_eq!(
+            d.lock().triage_pool_count("proj", "bug").unwrap(),
+            7,
+            "a preview must never drain the pool"
+        );
+        assert!(
+            d.lock().list_guardians().unwrap().is_empty(),
+            "a preview must never create a review (no LLM work)"
+        );
+    }
+
+    /// RAL-421: a clearing preview reports that confirming would only
+    /// remove the count trigger, never drain anything.
+    #[test]
+    fn triage_pool_threshold_preview_route_reports_clear_without_draining() {
+        let d = daemon();
+        for i in 0..3 {
+            pool_a_finished_cell(&d, "proj", "bug", &format!("b{i}"));
+        }
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold/preview",
+            r#"{"project":"proj","triage_type":"bug","threshold":null}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"clearing\":true"), "{}", r.body);
+        assert!(r.body.contains("\"full_batches\":0"), "{}", r.body);
+        assert!(r.body.contains("\"cells_drained\":0"), "{}", r.body);
+        assert!(r.body.contains("\"cells_left\":3"), "{}", r.body);
+        assert_eq!(d.lock().triage_pool_count("proj", "bug").unwrap(), 3);
+    }
+
+    /// RAL-421: the preview route rejects the same invalid thresholds the
+    /// confirm route does -- consistency keeps the UI honest before it ever
+    /// shows a Confirm button.
+    #[test]
+    fn triage_pool_threshold_preview_route_rejects_a_threshold_below_one() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold/preview",
+            r#"{"project":"proj","triage_type":"bug","threshold":0}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("invalid_value"));
     }
 
     /// RAL-374: setting a threshold via `POST /api/triage/pools/threshold`

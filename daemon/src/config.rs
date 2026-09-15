@@ -1337,6 +1337,35 @@ impl ForgeConfig {
     }
 }
 
+/// Provider-specific PR/MR submission defaults (`[github]`/`[gitlab]` tables,
+/// RAL-196). Each provider's table holds the same knobs, so both parse into
+/// this one struct — the fields on [`ConfigFile`] choose the table. Today
+/// there is a single knob: whether PRs/MRs submitted from reviews in this
+/// project open as **drafts** (work-in-progress) on that provider by default.
+/// The registry owner sets it so a whole project can decide once —
+/// "PRs from this repo start as drafts" — without every reviewer having to
+/// remember a flag; an individual submission can still override it either
+/// direction at submit time (the `PrRequest.draft` field, CLI
+/// `--draft`/`--ready-for-review`), and that per-call override always wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ForgeProviderConfig {
+    /// `draft_by_default`: whether PRs/MRs opened from reviews in this
+    /// project start as drafts on this provider. `None` (unset either here)
+    /// resolves to `false` — open ready-for-review, matching ralphus's
+    /// historical behavior — via [`resolve_pr_draft_by_default`].
+    #[serde(default)]
+    pub draft_by_default: Option<bool>,
+}
+
+impl ForgeProviderConfig {
+    /// The effective draft-by-default for this table: the configured value,
+    /// or `false` (open ready-for-review) when unset.
+    #[must_use]
+    pub fn resolved_draft_by_default(&self) -> bool {
+        self.draft_by_default.unwrap_or(false)
+    }
+}
+
 /// Environment-variable-override allowlist configuration (`[env_overrides]`
 /// table, RAL-150). A retry-time env override whose key is **not** in
 /// `allowlist` still takes effect (the allowlist is not a security boundary
@@ -1767,6 +1796,14 @@ struct ConfigFile {
     thrash: Option<ThrashConfig>,
     #[serde(default)]
     forge: Option<ForgeConfig>,
+    /// `[github]` provider-specific defaults table (RAL-196), see
+    /// [`ForgeProviderConfig`].
+    #[serde(default)]
+    github: Option<ForgeProviderConfig>,
+    /// `[gitlab]` provider-specific defaults table (RAL-196), see
+    /// [`ForgeProviderConfig`].
+    #[serde(default)]
+    gitlab: Option<ForgeProviderConfig>,
     #[serde(default)]
     env_overrides: Option<EnvOverridesConfig>,
     #[serde(default)]
@@ -2069,6 +2106,47 @@ pub fn resolve_forge(cwd: &Path) -> ForgeConfig {
     global.merge(project)
 }
 
+/// Parse a `[github]`/`[gitlab]` provider-defaults table from the given TOML
+/// text (RAL-196) — the table named by `kind`'s provider, or an empty table
+/// when absent/invalid.
+#[must_use]
+pub fn provider_defaults_from_toml_str(
+    s: &str,
+    kind: crate::forge::ForgeKind,
+) -> ForgeProviderConfig {
+    let cfg = toml::from_str::<ConfigFile>(s).unwrap_or_default();
+    match kind {
+        crate::forge::ForgeKind::GitHub => cfg.github.unwrap_or_default(),
+        crate::forge::ForgeKind::GitLab => cfg.gitlab.unwrap_or_default(),
+    }
+}
+
+/// Load the effective provider-defaults config for `kind` from one config file.
+#[must_use]
+fn load_provider_defaults_file(path: &Path, kind: crate::forge::ForgeKind) -> ForgeProviderConfig {
+    std::fs::read_to_string(path)
+        .map(|s| provider_defaults_from_toml_str(&s, kind))
+        .unwrap_or_default()
+}
+
+/// Resolve the effective `draft_by_default` for `kind` at `cwd` (RAL-196):
+/// the per-project `.ralphus.toml` value layered over the global config's
+/// (per-project wins on a scalar conflict — a project explicitly setting
+/// `draft_by_default = false` must beat a global `true`), same layering as
+/// [`resolve_forge`]. `false` (open ready-for-review) when neither sets it,
+/// which is also the per-call fallback when a submission provides no
+/// override.
+#[must_use]
+pub fn resolve_pr_draft_by_default(cwd: &Path, kind: crate::forge::ForgeKind) -> bool {
+    let global = global_config_path()
+        .map(|p| load_provider_defaults_file(&p, kind))
+        .and_then(|c| c.draft_by_default);
+    let project = find_project_config(cwd)
+        .map(|p| load_provider_defaults_file(&p, kind))
+        .and_then(|c| c.draft_by_default);
+    project.or(global).unwrap_or(false)
+}
+
 /// Parse an `EnvOverridesConfig` from the given TOML text.
 #[must_use]
 pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
@@ -2289,6 +2367,7 @@ pub(crate) fn reset_cors_cache_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::ForgeKind;
 
     #[test]
     fn ark_defaults_and_validation_are_safe() {
@@ -3398,6 +3477,86 @@ mod tests {
         assert!(validate_pull_request_branch_convention("static-branch-name").is_err());
         assert!(validate_pull_request_branch_convention("{name}-review").is_ok());
         assert!(validate_pull_request_branch_convention("release/blah-{name}").is_ok());
+    }
+
+    // ── ForgeProviderConfig (RAL-196): `[github]`/`[gitlab]` ─────────────
+
+    #[test]
+    fn provider_defaults_resolve_false_when_unset() {
+        assert!(!ForgeProviderConfig::default().resolved_draft_by_default());
+        assert!(
+            ForgeProviderConfig {
+                draft_by_default: Some(true)
+            }
+            .resolved_draft_by_default()
+        );
+    }
+
+    #[test]
+    fn provider_defaults_parse_each_provider_table_independently() {
+        let s = "[github]\ndraft_by_default = true\n[gitlab]\ndraft_by_default = false\n";
+        assert!(provider_defaults_from_toml_str(s, ForgeKind::GitHub).resolved_draft_by_default());
+        assert!(!provider_defaults_from_toml_str(s, ForgeKind::GitLab).resolved_draft_by_default());
+        // A table with no `draft_by_default` key parses to the default.
+        assert!(
+            !provider_defaults_from_toml_str("[github]\n[gitlab]\n", ForgeKind::GitHub)
+                .resolved_draft_by_default()
+        );
+    }
+
+    #[test]
+    fn provider_defaults_parse_only_the_named_providers_table() {
+        // A gitlab-only file leaves github unset (default); same both ways.
+        let s = "[gitlab]\ndraft_by_default = true\n";
+        assert!(!provider_defaults_from_toml_str(s, ForgeKind::GitHub).resolved_draft_by_default());
+        assert!(provider_defaults_from_toml_str(s, ForgeKind::GitLab).resolved_draft_by_default());
+    }
+
+    #[test]
+    fn provider_defaults_merge_project_scalar_wins() {
+        // The layering is by scalar, not by whole table: a project table that
+        // exists but leaves `draft_by_default` unset still lets the global
+        // value through (same "per-project scalar wins when set" semantics
+        // as `ForgeConfig::merge`).
+        let project = ForgeProviderConfig {
+            draft_by_default: None,
+        };
+        let global = ForgeProviderConfig {
+            draft_by_default: Some(true),
+        };
+        assert!(
+            project
+                .draft_by_default
+                .or(global.draft_by_default)
+                .unwrap_or(false)
+        );
+        // An explicitly-set project `false` beats a global `true`.
+        let project = ForgeProviderConfig {
+            draft_by_default: Some(false),
+        };
+        assert!(
+            !project
+                .draft_by_default
+                .or(global.draft_by_default)
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn resolve_pr_draft_by_default_project_file_wins_over_any_global_value() {
+        // A project `.ralphus.toml` explicitly setting `draft_by_default`
+        // must beat the global config regardless of what the test machine's
+        // global file says (the global file can't be controlled here).
+        let dir = std::env::temp_dir().join(format!("ralphus-cfg-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[github]\ndraft_by_default = true\n[gitlab]\ndraft_by_default = false\n",
+        )
+        .unwrap();
+        assert!(resolve_pr_draft_by_default(&dir, ForgeKind::GitHub));
+        assert!(!resolve_pr_draft_by_default(&dir, ForgeKind::GitLab));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── EnvOverridesConfig (RAL-150) ──────────────────────────────────────
