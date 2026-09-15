@@ -10911,12 +10911,26 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut next_number = 101_i64;
             loop {
-                let req = match server.recv_timeout(std::time::Duration::from_secs(20)) {
+                // An idle timeout must never drop the listener: under a full
+                // parallel `nextest` run this thread can sit idle while the
+                // main thread's git setup stretches past any fixed timeout,
+                // and closing the socket there is exactly the "connection
+                // refused" flake this loop used to produce. The test ends
+                // the loop explicitly with a `/done` request; a genuine
+                // tiny_http 0.12 accept-thread death (see `daemon/src/
+                // server.rs`'s rebind loop for that quirk) still breaks out
+                // and fails the test loudly.
+                let req = match server.recv_timeout(std::time::Duration::from_secs(30)) {
                     Ok(Some(r)) => r,
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => continue,
+                    Err(_) => break,
                 };
                 let method = req.method().clone();
                 let url = req.url().to_string();
+                if url == "/done" {
+                    req.respond(tiny_http::Response::empty(204)).unwrap();
+                    break;
+                }
                 let path = url.split('?').next().unwrap_or(&url).to_string();
                 let is_list = if forge_name == "github" {
                     path.ends_with("/pulls")
@@ -11156,6 +11170,15 @@ mod tests {
         assert_eq!(old_pr.state, "open");
         assert_eq!(old_pr.repo, origin_repo);
 
+        // End the server thread explicitly rather than waiting for an idle
+        // timeout, which under load can fire while the test is mid-flight
+        // and close the listener (see the loop's comment).
+        let done = ureq::get(&format!("http://{addr}/done"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .expect("done ping");
+        assert_eq!(done.status(), 204);
+
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&origin_bare);
@@ -11348,29 +11371,28 @@ mod tests {
         // PR template) -- only the two calls this test actually cares about:
         // branch A's create 422s, branch B's create succeeds.
         let handle = std::thread::spawn(move || {
-            let mut received_any = false;
             loop {
-                // The first `recv` is generous: under a full parallel
-                // `nextest` run this thread can be waiting behind real
-                // git2/filesystem setup work in the main thread while dozens
-                // of other tests contend for CPU, and too short a timeout
-                // here reads as "no more requests coming" and drops the
-                // listening socket before the real first request ever
-                // arrives. Once the client is mid-flow, a much shorter idle
-                // wait is enough to notice "done" without every run paying
-                // the full timeout as dead time at the end.
-                let timeout = if received_any {
-                    std::time::Duration::from_secs(5)
-                } else {
-                    std::time::Duration::from_secs(30)
-                };
-                let mut req = match server.recv_timeout(timeout) {
+                // An idle timeout must never drop the listener: the main
+                // thread's git2/filesystem setup below can stretch past any
+                // fixed timeout under a full parallel `nextest` run, and
+                // closing the socket then is exactly the "connection
+                // refused" flake this loop used to produce -- the original
+                // 30s-first-wait already tried to dodge that and still lost
+                // under enough load. The test ends the loop explicitly with
+                // a `/done` request; a genuine tiny_http 0.12 accept-thread
+                // death (see `daemon/src/server.rs`'s rebind loop for that
+                // quirk) still breaks out and fails the test loudly.
+                let mut req = match server.recv_timeout(std::time::Duration::from_secs(30)) {
                     Ok(Some(r)) => r,
-                    _ => break,
+                    Ok(None) => continue,
+                    Err(_) => break,
                 };
-                received_any = true;
                 let method = req.method().clone();
                 let url = req.url().to_string();
+                if url == "/done" {
+                    req.respond(tiny_http::Response::empty(204)).unwrap();
+                    break;
+                }
                 if method == tiny_http::Method::Get && url.starts_with("/repos/acme/w/pulls?") {
                     // `find_existing_pull_request`: report no pre-existing PR
                     // for either branch, same as a fresh submission.
@@ -11503,6 +11525,15 @@ mod tests {
         );
         assert_eq!(failed[0].0, branch_a_id);
         assert!(failed[0].1.contains("422"), "{}", failed[0].1);
+
+        // End the server thread explicitly rather than waiting for an idle
+        // timeout, which under load can fire while the test is mid-flight
+        // and close the listener (see the loop's comment).
+        let done = ureq::get(&format!("http://{addr}/done"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .expect("done ping");
+        assert_eq!(done.status(), 204);
 
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);

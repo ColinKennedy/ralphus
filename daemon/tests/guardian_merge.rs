@@ -675,7 +675,12 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
     let remained_cancelled = Arc::new(AtomicBool::new(false));
     let remained_cancelled_while_stopping = Arc::clone(&remained_cancelled);
     let release_worker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(75));
+        // Long enough that the reopen below is certainly already inside its
+        // stop-wait, short enough that it can never be the flake itself:
+        // the assertions this thread feeds only get *more* margin the later
+        // it runs; what would actually be fragile is making it race the
+        // stop-wait's own timeout, so keep it a couple of poll intervals.
+        std::thread::sleep(Duration::from_millis(150));
         remained_cancelled_while_stopping.store(
             store_while_stopping
                 .lock()
@@ -706,7 +711,11 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
         "reopen must not change status or start a new worker before the old one exits"
     );
 
-    for _ in 0..100 {
+    // The reopened worker stages a real git rebase in a temp worktree; under
+    // a fully loaded parallel `nextest` run that can take far longer than the
+    // original one-second budget, so poll generously before declaring it did
+    // not finish.
+    for _ in 0..1000 {
         if !cancellations.is_active(&key) {
             break;
         }
@@ -2386,7 +2395,11 @@ fn cancelling_a_review_kills_an_in_flight_check_gate_command() {
     );
     assert_eq!(reply.status, 202);
 
-    for _ in 0..2000 {
+    // The gate command is spawned fresh per merge; under a fully loaded
+    // parallel `nextest` run the subprocess can take many seconds to even
+    // reach its first write, so poll generously before declaring it never
+    // started (the assertion is what fails -- an early exit costs nothing).
+    for _ in 0..6000 {
         if started.exists() {
             break;
         }

@@ -35,8 +35,11 @@
 //! multi-cell squad can't produce an unusably large merged file.
 //!
 //! The generated file is a temp artifact (Q5), rewritten on every call under
-//! a fixed per-squad path in the OS temp directory — never intended to persist
-//! long-term.
+//! a per-process, per-squad path in the OS temp directory — never intended to
+//! persist long-term. The pid scope keeps concurrent writers (separate daemon
+//! or test processes sharing the same squad id) from clobbering each other's
+//! file; within one process the path is fixed, so a second call still replaces
+//! the previous render.
 
 use serde::Serialize;
 
@@ -364,7 +367,14 @@ fn format_ts(at_ms: i64) -> String {
 /// empty file. Rename is atomic on both POSIX and Windows.
 fn write_temp_file(squad_id: &str, text: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!("ralphus-timeline-{squad_id}.log"));
+    // The path is pid-scoped so concurrent writers (separate daemon or test
+    // processes sharing the same squad id) can never clobber each other's
+    // file -- within one process the path stays fixed, so repeated calls
+    // still replace the previous render (RAL-155 Q5 best-effort artifact).
+    let path = std::env::temp_dir().join(format!(
+        "ralphus-timeline-{squad_id}.{}.log",
+        std::process::id()
+    ));
     let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_path = std::env::temp_dir().join(format!(
         "ralphus-timeline-{squad_id}.{}.{unique}.tmp",
