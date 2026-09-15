@@ -1186,6 +1186,30 @@
           }),
         }).catch(() => {});
       }
+      /**
+       * Fires `POST /api/squads/{squadId}/tasks/0/suggest-name` (RAL-398)
+       * after a Simple-tab submit whose prompt had neither a typed label nor
+       * a ticket-id-shaped token to name the task after. Fire-and-forget --
+       * the daemon runs the naming call and applies the result (or falls
+       * back to `fallbackName`) entirely on its own background thread, so
+       * there is nothing here to poll: the renamed task/squad shows up on
+       * the board's next regular poll, whether or not this modal (or even
+       * this browser tab) is still open by then.
+       * @param {string} squadId
+       * @param {string} fallbackName
+       * @returns {void}
+       */
+      function ntRequestSuggestedName(squadId, fallbackName) {
+        const project = projects.find((p) => p.name === ntSimple.project);
+        const cwd = project ? project.path : ".";
+        fetch(`/api/squads/${encodeURIComponent(squadId)}/tasks/0/suggest-name`, {
+          method: "POST",
+          body: JSON.stringify({
+            cwd, agent: ntSimple.agent, model: ntSimple.model.trim() || undefined,
+            prompt_context: ntSimpleEffectivePrompt(), fallback_name: fallbackName,
+          }),
+        }).catch(() => {});
+      }
 
       // ---------- new task modal: Files tab ----------
       /**
