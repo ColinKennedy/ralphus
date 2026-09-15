@@ -663,7 +663,6 @@
        * @returns {void}
        */
       function closeProjectFilterMenu() { const m = document.getElementById("project-filter-menu"); if (m) m.remove(); }
-      document.addEventListener("click", closeProjectFilterMenu);
       /**
        * Renders the Reviews sidebar's guardian-status checkboxes and syncs its text filter input.
        * @returns {void}
@@ -850,7 +849,6 @@
       function renderSquads() {
         renderProjectFilterChips();
         const el = byId("squads");
-        renderProjectFilterChips();
         const list = visibleSquads();
         if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>`; return; }
         el.innerHTML = list.map((r) => `

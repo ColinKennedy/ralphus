@@ -5902,7 +5902,7 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             }
             _ => (req.fallback_name.clone(), None),
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
             crate::rlog!(
                 WARNING,

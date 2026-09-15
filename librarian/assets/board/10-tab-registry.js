@@ -427,7 +427,6 @@
        * @property {Set<string>} projects - RAL-345: project names whose tasks may be shown; an empty set means "every project" (no filter applied). AND-combined with `q`/`status`/`needsMe`.
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
-       * @property {Set<string>} project - RAL-345: task project names to include; empty means "no filter" (every project shown)
        * @property {boolean} pr - RAL-353: require at least one associated pull request
        * @property {"any"|"draft"|"non-draft"} prDraft - RAL-353: the chosen draft-status dimension; "any" disables it
        * @property {"any"|"passing"|"failing"} prCi - RAL-353: the chosen CI-status dimension; "any" disables it
@@ -1108,7 +1107,6 @@
         if (filters.projects && filters.projects.size && !filters.projects.has(row.project)) return false;
         if (!filters.showHidden && (hiddenSquadIds.has(row.squadId) || (hiddenTaskKeys && hiddenTaskKeys.has(row.key)))) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
-        if (filters.project && filters.project.size && !filters.project.has(row.task.project)) return false;
         if (!ttRowMatchesPrFilter(row, filters)) return false;
         return true;
       }

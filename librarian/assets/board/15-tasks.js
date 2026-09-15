@@ -864,7 +864,6 @@
        * @returns {void}
        */
       function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
-      document.addEventListener("click", ttCloseProjectFilterMenu);
       /**
        * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
        * @param {string} squadId
