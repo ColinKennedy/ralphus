@@ -17,11 +17,19 @@ model-agnostic runner that can be exercised end-to-end by local models.
 Linux and Windows are fully supported daemon hosts and are covered by CI's
 full fmt/clippy/test suite (`.github/workflows/ci.yml`). macOS daemon-host
 support is **experimental** (RAL-398): the same `cfg(unix)` code paths Linux
-already exercises cover macOS too, and CI runs a build-only macOS leg on
-every PR, but there is no real macOS hardware available to validate against
-beyond that. See [`docs/dependencies.md`](docs/dependencies.md) for what
-varies per OS and [`docs/machine-providers.md`](docs/machine-providers.md)
-for remote-machine (SSH provider) targets.
+already exercises cover macOS too, but there is no real macOS hardware
+available to validate a full test leg against. Since RAL-441, CI builds both
+debug and release configurations on Linux, Windows, and macOS on every PR:
+each OS runs its debug work first (full fmt/clippy/test on Linux and
+Windows, build-only smoke on macOS) and only then its release leg, which
+compiles the workspace in `--release`, packages through the
+platform-appropriate product script (scripts/build-release.sh on
+Linux/macOS, scripts/build-release.cmd on Windows), and smoke-launches the
+packaged binaries. A platform-specific release failure therefore surfaces
+at review time, not release time. See
+[`docs/dependencies.md`](docs/dependencies.md) for what varies per OS and
+[`docs/machine-providers.md`](docs/machine-providers.md) for remote-machine
+(SSH provider) targets.
 
 ## Architecture
 
