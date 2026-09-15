@@ -155,6 +155,44 @@ test("cached prompt text is re-applied to the fresh rows, and a standing poll ne
     "exactly one render per poll: a second one is the blank-then-repaint flicker");
 });
 
+test("selecting a squad fetches its prompt text immediately, not on the next poll", async () => {
+  // The fetch used to be kicked off only at the tail of `pollTasks`, so a
+  // selection made while nothing else was happening sat empty until the next
+  // poll -- on a quiet daemon, the 60s reconciliation tick. `renderDetails`
+  // calls `syncPromptCache`, and every selection path renders, so picking a
+  // cell now starts the request straight away.
+  const poll = makeTasksPoll({ selectedSquadId: "s-1" });
+  const first = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], {
+    daemon: { running: 0, max_concurrent: 0 },
+    squads: [{ id: "s-1", tasks: [{ cells: [{ prompt: null, proof: [] }], proof: [] }] }],
+  });
+  await first;
+  // Drain the load the poll itself started, so the cache is cold again.
+  const initial = poll.pendingFetches.find((f) => f.url.startsWith("/api/squads/"));
+  resolveJson(initial, { id: "s-1", tasks: [{ cells: [{ prompt: "P", proof: [] }], proof: [] }] });
+  await new Promise((r) => setTimeout(r, 0));
+  poll.invalidateTasksFetch(); // e.g. a mutation cleared it
+  assert.equal(poll.state().promptCacheSquadId, null);
+
+  const before = poll.pendingFetches.length;
+  poll.syncPromptCache();      // what a selection triggers, with no poll involved
+  assert.equal(poll.pendingFetches.length, before + 1,
+    "a selection whose squad is not cached must issue the fetch itself");
+  assert.ok(poll.pendingFetches[before].url.startsWith("/api/squads/"),
+    "and it must be the per-squad detail request");
+
+  resolveJson(poll.pendingFetches[before], { id: "s-1", tasks: [{ cells: [{ prompt: "P2", proof: [] }], proof: [] }] });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(poll.state().promptCacheSquadId, "s-1");
+  assert.ok(poll.calls.renderDetails > 0, "the pane repaints once the text arrives");
+
+  // A second call with the cache warm must not fetch again.
+  const warm = poll.pendingFetches.length;
+  poll.syncPromptCache();
+  assert.equal(poll.pendingFetches.length, warm, "a cached squad issues no further request");
+});
+
 test("invalidateTasksFetch drops the prompt cache, so an edited prompt is refetched", async () => {
   const poll = makeTasksPoll({ selectedSquadId: "s-1" });
   const first = poll.pollTasks();
