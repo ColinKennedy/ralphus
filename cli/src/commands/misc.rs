@@ -16,7 +16,8 @@ use crate::entity_uri::from_resolved_selector;
 use crate::flags::Scanner;
 use crate::selector::{self, ResolvedSelector, SelectorError};
 
-pub const SQUAD_STATES: [&str; 6] = [
+pub const SQUAD_STATES: [&str; 7] = [
+    "materializing",
     "queued",
     "pending",
     "running",
@@ -59,6 +60,7 @@ pub fn cmd_validate(opts: &GlobalOpts, files: &[String]) -> i32 {
                     } else {
                         print_validation_errors(o["errors"].as_array());
                     }
+                    print_validation_warnings(o["warnings"].as_array());
                 });
                 i32::from(!valid)
             }
@@ -87,6 +89,7 @@ pub fn cmd_validate(opts: &GlobalOpts, files: &[String]) -> i32 {
                     } else {
                         print_validation_errors(o["errors"].as_array());
                     }
+                    print_validation_warnings(o["warnings"].as_array());
                 });
                 if !valid {
                     had_error = true;
@@ -109,6 +112,24 @@ fn print_validation_errors(errors: Option<&Vec<Value>>) {
         println!(
             "error [line {line}]: {}",
             err["message"].as_str().unwrap_or("")
+        );
+    }
+}
+
+/// Print non-fatal findings (e.g. "no `[[review.auto_build]]`/
+/// `skip_auto_build` declared, and this can't be confirmed as covered by a
+/// project-level default without the daemon") -- unlike `errors`, these never
+/// affect the command's exit code, but a caller should still see them rather
+/// than discover the same gap only once the daemon rejects the submission at
+/// materialization time.
+fn print_validation_warnings(warnings: Option<&Vec<Value>>) {
+    for w in warnings.into_iter().flatten() {
+        let line = w["line"]
+            .as_i64()
+            .map_or_else(|| "?".to_string(), |l| l.to_string());
+        println!(
+            "warning [line {line}]: {}",
+            w["message"].as_str().unwrap_or("")
         );
     }
 }
@@ -321,6 +342,7 @@ fn validate_before_submit(
             Some(code)
         }
         Ok(outcome) => {
+            print_validation_warnings(outcome["warnings"].as_array());
             if outcome["valid"].as_bool().unwrap_or(false) {
                 None
             } else {
@@ -1285,6 +1307,11 @@ pub fn cmd_configuration(_opts: &GlobalOpts) -> i32 {
         "  daemon.log_level              = {}  ({})",
         config.daemon.log_level.as_deref().unwrap_or("not set"),
         prov("daemon.log_level")
+    );
+    println!(
+        "  daemon.opentelemetry          = {}  ({})",
+        config.daemon.opentelemetry,
+        prov("daemon.opentelemetry")
     );
     0
 }

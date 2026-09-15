@@ -11,30 +11,13 @@
 //!   to be added/removed at runtime, not redeployed). The built-in
 //!   [`UNCLASSIFIED_TYPE`] always exists and can never be deregistered.
 //! - the **pool**: cells opted into Triage with a resolved type are pooled by
-//!   `(project, triage_type)` until that pool's count threshold or one of
-//!   its cron schedule entries fires (see `crate::scheduler`'s Triage
-//!   tick), which drains the pool and hands the caller its cells to build a
-//!   review from. A cell can resolve to more than one type at once (e.g.
-//!   both "bug" and "investigation") -- it is pooled into every one of
-//!   those types' pools independently, and draining one never removes it
-//!   from the others.
-//!
-//! A pool fires on **complete identity only** (RAL-421): every drain
-//! touches exactly one `(project, triage_type)` key -- including the
-//! subproject component, when the cell was subproject-resolved (RAL-346) --
-//! so a cron schedule registered for `proj` never drains the `proj::core`
-//! or `proj::utils` pools, and a count threshold on one key never fires
-//! another. No review ever crosses a project, subproject, or triage type
-//! boundary.
-//!
-//! The count-threshold path drains a firing pool in **threshold-sized
-//! batches** (see [`Store::drain_triage_pool_batch`] and
-//! `crate::reviews::fire_triage_pool_in_threshold_batches`): a pool of 10
-//! with a threshold of 3 drains as three batches of 3 (each batch its own
-//! fresh review), leaving the final 1 pooled until more cells land. A cron
-//! firing, by contrast, drains its exact pool key wholesale into a single
-//! review (the schedule has no threshold to batch by -- it just means
-//! "drain now").
+//!   `(project, triage_type)` until that pool's count threshold or one of its
+//!   cron schedule entries fires (see `crate::scheduler`'s Triage tick),
+//!   which drains the pool and hands the caller its cells to build a review
+//!   from. A cell can resolve to more than one type at once (e.g. both
+//!   "bug" and "investigation") -- it is pooled into every one of those
+//!   types' pools independently, and draining one never removes it from the
+//!   others.
 //!
 //! Classification itself (asking the Arbiter's agent/model to pick a
 //! type -- possibly more than one) lives in `crate::arbiter`, which is a
@@ -749,6 +732,28 @@ pub fn pool_keys_for_cell(
     }
 }
 
+/// Every pool key sharing `base_project`'s namespace for `triage_type`
+/// (RAL-346): the plain `base_project` key itself, plus every
+/// `base_project::subproject` composite key -- i.e. every pool a cell
+/// belonging to this project could currently be sitting in, regardless of
+/// whether the Arbiter ever resolved a subproject for it. Used by the
+/// Arbiter's cron straggler sweep (`run_schedule_tick`) so a schedule
+/// registered against a project's plain base key still reaches straggler
+/// work sitting in per-subproject pools that never individually hit their
+/// own count threshold -- e.g. one bug fix each in `core`, `utils`, and
+/// `steam`, none alone reaching "every 2 bugs".
+#[must_use]
+pub fn project_pool_keys(store: &Store, base_project: &str, triage_type: &str) -> Vec<String> {
+    let prefix = subproject_pool_key(base_project, "");
+    store
+        .triage_pool_keys()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(p, t)| t == triage_type && (p == base_project || p.starts_with(&prefix)))
+        .map(|(p, _)| p)
+        .collect()
+}
+
 // ── Pool ─────────────────────────────────────────────────────────────────────
 
 impl Store {
@@ -868,8 +873,7 @@ impl Store {
     ) -> StoreResult<Vec<TriagePoolCellRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT squad_id, task_idx, idx, branch, upstream FROM triage_pool_cells
-             WHERE project=? AND triage_type=?
-             ORDER BY created_at_ms, rowid",
+             WHERE project=? AND triage_type=?",
         )?;
         let rows = stmt
             .query_map(params![project, triage_type], |r| {
@@ -885,10 +889,10 @@ impl Store {
         Ok(rows)
     }
 
-    /// Current pool size for `(project, triage_type)`, excluding any pooled
-    /// cell whose effective state (`Store::effective_state_for_cell`) has
-    /// resolved to `failed` -- a failed cell can never pass review, so it
-    /// must never count toward a threshold (RAL-318 bug 2).
+    /// Current eligible pool size for `(project, triage_type)`: only cells
+    /// whose effective state (`Store::effective_state_for_cell`) is `done`.
+    /// Pending cells remain in the pool and visible as scheduled candidates,
+    /// but cannot make a threshold fire before their work and proof complete.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
@@ -899,7 +903,7 @@ impl Store {
             let effective = self
                 .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
                 .unwrap_or_default();
-            if effective != "failed" {
+            if effective == "done" {
                 count += 1;
             }
         }
@@ -943,23 +947,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// Atomically remove every cell currently pooled for `(project,
-    /// triage_type)` and return only the ones still viable for a review --
-    /// any cell whose effective state has resolved to `failed` is dropped
-    /// for good here rather than returned, and never resurfaces in a later
-    /// drain (RAL-318 bug 2: a failed cell can never pass review, so it must
-    /// never be swept into an auto-created one). A failed cell dropped this
-    /// way remains visible forever in the separate Triage candidate list
-    /// (`triage_candidates`, spanning every squad regardless of pool
-    /// membership) with a `"failed"` status -- this only removes it from
-    /// the internal pool-counting table.
-    ///
-    /// This is the whole-pool drain used when a cron schedule fires: the
-    /// schedule owns its exact `(project, triage_type)` key (with its
-    /// subproject component, if any), so everything pooled under that key
-    /// goes into a single review (RAL-421) -- unlike
-    /// [`Store::drain_triage_pool_batch`], which only ever removes up to one
-    /// threshold-sized batch and is what the count-threshold path uses.
+    /// Remove completed or failed cells from `(project, triage_type)` and
+    /// return only the completed ones for a review. Pending cells remain in
+    /// the internal pool and the separate Triage candidate list as scheduled
+    /// work, so a review is never created in the hope that they will pass.
+    /// Failed cells are removed from the pool permanently, while remaining
+    /// visible in the candidate list with a `"failed"` status.
     ///
     /// Race-safety note: every `Store` method is called through the
     /// daemon's single `crate::store_lock::StoreHandle` (see `crate::scheduler`/
@@ -978,86 +971,25 @@ impl Store {
         triage_type: &str,
     ) -> StoreResult<Vec<TriagePoolCellRow>> {
         let rows = self.list_pooled_cells(project, triage_type)?;
-        self.conn.execute(
-            "DELETE FROM triage_pool_cells WHERE project=? AND triage_type=?",
-            params![project, triage_type],
-        )?;
         let mut viable = Vec::new();
         for row in rows {
             let effective = self
                 .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
                 .unwrap_or_default();
-            if effective != "failed" {
+            if effective == "done" || effective == "failed" {
+                self.remove_triage_pool_cell(
+                    project,
+                    triage_type,
+                    &row.squad_id,
+                    row.task_idx,
+                    row.idx,
+                )?;
+            }
+            if effective == "done" {
                 viable.push(row);
             }
         }
         Ok(viable)
-    }
-
-    /// Atomically remove the oldest up-to-`limit` *viable* cells currently
-    /// pooled for `(project, triage_type)` and return them -- the
-    /// threshold-sized batch primitive (RAL-421). A firing pool is drained
-    /// in `limit`-sized batches (e.g. a pool of 10 with a threshold of 3
-    /// drains as three batches of 3, leaving the final 1 pooled until more
-    /// cells land), and each batch becomes its own review, so one drain
-    /// event never merges more than one threshold's worth of work into a
-    /// single review.
-    ///
-    /// Like [`Self::drain_triage_pool`], a pooled cell whose effective
-    /// state has resolved to `failed` is dropped for good (never returned,
-    /// never resurfaces) -- but the failed cells a batch passes over are
-    /// not counted against `limit`, so a pool that is all failed cells
-    /// returns an empty batch and is left empty for every later call
-    /// (RAL-318 bug 2). Oldest-first by pool-entry order
-    /// (`created_at_ms, rowid` -- the same order `list_pooled_cells` now
-    /// uses, shared by the whole-pool cron drain).
-    ///
-    /// Calls are serialized through the daemon's single
-    /// `crate::store_lock::StoreHandle` (see `crate::scheduler`/`crate::server`),
-    /// so the read-then-delete sequence here cannot race a concurrent
-    /// insert/drain from another thread: once a cell is removed here it is
-    /// gone for every other caller, which is what makes a second caller's
-    /// drain of the same pool on an already-emptied batch come back empty
-    /// instead of double-returning a cell (the concurrent empty-pool
-    /// safety every firing path relies on).
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    pub fn drain_triage_pool_batch(
-        &self,
-        project: &str,
-        triage_type: &str,
-        limit: i64,
-    ) -> StoreResult<Vec<TriagePoolCellRow>> {
-        let rows = self.list_pooled_cells(project, triage_type)?;
-        let mut batch = Vec::new();
-        for row in rows {
-            if batch.len() >= limit.max(0) as usize {
-                break;
-            }
-            let effective = self
-                .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
-                .unwrap_or_default();
-            if effective == "failed" {
-                // Permanent drop, like the whole-pool drain: never counted
-                // against `limit`, never returned, never resurfaced.
-                self.conn.execute(
-                    "DELETE FROM triage_pool_cells
-                     WHERE project=? AND triage_type=? AND squad_id=? AND task_idx=? AND idx=?",
-                    params![project, triage_type, row.squad_id, row.task_idx, row.idx],
-                )?;
-            } else {
-                batch.push(row);
-            }
-        }
-        for row in &batch {
-            self.conn.execute(
-                "DELETE FROM triage_pool_cells
-                 WHERE project=? AND triage_type=? AND squad_id=? AND task_idx=? AND idx=?",
-                params![project, triage_type, row.squad_id, row.task_idx, row.idx],
-            )?;
-        }
-        Ok(batch)
     }
 
     /// Set (or clear, with `None`) the count threshold for `(project,
@@ -1303,15 +1235,17 @@ pub fn advance_schedule(
 /// `Duration`-based maintenance blocks. Steps every configured schedule
 /// entry forward by whatever cron occurrences have passed since it was last
 /// checked (see [`advance_schedule`]) and, for any that just crossed a
-/// qualifying `every_n`th occurrence, drains that schedule's **exact**
-/// `(project, triage_type)` pool into a fresh review (RAL-421: complete
-/// pool identity -- a schedule registered against a plain `proj` key never
-/// sweeps `proj::core`/`proj::utils` stragglers into the same review, and a
-/// schedule registered directly against a subproject composite key fires
-/// only that subproject's pool). Races safely against a concurrent
-/// submission's own count-threshold check and against another schedule on
-/// the same key (both ultimately drain through `Store::drain_triage_pool`,
-/// which no-ops on an already-empty pool).
+/// qualifying `every_n`th occurrence, sweeps every pool key sharing that
+/// schedule's project namespace into a fresh review (RAL-346's straggler
+/// sweep -- see [`crate::reviews::create_review_from_triage_project_sweep`]):
+/// the schedule's own exact `(project, triage_type)` pool plus every
+/// `project::subproject` composite pool for the same `triage_type`, so
+/// straggler work sitting in a per-subproject pool that never hit its own
+/// count threshold still gets collected on this independent cron, exactly
+/// like a plain single-project pool always has. Races safely against a
+/// concurrent submission's own count-threshold check (both ultimately drain
+/// through `Store::drain_triage_pool`, which no-ops on an already-empty
+/// pool).
 pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
     let now = now_ms();
     let schedules = {
@@ -1332,7 +1266,7 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
         let guard = store.lock();
         let _ = guard.advance_triage_schedule(sched.id, count, last);
         if fired {
-            match crate::reviews::create_review_from_triage_pool(
+            match crate::reviews::create_review_from_triage_project_sweep(
                 &guard,
                 &sched.project,
                 &sched.triage_type,
@@ -1451,6 +1385,18 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    fn completed_pool_cell(store: &mut Store) -> String {
+        let file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        squad_id
     }
 
     /// A real, existing directory for tests that need `std::fs::canonicalize`
@@ -1654,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_accumulates_and_drains_atomically() {
+    fn pool_retains_scheduled_cells_without_draining_them() {
         let s = store();
         assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
         s.record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
@@ -1663,7 +1609,7 @@ mod tests {
             .unwrap();
         s.record_triage_pool_cell("proj", "perf", "squad-3", 0, 0, "b3", "main")
             .unwrap();
-        assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 2);
+        assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
         assert_eq!(
             s.triage_pool_keys().unwrap(),
             vec![
@@ -1672,139 +1618,32 @@ mod tests {
             ]
         );
         let drained = s.drain_triage_pool("proj", "security").unwrap();
-        assert_eq!(drained.len(), 2);
+        assert!(drained.is_empty());
         assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
-        // The "perf" pool is untouched by draining "security".
-        assert_eq!(s.triage_pool_count("proj", "perf").unwrap(), 1);
-    }
-
-    /// RAL-421: a pool drains in threshold-sized batches, oldest first, with
-    /// only the final remainder left pooled for the next round.
-    #[test]
-    fn drain_triage_pool_batch_removes_oldest_batch_and_leaves_the_remainder() {
-        let s = store();
-        for i in 0..7 {
-            let squad = format!("squad-{i}");
-            let branch = format!("b{i}");
-            s.record_triage_pool_cell("proj", "security", &squad, 0, 0, &branch, "main")
-                .unwrap();
-        }
-        // First batch: the oldest 3 cells, in pool-entry order.
-        let batch = s.drain_triage_pool_batch("proj", "security", 3).unwrap();
-        assert_eq!(
-            batch.iter().map(|r| r.squad_id.clone()).collect::<Vec<_>>(),
-            vec![
-                "squad-0".to_string(),
-                "squad-1".to_string(),
-                "squad-2".to_string()
-            ],
-            "batches must drain oldest-first"
-        );
-        assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 4);
-        // Second call takes the next 3.
-        let batch = s.drain_triage_pool_batch("proj", "security", 3).unwrap();
-        assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0].squad_id, "squad-3");
-        // Third call gets only the 1-cell remainder, then nothing at all.
-        let batch = s.drain_triage_pool_batch("proj", "security", 3).unwrap();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].squad_id, "squad-6");
-        assert!(
-            s.drain_triage_pool_batch("proj", "security", 3)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
-    }
-
-    /// RAL-421: a batch drain permanently drops a failed cell it passes
-    /// over without counting it against the batch limit -- a pool that is
-    /// all failed cells returns an empty batch and stays empty, so a failed
-    /// cell can never be swept into a review (RAL-318 bug 2) and never
-    /// resurfaces on a later drain.
-    #[test]
-    fn drain_triage_pool_batch_skips_failed_cells_without_consuming_limit() {
-        let mut s = store();
-        let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
-        let failed_squad = s.insert_squad(&file, None, false).unwrap();
-        s.record_triage_pool_cell("proj", "bug", &failed_squad, 0, 0, "b-failed", "main")
-            .unwrap();
-        let ok_a = s.insert_squad(&file, None, false).unwrap();
-        s.record_triage_pool_cell("proj", "bug", &ok_a, 0, 0, "b-a", "main")
-            .unwrap();
-        let ok_b = s.insert_squad(&file, None, false).unwrap();
-        s.record_triage_pool_cell("proj", "bug", &ok_b, 0, 0, "b-b", "main")
-            .unwrap();
-
-        s.set_cell_state(&failed_squad, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
-        s.set_proof_state(
-            &failed_squad,
-            0,
-            "cell",
-            0,
-            0,
-            crate::store::NodeState::Failed,
-        )
-        .unwrap();
-        s.set_cell_state(&ok_a, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
-        s.set_cell_state(&ok_b, 0, 0, crate::store::NodeState::Done)
-            .unwrap();
-
-        // Batch of 2: only the two viable cells come back -- the failed
-        // cell in front did not consume either slot.
-        let batch = s.drain_triage_pool_batch("proj", "bug", 2).unwrap();
-        assert_eq!(batch.len(), 2);
-        assert!(!batch.iter().any(|r| r.squad_id == failed_squad));
-        assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 0);
-        // The failed row was dropped permanently, not just passed over.
-        assert!(
-            s.drain_triage_pool_batch("proj", "bug", 2)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// RAL-421: no cell is ever returned by two batch drains of the same
-    /// pool -- a second firing that runs after a first one already drained
-    /// sees only what the first left behind, so two racing firings of one
-    /// pool can never double-create a review from the same cells.
-    #[test]
-    fn drain_triage_pool_batch_never_returns_a_cell_twice_across_calls() {
-        let s = store();
-        s.record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj", "bug", "squad-2", 0, 0, "b2", "main")
-            .unwrap();
-        let first = s.drain_triage_pool_batch("proj", "bug", 1).unwrap();
-        let second = s.drain_triage_pool_batch("proj", "bug", 1).unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_ne!(
-            first[0].squad_id, second[0].squad_id,
-            "no cell may be returned twice"
-        );
-        assert!(
-            s.drain_triage_pool_batch("proj", "bug", 1)
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(s.all_pooled_cells().unwrap().len(), 3);
     }
 
     const POOL_CELL_FIXTURE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\"/repo\"\nprompt=\"do it\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n";
 
     #[test]
-    fn triage_pool_count_excludes_a_cell_whose_proof_failed() {
+    fn triage_pool_count_only_includes_a_cell_after_its_proof_passes() {
         let mut s = store();
         let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
         let squad_id = s.insert_squad(&file, None, false).unwrap();
         s.record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b1", "main")
             .unwrap();
-        assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 1);
+        assert_eq!(
+            s.triage_pool_count("proj", "bug").unwrap(),
+            0,
+            "a pending candidate must remain visible but not count toward a threshold"
+        );
 
         s.set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
             .unwrap();
+        s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 1);
+
         s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Failed)
             .unwrap();
         assert_eq!(
@@ -1815,14 +1654,17 @@ mod tests {
     }
 
     #[test]
-    fn drain_triage_pool_excludes_failed_cells_and_still_returns_viable_ones() {
+    fn drain_triage_pool_preserves_pending_cells_and_excludes_failed_ones() {
         let mut s = store();
         let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
         let failed_squad = s.insert_squad(&file, None, false).unwrap();
         let ok_squad = s.insert_squad(&file, None, false).unwrap();
+        let pending_squad = s.insert_squad(&file, None, false).unwrap();
         s.record_triage_pool_cell("proj", "bug", &failed_squad, 0, 0, "b1", "main")
             .unwrap();
         s.record_triage_pool_cell("proj", "bug", &ok_squad, 0, 0, "b2", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj", "bug", &pending_squad, 0, 0, "b3", "main")
             .unwrap();
 
         s.set_cell_state(&failed_squad, 0, 0, crate::store::NodeState::Done)
@@ -1845,8 +1687,12 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].squad_id, ok_squad);
 
-        // The failed row never resurfaces on a later drain of the same key.
+        // Failed rows are discarded, while pending work stays available as a
+        // scheduled candidate for a later threshold or schedule tick.
         assert_eq!(s.triage_pool_count("proj", "bug").unwrap(), 0);
+        let remaining = s.all_pooled_cells().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].2.squad_id, pending_squad);
         assert!(s.drain_triage_pool("proj", "bug").unwrap().is_empty());
     }
 
@@ -1934,9 +1780,10 @@ mod tests {
             Store::open_in_memory().unwrap(),
         ));
         {
-            let guard = store.lock();
+            let mut guard = store.lock();
+            let squad_id = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+                .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
                 .unwrap();
             // Anchored a few seconds in the past so this "every second" cron
             // is already due without needing to catch up decades of history
@@ -1960,39 +1807,35 @@ mod tests {
         assert!(schedules[0].last_checked_ms.is_some());
     }
 
-    /// RAL-421: complete pool identity across cron drains -- a schedule
-    /// registered against a project's plain base key must NOT elevate
-    /// stragglers sitting in that project's per-subproject pools, and must
-    /// never touch another project's or triage type's pool. The old
-    /// cross-subproject straggler sweep (RAL-346) drained every
-    /// `proj::*` pool for `proj`'s `bug` type into one combined review;
-    /// that behavior is deliberately gone -- each pool fires on its own
-    /// exact key, so no review crosses a project, subproject, or type
-    /// boundary.
+    /// RAL-346: a cron schedule registered against a project's plain base
+    /// key must still find and elevate straggler work sitting in per-
+    /// subproject pools that never individually hit their own count
+    /// threshold -- the whole point of the Arbiter's independent cron sweep.
     #[test]
-    fn run_schedule_tick_fires_only_the_schedules_exact_pool_key() {
+    fn run_schedule_tick_straggler_sweep_elevates_stragglers_across_subproject_pools() {
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
         {
-            let guard = store.lock();
-            // One cell each in the plain pool and one of the subproject
-            // pools, plus a different type under the same project and a
-            // different project entirely.
+            let mut guard = store.lock();
+            // One straggler each in the plain pool and two subproject pools,
+            // none of which individually reached any count threshold.
+            let squad_1 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
+                .record_triage_pool_cell("proj", "bug", &squad_1, 0, 0, "b1", "main")
                 .unwrap();
+            let squad_2 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
+                .record_triage_pool_cell("proj::core", "bug", &squad_2, 0, 0, "b2", "main")
                 .unwrap();
+            let squad_3 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
+                .record_triage_pool_cell("proj::utils", "bug", &squad_3, 0, 0, "b3", "main")
                 .unwrap();
+            // A different project's pool must never be swept in.
+            let squad_4 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj", "feature", "squad-4", 0, 0, "b4", "main")
-                .unwrap();
-            guard
-                .record_triage_pool_cell("other", "bug", "squad-5", 0, 0, "b5", "main")
+                .record_triage_pool_cell("other", "bug", &squad_4, 0, 0, "b4", "main")
                 .unwrap();
             guard
                 .add_triage_schedule("proj", "bug", "* * * * * *", now_ms() - 5_000, 1)
@@ -2000,48 +1843,25 @@ mod tests {
         }
         run_schedule_tick(&store);
         let guard = store.lock();
-        // Only the schedule's exact key drained.
         assert_eq!(guard.triage_pool_count("proj", "bug").unwrap(), 0);
-        // Every other key is untouched -- isolation is the point of RAL-421.
-        assert_eq!(
-            guard.triage_pool_count("proj::core", "bug").unwrap(),
-            1,
-            "a subproject pool must never be swept by a plain-key schedule"
-        );
-        assert_eq!(guard.triage_pool_count("proj::utils", "bug").unwrap(), 1);
-        assert_eq!(
-            guard.triage_pool_count("proj", "feature").unwrap(),
-            1,
-            "a different triage type under the same project must be untouched"
-        );
+        assert_eq!(guard.triage_pool_count("proj::core", "bug").unwrap(), 0);
+        assert_eq!(guard.triage_pool_count("proj::utils", "bug").unwrap(), 0);
         assert_eq!(
             guard.triage_pool_count("other", "bug").unwrap(),
             1,
-            "a different project's pool must be untouched"
+            "a different project's pool must be untouched by this project's sweep"
         );
         let guardians = guard.list_guardians().unwrap();
         assert_eq!(
             guardians.len(),
             1,
-            "exactly one review, built only from the schedule's own key's cell"
+            "every subproject straggler must be combined into a single review"
         );
         assert_eq!(
             guardians[0].origin,
             crate::guardian::GUARDIAN_ORIGIN_ARBITER
         );
-        assert_eq!(
-            guardians[0].branches.len(),
-            1,
-            "the review must carry only the plain key's branch, never a subproject straggler"
-        );
-        assert_eq!(
-            guardians[0]
-                .branches
-                .iter()
-                .map(|b| b.branch.clone())
-                .collect::<Vec<_>>(),
-            vec!["b1".to_string()]
-        );
+        assert_eq!(guardians[0].branches.len(), 3);
     }
 
     #[test]
@@ -2062,7 +1882,7 @@ mod tests {
         }
         run_schedule_tick(&store);
         let guard = store.lock();
-        assert_eq!(guard.triage_pool_count("proj", "security").unwrap(), 1);
+        assert_eq!(guard.triage_pool_count("proj", "security").unwrap(), 0);
         assert!(guard.list_guardians().unwrap().is_empty());
     }
 
@@ -2363,5 +2183,32 @@ mod tests {
             Some(("proj", "core"))
         );
         assert_eq!(split_subproject_pool_key("proj"), None);
+    }
+
+    #[test]
+    fn project_pool_keys_enumerates_the_plain_key_and_every_subproject_key() {
+        let s = store();
+        s.record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
+            .unwrap();
+        s.record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
+            .unwrap();
+        // A different project must never leak in.
+        s.record_triage_pool_cell("other", "bug", "squad-4", 0, 0, "b4", "main")
+            .unwrap();
+        // A different triage type under the same project must never leak in.
+        s.record_triage_pool_cell("proj::core", "feature", "squad-5", 0, 0, "b5", "main")
+            .unwrap();
+        let mut keys = project_pool_keys(&s, "proj", "bug");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "proj".to_string(),
+                "proj::core".to_string(),
+                "proj::utils".to_string(),
+            ]
+        );
     }
 }

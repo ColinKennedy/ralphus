@@ -1071,8 +1071,10 @@ dependencies = [
  "opentelemetry_sdk",
  "ralphus-auth",
  "ralphus-core",
+ "serde",
  "serde_json",
  "tiny_http",
+ "toml 0.8.23",
  "ureq",
 ]
 

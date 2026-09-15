@@ -15,6 +15,9 @@ pub struct RunnerConfig {
     pub keep_temporary_files: bool,
     /// `None` means unbounded (a `0` or negative value in the TOML file).
     pub maximum_timeout_seconds: Option<u64>,
+    /// Whether this runner may create an OpenTelemetry exporter. Defaults to
+    /// enabled so hand-authored specs retain the existing behavior.
+    pub opentelemetry_enabled: bool,
 }
 
 impl Default for RunnerConfig {
@@ -22,17 +25,21 @@ impl Default for RunnerConfig {
         Self {
             keep_temporary_files: false,
             maximum_timeout_seconds: Some(DEFAULT_MAX_TIMEOUT_SECS),
+            opentelemetry_enabled: true,
         }
     }
 }
 
-/// Loads config starting from `start_dir` (the session's workspace root),
-/// merging `$RALPHUS_CONFIGURATION_PATH` entries (left-to-right, later wins)
-/// and finally the nearest git-repo-root `.ralphus.toml` (highest priority),
-/// matching `config.py`'s precedence.
+/// Loads config from the global file, then `$RALPHUS_CONFIGURATION_PATH`
+/// entries (left-to-right, later wins), and finally the nearest git-repo-root
+/// `.ralphus.toml` (highest priority).
 #[must_use]
 pub fn load(start_dir: &Path) -> RunnerConfig {
-    load_with(start_dir, configuration_path_entries().as_slice())
+    let mut config = RunnerConfig::default();
+    if let Some(path) = global_config_path() {
+        apply_file(&mut config, &path);
+    }
+    load_with_base(config, start_dir, configuration_path_entries().as_slice())
 }
 
 /// [`load`] with the `$RALPHUS_CONFIGURATION_PATH` entries passed in
@@ -41,9 +48,20 @@ pub fn load(start_dir: &Path) -> RunnerConfig {
 /// setting -- `std::env::set_var`/`remove_var` can't be used to override it
 /// in-process, since both are `unsafe fn` and this workspace forbids
 /// `unsafe_code` outright).
+#[cfg(test)]
 fn load_with(start_dir: &Path, configuration_path_entries: &[PathBuf]) -> RunnerConfig {
-    let mut config = RunnerConfig::default();
+    load_with_base(
+        RunnerConfig::default(),
+        start_dir,
+        configuration_path_entries,
+    )
+}
 
+fn load_with_base(
+    mut config: RunnerConfig,
+    start_dir: &Path,
+    configuration_path_entries: &[PathBuf],
+) -> RunnerConfig {
     for path in configuration_path_entries {
         apply_file(&mut config, path);
     }
@@ -52,6 +70,19 @@ fn load_with(start_dir: &Path, configuration_path_entries: &[PathBuf]) -> Runner
     }
 
     config
+}
+
+fn global_config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("RALPHUS_CONFIG_HOME") {
+        return Some(PathBuf::from(dir).join("config.toml"));
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("ralphus")
+            .join("config.toml"),
+    )
 }
 
 fn configuration_path_entries() -> Vec<PathBuf> {
@@ -86,6 +117,13 @@ fn apply_file(config: &mut RunnerConfig, path: &Path) {
     {
         config.keep_temporary_files = keep;
     }
+    if let Some(enabled) = parsed
+        .get("daemon")
+        .and_then(|d| d.get("opentelemetry"))
+        .and_then(toml::Value::as_bool)
+    {
+        config.opentelemetry_enabled = enabled;
+    }
     if let Some(secs) = parsed
         .get("task")
         .and_then(|t| t.get("maximum_timeout_seconds"))
@@ -109,6 +147,7 @@ mod tests {
             config.maximum_timeout_seconds,
             Some(DEFAULT_MAX_TIMEOUT_SECS)
         );
+        assert!(config.opentelemetry_enabled);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -140,6 +179,19 @@ mod tests {
         let mut config = RunnerConfig::default();
         apply_file(&mut config, &cfg_path);
         assert_eq!(config.maximum_timeout_seconds, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opentelemetry_can_be_disabled() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-config-test-otel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("otel.toml");
+        std::fs::write(&cfg_path, "[daemon]\nopentelemetry = false\n").unwrap();
+        let mut config = RunnerConfig::default();
+        apply_file(&mut config, &cfg_path);
+        assert!(!config.opentelemetry_enabled);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

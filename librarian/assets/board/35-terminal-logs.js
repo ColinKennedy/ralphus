@@ -84,9 +84,14 @@
        *   cell that is cleanly detached (see `detachedBadge`) rather than
        *   genuinely done/failed/cancelled — swaps the "cell ended" wording
        *   below for one that doesn't misread as stuck/stalled.
+       * @param {number|null} [endedAtMs] - the most recent finish time (epoch
+       *   ms, local time) of the same agent `startedAtMs` describes. Shown in
+       *   the header next to "started" once the box is a historical record
+       *   (`peekEnded[key]`) — without it, "cell ended" gave no indication of
+       *   when.
        * @returns {string}
        */
-      function peekBox(key, startedAtMs, detachedAtMs) {
+      function peekBox(key, startedAtMs, detachedAtMs, endedAtMs) {
         if (!peekOpen[key]) return "";
         // Reuse the last-fetched content (if any) instead of always starting from
         // "Loading…" — the details pane fully re-renders on every pushed event
@@ -125,6 +130,12 @@
         const startedHtml = startedAtMs
           ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently started running.\nUpdates to a new time if it is restarted.\nExact time: ${fmtActivityTime(startedAtMs)}.">started ${fmtActivityTime(startedAtMs)}</span>`
           : "";
+        // The end-time counterpart to startedHtml — only meaningful once this
+        // box is a historical record (`ended`); a still-running step has no
+        // finish time yet even if a stale one is passed in from a prior run.
+        const endedHtml = ended && endedAtMs
+          ? `<span class="peek-activity" data-tip="When this step (cell, conflict resolver, or manual-checks generation) most recently finished running.\nExact time: ${fmtActivityTime(endedAtMs)}.">ended ${fmtActivityTime(endedAtMs)}</span>`
+          : "";
         // RAL-397 Phase 2G-A: the Live View renders the transcript tape run
         // through the ANSI-strip/classify pipeline; `peekContent[key]` already
         // holds that rendered text, so it's shown verbatim here. "Show Debug
@@ -135,7 +146,7 @@
         const shown = cached;
         const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
         return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             <div class="peek-pre-wrap">
               <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}" onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${shown !== undefined ? esc(shown) : "Loading…"}</pre>
               <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
@@ -213,22 +224,17 @@
           // pipe-pane capture never engaged — the `/pane` snapshot is shown
           // instead, so the box never dead-ends on "Waiting for output…". A
           // failed probe leaves `live` null so the tape-growth fallback decides.
-          /** @type {boolean|null} */
-          let live = null;
-          /** @type {string|undefined} */
-          let paneContent;
+          // Fired now but awaited after the tape fetch below: `/pane` and
+          // `/pane-transcript` are independent requests (the daemon-side
+          // `/pane` handler can shell out to tmux, which is the slower of the
+          // two), so kicking both off together instead of one-after-another
+          // roughly halves this box's per-tick latency.
           const liveUrl = peekUrlFor(key);
-          if (liveUrl) {
-            try {
-              const lr = await fetch(liveUrl);
-              if (lr.ok) {
-                /** @type {PeekPaneResponse} */
-                const ld = await lr.json();
-                live = ld.active ?? null;
-                if (typeof ld.content === "string") paneContent = ld.content;
-              }
-            } catch (_) { /* leave live=null / paneContent undefined; fallbacks decide */ }
-          }
+          const livePromise = liveUrl
+            ? fetch(liveUrl)
+                .then((lr) => (lr.ok ? /** @type {Promise<PeekPaneResponse|null>} */ (lr.json()) : null))
+                .catch(() => null)
+            : Promise.resolve(null);
 
           // Content: page the transcript tape when one exists. Seed the tail on
           // first open (probe total, then fetch the last chunk); afterwards
@@ -262,6 +268,18 @@
           } else {
             // No transcript available — render the /pane snapshot instead.
             delete peekTape[key];
+          }
+
+          // A failed/absent probe leaves `live` null so the tape-growth
+          // fallback (below, via `nextPeekPaneState`) decides instead.
+          /** @type {boolean|null} */
+          let live = null;
+          /** @type {string|undefined} */
+          let paneContent;
+          const ld = await livePromise;
+          if (ld) {
+            live = ld.active ?? null;
+            if (typeof ld.content === "string") paneContent = ld.content;
           }
 
           /** @type {PeekPaneState} */
@@ -683,7 +701,13 @@
         // up once the selection is released.
         if (userIsSelecting()) return;
         const keys = Object.keys(peekOpen).filter((k) => peekOpen[k]);
-        for (const key of keys) await fetchPeek(key, false);
+        // Concurrent, not sequential (RAL-397 made each box's fetchPeek() issue
+        // up to two round trips instead of one -- with N open boxes, a
+        // sequential for/await loop compounded that into 2N+ round trips paid
+        // one at a time, turning "instant" into a multi-second stall as more
+        // boxes were opened). Every box's fetch is independent, so run them
+        // together and let the slowest one bound the tick instead of the sum.
+        await Promise.all(keys.map((key) => fetchPeek(key, false)));
       }
       /**
        * Closes the graph node context menu, if open.

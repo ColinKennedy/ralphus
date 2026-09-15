@@ -796,6 +796,12 @@ pub struct DaemonConfig {
     /// when this happens.
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    /// Whether OpenTelemetry exporters may send traces to the endpoint named
+    /// by `OTEL_EXPORTER_OTLP_ENDPOINT`. Defaults to `true`; setting this to
+    /// `false` prevents the daemon, librarian, and daemon-spawned runners
+    /// from creating an exporter.
+    #[serde(default)]
+    pub opentelemetry: Option<bool>,
 }
 
 impl DaemonConfig {
@@ -824,6 +830,14 @@ impl DaemonConfig {
             Some(n) if n >= 0 => n,
             _ => crate::DEFAULT_MAX_CONCURRENT,
         }
+    }
+
+    /// Whether OpenTelemetry export is enabled. Unset preserves the existing
+    /// enabled behavior; an endpoint is still required before any export can
+    /// occur.
+    #[must_use]
+    pub fn opentelemetry_enabled(&self) -> bool {
+        self.opentelemetry.unwrap_or(true)
     }
 }
 
@@ -1872,6 +1886,7 @@ fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
         default_user: over.default_user.or(base.default_user),
         default_user_is_admin: over.default_user_is_admin.or(base.default_user_is_admin),
         max_concurrent: over.max_concurrent.or(base.max_concurrent),
+        opentelemetry: over.opentelemetry.or(base.opentelemetry),
     }
 }
 
@@ -3232,6 +3247,12 @@ mod tests {
     fn max_concurrent_malformed_toml_is_default() {
         let c = daemon_from_toml_str("not = = valid");
         assert_eq!(c.max_concurrent(), crate::DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn opentelemetry_defaults_to_enabled_and_can_be_disabled() {
+        assert!(daemon_from_toml_str("").opentelemetry_enabled());
+        assert!(!daemon_from_toml_str("[daemon]\nopentelemetry = false\n").opentelemetry_enabled());
     }
 
     #[test]
