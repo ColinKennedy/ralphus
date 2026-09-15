@@ -2195,6 +2195,30 @@ proof:<squad_id>:<task_idx>:<task|cell>:<cell_idx>:<proof_idx> (cell_idx is -1 f
 task-scope proof), or guardian:<guardian_id>, e.g. task:squad-000000000001:0 or \
 proof:squad-000000000001:0:cell:0:1";
 
+/// RAL-437: the concrete selector grammar one entity kind accepts, as a
+/// sentence fragment -- the shared format text behind both a command's
+/// `--help` ARGUMENTS entry for selector-backed chips (see
+/// [`chip_description`]) and the kind-mismatch error raised when a selector
+/// resolves to the wrong entity kind (e.g. a squad selector passed to
+/// `cell edit`, which needs a cell selector).
+#[must_use]
+pub fn selector_kind_format(kind: &str) -> String {
+    match kind {
+        "cell" => "a `<squad_id>/<task>/<cell>` item path (e.g. `squad-1/2/0`) or a \
+                   `cell:<squad_id>:<task_idx>:<cell_idx>` URI (e.g. `cell:squad-1:2:0`)"
+            .to_string(),
+        "task" => "a `<squad_id>/<task>` item path (e.g. `squad-1/build`) or a \
+                   `task:<squad_id>:<task_idx>` URI (e.g. `task:squad-1:2`)"
+            .to_string(),
+        "proof" => "a `<squad_id>/<task>/proof/<i>` or `<squad_id>/<task>/<cell>/proof/<i>` \
+                    item path, or a `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:\
+                    <proof_idx>` URI (e.g. `proof:squad-1:2:cell:0:1`; use `task` and `-1` \
+                    for a task-scoped proof)"
+            .to_string(),
+        _ => "a selector argument or `ralphus:` URI (see `ralphus <command> --help`)".to_string(),
+    }
+}
+
 /// Free-text description of one chip's grammar, keyed by its bare name --
 /// used by [`command_help`] to build `ralphus <cmd> --help`'s
 /// `ARGUMENTS:`/`OPTIONS:` sections, and by `ralphus-mcp`'s tool-schema
@@ -2229,10 +2253,10 @@ pub fn chip_description(chip: &str, option: bool) -> String {
             "selector" => {
                 format!("Entity selector or URI identifying the target, {SELECTOR_GRAMMAR}.")
             }
-            "cell" => "Squad-family selector that must resolve to exactly one cell: a \
-                 `<squad_id>/<task>/<cell>` item path (e.g. `squad-1/2/0`) or a \
-                 `cell:<squad_id>:<task_idx>:<cell_idx>` URI (e.g. `cell:squad-1:2:0`)."
-                .to_string(),
+            "cell" => format!(
+                "Squad-family selector that must resolve to exactly one cell: {}.",
+                selector_kind_format("cell")
+            ),
             "to_review" => {
                 "Destination review selector: a review id (e.g. `g-2`) or `@<name>`, each \
                  optionally with a `~`/`#` branch suffix, or a `guardian:<guardian_id>` URI \
@@ -2336,6 +2360,78 @@ pub fn requested_help(args: &[String]) -> Option<String> {
 /// code alone cannot expose a new command without a registered help node.
 pub fn validate_invocation(args: &[String]) -> Result<(), String> {
     resolved_path(args, true).map(|_| ())
+}
+
+/// RAL-437: the help screen of the deepest command name prefix `args`
+/// resolves to, shown after a usage error so a mistyped invocation lands on
+/// the real command's help (an unknown `cell` subcommand shows
+/// `cell --help`). Returns `None` when no command name prefix resolves at
+/// all (an entirely unknown top-level command).
+#[must_use]
+pub fn deepest_help_for(args: &[String]) -> Option<String> {
+    resolved_path(args, false)
+        .ok()
+        .and_then(|path| command_help(&path))
+}
+
+/// RAL-437: the first token in `args` that looks like an option (starts with
+/// `-`) but is not one the deepest resolved command accepts -- the "unknown
+/// flag" case that used to be swallowed as a positional or silently ignored.
+/// A bare `--` delegates every later token to a downstream command and ends
+/// the scan, matching the parsers (`command_tokens`/`quick_start.rs`). The
+/// value of a known value-taking flag is skipped even when it itself starts
+/// with `-` (e.g. `queue reorder --to -1`), exactly as `flags.rs`'s
+/// `take_value` consumes it. The universally handled flags (`--json`,
+/// `--daemon-url`, `--version`, `--help`, `-h`) count as known everywhere.
+#[must_use]
+pub fn unrecognized_flag(args: &[String]) -> Option<String> {
+    let path = resolved_path(args, false).ok()?;
+    let node = find_registered_node(&path)?;
+    let mut value_taking: Vec<&str> = Vec::new();
+    let mut boolean_flags: Vec<&str> = Vec::new();
+    for &chip in node.options {
+        if chip.contains('[') {
+            value_taking.push(chip.split(' ').next().unwrap_or(chip));
+        } else {
+            boolean_flags.push(chip);
+        }
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let token = args[i].as_str();
+        if token == "--" {
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            i += 1;
+            continue;
+        }
+        if matches!(token, "--json" | "--version" | "--help" | "-h") {
+            i += 1;
+            continue;
+        }
+        if token == "--daemon-url" {
+            i += 2;
+            continue;
+        }
+        if token.starts_with("--daemon-url=") {
+            i += 1;
+            continue;
+        }
+        if value_taking
+            .iter()
+            .any(|flag| token == *flag || token.starts_with(&format!("{}=", *flag)))
+        {
+            i += if token.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if boolean_flags.contains(&token) {
+            i += 1;
+            continue;
+        }
+        return Some(token.to_string());
+    }
+    None
 }
 
 /// Every user-callable command path, used by exhaustive invariant tests.
@@ -2822,5 +2918,103 @@ mod tests {
             .map(str::to_string)
             .to_vec();
         assert!(requested_help(&argv).is_none());
+    }
+
+    #[test]
+    fn unrecognized_flag_reports_unknown_options() {
+        fn flags(args: &[&str]) -> Option<String> {
+            unrecognized_flag(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        }
+        assert_eq!(flags(&["status", "--bogus"]).as_deref(), Some("--bogus"));
+        assert_eq!(
+            flags(&["cell", "edit", "--bogus", "x"]).as_deref(),
+            Some("--bogus")
+        );
+        assert_eq!(
+            flags(&["squad", "show", "--help", "--nope"]).as_deref(),
+            Some("--nope")
+        );
+        // Known flags, universally handled flags, and plain values are never
+        // flagged.
+        assert_eq!(flags(&["status"]), None);
+        assert_eq!(flags(&["status", "--json"]), None);
+        assert_eq!(flags(&["status", "--version"]), None);
+        assert_eq!(flags(&["status", "--help"]), None);
+        assert_eq!(flags(&["status", "-h"]), None);
+        assert_eq!(
+            flags(&["--daemon-url", "http://127.0.0.1:1", "status"]),
+            None
+        );
+        assert_eq!(flags(&["--daemon-url=http://127.0.0.1:1", "status"]), None);
+        assert_eq!(
+            flags(&["cell", "edit", "--agent", "claude", "squad-1"]),
+            None
+        );
+        assert_eq!(
+            flags(&["queue", "set-position", "--to", "-1", "task:1:0"]),
+            None,
+            "the value of a value-taking flag may itself start with '-'"
+        );
+        // A lone '-' (stdin) and everything after a bare '--' are exempt.
+        assert_eq!(flags(&["quick-start", "manager", "claude-code", "-"]), None);
+        assert_eq!(
+            flags(&["quick-start", "manager", "claude-code", "--", "--bogus"]),
+            None
+        );
+    }
+
+    #[test]
+    fn deepest_help_for_lands_on_the_resolved_command() {
+        let cell_argv = ["cell", "bogus"].map(str::to_string).to_vec();
+        let cell_help = deepest_help_for(&cell_argv).expect("cell bogus resolves to cell help");
+        assert!(cell_help.starts_with(&format!(
+            "{} cell --",
+            crate::program_name::resolve_program_name()
+        )));
+        let edit_argv = ["cell", "edit", "--bogus", "x"]
+            .map(str::to_string)
+            .to_vec();
+        let edit_help =
+            deepest_help_for(&edit_argv).expect("cell edit --bogus resolves to cell edit help");
+        assert!(edit_help.starts_with(&format!(
+            "{} cell edit --",
+            crate::program_name::resolve_program_name()
+        )));
+        // An entirely unknown top-level command has no help to show.
+        let bogus_argv = ["bogus"].map(str::to_string).to_vec();
+        assert!(deepest_help_for(&bogus_argv).is_none());
+    }
+
+    #[test]
+    fn every_selector_chip_help_documents_the_uri_grammar() {
+        // RAL-437 criterion 1: wherever a command accepts a selector, its
+        // `--help` shows the concrete expected URI formats.
+        for (path, node) in registered_leaves() {
+            let help = command_help(&path).unwrap_or_else(|| panic!("missing help for {path:?}"));
+            let has_uri_chip = node
+                .positionals
+                .iter()
+                .copied()
+                .chain(node.options.iter().copied())
+                .any(|chip| display_chip(chip).contains("[uri"));
+            if has_uri_chip {
+                assert!(
+                    help.contains("URI ARGUMENTS:"),
+                    "{path:?} accepts a selector but its help omits the URI grammar"
+                );
+                for example in [
+                    "squad:squad-1",
+                    "task:squad-1:2",
+                    "cell:squad-1:2:0",
+                    "proof:squad-1:2:cell:0:1",
+                    "guardian:g-1",
+                ] {
+                    assert!(
+                        help.contains(example),
+                        "{path:?} selector help is missing the {example} example"
+                    );
+                }
+            }
+        }
     }
 }

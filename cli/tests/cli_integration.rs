@@ -398,3 +398,54 @@ fn validate_joins_multiple_files_into_one_request_like_submit_does() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn unknown_cell_subcommand_shows_cell_help() {
+    // RAL-437: an unknown `cell` subcommand reports the error and shows
+    // `cell --help` so the user sees the real subcommand names.
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["cell", "bogus"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("usage error: unknown cell subcommand: bogus"));
+    assert!(stdout.contains("ralphus cell --"));
+    assert!(stdout.contains("SUBCOMMANDS:"));
+    assert!(stdout.contains("edit selector [uri]"));
+}
+
+#[test]
+fn unknown_flag_shows_the_deepest_resolved_subcommands_help() {
+    // RAL-437: an unrecognized option on a known command reports the flag
+    // and shows the help of the deepest command the argv resolves to, so the
+    // fix lands on the command that actually rejected it.
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["cell", "edit", "--bogus", "x"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("usage error: unrecognized flag: --bogus"));
+    assert!(stdout.contains("ralphus cell edit --"));
+    assert!(stdout.contains("URI ARGUMENTS:"));
+
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["status", "--bogus"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("usage error: unrecognized flag: --bogus"));
+    assert!(stdout.contains("ralphus status --"));
+}
+
+#[test]
+fn cell_edit_with_a_squad_selector_explains_a_cell_selector_is_expected() {
+    // RAL-437: a bare squad id resolves as a squad without any daemon call,
+    // so this deterministic client-side error can explain that a *cell*
+    // selector (with its format) is what `cell edit` needs.
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["cell", "edit", "squad-1"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("'squad-1' is a squad selector, not a cell"));
+    assert!(stdout.contains("expected a cell selector"));
+    assert!(stdout.contains("`<squad_id>/<task>/<cell>` item path (e.g. `squad-1/2/0`)"));
+    assert!(
+        stdout.contains("`cell:<squad_id>:<task_idx>:<cell_idx>` URI (e.g. `cell:squad-1:2:0`)")
+    );
+
+    // The sibling commands resolve through the same shared helper, so a squad
+    // passed to `task show` / `proof show` gets the same kind of correction.
+    let (_, task_stdout) = run_cli("http://127.0.0.1:1", &["task", "show", "squad-1"]);
+    assert!(task_stdout.contains("expected a task selector"));
+    let (_, proof_stdout) = run_cli("http://127.0.0.1:1", &["proof", "show", "squad-1"]);
+    assert!(proof_stdout.contains("expected a proof selector"));
+}

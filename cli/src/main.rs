@@ -32,6 +32,21 @@ fn main() -> std::process::ExitCode {
     }
     if let Err(message) = ralphus_cli::help_map::validate_invocation(&raw_args) {
         println!("usage error: {message}");
+        if let Some(help) = ralphus_cli::help_map::deepest_help_for(&raw_args) {
+            println!();
+            println!("{help}");
+        }
+        return std::process::ExitCode::from(2);
+    }
+    // RAL-437: an invocation that parses as a known command but carries an
+    // option that command does not recognize reports the flag itself and
+    // shows the deepest resolved subcommand's help.
+    if let Some(flag) = ralphus_cli::help_map::unrecognized_flag(&raw_args) {
+        println!("usage error: unrecognized flag: {flag}");
+        if let Some(help) = ralphus_cli::help_map::deepest_help_for(&raw_args) {
+            println!();
+            println!("{help}");
+        }
         return std::process::ExitCode::from(2);
     }
     let (opts, args) = extract_global_opts(&raw_args);
