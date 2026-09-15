@@ -2230,15 +2230,38 @@ impl Store {
         Ok(())
     }
 
+    /// Update the guardian's conflict-resolver backend and/or model.
+    ///
+    /// Each argument is two-level so one column can be addressed without
+    /// disturbing the other: `None` leaves the column unchanged, `Some(None)`
+    /// clears it to NULL, and `Some(Some(v))` sets it to `v`.
+    ///
+    /// Setting one of the pair must never clear the other. A review whose
+    /// `resolver_agent` names a custom `[agent.profiles.*]` entry falls back to
+    /// the default backend (`ollama`) the moment that column is nulled, and
+    /// then sends the profile's model name to an API that has never heard of
+    /// it -- the merge fails on every attempt with a confusing 404 naming a
+    /// model the user never pointed at that backend.
     pub fn set_guardian_resolver(
         &self,
         id: &str,
-        agent: Option<&str>,
-        model: Option<&str>,
+        agent: Option<Option<&str>>,
+        model: Option<Option<&str>>,
     ) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET resolver_agent=?, resolver_model=?, updated_at_ms=? WHERE id=?",
-            params![agent, model, crate::store::now_ms(), id],
+            "UPDATE guardians SET \
+               resolver_agent = CASE WHEN ?1 THEN ?2 ELSE resolver_agent END, \
+               resolver_model = CASE WHEN ?3 THEN ?4 ELSE resolver_model END, \
+               updated_at_ms = ?5 \
+             WHERE id = ?6",
+            params![
+                agent.is_some(),
+                agent.flatten(),
+                model.is_some(),
+                model.flatten(),
+                crate::store::now_ms(),
+                id
+            ],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -5710,16 +5733,70 @@ mod tests {
         assert_eq!(g.resolver_agent, None);
         assert_eq!(g.resolver_model, None);
         store
-            .set_guardian_resolver(&id, Some("claude"), Some("claude-opus-4-8"))
+            .set_guardian_resolver(&id, Some(Some("claude")), Some(Some("claude-opus-4-8")))
             .unwrap();
         let g = store.get_guardian(&id).unwrap();
         assert_eq!(g.resolver_agent.as_deref(), Some("claude"));
         assert_eq!(g.resolver_model.as_deref(), Some("claude-opus-4-8"));
         assert!(
             store
-                .set_guardian_resolver("nope", Some("x"), None)
+                .set_guardian_resolver("nope", Some(Some("x")), None)
                 .is_err()
         );
+    }
+
+    /// Writing one half of the resolver pair must leave the other half alone.
+    ///
+    /// Clearing `resolver_agent` as a side effect of setting only the model
+    /// drops the review onto the default backend (`ollama`) while keeping a
+    /// model name meant for a custom profile's backend, so every subsequent
+    /// merge attempt fails with a 404 for a model the user never pointed at
+    /// that backend.
+    #[test]
+    fn setting_one_resolver_field_leaves_the_other_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_resolver(&id, Some(Some("pi-openrouter-deepseek")), None)
+            .unwrap();
+
+        // Model-only write: the agent must survive it.
+        store
+            .set_guardian_resolver(&id, None, Some(Some("openrouter/deepseek/deepseek-v4")))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.resolver_agent.as_deref(), Some("pi-openrouter-deepseek"));
+        assert_eq!(
+            g.resolver_model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4")
+        );
+
+        // Agent-only write: the model must survive it.
+        store
+            .set_guardian_resolver(&id, Some(Some("pi-openrouter-glm")), None)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.resolver_agent.as_deref(), Some("pi-openrouter-glm"));
+        assert_eq!(
+            g.resolver_model.as_deref(),
+            Some("openrouter/deepseek/deepseek-v4")
+        );
+    }
+
+    /// `Some(None)` is still how a caller deliberately clears one column --
+    /// the escape hatch the partial-update semantics must preserve.
+    #[test]
+    fn an_explicit_none_still_clears_one_resolver_field() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .set_guardian_resolver(&id, Some(Some("pi-custom")), Some(Some("some-model")))
+            .unwrap();
+
+        store.set_guardian_resolver(&id, Some(None), None).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.resolver_agent, None);
+        assert_eq!(g.resolver_model.as_deref(), Some("some-model"));
     }
 
     #[test]
