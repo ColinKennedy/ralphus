@@ -111,6 +111,68 @@ test("updateCounter starting after an in-flight pollTasks must not cancel its re
   assert.equal(poll.calls.renderAll, 1, "the pollTasks render must survive an overlapping updateCounter");
 });
 
+// ---------- prompt-text cache: the details pane must not blank on every poll ----------
+
+test("cached prompt text is re-applied to the fresh rows, and a standing poll neither refetches nor double-renders", async () => {
+  // `/api/tasks` omits prompt text, so every poll hands back rows whose
+  // prompt fields are null. Without a cache applied before the first render,
+  // the details pane paints empty and only fills in once a follow-up fetch
+  // lands -- a visible blank-and-repaint on every single refresh.
+  const poll = makeTasksPoll({ selectedSquadId: "s-1" });
+
+  // First poll: the squad is now known, so the prompt fetch can run.
+  const first = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], {
+    daemon: { running: 0, max_concurrent: 0 },
+    squads: [{ id: "s-1", tasks: [{ cells: [{ prompt: null, system_prompt: null, proof: [] }], proof: [] }] }],
+  });
+  await first;
+
+  // The follow-up per-squad fetch carries the real text.
+  const detail = poll.pendingFetches.find((f) => f.url.startsWith("/api/squads/"));
+  assert.ok(detail, "a squad-detail fetch must be issued once the squad is known");
+  resolveJson(detail, { id: "s-1", tasks: [{ cells: [{ prompt: "P", system_prompt: "SP", proof: [] }], proof: [] }] });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(poll.state().promptCacheSquadId, "s-1", "the text is cached against its squad");
+
+  const rendersAfterLoad = poll.calls.renderAll;
+  const fetchesAfterLoad = poll.pendingFetches.length;
+
+  // Second poll: fresh rows, prompt fields null again.
+  const second = poll.pollTasks();
+  resolveJson(poll.pendingFetches[fetchesAfterLoad], {
+    daemon: { running: 0, max_concurrent: 0 },
+    squads: [{ id: "s-1", tasks: [{ cells: [{ prompt: null, system_prompt: null, proof: [] }], proof: [] }] }],
+  });
+  await second;
+
+  const cell = poll.state().squads[0].tasks[0].cells[0];
+  assert.equal(cell.prompt, "P", "cached prompt must be restored before the render, not after");
+  assert.equal(cell.system_prompt, "SP", "cached system prompt must be restored too");
+  assert.equal(poll.pendingFetches.length, fetchesAfterLoad + 1,
+    "a standing poll must not re-fetch the squad detail -- only the board request");
+  assert.equal(poll.calls.renderAll, rendersAfterLoad + 1,
+    "exactly one render per poll: a second one is the blank-then-repaint flicker");
+});
+
+test("invalidateTasksFetch drops the prompt cache, so an edited prompt is refetched", async () => {
+  const poll = makeTasksPoll({ selectedSquadId: "s-1" });
+  const first = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], {
+    daemon: { running: 0, max_concurrent: 0 },
+    squads: [{ id: "s-1", tasks: [{ cells: [{ prompt: null, proof: [] }], proof: [] }] }],
+  });
+  await first;
+  const detail = poll.pendingFetches.find((f) => f.url.startsWith("/api/squads/"));
+  resolveJson(detail, { id: "s-1", tasks: [{ cells: [{ prompt: "old", proof: [] }], proof: [] }] });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(poll.state().promptCacheSquadId, "s-1");
+
+  poll.invalidateTasksFetch();
+  assert.equal(poll.state().promptCacheSquadId, null,
+    "a squad mutation can rewrite a prompt, so the cached text must not survive it");
+});
+
 test("a request after the previous one has already settled is not coalesced -- dedup clears once the in-flight request lands", async () => {
   const poll = makeTasksPoll();
   const promiseA = poll.updateCounter();

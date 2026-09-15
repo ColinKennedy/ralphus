@@ -117,7 +117,9 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
        updateCounter,
        pollTasks,
        invalidateTasksFetch,
-       state: () => ({ seq: tasksPollSeq, squads, sel, nodeMultiSel, squadSelCache, squadNodeCache, lastSquadId, daemonStatus: window._daemonStatus }),
+       ensurePromptCache,
+       applyPromptCache,
+       state: () => ({ seq: tasksPollSeq, squads, sel, nodeMultiSel, squadSelCache, squadNodeCache, lastSquadId, daemonStatus: window._daemonStatus, promptCacheSquadId }),
      };`,
   );
   const api = factory(deps, fetchImpl);
