@@ -8,10 +8,16 @@ full elsewhere — this is just the index.
 **Platform support:** Linux and Windows are fully supported and get CI's full
 fmt/clippy/test suite. macOS is supported as a daemon host on an
 **experimental** basis (RAL-398) — it already runs the same `cfg(unix)` code
-paths Linux does, and CI runs a build-only macOS leg on every PR, but there
-is no real macOS hardware to validate a heavier leg against yet. Everything
-below that says "macOS" or "Unix" applies to it the same as Linux unless
-called out otherwise.
+paths Linux does, but there is no real macOS hardware to validate a heavier
+leg against yet. Since RAL-441, CI builds both debug and release
+configurations on Linux, Windows, and macOS on every PR, with each OS's
+debug work running before its release leg and the release legs packaging
+through the platform-appropriate product script
+(scripts/build-release.sh / scripts/build-release.cmd) before
+smoke-launching the built binaries, so per-platform release failures
+surface at review time rather than release time. Everything below that says
+"macOS" or "Unix" applies to it the same as Linux unless called out
+otherwise.
 
 ## 1. Build-time / installation dependencies
 

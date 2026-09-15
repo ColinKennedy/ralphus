@@ -11,36 +11,50 @@ concurrency:
 # RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
 # full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
 # adds a macOS leg -- experimental, so build-only rather than the full suite
-# (see "Platform support" in README.md and docs/dependencies.md).
+# (see "Platform support" in README.md and docs/dependencies.md). RAL-441
+# completes the platform picture: every rust check-name states the OS and
+# configuration explicitly, and the rust work is split into a `rust-debug`
+# job (full fmt/clippy/test suite on ubuntu+windows, MSRV verification, macOS
+# smoke build) followed -- via `rust-release`'s `needs: rust-debug` edge -- by
+# a release job whose per-OS legs compile the whole workspace in `--release`
+# and package through the platform-appropriate product script
+# (scripts/build-release.sh on Linux/macOS, scripts/build-release.cmd on
+# Windows), then smoke-launch the packaged binaries. Debug therefore always
+# runs before release on every OS, and a platform-specific release failure
+# surfaces on the PR rather than at release time.
 
 jobs:
-  rust:
-    name: Rust (fmt, clippy, test)
+  rust-debug:
+    name: Rust debug (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
-        # toolchain x OS. The floating `stable` leg runs the full
-        # fmt/clippy/test suite on both ubuntu and windows so the documented
-        # Windows-specific daemon/runner paths are covered (see
+        # toolchain x OS for debug builds. The floating `stable` legs run the
+        # full fmt/clippy/test suite on both ubuntu and windows so the
+        # documented Windows-specific daemon/runner paths are covered (see
         # .agent/gotchas.md). The pinned "1.86" MSRV leg only proves the
         # workspace still builds at the minimum supported toolchain; lint/test
         # drift is stable's job. The macOS leg (RAL-398) is deliberately
-        # minimal -- a build-only smoke test, not the full suite -- since
-        # macOS support is experimental and there's no real macOS hardware in
-        # CI to validate a heavier leg against.
+        # minimal -- debug build only, not the full suite -- since macOS
+        # support is experimental and there's no real macOS hardware in CI to
+        # validate a heavier leg against.
         include:
           - os: ubuntu-latest
             toolchain: stable
             suite: full
+            label: ubuntu · stable · fmt/clippy/test
           - os: windows-latest
             toolchain: stable
             suite: full
+            label: windows · stable · fmt/clippy/test
           - os: ubuntu-latest
             toolchain: "1.86"
             suite: msrv
+            label: ubuntu · 1.86 · MSRV debug build
           - os: macos-latest
             toolchain: stable
-            suite: macos-min
+            suite: macos-debug
+            label: macos · stable · debug build
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -76,14 +90,73 @@ jobs:
       - name: Build (MSRV verification)
         if: matrix.suite == 'msrv'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
-      # macOS leg (RAL-398): experimental support, so this only proves the
-      # workspace builds -- no fmt/clippy/test/doctest suite, and no vendored
-      # psmux (that feature is Windows-only and off by default). A deeper
-      # macOS CI leg can follow once there's a real need to justify it.
-      - name: Build (macOS smoke test)
-        if: matrix.suite == 'macos-min'
+      # macOS debug leg (RAL-398): experimental support, so this only proves
+      # the workspace builds -- no fmt/clippy/test/doctest suite, and no
+      # vendored psmux (that feature is Windows-only and off by default). A
+      # deeper macOS CI leg can follow once there's a real need to justify it.
+      - name: Build (macOS debug smoke test)
+        if: matrix.suite == 'macos-debug'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
+  rust-release:
+    # RAL-441: one leg per OS, gated on the whole `rust-debug` job finishing
+    # green, so every OS runs its debug work before any release work starts.
+    # Each leg first compiles the whole workspace in --release (covering test
+    # targets too, so release-mode cfg/feature divergence is caught on the
+    # PR) and then packages through the platform-appropriate product script
+    # (scripts/build-release.sh on Linux/macOS, scripts/build-release.cmd on
+    # Windows -- the Windows script also builds the vendored psmux submodule
+    # and links it via the `embedded-tmux` feature by default, matching
+    # .github/workflows/release.yml), then smoke-launches the packaged
+    # binaries. The --release workspace compile is intentionally
+    # feature-default (embedded-tmux is off unless the packaging step turns
+    # it on), so it never needs the vendor/psmux submodule on non-Windows
+    # legs.
+    name: Rust release (${{ matrix.label }})
+    needs: rust-debug
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            label: ubuntu · stable · release build
+            exe: ""
+            packager: bash scripts/build-release.sh
+            submodules: false
+          - os: windows-latest
+            toolchain: stable
+            label: windows · stable · release build
+            exe: ".exe"
+            packager: cmd /c scripts\build-release.cmd
+            submodules: true
+          - os: macos-latest
+            toolchain: stable
+            label: macos · stable · release build
+            exe: ""
+            packager: bash scripts/build-release.sh
+            submodules: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only the Windows leg needs the vendor/psmux submodule (its
+          # packaging script builds it by default); keep the other two legs'
+          # checkouts thin.
+          submodules: ${{ matrix.submodules }}
+      - name: Install Rust toolchain
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            vendor/psmux -> target
+      - name: Build (release, all targets)
+        run: cargo "+${{ matrix.toolchain }}" build --release --workspace --all-targets
+      - name: Build release package (platform packaging script)
+        run: ${{ matrix.packager }}
+      - name: Smoke-test release binaries
+        run: ./dist/ralphus${{ matrix.exe }} --version && ./dist/ralphus-daemon${{ matrix.exe }} --version
   psmux-integration:
     name: Windows psmux integration
     runs-on: windows-latest
