@@ -175,16 +175,69 @@ fn validate_raw(raw: &toml::Table) -> Vec<String> {
                 type_name(daemon_raw)
             )),
             Some(table) => {
-                const KNOWN_DAEMON: [&str; 5] = [
+                const KNOWN_DAEMON: [&str; 8] = [
                     "log_path",
                     "log_level",
                     "keep_temporary_files",
                     "max_concurrent",
                     "opentelemetry",
+                    "default_user",
+                    "default_user_is_admin",
+                    "downtime",
                 ];
                 for k in table.keys() {
                     if !KNOWN_DAEMON.contains(&k.as_str()) {
                         issues.push(format!("key \"daemon.{k}\" is unknown"));
+                    }
+                }
+                if let Some(dt) = table.get("downtime") {
+                    match dt.as_array() {
+                        None => issues.push(format!(
+                            "key \"daemon.downtime\" expects \"array\" but got a \"{}\" type",
+                            type_name(dt)
+                        )),
+                        Some(windows) => {
+                            for (i, window) in windows.iter().enumerate() {
+                                match window.as_table() {
+                                    None => issues.push(format!(
+                                        "key \"daemon.downtime[{i}]\" expects \"table\" but got a \"{}\" type",
+                                        type_name(window)
+                                    )),
+                                    Some(w) => {
+                                        for field in ["start", "end"] {
+                                            match w.get(field) {
+                                                None => issues.push(format!(
+                                                    "key \"daemon.downtime[{i}].{field}\" is required"
+                                                )),
+                                                Some(v) if v.as_str().is_none() => {
+                                                    issues.push(format!(
+                                                        "key \"daemon.downtime[{i}].{field}\" expects \"string\" but got a \"{}\" type",
+                                                        type_name(v)
+                                                    ));
+                                                }
+                                                Some(_) => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(du) = table.get("default_user") {
+                    if du.as_str().is_none() {
+                        issues.push(format!(
+                            "key \"daemon.default_user\" expects \"string\" but got a \"{}\" type",
+                            type_name(du)
+                        ));
+                    }
+                }
+                if let Some(dua) = table.get("default_user_is_admin") {
+                    if dua.as_bool().is_none() {
+                        issues.push(format!(
+                            "key \"daemon.default_user_is_admin\" expects \"boolean\" but got a \"{}\" type",
+                            type_name(dua)
+                        ));
                     }
                 }
                 if let Some(mc) = table.get("max_concurrent") {
@@ -365,7 +418,7 @@ fn validate_agent_section(raw: &toml::Table, issues: &mut Vec<String>) {
         return;
     };
 
-    const KNOWN_PROFILE: [&str; 3] = ["backend", "executable", "env"];
+    const KNOWN_PROFILE: [&str; 4] = ["backend", "executable", "model", "env"];
     for (name, profile_raw) in profiles_table {
         let path = format!("agent.profiles.{name}");
         if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&name.as_str()) {
@@ -398,6 +451,14 @@ fn validate_agent_section(raw: &toml::Table, issues: &mut Vec<String>) {
                 issues.push(format!(
                     "key \"{path}.executable\" expects \"string\" but got a \"{}\" type",
                     type_name(exe)
+                ));
+            }
+        }
+        if let Some(model) = profile_table.get("model") {
+            if model.as_str().is_none() {
+                issues.push(format!(
+                    "key \"{path}.model\" expects \"string\" but got a \"{}\" type",
+                    type_name(model)
                 ));
             }
         }
@@ -686,6 +747,85 @@ BAD = 5
             issues
                 .iter()
                 .any(|i| i.contains("agent.profiles.custom.env.BAD")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_agent_profile_model_field() {
+        let raw: toml::Table = r#"
+[agent.profiles.openrouter-deepseek]
+backend = "claude-code"
+model = "deepseek/deepseek-chat"
+"#
+        .parse()
+        .unwrap();
+        let issues = validate_raw(&raw);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn validate_raw_flags_wrong_type_agent_profile_model() {
+        let raw: toml::Table = r#"
+[agent.profiles.custom]
+backend = "claude-code"
+model = 5
+"#
+        .parse()
+        .unwrap();
+        let issues = validate_raw(&raw);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("agent.profiles.custom.model") && i.contains("string")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_daemon_default_user_settings() {
+        let raw: toml::Table = "[daemon]\ndefault_user = \"alice\"\ndefault_user_is_admin = true\n"
+            .parse()
+            .unwrap();
+        assert!(validate_raw(&raw).is_empty());
+    }
+
+    #[test]
+    fn validate_raw_flags_wrong_type_daemon_default_user_settings() {
+        let raw: toml::Table = "[daemon]\ndefault_user = 5\ndefault_user_is_admin = \"nope\"\n"
+            .parse()
+            .unwrap();
+        let issues = validate_raw(&raw);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("daemon.default_user") && i.contains("string")),
+            "{issues:?}"
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("daemon.default_user_is_admin") && i.contains("boolean")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_raw_accepts_daemon_downtime_windows() {
+        let raw: toml::Table = "[[daemon.downtime]]\nstart = \"22:00\"\nend = \"06:00\"\n"
+            .parse()
+            .unwrap();
+        assert!(validate_raw(&raw).is_empty());
+    }
+
+    #[test]
+    fn validate_raw_flags_daemon_downtime_missing_field() {
+        let raw: toml::Table = "[[daemon.downtime]]\nstart = \"22:00\"\n".parse().unwrap();
+        let issues = validate_raw(&raw);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("daemon.downtime[0].end") && i.contains("required")),
             "{issues:?}"
         );
     }
