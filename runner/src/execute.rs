@@ -382,6 +382,7 @@ fn run_with_backend(
             maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
             allow_personal_settings: spec.allow_personal_settings,
             allow_personal_memory: spec.allow_personal_memory,
+            hide_thinking: spec.hide_thinking,
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
@@ -487,6 +488,7 @@ fn run_with_backend(
                 maximum_tool_output_tokens: spec.maximum_tool_output_tokens,
                 allow_personal_settings: spec.allow_personal_settings,
                 allow_personal_memory: spec.allow_personal_memory,
+                hide_thinking: spec.hide_thinking,
             };
             outcome = match backend.nudge(workspace, &nudge_options) {
                 Ok(Some(o)) => o,
@@ -1190,6 +1192,7 @@ mod tests {
             maximum_tool_output_tokens: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            hide_thinking: false,
         }
     }
 
@@ -1419,6 +1422,7 @@ mod tests {
             maximum_tool_output_tokens: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            hide_thinking: false,
         };
         let result = run_cell(&spec, false);
         assert!(!result.ok());

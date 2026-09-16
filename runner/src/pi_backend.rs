@@ -193,6 +193,7 @@ impl ModelBackend for PiBackend {
             workspace,
             thrash_thresholds,
             tool_arg_truncate_chars,
+            options.hide_thinking,
         )?;
 
         if !self.keep_temporary_files {
@@ -571,6 +572,7 @@ fn drive_json_events(
     workspace: &Workspace,
     thrash_thresholds: crate::thrash::ThrashThresholds,
     tool_arg_truncate_chars: usize,
+    hide_thinking: bool,
 ) -> Result<BackendOutcome, BackendError> {
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
@@ -596,6 +598,7 @@ fn drive_json_events(
 
     let mut state = ParseState {
         thrash: crate::thrash::ThrashTracker::new(thrash_thresholds),
+        hide_thinking,
         ..ParseState::default()
     };
     for line in reader.lines().map_while(Result::ok) {
@@ -723,6 +726,19 @@ struct ParseState {
     /// Whether the next character in `json_buffer` is escaped (follows an
     /// unescaped `\` inside a string) and must not be interpreted specially.
     json_escape: bool,
+    /// RAL-434: `RunOptions::hide_thinking`, carried onto `ParseState` rather
+    /// than threaded through every `process_event` call the way
+    /// `tool_arg_truncate_chars` is -- this only needs to gate one small
+    /// branch of `message_update` handling, not the whole call chain.
+    hide_thinking: bool,
+    /// RAL-434: true while inside a thinking block (`thinking_start` through
+    /// `thinking_end`) that this run has already printed its compact
+    /// `thinking…` marker for. Only meaningful when `hide_thinking` is set --
+    /// gates [`handle_hidden_thinking_event`] so a block's marker prints
+    /// exactly once regardless of how many `thinking_delta` events follow,
+    /// and regardless of whether the provider even emits a `thinking_start`
+    /// (some stream `thinking_delta` directly).
+    in_thinking_block: bool,
 }
 
 /// Pi's `--mode json` `message_update` events stream the model's own raw
@@ -830,6 +846,36 @@ fn finish_pi_text_stream(state: &mut ParseState) {
             state.printed_text_delta = true;
         }
     }
+    // RAL-434: defensive reset -- a `thinking_end` should already have
+    // cleared this, but a turn that ends mid-thinking (error, abort) would
+    // otherwise leave the next block silently unmarked as "new".
+    state.in_thinking_block = false;
+}
+
+/// RAL-434: handles one `thinking_start`/`thinking_delta`/`thinking_end`
+/// `assistantMessageEvent` when [`ParseState::hide_thinking`] is set --
+/// called only for those three types (see [`process_event`]'s
+/// `message_update` arm). Prints one compact `thinking…` marker at the start
+/// of each thinking block and suppresses every other thinking event in that
+/// block, so the raw (often lengthy) reasoning text never reaches the log
+/// while still leaving a visible sign the agent is working.
+fn handle_hidden_thinking_event(state: &mut ParseState, assistant_message_event_type: &str) {
+    if assistant_message_event_type == "thinking_end" {
+        state.in_thinking_block = false;
+        return;
+    }
+    // "thinking_start" or "thinking_delta" -- either can be the first sign
+    // of a new block depending on the provider (some emit both, some stream
+    // `thinking_delta` straight away with no `thinking_start`).
+    if state.in_thinking_block {
+        return;
+    }
+    state.in_thinking_block = true;
+    if state.printed_text_delta {
+        finish_delta_line();
+        state.printed_text_delta = false;
+    }
+    print_thinking_marker();
 }
 
 /// Best-effort classification of one of Pi's bare tool-call JSON objects
@@ -964,7 +1010,23 @@ fn process_event(
                     }),
                 );
             }
-            if let Some(delta) = event["assistantMessageEvent"]["delta"].as_str() {
+            // RAL-434: Pi's `assistantMessageEvent.type` distinguishes
+            // thinking content (`thinking_start`/`thinking_delta`/
+            // `thinking_end`) from ordinary text/tool-call content
+            // (`text_*`/`toolcall_*`) even though `--mode json` streams both
+            // through the same `message_update` envelope -- confirmed
+            // against `@earendil-works/pi-ai`'s `AssistantMessageEvent`
+            // union and `json-event.ts::toJsonEvent`, which passes the
+            // `type` field through unchanged. When `hide_thinking` is unset
+            // this condition is always false, so behavior is identical to
+            // before this event type was ever inspected: every delta,
+            // thinking or not, streams raw.
+            let assistant_message_event_type = event["assistantMessageEvent"]["type"]
+                .as_str()
+                .unwrap_or("");
+            if state.hide_thinking && assistant_message_event_type.starts_with("thinking_") {
+                handle_hidden_thinking_event(state, assistant_message_event_type);
+            } else if let Some(delta) = event["assistantMessageEvent"]["delta"].as_str() {
                 if !delta.is_empty() {
                     feed_assistant_text(state, delta, tool_arg_truncate_chars);
                 }
@@ -1150,6 +1212,14 @@ fn print_delta(delta: &str) {
 #[allow(clippy::print_stdout)]
 fn finish_delta_line() {
     println!();
+}
+
+/// RAL-434: the compact stand-in printed once per hidden thinking block --
+/// see [`handle_hidden_thinking_event`].
+#[allow(clippy::print_stdout)]
+fn print_thinking_marker() {
+    println!("thinking…");
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
@@ -1490,6 +1560,187 @@ mod tests {
             );
         }
         assert_eq!(state.compaction_thrash, None);
+    }
+
+    // ── RAL-434: hide_thinking ──────────────────────────────────────────
+
+    /// With `hide_thinking` unset (the default), a `thinking_delta` streams
+    /// exactly like a `text_delta` always has -- the type field is inspected
+    /// but never changes behavior unless the flag is on.
+    #[test]
+    fn process_event_streams_thinking_deltas_raw_when_hide_thinking_is_unset() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_start"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_delta","delta":"reasoning about it..."}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        // Not suppressed -- fed straight into the same raw-passthrough path
+        // as any other delta, so the pending-delta-line flag is set (Can't
+        // capture stdout directly here, mirrors this file's other
+        // `process_event` tests).
+        assert!(state.printed_text_delta);
+        assert!(!state.in_thinking_block);
+    }
+
+    /// With `hide_thinking` set, a thinking block collapses to a single
+    /// compact marker: `in_thinking_block` flips true on the first thinking
+    /// event and stays true (not re-triggering the marker) across further
+    /// `thinking_delta`s in the same block, then clears on `thinking_end`.
+    #[test]
+    fn process_event_collapses_a_thinking_block_when_hide_thinking_is_set() {
+        let mut state = ParseState {
+            hide_thinking: true,
+            ..ParseState::default()
+        };
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_start"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.in_thinking_block);
+        assert!(!state.printed_text_delta);
+
+        for _ in 0..3 {
+            process_event(
+                &serde_json::json!({
+                    "type":"message_update",
+                    "usage":{},
+                    "assistantMessageEvent":{"type":"thinking_delta","delta":"more reasoning"}
+                }),
+                &mut state,
+                root,
+                DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            );
+            // Still just the one block -- suppressed deltas never touch the
+            // raw-passthrough flag.
+            assert!(state.in_thinking_block);
+            assert!(!state.printed_text_delta);
+        }
+
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_end"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(!state.in_thinking_block);
+    }
+
+    /// Some providers stream `thinking_delta` with no preceding
+    /// `thinking_start` -- the first delta itself must still open the block
+    /// (and thus trigger exactly one marker) rather than requiring a start
+    /// event that never arrives.
+    #[test]
+    fn process_event_opens_a_thinking_block_from_a_delta_with_no_start_event() {
+        let mut state = ParseState {
+            hide_thinking: true,
+            ..ParseState::default()
+        };
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_delta","delta":"..."}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.in_thinking_block);
+    }
+
+    /// Non-thinking content (regular text) must keep streaming normally even
+    /// while `hide_thinking` is set -- only thinking events are suppressed.
+    #[test]
+    fn process_event_retains_non_thinking_output_when_hide_thinking_is_set() {
+        let mut state = ParseState {
+            hide_thinking: true,
+            ..ParseState::default()
+        };
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"thinking_delta","delta":"hidden reasoning"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(!state.printed_text_delta);
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "usage":{},
+                "assistantMessageEvent":{"type":"text_delta","delta":"the actual answer"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(state.printed_text_delta);
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[{"type":"text","text":"the actual answer"}]}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.latest_assistant_message, "the actual answer");
+    }
+
+    /// A turn left mid-thinking (aborted/error) must not leak
+    /// `in_thinking_block` into the next turn's blocks -- `message_end`'s
+    /// existing `finish_pi_text_stream` call resets it defensively.
+    #[test]
+    fn process_event_resets_in_thinking_block_on_message_end() {
+        let mut state = ParseState {
+            hide_thinking: true,
+            in_thinking_block: true,
+            ..ParseState::default()
+        };
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"boom"}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert!(!state.in_thinking_block);
     }
 
     /// RAL-380: the exact shape observed in a real `pi-openrouter-deepseek`

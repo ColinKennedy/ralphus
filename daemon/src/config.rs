@@ -1104,6 +1104,18 @@ pub struct LiveViewConfig {
     /// falls back to 200.
     #[serde(default)]
     pub tool_arg_truncate_chars: Option<u32>,
+    /// RAL-434: whether the pi backend collapses each thinking/reasoning
+    /// block it streams into a compact marker instead of printing it
+    /// verbatim. Pi's own `hideThinkingBlock` setting only governs its
+    /// interactive TUI's renderer -- its `--mode json`/print-mode event
+    /// stream (what the pi backend actually consumes) always tags thinking
+    /// content with its own distinct event type regardless of that setting,
+    /// so this is ralphus's own control, not a passthrough of Pi's. `None`
+    /// means unset; resolved callers use
+    /// [`hide_thinking`](Self::hide_thinking), which falls back to `false`
+    /// (thinking streams like any other text).
+    #[serde(default)]
+    pub hide_thinking: Option<bool>,
 }
 
 impl LiveViewConfig {
@@ -1121,6 +1133,14 @@ impl LiveViewConfig {
     pub fn tool_arg_truncate_chars(&self) -> u32 {
         self.tool_arg_truncate_chars
             .unwrap_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS)
+    }
+
+    /// Whether the pi backend should collapse each thinking block into a
+    /// compact marker. Defaults to `false` (thinking streams like any other
+    /// text) when unset.
+    #[must_use]
+    pub fn hide_thinking(&self) -> bool {
+        self.hide_thinking.unwrap_or(false)
     }
 }
 
@@ -1165,6 +1185,7 @@ pub fn load_live_view_config() -> LiveViewConfig {
         tool_arg_truncate_chars: local
             .tool_arg_truncate_chars
             .or(global.tool_arg_truncate_chars),
+        hide_thinking: local.hide_thinking.or(global.hide_thinking),
     }
 }
 
@@ -3108,8 +3129,45 @@ mod tests {
             tool_arg_truncate_chars: local
                 .tool_arg_truncate_chars
                 .or(global.tool_arg_truncate_chars),
+            hide_thinking: local.hide_thinking.or(global.hide_thinking),
         };
         assert_eq!(effective.tool_arg_truncate_chars(), 500);
+    }
+
+    // ── hide_thinking (RAL-434) ────────────────────────────────────────────
+
+    #[test]
+    fn hide_thinking_defaults_to_false_when_absent() {
+        let c = live_view_from_toml_str("");
+        assert!(!c.hide_thinking());
+    }
+
+    #[test]
+    fn hide_thinking_parses_explicit_true() {
+        let c = live_view_from_toml_str("[live_view]\nhide_thinking = true\n");
+        assert!(c.hide_thinking());
+    }
+
+    #[test]
+    fn hide_thinking_parses_explicit_false() {
+        let c = live_view_from_toml_str("[live_view]\nhide_thinking = false\n");
+        assert!(!c.hide_thinking());
+    }
+
+    #[test]
+    fn hide_thinking_project_wins_over_global() {
+        let global = live_view_from_toml_str("[live_view]\nhide_thinking = false\n");
+        let local = live_view_from_toml_str("[live_view]\nhide_thinking = true\n");
+        let effective = LiveViewConfig {
+            show_debug_messages_default: local
+                .show_debug_messages_default
+                .or(global.show_debug_messages_default),
+            tool_arg_truncate_chars: local
+                .tool_arg_truncate_chars
+                .or(global.tool_arg_truncate_chars),
+            hide_thinking: local.hide_thinking.or(global.hide_thinking),
+        };
+        assert!(effective.hide_thinking());
     }
 
     // ── ThrashConfig (RAL-339) ─────────────────────────────────────────────
