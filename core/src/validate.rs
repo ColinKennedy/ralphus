@@ -411,6 +411,112 @@ fn unknown_keys(
     }
 }
 
+/// Keys allowed inside one `agent = [...]` list entry.
+const AGENT_CANDIDATE_KEYS: &[&str] = &["agent", "model"];
+
+/// Validate a task's or cell's own `agent` key shape: either a plain string
+/// (a literal value, unchanged from before this existed) or a non-empty
+/// array of `{agent, model}` tables to try in order (see
+/// [`crate::schema::AgentSpec`]). A scope using the array form must not also
+/// set its own `model` -- each candidate carries its own, so a sibling
+/// scalar `model` would be ambiguous. Proof-step `agent` is intentionally
+/// not routed through this -- it stays a plain string (`Ty::Str`), never a
+/// candidate list.
+fn check_agent_field(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(v) = table.get("agent") else { return };
+    match v {
+        toml::Value::String(_) => {}
+        toml::Value::Array(items) => {
+            if items.is_empty() {
+                let line = ctx.key_line(header, "agent");
+                ctx.error(
+                    &format!("{path}.agent"),
+                    ErrorKind::InvalidValue,
+                    "'agent' as a list must have at least one candidate",
+                    line,
+                );
+            }
+            for (i, item) in items.iter().enumerate() {
+                let cpath = format!("{path}.agent[{i}]");
+                let Some(ctable) = item.as_table() else {
+                    ctx.error(
+                        &cpath,
+                        ErrorKind::WrongType,
+                        "each 'agent' list entry must be a table, e.g. \
+                         { agent = \"codex\", model = \"...\" }",
+                        None,
+                    );
+                    continue;
+                };
+                unknown_keys(ctx, ctable, AGENT_CANDIDATE_KEYS, &cpath, None);
+                match ctable.get("agent") {
+                    None => ctx.error(
+                        &cpath,
+                        ErrorKind::MissingRequired,
+                        "each 'agent' list entry requires its own 'agent' name",
+                        None,
+                    ),
+                    Some(toml::Value::String(s)) if s.trim().is_empty() => ctx.error(
+                        &format!("{cpath}.agent"),
+                        ErrorKind::InvalidValue,
+                        "'agent' must not be empty",
+                        None,
+                    ),
+                    Some(toml::Value::String(_)) => {}
+                    Some(_) => check_type(ctx, ctable, "agent", Ty::Str, &cpath, None),
+                }
+                check_type(ctx, ctable, "model", Ty::Str, &cpath, None);
+            }
+            if table.contains_key("model") {
+                let line = ctx.key_line(header, "model");
+                ctx.error(
+                    &format!("{path}.model"),
+                    ErrorKind::ConflictingKeys,
+                    "'model' cannot be set alongside a list-form 'agent' -- each candidate \
+                     carries its own 'model' instead",
+                    line,
+                );
+            }
+        }
+        _ => {
+            let line = ctx.key_line(header, "agent");
+            ctx.error(
+                &format!("{path}.agent"),
+                ErrorKind::WrongType,
+                format!(
+                    "key \"agent\" must be a string or an array of {{agent, model}} tables, \
+                     found {}",
+                    type_name(v)
+                ),
+                line,
+            );
+        }
+    }
+}
+
+/// Every agent name a table's own `agent` key could resolve to, in order --
+/// one name for a plain string, one per entry for a candidate list -- or
+/// `None` if the key is absent or too malformed to name anything (letting
+/// the caller fall back to the inherited names from its parent scope).
+/// [`check_agent_field`] is what reports the malformed-shape error itself;
+/// this just avoids compounding it with a spurious capability-gate error.
+fn agent_names_in_table(table: &toml::Table) -> Option<Vec<&str>> {
+    match table.get("agent") {
+        Some(toml::Value::String(s)) => Some(vec![s.as_str()]),
+        Some(toml::Value::Array(items)) => {
+            let names: Vec<&str> = items
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .filter_map(|t| t.get("agent"))
+                .filter_map(toml::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if names.is_empty() { None } else { Some(names) }
+        }
+        _ => None,
+    }
+}
+
 // ── [[default]] ──────────────────────────────────────────────────────────────
 
 fn validate_defaults(value: Option<&toml::Value>, ctx: &mut Ctx) {
@@ -526,7 +632,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         }
 
         check_type(ctx, table, "project", Ty::Str, &path, header);
-        check_type(ctx, table, "agent", Ty::Str, &path, header);
+        check_agent_field(ctx, table, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
         check_machine(ctx, table, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
@@ -537,7 +643,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_positive_number(ctx, table, "maximum_context", &path, header);
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
-        check_maximum_context(ctx, table, None, &path, header);
+        check_maximum_context(ctx, table, &[], &path, header);
         check_type(
             ctx,
             table,
@@ -547,7 +653,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
-        check_maximum_tool_output_tokens(ctx, table, None, &path, header);
+        check_maximum_tool_output_tokens(ctx, table, &[], &path, header);
         check_type(ctx, table, "max_retries", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
@@ -556,13 +662,13 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
 
-        let task_agent = table.get("agent").and_then(toml::Value::as_str);
+        let task_agents = agent_names_in_table(table).unwrap_or_default();
         let task_project = table.get("project").and_then(toml::Value::as_str);
         validate_cells(
             table.get("cell"),
             t,
             &path,
-            task_agent,
+            &task_agents,
             task_project,
             header,
             &task_cell_index,
@@ -571,7 +677,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         validate_proof_array(
             table.get("proof"),
             &format!("{path}.proof"),
-            task_agent,
+            &task_agents,
             ctx,
         );
     }
@@ -584,7 +690,7 @@ fn validate_cells(
     value: Option<&toml::Value>,
     task_idx: usize,
     task_path: &str,
-    task_agent: Option<&str>,
+    task_agents: &[&str],
     task_project: Option<&str>,
     task_header: Option<u32>,
     task_cell_index: &HashMap<String, HashSet<String>>,
@@ -759,12 +865,12 @@ fn validate_cells(
         }
 
         check_type(ctx, table, "role", Ty::Str, &path, header);
-        check_type(ctx, table, "agent", Ty::Str, &path, header);
+        check_agent_field(ctx, table, &path, header);
         check_type(ctx, table, "model", Ty::Str, &path, header);
         check_machine(ctx, table, &path, header);
         check_type(ctx, table, "system_prompt", Ty::Str, &path, header);
         check_type(ctx, table, "system_prompt_position", Ty::Str, &path, header);
-        check_system_prompt(ctx, table, task_agent, &path, header);
+        check_system_prompt(ctx, table, task_agents, &path, header);
         check_type(ctx, table, "args", Ty::StrArray, &path, header);
         check_type(ctx, table, "budget_tokens", Ty::Int, &path, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &path, header);
@@ -773,7 +879,7 @@ fn validate_cells(
         check_positive_number(ctx, table, "maximum_context", &path, header);
         check_type(ctx, table, "auto_compact_threshold", Ty::Int, &path, header);
         check_positive_number(ctx, table, "auto_compact_threshold", &path, header);
-        check_maximum_context(ctx, table, task_agent, &path, header);
+        check_maximum_context(ctx, table, task_agents, &path, header);
         check_type(
             ctx,
             table,
@@ -783,7 +889,7 @@ fn validate_cells(
             header,
         );
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &path, header);
-        check_maximum_tool_output_tokens(ctx, table, task_agent, &path, header);
+        check_maximum_tool_output_tokens(ctx, table, task_agents, &path, header);
         check_type(ctx, table, "timeout_minutes", Ty::Int, &path, header);
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
@@ -808,14 +914,11 @@ fn validate_cells(
         check_type(ctx, table, "triage_type", Ty::StrOrStrArray, &path, header);
         check_triage(ctx, table, &path, header, &mut has_auto_review);
 
-        let cell_agent = table
-            .get("agent")
-            .and_then(toml::Value::as_str)
-            .or(task_agent);
+        let cell_agents = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
         validate_proof_array(
             table.get("proof"),
             &format!("{path}.proof"),
-            cell_agent,
+            &cell_agents,
             ctx,
         );
     }
@@ -991,8 +1094,12 @@ fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<
 /// delivery mechanism — see
 /// [`agent_supports_system_prompt`](crate::schema::agent_supports_system_prompt)
 /// — and the position, when set, must be the `"append"` sentinel. The
-/// effective agent is the cell's own `agent`, falling back to the
-/// task-level `agent`, then [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT).
+/// effective agent name(s) are the cell's own `agent` (every candidate's
+/// name, if it's a list), falling back to `task_agents`, then
+/// [`DEFAULT_AGENT`](crate::schema::DEFAULT_AGENT). When `agent` is a
+/// candidate list, the field is only allowed if **every** candidate
+/// supports it -- which one wins isn't known until submit-time resolution,
+/// so the field must be valid no matter which is picked.
 ///
 /// This only rejects agent names `core` can classify itself --
 /// [`RESERVED_AGENT_NAMES`](crate::schema::RESERVED_AGENT_NAMES), the
@@ -1004,7 +1111,7 @@ fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<
 fn check_system_prompt(
     ctx: &mut Ctx,
     table: &toml::Table,
-    task_agent: Option<&str>,
+    task_agents: &[&str],
     path: &str,
     header: Option<u32>,
 ) {
@@ -1014,29 +1121,30 @@ fn check_system_prompt(
         return;
     }
 
-    let agent = table
-        .get("agent")
-        .and_then(toml::Value::as_str)
-        .or(task_agent)
-        .unwrap_or(crate::schema::DEFAULT_AGENT);
-    if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
-        && !crate::schema::agent_supports_system_prompt(agent)
-    {
-        let key = if has_prompt {
-            "system_prompt"
-        } else {
-            "system_prompt_position"
-        };
-        let line = ctx.key_line(header, key);
-        ctx.error(
-            &format!("{path}.{key}"),
-            ErrorKind::InvalidValue,
-            format!(
-                "'system_prompt'/'system_prompt_position' are only supported for the \
-                 'claude-code'/'codex' agents right now, not '{agent}'"
-            ),
-            line,
-        );
+    let mut names = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
+    if names.is_empty() {
+        names.push(crate::schema::DEFAULT_AGENT);
+    }
+    for agent in names.iter().copied() {
+        if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
+            && !crate::schema::agent_supports_system_prompt(agent)
+        {
+            let key = if has_prompt {
+                "system_prompt"
+            } else {
+                "system_prompt_position"
+            };
+            let line = ctx.key_line(header, key);
+            ctx.error(
+                &format!("{path}.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'system_prompt'/'system_prompt_position' are only supported for the \
+                     'claude-code'/'codex' agents right now, not '{agent}'"
+                ),
+                line,
+            );
+        }
     }
 
     if let Some(pos) = table
@@ -1072,7 +1180,7 @@ fn check_system_prompt(
 fn check_maximum_context(
     ctx: &mut Ctx,
     table: &toml::Table,
-    task_agent: Option<&str>,
+    task_agents: &[&str],
     path: &str,
     header: Option<u32>,
 ) {
@@ -1082,39 +1190,40 @@ fn check_maximum_context(
         return;
     }
 
-    let agent = table
-        .get("agent")
-        .and_then(toml::Value::as_str)
-        .or(task_agent)
-        .unwrap_or(crate::schema::DEFAULT_AGENT);
-    if !crate::schema::RESERVED_AGENT_NAMES.contains(&agent) {
-        return;
+    let mut names = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
+    if names.is_empty() {
+        names.push(crate::schema::DEFAULT_AGENT);
     }
-
-    if has_context && !crate::schema::agent_supports_maximum_context(agent) {
-        let line = ctx.key_line(header, "maximum_context");
-        ctx.error(
-            &format!("{path}.maximum_context"),
-            ErrorKind::InvalidValue,
-            format!(
-                "'maximum_context' is only supported for the 'codex'/'pi' agents right now, \
-                 not '{agent}'. Remove this setting, or switch to one of those agents."
-            ),
-            line,
-        );
-    }
-    if has_threshold && !crate::schema::agent_supports_auto_compact_threshold(agent) {
-        let line = ctx.key_line(header, "auto_compact_threshold");
-        ctx.error(
-            &format!("{path}.auto_compact_threshold"),
-            ErrorKind::InvalidValue,
-            format!(
-                "'auto_compact_threshold' is only supported for the 'codex'/'pi'/'claude-code' \
-                 agents right now, not '{agent}'. Remove this setting, or switch to one of \
-                 those agents."
-            ),
-            line,
-        );
+    for agent in names
+        .iter()
+        .copied()
+        .filter(|a| crate::schema::RESERVED_AGENT_NAMES.contains(a))
+    {
+        if has_context && !crate::schema::agent_supports_maximum_context(agent) {
+            let line = ctx.key_line(header, "maximum_context");
+            ctx.error(
+                &format!("{path}.maximum_context"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'maximum_context' is only supported for the 'codex'/'pi' agents right now, \
+                     not '{agent}'. Remove this setting, or switch to one of those agents."
+                ),
+                line,
+            );
+        }
+        if has_threshold && !crate::schema::agent_supports_auto_compact_threshold(agent) {
+            let line = ctx.key_line(header, "auto_compact_threshold");
+            ctx.error(
+                &format!("{path}.auto_compact_threshold"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'auto_compact_threshold' is only supported for the \
+                     'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
+                     setting, or switch to one of those agents."
+                ),
+                line,
+            );
+        }
     }
 }
 
@@ -1131,7 +1240,7 @@ fn check_maximum_context(
 fn check_maximum_tool_output_tokens(
     ctx: &mut Ctx,
     table: &toml::Table,
-    task_agent: Option<&str>,
+    task_agents: &[&str],
     path: &str,
     header: Option<u32>,
 ) {
@@ -1139,27 +1248,28 @@ fn check_maximum_tool_output_tokens(
         return;
     }
 
-    let agent = table
-        .get("agent")
-        .and_then(toml::Value::as_str)
-        .or(task_agent)
-        .unwrap_or(crate::schema::DEFAULT_AGENT);
-    if !crate::schema::RESERVED_AGENT_NAMES.contains(&agent) {
-        return;
+    let mut names = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
+    if names.is_empty() {
+        names.push(crate::schema::DEFAULT_AGENT);
     }
-
-    if !crate::schema::agent_supports_maximum_tool_output_tokens(agent) {
-        let line = ctx.key_line(header, "maximum_tool_output_tokens");
-        ctx.error(
-            &format!("{path}.maximum_tool_output_tokens"),
-            ErrorKind::InvalidValue,
-            format!(
-                "'maximum_tool_output_tokens' is only supported for the \
-                 'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
-                 setting, or switch to one of those agents."
-            ),
-            line,
-        );
+    for agent in names
+        .iter()
+        .copied()
+        .filter(|a| crate::schema::RESERVED_AGENT_NAMES.contains(a))
+    {
+        if !crate::schema::agent_supports_maximum_tool_output_tokens(agent) {
+            let line = ctx.key_line(header, "maximum_tool_output_tokens");
+            ctx.error(
+                &format!("{path}.maximum_tool_output_tokens"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'maximum_tool_output_tokens' is only supported for the \
+                     'codex'/'pi'/'claude-code' agents right now, not '{agent}'. Remove this \
+                     setting, or switch to one of those agents."
+                ),
+                line,
+            );
+        }
     }
 }
 
@@ -1861,12 +1971,7 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
 
 // ── proof steps ─────────────────────────────────────────────────────────────
 
-fn validate_proof_array(
-    value: Option<&toml::Value>,
-    path: &str,
-    agent: Option<&str>,
-    ctx: &mut Ctx,
-) {
+fn validate_proof_array(value: Option<&toml::Value>, path: &str, agents: &[&str], ctx: &mut Ctx) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
@@ -1932,7 +2037,7 @@ fn validate_proof_array(
             None,
         );
         check_positive_number(ctx, table, "maximum_tool_output_tokens", &vpath, None);
-        check_maximum_tool_output_tokens(ctx, table, agent, &vpath, None);
+        check_maximum_tool_output_tokens(ctx, table, agents, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);
         check_type(ctx, table, "restart_on", Ty::StrArray, &vpath, None);
 
@@ -2993,6 +3098,129 @@ command = "cargo build"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\nsystem_prompt=123\n";
         let r = validate_toml(src);
         assert!(r.errors.iter().any(|e| e.kind == ErrorKind::WrongType));
+    }
+
+    #[test]
+    fn agent_candidate_list_is_valid() {
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "agent = [\n",
+            "    { agent = \"claude-code\", model = \"sonnet\" },\n",
+            "    { agent = \"codex\" },\n",
+            "]\n",
+        );
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn agent_candidate_list_cannot_be_empty() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent = []\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.path.ends_with(".agent")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn agent_candidate_missing_agent_key_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent = [{ model = \"sonnet\" }]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.path.contains("agent[0]")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn agent_candidate_unknown_key_rejected() {
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "agent = [{ agent = \"codex\", modle = \"gpt-5\" }]\n"
+        );
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey && e.path.contains("modle")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn agent_candidate_list_conflicts_with_sibling_model() {
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "model = \"sonnet\"\n",
+            "agent = [{ agent = \"codex\" }]\n"
+        );
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys && e.path.ends_with(".model")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn system_prompt_rejected_when_any_candidate_lacks_support() {
+        // codex supports system_prompt, ollama doesn't -- since either could
+        // win at submit time, the field must be rejected offline.
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "system_prompt=\"be terse\"\n",
+            "agent = [{ agent = \"codex\" }, { agent = \"ollama\" }]\n"
+        );
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn system_prompt_accepted_when_every_candidate_supports_it() {
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "system_prompt=\"be terse\"\n",
+            "agent = [{ agent = \"codex\" }, { agent = \"claude-code\" }]\n"
+        );
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn cell_candidate_list_inherits_from_task_level_gating() {
+        // task-level agent is a candidate list; the cell has no agent of its
+        // own but sets system_prompt, so it must inherit and check every
+        // task-level candidate.
+        let src = concat!(
+            "[[task]]\nname=\"t\"\n",
+            "agent = [{ agent = \"codex\" }, { agent = \"ollama\" }]\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\n",
+        );
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("ollama")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]
