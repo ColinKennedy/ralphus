@@ -47,17 +47,28 @@ export const DRAINING_PREVIEW = {
   cells_left: 1,
 };
 
+/** The default pool row `requestDrainTriagePool` reads (`proj`/`bug`, 7 pooled, threshold 3). */
+export const DRAINABLE_POOL = { project: "proj", triage_type: "bug", count: 7, threshold: 3 };
+
 /**
  * Builds the sandboxed preview/confirm pair: `previewPoolThreshold`,
- * `confirmPoolThreshold`, `cancelPoolThresholdPreview`, plus the pure
- * helpers (`triagePreviewKey`, `triageThresholdPreviewEffect`,
- * `triageThresholdConfirmLine`). Every fetch is stubbed to resolve
- * immediately; the first call records the request so the test can assert
- * URL, method, and body, then returns `previewJson` for the `/preview`
- * path and `confirmJson` for the confirm path.
- * @param {{previewJson?: object, confirmJson?: object}} [opts]
+ * `confirmPoolThreshold`, `cancelPoolThresholdPreview`, the RAL-449 manual
+ * drain trio (`requestDrainTriagePool`, `confirmDrainTriagePool`,
+ * `cancelDrainTriagePool`), plus the pure helpers (`triagePreviewKey`,
+ * `triageThresholdPreviewEffect`, `triageThresholdConfirmLine`,
+ * `triageDrainConfirmLine`). Every fetch is stubbed to resolve immediately;
+ * the first call records the request so the test can assert URL, method,
+ * and body, then returns `previewJson` for the `/preview` path,
+ * `drainJson` for the `/drain` path, and `confirmJson` for the threshold
+ * confirm path.
+ * @param {{previewJson?: object, confirmJson?: object, drainJson?: object, pools?: object[]}} [opts]
  */
-export function makeTriageConfirm({ previewJson = DRAINING_PREVIEW, confirmJson = { ok: true, reviews_created: 2, cells_drained: 6, cells_left: 1 } } = {}) {
+export function makeTriageConfirm({
+  previewJson = DRAINING_PREVIEW,
+  confirmJson = { ok: true, reviews_created: 2, cells_drained: 6, cells_left: 1 },
+  drainJson = { guardian_id: "guardian-1" },
+  pools = [DRAINABLE_POOL],
+} = {}) {
   const calls = {
     fetches: [],
     renderTriage: 0,
@@ -67,28 +78,42 @@ export function makeTriageConfirm({ previewJson = DRAINING_PREVIEW, confirmJson 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   const fetchImpl = (url, init) => {
     calls.fetches.push({ url, init });
-    const body = url.includes("/preview") ? previewJson : confirmJson;
+    const body = url.includes("/drain") ? drainJson : (url.includes("/preview") ? previewJson : confirmJson);
     return Promise.resolve({ ok: true, json: async () => body });
   };
   const responseError = async (_r, message) => { calls.responseError++; return message; };
-  const deps = { esc, fetch: fetchImpl, renderTriage: () => { calls.renderTriage++; }, pollTriage: async () => { calls.pollTriage++; }, responseError };
+  const deps = {
+    esc,
+    fetch: fetchImpl,
+    renderTriage: () => { calls.renderTriage++; },
+    pollTriage: async () => { calls.pollTriage++; },
+    responseError,
+    pools,
+  };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
     `const { esc, fetch, renderTriage, pollTriage, responseError } = deps;
      var triageError = "";
      var triageThresholdPreviews = {};
+     var triagePools = deps.pools;
+     var triageDrainConfirms = {};
      ${sliceRegion(REGIONS.preview)}
      ${sliceRegion(REGIONS.tabHandlers)}
      return {
        previewPoolThreshold,
        confirmPoolThreshold,
        cancelPoolThresholdPreview,
+       requestDrainTriagePool,
+       confirmDrainTriagePool,
+       cancelDrainTriagePool,
        triagePreviewKey,
        triageThresholdPreviewEffect,
        triageThresholdConfirmLine,
+       triageDrainConfirmLine,
        triageError: () => triageError,
        previews: () => triageThresholdPreviews,
+       drainConfirms: () => triageDrainConfirms,
      };`,
   );
   const api = factory(deps);

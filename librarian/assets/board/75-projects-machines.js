@@ -411,12 +411,13 @@ Work submitted against it will fail — fix the machine or deregister the provid
       function renderTriagePoolsSection() {
         const rows = triagePools.length
           ? triagePools.map((p) => triagePoolRowHtml(p)).join("")
-          : `<tr><td colspan="4" class="empty">No cells pooled and no thresholds configured yet.</td></tr>`;
+          : `<tr><td colspan="5" class="empty">No cells pooled and no thresholds configured yet.</td></tr>`;
         const table = `<table class="proj-table"><thead><tr>`
           + `<th data-tip="The project a pooled cell's owning task declared.">Project</th>`
           + `<th data-tip="The Triage type these pooled cells classified into, or were inline-declared as.">Type</th>`
           + `<th data-tip="Cells currently pooled for this (project, type) key, waiting for a count threshold or cron schedule to drain them into fresh review(s).">Pooled</th>`
           + `<th data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled; 'first to fire wins' against this key's schedules. Blank means no count-based trigger; only this key's schedules (if any) can drain it.">Threshold</th>`
+          + `<th data-tip="Force-create a review right now from every eligible candidate in this pool -- bypasses the count threshold above and needs no configured cron. Available whenever the pool holds at least one eligible candidate.">Action</th>`
           + `</tr></thead><tbody>${rows}</tbody></table>`;
         return `<div style="margin-bottom:24px">
             <div style="font-weight:600;margin-bottom:8px" data-tip="Current pool state (RAL-318): cells opted into Triage are pooled per (project, triage type) until a count threshold or cron schedule drains them into fresh review(s) -- a threshold fires in threshold-sized batches (one review per batch), a cron fires the whole pool of its exact key as one review, and neither ever crosses a project, subproject, or type boundary (RAL-421).\nTo configure a threshold before any cell has been pooled yet, use the ⋯ button on that project's row in the Projects tab instead.">Pools</div>
@@ -436,6 +437,11 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const thresholdVal = p.threshold === null || p.threshold === undefined ? "" : String(p.threshold);
         const preview = triageThresholdPreviews[triagePreviewKey(p.project, p.triage_type)];
         const confirmLine = preview ? triageThresholdConfirmLine(preview) : "";
+        const drainConfirm = triageDrainConfirms[triagePreviewKey(p.project, p.triage_type)];
+        const drainLine = drainConfirm ? triageDrainConfirmLine(drainConfirm) : "";
+        const drainButton = p.count > 0
+          ? `<button class="btn" style="padding:2px 8px;font-size:11px" data-click="requestDrainTriagePool" data-project="${esc(p.project)}" data-triage-type="${esc(p.triage_type)}" data-tip="Force-create a review right now from every eligible candidate in this pool, bypassing the count threshold and without needing a configured cron.">Drain now</button>`
+          : `<span style="color:var(--muted);font-size:11px">no eligible candidates</span>`;
         return `<tr>
             <td>${esc(p.project)}</td>
             <td><span class="proj-name">${esc(p.triage_type)}</span></td>
@@ -444,6 +450,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
               <input type="number" min="1" step="1" class="mono pool-threshold-input" value="${esc(thresholdVal)}" placeholder="none" style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px" data-tip="Draining this pool creates a review once it holds this many cells, in threshold-sized batches -- each full batch becomes its own review and a sub-threshold remainder stays pooled. Clear the field and press Preview to see what removing the count-based trigger would do." />
               <button class="btn" style="padding:2px 8px;font-size:11px" data-click="previewPoolThreshold" data-project="${esc(p.project)}" data-triage-type="${esc(p.triage_type)}" data-tip="Preview what confirming this threshold would drain (non-mutating: nothing is persisted, drained, or reviewed until you Confirm).">Preview</button>
             </div>${confirmLine}</td>
+            <td><div class="row" style="gap:4px">${drainButton}</div>${drainLine}</td>
           </tr>`;
       }
       // RALPHUS-TRIAGE-PREVIEW:BEGIN
@@ -563,6 +570,74 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function cancelPoolThresholdPreview(project, triageType) {
         delete triageThresholdPreviews[triagePreviewKey(project, triageType)];
+        renderTriage();
+      }
+      /**
+       * RAL-449: the inline Confirm/Cancel line shown under a pool row's
+       * "Drain now" button once it has been clicked. Unlike the threshold
+       * editor's preview, there is nothing to fetch first -- draining now
+       * always takes every currently eligible candidate, so the confirm
+       * line is built straight from the row's own already-known pool state.
+       * @param {TriagePoolDrainConfirm} confirm
+       * @returns {string}
+       */
+      function triageDrainConfirmLine(confirm) {
+        const thresholdText = confirm.threshold === null || confirm.threshold === undefined
+          ? "no threshold is configured"
+          : `the configured threshold of ${confirm.threshold}`;
+        return `<div class="row" style="gap:4px;margin:4px 0 0;max-width:440px" data-tip="Bypasses only this pool's count threshold -- every other review-creation invariant (Arbiter origin, project defaults, only completed cells) stays the same as an automatic drain, and no cron schedule is needed.">
+            <span style="color:var(--muted);font-size:11px">Create 1 review from ${confirm.count} candidate(s) now, bypassing ${thresholdText}.</span>
+            <button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="confirmDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="Create the review now.">Confirm & drain</button>
+            <button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="Discard; nothing was changed.">Cancel</button>
+          </div>`;
+      }
+      /**
+       * Shows the Confirm/Cancel line for a pool row's "Drain now" button
+       * (RAL-449), captured from the row's current pool state at click time.
+       * @param {MouseEvent} e
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {void}
+       */
+      function requestDrainTriagePool(e, project, triageType) {
+        const pool = triagePools.find((p) => p.project === project && p.triage_type === triageType);
+        if (!pool || pool.count <= 0) return;
+        triageDrainConfirms[triagePreviewKey(project, triageType)] = {
+          project, triage_type: triageType, count: pool.count, threshold: pool.threshold,
+        };
+        renderTriage();
+      }
+      /**
+       * Force-creates a review from every eligible candidate currently in
+       * this pool, bypassing its configured count threshold and without
+       * requiring a cron schedule (RAL-449).
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {Promise<void>}
+       */
+      async function confirmDrainTriagePool(project, triageType) {
+        const key = triagePreviewKey(project, triageType);
+        if (!triageDrainConfirms[key]) return;
+        try {
+          const r = await fetch("/api/triage/pools/drain", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project, triage_type: triageType }),
+          });
+          triageError = r.ok ? "" : await responseError(r, "drain failed");
+        } catch (err) { triageError = "daemon unreachable"; }
+        delete triageDrainConfirms[key];
+        await pollTriage();
+      }
+      /**
+       * Discards one Triage-tab row's pending "Drain now" confirmation
+       * without changing anything (RAL-449).
+       * @param {string} project
+       * @param {string} triageType
+       * @returns {void}
+       */
+      function cancelDrainTriagePool(project, triageType) {
+        delete triageDrainConfirms[triagePreviewKey(project, triageType)];
         renderTriage();
       }
       // RALPHUS-TRIAGE-TAB-HANDLERS:END
