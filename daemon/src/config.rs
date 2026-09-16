@@ -705,6 +705,62 @@ pub fn load_monorepo_config(start: &Path) -> MonorepoConfig {
         .unwrap_or_default()
 }
 
+/// Commit-trailer configuration (`[commits]` table, RAL-445): whether a
+/// Ralphus-managed project's commits automatically receive the
+/// `Co-authored-by: Ralphus <ralphus-bot@github.com>` trailer, injected by
+/// the `prepare-commit-msg` hook `crate::git_hooks::sync_coauthor_hook`
+/// installs. `None` means unset (so a lower layer can supply it); resolved
+/// callers use [`add_coauthor`](Self::add_coauthor), which falls back to
+/// `true` -- attribution is on by default, and a project opts out
+/// explicitly. Per-project scalars win over the global layer, same as
+/// [`ReviewConfig::skip_worktrees`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CommitConfig {
+    #[serde(default)]
+    pub add_coauthor: Option<bool>,
+}
+
+impl CommitConfig {
+    /// Whether the Ralphus co-author trailer hook should be installed for
+    /// this project (unset resolves to `true`).
+    #[must_use]
+    pub fn add_coauthor(&self) -> bool {
+        self.add_coauthor.unwrap_or(true)
+    }
+}
+
+/// Parse a `CommitConfig` from the given TOML text; the default (enabled)
+/// when the `[commits]` table is absent.
+#[must_use]
+pub fn commit_config_from_toml_str(s: &str) -> CommitConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .commits
+        .unwrap_or_default()
+}
+
+/// Load the effective commit-trailer config for the project reached by
+/// walking up from `start` to the nearest `.ralphus.toml`, layered under the
+/// global config file (per-project scalar wins) -- same layering as
+/// [`load_thrash_config`]/[`load_live_view_config`], but taking an explicit
+/// `start` path (mirroring [`load_monorepo_config`]) rather than
+/// `std::env::current_dir()`: hook installation always has a specific
+/// project root already in hand rather than running from within it.
+#[must_use]
+pub fn load_commit_config(start: &Path) -> CommitConfig {
+    let global = global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| commit_config_from_toml_str(&s))
+        .unwrap_or_default();
+    let local = find_project_config(start)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| commit_config_from_toml_str(&s))
+        .unwrap_or_default();
+    CommitConfig {
+        add_coauthor: local.add_coauthor.or(global.add_coauthor),
+    }
+}
+
 /// Parse an `ArbiterConfig` from the given TOML text; the default (`ollama`,
 /// no model override, unbounded budget) when the `[arbiter]` table is absent.
 #[must_use]
@@ -1752,6 +1808,8 @@ struct ConfigFile {
     #[serde(default)]
     monorepo: Option<MonorepoConfig>,
     #[serde(default)]
+    commits: Option<CommitConfig>,
+    #[serde(default)]
     review: Option<ReviewConfig>,
     #[serde(default)]
     defaults: Option<ReviewConfig>,
@@ -2568,6 +2626,62 @@ mod tests {
     fn monorepo_config_empty_subprojects_list_is_not_a_monorepo() {
         let c = monorepo_from_toml_str("[monorepo]\nsubprojects = []\n");
         assert!(!c.is_monorepo());
+    }
+
+    // ── commits (RAL-445) ──────────────────────────────────────────────────
+
+    #[test]
+    fn commit_config_defaults_to_enabled_when_unset() {
+        assert!(CommitConfig::default().add_coauthor());
+        assert!(commit_config_from_toml_str("").add_coauthor());
+    }
+
+    #[test]
+    fn commit_config_absent_table_is_default() {
+        assert_eq!(
+            commit_config_from_toml_str("[arbiter]\nagent = \"claude\"\n"),
+            CommitConfig::default()
+        );
+    }
+
+    #[test]
+    fn commit_config_explicit_false_disables() {
+        let c = commit_config_from_toml_str("[commits]\nadd_coauthor = false\n");
+        assert!(!c.add_coauthor());
+    }
+
+    #[test]
+    fn commit_config_explicit_true_stays_enabled() {
+        let c = commit_config_from_toml_str("[commits]\nadd_coauthor = true\n");
+        assert!(c.add_coauthor());
+    }
+
+    #[test]
+    fn commit_config_project_wins_over_global() {
+        let global = commit_config_from_toml_str("[commits]\nadd_coauthor = false\n");
+        let local = commit_config_from_toml_str("[commits]\nadd_coauthor = true\n");
+        let effective = CommitConfig {
+            add_coauthor: local.add_coauthor.or(global.add_coauthor),
+        };
+        assert!(effective.add_coauthor());
+    }
+
+    #[test]
+    fn load_commit_config_reads_per_project_override() {
+        let base = std::env::temp_dir().join(format!("ralphus-cfg-commits-{}", std::process::id()));
+        let nested = base.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            base.join(".ralphus.toml"),
+            "[commits]\nadd_coauthor = false\n",
+        )
+        .unwrap();
+
+        let loaded = load_commit_config(&nested);
+        assert_eq!(loaded.add_coauthor, Some(false));
+        assert!(!loaded.add_coauthor());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── summary_format (RAL-124) ──────────────────────────────────────────
