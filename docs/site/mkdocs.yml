@@ -17,6 +17,7 @@ nav:
       - Projects: views/projects.md
       - Machines: views/machines.md
       - Triage: views/triage.md
+      - Presets: views/presets.md
       - Users: views/users.md
       - Secrets: views/secrets.md
       - Worktree retirement: views/worktree-retirement.md

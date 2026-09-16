@@ -79,7 +79,7 @@
             <td>${cell(p.maximum_context)}</td>
             <td>${cell(p.auto_compact_threshold)}</td>
             <td>${cell(p.maximum_tool_output_tokens)}</td>
-            <td><button class="btn" data-click="removePreset" data-name="${esc(p.name)}" data-tip="Deregister this preset.\nA squad already submitted before removal keeps whatever values were already stamped into it -- only a future submission's &quot;extends&quot; referencing this name is affected. This cannot be undone.">Remove</button></td>
+            <td style="white-space:nowrap"><button class="btn" data-click="removePreset" data-name="${esc(p.name)}" data-tip="Deregister this preset.\nA squad already submitted before removal keeps whatever values were already stamped into it -- only a future submission's &quot;extends&quot; referencing this name is affected. This cannot be undone.">Remove</button></td>
           </tr>`;
       }
       /**
