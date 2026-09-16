@@ -11,7 +11,10 @@ concurrency:
 # RAL-260: python runs as a 3.11/3.12/3.13 + floating "3" matrix; rust runs its
 # full suite on linux+windows plus a pinned 1.86 MSRV build-only leg. RAL-398
 # adds a macOS leg -- experimental, so build-only rather than the full suite
-# (see "Platform support" in README.md and docs/dependencies.md).
+# (see "Platform support" in README.md and docs/dependencies.md). RAL-441
+# adds a debug x release build matrix across all three OSes (see the
+# `release-builds` job below) so release artifacts get the same early
+# validation as development builds.
 
 jobs:
   rust:
@@ -83,6 +86,53 @@ jobs:
       - name: Build (macOS smoke test)
         if: matrix.suite == 'macos-min'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
+
+  release-builds:
+    name: Build (${{ matrix.os }}, ${{ matrix.config }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Debug then release, per OS (RAL-441): a plain `cargo build` proves
+        # the workspace still builds in the profile developers iterate in
+        # day to day, while the release leg runs the same packaging scripts
+        # used to cut a real release (scripts/build-release.sh on
+        # linux/macOS, scripts/build-release.cmd on Windows), so ship-ready
+        # bundling -- not just compilation -- gets covered on every OS. The
+        # Windows release leg also exercises the vendored psmux submodule
+        # build that scripts/build-release.cmd performs by default.
+        include:
+          - os: ubuntu-latest
+            config: debug
+          - os: ubuntu-latest
+            config: release
+          - os: windows-latest
+            config: debug
+          - os: windows-latest
+            config: release
+          - os: macos-latest
+            config: debug
+          - os: macos-latest
+            config: release
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Only the Windows release leg needs vendor/psmux checked out --
+          # scripts/build-release.cmd builds it by default (RAL-347).
+          submodules: ${{ matrix.os == 'windows-latest' && matrix.config == 'release' }}
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Debug build
+        if: matrix.config == 'debug'
+        run: cargo build --workspace --all-targets
+      - name: Release build (scripts/build-release.sh)
+        if: matrix.config == 'release' && matrix.os != 'windows-latest'
+        run: bash scripts/build-release.sh
+      - name: Release build (scripts\build-release.cmd)
+        if: matrix.config == 'release' && matrix.os == 'windows-latest'
+        shell: cmd
+        run: scripts\build-release.cmd
 
   psmux-integration:
     name: Windows psmux integration
