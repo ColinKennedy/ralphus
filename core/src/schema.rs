@@ -2136,6 +2136,34 @@ mod tests {
     }
 
     #[test]
+    fn preset_sentinel_matches_wrapped_name() {
+        assert_eq!(
+            parse_preset_sentinel("<<ralphus:presets/commit_and_push>>"),
+            Some("commit_and_push")
+        );
+    }
+
+    #[test]
+    fn preset_sentinel_trims_whitespace_around_name() {
+        assert_eq!(
+            parse_preset_sentinel("<<ralphus:presets/ commit_and_push >>"),
+            Some("commit_and_push")
+        );
+    }
+
+    #[test]
+    fn preset_sentinel_none_for_bare_or_malformed() {
+        assert_eq!(
+            parse_preset_sentinel("ralphus:presets/commit_and_push"),
+            None
+        );
+        assert_eq!(parse_preset_sentinel("<<ralphus:presets/>>"), None);
+        assert_eq!(parse_preset_sentinel("<<review:backend>>"), None);
+        assert_eq!(parse_preset_sentinel("<<unknown>>"), None);
+        assert_eq!(parse_preset_sentinel(""), None);
+    }
+
+    #[test]
     fn worktree_placeholder_parses() {
         assert_eq!(
             parse_worktree_placeholder("ralphus:new-worktree/RAL-100-feature"),
