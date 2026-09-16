@@ -3054,6 +3054,21 @@ impl Store {
 
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
+            // By this point every `agent` candidate list has already been
+            // walked and collapsed to a literal (see
+            // `agent_profiles::resolve_agent_candidate_lists`, called before
+            // `insert_squad`/`insert_squad_with_id`) -- same invariant
+            // `ResolvedAgent::resolve`/`from_task` rely on a few lines below.
+            let task_agent_str = match &task.agent {
+                Some(ralphus_core::schema::AgentSpec::Single(s)) => Some(s.clone()),
+                Some(ralphus_core::schema::AgentSpec::Candidates(_)) => panic!(
+                    "insert_squad_with_id: task \"{}\" still has an unresolved agent \
+                     candidate list -- the caller must walk it first via \
+                     agent_profiles::resolve_agent_candidate_lists",
+                    task.name
+                ),
+                None => None,
+            };
             tx.execute(
                 "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![
@@ -3061,7 +3076,7 @@ impl Store {
                     t_idx_i,
                     task.name,
                     task.project,
-                    task.agent,
+                    task_agent_str,
                     task.model,
                     NodeState::Pending.as_str(),
                     to_json(&task.depends_on),

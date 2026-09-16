@@ -4628,6 +4628,25 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
             profile_errors,
         );
     }
+    // RAL-4xx: an `agent` candidate list is resolved to its first available
+    // entry exactly once, here, before persistence -- every candidate name
+    // was already confirmed to exist by the profile check just above, so a
+    // failure here only means "none of them are available on this machine."
+    // Runs before `apply_profile_model_defaults` so a winning candidate with
+    // no `model` of its own still gets that same profile-default backfill.
+    let candidate_list_errors = crate::agent_profiles::resolve_agent_candidate_lists(
+        &daemon.lock(),
+        &mut file,
+        &crate::runner::SubprocessRunner::from_env(),
+    );
+    if !candidate_list_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            candidate_list_errors,
+        );
+    }
     crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
 
     // RAL-318: an inline `triage_type` must name a registered Triage type --

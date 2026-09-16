@@ -317,121 +317,162 @@ fn validate_task_file_profiles_with(
     let mut errors = Vec::new();
     for (task_idx, task) in file.task.iter().enumerate() {
         for (cell_idx, cell) in task.cell.iter().enumerate() {
-            let agent = cell
+            // `agent` may be a literal name or a candidate list (RAL-4xx) --
+            // every named candidate must resolve to a real builtin/profile,
+            // even though only one of them will actually be picked at
+            // submit time (`Store::insert_squad_with_id`'s availability
+            // walk). This just catches typos/unknown names up front.
+            let spec = cell
                 .agent
-                .as_deref()
-                .or(task.agent.as_deref())
-                .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
+                .clone()
+                .or_else(|| task.agent.clone())
+                .unwrap_or_else(|| {
+                    ralphus_core::schema::AgentSpec::Single(
+                        ralphus_core::schema::DEFAULT_AGENT.to_string(),
+                    )
+                });
+            let names = spec.names();
             let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
-            let selection = match resolve_agent_for_path_with(agent, &cwd, configuration_path_env) {
-                Ok(s) => s,
-                Err(message) => {
+            let mut selections = Vec::with_capacity(names.len());
+            let mut resolution_failed = false;
+            for (candidate_idx, name) in names.iter().enumerate() {
+                match resolve_agent_for_path_with(name, &cwd, configuration_path_env) {
+                    Ok(s) => selections.push(s),
+                    Err(message) => {
+                        let path = if names.len() > 1 {
+                            format!("task[{task_idx}].cell[{cell_idx}].agent[{candidate_idx}]")
+                        } else {
+                            format!("task[{task_idx}].cell[{cell_idx}].agent")
+                        };
+                        errors.push(ValidationError {
+                            path,
+                            kind: ErrorKind::InvalidValue,
+                            message,
+                            line: None,
+                        });
+                        resolution_failed = true;
+                        break;
+                    }
+                }
+            }
+            if resolution_failed {
+                continue;
+            }
+
+            // Capability gating, run against every resolved candidate: since
+            // which one wins isn't known until submit-time availability
+            // resolution, a field is only allowed if it would be valid no
+            // matter which candidate is picked (mirrors `core::validate`'s
+            // "all must support" policy for the list form; a
+            // RESERVED_AGENT_NAMES agent is already rejected there, so this
+            // additionally covers a custom profile, whose backend `core`
+            // cannot see).
+            for (name, selection) in names.iter().zip(selections.iter()) {
+                // `core`'s offline validator only rejects system_prompt for
+                // agent names it recognizes itself (RESERVED_AGENT_NAMES) --
+                // it defers on any custom profile, since it can't see the
+                // profile's backend. Now that the profile is resolved, check
+                // its backend the same way.
+                if selection.custom_profile
+                    && (cell.system_prompt.is_some() || cell.system_prompt_position.is_some())
+                    && !ralphus_core::schema::agent_supports_system_prompt(&selection.backend)
+                {
+                    let key = if cell.system_prompt.is_some() {
+                        "system_prompt"
+                    } else {
+                        "system_prompt_position"
+                    };
                     errors.push(ValidationError {
-                        path: format!("task[{task_idx}].cell[{cell_idx}].agent"),
+                        path: format!("task[{task_idx}].cell[{cell_idx}].{key}"),
                         kind: ErrorKind::InvalidValue,
-                        message,
+                        message: format!(
+                            "agent profile \"{name}\" resolves to backend \"{}\", which does \
+                             not support system_prompt/system_prompt_position (only \
+                             claude-code, codex, and pi backends do)",
+                            selection.backend
+                        ),
                         line: None,
                     });
-                    continue;
                 }
-            };
-            // `core`'s offline validator only rejects system_prompt for agent
-            // names it recognizes itself (RESERVED_AGENT_NAMES) -- it defers on
-            // any custom profile, since it can't see the profile's backend. Now
-            // that the profile is resolved, check its backend the same way.
-            if selection.custom_profile
-                && (cell.system_prompt.is_some() || cell.system_prompt_position.is_some())
-                && !ralphus_core::schema::agent_supports_system_prompt(&selection.backend)
-            {
-                let key = if cell.system_prompt.is_some() {
-                    "system_prompt"
-                } else {
-                    "system_prompt_position"
-                };
-                errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].{key}"),
-                    kind: ErrorKind::InvalidValue,
-                    message: format!(
-                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support system_prompt/system_prompt_position (only claude-code, \
-                         codex, and pi backends do)",
-                        selection.backend
-                    ),
-                    line: None,
-                });
-            }
-            // RAL-304: same deferral shape as system_prompt above -- `core`
-            // can't classify a custom profile's backend itself, so it only
-            // rejects `maximum_context`/`auto_compact_threshold` for a
-            // RESERVED_AGENT_NAMES agent; check the resolved backend here.
-            // Either field cascades from the task, so both are checked at
-            // their effective (cell-or-task) value, not just the cell's own.
-            // The two fields are checked independently, not as a pair --
-            // claude-code accepts auto_compact_threshold but not
-            // maximum_context (see `agent_supports_auto_compact_threshold`'s
-            // doc comment for why).
-            let has_maximum_context =
-                cell.maximum_context.is_some() || task.maximum_context.is_some();
-            let has_auto_compact_threshold =
-                cell.auto_compact_threshold.is_some() || task.auto_compact_threshold.is_some();
-            if selection.custom_profile
-                && has_maximum_context
-                && !ralphus_core::schema::agent_supports_maximum_context(&selection.backend)
-            {
-                errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].maximum_context"),
-                    kind: ErrorKind::InvalidValue,
-                    message: format!(
-                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support maximum_context (only codex and pi backends do)",
-                        selection.backend
-                    ),
-                    line: None,
-                });
-            }
-            if selection.custom_profile
-                && has_auto_compact_threshold
-                && !ralphus_core::schema::agent_supports_auto_compact_threshold(&selection.backend)
-            {
-                errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].auto_compact_threshold"),
-                    kind: ErrorKind::InvalidValue,
-                    message: format!(
-                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support auto_compact_threshold (only codex, pi, and claude-code \
-                         backends do)",
-                        selection.backend
-                    ),
-                    line: None,
-                });
-            }
-            // RAL-333: same deferral shape as maximum_context/
-            // auto_compact_threshold above -- `core` can't classify a custom
-            // profile's backend itself, so it only rejects
-            // `maximum_tool_output_tokens` for a RESERVED_AGENT_NAMES agent;
-            // check the resolved backend here. Cascades from the task, so
-            // it's checked at its effective (cell-or-task) value.
-            let has_maximum_tool_output_tokens = cell.maximum_tool_output_tokens.is_some()
-                || task.maximum_tool_output_tokens.is_some();
-            if selection.custom_profile
-                && has_maximum_tool_output_tokens
-                && !ralphus_core::schema::agent_supports_maximum_tool_output_tokens(
-                    &selection.backend,
-                )
-            {
-                errors.push(ValidationError {
-                    path: format!("task[{task_idx}].cell[{cell_idx}].maximum_tool_output_tokens"),
-                    kind: ErrorKind::InvalidValue,
-                    message: format!(
-                        "agent profile \"{agent}\" resolves to backend \"{}\", which does not \
-                         support maximum_tool_output_tokens (only codex, pi, and claude-code \
-                         backends do)",
-                        selection.backend
-                    ),
-                    line: None,
-                });
+                // RAL-304: same deferral shape as system_prompt above --
+                // `core` can't classify a custom profile's backend itself,
+                // so it only rejects `maximum_context`/`auto_compact_threshold`
+                // for a RESERVED_AGENT_NAMES agent; check the resolved
+                // backend here. Either field cascades from the task, so both
+                // are checked at their effective (cell-or-task) value, not
+                // just the cell's own. The two fields are checked
+                // independently, not as a pair -- claude-code accepts
+                // auto_compact_threshold but not maximum_context (see
+                // `agent_supports_auto_compact_threshold`'s doc comment for
+                // why).
+                let has_maximum_context =
+                    cell.maximum_context.is_some() || task.maximum_context.is_some();
+                let has_auto_compact_threshold =
+                    cell.auto_compact_threshold.is_some() || task.auto_compact_threshold.is_some();
+                if selection.custom_profile
+                    && has_maximum_context
+                    && !ralphus_core::schema::agent_supports_maximum_context(&selection.backend)
+                {
+                    errors.push(ValidationError {
+                        path: format!("task[{task_idx}].cell[{cell_idx}].maximum_context"),
+                        kind: ErrorKind::InvalidValue,
+                        message: format!(
+                            "agent profile \"{name}\" resolves to backend \"{}\", which does \
+                             not support maximum_context (only codex and pi backends do)",
+                            selection.backend
+                        ),
+                        line: None,
+                    });
+                }
+                if selection.custom_profile
+                    && has_auto_compact_threshold
+                    && !ralphus_core::schema::agent_supports_auto_compact_threshold(
+                        &selection.backend,
+                    )
+                {
+                    errors.push(ValidationError {
+                        path: format!("task[{task_idx}].cell[{cell_idx}].auto_compact_threshold"),
+                        kind: ErrorKind::InvalidValue,
+                        message: format!(
+                            "agent profile \"{name}\" resolves to backend \"{}\", which does \
+                             not support auto_compact_threshold (only codex, pi, and \
+                             claude-code backends do)",
+                            selection.backend
+                        ),
+                        line: None,
+                    });
+                }
+                // RAL-333: same deferral shape as maximum_context/
+                // auto_compact_threshold above -- `core` can't classify a
+                // custom profile's backend itself, so it only rejects
+                // `maximum_tool_output_tokens` for a RESERVED_AGENT_NAMES
+                // agent; check the resolved backend here. Cascades from the
+                // task, so it's checked at its effective (cell-or-task)
+                // value.
+                let has_maximum_tool_output_tokens = cell.maximum_tool_output_tokens.is_some()
+                    || task.maximum_tool_output_tokens.is_some();
+                if selection.custom_profile
+                    && has_maximum_tool_output_tokens
+                    && !ralphus_core::schema::agent_supports_maximum_tool_output_tokens(
+                        &selection.backend,
+                    )
+                {
+                    errors.push(ValidationError {
+                        path: format!(
+                            "task[{task_idx}].cell[{cell_idx}].maximum_tool_output_tokens"
+                        ),
+                        kind: ErrorKind::InvalidValue,
+                        message: format!(
+                            "agent profile \"{name}\" resolves to backend \"{}\", which does \
+                             not support maximum_tool_output_tokens (only codex, pi, and \
+                             claude-code backends do)",
+                            selection.backend
+                        ),
+                        line: None,
+                    });
+                }
             }
         }
     }
@@ -491,11 +532,17 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
             if cell.model.is_some() || task.model.is_some() {
                 continue;
             }
-            let agent = cell
-                .agent
-                .as_deref()
-                .or(task.agent.as_deref())
-                .unwrap_or(ralphus_core::schema::DEFAULT_AGENT);
+            // A candidate list (RAL-4xx) carries its own per-entry model,
+            // and a list-form scope can't also set a sibling `model` (see
+            // `core::validate::check_agent_field`) -- so profile-default
+            // backfill only makes sense for a literal `agent`. Skip a
+            // candidate list entirely rather than guessing which entry's
+            // model to fill in.
+            let agent = match cell.agent.as_ref().or(task.agent.as_ref()) {
+                Some(ralphus_core::schema::AgentSpec::Single(s)) => s.as_str(),
+                Some(ralphus_core::schema::AgentSpec::Candidates(_)) => continue,
+                None => ralphus_core::schema::DEFAULT_AGENT,
+            };
             let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
@@ -528,6 +575,132 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
                 review.model = selection.model;
             }
         }
+    }
+}
+
+/// Cell/task cwd used to resolve an `agent` value that has no cell of its
+/// own to read a `cwd` from -- a cell-less task's own `agent` candidate
+/// list. Mirrors [`config_cwd_for_cell`]'s own project-path fallback, since
+/// there's no cell here to check for an inline `cwd` first. Only matters for
+/// resolving a *custom profile* candidate name (a builtin resolves
+/// regardless of cwd, see [`resolve_agent_for_path_with`]) -- falling back
+/// to the daemon's own working directory when even the project can't be
+/// resolved just means a profile-named candidate in that edge case won't be
+/// found, which is the correct outcome when there's no project to look one
+/// up in.
+fn task_level_cwd(store: &Store, task: &ralphus_core::schema::TaskDef) -> PathBuf {
+    task.cell
+        .first()
+        .and_then(|cell| config_cwd_for_cell(store, task.project.as_deref(), cell))
+        .or_else(|| {
+            task.project
+                .as_deref()
+                .and_then(|name| store.resolve_project(name).ok().flatten())
+                .map(|p| PathBuf::from(p.path))
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Walk every task/cell whose `agent` is a candidate list (RAL-4xx) and
+/// collapse it to the first available candidate, mutating `file` in place.
+/// Called once, at submit time, before persistence -- mirrors
+/// [`apply_profile_model_defaults`]'s mutate-before-`insert_squad` shape,
+/// and, like `TaskDef::machine` (RAL-185), is resolved exactly once so a
+/// restart never re-walks it: by the time `Store::insert_squad_with_id`
+/// runs, every `agent` field is guaranteed a literal (or absent).
+///
+/// "Available" is the same free preflight check the scheduler itself runs
+/// before dispatching a cell (`Runner::preflight_agent`, which spawns
+/// `ralphus-runner preflight`) -- not a live/billed reachability probe, so a
+/// bad API key or rejected model name still only surfaces once the picked
+/// candidate actually runs, same as it already does today for a literal
+/// `agent`. Only checked on the daemon's own host: resolution happens once,
+/// at submit time, before any worktree exists to know which remote machine
+/// (RAL-185) a cell will actually run on.
+///
+/// Every candidate name has already been confirmed to exist by
+/// [`validate_task_file_profiles`] (the caller runs that first and rejects
+/// the submission outright on any unknown name), so a resolution failure
+/// here is only ever "not installed/configured on this host," never a typo.
+///
+/// Takes `runner` rather than constructing a
+/// [`crate::runner::SubprocessRunner`] itself, mirroring
+/// `guardian_merge::preflight_resolver_agent`'s injected-`&dyn Runner` shape
+/// -- lets a test substitute a fake without spawning a real subprocess.
+pub fn resolve_agent_candidate_lists(
+    store: &Store,
+    file: &mut TaskFile,
+    runner: &dyn crate::runner::Runner,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for (task_idx, task) in file.task.iter_mut().enumerate() {
+        if let Some(ralphus_core::schema::AgentSpec::Candidates(candidates)) = &task.agent {
+            let cwd = task_level_cwd(store, task);
+            match pick_available_candidate(runner, candidates, &cwd) {
+                Some(winner) => {
+                    task.model = winner.model.clone();
+                    task.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
+                }
+                None => errors.push(no_candidate_available_error(
+                    format!("task[{task_idx}].agent"),
+                    candidates,
+                )),
+            }
+        }
+        for (cell_idx, cell) in task.cell.iter_mut().enumerate() {
+            let Some(ralphus_core::schema::AgentSpec::Candidates(candidates)) = &cell.agent else {
+                continue;
+            };
+            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
+                continue;
+            };
+            match pick_available_candidate(runner, candidates, &cwd) {
+                Some(winner) => {
+                    cell.model = winner.model.clone();
+                    cell.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
+                }
+                None => errors.push(no_candidate_available_error(
+                    format!("task[{task_idx}].cell[{cell_idx}].agent"),
+                    candidates,
+                )),
+            }
+        }
+    }
+    errors
+}
+
+/// First candidate (in list order) whose resolved backend passes the
+/// scheduler's own preflight check.
+fn pick_available_candidate(
+    runner: &dyn crate::runner::Runner,
+    candidates: &[ralphus_core::schema::AgentCandidate],
+    cwd: &Path,
+) -> Option<ralphus_core::schema::AgentCandidate> {
+    candidates
+        .iter()
+        .find(|c| {
+            resolve_agent_for_path(&c.agent, cwd).is_ok_and(|selection| {
+                runner
+                    .preflight_agent(&selection.backend, selection.executable.as_deref(), None)
+                    .is_ok()
+            })
+        })
+        .cloned()
+}
+
+fn no_candidate_available_error(
+    path: String,
+    candidates: &[ralphus_core::schema::AgentCandidate],
+) -> ValidationError {
+    let tried: Vec<&str> = candidates.iter().map(|c| c.agent.as_str()).collect();
+    ValidationError {
+        path,
+        kind: ErrorKind::InvalidValue,
+        message: format!(
+            "no candidate agent in this list is available on this machine (tried: {})",
+            tried.join(", ")
+        ),
+        line: None,
     }
 }
 
@@ -1201,6 +1374,211 @@ backend = "claude-code"
         assert!(
             errors.iter().all(|e| !e.path.starts_with("review[")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_when_any_candidate_in_a_list_lacks_system_prompt_support()
+     {
+        let project_root = tempdir("candidate-list-system-prompt-mixed");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-claude]
+backend = "claude-code"
+
+[agent.profiles.custom-ollama]
+backend = "ollama"
+"#,
+        )
+        .expect("write project config");
+        let cwd = project_root.to_string_lossy().replace('\\', "/");
+        let store = Store::open_in_memory().expect("open store");
+        let file: TaskFile = toml::from_str(&format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
+             system_prompt=\"be terse\"\n\
+             agent = [{{ agent = \"custom-claude\" }}, {{ agent = \"custom-ollama\" }}]\n"
+        ))
+        .expect("parse task file");
+
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("system_prompt") && e.message.contains("ollama")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_accepts_a_candidate_list_when_every_entry_supports_system_prompt()
+     {
+        let project_root = tempdir("candidate-list-system-prompt-all-ok");
+        fs::write(
+            project_root.join(".ralphus.toml"),
+            r#"
+[agent.profiles.custom-claude]
+backend = "claude-code"
+
+[agent.profiles.custom-codex]
+backend = "codex"
+"#,
+        )
+        .expect("write project config");
+        let cwd = project_root.to_string_lossy().replace('\\', "/");
+        let store = Store::open_in_memory().expect("open store");
+        let file: TaskFile = toml::from_str(&format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
+             system_prompt=\"be terse\"\n\
+             agent = [{{ agent = \"custom-claude\" }}, {{ agent = \"custom-codex\" }}]\n"
+        ))
+        .expect("parse task file");
+
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors.iter().all(|e| !e.path.contains("system_prompt")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_task_file_profiles_rejects_an_unknown_name_inside_a_candidate_list() {
+        let project_root = tempdir("candidate-list-unknown-name");
+        let cwd = project_root.to_string_lossy().replace('\\', "/");
+        let store = Store::open_in_memory().expect("open store");
+        let file: TaskFile = toml::from_str(&format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
+             agent = [{{ agent = \"codex\" }}, {{ agent = \"not-a-real-profile\" }}]\n"
+        ))
+        .expect("parse task file");
+
+        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.path.contains("agent[1]") && e.message.contains("not-a-real-profile")),
+            "{errors:?}"
+        );
+    }
+
+    /// Test-only [`crate::runner::Runner`] that reports a fixed set of agent
+    /// names as available, without spawning a real `ralphus-runner`
+    /// subprocess (mirrors `guardian_merge::preflight_resolver_agent`'s
+    /// injected-`&dyn Runner` seam).
+    struct FakeAvailabilityRunner {
+        available: Vec<&'static str>,
+    }
+
+    impl crate::runner::Runner for FakeAvailabilityRunner {
+        fn run(&self, _spec: &crate::runner::RunnerSpec) -> crate::runner::RunnerResult {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn preflight_agent(
+            &self,
+            agent: &str,
+            _executable: Option<&str>,
+            _machine: Option<&str>,
+        ) -> Result<(), String> {
+            if self.available.contains(&agent) {
+                Ok(())
+            } else {
+                Err(format!("{agent} is not available"))
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_agent_candidate_lists_picks_the_first_available_and_collapses_to_single() {
+        let store = Store::open_in_memory().expect("open store");
+        let mut file: TaskFile = toml::from_str(concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "agent = [\n",
+            "    { agent = \"claude-code\", model = \"opus\" },\n",
+            "    { agent = \"codex\", model = \"gpt-5\" },\n",
+            "]\n",
+        ))
+        .expect("parse task file");
+        let runner = FakeAvailabilityRunner {
+            available: vec!["codex"],
+        };
+
+        let errors = resolve_agent_candidate_lists(&store, &mut file, &runner);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            file.task[0].cell[0].agent,
+            Some(ralphus_core::schema::AgentSpec::Single("codex".to_string()))
+        );
+        assert_eq!(file.task[0].cell[0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn resolve_agent_candidate_lists_errors_naming_every_tried_candidate_when_none_are_available() {
+        let store = Store::open_in_memory().expect("open store");
+        let mut file: TaskFile = toml::from_str(concat!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "agent = [{ agent = \"claude-code\" }, { agent = \"codex\" }]\n",
+        ))
+        .expect("parse task file");
+        let runner = FakeAvailabilityRunner { available: vec![] };
+
+        let errors = resolve_agent_candidate_lists(&store, &mut file, &runner);
+
+        assert!(
+            errors.iter().any(|e| e.path.ends_with(".agent")
+                && e.message.contains("claude-code")
+                && e.message.contains("codex")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_candidate_lists_collapses_a_task_level_list_with_no_cell_override() {
+        let store = Store::open_in_memory().expect("open store");
+        let mut file: TaskFile = toml::from_str(concat!(
+            "[[task]]\nname=\"t\"\n",
+            "agent = [{ agent = \"claude-code\" }, { agent = \"codex\" }]\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+        ))
+        .expect("parse task file");
+        let runner = FakeAvailabilityRunner {
+            available: vec!["codex"],
+        };
+
+        let errors = resolve_agent_candidate_lists(&store, &mut file, &runner);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            file.task[0].agent,
+            Some(ralphus_core::schema::AgentSpec::Single("codex".to_string()))
+        );
+        // The cell has no `agent` of its own -- untouched, still inherits.
+        assert_eq!(file.task[0].cell[0].agent, None);
+    }
+
+    #[test]
+    fn resolve_agent_candidate_lists_leaves_a_literal_agent_completely_untouched() {
+        let store = Store::open_in_memory().expect("open store");
+        let mut file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n",
+        )
+        .expect("parse task file");
+        // No candidate would resolve -- proves a literal `agent` never goes
+        // through the availability walk at all.
+        let runner = FakeAvailabilityRunner { available: vec![] };
+
+        let errors = resolve_agent_candidate_lists(&store, &mut file, &runner);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            file.task[0].cell[0].agent,
+            Some(ralphus_core::schema::AgentSpec::Single(
+                "claude-code".to_string()
+            ))
         );
     }
 
