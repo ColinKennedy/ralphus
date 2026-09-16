@@ -166,6 +166,21 @@ pub struct TaskDef {
     /// its own [`CellDef::share_session`], which wins.
     #[serde(default)]
     pub share_session: Option<bool>,
+    /// Named presets (`daemon::presets`) to stamp field defaults from, each
+    /// written as a wrapped `<<ralphus:presets/<name>>>` sentinel (see
+    /// [`parse_preset_sentinel`]). At submit time, for each preset field
+    /// that applies to a task (`maximum_context`, `auto_compact_threshold`,
+    /// `maximum_tool_output_tokens` -- `system_prompt`/
+    /// `system_prompt_position` are cell-only and are silently skipped
+    /// here), the daemon fills that field only if this task left it unset;
+    /// when more than one named preset defines the same field, the last one
+    /// in this list wins. A field this task set explicitly is never
+    /// overridden. A task-level fill cascades to a cell exactly like any
+    /// other task-level value, via the existing `resolve_maximum_context`/
+    /// `resolve_auto_compact_threshold`/`resolve_cell_maximum_tool_output_tokens`
+    /// inheritance -- no separate mechanism needed.
+    #[serde(default)]
+    pub extends: Vec<String>,
     /// The agent cells.
     #[serde(default)]
     pub cell: Vec<CellDef>,
@@ -327,6 +342,17 @@ pub struct CellDef {
     /// named types' `(project, triage_type)` pools independently.
     #[serde(default, deserialize_with = "deserialize_triage_type")]
     pub triage_type: Option<Vec<String>>,
+    /// Named presets (`daemon::presets`) to stamp field defaults from, each
+    /// written as a wrapped `<<ralphus:presets/<name>>>` sentinel (see
+    /// [`parse_preset_sentinel`]). At submit time, for each of the 5
+    /// preset-eligible fields (`system_prompt`, `system_prompt_position`,
+    /// `maximum_context`, `auto_compact_threshold`,
+    /// `maximum_tool_output_tokens` -- all valid on a cell), the daemon
+    /// fills that field only if this cell left it unset; when more than one
+    /// named preset defines the same field, the last one in this list wins.
+    /// A field this cell set explicitly is never overridden.
+    #[serde(default)]
+    pub extends: Vec<String>,
 }
 
 /// Deserializes `triage_type` as either a bare TOML string (sugar for a
@@ -621,6 +647,28 @@ pub fn parse_cell_review_sentinel(review: &str) -> Option<&str> {
     }
     let inner = review.strip_prefix("<<")?.strip_suffix(">>")?;
     review_link_key(inner).is_some().then_some(inner)
+}
+
+/// Prefix for a preset reference within a wrapped `<<...>>` sentinel:
+/// `<<ralphus:presets/<name>>>` (see `extends` on [`TaskDef`], [`CellDef`],
+/// and [`ProofStep`]). The named preset is a daemon-registered bundle of
+/// field defaults (`daemon::presets`) stamped into any of the entity's own
+/// fields still unset at submit time -- `core` has no store access, so it
+/// can only check this sentinel's shape, never whether the name is actually
+/// registered.
+pub const PRESET_LINK_PREFIX: &str = "ralphus:presets/";
+
+/// Parse one `extends` list entry as a `<<ralphus:presets/<name>>>` sentinel.
+/// The value MUST be wrapped in `<<...>>` -- a bare, unwrapped string is
+/// rejected (see `core/src/validate.rs`'s `check_extends`), mirroring
+/// [`parse_cell_review_sentinel`]. Returns the preset name trimmed of
+/// surrounding whitespace, or `None` for a bare/unwrapped/malformed value or
+/// an empty name.
+#[must_use]
+pub fn parse_preset_sentinel(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("<<")?.strip_suffix(">>")?;
+    let name = inner.strip_prefix(PRESET_LINK_PREFIX)?.trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// The reserved `machine` value naming the daemon's own host. Also the
@@ -1108,6 +1156,19 @@ pub struct ProofStep {
     /// `POST /api/squads/{id}/tasks/{ti}/proof/{vi}/env`.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Named presets (`daemon::presets`) to stamp field defaults from, each
+    /// written as a wrapped `<<ralphus:presets/<name>>>` sentinel (see
+    /// [`parse_preset_sentinel`]). Of the 5 preset-eligible fields, only
+    /// `maximum_tool_output_tokens` exists on a proof step
+    /// (`system_prompt`/`system_prompt_position` are cell-only,
+    /// `maximum_context`/`auto_compact_threshold` don't exist on a proof
+    /// step at all) -- every other field a named preset defines is silently
+    /// skipped here. At submit time the daemon fills
+    /// `maximum_tool_output_tokens` only if this step left it unset; when
+    /// more than one named preset defines it, the last one in this list
+    /// wins. A value this step set explicitly is never overridden.
+    #[serde(default)]
+    pub extends: Vec<String>,
 }
 
 /// A task's or cell's `agent` value: either a literal name, used as-is with

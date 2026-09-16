@@ -35,6 +35,7 @@ pub mod monitor;
 pub mod otel;
 pub mod plan;
 pub mod pr;
+pub mod presets;
 pub mod procreg;
 pub mod project_forks;
 pub mod proof;
