@@ -3057,6 +3057,135 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     }
 }
 
+/// Verify that every consecutive pair of a stacked review's *published*
+/// branches still connects -- branch N's actual, freshly-fetched remote tip
+/// must be an ancestor of branch N+1's current content -- and restack forward
+/// from the first break found.
+///
+/// [`sync_open_pr_branches`] pushes each branch independently, only comparing
+/// that branch's own local commit against its own last-pushed SHA -- it never
+/// asks whether the *stack* still holds together. A restack that silently
+/// fails to re-publish one branch (its local ref never advanced, so
+/// `sync_open_pr_branches` saw "nothing changed" and skipped it, even though a
+/// later branch was built from a fresh replay of its content) leaves the
+/// stack broken even though every individual push "succeeded". This is the
+/// check that catches that: walk the stack closest-to-base first (the link
+/// from `base_branch` itself to position 0 is already covered by
+/// `rebuild_on_base_shift`, so this only needs to cover position-to-position
+/// links), and for every adjacent pair that both have an open PR, confirm the
+/// predecessor's live remote tip -- refetched here, never trusted from a
+/// cache, since the incident this guards against left the *local* ref stale
+/// too -- is reachable from the successor's current tip. The first break
+/// found is the true root cause (everything before it already checked out),
+/// so repairing restacks forward from exactly that position and re-publishes
+/// with `sync_open_pr_branches`.
+///
+/// A branch with no open PR yet has no remote ref to compare, so a pair
+/// missing either side's PR is skipped -- there's nothing published to be
+/// inconsistent with. Gated on `effective_auto_submit_pr_stack`: a review
+/// that opted out of PR auto-submission has nothing here to reconcile.
+/// Returns whether a repair restack ran.
+pub fn verify_and_repair_stack_ancestry(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+) -> bool {
+    let Ok(guardian) = store.lock().get_guardian(id) else {
+        return false;
+    };
+    if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        return false;
+    }
+    if !guardian.effective_auto_submit_pr_stack {
+        return false;
+    }
+    let root = PathBuf::from(&guardian.git_root);
+
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+    let open_pr_by_branch: HashMap<&str, &PullRequestView> = prs
+        .iter()
+        .filter(|p| p.state == "open")
+        .filter_map(|p| p.branch_id.as_deref().map(|bid| (bid, p)))
+        .collect();
+
+    let mut positions: Vec<&BranchView> = guardian.branches.iter().filter(|b| b.enabled).collect();
+    positions.sort_by_key(|b| b.position);
+
+    for i in 0..positions.len().saturating_sub(1) {
+        let pred = positions[i];
+        let succ = positions[i + 1];
+        let Some(pred_pr) = open_pr_by_branch.get(pred.id.as_str()).copied() else {
+            continue;
+        };
+        let Some(succ_pr) = open_pr_by_branch.get(succ.id.as_str()).copied() else {
+            continue;
+        };
+        let Ok(Some(pred_tip)) = fetch_remote_pr_tip(store, &pred_pr.id) else {
+            continue; // remote unreachable this pass -- try again next sweep
+        };
+        let Ok(Some(succ_tip)) = fetch_remote_pr_tip(store, &succ_pr.id) else {
+            continue;
+        };
+        if git(
+            &root,
+            &["merge-base", "--is-ancestor", &pred_tip, &succ_tip],
+        )
+        .is_ok()
+        {
+            continue; // this link holds
+        }
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} stack ancestry broken: position={} pr={} tip={pred_tip} is \
+             not an ancestor of position={} pr={} tip={succ_tip} -- restacking from position={}",
+            pred.position,
+            pred_pr.id,
+            succ.position,
+            succ_pr.id,
+            pred.position
+        );
+        {
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "stack ancestry broken; restacking downstream",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "predecessor_position": pred.position,
+                    "predecessor_pr": pred_pr.id,
+                    "predecessor_remote_tip": pred_tip,
+                    "successor_position": succ.position,
+                    "successor_pr": succ_pr.id,
+                    "successor_remote_tip": succ_tip,
+                }),
+                admin_only: false,
+            });
+        }
+        let repaired = guardian_merge::restack_stack_from(
+            store,
+            runner,
+            id,
+            pred.position,
+            "stack ancestry broken; restacking downstream",
+            &crate::cancel::CancelToken::never(),
+        );
+        if repaired {
+            sync_open_pr_branches(store, id);
+        }
+        return repaired;
+    }
+    false
+}
+
 /// Discover the branch order implied by each stacked PR's *live* base ref on
 /// the forge (RAL-273): reconstructs the chain by walking, from the
 /// guardian's own base branch, whichever open PR currently bases on it, then
@@ -6335,6 +6464,12 @@ pub fn pull_pr_commits(
             admin_only: false,
         });
     }
+    // This single-branch repair just re-published `branch_id`'s content without
+    // ever checking whether that broke the stack around it (the branch it was
+    // built on, or the branch built on it) -- close that window immediately
+    // rather than waiting for the next maintenance sweep, since this exact path
+    // is what produced the incident the check exists for.
+    verify_and_repair_stack_ancestry(store, runner, &pr.guardian_id);
     Ok(true)
 }
 
@@ -8622,6 +8757,307 @@ mod tests {
         assert_eq!(pr.last_pushed_sha.as_deref(), Some(new_local_sha.as_str()));
         let remote_sha = g(&remote_dir, &["rev-parse", "pr-y"]).trim().to_string();
         assert_eq!(remote_sha, new_local_sha);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// Build a 2-branch stack (`feature/a` -> `feature/b`) through the real
+    /// merge pipeline (mirrors `auto_fix_dispatch_folds_into_stack_and_restacks_downstream`
+    /// in `daemon/tests/guardian_merge.rs`), push both review branches to a
+    /// bare `origin` remote as `pr-a`/`pr-b`, and record a PR row + matching
+    /// `last_pushed_sha` for each. Returns everything a stack-ancestry test
+    /// needs to either leave consistent or deliberately break.
+    #[allow(clippy::type_complexity)]
+    fn ancestry_stack_fixture(
+        tag: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        crate::store_lock::StoreHandle,
+        String,
+        (String, String),
+        (String, String),
+        (String, String),
+    ) {
+        let root = tmp_dir(&format!("{tag}-root"));
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+
+        g(&root, &["checkout", "-b", "feature/a"]);
+        gwrite(&root, "a.txt", "from a\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add a"]);
+        g(&root, &["checkout", "main"]);
+        g(&root, &["checkout", "-b", "feature/b"]);
+        gwrite(&root, "b.txt", "from b\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add b"]);
+        g(&root, &["checkout", "main"]);
+
+        let remote_dir = tmp_dir(&format!("{tag}-remote"));
+        g(&remote_dir, &["init", "--bare"]);
+        g(
+            &root,
+            &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        );
+
+        let s = store();
+        let gid = s
+            .create_guardian("stack", "main", root.to_str().unwrap())
+            .unwrap();
+        s.add_guardian_branch(&gid, "feature/a").unwrap();
+        s.add_guardian_branch(&gid, "feature/b").unwrap();
+        s.set_guardian_auto_submit_pr_stack(&gid, Some(true))
+            .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
+        guardian_merge::run_merge(&store, &NoopRunner, &gid);
+
+        let view = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+        let bid_a = view.branches[0].id.clone();
+        let bid_b = view.branches[1].id.clone();
+        let rev_a = view.branches[0].review_branch.clone().unwrap();
+        let rev_b = view.branches[1].review_branch.clone().unwrap();
+        let wt_b = view.branches[1].worktree.clone().unwrap();
+
+        g(
+            &root,
+            &[
+                "push",
+                "origin",
+                &format!("{rev_a}:pr-a"),
+                &format!("{rev_b}:pr-b"),
+            ],
+        );
+        let sha_a = g(&root, &["rev-parse", &rev_a]).trim().to_string();
+        let sha_b = g(&root, &["rev-parse", &rev_b]).trim().to_string();
+
+        (
+            root,
+            remote_dir,
+            store,
+            gid,
+            (bid_a, bid_b),
+            (rev_a, wt_b),
+            (sha_a, sha_b),
+        )
+    }
+
+    /// The RAL-<pending> incident this check exists for: `feature/b` gets
+    /// rebuilt on top of a version of `feature/a` that is never published
+    /// anywhere -- `feature/a`'s own branch/PR (`pr-a`) is left completely
+    /// untouched, exactly as a restack that silently failed to re-publish the
+    /// branch it rebuilt would leave things. Both PR rows individually look
+    /// "in sync" (their `last_pushed_sha` matches their own remote), yet
+    /// what's published for b no longer descends from what's published for a.
+    #[test]
+    fn stack_ancestry_repair_detects_and_fixes_a_stale_middle_branch_push() {
+        let (root, remote_dir, store, gid, (bid_a, bid_b), (rev_a, wt_b), (sha_a, _sha_b)) =
+            ancestry_stack_fixture("ancestry-fix");
+
+        let pr_a = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_a),
+                "github",
+                "acme/w",
+                "pr-a",
+                "main",
+                "T",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let pr_b = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_b),
+                "github",
+                "acme/w",
+                "pr-b",
+                "main",
+                "T",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .update_pull_request_ex(
+                &pr_a,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&sha_a)),
+                None,
+            )
+            .unwrap();
+
+        // Fabricate the break: rebuild feature/b on a "ghost" copy of
+        // feature/a's content -- a sibling commit with the same diff but a
+        // different hash and no ancestry relationship to `sha_a` -- then push
+        // and record it as if it were a normal, successful sync. Mirrors the
+        // incident exactly: feature/a and pr-a are never touched, yet the
+        // published feature/b no longer descends from the published
+        // feature/a. Cherry-picking onto `main` (rather than branching from
+        // `rev_a`) is what makes it a sibling instead of a descendant.
+        g(&root, &["checkout", "-b", "a-ghost", "main"]);
+        g(&root, &["cherry-pick", &rev_a]);
+        g(&root, &["checkout", "main"]);
+        // No third `<branch>` arg -- `wt_b` is already checked out on
+        // feature/b, so this rebases HEAD in place and moves its own branch
+        // ref (a raw SHA there would instead detach HEAD, leaving feature/b
+        // untouched).
+        g(Path::new(&wt_b), &["rebase", "--onto", "a-ghost", &rev_a]);
+        let ghost_b = g(Path::new(&wt_b), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        g(
+            &root,
+            &["push", "--force", "origin", &format!("{ghost_b}:pr-b")],
+        );
+        store
+            .lock()
+            .update_pull_request_ex(
+                &pr_b,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&ghost_b)),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["merge-base", "--is-ancestor", &sha_a, &ghost_b])
+                .status()
+                .is_ok_and(|s| !s.success()),
+            "test setup didn't reproduce a broken stack"
+        );
+
+        let repaired = verify_and_repair_stack_ancestry(&store, &NoopRunner, &gid);
+        assert!(repaired, "the break should have been detected and repaired");
+
+        let remote_a = g(&remote_dir, &["rev-parse", "pr-a"]).trim().to_string();
+        assert_eq!(
+            remote_a, sha_a,
+            "branch a (the anchor) must be left untouched"
+        );
+        let remote_b = g(&remote_dir, &["rev-parse", "pr-b"]).trim().to_string();
+        assert_ne!(remote_b, ghost_b, "branch b must have been rebuilt");
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["merge-base", "--is-ancestor", &remote_a, &remote_b])
+                .status()
+                .is_ok_and(|s| s.success()),
+            "after repair, pr-a's tip must be an ancestor of pr-b's newly published tip"
+        );
+        let pr_b_after = store.lock().get_pull_request(&pr_b).unwrap();
+        assert_eq!(
+            pr_b_after.last_pushed_sha.as_deref(),
+            Some(remote_b.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn stack_ancestry_repair_is_a_noop_when_the_stack_is_consistent() {
+        let (root, remote_dir, store, gid, (bid_a, bid_b), _revs, (sha_a, sha_b)) =
+            ancestry_stack_fixture("ancestry-noop");
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_a),
+                "github",
+                "acme/w",
+                "pr-a",
+                "main",
+                "T",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_b),
+                "github",
+                "acme/w",
+                "pr-b",
+                "main",
+                "T",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+        // Both branches genuinely connect -- b was built on a by the same
+        // merge pass, and neither remote alias has moved since.
+
+        let repaired = verify_and_repair_stack_ancestry(&store, &NoopRunner, &gid);
+        assert!(!repaired, "a consistent stack must not trigger a restack");
+
+        let view = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(view.status, "in_review", "must not have moved the guardian");
+        let remote_a = g(&remote_dir, &["rev-parse", "pr-a"]).trim().to_string();
+        let remote_b = g(&remote_dir, &["rev-parse", "pr-b"]).trim().to_string();
+        assert_eq!(remote_a, sha_a);
+        assert_eq!(remote_b, sha_b);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn stack_ancestry_repair_skips_branches_without_an_open_pr() {
+        let (root, remote_dir, store, gid, (bid_a, _bid_b), _revs, _shas) =
+            ancestry_stack_fixture("ancestry-no-pr");
+        // Only branch a has been submitted as a PR; branch b hasn't been
+        // filed yet -- there's nothing published for it to be inconsistent
+        // with, so the pair must be skipped rather than treated as broken.
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_a),
+                "github",
+                "acme/w",
+                "pr-a",
+                "main",
+                "T",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+
+        let repaired = verify_and_repair_stack_ancestry(&store, &NoopRunner, &gid);
+        assert!(
+            !repaired,
+            "a branch with no open PR yet has nothing to compare"
+        );
+
+        let view = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(view.status, "in_review", "must not have moved the guardian");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
