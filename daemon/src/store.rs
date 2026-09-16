@@ -1979,18 +1979,16 @@ impl Store {
             }
         }
         if !presets_preexisting {
-            for (name, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens) in
-                crate::presets::DEFAULT_PRESETS
-            {
+            for seed in crate::presets::DEFAULT_PRESETS {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO presets(name, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms) VALUES(?,?,?,?,?,?,?)",
                     params![
-                        name,
-                        system_prompt,
-                        system_prompt_position,
-                        maximum_context.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-                        auto_compact_threshold.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
-                        maximum_tool_output_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        seed.name,
+                        seed.system_prompt,
+                        seed.system_prompt_position,
+                        seed.maximum_context.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        seed.auto_compact_threshold.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        seed.maximum_tool_output_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                         now_ms()
                     ],
                 )?;

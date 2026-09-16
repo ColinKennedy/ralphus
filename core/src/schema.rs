@@ -1485,6 +1485,7 @@ mod tests {
             environment: BTreeMap::new(),
             no_commit_required: false,
             share_session: None,
+            extends: vec![],
             cell: vec![],
             proof: vec![],
         }
@@ -1520,6 +1521,7 @@ mod tests {
             maximum_tool_output_tokens: None,
             triage: false,
             triage_type: None,
+            extends: vec![],
         }
     }
 

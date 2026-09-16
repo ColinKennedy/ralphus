@@ -49,58 +49,65 @@ pub struct PresetView {
 /// created (`Store::init_schema`, mirroring
 /// `crate::triage::DEFAULT_TRIAGE_TYPES`'s seeding pattern) -- never
 /// re-seeded afterward, so deregistering one of these is honored across
-/// every later restart. Columns: `(name, system_prompt,
-/// system_prompt_position, maximum_context, auto_compact_threshold,
-/// maximum_tool_output_tokens)`.
-pub const DEFAULT_PRESETS: &[(
-    &str,
-    Option<&str>,
-    Option<&str>,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-)] = &[
-    ("easy_task", None, None, Some(75_000), Some(51_000), Some(8_000)),
-    (
-        "medium_task",
-        None,
-        None,
-        Some(120_000),
-        Some(86_000),
-        Some(12_000),
-    ),
-    (
-        "complex_task",
-        None,
-        None,
-        Some(200_000),
-        Some(150_000),
-        Some(15_000),
-    ),
-    (
-        "no_git_commit",
-        Some(
+/// every later restart.
+pub struct PresetSeed {
+    pub name: &'static str,
+    pub system_prompt: Option<&'static str>,
+    pub system_prompt_position: Option<&'static str>,
+    pub maximum_context: Option<u64>,
+    pub auto_compact_threshold: Option<u64>,
+    pub maximum_tool_output_tokens: Option<u64>,
+}
+
+pub const DEFAULT_PRESETS: &[PresetSeed] = &[
+    PresetSeed {
+        name: "easy_task",
+        system_prompt: None,
+        system_prompt_position: None,
+        maximum_context: Some(75_000),
+        auto_compact_threshold: Some(51_000),
+        maximum_tool_output_tokens: Some(8_000),
+    },
+    PresetSeed {
+        name: "medium_task",
+        system_prompt: None,
+        system_prompt_position: None,
+        maximum_context: Some(120_000),
+        auto_compact_threshold: Some(86_000),
+        maximum_tool_output_tokens: Some(12_000),
+    },
+    PresetSeed {
+        name: "complex_task",
+        system_prompt: None,
+        system_prompt_position: None,
+        maximum_context: Some(200_000),
+        auto_compact_threshold: Some(150_000),
+        maximum_tool_output_tokens: Some(15_000),
+    },
+    PresetSeed {
+        name: "no_git_commit",
+        system_prompt: Some(
             "Do NOT commit and do NOT push under any circumstances. You are working in a \
              dedicated git worktree. You may run read-only git commands. Implement the ticket \
              completely, follow all applicable AGENTS.md instructions, run relevant formatters, \
              linters, and tests, and keep changes in this worktree.",
         ),
-        Some(ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND),
-        None,
-        None,
-        None,
-    ),
-    (
-        "commit_and_push",
-        Some(
+        system_prompt_position: Some(ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND),
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+    },
+    PresetSeed {
+        name: "commit_and_push",
+        system_prompt: Some(
             "Do NOT run formatters, linters, or tests. Just stage the intended source changes, \
              commit, and push.",
         ),
-        Some(ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND),
-        None,
-        None,
-        None,
-    ),
+        system_prompt_position: Some(ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND),
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+    },
 ];
 
 // ── Registry ─────────────────────────────────────────────────────────────
@@ -240,7 +247,11 @@ impl Store {
 /// their own occurrence. Mirrors `crate::triage::find_triage_type_line`'s
 /// same-shaped best-effort scan -- good enough for "roughly which line", not
 /// a byte-exact guarantee.
-fn find_preset_sentinel_line(raw_toml: &str, sentinel: &str, search_from_line: usize) -> Option<u32> {
+fn find_preset_sentinel_line(
+    raw_toml: &str,
+    sentinel: &str,
+    search_from_line: usize,
+) -> Option<u32> {
     let needle = format!("\"{sentinel}\"");
     for (i, line) in raw_toml.lines().enumerate().skip(search_from_line) {
         if line.contains(&needle) {
@@ -387,8 +398,7 @@ fn apply_to_task(task: &mut TaskDef, by_name: &PresetMap<'_>) {
         task.auto_compact_threshold = last_defined(&presets, |p| p.auto_compact_threshold);
     }
     if task.maximum_tool_output_tokens.is_none() {
-        task.maximum_tool_output_tokens =
-            last_defined(&presets, |p| p.maximum_tool_output_tokens);
+        task.maximum_tool_output_tokens = last_defined(&presets, |p| p.maximum_tool_output_tokens);
     }
     // `system_prompt`/`system_prompt_position` don't exist on `TaskDef` --
     // silently skipped, per this module's applicability rule.
@@ -412,8 +422,7 @@ fn apply_to_cell(cell: &mut CellDef, by_name: &PresetMap<'_>) {
         cell.auto_compact_threshold = last_defined(&presets, |p| p.auto_compact_threshold);
     }
     if cell.maximum_tool_output_tokens.is_none() {
-        cell.maximum_tool_output_tokens =
-            last_defined(&presets, |p| p.maximum_tool_output_tokens);
+        cell.maximum_tool_output_tokens = last_defined(&presets, |p| p.maximum_tool_output_tokens);
     }
 }
 
@@ -423,8 +432,7 @@ fn apply_to_proof(proof: &mut ProofStep, by_name: &PresetMap<'_>) {
         return;
     }
     if proof.maximum_tool_output_tokens.is_none() {
-        proof.maximum_tool_output_tokens =
-            last_defined(&presets, |p| p.maximum_tool_output_tokens);
+        proof.maximum_tool_output_tokens = last_defined(&presets, |p| p.maximum_tool_output_tokens);
     }
     // `system_prompt`/`system_prompt_position`/`maximum_context`/
     // `auto_compact_threshold` don't exist on `ProofStep` -- silently
@@ -483,16 +491,17 @@ mod tests {
     #[test]
     fn default_presets_are_seeded_on_a_fresh_store() {
         let s = store();
-        for (name, ..) in DEFAULT_PRESETS {
+        for seed in DEFAULT_PRESETS {
             assert!(
-                s.get_preset(name).unwrap().is_some(),
-                "{name:?} should be seeded by default"
+                s.get_preset(seed.name).unwrap().is_some(),
+                "{:?} should be seeded by default",
+                seed.name
             );
         }
         // Any preset, including a default one, is freely removable -- no
         // built-in-protection like `UNCLASSIFIED_TYPE`.
-        assert!(s.deregister_preset(DEFAULT_PRESETS[0].0).unwrap());
-        assert!(s.get_preset(DEFAULT_PRESETS[0].0).unwrap().is_none());
+        assert!(s.deregister_preset(DEFAULT_PRESETS[0].name).unwrap());
+        assert!(s.get_preset(DEFAULT_PRESETS[0].name).unwrap().is_none());
     }
 
     #[test]
@@ -516,7 +525,10 @@ mod tests {
             1,
             "re-registering must upsert, not duplicate"
         );
-        assert_eq!(s.get_preset("custom").unwrap().unwrap().maximum_context, Some(2));
+        assert_eq!(
+            s.get_preset("custom").unwrap().unwrap().maximum_context,
+            Some(2)
+        );
         assert!(s.deregister_preset("custom").unwrap());
         assert!(!s.deregister_preset("custom").unwrap());
     }
