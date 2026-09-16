@@ -1799,18 +1799,22 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // A guardian notice (`notice_kind`/`notice_message`/`notice_at_ms`) is
       // server-recorded, one-shot, purely informational state -- e.g. an
       // incoming GitHub/GitLab stack reorder interrupting a local reorder in
-      // flight, or a linked PR merging out-of-band while a rebase/feedback
-      // pass owned the review's worktrees (`pr_merged_mid_flight`, RAL-300;
-      // see `Store::set_guardian_notice`). There is no server-side "seen"
-      // tracking: each poll of `/api/guardians` re-sends whatever the last
-      // notice was, so the board itself remembers which `notice_at_ms` it
-      // already showed per guardian and only toasts once per new one.
+      // flight (`forge_drift_interrupted_local`; see `Store::set_guardian_notice`).
+      // There is no server-side "seen" tracking: each poll of `/api/guardians`
+      // re-sends whatever the last notice was, so the board itself remembers
+      // which `notice_at_ms` it already showed per guardian and only toasts
+      // once per new one. RAL-451: a linked PR merging out-of-band while a
+      // rebase/feedback pass owned the review's worktrees (`pr_merged_mid_flight`,
+      // RAL-300) used to go through this same mechanism, but repeated drops
+      // kept re-obstructing the board with no way to dismiss them -- it now
+      // goes through the dismissible mailbox widget instead (`82-mailbox.js`,
+      // `daemon/src/pr.rs`'s `settle_pr_merge_states`).
       // RALPHUS-GUARDIAN-NOTICE:BEGIN
       /**
        * Which of `list`'s guardian notices are newer than what `shown` last
-       * recorded for that guardian, as ready-to-display toast text (RAL-273;
-       * RAL-300 adds the `pr_merged_mid_flight` notice kind). Pure: does not
-       * touch the DOM or mutate `shown` -- the caller applies the result.
+       * recorded for that guardian, as ready-to-display toast text (RAL-273).
+       * Pure: does not touch the DOM or mutate `shown` -- the caller applies
+       * the result.
        * @param {GuardianView[]} list
        * @param {Map<string, number>} shown - guardian id -> last-shown notice_at_ms
        * @returns {{id: string, notice_at_ms: number, text: string}[]}
