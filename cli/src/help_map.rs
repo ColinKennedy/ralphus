@@ -35,7 +35,16 @@
 //! suffix (`--status [states]`), a boolean flag gets none, a repeatable flag
 //! gets `[value...]`, and a `--flag/--no-flag` tri-state (this crate's
 //! `take_tri_bool`, mirroring Python's `argparse.BooleanOptionalAction`) is
-//! rendered as one combined chip.
+//! rendered as one combined chip. A handful of chips are declared `[str]`
+//! here but rendered as `[uri]` or `[id]` by [`display_chip`], keyed by chip
+//! name rather than edited in place at every declaration site (RAL-376,
+//! RAL-431): `[uri]` for a chip whose command resolves it through
+//! `resolve_squad_selector`/`resolve_guardian_selector` (selector name/index
+//! forms and the RAL-188 URI form both work, see [`URI_ARGUMENT_NOTE`]);
+//! `[id]` for a chip that is an opaque identifier the daemon assigns and
+//! matches only by exact string equality -- never parsed, resolved, or
+//! accepted in URI form (see [`ID_ARGUMENT_NOTE`]). Everything else
+//! declared `[str]` is a plain, unconstrained string.
 //!
 //! `quick-start` is excluded from the AI-oriented generated map, mirroring
 //! Python's `_HIDDEN_COMMANDS`, but is present in the user-facing command
@@ -135,6 +144,9 @@ equivalent.";
 
 /// Syntax and examples for arguments displayed as `[uri]`.
 pub const URI_ARGUMENT_NOTE: &str = "`[uri]` arguments use the EntityUri grammar: `squad:<squad_id>` (e.g. `squad:squad-1`); `task:<squad_id>:<task_idx>` (e.g. `task:squad-1:2`); `cell:<squad_id>:<task_idx>:<cell_idx>` (e.g. `cell:squad-1:2:0`); `proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>` (e.g. `proof:squad-1:2:cell:0:1`; use `task` and `-1` for a task-scoped proof); and `guardian:<guardian_id>` (e.g. `guardian:g-1`) for a review. `selector` also accepts its documented name and index forms in addition to these URIs.";
+
+/// Syntax and examples for arguments displayed as `[id]` (RAL-431).
+pub const ID_ARGUMENT_NOTE: &str = "`[id]` arguments are opaque identifiers the daemon assigns when it creates an entity (e.g. `squad-000000000001`, `pr-000000000001`, `guardian-000000000001`) -- copy one verbatim from another command's output (e.g. `squad list`, `review pr list`). Unlike a `[uri]`/`selector` argument, a `[id]` value is matched by exact string equality only: it is never parsed, resolved against a name/index, or accepted in the RAL-188 URI form.";
 
 // ---- review subgroups (defined separately to keep REVIEW_CHILDREN readable) --
 
@@ -2040,10 +2052,12 @@ fn signature(n: &HelpNode) -> String {
 
 fn display_chip(chip: &str) -> String {
     let name = chip.split_whitespace().next().unwrap_or(chip);
-    if matches!(name, "selector" | "entity_uri" | "--entity" | "--for") {
-        chip.replacen("[str", "[uri", 1)
-    } else {
-        chip.to_string()
+    match name {
+        "selector" | "entity_uri" | "--entity" | "--for" | "cell" | "to_review" => {
+            chip.replacen("[str", "[uri", 1)
+        }
+        "squad_id" | "pr_id" | "--squad" | "--guardian" => chip.replacen("[str", "[id", 1),
+        _ => chip.to_string(),
     }
 }
 
@@ -2051,6 +2065,12 @@ fn has_uri_chip(chips: impl IntoIterator<Item = &'static str>) -> bool {
     chips
         .into_iter()
         .any(|chip| display_chip(chip).contains("[uri"))
+}
+
+fn has_id_chip(chips: impl IntoIterator<Item = &'static str>) -> bool {
+    chips
+        .into_iter()
+        .any(|chip| display_chip(chip).contains("[id"))
 }
 
 fn command_path(path: &[&str]) -> String {
@@ -2122,6 +2142,16 @@ pub fn command_help(path: &[&str]) -> Option<String> {
         out.push_str(URI_ARGUMENT_NOTE);
         out.push('\n');
     }
+    if has_id_chip(
+        node.positionals
+            .iter()
+            .copied()
+            .chain(node.options.iter().copied()),
+    ) {
+        out.push_str("\nID ARGUMENTS:\n    ");
+        out.push_str(ID_ARGUMENT_NOTE);
+        out.push('\n');
+    }
     if !node.children.is_empty() || path.is_empty() {
         let mut children: Vec<&HelpNode> = node.children.iter().collect();
         if path.is_empty() {
@@ -2190,12 +2220,12 @@ pub fn chip_description(chip: &str, option: bool) -> String {
         }
     } else {
         match name {
-            "selector" => {
+            "selector" | "cell" | "to_review" => {
                 format!("Entity selector or URI identifying the target, {SELECTOR_GRAMMAR}.")
             }
-            "squad_id" => {
-                "Squad identifier or accepted squad selector, e.g. squad-000000000001.".to_string()
-            }
+            "squad_id" => "Opaque squad identifier assigned by the daemon, e.g. \
+                squad-000000000001 -- not a selector or URI; see squad list/show to find one."
+                .to_string(),
             "entity_uri" => {
                 format!("Entity URI addressing any node uniformly: {ENTITY_URI_GRAMMAR}.")
             }
@@ -2390,7 +2420,7 @@ pub fn generate_read_only_safe() -> String {
 pub fn full_output() -> String {
     crate::program_name::substitute_backticked_invocations(&format!(
         "{SUBAGENT_NOTE}\n\n{READ_ONLY_NOTE}\n\n{PROJECT_LOOKUP_NOTE}\n\n{SUBMIT_VALIDATE_NOTE}\n\n\
-{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{URI_ARGUMENT_NOTE}\n\n{}",
+{SUBMIT_REVIEW_NOTE}\n\n{SUBMIT_RETRY_NOTE}\n\n{JSON_NOTE}\n\n{URI_ARGUMENT_NOTE}\n\n{ID_ARGUMENT_NOTE}\n\n{}",
         generate()
     ))
 }
@@ -2507,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn full_output_prints_all_eight_notes_before_the_tree() {
+    fn full_output_prints_all_nine_notes_before_the_tree() {
         let text = full_output();
         assert!(text.starts_with(SUBAGENT_NOTE));
         for note in [
@@ -2519,6 +2549,7 @@ mod tests {
             SUBMIT_RETRY_NOTE,
             JSON_NOTE,
             URI_ARGUMENT_NOTE,
+            ID_ARGUMENT_NOTE,
         ] {
             assert!(
                 text.contains(&crate::program_name::substitute_backticked_invocations(
@@ -2535,6 +2566,12 @@ mod tests {
         assert!(map.contains("- cell"));
         assert!(map.contains("        - edit selector [uri]"));
         assert!(map.contains("--entity [uri] --for [uri]"));
+        // RAL-431: `link-cell`'s `cell` and `move-branch`'s `to_review` both
+        // resolve through the same `resolve_squad_selector`/
+        // `resolve_guardian_selector` machinery as `selector`, so they get
+        // the same `[uri]` chip rather than staying mislabeled `[str]`.
+        assert!(map.contains("        - link-cell selector [uri] cell [uri]"));
+        assert!(map.contains("        - move-branch selector [uri] to_review [uri]"));
         for raw_uri_chip in [
             "selector [str]",
             "entity_uri [str]",
@@ -2546,6 +2583,12 @@ mod tests {
                 "URI argument still rendered as a string: {raw_uri_chip}"
             );
         }
+        // `cell [str]`/`to_review [str]` aren't checked as bare substrings
+        // above: `--cell [str]` (cartographer's unrelated exact-match filter
+        // option) contains "cell [str]" too. The positive assertions above
+        // (`link-cell selector [uri] cell [uri]` / `move-branch selector
+        // [uri] to_review [uri]`) already pin down that these two specific
+        // chips render as `[uri]`.
 
         let full = full_output();
         for example in [
@@ -2561,6 +2604,52 @@ mod tests {
         let command = command_help(&["task", "show"]).expect("task show help");
         assert!(command.contains("selector [uri]"));
         assert!(command.contains("URI ARGUMENTS:"));
+
+        let link_cell = command_help(&["review", "link-cell"]).expect("link-cell help");
+        assert!(link_cell.contains("cell [uri]"));
+        assert!(link_cell.contains("URI ARGUMENTS:"));
+        let move_branch = command_help(&["review", "move-branch"]).expect("move-branch help");
+        assert!(move_branch.contains("to_review [uri]"));
+        assert!(move_branch.contains("URI ARGUMENTS:"));
+    }
+
+    /// RAL-431: `squad_id`/`pr_id`/`--squad`/`--guardian` are opaque
+    /// identifiers the daemon assigns and matches by exact string equality
+    /// -- unlike `selector`/`entity_uri`, the CLI never resolves them
+    /// against a name, index, or RAL-188 URI (`cli/src/commands/squad.rs`,
+    /// `cli/src/commands/misc.rs`, `cli/src/commands/review.rs`'s
+    /// `ReviewPrCommand` dispatch all pass them straight through to the
+    /// daemon). So they get their own `[id]` chip, distinct from `[uri]`.
+    #[test]
+    fn rendered_id_arguments_use_id_chips_and_are_documented() {
+        let map = generate();
+        assert!(map.contains("        - (read-only-safe) show squad_id [id]"));
+        assert!(map.contains("            - (read-only-safe) show pr_id [id]"));
+        assert!(map.contains("--guardian [id]"));
+        assert!(map.contains("--squad [id]"));
+        for raw_id_chip in [
+            "squad_id [str]",
+            "pr_id [str]",
+            "--squad [str]",
+            "--guardian [str]",
+        ] {
+            assert!(
+                !map.contains(raw_id_chip),
+                "id argument still rendered as a string: {raw_id_chip}"
+            );
+        }
+
+        let full = full_output();
+        assert!(
+            full.contains(&crate::program_name::substitute_backticked_invocations(
+                ID_ARGUMENT_NOTE
+            ))
+        );
+
+        let command = command_help(&["squad", "show"]).expect("squad show help");
+        assert!(command.contains("squad_id [id]"));
+        assert!(command.contains("ID ARGUMENTS:"));
+        assert!(!command.contains("URI ARGUMENTS:"));
     }
 
     #[test]

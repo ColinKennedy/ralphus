@@ -264,6 +264,43 @@ mod tests {
         );
     }
 
+    /// RAL-431: `link-cell`'s `cell` argument resolves through the same
+    /// selector/URI machinery as `selector` (`resolve_squad_selector` in
+    /// `cli/src/commands/review.rs`), so its MCP schema description should
+    /// carry the same selector/URI grammar text as `selector`'s -- not the
+    /// generic "value using the type shown in usage" fallback a plain
+    /// string chip gets.
+    #[test]
+    fn link_cell_cell_argument_documents_selector_grammar() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.path == ["review", "link-cell"])
+            .expect("review link-cell tool");
+        let description = tool.input_schema["properties"]["cell"]["description"]
+            .as_str()
+            .expect("cell property has a description");
+        assert!(description.contains("selector"));
+        assert!(description.contains("ralphus:/SQUAD"));
+    }
+
+    /// RAL-431: `squad show`'s `squad_id` argument is an opaque identifier,
+    /// never resolved through the selector/URI machinery -- its MCP schema
+    /// description should say so rather than implying selector/URI support.
+    #[test]
+    fn squad_show_squad_id_argument_documents_opaque_identifier() {
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.path == ["squad", "show"])
+            .expect("squad show tool");
+        let description = tool.input_schema["properties"]["squad_id"]["description"]
+            .as_str()
+            .expect("squad_id property has a description");
+        assert!(description.contains("Opaque squad identifier"));
+        assert!(description.contains("not a selector or URI"));
+    }
+
     #[test]
     fn build_argv_reports_missing_required_argument() {
         let tools = all_tools();
