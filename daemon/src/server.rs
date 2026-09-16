@@ -4771,6 +4771,23 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
     }
     crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
 
+    // RAL-…: an `extends` entry must name a registered preset --
+    // `core::validate` only checked its shape, since `core` has no store
+    // access. Runs before `apply_presets` stamps field defaults into any of
+    // this file's tasks'/cells'/proof steps' own unset fields, so every
+    // stamp below is guaranteed to resolve a real preset.
+    let preset_errors =
+        crate::presets::validate_task_file_presets(&daemon.lock(), &req.toml, &file);
+    if !preset_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            preset_errors,
+        );
+    }
+    crate::presets::apply_presets(&daemon.lock(), &mut file);
+
     // RAL-318: an inline `triage_type` must name a registered Triage type --
     // `core::validate` only checked its structure (non-empty, requires
     // `triage = true`), since `core` has no store access.
