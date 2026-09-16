@@ -46,10 +46,16 @@ detailed usage and exit before doing any command work.
 ## Selectors
 
 Most `show`/action commands take a **selector** instead of raw ids/indices
-(`cli/src/selector.rs`). Anywhere this reference writes `<selector>`,
-`<squad_id>`, or a queue item path, the **ralphus URI** form below is accepted
-too — including the bare `squad_id` positionals of the `squad *` family, `status`,
-`graph`, and `queue set-status`/`reorder`/`set-position`.
+(`cli/src/selector.rs`). Anywhere this reference writes `<selector>`, the
+**ralphus URI** form below is accepted too — including inside a queue item
+path (`queue set-status`/`reorder`/`set-position`, which resolve a `ralphus:`
+URI client-side before routing).
+
+The bare `squad_id`/`pr_id`/`guardian_id` positionals below (the `squad *`
+family, `status`, `graph`, `retry`, `review pr *`) are **not** selectors or
+URIs: they're opaque ids the daemon assigns, matched only by exact string
+equality (RAL-431). Copy one from another command's output (e.g. `squad
+list`) rather than typing a selector or URI there.
 
 ### The ralphus URI scheme (RAL-188)
 
@@ -563,7 +569,7 @@ use; see `READ_ONLY_NOTE`.
 - ralphus --daemon-url [url] --json --version  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
-    - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [str] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [str] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
+    - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
         - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
@@ -583,7 +589,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
-    - (read-only-safe) graph squad_id [str, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
+    - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
@@ -628,7 +634,7 @@ use; see `READ_ONLY_NOTE`.
         - set-position paths [str...] --relative --to [integer]  {Move item(s) to an absolute index or a relative offset.}
         - set-status path [str] state [str]  {Set a squad/task/cell/proof status (e.g. ignored) by item path or squad id.}
     - (read-only-safe) resources  {Show per-task resource usage (CPU/RAM/GPU).}
-    - retry squad_id [str]  {Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
+    - retry squad_id [id]  {Re-run a squad from scratch (reset to pending). (Rust port: squad-level only; Python's per-selector --environment/--env-file overrides are not yet ported.)}
     - review (subagent)  {Inspect and act on reviews (guardians).}
         - action  {User-declared [[review.action]] test/action hints.}
             - (read-only-safe) list selector [uri]  {List the action hints.}
@@ -651,22 +657,22 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
-        - link-cell selector [uri] cell [str]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
+        - link-cell selector [uri] cell [uri]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
         - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
         - manual-checks-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
         - merge selector [uri]  {Start (or continue) the stacked rebase.}
-        - move-branch selector [uri] to_review [str]  {Move a branch to another review, then rebuild both.}
+        - move-branch selector [uri] to_review [uri]  {Move a branch to another review, then rebuild both.}
         - pr  {Submit/query pull requests for a review.}
-            - (read-only-safe) comments pr_id [str]  {List a PR's comments/notes.}
+            - (read-only-safe) comments pr_id [id]  {List a PR's comments/notes.}
             - (read-only-safe) find forge [github|gitlab] repo [str] pr_number [integer]  {Look up the ralphus PR row for a forge PR/MR number.}
             - (read-only-safe) list selector [uri]  {List PRs submitted for a review.}
-            - pull-feedback pr_id [str]  {Action a PR's un-actioned feedback into the owning review worktree.}
-            - pull-from-pr pr_id [str]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
-            - (read-only-safe) show pr_id [str]  {Show one PR row.}
+            - pull-feedback pr_id [id]  {Action a PR's un-actioned feedback into the owning review worktree.}
+            - pull-from-pr pr_id [id]  {Pull a reviewer's commits pushed directly to the PR branch back into the owning review worktree, resolving conflicts and restacking downstream branches (RAL-190).}
+            - (read-only-safe) show pr_id [id]  {Show one PR row.}
             - submit selector [uri] --alias [name] --allow-unlinked-fork --combined --description [text] --position [integer] --title [text] --use-worktree-branch-name  {Submit a PR/MR for one stacked branch or the combined worktree. --allow-unlinked-fork (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork.}
             - unlink selector [uri]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
-            - update pr_id [str] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
+            - update pr_id [id] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [uri] name [str]  {Rename a review.}
         - reopen selector [uri]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
@@ -685,20 +691,20 @@ use; see `READ_ONLY_NOTE`.
     - show  {Print machine-readable views of ralphus itself.}
         - (read-only-safe) help-map  {Print the full CLI command surface as an alphabetized, indented tree (for onboarding an AI agent).}
     - squad  {Inspect and act on squads.}
-        - activate squad_id [str]  {Promote a held (queued) squad to pending.}
-        - cancel squad_id [str]  {Cancel a squad.}
-        - delete squad_id [str] --yes  {Permanently delete a squad.}
-        - edit squad_id [str] --label [text]  {Edit a squad's fields.}
-        - (read-only-safe) env squad_id [str]  {List a squad's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
+        - activate squad_id [id]  {Promote a held (queued) squad to pending.}
+        - cancel squad_id [id]  {Cancel a squad.}
+        - delete squad_id [id] --yes  {Permanently delete a squad.}
+        - edit squad_id [id] --label [text]  {Edit a squad's fields.}
+        - (read-only-safe) env squad_id [id]  {List a squad's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - (read-only-safe) list --name [substring] --sort [date|name] --status [states]  {List squads.}
-        - (read-only-safe) logs squad_id [str]  {Show a squad's state-transition audit log.}
-        - rename squad_id [str] label [str]  {Rename a squad's label.}
-        - restart squad_id [str]  {Restart a whole squad, dirtying every squad that depends on it.}
-        - retry squad_id [str]  {Re-run with the same parameters (reset to pending).}
-        - set-status squad_id [str] state [str]  {Manually override a squad's status.}
-        - (read-only-safe) show squad_id [str]  {Show a single squad's detail.}
-        - timeline squad_id [str] --write [path]  {Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).}
-    - (read-only-safe) status squad_id [str, optional] --concurrency  {Show squad status from the daemon.}
+        - (read-only-safe) logs squad_id [id]  {Show a squad's state-transition audit log.}
+        - rename squad_id [id] label [str]  {Rename a squad's label.}
+        - restart squad_id [id]  {Restart a whole squad, dirtying every squad that depends on it.}
+        - retry squad_id [id]  {Re-run with the same parameters (reset to pending).}
+        - set-status squad_id [id] state [str]  {Manually override a squad's status.}
+        - (read-only-safe) show squad_id [id]  {Show a single squad's detail.}
+        - timeline squad_id [id] --write [path]  {Generate the merged, chronological uber-log-viewer timeline for a squad (RAL-155).}
+    - (read-only-safe) status squad_id [id, optional] --concurrency  {Show squad status from the daemon.}
     - submit file [str...] --activate --hold --label [text] --no-validate --wait (subagent)  {Submit one or more task TOML files to the daemon.}
     - task  {Task-authoring helpers and task-node inspection.}
         - edit selector [uri] --model [name] --name [name] --project [name]  {Edit a task node's name/project/model.}
