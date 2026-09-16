@@ -196,6 +196,7 @@
       CLICK_HANDLERS.checkMachine = (e, ds) => checkMachine(ds.scheme || "");
       CLICK_HANDLERS.removeMachine = (e, ds) => removeMachine(ds.scheme || "");
       CLICK_HANDLERS.removeTriageType = (e, ds) => removeTriageType(ds.name || "");
+      CLICK_HANDLERS.removePreset = (e, ds) => removePreset(ds.name || "");
       CLICK_HANDLERS.previewPoolThreshold = (e, ds) => previewPoolThreshold(e, ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.confirmPoolThreshold = (e, ds) => confirmPoolThreshold(ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.cancelPoolThresholdPreview = (e, ds) => cancelPoolThresholdPreview(ds.project || "", ds.triageType || "");

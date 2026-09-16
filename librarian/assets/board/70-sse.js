@@ -427,6 +427,7 @@
         else if (tab === "projects") { await pollProjects(); }
         else if (tab === "machines") { await pollMachines(); }
         else if (tab === "triage") { await pollTriage(); }
+        else if (tab === "presets") { await pollPresets(); }
         else if (tab === "users") { await pollUsers(); }
         else if (tab === "secrets") { await pollSecretEnvNames(); }
         else if (tab === "worktree-retirement") { await pollWorktreeRetirements(); }
