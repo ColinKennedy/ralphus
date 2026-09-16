@@ -1873,6 +1873,28 @@ fn run_cell_with_rate_limit_retries<'a>(
                 detail.occurrence_count,
                 detail.turns_since_previous_occurrence,
             );
+            {
+                let guard = store.lock();
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "scheduler",
+                    message: "cell failed: rate-limit retry thrashing",
+                    scope: Some("cell"),
+                    squad_id: Some(squad_id),
+                    guardian_id: None,
+                    cell_id: Some(&row.cell_id),
+                    task: Some(&row.task_name),
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "occurrence_count": detail.occurrence_count,
+                        "turns_since_previous_occurrence":
+                            detail.turns_since_previous_occurrence,
+                        "max_occurrences": detail.max_occurrences,
+                        "min_turn_gap": detail.min_turn_gap,
+                    }),
+                    admin_only: false,
+                });
+            }
             let failed = RunnerResult {
                 status: "failed".to_string(),
                 tokens_in: total_tokens_in,
@@ -1899,16 +1921,32 @@ fn run_cell_with_rate_limit_retries<'a>(
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_RATE_LIMIT_RETRY);
         let wake_at_ms = crate::store::now_ms() + retry_after.as_millis() as i64;
-        {
-            let guard = store.lock();
-            let _ = guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms);
-        }
         crate::rlog!(
             INFO,
             "ralphus [scheduler] cell {squad_id}/{} rate limited by pi; retrying in {}s",
             row.cell_id,
             retry_after.as_secs(),
         );
+        {
+            let guard = store.lock();
+            let _ = guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms);
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "scheduler",
+                message: "cell delayed: pi rate limit",
+                scope: Some("cell"),
+                squad_id: Some(squad_id),
+                guardian_id: None,
+                cell_id: Some(&row.cell_id),
+                task: Some(&row.task_name),
+                log_path: None,
+                payload: serde_json::json!({
+                    "retry_after_secs": retry_after.as_secs(),
+                    "wake_at_ms": wake_at_ms,
+                }),
+                admin_only: false,
+            });
+        }
         // Release the scheduler slot for the wait's duration -- a delayed
         // cell is doing nothing but sleeping, and every second it holds a
         // permit is a second another ready cell can't dispatch.
