@@ -485,7 +485,6 @@
        */
       /** @type {TaskTabColumn[]} */
       const TASK_TAB_COLUMNS = [
-        { key: "sel", label: "", width: 26, min: 26, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
         { key: "star", label: "", width: 24, min: 24, flex: false, sortable: false, hideable: false, groupable: false, align: "left" },
         { key: "name", label: "Task", width: 320, min: 160, flex: true, sortable: true, hideable: false, groupable: false, align: "left" },
         { key: "squad", label: "Squad", width: 150, min: 90, flex: false, sortable: true, hideable: false, groupable: true, align: "left" },
@@ -515,8 +514,9 @@
         return columns
           .filter((c) => !hiddenCols.has(c.key))
           .map((c) => {
-            const w = widths[c.key] || c.width;
-            return c.flex ? `minmax(${c.min}px, 1fr)` : `${Math.max(w, c.min)}px`;
+            const dragged = widths[c.key];
+            if (c.flex) return dragged != null ? `minmax(${Math.max(dragged, c.min)}px, 1fr)` : `minmax(${c.min}px, 1fr)`;
+            return `${Math.max(dragged != null ? dragged : c.width, c.min)}px`;
           })
           .join(" ");
       }
