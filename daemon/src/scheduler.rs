@@ -464,6 +464,13 @@ pub fn run_loop(
     // waiting a day for the first interval to elapse.
     crate::guardian_merge::retire_stale_worktrees(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
+    // Same daily cadence as the retirement sweep just above -- a repo this
+    // daemon manages otherwise never gets its accumulated loose objects
+    // packed, and every git fetch (including the "Merge / rebase" button's
+    // own preflight) pays for that pile on its "have" negotiation walk. See
+    // `guardian_merge::run_periodic_git_maintenance`.
+    crate::guardian_merge::run_periodic_git_maintenance(&store);
+    let mut last_git_maintenance = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
     // Run once at startup too, so a freshly (re)started daemon doesn't wait a
     // full BASE_BRANCH_FRESHNESS_POLL_INTERVAL before its first base-branch
@@ -525,6 +532,10 @@ pub fn run_loop(
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
             last_worktree_retirement = std::time::Instant::now();
+        }
+        if last_git_maintenance.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
+            crate::guardian_merge::run_periodic_git_maintenance(&store);
+            last_git_maintenance = std::time::Instant::now();
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();

@@ -8764,6 +8764,99 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
     }
 }
 
+/// How often [`run_periodic_git_maintenance`] runs (see `scheduler.rs`'s
+/// `WORKTREE_RETIREMENT_INTERVAL`, whose cadence this reuses): daily is
+/// plenty, since `git gc --auto` only does real work once a root has crossed
+/// git's own loose-object/pack-count threshold, not on every call.
+///
+/// A repo this daemon manages accumulates one commit per rebased branch, per
+/// resolved conflict, and per carry-forward pin, for every review it has ever
+/// run -- and nothing else in this codebase ever packs them. Measured on
+/// ralphus's own dev repo: ~37k loose objects left every plain `git fetch`
+/// paying an ~8s "have" negotiation walk before it sends a single byte over
+/// the wire, on top of an SSH handshake that alone takes about a second. That
+/// walk cost is exactly what made the "Merge / rebase" button feel stuck --
+/// its own preflight (`pr::sync_remote_pr_commits`) fetches every open PR
+/// before the guardian even flips to `merging`, and the board's own ambient
+/// per-PR sync-status polling (RAL-190) pays the same tax concurrently on the
+/// very same repo, contending for `pr::SYNC_FETCH_LOCKS`.
+///
+/// Best-effort and silent on failure: a `git gc` that can't run (a machine
+/// provider with no `gc` support, a transient lock held by a concurrent git
+/// process) just leaves the root exactly as loose-object-heavy as it already
+/// was, no worse off, and gets another chance tomorrow.
+///
+/// Dispatched one thread per root rather than run inline: on a heavily
+/// bloated repo `git gc` is not a quick check, it is minutes of real work
+/// (repacking, reachability across every worktree's HEAD), and the scheduler
+/// loop's own tick must not stall behind it -- the exact same reasoning
+/// [`poll_base_branch_freshness_once`] already applies to its own fetches.
+pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
+    let guardians: Vec<GuardianRootInfo> = {
+        let guard = store.lock();
+        guard
+            .list_guardians()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| GuardianRootInfo {
+                git_root: g.git_root,
+                machine: g.machine,
+            })
+            .collect()
+    };
+    for (root, machine) in collect_git_maintenance_roots(&guardians) {
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
+            match ws.git(&["gc", "--auto", "--quiet"]) {
+                Ok(_) => {
+                    crate::rlog!(
+                        DEBUG,
+                        "ralphus [guardian] git maintenance ran for {}",
+                        root.display()
+                    );
+                }
+                Err(error) => {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [guardian] git maintenance failed for {}: {error}",
+                        root.display()
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// The `(git_root, machine)` fields [`collect_git_maintenance_roots`] needs
+/// from a guardian -- narrowed down from the full `GuardianView` the same way
+/// [`GuardianBaseFetchInfo`] narrows it for `collect_base_fetch_targets`, so
+/// the pure dedup logic can be unit-tested without constructing a whole view.
+pub(crate) struct GuardianRootInfo {
+    pub git_root: String,
+    pub machine: Option<String>,
+}
+
+/// Every distinct `(root, machine)` git checkout across every guardian this
+/// daemon knows about, regardless of status -- unlike
+/// [`collect_base_fetch_targets`], a terminal guardian's root still carries
+/// whatever loose-object debt its own review left behind, so maintenance is
+/// not scoped to "currently maintained" guardians the way base-branch
+/// freshness is. Pure, no I/O.
+pub(crate) fn collect_git_maintenance_roots(
+    guardians: &[GuardianRootInfo],
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    for g in guardians {
+        let root = (PathBuf::from(&g.git_root), g.machine.clone());
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// The operator-facing worktree-retirement view (RAL-385, states widened by
 /// RAL-386): every persisted review worktree path classified by where it
 /// sits in the retirement lifecycle, plus durable history for paths already
@@ -10976,6 +11069,48 @@ mod tests {
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());
+    }
+
+    #[test]
+    fn collect_git_maintenance_roots_dedupes_a_root_shared_across_guardians() {
+        let guardians = vec![
+            GuardianRootInfo {
+                git_root: "/repo/a".to_string(),
+                machine: None,
+            },
+            GuardianRootInfo {
+                git_root: "/repo/a".to_string(),
+                machine: None,
+            },
+            GuardianRootInfo {
+                git_root: "/repo/a".to_string(),
+                machine: Some("build-farm-1".to_string()),
+            },
+            GuardianRootInfo {
+                git_root: "/repo/b".to_string(),
+                machine: None,
+            },
+        ];
+        let roots = collect_git_maintenance_roots(&guardians);
+        assert_eq!(roots.len(), 3, "got: {roots:?}");
+        assert!(roots.contains(&(PathBuf::from("/repo/a"), None)));
+        assert!(roots.contains(&(PathBuf::from("/repo/a"), Some("build-farm-1".to_string()))));
+        assert!(roots.contains(&(PathBuf::from("/repo/b"), None)));
+    }
+
+    #[test]
+    fn collect_git_maintenance_roots_includes_terminal_guardians() {
+        // Unlike `collect_base_fetch_targets`, a deployed/cancelled guardian's
+        // root still carries whatever loose-object debt its review left
+        // behind -- this list is never status-filtered.
+        let guardians = vec![GuardianRootInfo {
+            git_root: "/repo/a".to_string(),
+            machine: None,
+        }];
+        assert_eq!(
+            collect_git_maintenance_roots(&guardians),
+            vec![(PathBuf::from("/repo/a"), None)]
+        );
     }
 
     // -----------------------------------------------------------------------
