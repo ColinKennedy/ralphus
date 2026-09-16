@@ -788,6 +788,23 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
     )
 }
 
+/// Install or remove the RAL-445 co-author `prepare-commit-msg` hook for
+/// `root`'s project, per its resolved `.ralphus.toml` `[commits]
+/// add_coauthor` (`crate::config::load_commit_config`). Failure (e.g. a
+/// read-only hooks directory) is logged and swallowed rather than
+/// propagated -- a hook sync must never block a squad's actual work, and
+/// re-running this on the project's next materialization retries it anyway.
+fn sync_coauthor_hook_best_effort(root: &Path) {
+    let enabled = crate::config::load_commit_config(root).add_coauthor();
+    if let Err(e) = crate::git_hooks::sync_coauthor_hook(root, enabled) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [worktrees] could not sync co-author hook for {}: {e}",
+            root.display()
+        );
+    }
+}
+
 /// Like [`ensure_worktree`], but `existing` is a caller-supplied `git
 /// worktree list --porcelain` snapshot instead of one freshly queried here.
 ///
@@ -806,6 +823,7 @@ pub fn ensure_worktree_with_existing(
     upstream: &str,
     existing: &HashMap<String, String>,
 ) -> Result<PathBuf, String> {
+    sync_coauthor_hook_best_effort(root);
     let materialization = branch_materialization(root, branch)?;
     let wt = resolve_task_worktree_dir_with_existing(root, branch, existing);
     if wt.join(".git").exists() {

@@ -22,6 +22,7 @@ pub mod events;
 pub mod forge;
 pub mod generation;
 pub mod ghost;
+pub mod git_hooks;
 pub mod guardian;
 pub mod guardian_merge;
 pub mod health_targets;
