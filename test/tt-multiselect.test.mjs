@@ -1,14 +1,14 @@
-// Coverage for RAL-350 "Multi-row selection in the Task table, with
-// meatball-menu support":
+// Coverage for RAL-448 "Restore Tasks tab multi-selection and resizing":
 //
 // - ttVisibleTaskKeys only ever lists rows the current filter/group/sort
 //   pass actually produced (group-header and expanded-cell entries excluded);
-// - the header select-all checkbox's checked/indeterminate state is derived
-//   purely from how many of those visible rows are selected;
-// - toggling it only ever touches currently visible rows -- a selected row a
-//   filter is hiding is left alone, the "double filter" rule;
-// - a row's own checkbox toggles it, and shift-click range-selects between
-//   the last-clicked row and the shift-clicked one, among visible rows only;
+// - a plain click on a row selects just that row, clearing any prior
+//   multi-selection and becoming the shift-range anchor;
+// - a ctrl/cmd-click toggles just the clicked row's own membership without
+//   touching the rest of the selection;
+// - a shift-click range-selects between the last anchor and the clicked row
+//   (among visible rows only), replacing any prior selection -- with no
+//   anchor yet, it falls back to a plain single selection;
 // - ttVisibleSelectedRows (what a bulk action actually reaches) returns just
 //   the clicked row when it isn't part of a multi-selection, and the visible
 //   subset of the whole selection when it is -- selecting, filtering it down,
@@ -45,71 +45,36 @@ test("ttVisibleTaskKeys lists only task-type display items, in order, skipping g
   assert.deepEqual(h.ttVisibleTaskKeys(), ["sq-0:0", "sq-0:1"]);
 });
 
-// ---------- ttSelectAllState ----------
-
-test("ttSelectAllState: no visible rows", () => {
-  const h = makeMultiSelect({ ttDisplayItems: [] });
-  assert.deepEqual(h.ttSelectAllState(), { checked: false, indeterminate: false });
-});
-
-test("ttSelectAllState: none of the visible rows selected", () => {
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(3), ttSel: new Set() });
-  assert.deepEqual(h.ttSelectAllState(), { checked: false, indeterminate: false });
-});
-
-test("ttSelectAllState: some of the visible rows selected", () => {
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(3), ttSel: new Set(["sq-1:0"]) });
-  assert.deepEqual(h.ttSelectAllState(), { checked: false, indeterminate: true });
-});
-
-test("ttSelectAllState: every visible row selected", () => {
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(3), ttSel: new Set(["sq-0:0", "sq-1:0", "sq-2:0"]) });
-  assert.deepEqual(h.ttSelectAllState(), { checked: true, indeterminate: false });
-});
-
-test("ttSelectAllState ignores a selected key a filter is currently hiding", () => {
-  // sq-9:0 is selected but not among the (filtered) visible rows -- it must
-  // not count toward "every visible row selected".
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(2), ttSel: new Set(["sq-0:0", "sq-1:0", "sq-9:0"]) });
-  assert.deepEqual(h.ttSelectAllState(), { checked: true, indeterminate: false });
-});
-
-// ---------- ttToggleSelectAllVisible ----------
-
-test("ttToggleSelectAllVisible(true) selects every currently visible row and re-renders", () => {
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(3) });
-  h.ttToggleSelectAllVisible(true);
-  assert.deepEqual([...h.state().ttSel].sort(), ["sq-0:0", "sq-1:0", "sq-2:0"]);
-  assert.equal(h.state().ttSelAnchor, null);
-  assert.equal(h.calls.renderTasksTab, 1);
-});
-
-test("ttToggleSelectAllVisible(false) only deselects visible rows -- a selection a filter hides survives (double filter)", () => {
-  const h = makeMultiSelect({
-    ttDisplayItems: taskDisplayItems(2), // only sq-0:0, sq-1:0 visible under the current filter
-    ttSel: new Set(["sq-0:0", "sq-1:0", "sq-9:0"]),
-  });
-  h.ttToggleSelectAllVisible(false);
-  assert.deepEqual([...h.state().ttSel], ["sq-9:0"]);
-});
-
 // ---------- ttToggleRowSel ----------
 
-test("a plain click toggles just that row on and becomes the shift-range anchor", () => {
+test("a plain click selects just that row and becomes the shift-range anchor", () => {
   const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5) });
-  h.ttToggleRowSel({ shiftKey: false }, "sq-2", 0);
+  h.ttToggleRowSel({ shiftKey: false, ctrlKey: false, metaKey: false }, "sq-2", 0);
   assert.deepEqual([...h.state().ttSel], ["sq-2:0"]);
   assert.equal(h.state().ttSelAnchor, "sq-2:0");
   assert.equal(h.calls.renderTasksTab, 1);
 });
 
-test("a plain click on an already-selected row toggles it back off", () => {
-  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5), ttSel: new Set(["sq-2:0"]) });
-  h.ttToggleRowSel({ shiftKey: false }, "sq-2", 0);
-  assert.deepEqual([...h.state().ttSel], []);
+test("a plain click clears any prior multi-selection down to just the clicked row", () => {
+  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5), ttSel: new Set(["sq-0:0", "sq-1:0", "sq-4:0"]) });
+  h.ttToggleRowSel({ shiftKey: false, ctrlKey: false, metaKey: false }, "sq-2", 0);
+  assert.deepEqual([...h.state().ttSel], ["sq-2:0"]);
 });
 
-test("shift-click with no prior anchor just toggles the clicked row (and becomes the anchor)", () => {
+test("a ctrl/cmd-click toggles just the clicked row on, leaving the rest of the selection untouched", () => {
+  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5), ttSel: new Set(["sq-0:0"]) });
+  h.ttToggleRowSel({ shiftKey: false, ctrlKey: true, metaKey: false }, "sq-2", 0);
+  assert.deepEqual([...h.state().ttSel].sort(), ["sq-0:0", "sq-2:0"]);
+  assert.equal(h.state().ttSelAnchor, "sq-2:0");
+});
+
+test("a ctrl/cmd-click on an already-selected row toggles it off, leaving the rest of the selection untouched", () => {
+  const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5), ttSel: new Set(["sq-0:0", "sq-2:0"]) });
+  h.ttToggleRowSel({ shiftKey: false, ctrlKey: false, metaKey: true }, "sq-2", 0);
+  assert.deepEqual([...h.state().ttSel], ["sq-0:0"]);
+});
+
+test("shift-click with no prior anchor falls back to a plain single selection", () => {
   const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(5) });
   h.ttToggleRowSel({ shiftKey: true }, "sq-3", 0);
   assert.deepEqual([...h.state().ttSel], ["sq-3:0"]);
@@ -128,10 +93,10 @@ test("shift-click range selection works in either direction", () => {
   assert.deepEqual([...h.state().ttSel].sort(), ["sq-1:0", "sq-2:0", "sq-3:0", "sq-4:0"]);
 });
 
-test("shift-click range selection adds to, rather than replaces, any pre-existing selection", () => {
+test("shift-click range selection replaces, rather than adds to, any pre-existing selection", () => {
   const h = makeMultiSelect({ ttDisplayItems: taskDisplayItems(6), ttSel: new Set(["sq-0:0"]), ttSelAnchor: "sq-1:0" });
   h.ttToggleRowSel({ shiftKey: true }, "sq-3", 0);
-  assert.deepEqual([...h.state().ttSel].sort(), ["sq-0:0", "sq-1:0", "sq-2:0", "sq-3:0"]);
+  assert.deepEqual([...h.state().ttSel].sort(), ["sq-1:0", "sq-2:0", "sq-3:0"]);
 });
 
 // ---------- ttVisibleSelectedRows ----------

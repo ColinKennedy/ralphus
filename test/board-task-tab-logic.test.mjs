@@ -528,3 +528,15 @@ test("taskTabGridTemplate never lets a dragged width go below the column's minim
   const tmpl = taskTabGridTemplate(columns, new Set(), { a: 10 });
   assert.equal(tmpl, "80px");
 });
+
+test("taskTabGridTemplate honors a dragged width on a flex column (RAL-448: Task column resize)", () => {
+  const columns = [{ key: "name", width: 320, min: 160, flex: true }];
+  const tmpl = taskTabGridTemplate(columns, new Set(), { name: 500 });
+  assert.equal(tmpl, "minmax(500px, 1fr)");
+});
+
+test("taskTabGridTemplate clamps a dragged flex-column width to its minimum", () => {
+  const columns = [{ key: "name", width: 320, min: 160, flex: true }];
+  const tmpl = taskTabGridTemplate(columns, new Set(), { name: 50 });
+  assert.equal(tmpl, "minmax(160px, 1fr)");
+});

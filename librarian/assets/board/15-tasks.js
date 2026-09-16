@@ -152,9 +152,8 @@
        * @type {{[key: string]: string}}
        */
       const TT_COLUMN_TIPS = {
-        sel: "Select tasks for bulk actions (RAL-350). Click a box to select that task; shift-click to select a range. This header box selects/deselects every task currently shown by the filter.\nThe selection persists even if a later filter hides some selected rows -- a bulk action (the row meatball, ⋮) then applies only to what's still visible.",
         star: "Watched status (RAL-362 §5). Click a row's star to watch/unwatch its task.\nA task covered by a watch on its whole squad shows a distinct inherited-watch glyph.",
-        name: "Task name. Click the row to select it; the chevron (when present) expands its cells.",
+        name: "Task name. Click a row to select it; ctrl/cmd-click to toggle it into a multi-selection, shift-click to select a range -- a bulk action (the row meatball, ⋮) then applies to every task still selected and visible.\nThe chevron (when present) expands its cells.",
         squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
         review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
@@ -170,9 +169,6 @@
        * @returns {string}
        */
       function ttHeadCellHtml(c) {
-        if (c.key === "sel") {
-          return `<div class="tt-head-cell" data-tip="${esc(TT_COLUMN_TIPS.sel)}"><input type="checkbox" class="tt-sel-all" onclick="event.stopPropagation();ttToggleSelectAllVisible(this.checked)" data-tip="${esc(TT_COLUMN_TIPS.sel)}"></div>`;
-        }
         const isSort = taskTabFilters.sort === c.key;
         const label = c.sortable
           ? `<span onclick="ttSetSort('${c.key}')" style="cursor:pointer">${esc(c.label)}</span>`
@@ -354,14 +350,6 @@
           const el = /** @type {HTMLElement} */ (el0);
           el.addEventListener("mousedown", (/** @type {MouseEvent} */ e) => onTtColResizeDown(e));
         });
-        // Reflects the "some but not all visible rows selected" state -- HTML has
-        // no attribute for it, so it's set as a DOM property after the checkbox exists.
-        const selAll = /** @type {HTMLInputElement|null} */ (head.querySelector(".tt-sel-all"));
-        if (selAll) {
-          const { checked, indeterminate } = ttSelectAllState();
-          selAll.checked = checked;
-          selAll.indeterminate = indeterminate;
-        }
       }
       /**
        * Renders one column's cell wrapper, or "" when that column is currently hidden (so the emitted grid-cell count matches the header's).
@@ -380,42 +368,23 @@
       /**
        * The `TtRow.key`s of every task row in the current filtered/sorted/
        * grouped display list, in display order (RAL-350) -- "visible" for the
-       * double-filter rule: a bulk action or the header select-all/none only
-       * ever reaches rows in this list, never rows the underlying `ttSel`
-       * remembers but a filter is currently hiding.
+       * double-filter rule: a bulk action only ever reaches rows in this
+       * list, never rows the underlying `ttSel` remembers but a filter is
+       * currently hiding.
        * @returns {string[]}
        */
       function ttVisibleTaskKeys() {
         return ttDisplayItems.filter((it) => it.type === "task").map((it) => /** @type {TtRow} */ (it.row).key);
       }
       /**
-       * The header select-all checkbox's checked/indeterminate state, derived
-       * from how many of the currently visible task rows are in `ttSel`.
-       * @returns {{checked: boolean, indeterminate: boolean}}
-       */
-      function ttSelectAllState() {
-        const keys = ttVisibleTaskKeys();
-        if (!keys.length) return { checked: false, indeterminate: false };
-        const n = keys.filter((k) => ttSel.has(k)).length;
-        return { checked: n === keys.length, indeterminate: n > 0 && n < keys.length };
-      }
-      /**
-       * Selects or deselects every currently visible task row at once (the
-       * header checkbox) -- never touches a selected row the current filter
-       * is hiding (RAL-350's double filter).
-       * @param {boolean} checked
-       * @returns {void}
-       */
-      function ttToggleSelectAllVisible(checked) {
-        for (const k of ttVisibleTaskKeys()) { if (checked) ttSel.add(k); else ttSel.delete(k); }
-        ttSelAnchor = null;
-        renderTasksTab();
-      }
-      /**
-       * Handles a click on one row's own selection checkbox: plain click
-       * toggles just that row and becomes the new shift-range anchor;
-       * shift-click selects the range between the anchor and this row among
-       * the currently visible task rows (RAL-350, mirrors `onSquadClick`).
+       * Handles a click on a task row: plain click selects just that row,
+       * clearing any prior multi-selection; ctrl/cmd-click toggles the
+       * clicked row's own membership without touching the rest of the
+       * selection; shift-click selects the contiguous range between the last
+       * anchor and this row among the currently visible task rows, replacing
+       * the prior selection (RAL-448, mirrors `onSquadClick`/`onReviewClick`).
+       * A shift-click with no anchor yet falls back to a plain single
+       * selection.
        * @param {MouseEvent} e
        * @param {string} squadId
        * @param {number} taskIdx
@@ -428,10 +397,13 @@
           const a = vis.indexOf(ttSelAnchor), b = vis.indexOf(key);
           if (a >= 0 && b >= 0) {
             const lo = Math.min(a, b), hi = Math.max(a, b);
-            for (let i = lo; i <= hi; i++) ttSel.add(vis[i]);
-          } else if (ttSel.has(key)) { ttSel.delete(key); } else { ttSel.add(key); }
-        } else {
+            ttSel = new Set(vis.slice(lo, hi + 1));
+          }
+        } else if (e.ctrlKey || e.metaKey) {
           if (ttSel.has(key)) ttSel.delete(key); else ttSel.add(key);
+          ttSelAnchor = key;
+        } else {
+          ttSel = new Set([key]);
           ttSelAnchor = key;
         }
         renderTasksTab();
@@ -581,7 +553,6 @@
         const chevron = hasCells
           ? `<span class="tt-chevron ${expanded ? "expanded" : ""}" onclick="event.stopPropagation();ttToggleExpand('${esc(row.key)}')" data-tip="Expand to show this task's cells.">▶</span>`
           : `<span class="tt-chevron hidden-chevron">▶</span>`;
-        const selCb = `<input type="checkbox" class="tt-row-sel" ${multiSelected ? "checked" : ""} onclick="event.stopPropagation();ttToggleRowSel(event,'${esc(row.squadId)}',${row.taskIdx})" data-tip="Select this task for bulk actions -- the row meatball (⋮) then applies to every selected task.\nShift-click to select a range.">`;
         const starCls = row.watch.watched ? `watched ${row.watch.inherited ? "inherited" : ""}` : "";
         const starTip = !row.watch.watched
           ? "Not watched. Click to watch — \"needs me\" only ever surfaces watched work."
@@ -596,8 +567,7 @@
         const hiddenMarker = taskTabFilters.showHidden && ttRowIsHidden(row, hiddenSquadIds, hiddenTaskKeys)
           ? `<span data-tip="${esc(hiddenTaskKeys.has(row.key) ? "This task is hidden from your own view." : "This task's squad is hidden from your own view.")}">🙈</span>`
           : "";
-        return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask('${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
-          + ttColCell("sel", selCb)
+        return `<div class="tt-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="ttSelectTask(event,'${esc(row.squadId)}',${row.taskIdx})" onmouseenter="ttHoverSquad('${esc(row.squadId)}',true)" onmouseleave="ttHoverSquad('${esc(row.squadId)}',false)">`
           + ttColCell("star", star)
           + ttColCell("name", `<span class="tt-name-cell">${chevron}${sdot(row.state)}${hiddenMarker}<span class="tt-name-text" data-tip="${esc(row.name)}">${esc(ntTaskDisplayName(row.name))}</span>${needsDot}</span>`)
           + ttColCell("squad", ttSquadChipHtml(row))
@@ -628,7 +598,6 @@
         const proofPips = (cell.proof || []).map((v) => `<span data-tip="${esc(v.kind)}: ${esc(v.state)}">${sdot(v.state)}</span>`).join("") || `<span class="tt-cells-count">–</span>`;
         const branch = cell.reviews && cell.reviews.length ? cell.reviews.map((r) => esc(r.branch || "")).filter(Boolean).join(", ") : "–";
         return `<div class="tt-row tt-cell-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="event.stopPropagation();ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${cellIdx})">`
-          + ttColCell("sel", "")
           + ttColCell("star", "")
           + ttColCell("name", `<span class="tt-name-cell" style="padding-left:20px">${sdot(cell.state)}<span class="tt-name-text" data-tip="${esc(cell.name || cell.id)}">${esc(cell.name || cell.id)}</span></span>`)
           + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent)} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent)}</span>`)
@@ -663,7 +632,6 @@
           ? `${formatted} across the ${groupRows.length} tasks shown in this group (of ${allForSquad.length} total in the squad; a filter is hiding the rest).`
           : `${formatted} across all ${groupRows.length} tasks in this squad.`;
         return `<div class="tt-group-header" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(squadId)}">`
-          + ttColCell("sel", "")
           + ttColCell("star", "")
           + ttColCell("name", `<span class="tt-group-label" onclick="ttOpenSquadInSquadsTab('${esc(squadId)}')" data-tip="Squad ${esc(label)} — click to open on the Squads tab.">${sdot(squadState)} ${esc(label)} <span style="color:var(--muted);font-weight:400">(${groupRows.length})</span></span>`)
           + ttColCell("squad", "")
@@ -902,15 +870,18 @@
         renderTasksTab();
       }
       /**
-       * Selects a task for the details pane and re-renders.
+       * Selects a task for the details pane and applies the click's
+       * multi-selection gesture (plain/ctrl-cmd/shift, RAL-448) via
+       * `ttToggleRowSel`, which also re-renders.
+       * @param {MouseEvent} e
        * @param {string} squadId
        * @param {number} taskIdx
        * @returns {void}
        */
-      function ttSelectTask(squadId, taskIdx) {
+      function ttSelectTask(e, squadId, taskIdx) {
         taskTabSel = { kind: "task", squadId, taskIdx, cellIdx: -1 };
         syncHash(true);
-        renderTasksTab();
+        ttToggleRowSel(e, squadId, taskIdx);
       }
       /**
        * Selects a cell (within its task) for the details pane.

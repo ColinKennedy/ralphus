@@ -31,12 +31,11 @@ function sliceRegion([BEGIN, END]) {
 const REGION = ["// RALPHUS-TT-MULTISELECT:BEGIN", "// RALPHUS-TT-MULTISELECT:END"];
 
 /**
- * Builds the sandboxed Tasks-tab multi-selection helpers (RAL-350:
- * `ttVisibleTaskKeys`, `ttSelectAllState`, `ttToggleSelectAllVisible`,
- * `ttToggleRowSel`, `ttVisibleSelectedRows`) with injectable state.
- * `renderTasksTab` is a call-counting stub only -- the real function's own
- * rendering is covered elsewhere; this harness is purely about the
- * selection-set bookkeeping.
+ * Builds the sandboxed Tasks-tab multi-selection helpers (RAL-448:
+ * `ttVisibleTaskKeys`, `ttToggleRowSel`, `ttVisibleSelectedRows`) with
+ * injectable state. `renderTasksTab` is a call-counting stub only -- the
+ * real function's own rendering is covered elsewhere; this harness is
+ * purely about the selection-set bookkeeping.
  */
 export function makeMultiSelect({ ttDisplayItems = [], ttAllRows = [], ttSel = new Set(), ttSelAnchor = null } = {}) {
   const calls = { renderTasksTab: 0 };
@@ -57,7 +56,7 @@ export function makeMultiSelect({ ttDisplayItems = [], ttAllRows = [], ttSel = n
      var ttSelAnchor = deps.ttSelAnchor;
      ${sliceRegion(REGION)}
      return {
-       ttVisibleTaskKeys, ttSelectAllState, ttToggleSelectAllVisible, ttToggleRowSel, ttVisibleSelectedRows,
+       ttVisibleTaskKeys, ttToggleRowSel, ttVisibleSelectedRows,
        state: () => ({ ttSel, ttSelAnchor }),
      };`,
   );
