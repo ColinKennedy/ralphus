@@ -3378,43 +3378,70 @@ pub(crate) fn kickoff_merge(
         return Err(StartMergeError::NotFound(e.to_string()));
     }
     // RAL-300: a manual "Merge / rebase" trigger must not waste a rebuild
-    // when every linked PR has already merged -- ask first, exactly like the
-    // periodic sweep (`review_maintenance`) does. When this settles the
-    // review by approving it outright, report that instead of falling
-    // through to the ordinary claim/rebuild path below (which would just
-    // find nothing left to claim and 409). A mid-flight PR drop (guardian
-    // status unchanged) falls straight through to the normal path.
-    if crate::pr::check_pr_merges(&store, id) {
-        let now_approved = matches!(
-            store.lock().get_guardian(id),
-            Ok(g) if g.status.as_str() == GuardianStatus::Approved.as_str()
-        );
-        if now_approved {
-            return Ok(StartMergeOutcome::AlreadyMerged);
-        }
+    // when every linked PR has already merged, or the base branch already
+    // contains every enabled branch's commits, or a reviewer pushed to an
+    // already-open PR -- ask first, exactly like the periodic sweep
+    // (`review_maintenance`) does. When one of these settles the review by
+    // approving it outright, report that instead of falling through to the
+    // ordinary claim/rebuild path below (which would just find nothing left
+    // to claim and 409). A mid-flight PR drop (guardian status unchanged)
+    // falls straight through to the normal path.
+    //
+    // These three checks are each independent -- `check_pr_merges` and
+    // `guardian_base_already_has_every_branch` read/approve off a snapshot
+    // that doesn't need `sync_remote_pr_commits` to have run first (a
+    // slightly stale ancestry read just means a rare missed shortcut, not a
+    // wrong one -- the ordinary rebuild path below still runs
+    // `sync_remote_pr_commits`-fresh data via `run_merge_cancellable`'s own
+    // work). They used to run one after another, each paying its own
+    // network/git round trip in sequence -- on a review with open PRs that
+    // added several real seconds to every "Merge / rebase" click before the
+    // button's own status change even landed (this function is documented
+    // to "return immediately" above). Running them concurrently instead
+    // collapses that wait to the single slowest of the three.
+    let guardian_snapshot = {
+        let guard = store.lock();
+        guard.get_guardian(id).ok()
+    };
+    let (already_merged_via_prs, sync_result, base_already_has_every_branch) =
+        std::thread::scope(|scope| {
+            let pr_merges = scope.spawn(|| crate::pr::check_pr_merges(&store, id));
+            let sync =
+                scope.spawn(|| crate::pr::sync_remote_pr_commits(&store, runner.as_ref(), id));
+            let base_landed = scope.spawn(|| {
+                guardian_snapshot.as_ref().is_some_and(|g| {
+                    g.status.as_str() == GuardianStatus::InReview.as_str()
+                        && guardian_base_already_has_every_branch(&store, id, g)
+                })
+            });
+            let pr_merges_settled = pr_merges.join().unwrap_or(false);
+            let already_merged_via_prs = pr_merges_settled
+                && matches!(
+                    store.lock().get_guardian(id),
+                    Ok(g) if g.status.as_str() == GuardianStatus::Approved.as_str()
+                );
+            (
+                already_merged_via_prs,
+                sync.join().unwrap_or(Ok(0)),
+                base_landed.join().unwrap_or(false),
+            )
+        });
+    if already_merged_via_prs {
+        return Ok(StartMergeOutcome::AlreadyMerged);
     }
     // A manual merge must never build from a stale review worktree. The fast
     // path only fetches and compares each open PR branch; if a reviewer (or
     // another ralphus worktree) pushed commits, integrate and restack them
     // before claiming this new merge.
-    if let Err(e) = crate::pr::sync_remote_pr_commits(&store, runner.as_ref(), id) {
+    if let Err(e) = sync_result {
         return Err(StartMergeError::Preflight(e));
     }
     // RAL-300: same idea, but via git ancestry rather than the forge -- a
     // review whose base branch already contains every enabled branch's
     // commits (e.g. a fast-forward merge outside any tracked PR) has
     // nothing left to rebuild either.
-    let guardian_snapshot = {
-        let guard = store.lock();
-        guard.get_guardian(id).ok()
-    };
-    if let Some(guardian_snapshot) = guardian_snapshot {
-        if guardian_snapshot.status.as_str() == GuardianStatus::InReview.as_str()
-            && guardian_base_already_has_every_branch(&store, id, &guardian_snapshot)
-            && approve_base_already_landed(&store, id)
-        {
-            return Ok(StartMergeOutcome::AlreadyMerged);
-        }
+    if base_already_has_every_branch && approve_base_already_landed(&store, id) {
+        return Ok(StartMergeOutcome::AlreadyMerged);
     }
     // The guardian read and the "is any branch still waiting on its cell?"
     // check share one lock acquisition: they are two reads of the same
