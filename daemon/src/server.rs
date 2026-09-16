@@ -16403,12 +16403,17 @@ machine=\"incredibuild:B\"
     }
 
     #[test]
-    fn manual_cell_done_override_promotes_a_ready_review_branch_immediately() {
-        // RAL-<new>: a manual `set-status` (RAL-74) bypasses the scheduler's
-        // own task-completion path entirely, so before this fix a review
-        // branch fed by the just-fixed cell only got promoted to `ready`
-        // once the periodic maintenance sweep's straggler pass eventually
-        // noticed -- not immediately, the way a natural completion does.
+    fn manual_cell_done_override_does_not_promote_review_until_the_owning_task_is_also_done() {
+        // A manual `set-status` (RAL-74) cell override bypasses the
+        // scheduler's own task-completion path (`run_task_finalizer`)
+        // entirely, so it eagerly re-checks review readiness right here
+        // (RAL-315) rather than waiting for the periodic maintenance sweep's
+        // straggler pass to eventually notice. But RAL-442: a done cell
+        // alone is not the same as its owning task reaching final,
+        // *validated* completion -- the task still has its own task-level
+        // proof steps (and the no-commits guard) to clear. The review branch
+        // must stay `pending` until the task itself is also `done`, not
+        // promote off the cell alone.
         let d = daemon();
         let repo = tmp_git_repo("manual-done-review-ready");
         let r = route(
@@ -16448,10 +16453,32 @@ machine=\"incredibuild:B\"
 
         assert_eq!(
             d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
+            "pending",
+            "the cell is done, but its owning task has not itself reached \
+             `done` -- a manual cell override alone must not promote the \
+             review branch"
+        );
+
+        // The task itself now reaches its own final, validated `done` state
+        // (in production, `run_task_finalizer` after task-level proofs and
+        // the no-commits guard clear; simulated here via the same manual
+        // `set-status` path used for the task kind).
+        let body = serde_json::json!({
+            "kind": "task", "task_idx": 0, "state": "done"
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/set-status"),
+            &body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        assert_eq!(
+            d.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
             "ready",
-            "a manual cell `done` override must promote the review branch \
-             immediately, not only once the periodic maintenance sweep \
-             eventually notices"
+            "once the owning task is also done, the review branch may promote"
         );
 
         let _ = std::fs::remove_dir_all(&repo);
@@ -20097,6 +20124,11 @@ command = "true"
         let squad_id = submit_squad(&d);
         d.lock()
             .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        // RAL-442: the cell's owning task must also be `done` before linking
+        // may promote the branch straight out of `pending`.
+        d.lock()
+            .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
             .unwrap();
 
         let body =

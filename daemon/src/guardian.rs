@@ -1339,6 +1339,12 @@ impl Store {
     /// table. Requiring *every* historical row done, as a plain `!= 'done'`
     /// filter over the full join would, means a stale row from a superseded
     /// attempt blocks readiness forever even after a fresh attempt succeeds.
+    ///
+    /// RAL-442: also requires every contributing cell's owning task to be
+    /// `done`, mirroring [`Self::mark_ready_branches_with_done_cells`] — this
+    /// gates the blind [`Self::mark_guardian_branches_ready`] startup-recovery
+    /// promotion, so it must apply the same task-level gate or recovery could
+    /// promote a branch whose task hasn't finished validating yet.
     pub fn collecting_guardians_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM guardians WHERE status = 'collecting'
@@ -1355,6 +1361,13 @@ impl Store {
                        WHERE s.review_branch = gb.branch
                        ORDER BY s.rowid DESC LIMIT 1
                    ) != 'done'
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM guardian_branches gb
+                 JOIN cells s ON s.review_branch = gb.branch
+                 JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+                 WHERE gb.guardian_id = guardians.id AND gb.enabled = 1
+                   AND t.state != 'done'
              )
              ORDER BY created_at_ms, id",
         )?;
@@ -1456,6 +1469,16 @@ impl Store {
     /// the plain string join, so the `NOT EXISTS` below sees a non-done
     /// contributor forever and the branch is stuck `pending` even though the
     /// current attempt's own cells are all `done`.
+    ///
+    /// RAL-442: a cell reaching `done` is not the same as its owning task
+    /// reaching final successful completion — the task still has its own
+    /// task-level proof steps and the no-commits guard to clear
+    /// (`run_task_finalizer`), either of which can flip it to `failed` after
+    /// every one of its cells already finished. The third `NOT EXISTS` below
+    /// requires every contributing cell's owning task to also be `done`
+    /// before promoting, so a branch whose task hasn't finished validating
+    /// yet (or that goes on to fail validation) stays `pending` rather than
+    /// being promoted off the strength of cell completion alone.
     pub fn mark_ready_branches_with_done_cells(&self, guardian_id: &str) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE guardian_branches
@@ -1471,6 +1494,13 @@ impl Store {
                    WHERE s.review_branch = guardian_branches.branch
                      AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
                      AND s.state != 'done'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM cells s
+                   JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+                   WHERE s.review_branch = guardian_branches.branch
+                     AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
+                     AND t.state != 'done'
                )",
             params![guardian_id],
         )?;
@@ -7428,14 +7458,29 @@ mod tests {
     // ── stale-cell-row regression: a superseded attempt must not block a
     // branch whose current attempt has finished ─────────────────────────
 
+    // RAL-442: defaults the owning task to `done` -- these callers are all
+    // exercising cell-level readiness mechanics (stale rows, resubmission,
+    // per-guardian scoping) that predate the task-completion gate and don't
+    // care about it. Tests that specifically exercise the task-completion
+    // gate use `insert_cell_for_branch_with_task_state` instead.
     fn insert_cell_for_branch(store: &mut Store, branch: &str, state: NodeState) -> String {
+        insert_cell_for_branch_with_task_state(store, branch, state, NodeState::Done)
+    }
+
+    fn insert_cell_for_branch_with_task_state(
+        store: &mut Store,
+        branch: &str,
+        cell_state: NodeState,
+        task_state: NodeState,
+    ) -> String {
         let src = "[[task]]\nname=\"t0\"\n[[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n";
         let tf: ralphus_core::schema::TaskFile = toml::from_str(src).expect("valid fixture");
         let squad_id = store.insert_squad(&tf, None, false).unwrap();
+        store.set_task_state(&squad_id, 0, task_state).unwrap();
         store
             .set_cell_review_branch(&squad_id, 0, 0, branch)
             .unwrap();
-        store.set_cell_state(&squad_id, 0, 0, state).unwrap();
+        store.set_cell_state(&squad_id, 0, 0, cell_state).unwrap();
         squad_id
     }
 
@@ -7557,6 +7602,137 @@ mod tests {
         assert_eq!(
             store.get_guardian(&id).unwrap().branches[0].merge_status,
             "ready"
+        );
+    }
+
+    // ── RAL-442: readiness is gated on the parent task's final state, not
+    // just its child cell(s) ──────────────────────────────────────────────
+
+    #[test]
+    fn mark_ready_branches_stays_pending_while_the_owning_task_has_not_finished() {
+        // A cell can reach `done` well before its owning task's own
+        // task-level proof steps (and the no-commits guard) have run --
+        // `run_task_finalizer` only flips the task to `done`/`failed` after
+        // those clear. A done cell must not, on its own, promote the branch.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        insert_cell_for_branch_with_task_state(
+            &mut store,
+            "feat",
+            NodeState::Done,
+            NodeState::Running,
+        );
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            0,
+            "the cell is done but its owning task is still running -- must not promote"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn mark_ready_branches_never_promotes_once_the_owning_task_fails_validation() {
+        // Guards against the exact regression RAL-442 describes: a cell
+        // finishes `done`, but the task it belongs to subsequently fails its
+        // own task-level proof/no-commits validation in `run_task_finalizer`.
+        // The branch must never become `ready` off the strength of the cell
+        // alone, and must stay stuck `pending` once the task is `failed`
+        // (there is no valid path to `ready` from a failed task).
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let squad = insert_cell_for_branch_with_task_state(
+            &mut store,
+            "feat",
+            NodeState::Done,
+            NodeState::Running,
+        );
+        assert_eq!(store.mark_ready_branches_with_done_cells(&id).unwrap(), 0);
+
+        // Task validation now fails.
+        store.set_task_state(&squad, 0, NodeState::Failed).unwrap();
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            0,
+            "the owning task failed validation -- the branch must never be promoted"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn mark_ready_branches_requires_every_contributing_task_done_not_just_every_cell() {
+        // A linked review's branch can be fed by cells from more than one
+        // task (RAL-97/98 -- separate squads contributing to the same
+        // branch). Every one of those tasks must be `done`, not just every
+        // cell, before the branch promotes.
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        let first = insert_cell_for_branch_with_task_state(
+            &mut store,
+            "feat",
+            NodeState::Done,
+            NodeState::Done,
+        );
+        store.set_cell_review_guardian(&first, 0, 0, &id).unwrap();
+        let second = insert_cell_for_branch_with_task_state(
+            &mut store,
+            "feat",
+            NodeState::Done,
+            NodeState::Running,
+        );
+        store.set_cell_review_guardian(&second, 0, 0, &id).unwrap();
+
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            0,
+            "every contributing cell is done, but the second cell's task is not -- must not promote"
+        );
+
+        store.set_task_state(&second, 0, NodeState::Done).unwrap();
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&id).unwrap(),
+            1,
+            "every contributing task is now done -- the branch may promote"
+        );
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0].merge_status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn collecting_guardians_ready_excludes_a_guardian_whose_task_has_not_finished() {
+        // Mirrors `mark_ready_branches_stays_pending_while_the_owning_task_has_not_finished`
+        // for the startup-recovery path: `collecting_guardians_ready` gates
+        // the blind `mark_guardian_branches_ready` promotion used on daemon
+        // restart, so it needs the same task-completion gate.
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch_with_task_state(
+            &mut store,
+            "feat",
+            NodeState::Done,
+            NodeState::Running,
+        );
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(
+            store.collecting_guardians_ready().unwrap(),
+            Vec::<String>::new(),
+            "the cell is done but its owning task is still running -- must not be recovery-ready"
         );
     }
 
@@ -7698,6 +7874,11 @@ mod tests {
         // `review_branch` to it yet, so readiness has no way to observe that.
         store
             .set_cell_state(&squad, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        // RAL-442: the cell's owning task must also be `done` before linking
+        // may promote the branch straight out of `pending`.
+        store
+            .set_task_state(&squad, 0, crate::store::NodeState::Done)
             .unwrap();
         assert_eq!(
             store.get_guardian(&gid).unwrap().branches[0].merge_status,

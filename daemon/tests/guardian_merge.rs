@@ -512,6 +512,10 @@ fn setup_review_with_pending_last_branch(store: &mut Store) -> (PathBuf, String)
     store
         .set_cell_state(&run_id, 0, 0, NodeState::Done)
         .unwrap();
+    // RAL-442: task "a" must also reach `done` -- mirroring
+    // `run_task_finalizer` clearing task-level proofs -- before its branch
+    // may promote.
+    store.set_task_state(&run_id, 0, NodeState::Done).unwrap();
     store.mark_ready_branches_with_done_cells(&gid).unwrap();
 
     let guardian = store.get_guardian(&gid).unwrap();
@@ -3370,6 +3374,11 @@ fn straggler_branch_from_a_later_run_is_reopened_and_merged() {
         g.add_guardian_branch(&id, "feature/b").unwrap();
         g.set_cell_review_branch(&run_b, 0, 0, "feature/b").unwrap();
         g.set_cell_state(&run_b, 0, 0, NodeState::Done).unwrap();
+        // RAL-442: run B's task must also reach `done` -- mirroring
+        // `run_task_finalizer` clearing task-level proofs -- before
+        // `reopen_straggler`'s `mark_ready_branches_with_done_cells` call may
+        // promote its branch.
+        g.set_task_state(&run_b, 0, NodeState::Done).unwrap();
     }
 
     // Sanity check: this is the bug. The straggler branch is stuck `pending`

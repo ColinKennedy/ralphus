@@ -4404,8 +4404,14 @@ print(json.dumps(result))
         );
 
         // "finalize" finishes too -- now every worktree-sharing cell is done.
+        // Its owning task (RAL-442) must also reach `done` -- mirroring
+        // `run_task_finalizer` clearing task-level proofs -- before the
+        // branch may promote.
         store
             .set_cell_state(&squad_id, 0, 1, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
             .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(n, 1, "promotes exactly the one branch");
@@ -4481,9 +4487,13 @@ print(json.dumps(result))
             "pending"
         );
 
-        // "finalize" finishes too.
+        // "finalize" finishes too. Its owning task (RAL-442) must also reach
+        // `done` before the branch may promote.
         store
             .set_cell_state(&squad_id, 0, 1, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
             .unwrap();
         let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
         assert_eq!(n, 1, "promotes exactly the one branch");
