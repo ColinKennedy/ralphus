@@ -57,7 +57,7 @@
 
       /* RAL-12: sidebar/details widths are draggable (var-driven) and persisted. */
       main#squads-page { display: grid; grid-template-columns: var(--sidebar-w, 280px) 6px 1fr 6px var(--details-w, 340px); height: calc(100vh - 51px); }
-      main#tasks-page { display: grid; grid-template-columns: 1fr 6px var(--task-details-w, 340px); height: calc(100vh - 51px); }
+      main#tasks-page { display: grid; grid-template-columns: 1fr 3px var(--task-details-w, 340px); height: calc(100vh - 51px); }
       /* RAL-417: the Reviews sidebar is variable-width and draggable like the Squads one --
          the same var-driven track + `.splitter` pattern; the 300px fallback is the old fixed width. */
       main#reviews-page { display: grid; grid-template-columns: var(--reviews-sidebar-w, 300px) 6px 1fr; height: calc(100vh - 51px); }
@@ -86,6 +86,10 @@
       .proj-field:hover { border-color: var(--border); background: var(--bg); }
       .proj-edit-row input, .proj-edit-row select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 6px; }
       .col { overflow-y: auto; }
+      /* RAL-438: Thin resize handles for reduced visual weight while maintaining discoverability.
+         The transparent background hides the handle at rest; on hover/drag it lights up with --accent,
+         making it discoverable without consuming space. Pane splitter: 3px (was 6px).
+         Table column resize: 6px (was 12px). Both tested for practical pointer targeting. */
       .splitter { cursor: col-resize; background: transparent; transition: background .12s; }
       .splitter:hover, .splitter.dragging { background: var(--accent); }
       .sidebar { border-right: 1px solid var(--border); background: var(--panel); }
@@ -338,7 +342,9 @@
       .tt-sort-caret.desc { transform: rotate(180deg); }
       .tt-meatball { opacity: .55; cursor: pointer; padding: 0 3px; border-radius: 4px; margin-left: auto; }
       .tt-meatball:hover { opacity: 1 !important; background: var(--panel-2); }
-      .tt-col-resize { position: absolute; right: 0; top: 0; bottom: 0; width: 12px; cursor: col-resize; z-index: 2; background: transparent; transition: background .12s; }
+      /* RAL-438: Table column resize handle reduced from 12px to 6px for visual lightness.
+         Transparent at rest, reveals on hover with --accent. Maintains practical drag target. */
+      .tt-col-resize { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; background: transparent; transition: background .12s; }
       .tt-col-resize:hover, .tt-col-resize.dragging { background: var(--accent); }
       .tt-body { position: relative; }
       .tt-row { display: grid; grid-template-columns: var(--tt-grid, 1fr); border-bottom: 1px solid var(--border); align-items: center; cursor: pointer; position: absolute; left: 0; right: 0; }
