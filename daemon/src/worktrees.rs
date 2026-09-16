@@ -797,6 +797,7 @@ pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<Path
 fn sync_coauthor_hook_best_effort(root: &Path) {
     let enabled = crate::config::load_commit_config(root).add_coauthor();
     if let Err(e) = crate::git_hooks::sync_coauthor_hook(root, enabled) {
+        // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
         crate::rlog!(
             WARNING,
             "ralphus [worktrees] could not sync co-author hook for {}: {e}",
