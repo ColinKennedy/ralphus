@@ -3944,6 +3944,88 @@ command = "cargo build"
     }
 
     #[test]
+    fn task_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nextends=[\"<<ralphus:presets/complex_task>>\"]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn task_extends_bare_unwrapped_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nextends=[\"ralphus:presets/complex_task\"]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<ralphus:presets/commit_and_push>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_empty_name_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<ralphus:presets/>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_unrecognized_sentinel_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<review:backend>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nextends=[\"<<ralphus:presets/commit_and_push>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn proof_extends_bare_unwrapped_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nextends=[\"ralphus:presets/commit_and_push\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn subprojects_single_valid() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nsubprojects=[\"packages/foo\"]\n";
         assert!(
