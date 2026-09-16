@@ -2790,7 +2790,7 @@ fn branch_wt_dir(
 /// merge pass. [`run_feedback`] applies the same logic via its own inline copy
 /// of this loop rather than calling this helper.
 #[allow(clippy::too_many_arguments)]
-fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
+pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     id: &str,
@@ -7001,6 +7001,12 @@ pub fn review_maintenance(
             // settled review here on the sweep that already visits it. Skips
             // out before any network call when nothing drifted.
             crate::pr::sync_open_pr_branches(&store, &id);
+            // RAL-<pending>: the restacks above (and `sync_open_pr_branches`
+            // itself) only ever check one branch's push against its own prior
+            // state -- never whether the *stack* still holds together. Catch
+            // a branch that silently failed to get re-published here, on the
+            // same sweep that already reconciles every settled review.
+            crate::pr::verify_and_repair_stack_ancestry(&store, runner.as_ref(), &id);
             repair_missing_final_summary(&store, &id);
             cancellations.remove(&format!("guardian:{id}"));
         });
@@ -7089,6 +7095,57 @@ fn snapshot_review_heads(store: &crate::store_lock::StoreHandle, id: &str) {
     }
 }
 
+/// Claim an idle guardian (`in_review` or `merge_failed`) into `Merging` and run
+/// [`restack_from_position`] on it, resolving the workspace/worktree paths and
+/// wiring the store-backed `set_status` closure both callers previously
+/// duplicated inline. Shared by [`rebase_on_manual_push`] and the stack-ancestry
+/// repair path in `pr.rs` — both react to a downstream branch turning out to be
+/// built on stale content and need the same claim-then-restack sequence, just
+/// triggered by different detectors (an unexpected local ref move vs. a
+/// published branch that isn't actually an ancestor of its successor). Returns
+/// whether the claim succeeded and a restack ran; `false` means another
+/// operation currently owns the guardian, so the caller should just leave it
+/// for the next sweep rather than retry immediately.
+pub(crate) fn restack_stack_from(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    from_position: i64,
+    detail: &str,
+    cancel: &CancelToken,
+) -> bool {
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let claimed = {
+        let g = store.lock();
+        matches!(g.get_guardian(id), Ok(gv) if matches!(gv.status.as_str(), "in_review" | "merge_failed"))
+            && g.set_guardian_status(id, GuardianStatus::Merging, Some(detail))
+                .is_ok()
+    };
+    if !claimed {
+        return false;
+    }
+    let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
+    let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
+    let set_status = |s: GuardianStatus, d: Option<&str>| {
+        let _ = store.lock().set_guardian_status(id, s, d);
+    };
+    restack_from_position(
+        store,
+        runner,
+        id,
+        &git_root,
+        &wt_base,
+        &guardian.base_branch,
+        from_position,
+        &set_status,
+        cancel,
+    );
+    true
+}
+
 /// Detect a reviewer's manual push/amend to any of a review's per-branch review
 /// worktrees and, if found, rebase the touched branch's downstream stack — the
 /// same one-at-a-time restack that pressing "Merge / rebase" performs (RAL-92).
@@ -7168,33 +7225,11 @@ pub fn rebase_on_manual_push(
         return false;
     }
 
-    // Claim the review (in_review → merging) under one lock so a concurrent
-    // maintenance pass or an explicit merge request cannot also start rebuilding it.
-    let claimed = {
-        let g = store.lock();
-        matches!(g.get_guardian(id), Ok(gv) if gv.status.as_str() == "in_review")
-            && g.set_guardian_status(
-                id,
-                GuardianStatus::Merging,
-                Some("manual push detected; rebasing downstream"),
-            )
-            .is_ok()
-    };
-    if !claimed {
-        return false;
-    }
-    let _permit = sem.acquire();
-
     // Restack downstream of the lowest touched branch. `restack_from_position`
     // leaves that branch untouched and rebases each later branch onto it in turn,
     // then re-baselines all branches (so the moved downstream tips are not read as
     // a fresh manual push next sweep) and sets the final status.
     let from_position = *changed.iter().min().expect("non-empty");
-    let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
-    let wt_base = git_root.at(worktree_dir(&guardian.git_root, id));
-    let set_status = |s: GuardianStatus, detail: Option<&str>| {
-        let _ = store.lock().set_guardian_status(id, s, detail);
-    };
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} rebasing downstream after manual push from_position={from_position}"
@@ -7215,21 +7250,18 @@ pub fn rebase_on_manual_push(
             admin_only: false,
         });
     }
+    let _permit = sem.acquire();
     // RAL-213: a manual-push restack is a separate reviewer-driven flow, not a
     // cancellable merge -- see `run_merge_cancellable`'s doc comment for the
     // feature this token type serves.
-    restack_from_position(
+    restack_stack_from(
         store,
         runner,
         id,
-        &git_root,
-        &wt_base,
-        &guardian.base_branch,
         from_position,
-        &set_status,
+        "manual push detected; rebasing downstream",
         &CancelToken::never(),
-    );
-    true
+    )
 }
 
 /// Whether every enabled branch under `project` already has its review-branch
