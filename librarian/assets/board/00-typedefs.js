@@ -131,6 +131,7 @@
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
        * @property {TaskView[]} tasks
+       * @property {string[]} [projects] - Every distinct `TaskView.project` among this squad's tasks, precomputed server-side so the sidebar's project filter needs no per-task data.
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every cell/proof subprocess this squad spawns from now on, until unset. Empty/absent for the vast majority of squads.
        * @property {GenerationUsage} [generation_cost] - RAL-420: this squad's own pre-work generation cost — the retained usage of the agent/model calls the Simple form made before submission (Generate proof steps / manual checks / auto-build steps, plus the suggest-name fallback), attributed to this squad at submit time and folded into its normal totals exactly once. Absent for the vast majority of squads (only Simple-tab submissions that used the Generate buttons or the suggest-name fallback have rows).
@@ -281,6 +282,7 @@
        * @property {string[]} [projects]
        * @property {string[]} [squash_projects]
        * @property {GuardianBranch[]} branches
+       * @property {number} [branch_count] - not a real `GuardianView` field -- present only on a `guardians[]` entry that's still lean (came from `/api/guardian-index` and hasn't had this review's full detail merged in yet, see the `guardians` declaration in `05-engines.js`). `branches` is the authoritative count once available.
        * @property {string} [squad_id]
        * @property {string} [git_root]
        * @property {string|null} [project] - registered-project creation identity, or null for a raw-directory review
@@ -345,6 +347,27 @@
        * @property {boolean|null} [auto_fix_pr_errors] - RAL-395: this review's own override for whether the resolver agent is auto-dispatched to fix this review's PR when its CI checks go red, or null to inherit the project/global default. No `effective_` counterpart is exposed yet -- callers read this raw value.
        * @property {string|null} [auto_fix_prompt_template] - RAL-395: this review's own prompt template for that auto-fix dispatch, with `<<prompt>>` replaced by the failing branch's own Cell prompts, or null to inherit the project default. Non-empty values must contain the literal `<<prompt>>` placeholder -- enforced server-side.
        * @property {string} [origin] - RAL-318: provenance of this review -- "explicit" (an authored [[review]] block, or any other pre-existing creation path -- the default/normal case) or "arbiter" (created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired).
+       */
+      /**
+       * `GET /api/guardian-index` response shape -- the lean per-review
+       * summary the Reviews tab's sidebar list, its filters, and
+       * `checkGuardianNotices` read. Everything a `GuardianView` carries
+       * beyond these fields (env overrides, resolver session ids, token/cost
+       * accounting, per-branch detail, ...) is fetched separately, per
+       * review, only once that review is actually opened -- see
+       * `guardianDetail`.
+       * @typedef {object} GuardianIndexEntry
+       * @property {string} id
+       * @property {string} name
+       * @property {string} status
+       * @property {string} origin
+       * @property {number} branch_count
+       * @property {string|null} resolver_agent
+       * @property {string} git_root
+       * @property {string[]} projects
+       * @property {string|null} notice_kind
+       * @property {string|null} notice_message
+       * @property {number|null} notice_at_ms
        */
       /**
        * A pull/merge request submitted for one of a review's branches, or for

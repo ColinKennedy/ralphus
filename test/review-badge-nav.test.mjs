@@ -161,13 +161,16 @@ test("rapid clicks on different review badges leave the last-clicked review sele
   assert.equal(api.calls.renderReviewDetail, 2);
 });
 
-test("renderReviewDetail shows the loading placeholder only for the pending navigation target", () => {
+test("renderReviewDetail shows the loading placeholder whenever a review is selected but its (full) data hasn't arrived yet", () => {
   const block = boardSource.slice(boardSource.indexOf("function renderReviewDetail()"));
   const head = block.slice(0, block.indexOf("const canReorder"));
-  // placeholder for the pending target...
-  assert.match(head, /selectedGuardian && reviewDetailLoading === selectedGuardian/);
+  // placeholder covers both "not in the lean list yet" and "in the list but
+  // its full detail hasn't been merged in yet" (g.branches only exists once
+  // that merge has happened -- see the `guardians` declaration in
+  // 05-engines.js)...
+  assert.match(head, /!g \|\| !g\.branches/);
   assert.match(head, /Loading review/);
-  // ...and the plain prompt otherwise (including the nothing-selected case)
+  // ...and the plain prompt otherwise (only when nothing is selected at all)
   assert.match(head, /Select a review\./);
   // the flag clears once the target's data is found
   assert.match(head, /reviewDetailLoading = null;/);
@@ -217,7 +220,7 @@ test("a poll parked inside its branch refreshes does not render after being over
 
   const promiseB = poll.pollReviews();  // seq 2 — starts while A is parked
   const bListFetches = poll.pendingFetches.slice(1);
-  const fetchB = bListFetches.find((f) => f.url === "/api/guardians");
+  const fetchB = bListFetches.find((f) => f.url === "/api/guardian-index");
   resolveJson(fetchB, [{ id: "review-b", name: "b", status: "in_review" }]);
   await promiseB;
   assert.ok(poll.calls.renderReviews >= 1, "the newer poll renders");

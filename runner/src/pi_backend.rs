@@ -1,9 +1,11 @@
 //! The `pi` `ModelBackend`. Drives `pi` in JSON mode non-interactively,
 //! parsing its JSONL event stream on stdout.
 
+use std::fs::OpenOptions;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -20,6 +22,7 @@ const SUMMARY_TAIL_CHARS: usize = 2000;
 /// `RunOptions::tool_arg_truncate_chars` is unset. Kept as a separate
 /// constant rather than shared because that one is private to its module.
 const DEFAULT_TOOL_ARG_TRUNCATE_CHARS: usize = 200;
+const PI_WORKSPACE_GUARD: &str = include_str!("../assets/pi-workspace-guard.mjs");
 
 pub struct PiBackend {
     pub keep_temporary_files: bool,
@@ -153,7 +156,9 @@ impl ModelBackend for PiBackend {
         // Always send the cell's own prompt, even on resume -- matches
         // claude-code/codex (RAL-248 AC3): cross-cell session sharing needs
         // the new cell's task text, not a generic "continue".
-        let args = build_args(options, system_prompt_file.as_deref());
+        let workspace_guard = materialize_workspace_guard()
+            .map_err(|e| BackendError(format!("could not materialize Pi workspace guard: {e}")))?;
+        let args = build_args(options, system_prompt_file.as_deref(), &workspace_guard);
 
         let mut child = spawn(
             &program,
@@ -161,6 +166,7 @@ impl ModelBackend for PiBackend {
             &args,
             workspace,
             isolated_dir.as_deref(),
+            &workspace_guard,
         )
         .map_err(|e| BackendError(format!("could not spawn {program}: {e}")))?;
 
@@ -487,8 +493,14 @@ fn write_json_object(
 /// Both matter because Windows resolves `pi` to npm's `pi.cmd` shim, and a
 /// batch launcher cannot carry a newline in any argument -- cmd truncates the
 /// line at it, silently dropping everything after (RAL-385).
-fn build_args(options: &RunOptions<'_>, system_prompt_file: Option<&Path>) -> Vec<String> {
+fn build_args(
+    options: &RunOptions<'_>,
+    system_prompt_file: Option<&Path>,
+    workspace_guard: &Path,
+) -> Vec<String> {
     let mut args = vec![
+        "-e".to_string(),
+        workspace_guard.display().to_string(),
         "--mode".to_string(),
         "json".to_string(),
         "--approve".to_string(),
@@ -525,6 +537,7 @@ fn spawn(
     args: &[String],
     workspace: &Workspace,
     isolated_config_dir: Option<&Path>,
+    workspace_guard: &Path,
 ) -> std::io::Result<Child> {
     if compound {
         // npm's `pi.cmd` is a batch file, not a generic user command. It
@@ -537,13 +550,24 @@ fn spawn(
         };
         let _ = shellcmd::detect_parent_shell(&Env::from_process());
         let line = crate::cli_agent_common::shell_command_line(&shell, program, args);
+        let cmd_workspace = cmd_compatible_path(workspace.root());
+        let line = if shell == "cmd" {
+            format!("cd /d \"{}\" && {line}", cmd_workspace.display())
+        } else {
+            line
+        };
         let mut cmd =
             shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), args)?;
-        cmd.current_dir(workspace.root())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.current_dir(if shell == "cmd" {
+            &cmd_workspace
+        } else {
+            workspace.root()
+        })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+        apply_workspace_guard_env(&mut cmd, workspace, workspace_guard);
         cmd.spawn()
     } else {
         let mut cmd = Command::new(program);
@@ -553,7 +577,24 @@ fn spawn(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_isolated_config_dir_env(&mut cmd, isolated_config_dir);
+        apply_workspace_guard_env(&mut cmd, workspace, workspace_guard);
         cmd.spawn()
+    }
+}
+
+/// `cmd.exe` treats Rust's verbatim-disk prefix (`\\?\C:\...`) as a UNC
+/// current directory and falls back elsewhere. Use the equivalent DOS path at
+/// the batch-launcher boundary; Windows paths cannot contain a literal `"`.
+/// This fixes local extended-length paths only. A genuine UNC workspace still
+/// cannot be the current directory of Pi's npm-provided `pi.cmd` launcher.
+fn cmd_compatible_path(path: &Path) -> std::path::PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -566,6 +607,62 @@ fn apply_isolated_config_dir_env(cmd: &mut Command, isolated_config_dir: Option<
     }
 }
 
+/// Supplies the bundled Pi extension with the workspace it must protect.
+fn apply_workspace_guard_env(cmd: &mut Command, workspace: &Workspace, workspace_guard: &Path) {
+    cmd.env(
+        "RALPHUS_PI_WORKSPACE_ROOT",
+        cmd_compatible_path(workspace.root()),
+    )
+    .env("RALPHUS_PI_WORKSPACE_GUARD", workspace_guard);
+}
+
+/// Writes the bundled guard to a durable, content-addressed Ralphus state path.
+/// The filename is never renamed or overwritten.
+fn materialize_workspace_guard() -> std::io::Result<std::path::PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    materialize_workspace_guard_in(
+        &home.join(".ralphus").join("pi-extensions"),
+        PI_WORKSPACE_GUARD,
+    )
+}
+
+fn materialize_workspace_guard_in(dir: &Path, source: &str) -> std::io::Result<std::path::PathBuf> {
+    use sha2::{Digest as _, Sha256};
+
+    std::fs::create_dir_all(dir)?;
+    let digest = Sha256::digest(source.as_bytes());
+    let short_digest = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = dir.join(format!("ralphus-pi-workspace-guard-{short_digest}.mjs"));
+
+    for _ in 0..10 {
+        if std::fs::read(&path).is_ok_and(|existing| existing == source.as_bytes()) {
+            return Ok(path);
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(source.as_bytes())?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if std::fs::read(&path).is_ok_and(|existing| existing != source.as_bytes()) {
+        std::fs::remove_file(&path)?;
+        return materialize_workspace_guard_in(dir, source);
+    }
+    Ok(path)
+}
+
 fn drive_json_events(
     child: &mut Child,
     workspace: &Workspace,
@@ -576,6 +673,7 @@ fn drive_json_events(
     let stderr_thread = stderr.map(|s| {
         std::thread::spawn(move || {
             let reader = BufReader::new(s);
+            let mut output = String::new();
             for line in reader.lines().map_while(Result::ok) {
                 crate::cartographer::emit(
                     "pi",
@@ -584,7 +682,12 @@ fn drive_json_events(
                     crate::cartographer::EventContext::default(),
                     Value::Null,
                 );
+                if output.len() < SUMMARY_TAIL_CHARS {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
             }
+            output
         })
     });
 
@@ -644,9 +747,9 @@ fn drive_json_events(
     }
 
     let status = child.wait().map_err(|e| BackendError(format!("pi: {e}")))?;
-    if let Some(t) = stderr_thread {
-        let _ = t.join();
-    }
+    let stderr_output = stderr_thread
+        .and_then(|t| t.join().ok())
+        .unwrap_or_default();
 
     if let Some(error) = state.terminal_error {
         return Err(BackendError(format!(
@@ -656,8 +759,14 @@ fn drive_json_events(
     }
 
     if !state.saw_terminal_event {
+        let detail = tail(&stderr_output, SUMMARY_TAIL_CHARS);
         return Err(BackendError(format!(
-            "pi exited ({status:?}) without a terminal message/agent event"
+            "pi exited ({status:?}) without a terminal message/agent event{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         )));
     }
 
@@ -1177,6 +1286,7 @@ mod tests {
 
     #[test]
     fn build_args_includes_resume_model_and_system_prompt() {
+        let guard = Path::new("C:/state/pi-extensions/ralphus-pi-workspace-guard-test.mjs");
         let args = build_args(
             &RunOptions {
                 model: Some("openrouter/deepseek"),
@@ -1185,8 +1295,10 @@ mod tests {
                 ..Default::default()
             },
             None,
+            guard,
         );
         assert!(args.windows(2).any(|w| w == ["--session", "sess-123"]));
+        assert!(!args.iter().any(|arg| arg == "--fork"));
         assert!(
             args.windows(2)
                 .any(|w| w == ["--model", "openrouter/deepseek"])
@@ -1195,7 +1307,8 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--append-system-prompt", "be terse"])
         );
-        assert_eq!(args[0], "--mode");
+        assert_eq!(args[0], "-e");
+        assert_eq!(args[1], guard.display().to_string());
         assert!(args.contains(&"--approve".to_string()));
         assert!(args.contains(&"-p".to_string()));
     }
@@ -1204,7 +1317,11 @@ mod tests {
     /// npm's `pi.cmd` shim cannot carry a multiline argv token.
     #[test]
     fn build_args_never_carries_the_prompt() {
-        let args = build_args(&RunOptions::default(), None);
+        let args = build_args(
+            &RunOptions::default(),
+            None,
+            Path::new("C:/state/pi-extensions/ralphus-pi-workspace-guard-test.mjs"),
+        );
         assert_eq!(args.last().map(String::as_str), Some("-p"));
         assert!(!args.iter().any(|a| a.contains('\n')));
     }
@@ -1214,12 +1331,14 @@ mod tests {
     #[test]
     fn build_args_passes_system_prompt_as_a_file_when_given_one() {
         let path = Path::new("C:/state/task_prompts/abc123.md");
+        let guard = Path::new("C:/state/pi-extensions/ralphus-pi-workspace-guard-test.mjs");
         let args = build_args(
             &RunOptions {
                 append_system_prompt: Some("line one\n\nline two"),
                 ..Default::default()
             },
             Some(path),
+            guard,
         );
         let value = path.display().to_string();
         assert!(
@@ -1941,6 +2060,41 @@ mod tests {
         let mut cmd = Command::new("echo");
         apply_isolated_config_dir_env(&mut cmd, None);
         assert!(!cmd.get_envs().any(|(k, _)| k == "PI_CODING_AGENT_DIR"));
+    }
+
+    #[test]
+    fn workspace_guard_is_durable_content_addressed_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pi-workspace-guard-test-{}",
+            std::process::id()
+        ));
+        let source = "export default () => {};\n";
+        let first = materialize_workspace_guard_in(&dir, source).unwrap();
+        let second = materialize_workspace_guard_in(&dir, source).unwrap();
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ralphus-pi-workspace-guard-")
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), source);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bundled_workspace_guard_covers_shells_and_project_worktrees() {
+        assert!(PI_WORKSPACE_GUARD.contains("worktree"));
+        assert!(PI_WORKSPACE_GUARD.contains("--porcelain"));
+        assert!(PI_WORKSPACE_GUARD.contains("[\"-C\", workspaceRoot"));
+        assert!(PI_WORKSPACE_GUARD.contains("comparablePath"));
+        assert!(PI_WORKSPACE_GUARD.contains("\\\\\\\\?\\\\UNC\\\\"));
+        assert!(PI_WORKSPACE_GUARD.contains("event.toolName === \"bash\""));
+        assert!(PI_WORKSPACE_GUARD.contains("event.toolName === \"powershell\""));
+        assert!(PI_WORKSPACE_GUARD.contains("Blocked access to another worktree"));
     }
 
     #[test]

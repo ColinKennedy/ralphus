@@ -50,7 +50,7 @@ const fs = require("fs");
 let stdin = "";
 process.stdin.on("data", (c) => (stdin += c));
 process.stdin.on("end", () => {{
-  fs.writeFileSync({report:?}, JSON.stringify({{argv: process.argv.slice(2), stdin}}, null, 2));
+  fs.writeFileSync({report:?}, JSON.stringify({{argv: process.argv.slice(2), stdin, cwd: process.cwd()}}, null, 2));
   process.stdout.write(JSON.stringify({{type: "session", id: "pi-test"}}) + "\n");
 }});
 "#,
@@ -78,7 +78,7 @@ fn run_against_shim(
     label: &str,
     system_prompt: Option<&str>,
     model: Option<&str>,
-) -> (Vec<String>, String) {
+) -> (Vec<String>, String, String) {
     let dir = std::env::temp_dir().join(format!("ralphus ral385 {label}"));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let (shim, report) = write_fake_shim(&dir);
@@ -111,7 +111,8 @@ fn run_against_shim(
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
     let stdin = parsed["stdin"].as_str().unwrap_or_default().to_string();
-    (argv, stdin)
+    let cwd = parsed["cwd"].as_str().unwrap_or_default().to_string();
+    (argv, stdin, cwd)
 }
 
 /// The regression itself: before the fix the multiline prompt was an argv
@@ -123,7 +124,7 @@ fn multiline_prompt_reaches_a_batch_launcher_intact_over_stdin() {
         eprintln!("SKIP: node is not on PATH");
         return;
     }
-    let (argv, stdin) = run_against_shim("prompt", Some(SYSTEM_PROMPT), None);
+    let (argv, stdin, cwd) = run_against_shim("prompt", Some(SYSTEM_PROMPT), None);
 
     assert_eq!(stdin, PROMPT, "the whole prompt must arrive over stdin");
     assert!(
@@ -133,6 +134,10 @@ fn multiline_prompt_reaches_a_batch_launcher_intact_over_stdin() {
     assert!(
         !argv.iter().any(|a| a.contains("RAL-385")),
         "the prompt must not be an argument at all: {argv:?}"
+    );
+    assert!(
+        cwd.ends_with("ralphus ral385 prompt"),
+        "unexpected cwd: {cwd}"
     );
 }
 
@@ -144,7 +149,7 @@ fn multiline_system_prompt_reaches_a_batch_launcher_as_a_file() {
         eprintln!("SKIP: node is not on PATH");
         return;
     }
-    let (argv, _) = run_against_shim("sysprompt", Some(SYSTEM_PROMPT), None);
+    let (argv, _, _) = run_against_shim("sysprompt", Some(SYSTEM_PROMPT), None);
 
     let index = argv
         .iter()
@@ -175,7 +180,7 @@ fn a_space_bearing_argument_survives_a_batch_launcher() {
         eprintln!("SKIP: node is not on PATH");
         return;
     }
-    let (argv, _) = run_against_shim("space", None, Some("openrouter/glm 5 3 flash"));
+    let (argv, _, _) = run_against_shim("space", None, Some("openrouter/glm 5 3 flash"));
     assert!(
         argv.windows(2)
             .any(|w| w[0] == "--model" && w[1] == "openrouter/glm 5 3 flash"),

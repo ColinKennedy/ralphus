@@ -183,17 +183,69 @@
        * Renders the right details pane for the current selection.
        * @returns {void}
        */
+      /**
+       * The last markup written to the details pane, with live running-time
+       * values masked out (see {@link detailsMemoKey}). An unchanged render
+       * skips the DOM write entirely.
+       * @type {string|null}
+       */
+      let lastDetailsHtml = null;
+      /**
+       * Comparison key for {@link lastDetailsHtml}: the markup with the text
+       * of every `data-running="1"` element blanked. Those elements hold a
+       * duration recomputed from `Date.now()` on each render and ticked in
+       * place once a second by `ttTickRunningTimes`, so they differ every
+       * time and would defeat the comparison -- while the in-place ticker
+       * keeps them correct whether or not the pane is rebuilt.
+       * @param {string} html
+       * @returns {string}
+       */
+      function detailsMemoKey(html) { return html.replace(/(data-running="1"[^>]*>)[^<]*/g, "$1"); }
+      /**
+       * Writes `html` into the details pane only if it differs from what is
+       * already there.
+       *
+       * `el.innerHTML = ...` tears down and rebuilds the whole subtree, which
+       * for a cell's multi-KB prompt and system-prompt blocks is visible as a
+       * blank-and-repaint. The pane re-renders on every pushed event now that
+       * refreshes are SSE-driven rather than a slow poll, so an unconditional
+       * write made that flicker continuous while a squad was active.
+       * @param {HTMLElement} el
+       * @param {string} html
+       * @returns {boolean} whether the DOM was actually written
+       */
+      function setDetailsHtml(el, html) {
+        const key = detailsMemoKey(html);
+        if (key === lastDetailsHtml) return false;
+        lastDetailsHtml = key;
+        el.innerHTML = html;
+        return true;
+      }
+      /**
+       * Renders the details pane for the current selection.
+       * @returns {void}
+       */
       function renderDetails() {
         const el = byId("details");
+        // Prompt text lives in a per-squad cache fetched separately from the
+        // board list; start that fetch the moment a selection needs a squad
+        // that is not loaded yet, rather than waiting for the next poll.
+        syncPromptCache();
         const squad = findSquad(selectedSquadId);
-        if (!squad || !sel.kind) { el.innerHTML = `<div class="empty">Select a squad, task, cell, or proof step.</div>`; return; }
+        if (!squad || !sel.kind) { setDetailsHtml(el, `<div class="empty">Select a squad, task, cell, or proof step.</div>`); return; }
         const tabs = multiSel.size > 1 ? selectionTabs() : "";
-        if (editing) { el.innerHTML = tabs + editForm(squad); return; }
-        if (sel.kind === "squad") el.innerHTML = tabs + squadView(squad);
-        else if (sel.kind === "task") el.innerHTML = tabs + taskView(squad, squad.tasks[sel.taskIdx]);
-        else if (sel.kind === "proof") el.innerHTML = tabs + proofView(squad);
-        else el.innerHTML = tabs + cellView(squad, squad.tasks[sel.taskIdx], squad.tasks[sel.taskIdx].cells[sel.cellIdx]);
+        if (editing) { setDetailsHtml(el, tabs + editForm(squad)); return; }
+        let html;
+        if (sel.kind === "squad") html = tabs + squadView(squad);
+        else if (sel.kind === "task") html = tabs + taskView(squad, squad.tasks[sel.taskIdx]);
+        else if (sel.kind === "proof") html = tabs + proofView(squad);
+        else html = tabs + cellView(squad, squad.tasks[sel.taskIdx], squad.tasks[sel.taskIdx].cells[sel.cellIdx]);
+        if (!setDetailsHtml(el, html)) return;
         attachPeekResizeHandlers();
+        // The markup above carries a stale duration for anything still
+        // running; fill in the live values immediately rather than leaving
+        // them wrong until the next one-second tick.
+        ttTickRunningTimes();
       }
       /**
        * Renders the shared "Edit" button row shown at the bottom of the details pane.
@@ -558,6 +610,7 @@
         renderReviews();
         if (!findGuardian(id)) reviewDetailLoading = id;
         renderReviewDetail();
+        ensureGuardianDetailLoaded(id);
       }
       // RALPHUS-GOTO-REVIEW:END
       /**
@@ -570,9 +623,13 @@
         selectedGuardian = gid;
         revealedGuardianId = gid;
         selectedBranch[gid] = branch;
-        // Auto-expand the branch so its detail is visible.
+        // Auto-expand the branch so its detail is visible. `g.branches` is
+        // only present once full detail has been merged in (see the
+        // `guardians` declaration in `05-engines.js`) -- if this review
+        // hasn't been opened before, there's nothing to expand yet, and
+        // `ensureGuardianDetailLoaded` below re-renders once it arrives.
         const g = guardians.find((x) => x.id === gid);
-        if (g) {
+        if (g && g.branches) {
           const b = g.branches.find((br) => br.branch === branch);
           if (b != null) expandedBranches.add(`${gid}:${b.id}`);
         }
@@ -584,6 +641,7 @@
         if (!findGuardian(gid)) reviewDetailLoading = gid;
         renderReviews();
         renderReviewDetail();
+        ensureGuardianDetailLoaded(gid);
       }
       /**
        * Toggles a branch row's selection within a review's branch list.
@@ -1262,7 +1320,8 @@
               <label>agent<input id="e-agent" list="e-agent-list" value="${esc(s.agent || "")}">
                 <datalist id="e-agent-list">${agents.map((a) => `<option value="${a}">`).join("")}</datalist></label>
               <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
-              <label>prompt<textarea id="e-prompt" rows="5">${esc(s.prompt || "")}</textarea></label>
+              <label>prompt<textarea id="e-prompt" rows="5"${s.prompt == null ? " disabled" : ""}>${esc(s.prompt || "")}</textarea></label>${s.prompt == null ? `<div class="warn" style="margin:2px 0 6px" data-tip="The prompt text is fetched separately from the squad list and has not arrived yet.
+It is held back rather than shown blank, so saving cannot overwrite it with an empty value.">prompt still loading — it will not be modified by this save</div>` : ""}
             </div>
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
@@ -1314,7 +1373,13 @@
           if (val("e-mode") === "command") {
             body.command = val("e-command");
           } else {
-            body.agent = val("e-agent"); body.model = val("e-model"); body.prompt = val("e-prompt");
+            body.agent = val("e-agent"); body.model = val("e-model");
+            // Only send the prompt when it was actually loaded into the form.
+            // The board list omits prompt text (it is fetched per-squad), so a
+            // form opened before that fetch landed holds an empty textarea --
+            // submitting it would overwrite the real prompt with "".
+            const promptEl = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("e-prompt"));
+            if (promptEl && !promptEl.disabled) body.prompt = promptEl.value;
           }
         }
         try {
@@ -1328,16 +1393,20 @@
       /**
        * Toggles the header's "running work" dropdown, listing every in-flight cell/proof/review.
        * @param {MouseEvent} e
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function toggleRunning(e) {
+      async function toggleRunning(e) {
         e.stopPropagation();
         const m = byId("running-menu");
         if (!m.classList.contains("hidden")) { m.classList.add("hidden"); return; }
+        // The "Running X / Y" counter itself comes from the daemon's
+        // semaphore and is always live; only this dropdown's contents need
+        // per-cell state, so they are fetched when it opens.
+        await loadTaskIndex();
         /** @type {string[]} */
         const rows = [];
         // Running cells
-        for (const r of squads) {
+        for (const r of taskIndex) {
           for (let ti = 0; ti < r.tasks.length; ti++) {
             const t = r.tasks[ti];
             for (let si = 0; si < t.cells.length; si++) {
@@ -1378,7 +1447,12 @@
         const reviewList = (/** @type {any} */ (window)._daemonStatus && /** @type {any} */ (window)._daemonStatus.running_reviews) || [];
         for (const rv of reviewList) {
           const g = guardians.find((x) => x.id === rv.id);
-          const inProg = g && g.branches.find((b) => b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning");
+          // `g.branches` is only present once this review's full detail has
+          // been fetched (see the `guardians` declaration in
+          // `05-engines.js`) -- most reviews in this "what's running" widget
+          // were never opened, so degrade to the generic tooltip below
+          // instead of fetching full detail just to populate one.
+          const inProg = g && g.branches && g.branches.find((b) => b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning");
           const tip = inProg
             ? inProg.merge_status === "proof_pending"
               ? `Guardian review '${esc(rv.name)}' is running final verification on branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`

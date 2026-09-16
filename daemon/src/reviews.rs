@@ -1217,7 +1217,7 @@ fn record_review_guardian(
 ///
 /// `agent`/`model`/`proof_scope` don't need an equivalent here: they're
 /// resolved lazily against the same project config, at the point each is
-/// actually used (`guardian_merge::resolver_agent`/`resolver_model`,
+/// actually used (`guardian_merge::resolve_resolver_agent`,
 /// `guardian.rs`'s `effective_proof_scope`), so they already pick up a
 /// project default regardless of how the guardian was created.
 /// `auto_submit_pr_stack` also doesn't need one: `create_guardian_keyed`
@@ -1284,8 +1284,11 @@ fn apply_resolver(
     let agent = members.iter().find_map(|m| m.agent.clone());
     let model = members.iter().find_map(|m| m.model.clone());
     if agent.is_some() || model.is_some() {
+        // Each column is written only when some member declares it -- a member
+        // that sets `model` alone must not wipe a `resolver_agent` naming a
+        // custom agent profile (see `Store::set_guardian_resolver`).
         store
-            .set_guardian_resolver(gid, agent.as_deref(), model.as_deref())
+            .set_guardian_resolver(gid, agent.as_deref().map(Some), model.as_deref().map(Some))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // RAL-185: where this review's own work runs. Independent of any

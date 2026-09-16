@@ -404,6 +404,47 @@ impl Daemon {
         }
     }
 
+    /// [`Store::board_snapshot_conn`] routed through the RAL-393 Stage 3
+    /// read pool, so the board poll — by far the largest and most frequent
+    /// read the daemon serves — no longer holds the writer lock away from
+    /// the scheduler, the guardian-merge workers, and every mutation for the
+    /// whole time it runs. Falls back to the locked writer connection only
+    /// when the pool has no connections at all (see [`ReadConnPool::acquire`]).
+    ///
+    /// Snapshot consistency comes from the read transaction inside
+    /// `board_snapshot_conn`, not from excluding the writer.
+    /// Run `f` against a pooled read-only connection inside one read
+    /// transaction, so a multi-statement read observes a single consistent
+    /// snapshot and never takes the writer lock. Falls back to the writer
+    /// connection when the pool has none (see [`ReadConnPool::acquire`]).
+    ///
+    /// The transaction is what preserves the atomicity the writer lock used
+    /// to supply implicitly — see [`Store::board_snapshot_conn`] for the
+    /// torn-read this prevents.
+    pub(crate) fn with_read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> crate::store::Result<T>,
+    ) -> crate::store::Result<T> {
+        match self.read_pool.acquire() {
+            Some(conn) => {
+                let tx = conn.unchecked_transaction()?;
+                f(&tx)
+            }
+            None => {
+                let store = self.lock();
+                let tx = store.conn.unchecked_transaction()?;
+                f(&tx)
+            }
+        }
+    }
+
+    pub(crate) fn read_board_snapshot(&self) -> crate::store::Result<crate::store::BoardSnapshot> {
+        match self.read_pool.acquire() {
+            Some(conn) => Store::board_snapshot_conn(&conn),
+            None => Store::board_snapshot_conn(&self.lock().conn),
+        }
+    }
+
     /// Request that `run_http_loop` stop accepting new requests and return,
     /// so `serve()` returns and the daemon process exits. See the `shutdown`
     /// field's doc comment.
@@ -794,6 +835,12 @@ struct TaskIndexTask {
 struct TaskIndexCell {
     id: String,
     name: Option<String>,
+    /// Working directory, needed by the board's worktree-linkage lookup
+    /// (`findLinkedCells`), which matches a review worktree path against
+    /// every cell's cwd. Short compared with the prompt text the full board
+    /// view carries, and it is the only field that lookup needs beyond what
+    /// this index already had.
+    cwd: Option<String>,
     agent: String,
     model: Option<String>,
     state: String,
@@ -851,6 +898,7 @@ impl From<crate::store::CellView> for TaskIndexCell {
         Self {
             id: value.id,
             name: value.name,
+            cwd: value.cwd,
             agent: value.agent,
             model: value.model,
             state: value.state,
@@ -1457,6 +1505,7 @@ fn route_for_user(
         ) => proof_terminal_log_attempt(daemon, id, task_idx, scope, cell_idx, proof_idx, attempt),
         ("DELETE", ["api", "squads", id]) => delete_squad(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
+        ("GET", ["api", "guardian-index"]) => guardian_index(daemon),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
@@ -1845,63 +1894,111 @@ fn filter_and_sort_squads(
 }
 
 /// `?status=queued,running&name=foo&sort=name` — see [`filter_and_sort_squads`].
+/// Drop the agent prompt text from a board listing.
+///
+/// Measured against a real history, `cell.prompt`, `cell.system_prompt` and
+/// `proof.system_prompt` were 4.89MB of this endpoint's 6.23MB — 79% of the
+/// whole response — because agent prompts run to multiple KB each and there
+/// are hundreds of cells and proof steps. Nothing that renders a *list*
+/// reads them: the board's sidebar, graph, go-to search, running-cells
+/// dropdown and worktree linkage all use shallow fields, and the CLI's only
+/// consumer of this endpoint (`selector::lookup_squad_id`) reads `id` and
+/// `label`. The one place prompt text is shown is the details pane, for the
+/// single selected cell or proof step, which reads it from
+/// `GET /api/squads/{id}` instead.
+///
+/// Deliberately applied here rather than on `CellView`/`ProofView`
+/// themselves: the per-squad endpoint serializes the same types and must
+/// keep carrying the full text.
+fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
+    for squad in squads.iter_mut() {
+        for task in &mut squad.tasks {
+            for proof in &mut task.proof {
+                proof.system_prompt = None;
+            }
+            for cell in &mut task.cells {
+                cell.prompt = None;
+                cell.system_prompt = None;
+                for proof in &mut cell.proof {
+                    proof.system_prompt = None;
+                }
+            }
+        }
+    }
+}
+
 fn board(daemon: &Daemon, query: &str) -> Reply {
-    let store = daemon.lock();
+    // Served from the read pool, not the writer lock. This is the single
+    // largest response the daemon produces (megabytes once a real squad
+    // history has accumulated) and every open board polls it, so running it
+    // under the daemon-wide mutex stalled the scheduler, every
+    // guardian-merge worker, and every mutation for its whole duration.
+    // `read_board_snapshot` reads both halves inside one read transaction,
+    // which is what preserves the atomicity the mutex used to provide.
+    let read_started = Instant::now();
+    let (squads, merging) = match daemon.read_board_snapshot() {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let view_ms = read_started.elapsed().as_millis();
     // Ground truth is the shared concurrency semaphore, not a DB row count:
     // a permit is held for a cell/proof/review-merge's entire time in
     // flight, which outlasts the windows where any single row actually reads
     // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
     let running = daemon.sem.in_use();
-    let running_reviews: Vec<RunningReviewItem> = store
-        .merging_guardians()
-        .unwrap_or_default()
+    let running_reviews: Vec<RunningReviewItem> = merging
         .into_iter()
         .map(|(id, name)| RunningReviewItem { id, name })
         .collect();
-    match store.list_squads() {
-        Ok(squads) => {
-            let status = query_filter(query, "status");
-            let name = query_filter(query, "name");
-            let sort = query_filter(query, "sort");
-            let squads =
-                filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
-            json(
-                200,
-                &Board {
-                    daemon: DaemonStatus {
-                        running,
-                        max_concurrent: daemon.max_concurrent,
-                        running_reviews,
-                        downtime_active: crate::config::scheduler_in_downtime(),
-                    },
-                    squads,
-                },
-            )
-        }
-        Err(e) => store_error(&e),
-    }
+    let status = query_filter(query, "status");
+    let name = query_filter(query, "name");
+    let sort = query_filter(query, "sort");
+    let mut squads =
+        filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
+    strip_prompt_text(&mut squads);
+    let serialize_started = Instant::now();
+    let reply = json(
+        200,
+        &Board {
+            daemon: DaemonStatus {
+                running,
+                max_concurrent: daemon.max_concurrent,
+                running_reviews,
+                downtime_active: crate::config::scheduler_in_downtime(),
+            },
+            squads,
+        },
+    );
+    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
+    crate::rlog!(
+        INFO,
+        "ralphus [performance] board read={}ms serialize={}ms bytes={}",
+        view_ms,
+        serialize_started.elapsed().as_millis(),
+        reply.body.len()
+    );
+    reply
 }
 
 /// Compact cross-squad task data for the Tasks tab, with stage timings that
 /// separate store-lock contention, view construction, and serialization.
 fn task_index(daemon: &Daemon) -> Reply {
-    let lock_started = Instant::now();
-    let store = daemon.lock();
-    let lock_wait_ms = lock_started.elapsed().as_millis();
-    let view_started = Instant::now();
-    let squads = match store.list_squads() {
-        Ok(squads) => squads,
+    // Same read as `board` above, served from the same pooled snapshot --
+    // this endpoint reads exactly the two things `board_snapshot_conn`
+    // returns, so there is no reason for it to take the writer lock either.
+    // The Tasks tab polls it, and `updateCounter` polls it from every other
+    // tab, so it is nearly as hot as `/api/tasks` itself.
+    let read_started = Instant::now();
+    let (squads, merging) = match daemon.read_board_snapshot() {
+        Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let view_ms = view_started.elapsed().as_millis();
+    let view_ms = read_started.elapsed().as_millis();
     let running = daemon.sem.in_use();
-    let running_reviews = store
-        .merging_guardians()
-        .unwrap_or_default()
+    let running_reviews = merging
         .into_iter()
         .map(|(id, name)| RunningReviewItem { id, name })
         .collect();
-    drop(store);
     let response = TaskIndexBoard {
         daemon: DaemonStatus {
             running,
@@ -1916,8 +2013,7 @@ fn task_index(daemon: &Daemon) -> Reply {
     // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
     crate::rlog!(
         INFO,
-        "ralphus [performance] task-index lock_wait={}ms view={}ms serialize={}ms bytes={}",
-        lock_wait_ms,
+        "ralphus [performance] task-index read={}ms serialize={}ms bytes={}",
         view_ms,
         serialize_started.elapsed().as_millis(),
         reply.body.len()
@@ -4620,6 +4716,25 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
             "validation_failed",
             "the submitted TOML is invalid",
             profile_errors,
+        );
+    }
+    // RAL-4xx: an `agent` candidate list is resolved to its first available
+    // entry exactly once, here, before persistence -- every candidate name
+    // was already confirmed to exist by the profile check just above, so a
+    // failure here only means "none of them are available on this machine."
+    // Runs before `apply_profile_model_defaults` so a winning candidate with
+    // no `model` of its own still gets that same profile-default backfill.
+    let candidate_list_errors = crate::agent_profiles::resolve_agent_candidate_lists(
+        &daemon.lock(),
+        &mut file,
+        &crate::runner::SubprocessRunner::from_env(),
+    );
+    if !candidate_list_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            candidate_list_errors,
         );
     }
     crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
@@ -7358,7 +7473,10 @@ fn add_dependency(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// Dry-run preview of [`restart_squad`]: computes the same downstream-impact
 /// set the real restart would dirty, without mutating anything (RAL-104).
 fn restart_squad_preview(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().compute_squad_restart_impact(id) {
+    // Read-only dry run: served from the read pool, so it no longer queues
+    // behind whatever holds the writer lock. That wait, not the graph walk,
+    // is what made this preview take many seconds on a busy daemon.
+    match daemon.with_read_snapshot(|c| Store::compute_squad_restart_impact_conn(c, id)) {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
     }
@@ -7476,9 +7594,9 @@ fn restart_cell_preview(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply 
             vec![],
         );
     };
+    // Read-only dry run -- see `restart_squad_preview` above.
     match daemon
-        .lock()
-        .compute_cell_restart_impact(id, task_idx, cell_idx)
+        .with_read_snapshot(|c| Store::compute_cell_restart_impact_conn(c, id, task_idx, cell_idx))
     {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
@@ -7545,7 +7663,8 @@ fn restart_task_preview(daemon: &Daemon, id: &str, ti: &str) -> Reply {
     let Ok(task_idx) = ti.parse::<i64>() else {
         return error(400, "bad_request", "task index must be an integer", vec![]);
     };
-    match daemon.lock().compute_task_restart_impact(id, task_idx) {
+    // Read-only dry run -- see `restart_squad_preview` above.
+    match daemon.with_read_snapshot(|c| Store::compute_task_restart_impact_conn(c, id, task_idx)) {
         Ok(impact) => json(200, &impact),
         Err(e) => store_error(&e),
     }
@@ -11087,8 +11206,80 @@ struct PositionResponse {
     position: i64,
 }
 
+/// Lean per-review projection for the Reviews tab's sidebar list, its
+/// status/origin/agent filters, and cross-review notice toasts
+/// (`checkGuardianNotices` in the board JS, which needs notice fields for
+/// every review, not just the one currently open) -- everything the list
+/// needs without hydrating or serializing the full [`crate::guardian::GuardianView`]
+/// (env overrides, build/manual-checks environments, resolver session ids,
+/// token/cost accounting, per-branch detail, ...) for every review on every
+/// poll. Mirrors the `TaskIndex*` structs' relationship to the full board
+/// view (see `task_index` below).
+#[derive(Serialize)]
+struct GuardianIndexEntry {
+    id: String,
+    name: String,
+    status: String,
+    origin: String,
+    /// Just the count -- the sidebar list shows "N branches", never a
+    /// per-branch breakdown; that only renders once a review is open.
+    branch_count: usize,
+    resolver_agent: Option<String>,
+    git_root: String,
+    projects: Vec<String>,
+    notice_kind: Option<String>,
+    notice_message: Option<String>,
+    notice_at_ms: Option<i64>,
+}
+
+impl From<crate::guardian::GuardianView> for GuardianIndexEntry {
+    fn from(value: crate::guardian::GuardianView) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            status: value.status,
+            origin: value.origin,
+            branch_count: value.branches.len(),
+            resolver_agent: value.resolver_agent,
+            git_root: value.git_root,
+            projects: value.projects,
+            notice_kind: value.notice_kind,
+            notice_message: value.notice_message,
+            notice_at_ms: value.notice_at_ms,
+        }
+    }
+}
+
+/// `GET /api/guardian-index` -- the Reviews tab's list poll. Same read as
+/// `guardian_list` below, served from the same read-pool snapshot: this
+/// doesn't avoid the per-row hydration cost noted there, only the
+/// serialization/transfer cost of the ~50 detail-only fields the sidebar
+/// list never reads.
+fn guardian_index(daemon: &Daemon) -> Reply {
+    match daemon.with_read_snapshot(Store::list_guardians_conn) {
+        Ok(gs) => {
+            let queue = daemon.summary_queue_handle();
+            for g in &gs {
+                if g.status == "collecting" {
+                    queue.enqueue(&g.id, crate::summary_worker::Priority::Low);
+                }
+            }
+            let entries: Vec<GuardianIndexEntry> = gs.into_iter().map(Into::into).collect();
+            json(200, &entries)
+        }
+        Err(e) => store_error(&e),
+    }
+}
+
 fn guardian_list(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_guardians() {
+    // Served from the read pool inside one read transaction. This is the
+    // Reviews tab's poll: ~600KB and multiple seconds against a real review
+    // history, since every guardian is hydrated individually. Holding the
+    // writer lock for that stalled the scheduler and every merge worker --
+    // and, because the `MutexGuard` was a temporary in the `match`
+    // scrutinee, it stayed held across the `json(...)` serialization below
+    // as well.
+    match daemon.with_read_snapshot(Store::list_guardians_conn) {
         Ok(gs) => {
             // RAL-121: this list only ever needs to show summary DATA for the
             // one review the user actually opens (`guardian_get` promotes
@@ -11241,6 +11432,14 @@ fn guardian_rename(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 }
 
+/// One `resolver_agent`/`resolver_model` field of a review-settings request,
+/// in the two-level form [`Store::set_guardian_resolver`] takes: an omitted
+/// field (`None`) leaves the stored column alone, an explicitly empty string
+/// clears it, and any other value sets it.
+fn resolver_field(raw: Option<&str>) -> Option<Option<&str>> {
+    raw.map(|s| (!s.is_empty()).then_some(s))
+}
+
 /// Update per-review settings (opt-out flags). Only the fields present in the
 /// body are changed; the updated guardian view is returned.
 fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -11264,8 +11463,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     }
     if req.resolver_agent.is_some() || req.resolver_model.is_some() {
-        let agent = req.resolver_agent.as_deref().filter(|s| !s.is_empty());
-        let model = req.resolver_model.as_deref().filter(|s| !s.is_empty());
+        // Partial update: a field the request omits is left untouched, an
+        // explicitly empty string clears it. Setting only one of the pair must
+        // not clear the other -- see `Store::set_guardian_resolver`.
+        let agent = resolver_field(req.resolver_agent.as_deref());
+        let model = resolver_field(req.resolver_model.as_deref());
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
         }
@@ -11563,8 +11765,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         }
     }
     if req.resolver_agent.is_some() || req.resolver_model.is_some() {
-        let agent = req.resolver_agent.as_deref().filter(|s| !s.is_empty());
-        let model = req.resolver_model.as_deref().filter(|s| !s.is_empty());
+        // Partial update: a field the request omits is left untouched, an
+        // explicitly empty string clears it. Setting only one of the pair must
+        // not clear the other -- see `Store::set_guardian_resolver`.
+        let agent = resolver_field(req.resolver_agent.as_deref());
+        let model = resolver_field(req.resolver_model.as_deref());
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
         }
@@ -20854,6 +21059,34 @@ command = "true"
             route(&d, "GET", &format!("/api/guardians/{gid}"), "").status,
             404
         );
+    }
+
+    #[test]
+    fn guardian_index_returns_lean_summary_only() {
+        let d = daemon();
+        let body = serde_json::json!({
+            "name": "r", "base_branch": "main", "git_root": "/repo",
+        })
+        .to_string();
+        let created = route(&d, "POST", "/api/guardians", &body);
+        assert_eq!(created.status, 201, "{}", created.body);
+        let gid = "guardian-000000000001";
+
+        let index = route(&d, "GET", "/api/guardian-index", "");
+        assert_eq!(index.status, 200, "{}", index.body);
+        assert!(index.body.contains(&format!("\"id\":\"{gid}\"")));
+        assert!(index.body.contains("\"name\":\"r\""));
+        assert!(index.body.contains("\"origin\":"));
+        assert!(index.body.contains("\"branch_count\":0"));
+        // Detail-only fields the sidebar list never reads must not be
+        // serialized here -- that's the entire point of this endpoint.
+        assert!(!index.body.contains("\"skip_auto_build\""));
+        assert!(!index.body.contains("\"combined_env\""));
+        assert!(!index.body.contains("\"attempt_tokens_in\""));
+
+        // The full endpoint is unaffected by this one's existence.
+        let full = route(&d, "GET", "/api/guardians", "");
+        assert!(full.body.contains("\"skip_auto_build\""));
     }
 
     #[test]

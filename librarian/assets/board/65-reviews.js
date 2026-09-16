@@ -168,7 +168,7 @@
        * @param {string} id
        * @returns {void}
        */
-      function selectGuardian(id) { selectedGuardian = id; revealedGuardianId = id; syncHash(true); renderReviews(); renderReviewDetail(); }
+      function selectGuardian(id) { selectedGuardian = id; revealedGuardianId = id; syncHash(true); renderReviews(); renderReviewDetail(); ensureGuardianDetailLoaded(id); }
       /**
        * Renders the review list in the Reviews tab's sidebar.
        * @returns {void}
@@ -184,7 +184,7 @@
         const bulkBar = guardianMultiSel.size > 1 ? reviewSelectionBar() : "";
         el.innerHTML = bulkBar + list.map((g) => `<div class="squad-item ${(g.id===selectedGuardian || guardianMultiSel.has(g.id))?"selected":""}" data-click="onReviewClick" data-ctx="openReviewMenu" data-guardian-id="${esc(g.id)}">
           <button class="btn squadbtn" data-click="openReviewMenu" data-guardian-id="${esc(g.id)}" data-tip="Review actions — rename, hide, cancel, or delete this review.">⋯</button>
-          <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branches.length} branches</div></div>`).join("");
+          <div class="rid">${hiddenGuardianIds.has(g.id) ? `<span data-tip="You've hidden this review from your own view.\nIt's shown now because \"show hidden\" is on, or you navigated to it directly.\nA personal preference — it does not affect what other users see.">🙈</span> ` : ""}${esc(g.name)} ${arbiterBadge(g)}</div><div class="meta">${gdot(g.status)}<span>${g.status}</span> · ${g.branch_count} branches</div></div>`).join("");
       }
       /**
        * Handles a click on a review row: plain select, ctrl/cmd toggle, or
@@ -819,12 +819,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function renderReviewDetail() {
         const el = byId("review-detail");
         const g = guardians.find((x) => x.id === selectedGuardian);
-        if (!g) {
-          // RAL-382: a review just navigated to (gotoReview) whose data hasn't
-          // arrived yet shows a loading placeholder — never the previously
-          // selected review's details, and never a bare "Select a review." that
-          // reads as if the click did nothing.
-          el.innerHTML = (selectedGuardian && reviewDetailLoading === selectedGuardian) ? `<div class="empty">Loading review…</div>` : `<div class="empty">Select a review.</div>`;
+        // `g.branches` is only present once `pollReviews`'s per-selected-guardian
+        // fetch has merged full `GuardianView` detail onto this lean-list entry
+        // (see the `guardians` declaration in `05-engines.js`) -- absent either
+        // because the review hasn't reached the lean list yet (RAL-382,
+        // `reviewDetailLoading`) or because its full detail is still in flight.
+        // Either way: never the previously selected review's details, and never
+        // a bare "Select a review." that reads as if the click did nothing.
+        if (!g || !g.branches) {
+          el.innerHTML = selectedGuardian ? `<div class="empty">Loading review…</div>` : `<div class="empty">Select a review.</div>`;
           return;
         }
         reviewDetailLoading = null;
@@ -2209,7 +2212,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {Promise<void>}
        */
       async function refreshBanner() {
-        // On the reviews tab `guardians` is already fresh; elsewhere fetch it.
-        if (tab !== "reviews") { try { guardians = await (await fetch("/api/guardians")).json(); } catch (_) {} }
+        // On the reviews tab `guardians` is already fresh; elsewhere fetch
+        // it -- the lean list is all `renderReadyBanner` below needs
+        // (status/id/name), and this runs on every tick regardless of tab.
+        if (tab !== "reviews") { try { guardians = await (await fetch("/api/guardian-index")).json(); } catch (_) {} }
         if (!userIsSelecting()) renderReadyBanner();
       }

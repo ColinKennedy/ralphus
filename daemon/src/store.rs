@@ -573,6 +573,11 @@ pub struct SquadView {
     pub finished_at_ms: Option<i64>,
     /// The tasks in the squad.
     pub tasks: Vec<TaskView>,
+    /// Every distinct [`TaskView::project`] among this squad's tasks, in
+    /// first-seen order. Precomputed here so the board's project filter can
+    /// work off the squad row alone rather than walking each squad's whole
+    /// task list -- the one thing the sidebar needed the task tree for.
+    pub projects: Vec<String>,
     /// Reviews (guardians) derived from this squad.
     pub reviews: Vec<SquadReviewRef>,
     /// Persistent environment-variable overrides applied to every subprocess
@@ -787,6 +792,12 @@ pub(crate) struct GuardianWorktreeRetirementRecord {
 // ── Store ────────────────────────────────────────────────────────────────────
 
 /// The task store.
+/// The two halves of one `GET /api/tasks` board read: the squad list, and
+/// the `(id, name)` pairs of reviews currently building a stacked rebase.
+/// See [`Store::board_snapshot_conn`], which reads both from a single
+/// consistent snapshot.
+pub(crate) type BoardSnapshot = (Vec<SquadView>, Vec<(String, String)>);
+
 pub struct Store {
     pub(crate) conn: Connection,
     /// In-process SSE broadcast registry (RAL-167), fed by
@@ -3043,6 +3054,21 @@ impl Store {
 
         for (t_idx, task) in file.task.iter().enumerate() {
             let t_idx_i = i64::try_from(t_idx).unwrap_or(0);
+            // By this point every `agent` candidate list has already been
+            // walked and collapsed to a literal (see
+            // `agent_profiles::resolve_agent_candidate_lists`, called before
+            // `insert_squad`/`insert_squad_with_id`) -- same invariant
+            // `ResolvedAgent::resolve`/`from_task` rely on a few lines below.
+            let task_agent_str = match &task.agent {
+                Some(ralphus_core::schema::AgentSpec::Single(s)) => Some(s.clone()),
+                Some(ralphus_core::schema::AgentSpec::Candidates(_)) => panic!(
+                    "insert_squad_with_id: task \"{}\" still has an unresolved agent \
+                     candidate list -- the caller must walk it first via \
+                     agent_profiles::resolve_agent_candidate_lists",
+                    task.name
+                ),
+                None => None,
+            };
             tx.execute(
                 "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 params![
@@ -3050,7 +3076,7 @@ impl Store {
                     t_idx_i,
                     task.name,
                     task.project,
-                    task.agent,
+                    task_agent_str,
                     task.model,
                     NodeState::Pending.as_str(),
                     to_json(&task.depends_on),
@@ -3506,7 +3532,13 @@ impl Store {
     /// Guardian reviews that are currently building their stacked rebase, for
     /// display in the concurrency-counter dropdown.
     pub fn merging_guardians(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        Self::merging_guardians_conn(&self.conn)
+    }
+
+    /// [`Self::merging_guardians`] against any connection, so a pooled
+    /// read-only connection can serve it without the writer lock.
+    pub(crate) fn merging_guardians_conn(conn: &Connection) -> Result<Vec<(String, String)>> {
+        let mut stmt = conn.prepare(
             "SELECT id, name FROM guardians WHERE status='merging' ORDER BY created_at_ms, id",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -3937,7 +3969,8 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        self.build_squad_view(
+        Self::build_squad_view(
+            &self.conn,
             row.0,
             row.1,
             row.2,
@@ -3951,10 +3984,41 @@ impl Store {
 
     /// Fetch all squads, newest first.
     pub fn list_squads(&self) -> Result<Vec<SquadView>> {
+        Self::list_squads_conn(&self.conn)
+    }
+
+    /// One internally consistent snapshot of everything `GET /api/tasks`
+    /// renders: the squad list, plus the reviews currently building a
+    /// stacked rebase.
+    ///
+    /// Both reads run inside a single `BEGIN DEFERRED` read transaction so
+    /// they observe the same WAL snapshot. This is load-bearing, not
+    /// decoration: SQLite gives each *statement* its own snapshot otherwise,
+    /// so a write landing between them could produce a response showing a
+    /// squad as `running` next to cells that had already finished — a torn
+    /// view indistinguishable, from the board's side, from a stale one. The
+    /// writer-lock path gets this atomicity for free by holding the
+    /// daemon-wide mutex across every statement; a pooled reader, which by
+    /// design does *not* exclude the writer, has to ask for it explicitly.
+    ///
+    /// The transaction is read-only and rolls back on drop.
+    pub(crate) fn board_snapshot_conn(conn: &Connection) -> Result<BoardSnapshot> {
+        let tx = conn.unchecked_transaction()?;
+        let squads = Self::list_squads_conn(&tx)?;
+        let merging = Self::merging_guardians_conn(&tx)?;
+        Ok((squads, merging))
+    }
+
+    /// [`Self::list_squads`] against any connection, so a pooled read-only
+    /// connection (`crate::store_pool`) can serve it without taking the
+    /// writer lock. A caller needing one consistent snapshot across several
+    /// of these reads must wrap them in a read transaction -- see
+    /// [`Self::board_snapshot_conn`].
+    pub(crate) fn list_squads_conn(conn: &Connection) -> Result<Vec<SquadView>> {
         // Tie-break on id so squads created within the same millisecond still order
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error FROM squads ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
@@ -3973,7 +4037,8 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|(id, label, state, ts, started, finished, env, error)| {
-                self.build_squad_view(
+                Self::build_squad_view(
+                    conn,
                     id,
                     label,
                     state,
@@ -4032,7 +4097,7 @@ impl Store {
 
     #[allow(clippy::too_many_arguments)]
     fn build_squad_view(
-        &self,
+        conn: &Connection,
         id: String,
         label: Option<String>,
         state: String,
@@ -4042,7 +4107,7 @@ impl Store {
         env_overrides: BTreeMap<String, String>,
         error: Option<String>,
     ) -> Result<SquadView> {
-        let mut tstmt = self.conn.prepare(
+        let mut tstmt = conn.prepare(
             "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
              FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
@@ -4069,17 +4134,18 @@ impl Store {
 
         // Map each guardian branch of this squad back to its review, so a cell
         // whose review branch is in a guardian's stack lists that review (RAL-17).
-        let review_by_branch = self.reviews_by_branch(&id)?;
+        let review_by_branch = Self::reviews_by_branch(conn, &id)?;
         // Fetch every proof step and cell belonging to this squad in one
         // statement each (grouped in memory below), rather than one query per
         // task/cell as before -- a squad with hundreds of tasks turned that
         // into thousands of individual SQL statements, all serialized under
         // the daemon's single store lock, which is what made `GET /api/tasks`
         // slow enough to stall restart/status-flip requests queued behind it.
-        let proofs_by_scope = self.proofs_by_scope(&id)?;
-        let triage_by_cell = self.triage_types_by_cell(&id)?;
-        let subprojects_by_cell = self.subprojects_by_cell(&id)?;
-        let mut cells_by_task = self.cells_by_task(
+        let proofs_by_scope = Self::proofs_by_scope(conn, &id)?;
+        let triage_by_cell = Self::triage_types_by_cell(conn, &id)?;
+        let subprojects_by_cell = Self::subprojects_by_cell(conn, &id)?;
+        let mut cells_by_task = Self::cells_by_task(
+            conn,
             &id,
             &review_by_branch,
             &proofs_by_scope,
@@ -4131,8 +4197,14 @@ impl Store {
             });
         }
 
-        let reviews = self.reviews_for_squad(&id)?;
-        let state = effective_squad_state(&self.conn, state, &id)?;
+        let reviews = Self::reviews_for_squad(conn, &id)?;
+        let state = effective_squad_state(conn, state, &id)?;
+        let mut projects: Vec<String> = Vec::new();
+        for t in &tasks {
+            if !projects.iter().any(|p| p == &t.project) {
+                projects.push(t.project.clone());
+            }
+        }
         Ok(SquadView {
             id,
             label,
@@ -4141,6 +4213,7 @@ impl Store {
             started_at_ms,
             finished_at_ms,
             tasks,
+            projects,
             reviews,
             env_overrides,
             error,
@@ -4169,8 +4242,8 @@ impl Store {
     /// string join for a pre-RAL-314 row. No status filter -- a squad's
     /// review list has always included terminal (approved/deployed/cancelled)
     /// reviews too.
-    fn reviews_for_squad(&self, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
-        let mut stmt = self.conn.prepare(
+    fn reviews_for_squad(conn: &Connection, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
+        let mut stmt = conn.prepare(
             "SELECT DISTINCT g.id, g.name, g.status, g.origin FROM guardians g
              JOIN cells s ON (
                  s.review_guardian_id = g.id
@@ -4206,14 +4279,14 @@ impl Store {
     /// (see [`Self::proofs_by_scope`]) so each cell's own proof list
     /// can be attached without a further per-cell query.
     fn cells_by_task(
-        &self,
+        conn: &Connection,
         squad_id: &str,
         review_by_branch: &HashMap<(i64, i64), Vec<SquadReviewRef>>,
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
         triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
@@ -4312,12 +4385,12 @@ impl Store {
     /// resolving correctly -- see `collecting_guardians_for_cells`, which
     /// needs the same two-tier lookup.
     fn reviews_by_branch(
-        &self,
+        conn: &Connection,
         squad_id: &str,
     ) -> Result<HashMap<(i64, i64), Vec<SquadReviewRef>>> {
         let mut map: HashMap<(i64, i64), Vec<SquadReviewRef>> = HashMap::new();
 
-        let mut direct_stmt = self.conn.prepare(
+        let mut direct_stmt = conn.prepare(
             "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch, g.origin
              FROM cells s
              JOIN guardians g ON g.id = s.review_guardian_id
@@ -4342,7 +4415,7 @@ impl Store {
             map.entry((task_idx, idx)).or_default().push(rref);
         }
 
-        let mut fallback_stmt = self.conn.prepare(
+        let mut fallback_stmt = conn.prepare(
             "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch, g.origin
              FROM cells s
              JOIN guardian_branches gb ON gb.branch = s.review_branch
@@ -4412,10 +4485,10 @@ impl Store {
     /// constant number of queries regardless of how many tasks/cells it
     /// has, instead of one query per task/cell.
     fn proofs_by_scope(
-        &self,
+        conn: &Connection,
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
@@ -4729,8 +4802,15 @@ impl Store {
     /// Consulted by [`Self::resolve_review_config`] as a layer over the
     /// file-based `.ralphus.toml [review]` defaults.
     pub fn get_project_review_settings(&self, project: &str) -> Result<ProjectReviewSettings> {
-        let raw: Option<String> = self
-            .conn
+        Self::get_project_review_settings_conn(&self.conn, project)
+    }
+    /// [`Self::get_project_review_settings`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn get_project_review_settings_conn(
+        conn: &Connection,
+        project: &str,
+    ) -> Result<ProjectReviewSettings> {
+        let raw: Option<String> = conn
             .query_row(
                 "SELECT settings_json FROM project_review_settings WHERE project=?",
                 params![project],
@@ -4769,8 +4849,17 @@ impl Store {
     /// that project has never saved any settings here.
     #[must_use]
     pub fn project_review_settings_for_path(&self, path: &str) -> ProjectReviewSettings {
-        self.project_name_for_path(path)
-            .and_then(|name| self.get_project_review_settings(&name).ok())
+        Self::project_review_settings_for_path_conn(&self.conn, path)
+    }
+    /// [`Self::project_review_settings_for_path`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    #[must_use]
+    pub(crate) fn project_review_settings_for_path_conn(
+        conn: &Connection,
+        path: &str,
+    ) -> ProjectReviewSettings {
+        Self::project_name_for_path_conn(conn, path)
+            .and_then(|name| Self::get_project_review_settings_conn(conn, &name).ok())
             .unwrap_or_default()
     }
 
@@ -4783,9 +4872,17 @@ impl Store {
     /// today.
     #[must_use]
     pub fn resolve_review_config(&self, cwd: &Path) -> crate::config::ReviewConfig {
+        Self::resolve_review_config_conn(&self.conn, cwd)
+    }
+    /// [`Self::resolve_review_config`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    #[must_use]
+    pub(crate) fn resolve_review_config_conn(
+        conn: &Connection,
+        cwd: &Path,
+    ) -> crate::config::ReviewConfig {
         let file_cfg = crate::config::resolve(cwd);
-        let db_cfg = self
-            .project_review_settings_for_path(&cwd.to_string_lossy())
+        let db_cfg = Self::project_review_settings_for_path_conn(conn, &cwd.to_string_lossy())
             .into_review_config();
         file_cfg.merge(db_cfg)
     }
@@ -4833,8 +4930,13 @@ impl Store {
     /// this guardian's `git_root` belong to" for fork resolution -- a
     /// guardian has no direct project foreign key, only a filesystem path.
     pub fn project_name_for_path(&self, path: &str) -> Option<String> {
+        Self::project_name_for_path_conn(&self.conn, path)
+    }
+    /// [`Self::project_name_for_path`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn project_name_for_path_conn(conn: &Connection, path: &str) -> Option<String> {
         let trimmed = Self::normalize_for_project_lookup(path);
-        let mut stmt = self.conn.prepare("SELECT name, path FROM projects").ok()?;
+        let mut stmt = conn.prepare("SELECT name, path FROM projects").ok()?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .ok()?
@@ -4897,8 +4999,10 @@ impl Store {
     /// separate full-table-scan queries *per guardian*. Same
     /// swallow-and-return-empty failure mode as `project_bool_stamp` (a
     /// project lookup is best-effort, never a hard error).
-    pub(crate) fn load_all_project_stamps(&self) -> Vec<(String, ProjectStamps)> {
-        let mut stmt = match self.conn.prepare(
+    /// [`Self::load_all_project_stamps`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn load_all_project_stamps_conn(conn: &Connection) -> Vec<(String, ProjectStamps)> {
+        let mut stmt = match conn.prepare(
             "SELECT path, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch FROM projects",
         ) {
             Ok(s) => s,
@@ -5895,7 +5999,12 @@ pub struct CancelImpact {
 impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
-        let mut stmt = self.conn.prepare(
+        Self::cells_of_conn(&self.conn, squad_id)
+    }
+    /// [`Self::cells_of`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
+        let mut stmt = conn.prepare(
             "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
@@ -5936,7 +6045,12 @@ impl Store {
 
     /// All tasks of a squad with their dependencies, in order.
     pub fn tasks_of(&self, squad_id: &str) -> Result<Vec<TaskRow>> {
-        let mut stmt = self.conn.prepare(
+        Self::tasks_of_conn(&self.conn, squad_id)
+    }
+    /// [`Self::tasks_of`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn tasks_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<TaskRow>> {
+        let mut stmt = conn.prepare(
             "SELECT idx, name, project, depends_on, soloed FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -6906,6 +7020,14 @@ impl Store {
         &self,
         refs: &[CellRef],
     ) -> Result<HashMap<CellRef, BTreeMap<String, String>>> {
+        Self::resolve_cell_env_overrides_batch_conn(&self.conn, refs)
+    }
+    /// [`Self::resolve_cell_env_overrides_batch`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn resolve_cell_env_overrides_batch_conn(
+        conn: &Connection,
+        refs: &[CellRef],
+    ) -> Result<HashMap<CellRef, BTreeMap<String, String>>> {
         if refs.is_empty() {
             return Ok(HashMap::new());
         }
@@ -6919,7 +7041,7 @@ impl Store {
 
         let mut squad_env: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, env_overrides FROM squads WHERE id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
@@ -6933,7 +7055,7 @@ impl Store {
 
         let mut task_env: HashMap<(String, i64), BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT squad_id, idx, env_overrides FROM tasks WHERE squad_id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
@@ -6951,7 +7073,7 @@ impl Store {
 
         let mut cell_env: HashMap<(String, i64, i64), BTreeMap<String, String>> = HashMap::new();
         {
-            let mut stmt = self.conn.prepare(&format!(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT squad_id, task_idx, idx, env_overrides FROM cells WHERE squad_id IN ({placeholders})"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(squad_ids.iter()), |r| {
@@ -7459,8 +7581,15 @@ impl Store {
     /// non-mutating dry-run preview and the real restart (RAL-104) so the two
     /// can never drift out of sync.
     pub fn compute_squad_restart_impact(&self, squad_id: &str) -> Result<RestartImpact> {
-        let exists: Option<String> = self
-            .conn
+        Self::compute_squad_restart_impact_conn(&self.conn, squad_id)
+    }
+    /// [`Self::compute_squad_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_squad_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> Result<RestartImpact> {
+        let exists: Option<String> = conn
             .query_row("SELECT id FROM squads WHERE id=?", params![squad_id], |r| {
                 r.get(0)
             })
@@ -7468,8 +7597,7 @@ impl Store {
         if exists.is_none() {
             return Err(StoreError::NotFound);
         }
-        let cells = self
-            .cells_of(squad_id)?
+        let cells = Self::cells_of_conn(conn, squad_id)?
             .into_iter()
             .map(|s| RestartImpactCell {
                 task_idx: s.task_idx,
@@ -7478,15 +7606,14 @@ impl Store {
                 cell_id: s.cell_id,
             })
             .collect();
-        let tasks = self
-            .tasks_of(squad_id)?
+        let tasks = Self::tasks_of_conn(conn, squad_id)?
             .into_iter()
             .map(|t| RestartImpactTask {
                 idx: t.idx,
                 name: t.name,
             })
             .collect();
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
         Ok(RestartImpact {
             cells,
             tasks,
@@ -7550,8 +7677,18 @@ impl Store {
         task_idx: i64,
         idx: i64,
     ) -> Result<RestartImpact> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        Self::compute_cell_restart_impact_conn(&self.conn, squad_id, task_idx, idx)
+    }
+    /// [`Self::compute_cell_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_cell_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<RestartImpact> {
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         let target = cells
             .iter()
             .position(|s| s.task_idx == task_idx && s.idx == idx)
@@ -7604,7 +7741,7 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
 
         Ok(RestartImpact {
             cells: affected_cells,
@@ -7674,8 +7811,17 @@ impl Store {
         squad_id: &str,
         task_idx: i64,
     ) -> Result<RestartImpact> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        Self::compute_task_restart_impact_conn(&self.conn, squad_id, task_idx)
+    }
+    /// [`Self::compute_task_restart_impact`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_task_restart_impact_conn(
+        conn: &Connection,
+        squad_id: &str,
+        task_idx: i64,
+    ) -> Result<RestartImpact> {
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         if !tasks.iter().any(|t| t.idx == task_idx) {
             return Err(StoreError::NotFound);
         }
@@ -7735,7 +7881,7 @@ impl Store {
             .collect();
         affected_tasks.sort_by_key(|t| t.idx);
 
-        let dirtied_squads = self.compute_dirty_dependents(squad_id)?;
+        let dirtied_squads = Self::compute_dirty_dependents_conn(conn, squad_id)?;
 
         Ok(RestartImpact {
             cells: affected_cells,
@@ -7863,9 +8009,15 @@ impl Store {
     /// dependent on `squad_id`, in discovery order. Does not mutate anything —
     /// shared by the dry-run preview and [`Store::dirty_dependents`] (RAL-104).
     pub fn compute_dirty_dependents(&self, squad_id: &str) -> Result<Vec<RestartImpactSquad>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, label, depends_on FROM squads")?;
+        Self::compute_dirty_dependents_conn(&self.conn, squad_id)
+    }
+    /// [`Self::compute_dirty_dependents`] against any connection, so the read pool
+    /// (`crate::store_pool`) can serve it without the writer lock.
+    pub(crate) fn compute_dirty_dependents_conn(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> Result<Vec<RestartImpactSquad>> {
+        let mut stmt = conn.prepare("SELECT id, label, depends_on FROM squads")?;
         let all: Vec<(String, Option<String>, Vec<String>)> = stmt
             .query_map([], |r| {
                 Ok((
@@ -14457,6 +14609,75 @@ command = "e"
 
     fn any_guardian(store: &Store) -> String {
         store.create_guardian("r", "main", "/repo").unwrap()
+    }
+
+    /// The board read no longer holds the writer lock, so a write *can* now
+    /// commit while it is running. What keeps `GET /api/tasks` from returning
+    /// a torn view is the read transaction inside
+    /// [`Store::board_snapshot_conn`]; this pins that it is really there.
+    #[test]
+    fn board_snapshot_holds_one_snapshot_across_both_halves() {
+        // Must be an on-disk store: WAL — and therefore the MVCC snapshot
+        // this depends on — is unavailable to the shared-cache in-memory
+        // databases `open_in_memory` creates, so an in-memory version of this
+        // test would exercise table locking instead of the semantics
+        // production actually runs on.
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-board-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+
+        let gid = any_guardian(&store);
+        store
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merging, None)
+            .expect("seed merging");
+
+        let pool = store.read_pool();
+        let conn = pool.acquire().expect("pooled read connection");
+        let tx = conn
+            .unchecked_transaction()
+            .expect("begin read transaction");
+
+        let first = Store::merging_guardians_conn(&tx).expect("first half");
+        assert_eq!(first.len(), 1, "the seeded guardian should read as merging");
+
+        // A writer commits between the snapshot's two reads — in production
+        // this is the scheduler or a merge worker, which the board read no
+        // longer excludes. It must not block, and it must not be visible to
+        // the transaction already in progress.
+        store
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Approved, None)
+            .expect("concurrent write must not block behind the open read");
+
+        // Rules out "the write never landed" as the reason the snapshot
+        // assertion below passes: a different pooled connection, holding no
+        // snapshot of its own, sees the new status immediately.
+        let other = pool.acquire().expect("second pooled read connection");
+        assert!(
+            Store::merging_guardians_conn(&other)
+                .expect("read on a connection with no open snapshot")
+                .is_empty(),
+            "the write must be committed and visible to a fresh reader"
+        );
+
+        let second = Store::merging_guardians_conn(&tx).expect("second half");
+        assert_eq!(
+            second.len(),
+            1,
+            "an open read snapshot must not observe a write committed after it began -- \
+             without the transaction the two halves of one board response could disagree"
+        );
+
+        drop(tx);
+
+        let (_squads, merging_after) = Store::board_snapshot_conn(&conn).expect("fresh snapshot");
+        assert!(
+            merging_after.is_empty(),
+            "a snapshot taken after the write must observe it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

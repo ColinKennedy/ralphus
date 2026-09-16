@@ -54,9 +54,11 @@ pub struct TaskDef {
     /// registry lives in the daemon's store, which `core` cannot see).
     #[serde(default)]
     pub project: Option<String>,
-    /// Agent binary for all cells (e.g. `"claude"`). Cells inherit unless overridden.
+    /// Agent for all cells: a literal name (e.g. `"claude"`), or an ordered
+    /// list of `{agent, model}` candidates to try until one is available
+    /// (see [`AgentSpec`]). Cells inherit unless overridden.
     #[serde(default)]
-    pub agent: Option<String>,
+    pub agent: Option<AgentSpec>,
     /// Default model for all cells. Cells may override.
     #[serde(default)]
     pub model: Option<String>,
@@ -198,9 +200,10 @@ pub struct CellDef {
     /// ID (`"cell-a"`) or cross-task `"<task-name>/<cell-id>"`.
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Override the task-level agent for this cell.
+    /// Override the task-level agent for this cell -- a literal name or a
+    /// candidate list, same shape as [`TaskDef::agent`] (see [`AgentSpec`]).
     #[serde(default)]
-    pub agent: Option<String>,
+    pub agent: Option<AgentSpec>,
     /// Override the task-level model for this cell.
     #[serde(default)]
     pub model: Option<String>,
@@ -1107,6 +1110,56 @@ pub struct ProofStep {
     pub environment: BTreeMap<String, String>,
 }
 
+/// A task's or cell's `agent` value: either a literal name, used as-is with
+/// no resolution of any kind, or an ordered list of candidates to try until
+/// one is available.
+///
+/// The list form is resolved exactly once, at submit time
+/// (`daemon::store::insert_squad_with_id`, the only place that walk
+/// happens): the first available candidate wins and is baked down into a
+/// plain `agent`/`model` pair for that cell/task forever -- restarts reuse
+/// the same pick, never re-walking the list. "Available" is a cheap
+/// presence check (the binary resolves / the profile exists), not a live
+/// reachability probe, so a bad API key or rejected model name still only
+/// surfaces once the picked candidate actually runs, same as it does today
+/// for a literal `agent`.
+///
+/// A literal (`Single`) value never goes through that walk at all -- it is
+/// taken completely at face value, exactly as `agent` always has been.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum AgentSpec {
+    /// A literal agent name.
+    Single(String),
+    /// An ordered list of candidates (see [`AgentSpec`]'s doc comment).
+    Candidates(Vec<AgentCandidate>),
+}
+
+/// One entry in an [`AgentSpec::Candidates`] list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AgentCandidate {
+    /// Agent name for this candidate -- same grammar as a literal `agent`.
+    pub agent: String,
+    /// Model for this candidate. Optional: some backends have a baked-in
+    /// default and don't require one.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl AgentSpec {
+    /// Every candidate agent name in this spec, in order -- a single name
+    /// for [`AgentSpec::Single`], or each entry's `agent` for
+    /// [`AgentSpec::Candidates`]. Lets a check reason about "every backend
+    /// this could resolve to" without caring which shape was written.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            AgentSpec::Single(s) => vec![s.as_str()],
+            AgentSpec::Candidates(list) => list.iter().map(|c| c.agent.as_str()).collect(),
+        }
+    }
+}
+
 /// Resolved agent config after task→cell inheritance is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {
@@ -1262,17 +1315,53 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
 }
 
 impl ResolvedAgent {
-    /// Merge task defaults with cell overrides (cell wins).
+    /// Winning `agent` spec after task→cell inheritance (cell wins), plus
+    /// the merged extra args -- computed before any candidate-list
+    /// availability walk. The common case (`AgentSpec::Single`) can go
+    /// straight to [`Self::resolve`]; a `Candidates` winner must be walked
+    /// by the caller and turned into a final value via
+    /// [`Self::from_candidate`] -- see `daemon::store::insert_squad_with_id`,
+    /// the only place that walk happens.
     #[must_use]
-    pub fn resolve(task: &TaskDef, cell: &CellDef) -> Self {
-        let program = cell
+    pub fn effective_spec(task: &TaskDef, cell: &CellDef) -> (AgentSpec, Vec<String>) {
+        let spec = cell
             .agent
             .clone()
             .or_else(|| task.agent.clone())
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string());
-        let model = cell.model.clone().or_else(|| task.model.clone());
+            .unwrap_or_else(|| AgentSpec::Single(DEFAULT_AGENT.to_string()));
         let mut args = task.args.clone();
         args.extend_from_slice(&cell.args);
+        (spec, args)
+    }
+
+    /// Task-level-only counterpart of [`Self::effective_spec`], for a
+    /// task-scope proof step with no cell.
+    #[must_use]
+    pub fn effective_spec_from_task(task: &TaskDef) -> (AgentSpec, Vec<String>) {
+        let spec = task
+            .agent
+            .clone()
+            .unwrap_or_else(|| AgentSpec::Single(DEFAULT_AGENT.to_string()));
+        (spec, task.args.clone())
+    }
+
+    /// Merge task defaults with cell overrides (cell wins).
+    ///
+    /// # Panics
+    /// Panics if [`Self::effective_spec`] resolves to `AgentSpec::Candidates`
+    /// -- a candidate list must be walked and collapsed by the caller first
+    /// (`daemon::store::insert_squad_with_id`); every other call site only
+    /// ever sees an already-collapsed literal.
+    #[must_use]
+    pub fn resolve(task: &TaskDef, cell: &CellDef) -> Self {
+        let (spec, args) = Self::effective_spec(task, cell);
+        let AgentSpec::Single(program) = spec else {
+            panic!(
+                "ResolvedAgent::resolve called with an unresolved agent candidate list -- \
+                 the caller must walk it first (see Self::effective_spec)"
+            );
+        };
+        let model = cell.model.clone().or_else(|| task.model.clone());
         Self {
             program,
             model,
@@ -1280,16 +1369,33 @@ impl ResolvedAgent {
         }
     }
 
-    /// Task-level defaults only (for task-level proof steps that have no cell).
+    /// Task-level defaults only (for task-level proof steps that have no
+    /// cell). Same `Candidates`-panics contract as [`Self::resolve`].
     #[must_use]
     pub fn from_task(task: &TaskDef) -> Self {
+        let (spec, args) = Self::effective_spec_from_task(task);
+        let AgentSpec::Single(program) = spec else {
+            panic!(
+                "ResolvedAgent::from_task called with an unresolved agent candidate list -- \
+                 the caller must walk it first (see Self::effective_spec_from_task)"
+            );
+        };
         Self {
-            program: task
-                .agent
-                .clone()
-                .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+            program,
             model: task.model.clone(),
-            args: task.args.clone(),
+            args,
+        }
+    }
+
+    /// Build the final resolved value from a chosen candidate -- used once
+    /// the daemon has picked the first available entry out of a
+    /// `Candidates` list.
+    #[must_use]
+    pub fn from_candidate(candidate: &AgentCandidate, args: Vec<String>) -> Self {
+        Self {
+            program: candidate.agent.clone(),
+            model: candidate.model.clone(),
+            args,
         }
     }
 }
@@ -1302,7 +1408,7 @@ mod tests {
         TaskDef {
             name: "t".into(),
             project: None,
-            agent: agent.map(str::to_string),
+            agent: agent.map(|a| AgentSpec::Single(a.to_string())),
             model: model.map(str::to_string),
             machine: None,
             args: args.iter().map(|s| (*s).to_string()).collect(),
@@ -1333,7 +1439,7 @@ mod tests {
             prompt: Some("hi".into()),
             command: None,
             depends_on: vec![],
-            agent: agent.map(str::to_string),
+            agent: agent.map(|a| AgentSpec::Single(a.to_string())),
             model: model.map(str::to_string),
             machine: None,
             system_prompt: None,
@@ -1381,6 +1487,104 @@ mod tests {
         let task = task_with(None, None, &[]);
         let sess = cell_with(None, None, &[]);
         assert_eq!(ResolvedAgent::resolve(&task, &sess).program, DEFAULT_AGENT);
+    }
+
+    #[test]
+    fn agent_spec_deserializes_a_plain_string() {
+        let toml =
+            "[[task]]\nname=\"t\"\nagent=\"codex\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let file: TaskFile = toml::from_str(toml).unwrap();
+        assert_eq!(
+            file.task[0].agent,
+            Some(AgentSpec::Single("codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn agent_spec_deserializes_a_candidate_list() {
+        let toml = concat!(
+            "[[task]]\nname=\"t\"\n",
+            "agent = [\n",
+            "    { agent = \"claude-code\", model = \"sonnet\" },\n",
+            "    { agent = \"codex\" },\n",
+            "]\n",
+            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+        );
+        let file: TaskFile = toml::from_str(toml).unwrap();
+        assert_eq!(
+            file.task[0].agent,
+            Some(AgentSpec::Candidates(vec![
+                AgentCandidate {
+                    agent: "claude-code".to_string(),
+                    model: Some("sonnet".to_string()),
+                },
+                AgentCandidate {
+                    agent: "codex".to_string(),
+                    model: None,
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn agent_spec_names_lists_every_candidate() {
+        let single = AgentSpec::Single("claude".to_string());
+        assert_eq!(single.names(), vec!["claude"]);
+
+        let list = AgentSpec::Candidates(vec![
+            AgentCandidate {
+                agent: "claude-code".to_string(),
+                model: None,
+            },
+            AgentCandidate {
+                agent: "codex".to_string(),
+                model: Some("gpt-5".to_string()),
+            },
+        ]);
+        assert_eq!(list.names(), vec!["claude-code", "codex"]);
+    }
+
+    #[test]
+    fn effective_spec_reports_a_cell_level_candidate_list() {
+        let task = task_with(Some("claude"), Some("task-model"), &["--task"]);
+        let mut cell = cell_with(None, None, &["--sess"]);
+        cell.agent = Some(AgentSpec::Candidates(vec![AgentCandidate {
+            agent: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+        }]));
+        let (spec, args) = ResolvedAgent::effective_spec(&task, &cell);
+        assert_eq!(
+            spec,
+            AgentSpec::Candidates(vec![AgentCandidate {
+                agent: "codex".to_string(),
+                model: Some("gpt-5".to_string()),
+            }])
+        );
+        assert_eq!(args, vec!["--task", "--sess"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unresolved agent candidate list")]
+    fn resolve_panics_on_an_unwalked_candidate_list() {
+        let task = task_with(None, None, &[]);
+        let mut cell = cell_with(None, None, &[]);
+        cell.agent = Some(AgentSpec::Candidates(vec![AgentCandidate {
+            agent: "codex".to_string(),
+            model: None,
+        }]));
+        let _ = ResolvedAgent::resolve(&task, &cell);
+    }
+
+    #[test]
+    fn from_candidate_builds_the_final_resolved_value() {
+        let candidate = AgentCandidate {
+            agent: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+        };
+        let r = ResolvedAgent::from_candidate(&candidate, vec!["--a".to_string()]);
+        assert_eq!(r.program, "codex");
+        assert_eq!(r.model.as_deref(), Some("gpt-5"));
+        assert_eq!(r.args, vec!["--a"]);
     }
 
     #[test]

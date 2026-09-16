@@ -86,7 +86,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
-    `const { showTab, findGuardian, renderReviews, renderReviewDetail } = deps;
+    `const { showTab, findGuardian, renderReviews, renderReviewDetail, ensureGuardianDetailLoaded } = deps;
      var selectedGuardian = null, revealedGuardianId = null, reviewDetailLoading = null;
      ${sliceRegion(REGIONS.gotoReview)}
      return {
@@ -99,6 +99,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
     findGuardian,
     renderReviews: () => { calls.renderReviews++; },
     renderReviewDetail: () => { calls.renderReviewDetail++; },
+    ensureGuardianDetailLoaded: () => {},
   });
   return { ...api, calls };
 }
@@ -109,7 +110,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
  * the test resolves manually, which is what makes out-of-order poll completion
  * deterministic.
  */
-export function makePollReviews({ userIsSelecting = () => false, pendingHash = null, initialGuardians = [], slowRefresh = null } = {}) {
+export function makePollReviews({ selectionWithin = () => false, pendingHash = null, initialGuardians = [], slowRefresh = null } = {}) {
   const calls = { renderReviews: 0, renderReviewDetail: 0, markUpdated: 0, fetches: [] };
   /** @type {{url: string, resolve: (r: {json: () => Promise<any>}) => void, reject: (e: unknown) => void}[]} */
   const pendingFetches = [];
@@ -136,10 +137,11 @@ export function makePollReviews({ userIsSelecting = () => false, pendingHash = n
     pollBranchConflicts: async () => {},
     pollPullRequests: async () => {},
     pollPrErrors: async () => {},
+    fetchGuardianDetail: async () => {},
     preserveUserState: (_el, fn) => fn(),
     renderReviews: () => { calls.renderReviews++; },
     renderReviewDetail: () => { calls.renderReviewDetail++; },
-    userIsSelecting,
+    selectionWithin,
     document: { getElementById: () => ({}) },
   };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
@@ -147,8 +149,8 @@ export function makePollReviews({ userIsSelecting = () => false, pendingHash = n
     "deps",
     "fetchImpl",
     `const { checkGuardianNotices, byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
-             pollBranchConflicts, pollPullRequests, pollPrErrors, preserveUserState, renderReviews, renderReviewDetail,
-             userIsSelecting, document } = deps;
+             pollBranchConflicts, pollPullRequests, pollPrErrors, fetchGuardianDetail, preserveUserState, renderReviews, renderReviewDetail,
+             selectionWithin, document } = deps;
      const fetch = fetchImpl;
      var guardians = ${JSON.stringify(initialGuardians)}, selectedGuardian = null, revealedGuardianId = null,
          pendingHash = ${JSON.stringify(pendingHash)}, reviewDetailLoading = null;
