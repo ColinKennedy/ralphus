@@ -2171,13 +2171,19 @@ pub fn command_help(path: &[&str]) -> Option<String> {
 }
 
 /// The `selector [uri]` chip's grammar, spelled out with concrete examples
-/// (RAL-376) -- both the legacy path form (`cli/src/selector.rs`'s
-/// `parse_squad_selector`) and the RAL-188 URI form
-/// (`core/src/uri.rs`) resolve to the same squad/task/cell/proof
-/// coordinates.
+/// (RAL-376, extended for review branches by RAL-431) -- both the legacy
+/// path form (`cli/src/selector.rs`'s `parse_squad_selector`/
+/// `parse_guardian_selector`) and the RAL-188 URI form (`core/src/uri.rs`)
+/// resolve to the same squad/task/cell/proof coordinates, or (for a review)
+/// a guardian id plus an optional branch.
 const SELECTOR_GRAMMAR: &str = "e.g. squad-000000000001/build/0 (squad/task/cell path) or \
 squad-000000000001/build/proof/0 (proof path); also accepts the RAL-188 URI form, e.g. \
-ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001";
+ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001. To address one branch of a review \
+(rather than the whole review), append `~<branch-id-or-name-or-position>` to the guardian id or \
+`@<name>`, e.g. guardian-000000000001~2 or @my review~feature-x (`#` is also accepted as an \
+older spelling of `~`); the URI form is \
+ralphus:/REVIEW[my review]?id=guardian-000000000001&worktree=feature-x \
+(`&combined` addresses the review's combined worktree instead of one branch).";
 
 /// The `entity_uri [uri]` chip's grammar, mirrored from
 /// `daemon/src/entity_uri.rs`/`cli/src/entity_uri.rs`'s `EntityUri` (RAL-155)
