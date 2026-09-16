@@ -459,6 +459,7 @@
         else if (tab === "projects") tabPoll = pollProjects();
         else if (tab === "machines") tabPoll = pollMachines();
         else if (tab === "triage") tabPoll = pollTriage();
+        else if (tab === "presets") tabPoll = pollPresets();
         else if (tab === "users") tabPoll = pollUsers();
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
