@@ -801,9 +801,10 @@ pub fn cmd_history(opts: &GlobalOpts, selector: &str) -> i32 {
     run_and_report(opts, None, || {
         let resolved = selector::resolve_squad_selector(&client, selector)?;
         if resolved.kind != "cell" && resolved.kind != "proof" {
-            return Err(SelectorError(format!(
-                "'{selector}' is a {} selector -- history targets a cell or proof step",
-                resolved.kind
+            return Err(SelectorError(crate::help_map::wrong_selector_kind_any(
+                selector,
+                &resolved.kind,
+                &["cell", "proof"],
             ))
             .into());
         }

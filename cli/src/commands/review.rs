@@ -1393,7 +1393,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             if cell.kind != "cell" {
                 return fail_message(
                     opts,
-                    format!("'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)"),
+                    crate::help_map::wrong_selector_kind(&cell_selector, &cell.kind, "cell"),
                     2,
                 );
             }
