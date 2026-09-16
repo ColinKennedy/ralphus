@@ -6125,6 +6125,7 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             _ => (req.fallback_name.clone(), None),
         };
         let guard = store.lock().expect("store mutex poisoned");
+        let task_idx_ref = format!("{task_idx}");
         if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
             crate::rlog!(
                 WARNING,
@@ -6138,9 +6139,13 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
                 squad_id: Some(&squad_id),
                 guardian_id: None,
                 cell_id: None,
-                task: None,
+                task: Some(&task_idx_ref),
                 log_path: None,
-                payload: serde_json::json!({"task_idx": task_idx, "error": e.to_string()}),
+                payload: serde_json::json!({
+                    "squad_id": squad_id,
+                    "task_idx": task_idx,
+                    "error": format!("{e}"),
+                }),
                 admin_only: false,
             });
         }
