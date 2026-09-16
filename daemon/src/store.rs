@@ -1170,6 +1170,21 @@ impl Store {
             )
             .unwrap_or(0)
             > 0;
+        // RAL-…: same rationale as `triage_types_preexisting` above --
+        // captured before the `CREATE TABLE IF NOT EXISTS` below so the
+        // starter presets (`crate::presets::DEFAULT_PRESETS`) are seeded
+        // exactly once, at first-ever creation. A user who deregisters one
+        // of these must not see it silently reappear on the next daemon
+        // restart.
+        let presets_preexisting: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='presets'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
         if follows_table_preexisting {
             let _ = self.conn.execute_batch(
                 "
@@ -1921,6 +1936,22 @@ impl Store {
                 ON task_worktree_claims(project, base_branch);
             CREATE INDEX IF NOT EXISTS idx_wt_claims_squad
                 ON task_worktree_claims(project, base_branch, squad_id);
+            -- RAL-…: the preset registry -- named bundles of field defaults
+            -- an `extends = [\"<<ralphus:presets/<name>>>\"]` entry stamps
+            -- into a task's/cell's/proof step's own unset fields at submit
+            -- time. Mirrors `triage_types`' register/list/get/deregister
+            -- shape -- see `crate::presets`. Unlike the built-in
+            -- `unclassified` Triage type, no preset is structurally
+            -- required to exist.
+            CREATE TABLE IF NOT EXISTS presets (
+                name                        TEXT PRIMARY KEY,
+                system_prompt               TEXT,
+                system_prompt_position      TEXT,
+                maximum_context             INTEGER,
+                auto_compact_threshold      INTEGER,
+                maximum_tool_output_tokens  INTEGER,
+                created_at_ms               INTEGER NOT NULL
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
@@ -1944,6 +1975,24 @@ impl Store {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO triage_types(name, label, description, created_at_ms) VALUES(?,?,?,?)",
                     params![name, label, description, now_ms()],
+                )?;
+            }
+        }
+        if !presets_preexisting {
+            for (name, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens) in
+                crate::presets::DEFAULT_PRESETS
+            {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO presets(name, system_prompt, system_prompt_position, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, created_at_ms) VALUES(?,?,?,?,?,?,?)",
+                    params![
+                        name,
+                        system_prompt,
+                        system_prompt_position,
+                        maximum_context.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        auto_compact_threshold.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        maximum_tool_output_tokens.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                        now_ms()
+                    ],
                 )?;
             }
         }

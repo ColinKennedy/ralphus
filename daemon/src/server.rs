@@ -1141,6 +1141,21 @@ fn route_for_user(
         ("GET", ["api", "triage", "candidates"]) => {
             admin_gated(daemon, user_header, || list_triage_candidates(daemon))
         }
+        // Preset registry -- named field-default bundles an `extends`
+        // sentinel stamps into a task's/cell's/proof step's own unset
+        // fields at submit time (see `crate::presets`). Admin-only, client
+        // and server side, mirroring the Triage type registry above --
+        // nothing outside a Presets management panel reads this.
+        ("GET", ["api", "presets"]) => admin_gated(daemon, user_header, || list_presets(daemon)),
+        ("POST", ["api", "presets"]) => {
+            admin_gated(daemon, user_header, || register_preset(daemon, body))
+        }
+        ("GET", ["api", "presets", name]) => {
+            admin_gated(daemon, user_header, || get_preset(daemon, name))
+        }
+        ("DELETE", ["api", "presets", name]) => {
+            admin_gated(daemon, user_header, || deregister_preset(daemon, name))
+        }
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
@@ -3077,6 +3092,113 @@ fn deregister_triage_type(daemon: &Daemon, name: &str) -> Reply {
                 "\"{}\" is the built-in fallback Triage type and can never be deregistered",
                 crate::triage::UNCLASSIFIED_TYPE
             ),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/presets` body. Mirrors [`RegisterTriageTypeBody`]'s
+/// shape/rationale: registering a preset is an explicit administrative
+/// action, not declarable inside a submitted task file.
+#[derive(Deserialize)]
+struct RegisterPresetBody {
+    name: String,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    system_prompt_position: Option<String>,
+    #[serde(default)]
+    maximum_context: Option<u64>,
+    #[serde(default)]
+    auto_compact_threshold: Option<u64>,
+    #[serde(default)]
+    maximum_tool_output_tokens: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PresetsResponse {
+    presets: Vec<crate::presets::PresetView>,
+}
+
+/// `POST /api/presets`: register (or update) a preset. Rejects a
+/// `system_prompt_position` other than the one accepted value up front
+/// (mirroring `core::validate`'s own cell-level check), so a bad value
+/// fails at definition time instead of silently propagating into every
+/// cell that later extends it.
+fn register_preset(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RegisterPresetBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include a \"name\" string",
+            vec![],
+        );
+    };
+    let name = req.name.trim();
+    if name.is_empty() {
+        return error(400, "invalid_value", "'name' must not be empty", vec![]);
+    }
+    if let Some(pos) = &req.system_prompt_position {
+        if pos != ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND {
+            return error(
+                400,
+                "invalid_value",
+                &format!(
+                    "'system_prompt_position' must be \"{}\"",
+                    ralphus_core::schema::SYSTEM_PROMPT_POSITION_APPEND
+                ),
+                vec![],
+            );
+        }
+    }
+    let view = crate::presets::PresetView {
+        name: name.to_string(),
+        system_prompt: req.system_prompt,
+        system_prompt_position: req.system_prompt_position,
+        maximum_context: req.maximum_context,
+        auto_compact_threshold: req.auto_compact_threshold,
+        maximum_tool_output_tokens: req.maximum_tool_output_tokens,
+        created_at_ms: 0,
+    };
+    match daemon.lock().register_preset(&view) {
+        Ok(()) => json(201, &serde_json::json!({"name": name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/presets`: every registered preset.
+fn list_presets(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_presets() {
+        Ok(presets) => json(200, &PresetsResponse { presets }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/presets/{name}`.
+fn get_preset(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_preset(name) {
+        Ok(Some(p)) => json(200, &p),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("preset \"{name}\" is not registered"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/presets/{name}`. Any preset, including a starter default,
+/// may be freely removed -- no built-in-protection like the Triage
+/// registry's `unclassified` type.
+fn deregister_preset(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().deregister_preset(name) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("preset \"{name}\" is not registered"),
             vec![],
         ),
         Err(e) => store_error(&e),
