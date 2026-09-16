@@ -12,27 +12,33 @@ let failure = "Ralphus Pi workspace guard has not validated the workspace";
 let otherWorktrees = [];
 let projectWorktreeRoot = workspaceRoot;
 
-function comparablePath(value) {
-	let resolved = path.resolve(value);
-	if (insensitivePaths && resolved.startsWith("\\\\?\\UNC\\")) {
+function comparablePath(value, pathModule, insensitive) {
+	let resolved = pathModule.resolve(value);
+	if (insensitive && resolved.startsWith("\\\\?\\UNC\\")) {
 		resolved = `\\\\${resolved.slice("\\\\?\\UNC\\".length)}`;
-	} else if (insensitivePaths && resolved.startsWith("\\\\?\\")) {
+	} else if (insensitive && resolved.startsWith("\\\\?\\")) {
 		resolved = resolved.slice("\\\\?\\".length);
 	}
-	return insensitivePaths ? resolved.toLowerCase() : resolved;
+	return insensitive ? resolved.toLowerCase() : resolved;
 }
 
 function samePath(a, b) {
-	return comparablePath(a) === comparablePath(b);
+	return comparablePath(a, path, insensitivePaths) === comparablePath(b, path, insensitivePaths);
 }
 
-function isWithin(candidate, root) {
-	const relative = path.relative(comparablePath(root), comparablePath(candidate));
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+function isWithin(candidate, root, pathModule, insensitive) {
+	const relative = pathModule.relative(comparablePath(root, pathModule, insensitive), comparablePath(candidate, pathModule, insensitive));
+	return relative === "" || (!relative.startsWith("..") && !pathModule.isAbsolute(relative));
 }
 
-function isOtherProjectWorktree(candidate) {
-	return otherWorktrees.some((root) => isWithin(candidate, root));
+// This project nests worktrees under `.git/.ralphus/g/...` of the main
+// worktree, so the main worktree -- always present in `otherWorktrees` --
+// is an ancestor of the assigned one. Checking `otherWorktrees` alone would
+// therefore block the agent from its own assigned files; the assigned
+// worktree always wins over any broader root that merely contains it.
+function isOtherProjectWorktree(candidate, assigned, otherWorktrees, pathModule, insensitive) {
+	if (isWithin(candidate, assigned, pathModule, insensitive)) return false;
+	return otherWorktrees.some((root) => isWithin(candidate, root, pathModule, insensitive));
 }
 
 function quote(value) {
@@ -51,12 +57,25 @@ function listedWorktrees(output) {
 		.filter((root) => !samePath(root, projectWorktreeRoot));
 }
 
-function commandNamesOtherWorktree(command) {
-	const normalized = insensitivePaths ? command.toLowerCase() : command;
-	return otherWorktrees.some((root) => {
-		const candidate = insensitivePaths ? root.toLowerCase() : root;
-		return normalized.includes(candidate);
-	});
+// Same "assigned wins" rule as `isOtherProjectWorktree`, applied as a
+// substring search over a raw shell command instead of a resolved path:
+// mask out every occurrence of the assigned worktree first, so a command
+// that only names the assigned worktree isn't blocked merely because that
+// path's text also contains a shorter `otherWorktrees` root as a prefix
+// (e.g. the assigned worktree nested under the main worktree root).
+function commandNamesOtherWorktree(command, assigned, otherWorktrees, pathModule, insensitive) {
+	const normalize = (text) => {
+		const otherSep = pathModule.sep === "\\" ? "/" : "\\";
+		const canonical = text.split(otherSep).join(pathModule.sep);
+		const stripped = pathModule.sep === "\\"
+			? canonical.replace(/\\\\\?\\UNC\\/g, "\\\\").replace(/\\\\\?\\/g, "")
+			: canonical;
+		return insensitive ? stripped.toLowerCase() : stripped;
+	};
+	const normalizedAssigned = normalize(assigned);
+	const normalizedCommand = normalize(command);
+	const masked = normalizedAssigned ? normalizedCommand.split(normalizedAssigned).join("\0") : normalizedCommand;
+	return otherWorktrees.some((root) => masked.includes(normalize(root)));
 }
 
 function pathForTool(input) {
@@ -64,7 +83,7 @@ function pathForTool(input) {
 	const candidate = path.isAbsolute(input)
 		? path.resolve(input)
 		: path.resolve(workspaceRoot, input);
-	if (isOtherProjectWorktree(candidate)) {
+	if (isOtherProjectWorktree(candidate, projectWorktreeRoot, otherWorktrees, path, insensitivePaths)) {
 		return { block: `Blocked access to another worktree of this project: ${input}` };
 	}
 	return { path: candidate };
@@ -91,7 +110,7 @@ export default function ralphusPiWorkspaceGuard(pi) {
 		if (!ready) return { block: true, reason: failure };
 		if (event.toolName === "bash" || event.toolName === "powershell") {
 			if (typeof event.input.command !== "string") return;
-			if (commandNamesOtherWorktree(event.input.command)) {
+			if (commandNamesOtherWorktree(event.input.command, projectWorktreeRoot, otherWorktrees, path, insensitivePaths)) {
 				return { block: true, reason: "Blocked command targeting another worktree of this project" };
 			}
 			event.input.command = event.toolName === "powershell"
@@ -110,3 +129,5 @@ export default function ralphusPiWorkspaceGuard(pi) {
 		}
 	});
 }
+
+export const __test = { isOtherProjectWorktree, commandNamesOtherWorktree };

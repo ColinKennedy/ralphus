@@ -53,11 +53,37 @@
         const s = window.getSelection && window.getSelection();
         return !!(s && !s.isCollapsed && String(s).length);
       }
+      // RAL-431 (follow-up): `userIsSelecting()` is page-wide, so selecting
+      // text anywhere (e.g. copying a cwd path out of the details pane) froze
+      // the sidebar and graph too, not just the pane holding the selection --
+      // their status badges kept showing whatever state was live at the
+      // moment of selection, indefinitely, since nothing re-checks once a
+      // selection is left dangling (e.g. the tab loses focus before it's
+      // cleared). Scope the skip to whichever element the selection is
+      // actually anchored inside.
       /**
-       * Re-renders the sidebar, graph, and details pane.
+       * Checks whether the user's active text/DOM selection is anchored inside `el`, so only that pane's re-render needs to be skipped.
+       * @param {HTMLElement|null} el
+       * @returns {boolean}
+       */
+      function selectionWithin(el) {
+        if (!el) return false;
+        const a = /** @type {HTMLInputElement|HTMLTextAreaElement|Element|null} */ (document.activeElement);
+        if (a && el.contains(a) && "selectionStart" in a && a.selectionStart != null && a.selectionStart !== a.selectionEnd) return true;
+        const s = window.getSelection && window.getSelection();
+        return !!(s && !s.isCollapsed && String(s).length && s.anchorNode && el.contains(s.anchorNode));
+      }
+      /**
+       * Re-renders the sidebar and graph unconditionally, and the details pane unless the user is mid-selection inside it.
        * @returns {void}
        */
-      function renderAll() { renderSquads(); renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); }
+      function renderAll() {
+        renderSquads();
+        renderGraph();
+        const details = document.getElementById("details");
+        if (selectionWithin(details)) return; // keep the user's in-pane selection intact
+        preserveUserState(details, renderDetails);
+      }
       /**
        * Formats the daemon status counter text, showing "unlimited" in place
        * of the cap when `maxConcurrent` is 0 (no limit).
@@ -732,7 +758,6 @@
             pruneSquadSelCache(squadSelCache, squadNodeCache, squads.map((r) => r.id));
             reconcileLiveSelection();
             if (!selectedSquadId && squads.length) { pendingHash = null; restoreInitialSquadSelection(); renderAll(); syncHash(); }
-            else if (userIsSelecting()) { /* keep the user's text selection intact */ }
             else if (!editing) renderAll();
             else renderSquads();
           }
@@ -741,7 +766,7 @@
           ensurePromptCache(selectedSquadId).then((loaded) => {
             if (!loaded || seq !== tasksPollSeq) return;
             applyPromptCache();
-            if (!userIsSelecting() && !editing) renderAll();
+            if (!editing) renderAll();
           });
         } catch (e) {
           if (seq !== tasksPollSeq) return;
@@ -893,7 +918,10 @@
           // per repo on the daemon side) -- the list/sidebar has no reason to
           // sit blank that whole time when its own data already arrived.
           const renderIfNotSelecting = () => {
-            if (!userIsSelecting()) { renderReviews(); preserveUserState(document.getElementById("review-detail"), renderReviewDetail); }
+            renderReviews();
+            const detail = document.getElementById("review-detail");
+            if (selectionWithin(detail)) return; // keep the user's in-pane selection intact
+            preserveUserState(detail, renderReviewDetail);
           };
           renderIfNotSelecting();
           // Keep every expanded branch's feedback thread fresh (RAL-272) so a
