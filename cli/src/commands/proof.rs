@@ -96,10 +96,9 @@ pub fn resolve_scoped(
 ) -> Result<ResolvedSelector, CommandError> {
     let resolved = resolve_squad_selector(client, selector)?;
     if resolved.kind != want_kind {
-        return Err(CommandError::Selector(SelectorError(format!(
-            "'{selector}' is a {} selector, not a {want_kind}",
-            resolved.kind
-        ))));
+        return Err(CommandError::Selector(SelectorError(
+            crate::help_map::wrong_selector_kind(selector, &resolved.kind, want_kind),
+        )));
     }
     Ok(resolved)
 }

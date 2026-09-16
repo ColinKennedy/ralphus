@@ -237,6 +237,47 @@ fn unknown_subcommand_is_a_usage_error_not_a_panic() {
     assert!(stdout.contains("usage error"));
 }
 
+/// RAL-437 AC5: a mistyped nested subcommand answers with the parent
+/// group's own help, so the real subcommand list is right there.
+#[test]
+fn unknown_cell_subcommand_prints_cell_help() {
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["cell", "bogus"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("usage error: unknown cell subcommand: bogus"));
+    assert!(stdout.contains("ralphus cell -- "));
+    assert!(stdout.contains("SUBCOMMANDS:"));
+    assert!(stdout.contains("edit selector [uri]"));
+}
+
+/// RAL-437 AC4: an unknown flag resolves to the deepest command that did
+/// parse, and prints that command's help -- including the selector format
+/// section, so a second `--help` run is never needed.
+#[test]
+fn unknown_flag_prints_the_deepest_resolved_subcommand_help() {
+    let (code, stdout) = run_cli("http://127.0.0.1:1", &["cell", "edit", "--bogus", "sel"]);
+    assert_eq!(code, 2);
+    assert!(stdout.contains("usage error: unknown cell edit option: --bogus"));
+    assert!(stdout.contains("ralphus cell edit -- "));
+    assert!(stdout.contains("--prompt [text]"));
+    assert!(stdout.contains("selector must name a cell"));
+}
+
+/// RAL-437 AC3: naming the mismatch is half the message; the other half is
+/// the syntax that would have worked. Resolving a bare squad id needs no
+/// daemon round trip, so the unreachable URL here is deliberate.
+#[test]
+fn cell_edit_rejects_a_squad_selector_and_shows_the_cell_format() {
+    let (code, stdout) = run_cli(
+        "http://127.0.0.1:1",
+        &["cell", "edit", "squad-000000000001", "--prompt", "hi"],
+    );
+    assert_eq!(code, 2);
+    assert!(stdout.contains("'squad-000000000001' is a squad selector"));
+    assert!(stdout.contains("a cell selector is required here"));
+    assert!(stdout.contains("expected cell selector format: <squad>/<task>/<cell>"));
+    assert!(stdout.contains("squad-000000000001/build/0"));
+}
+
 #[test]
 fn quick_start_with_no_args_prints_help_rather_than_launching_anything() {
     let (code, stdout) = run_cli("http://127.0.0.1:1", &["quick-start"]);
