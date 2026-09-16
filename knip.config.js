@@ -161,6 +161,5 @@ export default {
   ignore: [
     "librarian/assets/board/**",
     "librarian/assets/vendor/**",
-    "vendor/psmux/tests/**",
   ],
 };

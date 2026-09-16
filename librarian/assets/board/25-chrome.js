@@ -579,6 +579,7 @@
        * @returns {void}
        */
       function onFilter(v) { filters.q = v.toLowerCase(); renderSquads(); syncHash(); }
+      // RALPHUS-PROJECT-FILTER-MENU:BEGIN
       // RAL-345: project filter -- a Set<string> of task-project names,
       // matching `filters.status`'s idiom (a plain Set, checkbox-driven), but
       // with "empty means no filter" semantics rather than status's
@@ -626,7 +627,11 @@
       function projectFilterMenuRowsHtml() {
         const names = projects.map((p) => p.name).sort((a, b) => a.localeCompare(b));
         if (!names.length) return `<div style="color:var(--muted);cursor:default">No registered projects.</div>`;
-        return names.map((name) => `<div class="ctx-check ${filters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${filters.project.has(name) ? "checked" : ""} onchange="toggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+        // A click on the row must not bubble to the document-level
+        // closeProjectFilterMenu listener -- otherwise the very click that's
+        // meant to check the box also tears the menu down underneath it,
+        // undermining the "stays open across individual clicks" design above.
+        return names.map((name) => `<div class="ctx-check ${filters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${filters.project.has(name) ? "checked" : ""} onchange="toggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
       /**
        * Opens the Squads sidebar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks (unlike the column meatball's single-choice menus) since picking several projects in a row is the common case.
@@ -646,6 +651,7 @@
       /** Closes the Squads sidebar's project-filter dropdown, if open. @returns {void} */
       function closeProjectFilterMenu() { const m = document.getElementById("project-filter-menu"); if (m) m.remove(); }
       document.addEventListener("click", closeProjectFilterMenu);
+      // RALPHUS-PROJECT-FILTER-MENU:END
       /**
        * Renders the Reviews sidebar's guardian-status checkboxes and syncs its text filter input.
        * @returns {void}

@@ -774,6 +774,7 @@
         /** @type {HTMLInputElement} */ (byId("tt-show-hidden")).checked = taskTabFilters.showHidden;
         /** @type {HTMLInputElement} */ (byId("tt-needs-me")).checked = taskTabFilters.needsMe;
       }
+      // RALPHUS-TT-PROJECT-FILTER-MENU:BEGIN
       // RAL-345: project filter -- own state/render path, deliberately not
       // shared with the Squads tab's identical-looking (non-`tt`-prefixed)
       // equivalent in 25-chrome.js. Empty set means "no filter" (every
@@ -825,7 +826,11 @@
       function ttProjectFilterMenuRowsHtml() {
         const names = projects.map((p) => p.name).sort((a, b) => a.localeCompare(b));
         if (!names.length) return `<div style="color:var(--muted);cursor:default">No registered projects.</div>`;
-        return names.map((name) => `<div class="ctx-check ${taskTabFilters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer"><input type="checkbox" ${taskTabFilters.project.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+        // A click on the row must not bubble to the document-level
+        // ttCloseProjectFilterMenu listener -- otherwise the very click that's
+        // meant to check the box also tears the menu down underneath it,
+        // undermining the "stays open across individual clicks" design above.
+        return names.map((name) => `<div class="ctx-check ${taskTabFilters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${taskTabFilters.project.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
       /**
        * Opens the Tasks toolbar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
@@ -845,6 +850,7 @@
       /** Closes the Tasks toolbar's project-filter dropdown, if open. @returns {void} */
       function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
       document.addEventListener("click", ttCloseProjectFilterMenu);
+      // RALPHUS-TT-PROJECT-FILTER-MENU:END
       /**
        * Watches/unwatches/mutes a task's star (RAL-362 §5): explicit watch/unwatch round-trips through `/api/watches`; clicking an inherited (squad-covered) watch is a client-only mute/unmute since the daemon has no "exception to a cascade" of its own.
        * @param {string} squadId
