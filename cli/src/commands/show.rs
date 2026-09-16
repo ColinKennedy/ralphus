@@ -11,8 +11,9 @@
 //! exists to port.
 //!
 //! `show help-map` is backed by [`crate::help_map`], this crate's port of
-//! `ralphus.helpmap` (RAL-110): the six guidance notes followed by the full
-//! command-tree text, matching `_cmd_show_help_map`'s exact print sequence.
+//! `ralphus.helpmap` (RAL-110): the guidance notes (see `help_map::full_output`)
+//! followed by the full command-tree text, matching `_cmd_show_help_map`'s
+//! exact print sequence.
 
 use crate::args::GlobalOpts;
 
