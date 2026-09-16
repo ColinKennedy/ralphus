@@ -23,7 +23,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { peek } from "./board-peek-state.mjs";
 
-const { PEEK_MISSING_STRIKE_LIMIT, peekCssKey, peekUrlFor, peekTranscriptUrlFor, nextPeekPaneState } = peek;
+const { PEEK_MISSING_STRIKE_LIMIT, peekCssKey, peekUrlFor, peekTranscriptUrlFor, systemPromptUrlFor, peekPromptDisplay, peekPromptText, nextPeekPaneState } = peek;
 
 const NOW = 1_700_000_000_000;
 
@@ -193,4 +193,44 @@ test("the strike limit is a real tolerance, not a no-op", () => {
     PEEK_MISSING_STRIKE_LIMIT >= 2,
     "a limit of 1 would flash 'session ended' on every transient tape-quiet poll when the probe is down",
   );
+});
+
+// ---- RAL-428: the System Prompt tab's URL derivation + display states ----
+
+test("peek keys resolve to their own system-prompt endpoints", () => {
+  assert.equal(systemPromptUrlFor("cell|squad-abc|0|1"), "/api/squads/squad-abc/cells/0/1/system-prompt");
+  assert.equal(systemPromptUrlFor("proof|squad-abc|0|task|-1|2"), "/api/squads/squad-abc/proofs/0/task/-1/2/system-prompt");
+  assert.equal(systemPromptUrlFor("proof|squad-abc|0|cell|1|2"), "/api/squads/squad-abc/proofs/0/cell/1/2/system-prompt");
+  assert.equal(systemPromptUrlFor("guardian|g1|b2"), "/api/guardians/g1/branches/b2/system-prompt");
+  assert.equal(systemPromptUrlFor("guardian-manual|g1"), "/api/guardians/g1/manual-checks/system-prompt");
+  assert.equal(systemPromptUrlFor("nonsense|whatever"), null);
+});
+
+test("every peek kind the board renders a live viewer for has a system-prompt endpoint", () => {
+  const keys = [
+    "cell|squad-abc|0|1",
+    "proof|squad-abc|0|task|-1|2",
+    "proof|squad-abc|0|cell|1|2",
+    "guardian|g1|b2",
+    "guardian-manual|g1",
+  ];
+  for (const key of keys) {
+    assert.ok(systemPromptUrlFor(key), `${key} should address a system-prompt endpoint`);
+  }
+});
+
+test("peekPromptText returns the loaded prompt, and nothing else", () => {
+  assert.equal(peekPromptText(undefined), null, "never-opened tab has no text");
+  assert.equal(peekPromptText("loading"), null, "in-flight fetch has no text yet");
+  assert.equal(peekPromptText({ error: "this step has no prompt" }), null, "an error state is not prompt text");
+  assert.equal(peekPromptText({ text: "custom system prompt" }), "custom system prompt");
+  assert.equal(peekPromptText({ text: "" }), "", "even an empty string is the real (edited) prompt");
+});
+
+test("peekPromptDisplay renders the three System Prompt tab states", () => {
+  assert.equal(peekPromptDisplay(undefined), "Loading…");
+  assert.equal(peekPromptDisplay("loading"), "Loading…");
+  assert.equal(peekPromptDisplay({ error: "no such step" }), "no such step", "reason shown verbatim");
+  assert.equal(peekPromptDisplay({ text: "the prompt" }), "the prompt");
+  assert.equal(peekPromptDisplay({}), "(no system prompt)", "a state with neither text nor error falls back");
 });

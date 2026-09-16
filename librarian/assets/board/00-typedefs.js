@@ -112,6 +112,17 @@
        * @property {number} total - Transcript size in bytes at read time.
        */
       /**
+       * One `GET .../system-prompt` reply (RAL-428) — the exact effective
+       * system prompt an agent step received, served for the admin-only
+       * System Prompt tab in the live terminal viewer. `system_prompt`
+       * holds the full text when `available`; `reason` explains absence (a
+       * command cell, or a prompt step never yet dispatched).
+       * @typedef {object} SystemPromptReply
+       * @property {boolean} available
+       * @property {string} [system_prompt]
+       * @property {string} [reason]
+       */
+      /**
        * @typedef {object} SquadView
        * @property {string} id
        * @property {string|null} label

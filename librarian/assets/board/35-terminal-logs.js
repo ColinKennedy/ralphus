@@ -144,14 +144,36 @@
         // prepended block (that richer Cartographer stream returns in 2G-B).
         const showDebug = peekShowsDebug(key);
         const shown = cached;
-        const debugToggleHtml = `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        // RAL-428: admins get a two-tab live viewer — the transcript-tape
+        // terminal (default; the Show Debug Messages toggle, jump button and
+        // tape scroll/keydown handlers are all the *terminal* tab's) and the
+        // step's exact system prompt. Non-admins get byte-identical
+        // single-tab markup to what this box always produced. The prompt tab
+        // only ever renders for admins: `peekTab` is per-key session state,
+        // so a demoted admin's stale "prompt" choice ALSO falls back to the
+        // terminal tab.
+        const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
+        const debugToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const copyTip = promptTab
+          ? "Copy this step's system prompt to clipboard.\nCopies the exact text shown on this tab — the full effective prompt the agent received (ralphus's hidden instructions plus the step's authored system prompt).\nA command cell or an agent step never yet dispatched has no text to copy."
+          : "Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after.";
+        const tabsHtml = currentUserIsAdmin
+          ? `<div class="peek-tabs" data-tip="Which content this live viewer shows:\nTerminal — the step's live tmux output, with the Show Debug Messages toggle.\nSystem Prompt — the exact system prompt this step's agent received: ralphus's hidden instructions plus the step's authored system prompt.\nRead-only reference — changing it means editing the task file.\nAdmin-only view — non-admins see only the Terminal tab.">
+              <button class="peek-tab${promptTab ? "" : " active"}" data-click="switchPeekTab" data-key="${esc(key)}" data-tab="terminal" data-tip="The step's live terminal output (default).">Terminal</button>
+              <button class="peek-tab${promptTab ? " active" : ""}" data-click="switchPeekTab" data-key="${esc(key)}" data-tab="prompt" data-tip="The step's exact system prompt — ralphus's hidden instructions plus the step's authored system prompt, exactly as the agent received it.\nRead-only reference — changing it means editing the task file.">System Prompt</button>
+            </div>`
+          : "";
         return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after." data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
-            <div class="peek-pre-wrap">
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+            ${tabsHtml}
+            ${promptTab ? `<div class="peek-pre-wrap">
+              <pre id="peek-prompt-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" data-tip="The exact system prompt this step's agent received — ralphus's hidden instructions plus the step's authored system prompt.\nShown on the System Prompt tab; the ⧉ Copy control copies this text.">${esc(peekPromptDisplay(peekSystemPrompt[key]))}</pre>
+              <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
+            </div>` : `<div class="peek-pre-wrap">
               <pre id="peek-pre-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" tabindex="0" data-key="${esc(key)}" onscroll="onPeekScroll(this.dataset.key)" onkeydown="handlePeekKeydown(event,this.dataset.key)" data-tip="Scroll through the live terminal output.\nClick here then press Ctrl+End to jump to the latest output, or Ctrl+Home to jump to the start.">${shown !== undefined ? esc(shown) : "Loading…"}</pre>
               <button id="peek-jump-${cssKey}" class="peek-jump-btn" style="display:none" data-click="peekScrollToBottom" data-key="${esc(key)}" data-tip="Jump to the latest output.\nAppears once you've scrolled up from the bottom — also triggerable with Ctrl+End while the terminal is focused.">↓ Jump to latest</button>
               <div class="peek-resize-handle" data-peek-key="${key}" data-tip="Drag to resize the live terminal view.\nYour chosen size is kept while you switch between tabs during this browser session."></div>
-            </div>
+            </div>`}
           </div>`;
       }
       /**
@@ -209,6 +231,17 @@
         // leave peekOpen alone so the toggle is remembered per-cell
         // (RAL-162) and skip fetching until it's rendered again.
         if (!document.getElementById(preId)) return;
+        // RAL-428: while this box is showing the System Prompt tab (admins),
+        // the tmux tape isn't what's on screen — skip the tape/pane poll and
+        // just make sure the prompt text is present (idempotent; patched into
+        // the prompt `<pre>` when its fetch lands). Switching back to Terminal
+        // relies on the next poll tick to repopulate the tape content in
+        // place. A non-admin can never render the prompt tab, so their poll
+        // loop is untouched.
+        if (currentUserIsAdmin && peekTab[key] === "prompt") {
+          void ensurePeekSystemPrompt(key);
+          return;
+        }
         const tapeUrl = peekTranscriptUrlFor(key);
         if (!tapeUrl) { delete peekOpen[key]; delete peekContent[key]; delete peekTape[key]; return; }
         try {
@@ -663,7 +696,10 @@
             handle.setPointerCapture(e.pointerId);
             const startY = e.clientY;
             const startH = peekPaneHeight;
-            const pre = document.getElementById(`peek-pre-${peekCssKey(key)}`);
+            // RAL-428: on the System Prompt tab there is no terminal `<pre>` —
+            // resize the prompt `<pre>` instead.
+            const cssKey = peekCssKey(key);
+            const pre = document.getElementById(`peek-pre-${cssKey}`) ?? document.getElementById(`peek-prompt-${cssKey}`);
             /**
              * @param {PointerEvent} ev
              * @returns {void}
