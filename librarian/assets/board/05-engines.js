@@ -199,6 +199,9 @@
       CLICK_HANDLERS.previewPoolThreshold = (e, ds) => previewPoolThreshold(e, ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.confirmPoolThreshold = (e, ds) => confirmPoolThreshold(ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.cancelPoolThresholdPreview = (e, ds) => cancelPoolThresholdPreview(ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.requestDrainTriagePool = (e, ds) => requestDrainTriagePool(e, ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.confirmDrainTriagePool = (e, ds) => confirmDrainTriagePool(ds.project || "", ds.triageType || "");
+      CLICK_HANDLERS.cancelDrainTriagePool = (e, ds) => cancelDrainTriagePool(ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.removeTriageSchedule = (e, ds) => removeTriageSchedule(ds.id || "");
       CLICK_HANDLERS.removeUser = (e, ds) => removeUser(ds.name || "");
       CLICK_HANDLERS.saveUserEdit = (e, ds) => saveUserEdit(ds.name || "");
