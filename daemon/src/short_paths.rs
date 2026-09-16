@@ -115,7 +115,12 @@ where
         let base = short_name(branch);
         let mut candidate = base.clone();
         let mut n = 2;
-        while used.contains(&candidate) {
+        // Case-insensitive: these become directory names on a filesystem
+        // that is case-insensitive on Windows and on a default-configured
+        // macOS, so two branches differing only in case must not be handed
+        // the same bare short name -- see the matching fix in
+        // `worktrees::resolve_task_worktree_dir_with_existing`.
+        while used.iter().any(|u| u.eq_ignore_ascii_case(&candidate)) {
             candidate = format!("{base}-{n}");
             n += 1;
         }
@@ -320,6 +325,19 @@ mod tests {
         assert_eq!(out["improve-wasd-a"], "improve-wasd");
         assert_eq!(out["improve-wasd-b"], "improve-wasd-2");
         assert_eq!(out["improve-wasd-c"], "improve-wasd-3");
+    }
+
+    #[test]
+    fn dedupe_short_names_treats_a_case_only_difference_as_a_collision() {
+        // "RAL-428-x" and "ral-428-x" both truncate to a short name that
+        // differs only in case ("RAL-428" vs "ral-428") -- the same
+        // directory on a case-insensitive filesystem (Windows, default
+        // macOS). A case-sensitive `used.contains` would hand both the bare
+        // short name, silently pointing two different branches' worktrees at
+        // the same on-disk directory.
+        let out = dedupe_short_names(["RAL-428-admin-system-prompt-tab", "ral-428-other-branch"]);
+        assert_eq!(out["RAL-428-admin-system-prompt-tab"], "RAL-428");
+        assert_eq!(out["ral-428-other-branch"], "ral-428-2");
     }
 
     #[test]
