@@ -206,7 +206,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let cell = resolve_squad_selector(client, &cell_selector)?;
             if cell.kind != "cell" {
                 return Err(usage(
-                    format!("'{cell_selector}' does not name a cell (use <squad>/<task>/<cell>)")
+                    ralphus_cli::help_map::wrong_selector_kind(&cell_selector, &cell.kind, "cell")
                         .as_str(),
                 ));
             }

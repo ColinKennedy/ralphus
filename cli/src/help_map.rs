@@ -2132,6 +2132,25 @@ pub fn command_help(path: &[&str]) -> Option<String> {
         }
         out.push_str("    -h, --help                       Print help and exit\n");
     }
+    // RAL-437: before the generic grammar, spell out the one selector shape
+    // *this* command accepts. `cell edit` wants a cell and nothing else, so
+    // showing the whole squad/task/cell/proof language and leaving the
+    // reader to narrow it down is exactly the inference this ticket removes.
+    let typed_selectors: Vec<(String, &'static str, &'static str)> = node
+        .positionals
+        .iter()
+        .filter_map(|chip| {
+            let kind = expected_chip_kind(path, chip)?;
+            Some((display_chip(chip), kind, selector_format(kind)?))
+        })
+        .collect();
+    if !typed_selectors.is_empty() {
+        out.push_str("\nSELECTOR FORMAT:\n");
+        for (displayed, kind, format) in typed_selectors {
+            let name = displayed.split_whitespace().next().unwrap_or(&displayed);
+            out.push_str(&format!("    {name} must name a {kind}: {format}\n"));
+        }
+    }
     if has_uri_chip(
         node.positionals
             .iter()
@@ -2188,6 +2207,123 @@ task:<squad_id>:<task_idx>, cell:<squad_id>:<task_idx>:<cell_idx>, \
 proof:<squad_id>:<task_idx>:<task|cell>:<cell_idx>:<proof_idx> (cell_idx is -1 for a \
 task-scope proof), or guardian:<guardian_id>, e.g. task:squad-000000000001:0 or \
 proof:squad-000000000001:0:cell:0:1";
+
+// ---- per-kind selector grammars (RAL-437) ---------------------------------
+//
+// [`SELECTOR_GRAMMAR`] above describes the selector language as a whole,
+// which is all a generic `[uri]` chip can promise. Most commands are
+// narrower than that: every `cell` subcommand rejects anything that doesn't
+// resolve to a cell, every `task` subcommand wants a task, and so on (see
+// `commands::{cell,task,proof}::resolve_scoped`). The constants below spell
+// out the one shape each of those commands actually accepts, so
+// [`command_help`] can show it up front and
+// [`wrong_selector_kind`] can repeat it verbatim when the user gets it
+// wrong -- help text and error text stay in lockstep because they read the
+// same string.
+
+const SQUAD_SELECTOR_FORMAT: &str = "<squad>, e.g. squad-000000000001 (its id) or the label you \
+gave it; also the URI form ralphus:/SQUAD[my squad]?id=squad-000000000001";
+
+const TASK_SELECTOR_FORMAT: &str = "<squad>/<task>, e.g. squad-000000000001/build (a task name, \
+or its position such as squad-000000000001/0); also the URI form \
+ralphus:/SQUAD[my squad]/TASK[build]?id=squad-000000000001";
+
+const CELL_SELECTOR_FORMAT: &str = "<squad>/<task>/<cell>, e.g. squad-000000000001/build/0 (a \
+cell name, or its position within the task); also the URI form \
+ralphus:/SQUAD[my squad]/TASK[build]/CELL[~0]?id=squad-000000000001";
+
+const PROOF_SELECTOR_FORMAT: &str = "<squad>/<task>/<cell>/proof/<index> for a cell-scoped proof \
+step, e.g. squad-000000000001/build/0/proof/1, or <squad>/<task>/proof/<index> for a \
+task-scoped one; also the URI form \
+ralphus:/SQUAD[my squad]/TASK[build]/CELL[~0]/PROOF[~1]?id=squad-000000000001";
+
+const REVIEW_SELECTOR_FORMAT: &str = "<guardian_id> or @<review name>, e.g. \
+guardian-000000000001 or @my review; append #<branch> or ~<position> to address one of its \
+branches, e.g. @my review#feature-x; also the URI form \
+ralphus:/REVIEW[my review]?id=guardian-000000000001";
+
+/// The concrete selector syntax for one resolved entity `kind` -- the
+/// `kind` strings are exactly those `selector::ResolvedSelector::kind`
+/// produces (`squad`/`task`/`cell`/`proof`), plus `review` for the guardian
+/// selectors `selector::resolve_guardian_selector` handles. Returns `None`
+/// for a kind with no single documented shape, in which case callers fall
+/// back to the generic grammar.
+#[must_use]
+pub fn selector_format(kind: &str) -> Option<&'static str> {
+    match kind {
+        "squad" => Some(SQUAD_SELECTOR_FORMAT),
+        "task" => Some(TASK_SELECTOR_FORMAT),
+        "cell" => Some(CELL_SELECTOR_FORMAT),
+        "proof" => Some(PROOF_SELECTOR_FORMAT),
+        "review" => Some(REVIEW_SELECTOR_FORMAT),
+        _ => None,
+    }
+}
+
+/// The two-part message every typed-selector check raises (RAL-437): first
+/// what the selector the user actually typed addresses, then the syntax the
+/// command wanted. Both halves matter -- naming only the mismatch leaves the
+/// reader to go re-read `--help` to find out what the right shape is.
+#[must_use]
+pub fn wrong_selector_kind(selector: &str, got_kind: &str, want_kind: &str) -> String {
+    wrong_selector_kind_any(selector, got_kind, &[want_kind])
+}
+
+/// [`wrong_selector_kind`] for the handful of commands that accept more than
+/// one kind (`history` takes a cell or a proof step): every acceptable shape
+/// is listed, since naming only the first would send the reader down the
+/// wrong branch of the grammar.
+#[must_use]
+pub fn wrong_selector_kind_any(selector: &str, got_kind: &str, want_kinds: &[&str]) -> String {
+    let wanted = match want_kinds {
+        [] => return format!("'{selector}' is a {got_kind} selector, which is not accepted here"),
+        [single] => (*single).to_string(),
+        [head @ .., last] => format!("{} or {last}", head.join(", ")),
+    };
+    let mut message =
+        format!("'{selector}' is a {got_kind} selector, but a {wanted} selector is required here");
+    for kind in want_kinds {
+        if let Some(format) = selector_format(kind) {
+            message.push_str(&format!("\n  expected {kind} selector format: {format}"));
+        }
+    }
+    message
+}
+
+/// A selector that addresses a review where a squad/task/cell/proof
+/// coordinate was wanted (RAL-437). There is no single kind to name here --
+/// any of the four would have been accepted -- so the whole family's
+/// grammar is quoted instead of one [`selector_format`] entry.
+#[must_use]
+pub fn not_a_squad_family_selector(selector: &str) -> String {
+    format!(
+        "'{selector}' addresses a review, not a squad/task/cell/proof selector\n  \
+         expected a squad/task/cell/proof selector: {SELECTOR_GRAMMAR}"
+    )
+}
+
+/// The entity kind a chip must resolve to on this specific command, or
+/// `None` when the command genuinely accepts any squad/task/cell/proof
+/// coordinate (top-level `history`/`listen`/`get`, `queue set-status`, ...)
+/// and so has nothing narrower to promise than [`SELECTOR_GRAMMAR`].
+fn expected_chip_kind(path: &[&str], chip: &str) -> Option<&'static str> {
+    let name = chip.split_whitespace().next().unwrap_or(chip);
+    match name {
+        // `review link-cell`'s second positional, checked against `kind ==
+        // "cell"` in `commands::review.rs`.
+        "cell" => Some("cell"),
+        // `review move-branch`'s destination review.
+        "to_review" => Some("review"),
+        "selector" => match path.first().copied()? {
+            "cell" => Some("cell"),
+            "task" => Some("task"),
+            "proof" => Some("proof"),
+            "review" => Some("review"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// Free-text description of one chip's grammar, keyed by its bare name --
 /// used by [`command_help`] to build `ralphus <cmd> --help`'s
@@ -2266,17 +2402,53 @@ fn command_tokens(args: &[String]) -> Vec<&str> {
     out
 }
 
-fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, String> {
+/// A rejected invocation: what was wrong, plus the deepest command path that
+/// *was* recognized. `main.rs` prints that path's full `--help` screen right
+/// after the usage line (RAL-437) so a mistyped flag or subcommand is
+/// correctable from the one error, without a second `--help` invocation to
+/// go look up the grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvocationError {
+    pub message: String,
+    pub path: Vec<String>,
+}
+
+impl InvocationError {
+    /// [`Self::path`] in [`command_help`]'s borrowed form.
+    #[must_use]
+    pub fn help_path(&self) -> Vec<&str> {
+        self.path.iter().map(String::as_str).collect()
+    }
+}
+
+impl std::fmt::Display for InvocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for InvocationError {}
+
+fn invocation_error(message: String, path: &[&str]) -> InvocationError {
+    InvocationError {
+        message,
+        path: path.iter().map(|part| (*part).to_string()).collect(),
+    }
+}
+
+fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationError> {
     let tokens = command_tokens(args);
     let Some(first) = tokens.first().copied() else {
         return Ok(Vec::new());
     };
-    if first == "help" {
+    // A leading flag is a flag on `ralphus` itself, not a command name --
+    // same reasoning as the in-loop check below.
+    if first == "help" || first.starts_with('-') {
         return Ok(Vec::new());
     }
     let mut path = vec![first];
-    let mut node =
-        find_registered_node(&path).ok_or_else(|| format!("unknown command: {first}"))?;
+    let mut node = find_registered_node(&path)
+        .ok_or_else(|| invocation_error(format!("unknown command: {first}"), &[]))?;
     let mut index = 1;
     while !node.children.is_empty() && index < tokens.len() {
         let candidate = tokens[index];
@@ -2284,11 +2456,11 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, String> {
             return Ok(path);
         }
         let Some(child) = node.children.iter().find(|child| child.name == candidate) else {
-            if strict {
-                return Err(format!(
-                    "unknown {} subcommand: {candidate}",
-                    path.join(" ")
-                ));
+            // A flag here is a flag, not a misspelled subcommand -- leave it
+            // for `unknown_option` so the message names the real problem.
+            if strict && !candidate.starts_with('-') {
+                let message = format!("unknown {} subcommand: {candidate}", path.join(" "));
+                return Err(invocation_error(message, &path));
             }
             break;
         };
@@ -2297,6 +2469,49 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, String> {
         index += 1;
     }
     Ok(path)
+}
+
+/// Every flag name an option chip declares: one for `--from [index]`, two
+/// for a tristate pair like `--skip-worktrees/--no-skip-worktrees`.
+fn option_names(chip: &str) -> impl Iterator<Item = &str> {
+    chip.split_whitespace()
+        .next()
+        .unwrap_or(chip)
+        .split('/')
+        .filter(|name| !name.is_empty())
+}
+
+/// The first token in `tokens` that looks like an option `node` doesn't
+/// declare. Values of declared value-taking options are stepped over, so
+/// `restart-proof --from -1` reads `-1` as `--from`'s value rather than as
+/// an option of its own.
+fn unknown_option<'a>(node: &HelpNode, tokens: &[&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        index += 1;
+        let Some(body) = token.strip_prefix("--") else {
+            continue;
+        };
+        let (name, inline_value) = match body.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (body, false),
+        };
+        let flag = format!("--{name}");
+        let Some(chip) = node
+            .options
+            .iter()
+            .find(|chip| option_names(chip).any(|declared| declared == flag))
+        else {
+            return Some(token);
+        };
+        // A chip with a `[placeholder]` takes a value; a bare one is a
+        // boolean switch and consumes nothing after it.
+        if !inline_value && chip.contains('[') {
+            index += 1;
+        }
+    }
+    None
 }
 
 /// Returns the requested help screen before any ordinary parsing or work.
@@ -2315,11 +2530,30 @@ pub fn requested_help(args: &[String]) -> Option<String> {
     command_help(&path)
 }
 
-/// Validates the command-prefix portion of an invocation against the same
-/// registry that renders help. This is the structural guard: adding parser
-/// code alone cannot expose a new command without a registered help node.
-pub fn validate_invocation(args: &[String]) -> Result<(), String> {
-    resolved_path(args, true).map(|_| ())
+/// Validates the command-prefix portion of an invocation, and the options
+/// that follow it, against the same registry that renders help. This is the
+/// structural guard: adding parser code alone cannot expose a new command --
+/// or a new flag on an existing one -- without a registered help node to
+/// document it.
+pub fn validate_invocation(args: &[String]) -> Result<(), InvocationError> {
+    let path = resolved_path(args, true)?;
+    let Some(node) = find_registered_node(&path) else {
+        return Ok(());
+    };
+    let tokens = command_tokens(args);
+    let tail = &tokens[path.len().min(tokens.len())..];
+    if let Some(flag) = unknown_option(node, tail) {
+        let scope = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", path.join(" "))
+        };
+        return Err(invocation_error(
+            format!("unknown {scope}option: {flag}"),
+            &path,
+        ));
+    }
+    Ok(())
 }
 
 /// Every user-callable command path, used by exhaustive invariant tests.
@@ -2428,6 +2662,10 @@ pub fn full_output() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
 
     const SAMPLE_CHILD: HelpNode = node(
         "alpha",
@@ -2815,6 +3053,185 @@ mod tests {
             "{} quick-start manager --",
             crate::program_name::resolve_program_name()
         )));
+    }
+
+    /// RAL-437 AC1: a command that only accepts one kind of selector says
+    /// which kind, and shows syntax the reader can copy, rather than
+    /// leaving them to narrow the whole selector language down themselves.
+    #[test]
+    fn command_help_spells_out_the_selector_kind_each_command_accepts() {
+        for (path, kind, example) in [
+            (["cell", "edit"], "cell", "squad-000000000001/build/0"),
+            (["cell", "show"], "cell", "squad-000000000001/build/0"),
+            (["task", "show"], "task", "squad-000000000001/build"),
+            (
+                ["proof", "show"],
+                "proof",
+                "squad-000000000001/build/0/proof/1",
+            ),
+            (["review", "show"], "review", "guardian-000000000001"),
+        ] {
+            let text = command_help(&path).unwrap_or_else(|| panic!("help for {path:?}"));
+            assert!(
+                text.contains("SELECTOR FORMAT:"),
+                "no selector format section for {path:?}"
+            );
+            assert!(
+                text.contains(&format!("selector must name a {kind}")),
+                "{path:?} does not say it wants a {kind}: {text}"
+            );
+            assert!(
+                text.contains(example),
+                "{path:?} is missing the concrete example {example}"
+            );
+        }
+
+        // `review link-cell` takes one of each, so both are spelled out.
+        let link_cell = command_help(&["review", "link-cell"]).expect("link-cell help");
+        assert!(link_cell.contains("selector must name a review"));
+        assert!(link_cell.contains("cell must name a cell"));
+
+        // Commands that genuinely accept any squad/task/cell/proof
+        // coordinate have nothing narrower to promise, so they keep only
+        // the generic grammar.
+        let history = command_help(&["history"]).expect("history help");
+        assert!(!history.contains("SELECTOR FORMAT:"));
+        assert!(history.contains("URI ARGUMENTS:"));
+    }
+
+    /// RAL-437 AC2: the per-command selector sections are a property of
+    /// `command_help` alone -- `show help-map`'s tree is unchanged.
+    #[test]
+    fn selector_format_sections_never_reach_the_help_map_tree() {
+        let full = full_output();
+        assert!(!full.contains("SELECTOR FORMAT"));
+        for format in [
+            SQUAD_SELECTOR_FORMAT,
+            TASK_SELECTOR_FORMAT,
+            CELL_SELECTOR_FORMAT,
+            PROOF_SELECTOR_FORMAT,
+            REVIEW_SELECTOR_FORMAT,
+        ] {
+            assert!(
+                !full.contains(format),
+                "per-kind format leaked into help-map"
+            );
+        }
+    }
+
+    /// RAL-437: the mismatch and the fix, in one message.
+    #[test]
+    fn wrong_selector_kind_names_what_was_given_and_what_was_wanted() {
+        let message = wrong_selector_kind("squad-000000000001", "squad", "cell");
+        assert!(message.contains("'squad-000000000001' is a squad selector"));
+        assert!(message.contains("a cell selector is required here"));
+        assert!(message.contains("expected cell selector format:"));
+        assert!(message.contains(CELL_SELECTOR_FORMAT));
+
+        let either = wrong_selector_kind_any("squad-000000000001", "squad", &["cell", "proof"]);
+        assert!(either.contains("a cell or proof selector is required here"));
+        assert!(either.contains("expected cell selector format:"));
+        assert!(either.contains("expected proof selector format:"));
+    }
+
+    /// A selector from the wrong family entirely still gets the second
+    /// half of the message -- there is just no single kind to name.
+    #[test]
+    fn a_review_uri_where_a_squad_coordinate_belongs_quotes_the_family_grammar() {
+        let message = not_a_squad_family_selector("REVIEW[my review]");
+        assert!(message.contains("'REVIEW[my review]' addresses a review"));
+        assert!(message.contains(
+            "
+  expected a squad/task/cell/proof selector: "
+        ));
+        assert!(message.contains(SELECTOR_GRAMMAR));
+    }
+
+    /// RAL-437 AC4/AC5: both failures carry the deepest command whose help
+    /// still applies, which is what `main.rs` prints after the usage line.
+    #[test]
+    fn rejected_invocations_carry_the_deepest_applicable_help_path() {
+        let unknown_flag = validate_invocation(&v(&["cell", "edit", "--bogus", "sel"]))
+            .expect_err("unknown flag rejected");
+        assert_eq!(unknown_flag.path, v(&["cell", "edit"]));
+        assert_eq!(unknown_flag.message, "unknown cell edit option: --bogus");
+
+        let unknown_sub =
+            validate_invocation(&v(&["cell", "bogus"])).expect_err("unknown subcommand rejected");
+        assert_eq!(unknown_sub.path, v(&["cell"]));
+        assert!(
+            command_help(&unknown_sub.help_path())
+                .expect("cell help")
+                .starts_with(&format!(
+                    "{} cell --",
+                    crate::program_name::resolve_program_name()
+                ))
+        );
+
+        // A flag typed where a subcommand belongs is reported as the flag it
+        // is, against the group that rejected it.
+        let flag_on_group =
+            validate_invocation(&v(&["cell", "--bogus"])).expect_err("group flag rejected");
+        assert_eq!(flag_on_group.path, v(&["cell"]));
+        assert_eq!(flag_on_group.message, "unknown cell option: --bogus");
+
+        let unknown_root = validate_invocation(&v(&["totally-bogus"])).expect_err("rejected");
+        assert!(unknown_root.path.is_empty());
+
+        // A leading flag belongs to `ralphus` itself, so it is reported
+        // against the root rather than as a misspelled command name.
+        let root_flag = validate_invocation(&v(&["--bogus"])).expect_err("rejected");
+        assert!(root_flag.path.is_empty());
+        assert_eq!(root_flag.message, "unknown option: --bogus");
+    }
+
+    /// The unknown-option scan must not trip over a declared option's own
+    /// value, including a negative number, nor over a tristate pair's
+    /// `--no-` half or an `=`-joined value.
+    #[test]
+    fn declared_options_and_their_values_pass_validation() {
+        for argv in [
+            v(&["cell", "restart-proof", "--from", "-1", "sel"]),
+            v(&["cell", "edit", "--prompt", "--not-a-flag", "sel"]),
+            v(&["cell", "terminal", "--mode=readonly", "sel"]),
+            v(&[
+                "project",
+                "review-settings",
+                "set",
+                "proj",
+                "--no-match-pr-branch-name",
+            ]),
+            v(&["queue", "list", "--all"]),
+            v(&["quick-start", "manager", "codex", "--", "--anything"]),
+        ] {
+            assert!(
+                validate_invocation(&argv).is_ok(),
+                "wrongly rejected: {argv:?}"
+            );
+        }
+    }
+
+    /// Nothing the help tree documents may be rejected by the scan that
+    /// reads it -- the drift this guards against is a chip whose flag name
+    /// the matcher fails to recognize (e.g. a tristate pair).
+    #[test]
+    fn every_documented_option_survives_invocation_validation() {
+        for (path, node) in registered_leaves() {
+            for chip in node.options {
+                for name in option_names(chip) {
+                    let mut argv: Vec<String> =
+                        path.iter().map(|part| (*part).to_string()).collect();
+                    argv.push(name.to_string());
+                    if chip.contains('[') {
+                        argv.push("value".to_string());
+                    }
+                    assert!(
+                        validate_invocation(&argv).is_ok(),
+                        "documented option {name} rejected on {path:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

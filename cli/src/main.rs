@@ -30,8 +30,15 @@ fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::SUCCESS;
     }
-    if let Err(message) = ralphus_cli::help_map::validate_invocation(&raw_args) {
-        println!("usage error: {message}");
+    if let Err(error) = ralphus_cli::help_map::validate_invocation(&raw_args) {
+        println!("usage error: {error}");
+        // RAL-437: follow the usage line with the deepest command help that
+        // still applies, so an unknown flag or nested subcommand is
+        // correctable from this one message.
+        if let Some(help) = ralphus_cli::help_map::command_help(&error.help_path()) {
+            println!();
+            println!("{help}");
+        }
         return std::process::ExitCode::from(2);
     }
     let (opts, args) = extract_global_opts(&raw_args);

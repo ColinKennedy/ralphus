@@ -292,9 +292,10 @@ fn exec_history(client: &DaemonClient, sel: &str) -> ExecResult {
     let resolved = selector::resolve_squad_selector(client, sel)?;
     if resolved.kind != "cell" && resolved.kind != "proof" {
         return Err(CommandError::Selector(
-            ralphus_cli::selector::SelectorError(format!(
-                "'{sel}' is a {} selector -- history targets a cell or proof step",
-                resolved.kind
+            ralphus_cli::selector::SelectorError(ralphus_cli::help_map::wrong_selector_kind_any(
+                sel,
+                &resolved.kind,
+                &["cell", "proof"],
             )),
         ));
     }

@@ -80,8 +80,8 @@ fn squad_selector_from_uri(
     raw: &str,
 ) -> Result<RawSquadSelector, SelectorError> {
     if parsed.kinds().first() != Some(&"SQUAD") {
-        return Err(SelectorError(format!(
-            "'{raw}' addresses a review, not a squad/task/cell/proof"
+        return Err(SelectorError(crate::help_map::not_a_squad_family_selector(
+            raw,
         )));
     }
     let squad_seg = parsed
@@ -416,9 +416,10 @@ pub fn parse_guardian_selector(raw: &str) -> Result<RawGuardianSelector, Selecto
         let parsed = uri::parse_uri(raw)?;
         let kind = *parsed.kinds().first().unwrap_or(&"");
         if kind != "REVIEW" {
-            return Err(SelectorError(format!(
-                "'{raw}' addresses a {}, not a review",
-                kind.to_lowercase()
+            return Err(SelectorError(crate::help_map::wrong_selector_kind(
+                raw,
+                &kind.to_lowercase(),
+                "review",
             )));
         }
         let segment = &parsed.segments[0];

@@ -43,6 +43,13 @@ detailed usage and exit before doing any command work.
 | 3 | not found (HTTP 404) |
 | 4 | conflict (HTTP 409, e.g. "already merging") |
 
+An unknown flag or an unknown nested subcommand exits 2 and prints the
+deepest command help that still applies (RAL-437): `ralphus cell bogus`
+answers with `ralphus cell --help`, and `ralphus cell edit --bogus` answers
+with `ralphus cell edit --help`. The valid subcommands, flags, and selector
+format are all in that one reply, so a follow-up `--help` run is never
+needed to find them.
+
 ## Selectors
 
 Most `show`/action commands take a **selector** instead of raw ids/indices
@@ -56,6 +63,16 @@ family, `status`, `graph`, `retry`, `review pr *`) are **not** selectors or
 URIs: they're opaque ids the daemon assigns, matched only by exact string
 equality (RAL-431). Copy one from another command's output (e.g. `squad
 list`) rather than typing a selector or URI there.
+
+Most commands accept only **one kind** of selector: every `cell` subcommand
+wants a cell, every `task` subcommand a task, every `proof` subcommand a
+proof step, and every `review` subcommand a review. `ralphus <cmd> --help`
+prints that one shape under a `SELECTOR FORMAT:` heading, and passing the
+wrong kind exits 2 with the same text (RAL-437) — e.g. `ralphus cell edit
+squad-000000000001` reports that it got a squad selector where a cell
+selector is required, and quotes `<squad>/<task>/<cell>`. The commands that
+genuinely take any squad/task/cell/proof coordinate (`get`, `history`,
+`listen`, `queue set-status`/`reorder`/`set-position`) have no such heading.
 
 ### The ralphus URI scheme (RAL-188)
 
