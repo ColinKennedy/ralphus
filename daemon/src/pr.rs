@@ -2882,14 +2882,35 @@ fn settle_pr_merge_states(
             pr.branch_id,
             current_guardian.status,
         );
+        // RAL-451: one dismissible mailbox notice per dropped PR, rather than
+        // the old `set_guardian_notice` single overwritable slot -- that
+        // mechanism has no per-user "seen" tracking, so the board re-toasted
+        // it on every `/api/guardians` poll until a *newer* notice replaced
+        // it. The dropped-PR row itself (`state='dropped'` + `dropped_reason`,
+        // surfaced in the "view past PR stacks" modal) remains the permanent
+        // record of what happened; this notice is just the interruption, and
+        // is safe to lose once acknowledged.
+        let pr_ref = pr
+            .pr_url
+            .clone()
+            .unwrap_or_else(|| format!("{} PR/MR #{}", pr.forge, pr.pr_number.unwrap_or_default()));
+        let message = format!(
+            "Linked pull request {pr_ref} merged on the forge while review '{}' ({id}) had a \
+             merge/feedback pass in flight. It has been dropped from the review -- check whether \
+             any in-flight work still applies, and resubmit a fresh PR if needed.",
+            current_guardian.name,
+        );
+        let entity_uri = format!("guardian:{id}");
+        let _ = guard.enqueue_mailbox_message_ex(
+            crate::mailbox::MailboxPriority::High,
+            &message,
+            None,
+            None,
+            None,
+            Some(&entity_uri),
+            Some("review"),
+        );
     }
-    let _ = store.lock().set_guardian_notice(
-        id,
-        "pr_merged_mid_flight",
-        "A linked pull request merged on the forge while this review had a merge/feedback pass \
-         in flight. It has been dropped from the review -- check whether any in-flight work still \
-         applies, and resubmit a fresh PR if needed.",
-    );
     true
 }
 
@@ -9722,10 +9743,6 @@ mod tests {
             "merging",
             "a mid-flight review must not be silently force-approved"
         );
-        assert_eq!(
-            updated_guardian.notice_kind.as_deref(),
-            Some("pr_merged_mid_flight")
-        );
         let dropped_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(
             dropped_pr.state, "dropped",
@@ -9735,6 +9752,20 @@ mod tests {
             dropped_pr.dropped_reason.is_some(),
             "a dropped pr row must record why"
         );
+
+        // RAL-451: the drop is reported through the dismissible mailbox
+        // system, one message per dropped PR, rather than the old
+        // `set_guardian_notice` overwritable slot.
+        let messages = store
+            .lock()
+            .mailbox_messages_for_client_filtered("any-client", false, None, Some("review"))
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].entity_uri.as_deref(),
+            Some(format!("guardian:{gid}").as_str())
+        );
+        assert!(messages[0].message.contains("dropped from the review"));
 
         handle.join().unwrap();
     }

@@ -1,7 +1,10 @@
-// Coverage for the board's popup (toast) that explains a guardian notice,
-// including the RAL-300 case: a linked PR merged out-of-band while a
-// rebase/feedback pass owned the review, so the daemon drops the stale PR
-// row and records a `pr_merged_mid_flight` notice for the board to surface.
+// Coverage for the board's popup (toast) that explains a guardian notice --
+// the `set_guardian_notice`-backed, one-shot informational kinds still
+// delivered this way (e.g. `forge_drift_interrupted_local`, RAL-299). As of
+// RAL-451, `pr_merged_mid_flight` (a linked PR merging out-of-band while a
+// rebase/feedback pass owned the review) no longer goes through this toast --
+// it's routed through the dismissible mailbox widget instead (see
+// `daemon/src/pr.rs`'s `settle_pr_merge_states` and `test/mailbox.test.mjs`).
 //
 // Run with `npm test` (node --test). See ./board-guardian-notice.mjs for how
 // the view logic is loaded out of the real board.html.
@@ -12,27 +15,23 @@ import { guardianNotice, boardSource } from "./board-guardian-notice.mjs";
 
 const { pendingGuardianNoticeToasts } = guardianNotice;
 
-/** A minimal GuardianView-shaped fixture for a dropped, out-of-band-merged PR notice. */
-const DROPPED_PR_NOTICE = {
+/** A minimal GuardianView-shaped fixture for a forge-drift-interrupted-local notice. */
+const FORGE_DRIFT_NOTICE = {
   id: "guardian-1",
   name: "demo",
-  notice_kind: "pr_merged_mid_flight",
+  notice_kind: "forge_drift_interrupted_local",
   notice_message:
-    "A linked pull request merged on the forge while this review had a merge/feedback pass " +
-    "in flight. It has been dropped from the review -- check whether any in-flight work still " +
-    "applies, and resubmit a fresh PR if needed.",
+    "A GitHub/GitLab stack edit arrived while a local review edit was in progress; the newest base edit won.",
   notice_at_ms: 1000,
 };
 
-test("a dropped, out-of-band-merged PR produces a popup explaining what happened", () => {
-  const toasts = pendingGuardianNoticeToasts([DROPPED_PR_NOTICE], new Map());
+test("a guardian notice produces a popup explaining what happened", () => {
+  const toasts = pendingGuardianNoticeToasts([FORGE_DRIFT_NOTICE], new Map());
   assert.equal(toasts.length, 1);
   const [toast] = toasts;
   assert.equal(toast.id, "guardian-1");
   assert.match(toast.text, /demo:/);
-  assert.match(toast.text, /merged on the forge/i);
-  assert.match(toast.text, /dropped from the review/i);
-  assert.match(toast.text, /resubmit a fresh PR/i);
+  assert.match(toast.text, /stack edit arrived/i);
 });
 
 test("a guardian with no notice produces no popup", () => {
@@ -44,36 +43,36 @@ test("a guardian with no notice produces no popup", () => {
 });
 
 test("a notice already shown at the same notice_at_ms is not re-shown", () => {
-  const shown = new Map([["guardian-1", DROPPED_PR_NOTICE.notice_at_ms]]);
-  const toasts = pendingGuardianNoticeToasts([DROPPED_PR_NOTICE], shown);
+  const shown = new Map([["guardian-1", FORGE_DRIFT_NOTICE.notice_at_ms]]);
+  const toasts = pendingGuardianNoticeToasts([FORGE_DRIFT_NOTICE], shown);
   assert.deepEqual(toasts, []);
 });
 
 test("a fresh notice newer than what was shown is popped up again", () => {
   const shown = new Map([["guardian-1", 500]]);
-  const toasts = pendingGuardianNoticeToasts([DROPPED_PR_NOTICE], shown);
+  const toasts = pendingGuardianNoticeToasts([FORGE_DRIFT_NOTICE], shown);
   assert.equal(toasts.length, 1);
   assert.equal(toasts[0].notice_at_ms, 1000);
 });
 
 test("pendingGuardianNoticeToasts does not mutate the shown map itself", () => {
   const shown = new Map();
-  pendingGuardianNoticeToasts([DROPPED_PR_NOTICE], shown);
+  pendingGuardianNoticeToasts([FORGE_DRIFT_NOTICE], shown);
   assert.equal(shown.size, 0, "the caller, not this pure function, records what was shown");
 });
 
 test("a notice with no message falls back to the notice kind", () => {
   const toasts = pendingGuardianNoticeToasts(
-    [{ id: "guardian-1", name: "demo", notice_kind: "pr_merged_mid_flight", notice_message: null, notice_at_ms: 1 }],
+    [{ id: "guardian-1", name: "demo", notice_kind: "auto_build_failed", notice_message: null, notice_at_ms: 1 }],
     new Map(),
   );
-  assert.match(toasts[0].text, /pr_merged_mid_flight/);
+  assert.match(toasts[0].text, /auto_build_failed/);
 });
 
 test("multiple guardians each newer than last-shown all produce a popup", () => {
   const list = [
-    { ...DROPPED_PR_NOTICE, id: "guardian-1" },
-    { ...DROPPED_PR_NOTICE, id: "guardian-2", name: "other" },
+    { ...FORGE_DRIFT_NOTICE, id: "guardian-1" },
+    { ...FORGE_DRIFT_NOTICE, id: "guardian-2", name: "other" },
   ];
   const toasts = pendingGuardianNoticeToasts(list, new Map());
   assert.equal(toasts.length, 2);
