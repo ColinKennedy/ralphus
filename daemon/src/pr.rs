@@ -1625,7 +1625,6 @@ fn synthesize_pr_text(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
-        hide_thinking: false,
         maximum_timeout: None,
     };
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome

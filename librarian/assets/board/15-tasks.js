@@ -1490,6 +1490,10 @@
       let showDebugMessagesDefault = false;
       /** @type {{[key: string]: boolean}} peek key -> per-pane override of whether ralphus's own diagnostic/telemetry lines are shown (RAL-232), set by toggling that pane's "Show Debug Messages" checkbox. Absent means "use showDebugMessagesDefault." Session-only, like every other peek* map -- not persisted. */
       let peekShowDebug = {};
+      /** @type {boolean} config-driven default (`live_view.hide_thinking`, `.ralphus.toml`) for whether a newly-opened Live View pane starts with the model's thinking/reasoning folded away (RAL-434). Fetched once at page load by fetchLiveViewConfigDefault(); a per-pane override in peekShowThinking takes precedence over this. */
+      let hideThinkingDefault = false;
+      /** @type {{[key: string]: boolean}} peek key -> per-pane override of whether the model's thinking/reasoning lines are expanded (RAL-434), set by toggling that pane's "Show Thinking" checkbox. Absent means "use !hideThinkingDefault." Session-only, like every other peek* map -- not persisted. */
+      let peekShowThinking = {};
       /** @type {{[key: string]: string}} peek key -> the peek box's selected tab (RAL-428): "terminal" (default, the transcript-tape live view) or "prompt" (the admin-only System Prompt tab). Absent means "terminal". Session-only, like every other peek* map -- not persisted; a non-admin never gets the tab buttons that set it, and `peekBox` falls back to terminal for a stale choice. */
       let peekTab = {};
       /** @type {{[key: string]: (PromptTabState|"loading")|undefined}} peek key -> System Prompt tab state (RAL-428): a `PromptTabState` once fetched (the loaded text, or why there is none), the literal "loading" while a fetch is in flight, undefined until the tab is first opened. Deleted on close (see `togglePeek`) so the next open refetches. */

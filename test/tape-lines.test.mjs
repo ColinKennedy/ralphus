@@ -7,7 +7,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { lines } from "./board-tape-lines.mjs";
 
-const { renderPaneLine, formatInlineTapeEvent, classifyTapeLine, renderTapeLines } = lines;
+const {
+  renderPaneLine,
+  formatInlineTapeEvent,
+  classifyTapeLine,
+  renderTapeLines,
+  stripThinkingPrefixes,
+  THINKING_FOLDED_TEXT,
+} = lines;
 
 // ---- renderPaneLine (a JS mirror of terminal_log.rs::render_pane_line) ----
 // Kept assertion-for-assertion in step with the Rust tests of the same name;
@@ -73,21 +80,21 @@ test("bounds an absurd column move instead of padding unboundedly", () => {
 // ---- classifyTapeLine ----
 
 test("agent output lines are kept verbatim (with the trailing CR of a CRLF trimmed)", () => {
-  assert.equal(classifyTapeLine("hello world", false), "hello world");
-  assert.equal(classifyTapeLine("hello world\r", false), "hello world");
+  assert.equal(classifyTapeLine("hello world", false, true), "hello world");
+  assert.equal(classifyTapeLine("hello world\r", false, true), "hello world");
 });
 
 test("the done sentinel is always dropped, in both debug states", () => {
-  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", false), null);
-  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", true), null);
+  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", false, true), null);
+  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", true, true), null);
 });
 
 test("RALPHUS_EVENT lines are dropped when Debug is off", () => {
-  assert.equal(classifyTapeLine('RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}', false), null);
+  assert.equal(classifyTapeLine('RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}', false, true), null);
 });
 
 test("RALPHUS_EVENT lines render inline when Debug is on", () => {
-  const out = classifyTapeLine('RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}', true);
+  const out = classifyTapeLine('RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}', true, true);
   assert.ok(out && out.includes("claude-code"), "the event source appears inline");
   assert.ok(out && out.includes("live usage"), "the event message appears inline");
 });
@@ -130,7 +137,7 @@ test("renderTapeLines strips ANSI, drops sentinels/events, and joins agent outpu
     "done",
     "RALPHUS_TMUX_DONE: ok",
   ];
-  assert.equal(renderTapeLines(raw, false), "building...\ndone");
+  assert.equal(renderTapeLines(raw, false, true), "building...\ndone");
 });
 
 test("renderTapeLines inlines events in place when Debug is on, still dropping the sentinel", () => {
@@ -140,9 +147,79 @@ test("renderTapeLines inlines events in place when Debug is on, still dropping t
     "done",
     "RALPHUS_TMUX_DONE: ok",
   ];
-  const out = renderTapeLines(raw, true).split("\n");
+  const out = renderTapeLines(raw, true, true).split("\n");
   assert.equal(out[0], "building...");
   assert.ok(out[1].includes("live usage"), "the event is rendered inline right where it occurred");
   assert.equal(out[2], "done");
   assert.equal(out.length, 3, "the done sentinel is still dropped");
+});
+
+// ---- RAL-434: the "Show Thinking" fold ----
+// The runner tags each reasoning line with RALPHUS_THINKING rather than
+// dropping it, so visibility is decided here, at render time, and is
+// reversible. These are that contract's only coverage.
+
+test("classifyTapeLine un-prefixes a thinking line when Thinking is on", () => {
+  assert.equal(classifyTapeLine("RALPHUS_THINKING: weighing the options", false, true), "weighing the options");
+});
+
+test("classifyTapeLine keeps an empty thinking line empty rather than dropping it", () => {
+  assert.equal(classifyTapeLine("RALPHUS_THINKING: ", false, true), "");
+});
+
+test("classifyTapeLine does not treat a mid-line thinking marker as a tag", () => {
+  const line = "echo RALPHUS_THINKING: not a marker";
+  assert.equal(classifyTapeLine(line, false, true), line);
+});
+
+test("a thinking block folds to exactly one placeholder when Thinking is off", () => {
+  const raw = [
+    "before",
+    "RALPHUS_THINKING: first",
+    "RALPHUS_THINKING: second",
+    "RALPHUS_THINKING: third",
+    "after",
+  ];
+  assert.equal(renderTapeLines(raw, false, false), `before\n${THINKING_FOLDED_TEXT}\nafter`);
+});
+
+test("two thinking blocks separated by real output stay separately folded", () => {
+  const raw = [
+    "RALPHUS_THINKING: a",
+    "RALPHUS_THINKING: b",
+    "[tool] bash(command=\"ls\")",
+    "RALPHUS_THINKING: c",
+  ];
+  assert.equal(
+    renderTapeLines(raw, false, false),
+    `${THINKING_FOLDED_TEXT}\n[tool] bash(command="ls")\n${THINKING_FOLDED_TEXT}`,
+  );
+});
+
+test("the same tape expands to every reasoning line when Thinking is on", () => {
+  const raw = ["before", "RALPHUS_THINKING: first", "RALPHUS_THINKING: second", "after"];
+  assert.equal(renderTapeLines(raw, false, true), "before\nfirst\nsecond\nafter");
+});
+
+test("folding a thinking block does not swallow the debug lines inside it", () => {
+  const raw = [
+    "RALPHUS_THINKING: a",
+    'RALPHUS_EVENT: {"source":"pi","message":"llm done"}',
+    "RALPHUS_THINKING: b",
+  ];
+  const out = renderTapeLines(raw, true, false).split("\n");
+  assert.equal(out.length, 3, "the event breaks the run, so each block folds on its own");
+  assert.equal(out[0], THINKING_FOLDED_TEXT);
+  assert.ok(out[1].startsWith("\u27e8debug\u27e9"));
+  assert.equal(out[2], THINKING_FOLDED_TEXT);
+});
+
+test("a tape with no thinking at all renders identically either way", () => {
+  const raw = ["building...", "done"];
+  assert.equal(renderTapeLines(raw, false, false), renderTapeLines(raw, false, true));
+});
+
+test("stripThinkingPrefixes untags a whole block of text, leaving other lines alone", () => {
+  const text = "plain\nRALPHUS_THINKING: reasoning\nRALPHUS_EVENT: {}\nmore";
+  assert.equal(stripThinkingPrefixes(text), "plain\nreasoning\nRALPHUS_EVENT: {}\nmore");
 });

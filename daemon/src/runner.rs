@@ -26,6 +26,19 @@ use crate::tmux::Tmux;
 /// Mirrors the existing `RALPHUS_PROOF: PASS/FAIL` marker-parsing pattern.
 pub const EVENT_MARKER: &str = "RALPHUS_EVENT: ";
 
+/// RAL-434: prefix the runner writes before each line of model
+/// thinking/reasoning content, mirrored from
+/// `runner/src/pi_backend.rs::THINKING_MARKER` (the daemon does not depend on
+/// `ralphus-runner`, so this constant is duplicated the same way
+/// [`EVENT_MARKER`] is).
+///
+/// Unlike [`EVENT_MARKER`], which tags ralphus's own telemetry, this tags the
+/// *model's* output -- it exists so thinking visibility is a render-time
+/// choice (the board's per-pane "Show Thinking" checkbox) instead of
+/// something decided destructively at capture time. See
+/// `docs/special-syntax.md`.
+pub const THINKING_MARKER: &str = "RALPHUS_THINKING: ";
+
 /// The message every agent backend gives its per-turn token/cost snapshot
 /// (RAL-161), mirrored from `runner/src/cartographer.rs::LIVE_USAGE_MESSAGE`.
 /// [`forward_runner_event`] folds such an event's payload onto the cell row
@@ -256,17 +269,6 @@ pub struct RunnerSpec {
     /// operator's personal memory (Claude Code's global `CLAUDE.md`/history,
     /// Codex/Pi's equivalent). Defaults to `false` (isolated).
     pub allow_personal_memory: bool,
-    /// RAL-434: the resolved `[live_view] hide_thinking` value
-    /// (`crate::config::LiveViewConfig::hide_thinking`), forwarded over the
-    /// stdin wire contract so a backend that streams thinking/reasoning
-    /// content as its own distinct event type (currently only pi) knows
-    /// whether to collapse each thinking block into a compact marker
-    /// instead of streaming it verbatim. Always serialized (no
-    /// `skip_serializing_if`), same rationale as
-    /// [`Self::allow_personal_settings`] -- defaults to `false` (thinking
-    /// streams like any other text) wherever this spec isn't resolved from
-    /// `.ralphus.toml`.
-    pub hide_thinking: bool,
     /// RAL-308 cumulative `maximum_timeout_seconds` hard-cap accounting.
     /// `None` when neither this row, its owning cell, nor its owning task
     /// declared the field -- the common case, costing nothing extra at poll
@@ -523,14 +525,6 @@ fn resolved_thrash_thresholds() -> (u32, u32) {
     (cfg.max_compactions(), cfg.min_turn_gap())
 }
 
-/// RAL-434: the effective `[live_view] hide_thinking`, read fresh at
-/// spec-construction time -- mirrors [`resolved_tool_arg_truncate_chars`]'s
-/// "read live so a config change takes effect on a squad's next cell without
-/// a daemon restart" reasoning.
-fn resolved_hide_thinking() -> bool {
-    crate::config::load_live_view_config().hide_thinking()
-}
-
 impl RunnerSpec {
     /// Build a spec from a stored cell row.
     ///
@@ -622,7 +616,6 @@ impl RunnerSpec {
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
-            hide_thinking: resolved_hide_thinking(),
             // RAL-308: a cell's own cap is already the cumulative cap
             // covering itself and its cell-scope proofs -- see
             // `MaximumTimeoutCaps`'s doc comment.
@@ -744,7 +737,6 @@ impl RunnerSpec {
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
-            hide_thinking: resolved_hide_thinking(),
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -824,10 +816,6 @@ impl RunnerSpec {
             // inert here.
             allow_personal_settings: false,
             allow_personal_memory: false,
-            // No `ModelBackend` reached here either, so thinking-visibility
-            // rendering is inert -- same rationale as the isolation fields
-            // above.
-            hide_thinking: false,
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -3316,7 +3304,6 @@ mod tests {
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
-            hide_thinking: false,
             maximum_timeout: None,
         }
     }
@@ -5235,7 +5222,6 @@ prompt = "make it build"
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
-            hide_thinking: false,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
@@ -5374,7 +5360,6 @@ prompt = "make it build"
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
-            hide_thinking: false,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);

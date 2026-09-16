@@ -8140,11 +8140,13 @@ struct OpenTerminalResponse {
     ok: bool,
 }
 
-/// The Live View "Show Debug Messages" checkbox's config-driven default
-/// (RAL-232): the effective (global-under-project) `[live_view]` setting.
+/// The Live View checkboxes' config-driven defaults: the effective
+/// (global-under-project) `[live_view]` settings for "Show Debug Messages"
+/// (RAL-232) and "Show Thinking" (RAL-434).
 #[derive(Serialize)]
 struct LiveViewConfigResponse {
     show_debug_messages_default: bool,
+    hide_thinking: bool,
 }
 
 /// `GET /api/config/live-view` (RAL-232): lets the board initialize its
@@ -8153,11 +8155,12 @@ struct LiveViewConfigResponse {
 /// unrelated to `capture_pane_reply`/Cartographer, which always capture and
 /// persist both agent and ralphus-diagnostic lines regardless of this value.
 fn live_view_config_reply() -> Reply {
+    let config = crate::config::load_live_view_config();
     json(
         200,
         &LiveViewConfigResponse {
-            show_debug_messages_default: crate::config::load_live_view_config()
-                .show_debug_messages_default(),
+            show_debug_messages_default: config.show_debug_messages_default(),
+            hide_thinking: config.hide_thinking(),
         },
     )
 }
@@ -8292,8 +8295,33 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
             let trimmed = line.trim_start();
             !(trimmed.starts_with("RALPHUS_EVENT: ") || trimmed.starts_with("RALPHUS_TMUX_DONE"))
         })
+        .map(unprefix_thinking_line)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// RAL-434: removes the runner's `RALPHUS_THINKING: ` tag from one `/pane`
+/// line, leaving the reasoning text itself.
+///
+/// `/pane` is the Live View's *fallback* content source, used only when a
+/// cell has no `.raw` transcript to page (one that predates transcript
+/// capture, or whose pipe-pane never engaged). The per-pane "Show Thinking"
+/// checkbox works off the transcript tape and is already documented as inert
+/// while falling back, so the honest degrade here is to show the reasoning
+/// plainly -- exactly what this pane did before thinking was tagged at all --
+/// rather than either leaking a marker the fallback renderer won't parse or
+/// dropping the content outright the way `RALPHUS_EVENT: ` lines are. Those
+/// are ralphus's own telemetry; thinking is the model's output.
+///
+/// Matches at a line start only (after leading whitespace), like the filter
+/// above, so a mid-line occurrence in genuine agent output is left alone.
+#[must_use]
+fn unprefix_thinking_line(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    match trimmed.strip_prefix(crate::runner::THINKING_MARKER) {
+        Some(rest) => rest,
+        None => line,
+    }
 }
 
 /// Capture-pane content for the tmux session keyed by `(squad_id, task,
@@ -18070,6 +18098,9 @@ command=\"check\"
         let r = route(&d, "GET", "/api/config/live-view", "");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"show_debug_messages_default\":false"));
+        // RAL-434: the board reads this to seed each pane's "Show Thinking"
+        // checkbox; false means thinking starts expanded.
+        assert!(r.body.contains("\"hide_thinking\":false"));
     }
 
     #[test]
@@ -22757,6 +22788,26 @@ command = "true"
         let body = serde_json::json!({"set": {"A": "1"}}).to_string();
         let r = route(&d, "POST", "/api/squads/squad-1/cells/x/0/env", &body);
         assert_eq!(r.status, 400);
+    }
+
+    /// RAL-434: `/pane` is a fallback with no "Show Thinking" checkbox, so a
+    /// tagged line degrades to its plain reasoning text rather than leaking
+    /// the marker or losing the content.
+    #[test]
+    fn strip_ralphus_pane_markers_unprefixes_thinking_lines() {
+        let text = "before\nRALPHUS_THINKING: weighing the options\nafter";
+        assert_eq!(
+            strip_ralphus_pane_markers(text),
+            "before\nweighing the options\nafter"
+        );
+    }
+
+    /// The thinking tag is a line prefix; the same bytes inside genuine agent
+    /// output are not a marker and must survive untouched.
+    #[test]
+    fn strip_ralphus_pane_markers_leaves_a_mid_line_thinking_marker_alone() {
+        let text = "echo RALPHUS_THINKING: not a marker";
+        assert_eq!(strip_ralphus_pane_markers(text), text);
     }
 
     #[test]
