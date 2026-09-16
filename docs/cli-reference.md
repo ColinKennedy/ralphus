@@ -604,6 +604,11 @@ use; see `READ_ONLY_NOTE`.
         - unwatch entity_uri [uri] --user [name]  {Stop watching an entity (RAL-343).}
         - watch entity_uri [uri] --tier [urgent|high|normal...] --user [name]  {Watch an entity so its notifications reach the personal mailbox; re-watching updates the notification tiers in place (RAL-343).}
         - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-343).}
+    - preset  {Register and inspect presets -- named bundles of field defaults an "extends = [\"<<ralphus:presets/<name>>>\"]" entry stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted.}
+        - deregister name [str]  {Remove a preset. Any preset, including a starter default, may be freely removed.}
+        - (read-only-safe) get name [str]  {Show one registered preset by exact name.}
+        - (read-only-safe) list  {List every registered preset.}
+        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted.}
     - project  {Register and inspect projects known to the daemon.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}
