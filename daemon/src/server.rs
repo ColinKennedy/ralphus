@@ -1078,6 +1078,9 @@ fn route_for_user(
                 set_triage_pool_threshold(daemon, body)
             })
         }
+        ("POST", ["api", "triage", "pools", "drain"]) => admin_gated(daemon, user_header, || {
+            force_drain_triage_pool(daemon, body)
+        }),
         ("GET", ["api", "triage", "schedules"]) => {
             admin_gated(daemon, user_header, || list_triage_schedules(daemon, query))
         }
@@ -3050,6 +3053,49 @@ fn set_triage_pool_threshold(daemon: &Daemon, body: &str) -> Reply {
     match store.set_triage_pool_threshold(&project, &req.triage_type, req.threshold) {
         Ok(()) => json(200, &serde_json::json!({"ok": true})),
         Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/triage/pools/drain` body (RAL-449).
+#[derive(Deserialize)]
+struct DrainTriagePoolBody {
+    project: String,
+    triage_type: String,
+}
+
+#[derive(Serialize)]
+struct DrainTriagePoolResponse {
+    guardian_id: String,
+}
+
+/// `POST /api/triage/pools/drain`: force-create a review from every eligible
+/// candidate currently sitting in a `(project, triage_type)` pool, bypassing
+/// its configured count threshold and without needing a cron schedule
+/// (RAL-449). Reuses [`crate::reviews::create_review_from_triage_pool`] --
+/// the same function the threshold/schedule-driven paths call -- so the
+/// resulting review keeps every normal invariant (Arbiter origin, project
+/// defaults, only `"done"` cells included, etc.); only the threshold check
+/// itself is skipped.
+fn force_drain_triage_pool(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<DrainTriagePoolBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"project\" and \"triage_type\" strings",
+            vec![],
+        );
+    };
+    let store = daemon.lock();
+    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    match crate::reviews::create_review_from_triage_pool(&store, &project, &req.triage_type) {
+        Ok(Some(guardian_id)) => json(200, &DrainTriagePoolResponse { guardian_id }),
+        Ok(None) => error(
+            409,
+            "empty_pool",
+            "no eligible candidates in this pool",
+            vec![],
+        ),
+        Err(e) => error(500, "internal_error", &e.to_string(), vec![]),
     }
 }
 
@@ -23331,6 +23377,103 @@ command=\"cargo test\"
         assert_eq!(r.status, 200, "{}", r.body);
         let r = route(&d, "DELETE", &format!("/api/triage/schedules/{id}"), "");
         assert_eq!(r.status, 404);
+    }
+
+    /// RAL-449: `POST /api/triage/pools/drain` force-creates a review from a
+    /// pool's eligible candidates even though it never reached its
+    /// configured threshold -- the whole point of the manual action.
+    #[test]
+    fn force_drain_triage_pool_route_creates_a_review_below_threshold() {
+        let d = daemon();
+        pool_a_finished_cell(&d, "proj", "bug", "b1");
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/threshold",
+            r#"{"project":"proj","triage_type":"bug","threshold":10}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/drain",
+            r#"{"project":"proj","triage_type":"bug"}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let gid = v["guardian_id"].as_str().unwrap().to_string();
+        {
+            let store = d.lock();
+            let g = store.get_guardian(&gid).unwrap();
+            assert_eq!(g.origin, crate::guardian::GUARDIAN_ORIGIN_ARBITER);
+            assert_eq!(g.branches.len(), 1);
+        }
+
+        // The pool is now empty -- draining below threshold still removes
+        // the cell like any other drain.
+        let r = route(&d, "GET", "/api/triage/pools", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"count\":0"), "{}", r.body);
+    }
+
+    /// RAL-449: draining a pool with no eligible candidates is a
+    /// non-mutating no-op reported as a `409`, not a silently created empty
+    /// review.
+    #[test]
+    fn force_drain_triage_pool_route_on_empty_pool_is_409() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/drain",
+            r#"{"project":"proj","triage_type":"bug"}"#,
+        );
+        assert_eq!(r.status, 409, "{}", r.body);
+    }
+
+    /// RAL-449: a malformed body (missing required fields) is a `400`, the
+    /// same contract as the threshold route's body validation.
+    #[test]
+    fn force_drain_triage_pool_route_rejects_a_malformed_body() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/drain",
+            r#"{"project":"proj"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    /// RAL-449: the same registered-project path resolution the threshold
+    /// route gets (RAL-374) applies here too, so a manual drain keyed off a
+    /// project's filesystem path still lands on the same pool row a
+    /// resolved-name pooled cell uses.
+    #[test]
+    fn force_drain_triage_pool_route_resolves_a_project_path_to_its_registered_name() {
+        let d = daemon();
+        let dir = std::env::temp_dir().join(format!(
+            "ral449-server-drain-by-path-{}-{}",
+            std::process::id(),
+            PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        d.lock()
+            .register_project("proj", "", &dir.to_string_lossy(), "none")
+            .unwrap();
+        pool_a_finished_cell(&d, "proj", "bug", "b1");
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/triage/pools/drain",
+            &serde_json::json!({"project": dir.to_string_lossy(), "triage_type": "bug"})
+                .to_string(),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RAL-374: setting a threshold via `POST /api/triage/pools/threshold`

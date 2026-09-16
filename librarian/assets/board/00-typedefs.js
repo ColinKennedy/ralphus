@@ -523,6 +523,18 @@
        * @property {number|null} threshold
        */
       /**
+       * RAL-449: the Triage tab pool table's local "Drain now" confirmation
+       * state -- captured straight from a `TriagePoolView` row at the
+       * moment the human clicks it, so Confirm always drains exactly what
+       * was shown (no server preview round trip; unlike a threshold change
+       * there is nothing to compute in advance).
+       * @typedef {object} TriagePoolDrainConfirm
+       * @property {string} project
+       * @property {string} triage_type
+       * @property {number} count
+       * @property {number|null} threshold
+       */
+      /**
        * RAL-421: the non-mutating "rough preview" of a proposed pool
        * threshold -- what confirming it would drain *right now*. The daemon
        * computes it from the pool's viable count under its store lock at
