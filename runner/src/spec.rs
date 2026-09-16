@@ -298,6 +298,12 @@ pub struct CellResult {
     pub proofed: Option<bool>,
     pub agent_session_id: Option<String>,
     pub ghost: Option<String>,
+    /// RAL-435: set only when `status == "rate_limited"` -- the Pi backend's
+    /// suggested retry delay, in whole seconds, for a recognized retryable
+    /// 429. The daemon waits out this delay and resumes `agent_session_id`
+    /// rather than treating the cell as done or failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl CellResult {
@@ -319,6 +325,7 @@ impl CellResult {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            retry_after_secs: None,
         }
     }
 
@@ -340,6 +347,51 @@ impl CellResult {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// RAL-435: a recognized, retryable Pi 429 rate limit with a suggested
+    /// delay -- neither success nor failure. Carries whatever usage/
+    /// session-id was captured live up to the rate limit, the same
+    /// "don't regress the board's numbers" reasoning as [`Self::detached`].
+    /// The daemon waits out `retry_after_secs` and resumes
+    /// `agent_session_id` rather than treating the cell as done or failed.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rate_limited(
+        retry_after_secs: u64,
+        summary: impl Into<String>,
+        tokens_in: i64,
+        tokens_out: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
+        compaction_input_tokens: i64,
+        compaction_count: i64,
+        turns: i64,
+        cost_usd: f64,
+        agent_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: "rate_limited".to_string(),
+            tokens_in,
+            tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
+            compaction_input_tokens,
+            compaction_count,
+            turns: Some(turns),
+            cost_usd,
+            // A rate limit carries whatever the live snapshot held at the
+            // retry point, never a terminal usage event -- so it is an
+            // estimate by construction (RAL-326), same as a detach.
+            cost_is_estimated: true,
+            summary: summary.into(),
+            error: None,
+            proofed: None,
+            agent_session_id,
+            ghost: None,
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -381,6 +433,7 @@ impl CellResult {
             proofed: None,
             agent_session_id,
             ghost: None,
+            retry_after_secs: None,
         }
     }
 
@@ -393,6 +446,13 @@ impl CellResult {
     #[must_use]
     pub fn is_detached(&self) -> bool {
         self.status == "detached"
+    }
+
+    /// RAL-435: a recognized, retryable Pi rate limit -- see
+    /// [`Self::rate_limited`].
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        self.status == "rate_limited"
     }
 
     /// Serializes all fields unconditionally (including `None`s) -- the

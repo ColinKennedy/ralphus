@@ -742,6 +742,7 @@ fn drive_json_events(
             agent_session_id: state.agent_session_id,
             abandoned_background_job: None,
             compaction_thrash: Some(detail),
+            rate_limit_retry_after: None,
             // RAL-373: this backend reports no compaction data (it has no
             // `compact_boundary`-equivalent event), not "never compacts".
             compaction_input_tokens: 0,
@@ -755,6 +756,27 @@ fn drive_json_events(
         .unwrap_or_default();
 
     if let Some(error) = state.terminal_error {
+        // RAL-435: a recognized, retryable Pi 429 with a suggested delay is
+        // reported as a live-snapshot outcome (like `compaction_thrash`)
+        // rather than a hard failure, so the daemon can wait out the delay
+        // and resume this same agent session instead of ending the cell.
+        if let Some(delay) = parse_retryable_rate_limit(&error) {
+            return Ok(BackendOutcome {
+                summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                turns: state.turns,
+                tokens_in: state.tokens_in,
+                tokens_out: state.tokens_out,
+                cache_creation_tokens: state.cache_creation_tokens,
+                cache_read_tokens: state.cache_read_tokens,
+                cost_usd: state.cost_usd,
+                agent_session_id: state.agent_session_id,
+                abandoned_background_job: None,
+                compaction_thrash: None,
+                rate_limit_retry_after: Some(delay),
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+            });
+        }
         return Err(BackendError(format!(
             "pi: {}",
             display_terminal_error(&error)
@@ -784,6 +806,7 @@ fn drive_json_events(
         agent_session_id: state.agent_session_id,
         abandoned_background_job: None,
         compaction_thrash: None,
+        rate_limit_retry_after: None,
         // RAL-373: this backend reports no compaction data (it has no
         // `compact_boundary`-equivalent event), not "never compacts".
         compaction_input_tokens: 0,
@@ -1266,6 +1289,50 @@ fn display_terminal_error(error: &str) -> String {
     }
 }
 
+/// RAL-435: recognizes a Pi terminal `errorMessage` (see
+/// `record_assistant_terminal`) as a retryable provider rate limit. Pi's own
+/// error text is free-form prose, not a structured object -- the same shape
+/// `display_terminal_error`'s OpenRouter 402 budget special-case already
+/// relies on. Deliberately conservative: only fires when the message names
+/// the explicit HTTP 429 status *and* carries a parseable "retry after N
+/// second(s)" delay (the same phrasing OpenRouter uses for its own 402
+/// budget errors). A 429 with no delay, a differently worded rate limit, or
+/// any other status is treated as a genuine failure rather than guessed at.
+fn parse_retryable_rate_limit(error: &str) -> Option<std::time::Duration> {
+    if !mentions_http_429(error) {
+        return None;
+    }
+    parse_retry_after_seconds(error).map(std::time::Duration::from_secs)
+}
+
+/// Whether `error` names the explicit HTTP 429 status as a standalone token,
+/// not merely a substring of a larger number (e.g. "42900" or "3429").
+fn mentions_http_429(error: &str) -> bool {
+    error
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == "429")
+}
+
+/// Parses a `"retry after N second(s)"` phrase (case-insensitive), returning
+/// the delay in whole seconds. `None` when the phrase is absent or not
+/// followed by a plain non-negative integer.
+fn parse_retry_after_seconds(error: &str) -> Option<u64> {
+    const MARKER: &str = "retry after ";
+    // `to_ascii_lowercase` is byte-length- and offset-preserving for ASCII
+    // input, so a byte index found in the lowercased copy is safe to slice
+    // out of the original (mixed-case) string.
+    let lower = error.to_ascii_lowercase();
+    let start = lower.find(MARKER)? + MARKER.len();
+    let digits: String = error[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 fn extract_message_text(message: &Value) -> String {
     extract_text(&message["content"]).trim().to_string()
 }
@@ -1523,6 +1590,73 @@ mod tests {
             display_terminal_error(raw),
             "$ in-flight budget full (OpenRouter; retry later): OpenRouter 402: \
              in_flight_budget_exhausted; retry after 120 seconds"
+        );
+    }
+
+    /// RAL-435: the exact recognized shape -- an explicit 429 plus a
+    /// parseable "retry after N seconds" delay.
+    #[test]
+    fn parse_retryable_rate_limit_recognizes_an_explicit_429_with_a_delay() {
+        let raw = "OpenRouter 429: rate_limit_exceeded; retry after 30 seconds";
+        assert_eq!(
+            parse_retryable_rate_limit(raw),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_is_case_insensitive_about_the_delay_phrase() {
+        let raw = "HTTP 429 Too Many Requests; Retry After 5 seconds";
+        assert_eq!(
+            parse_retryable_rate_limit(raw),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_rejects_a_429_with_no_delay() {
+        let raw = "OpenRouter 429: rate_limit_exceeded";
+        assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_rejects_a_non_429_error_even_with_a_delay() {
+        // The real-world OpenRouter 402 budget error already handled by
+        // `display_terminal_error` -- a different (non-retryable) status
+        // must never be guessed at as a rate limit just because it also
+        // carries a "retry after" phrase.
+        let raw = "OpenRouter 402: in_flight_budget_exhausted; retry after 120 seconds";
+        assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_rejects_429_as_a_substring_of_a_larger_number() {
+        let raw = "OpenRouter 42900: some other error; retry after 5 seconds";
+        assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    #[test]
+    fn pi_terminal_429_with_delay_is_reported_as_a_retryable_outcome_not_an_error() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"OpenRouter 429: rate_limit_exceeded; retry after 12 seconds"
+                }
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        let error = state.terminal_error.expect("terminal error recorded");
+        assert_eq!(
+            parse_retryable_rate_limit(&error),
+            Some(std::time::Duration::from_secs(12))
         );
     }
 

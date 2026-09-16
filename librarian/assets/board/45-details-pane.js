@@ -34,7 +34,7 @@
           const cells = t.cells.map((s, si) => `
             <div class="cell selectable ${selCls("cell", ti, si)}" id="n-${ti}-${si}" data-click="onGraphNodeClick" data-ctx="openCellNodeMenu" data-squad-id="${esc(squad.id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1"
                  data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
-              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${detachedGraphBadge(s.detached_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
+              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${detachedGraphBadge(s.detached_at_ms)}${delayedGraphBadge(s.delayed_until_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
               ${cellProof(s, ti, si, selCls, squad.id)}
             </div>`).join("");
@@ -1056,7 +1056,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>

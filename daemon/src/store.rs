@@ -448,6 +448,15 @@ pub struct CellView {
     /// time the cell is dispatched (a restart, or resume-automation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detached_at_ms: Option<i64>,
+    /// RAL-435: when this cell is waiting out a Pi rate limit's suggested
+    /// retry delay (Unix epoch milliseconds it will resume at). `None`
+    /// while not delayed. `state` stays `"running"` throughout -- an
+    /// additive signal, mirroring [`Self::detached_at_ms`], so the board
+    /// can tell "waiting on a provider rate limit" apart from "actively
+    /// executing" without a new terminal `NodeState`. Cleared the moment
+    /// the cell resumes (a successful retry) or gives up (thrash).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_until_ms: Option<i64>,
 }
 
 /// A task as shown in the board.
@@ -2712,6 +2721,15 @@ impl Store {
             "ALTER TABLE guardians ADD COLUMN post_merge_detail TEXT",
             "ALTER TABLE guardians ADD COLUMN post_merge_started_at_ms INTEGER",
             "ALTER TABLE guardians ADD COLUMN post_merge_finished_at_ms INTEGER",
+            // RAL-435: when this cell is waiting out a Pi rate limit's
+            // suggested retry delay (Unix epoch milliseconds it will resume
+            // at). `NULL` while not delayed. `state` stays `"running"`
+            // throughout -- an additive signal, mirroring `detached_at_ms`,
+            // so the board can tell "waiting on a provider rate limit" apart
+            // from "actively executing" without a new terminal `NodeState`.
+            // Cleared the moment the cell resumes (a successful retry) or
+            // gives up (thrash), by `Store::clear_cell_delayed`.
+            "ALTER TABLE cells ADD COLUMN delayed_until_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -4287,7 +4305,7 @@ impl Store {
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -4346,6 +4364,7 @@ impl Store {
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
                         compaction_input_tokens: r.get::<_, i64>(32)?,
                         compaction_count: r.get::<_, i64>(33)?,
+                        delayed_until_ms: r.get::<_, Option<i64>>(34)?,
                     },
                 ))
             })?
@@ -8454,6 +8473,39 @@ impl Store {
     pub fn clear_cell_detached(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE cells SET detached_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a cell is waiting out a Pi rate limit's suggested retry
+    /// delay (RAL-435) -- called from `scheduler::run_cell_worker`'s
+    /// rate-limited-retry loop, right before it drops its scheduler permit
+    /// and sleeps. See [`CellView::delayed_until_ms`] for what this drives
+    /// on the board. `wake_at_ms` is the Unix epoch millisecond timestamp
+    /// the daemon expects to resume this cell at, purely informational
+    /// (`run_cell_worker` itself owns the actual wait).
+    pub fn mark_cell_delayed(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        wake_at_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET delayed_until_ms=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![wake_at_ms, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Clears a cell's `delayed_until_ms`, called the moment
+    /// `run_cell_worker` either reacquires a permit to retry after the delay
+    /// or gives up on the cell entirely (thrash) -- unconditional (no-op if
+    /// already clear), mirroring [`Store::clear_cell_detached`].
+    pub fn clear_cell_delayed(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET delayed_until_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
             params![squad_id, task_idx, idx],
         )?;
         Ok(())

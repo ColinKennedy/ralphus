@@ -806,6 +806,15 @@ pub struct RunnerResult {
     /// or when the agent had nothing to hand off.
     #[serde(default)]
     pub ghost: Option<String>,
+    /// RAL-435: set only when `status == "rate_limited"` -- the Pi backend's
+    /// suggested retry delay, in whole seconds, for a recognized retryable
+    /// 429. `run_cell_worker` waits out this delay (releasing its scheduler
+    /// permit while it does) and resumes `agent_session_id` rather than
+    /// treating the cell as done or failed, guarded by the same N-in-M-turns
+    /// thrash rule `runner::thrash` uses for autocompaction (RAL-339), via
+    /// `ralphus_core::thrash`.
+    #[serde(default)]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl RunnerResult {
@@ -828,6 +837,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            retry_after_secs: None,
         }
     }
 
@@ -866,6 +876,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: Some(usage.turns),
             ghost: None,
+            retry_after_secs: None,
         }
     }
 
@@ -896,6 +907,49 @@ impl RunnerResult {
             agent_session_id,
             turns: Some(usage.turns),
             ghost: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// RAL-435: a recognized, retryable Pi rate limit with a suggested
+    /// delay -- neither success nor failure, mirroring [`Self::detached`]'s
+    /// "don't regress the board's numbers" reasoning. `run_cell_worker`
+    /// special-cases this before it would otherwise reach
+    /// [`Self::node_state`] (it never lets a `"rate_limited"` result escape
+    /// its own retry loop), so this constructor exists mainly so that loop
+    /// has something to build from the runner's raw JSON result.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rate_limited(
+        retry_after_secs: u64,
+        summary: String,
+        tokens_in: i64,
+        tokens_out: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
+        compaction_input_tokens: i64,
+        compaction_count: i64,
+        turns: Option<i64>,
+        cost_usd: f64,
+        agent_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            status: "rate_limited".to_string(),
+            tokens_in,
+            tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
+            compaction_input_tokens,
+            compaction_count,
+            cost_usd,
+            cost_is_estimated: true,
+            summary,
+            error: None,
+            proofed: None,
+            agent_session_id,
+            turns,
+            ghost: None,
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -915,12 +969,21 @@ impl RunnerResult {
         self.status == "detached"
     }
 
+    /// RAL-435: a recognized, retryable Pi rate limit -- see
+    /// [`Self::rate_limited`]. `run_cell_worker`'s retry loop checks this on
+    /// every attempt and never lets it reach the rest of the normal
+    /// done/failed/detached handling.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        self.status == "rate_limited"
+    }
+
     /// Map to a node state.
     #[must_use]
     pub fn node_state(&self) -> NodeState {
         if self.is_done() {
             NodeState::Done
-        } else if self.is_detached() {
+        } else if self.is_detached() || self.is_rate_limited() {
             NodeState::Running
         } else {
             NodeState::Failed
@@ -3265,6 +3328,7 @@ mod tests {
             agent_session_id: None,
             ghost: None,
             turns: None,
+            retry_after_secs: None,
         };
         assert!(r.proof_passed());
 

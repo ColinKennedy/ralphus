@@ -23,6 +23,17 @@ use crate::store::{CellOutcome, NodeState, SquadState, Store};
 /// How long a worker holds nothing; the poll interval between ticks.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// RAL-435: fallback Pi rate-limit retry delay for the (should-never-happen)
+/// case where a `"rate_limited"` `RunnerResult` carries no `retry_after_secs`
+/// -- mirrors `pr.rs`'s `DEFAULT_RATE_LIMIT_BACKOFF` for the same "the
+/// provider told us to retry but not when" shape.
+const DEFAULT_RATE_LIMIT_RETRY: Duration = Duration::from_secs(60);
+
+/// How long to sleep between cancellation checks while waiting out a
+/// rate-limit retry delay -- short enough that a cancellation lands promptly
+/// without the delay's full duration blocking `run_cell_worker`'s thread.
+const RATE_LIMIT_RETRY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// How often to check reviews for a base-branch shift and auto-rebuild them.
 pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -1770,6 +1781,184 @@ fn cell_dispatch_priority(
     }
 }
 
+/// RAL-435: runs `spec` via `runner.run_cancellable`, transparently retrying
+/// through a recognized, retryable Pi rate limit (`RunnerResult::
+/// is_rate_limited`) by waiting out its suggested delay and resuming the
+/// same agent session, until either a normal (non-rate-limited) result comes
+/// back or the retry cadence crosses into thrash -- the exact same N-in-M-
+/// turns rule `runner::thrash` uses for autocompaction (RAL-339), reused
+/// here via the shared `ralphus_core::thrash` tracker so both guards stay in
+/// sync. `permit` is dropped for the duration of each wait (mirroring
+/// `record_cell_result`'s "a rate-limited cell isn't holding real capacity"
+/// intent) and reacquired before the next attempt, so a rate-limited cell
+/// doesn't sit on a scheduler slot doing nothing.
+///
+/// Usage/cost across every attempt (including thrashed-away and successful
+/// retries) is summed into the returned `RunnerResult`, the same "don't
+/// regress the board's numbers" accumulation `run_with_backend` already does
+/// for its own in-process attempt loop.
+///
+/// Returns `None` only when a cancellation landed (mid-run or mid-wait) --
+/// the caller's job is then just to abandon this cell, the same "leave it as
+/// the store already reflects" treatment cancellation gets everywhere else
+/// in `run_cell_worker`. Otherwise returns the final result paired with a
+/// live permit for the caller to hold for the rest of its own work.
+#[allow(clippy::too_many_arguments)]
+fn run_cell_with_rate_limit_retries<'a>(
+    spec: &mut RunnerSpec,
+    runner: &dyn Runner,
+    cancel: &CancelToken,
+    mut permit: SemaphorePermit<'a>,
+    sem: &'a Semaphore,
+    dispatch_priority: f64,
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+) -> Option<(RunnerResult, SemaphorePermit<'a>)> {
+    let mut tracker = ralphus_core::thrash::OccurrenceTracker::new(
+        ralphus_core::thrash::OccurrenceThresholds::default(),
+    );
+    let mut total_tokens_in = 0i64;
+    let mut total_tokens_out = 0i64;
+    let mut total_cache_creation_tokens = 0i64;
+    let mut total_cache_read_tokens = 0i64;
+    let mut total_compaction_input_tokens = 0i64;
+    let mut total_compaction_count = 0i64;
+    let mut total_cost_usd = 0.0f64;
+    let mut total_turns: Option<i64> = None;
+
+    loop {
+        let attempt = runner.run_cancellable(spec, cancel);
+        if cancel.is_cancelled() {
+            return None;
+        }
+        total_tokens_in += attempt.tokens_in;
+        total_tokens_out += attempt.tokens_out;
+        total_cache_creation_tokens += attempt.cache_creation_tokens;
+        total_cache_read_tokens += attempt.cache_read_tokens;
+        total_compaction_input_tokens += attempt.compaction_input_tokens;
+        total_compaction_count += attempt.compaction_count;
+        total_cost_usd += attempt.cost_usd;
+        if let Some(t) = attempt.turns {
+            total_turns = Some(total_turns.unwrap_or(0) + t);
+        }
+
+        if !attempt.is_rate_limited() {
+            let mut merged = attempt;
+            merged.tokens_in = total_tokens_in;
+            merged.tokens_out = total_tokens_out;
+            merged.cache_creation_tokens = total_cache_creation_tokens;
+            merged.cache_read_tokens = total_cache_read_tokens;
+            merged.compaction_input_tokens = total_compaction_input_tokens;
+            merged.compaction_count = total_compaction_count;
+            merged.cost_usd = total_cost_usd;
+            merged.turns = total_turns;
+            return Some((merged, permit));
+        }
+
+        let agent_session_id = attempt
+            .agent_session_id
+            .clone()
+            .or_else(|| spec.resume_agent_session_id.clone());
+
+        for _ in 0..attempt.turns.unwrap_or(0).max(0) {
+            tracker.record_turn();
+        }
+
+        if let Some(detail) = tracker.record_occurrence() {
+            crate::rlog!(
+                WARNING,
+                "ralphus [scheduler] cell {squad_id}/{} rate-limit retry thrashing: {} retries, most recently {} turn(s) after the previous one",
+                row.cell_id,
+                detail.occurrence_count,
+                detail.turns_since_previous_occurrence,
+            );
+            let failed = RunnerResult {
+                status: "failed".to_string(),
+                tokens_in: total_tokens_in,
+                tokens_out: total_tokens_out,
+                cache_creation_tokens: total_cache_creation_tokens,
+                cache_read_tokens: total_cache_read_tokens,
+                compaction_input_tokens: total_compaction_input_tokens,
+                compaction_count: total_compaction_count,
+                cost_usd: total_cost_usd,
+                cost_is_estimated: true,
+                summary: attempt.summary,
+                error: Some(rate_limit_thrash_message(&detail)),
+                proofed: None,
+                agent_session_id,
+                turns: total_turns,
+                ghost: None,
+                retry_after_secs: None,
+            };
+            return Some((failed, permit));
+        }
+
+        let retry_after = attempt
+            .retry_after_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_RATE_LIMIT_RETRY);
+        let wake_at_ms = crate::store::now_ms() + retry_after.as_millis() as i64;
+        {
+            let guard = store.lock();
+            let _ = guard.mark_cell_delayed(squad_id, row.task_idx, row.idx, wake_at_ms);
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [scheduler] cell {squad_id}/{} rate limited by pi; retrying in {}s",
+            row.cell_id,
+            retry_after.as_secs(),
+        );
+        // Release the scheduler slot for the wait's duration -- a delayed
+        // cell is doing nothing but sleeping, and every second it holds a
+        // permit is a second another ready cell can't dispatch.
+        drop(permit);
+        let cancelled = sleep_out_rate_limit_retry(retry_after, cancel);
+        {
+            let guard = store.lock();
+            let _ = guard.clear_cell_delayed(squad_id, row.task_idx, row.idx);
+        }
+        if cancelled {
+            return None;
+        }
+        permit = sem.acquire_ranked(dispatch_priority);
+        spec.resume_agent_session_id = agent_session_id;
+    }
+}
+
+/// RAL-435: sleeps out a Pi rate limit's suggested delay in short increments
+/// so a cancellation lands within one poll interval instead of blocking for
+/// the delay's full duration. Returns `true` if cancellation was observed
+/// before the delay fully elapsed.
+fn sleep_out_rate_limit_retry(delay: Duration, cancel: &CancelToken) -> bool {
+    let mut remaining = delay;
+    while remaining > Duration::ZERO {
+        if cancel.is_cancelled() {
+            return true;
+        }
+        let step = remaining.min(RATE_LIMIT_RETRY_POLL_INTERVAL);
+        std::thread::sleep(step);
+        remaining -= step;
+    }
+    cancel.is_cancelled()
+}
+
+/// RAL-435: backend-neutral error message for a cell that crossed into
+/// rate-limit retry thrashing -- mirrors
+/// `runner::thrash::thrash_error_message`'s shape and wording for the
+/// analogous autocompaction case.
+fn rate_limit_thrash_message(detail: &ralphus_core::thrash::OccurrenceDetail) -> String {
+    format!(
+        "rate-limit retry thrashing: pi was rate limited {} times this run, most recently only \
+         {} turn(s) after the previous retry (thrash threshold: {}+ retries with fewer than {} \
+         turns between them)",
+        detail.occurrence_count,
+        detail.turns_since_previous_occurrence,
+        detail.max_occurrences,
+        detail.min_turn_gap,
+    )
+}
+
 /// Run one cell — and, on success, its cell-level proofs — while
 /// holding a permit from the shared semaphore, then publish the result into the
 /// shared `progress` (status + failure flag). Dependency-waiting is the
@@ -1836,7 +2025,10 @@ fn run_cell_worker(
     // Acquire a global slot; released when `_permit` drops at function end.
     // RAL-280: ranked, not plain `acquire()` — cells that unblock a Review's
     // rebase jump ahead of other ready cells contending for the same freed slot.
-    let _permit = sem.acquire_ranked(dispatch_priority);
+    // RAL-435: `mut` so a rate-limit retry can drop it before sleeping out the
+    // delay and reacquire it afterward, releasing scheduler capacity for the
+    // wait's duration instead of holding a slot idle.
+    let mut _permit = sem.acquire_ranked(dispatch_priority);
     if cancel.is_cancelled() {
         return;
     }
@@ -1899,6 +2091,10 @@ fn run_cell_worker(
         // resume-automation-triggered one, without either needing to know
         // about the other's bookkeeping.
         let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
+        // RAL-435: same reasoning, for a stale `delayed_until_ms` left behind
+        // by a previous attempt that was still waiting out a rate limit when
+        // e.g. the daemon restarted.
+        let _ = guard.clear_cell_delayed(squad_id, row.task_idx, row.idx);
     }
 
     // Resolve handoff placeholders against completed upstream summaries.
@@ -2190,12 +2386,29 @@ fn run_cell_worker(
         return;
     }
 
-    let result = runner.run_cancellable(&spec, cancel);
-    // A cancellation that landed while the runner was working: leave the
-    // (already `cancelled`) node as the store set it and abandon this cell.
-    if cancel.is_cancelled() {
+    // RAL-435: `run_cancellable` wrapped in a retry loop that catches a
+    // recognized, retryable Pi rate limit, waits out its suggested delay
+    // (releasing `_permit` for the duration), and resumes the same agent
+    // session -- guarded by the same N-in-M-turns thrash rule
+    // `runner::thrash` uses for autocompaction (RAL-339), via
+    // `ralphus_core::thrash`. Returns `None` only when a cancellation landed
+    // (mid-run or mid-wait); the (already `cancelled`) node is left as the
+    // store set it, the same "abandon this cell" treatment a cancellation
+    // gets everywhere else in this function.
+    let Some((result, resumed_permit)) = run_cell_with_rate_limit_retries(
+        &mut spec,
+        runner,
+        cancel,
+        _permit,
+        sem,
+        dispatch_priority,
+        store,
+        squad_id,
+        row,
+    ) else {
         return;
-    }
+    };
+    _permit = resumed_permit;
     // RAL-288 Stage 6: a deliberate human-triggered detach mid-task is
     // neither success nor failure -- record whatever usage/session-id was
     // captured live (so the board's numbers don't regress), but never run
@@ -3993,6 +4206,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 2,
@@ -4031,6 +4245,7 @@ mod tests {
                 *seen_prompt.lock().unwrap() = spec.prompt.clone();
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
@@ -4290,6 +4505,7 @@ mod tests {
                         );
                     }
                     RunnerResult {
+                        retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 0,
                         tokens_out: 0,
@@ -4320,6 +4536,7 @@ mod tests {
                         released = cv.wait(released).expect("mutex poisoned");
                     }
                     RunnerResult {
+                        retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 0,
                         tokens_out: 0,
@@ -4446,6 +4663,273 @@ mod tests {
         assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
+    /// RAL-435: reports a recognized, retryable Pi rate limit on its first
+    /// call, then succeeds on the second -- capturing what
+    /// `resume_agent_session_id` that second call saw, so the test can
+    /// assert the retry actually resumed the session the rate limit
+    /// reported rather than starting a fresh one.
+    struct RateLimitOnceThenDoneRunner {
+        calls: std::sync::atomic::AtomicUsize,
+        seen_resume_agent_session_id: Mutex<Option<Option<String>>>,
+    }
+
+    impl Runner for RateLimitOnceThenDoneRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            use std::sync::atomic::Ordering;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return RunnerResult::rate_limited(
+                    1,
+                    "partial work before the rate limit".to_string(),
+                    5,
+                    7,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(2),
+                    0.1,
+                    Some("sess-rl-1".to_string()),
+                );
+            }
+            *self.seen_resume_agent_session_id.lock().unwrap() =
+                Some(spec.resume_agent_session_id.clone());
+            RunnerResult {
+                retry_after_secs: None,
+                status: "done".to_string(),
+                tokens_in: 3,
+                tokens_out: 4,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.05,
+                cost_is_estimated: false,
+                summary: "finished after the retry".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: Some("sess-rl-1".to_string()),
+                ghost: None,
+                turns: Some(1),
+            }
+        }
+    }
+
+    /// RAL-435 acceptance: a retryable Pi 429 with a suggested delay waits
+    /// out that delay (marking the cell `delayed_until_ms` for the board
+    /// while it does, then clearing it), resumes the same agent session,
+    /// and the cell finishes normally with usage summed across both
+    /// attempts.
+    #[test]
+    fn a_retryable_rate_limit_waits_out_its_delay_and_resumes_the_same_session() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = Arc::new(RateLimitOnceThenDoneRunner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_resume_agent_session_id: Mutex::new(None),
+        });
+
+        let store_for_thread = Arc::clone(&store);
+        let id_for_thread = id.clone();
+        let runner_for_thread = Arc::clone(&runner);
+        let handle = std::thread::spawn(move || {
+            execute_squad(
+                &store_for_thread,
+                runner_for_thread.as_ref(),
+                &id_for_thread,
+            );
+        });
+
+        // Best-effort poll for the cell showing up as delayed at some point
+        // during the wait -- generous enough not to flake under load, but
+        // not load-bearing for the rest of the assertions below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_delayed = false;
+        while std::time::Instant::now() < deadline && !handle.is_finished() {
+            if store.lock().get_squad(&id).unwrap().tasks[0].cells[0]
+                .delayed_until_ms
+                .is_some()
+            {
+                saw_delayed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+
+        assert!(
+            saw_delayed,
+            "cell was never observed as delayed during the rate-limit wait"
+        );
+        assert_eq!(
+            *runner.seen_resume_agent_session_id.lock().unwrap(),
+            Some(Some("sess-rl-1".to_string())),
+            "the retried attempt must resume the same agent session the rate limit reported"
+        );
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "done");
+        assert_eq!(squad.tasks[0].cells[0].tokens_in, 5 + 3);
+        assert_eq!(squad.tasks[0].cells[0].tokens_out, 7 + 4);
+        assert!(
+            squad.tasks[0].cells[0].delayed_until_ms.is_none(),
+            "delayed_until_ms must be cleared once the cell resumes"
+        );
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
+    }
+
+    /// RAL-435: reports a recognized, retryable Pi rate limit (no delay, so
+    /// this test doesn't spend real wall-clock time waiting) on every call.
+    struct AlwaysRateLimitedRunner {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Runner for AlwaysRateLimitedRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RunnerResult::rate_limited(
+                0,
+                "still rate limited".to_string(),
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                Some(0),
+                0.01,
+                Some("sess-rl-thrash".to_string()),
+            )
+        }
+    }
+
+    /// RAL-435 acceptance: three rate-limit retries within the two-turn
+    /// thrash window terminate as a real failure instead of retrying
+    /// forever.
+    #[test]
+    fn three_rate_limit_retries_within_the_thrash_window_fail_the_cell() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = AlwaysRateLimitedRunner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        execute_squad(&store, &runner, &id);
+
+        assert_eq!(
+            runner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must stop retrying after the 3rd rate limit rather than retrying forever"
+        );
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "failed");
+        let error = squad.tasks[0].cells[0].error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("rate-limit retry thrashing"),
+            "expected a thrash-shaped error, got: {error}"
+        );
+        assert!(squad.tasks[0].cells[0].delayed_until_ms.is_none());
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
+    /// RAL-435: thrashes exactly like [`AlwaysRateLimitedRunner`] for its
+    /// first 3 calls (one episode's worth), then reports one more rate
+    /// limit followed by success -- modeling a later, independent episode
+    /// after the cell is restarted.
+    struct ThrashOnceThenHealthyRunner {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Runner for ThrashOnceThenHealthyRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            use std::sync::atomic::Ordering;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 3 {
+                return RunnerResult::rate_limited(
+                    0,
+                    "still rate limited".to_string(),
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(0),
+                    0.01,
+                    Some("sess-rl-episode-1".to_string()),
+                );
+            }
+            if call == 3 {
+                return RunnerResult::rate_limited(
+                    0,
+                    "rate limited again, independently".to_string(),
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(0),
+                    0.01,
+                    Some("sess-rl-episode-2".to_string()),
+                );
+            }
+            RunnerResult {
+                retry_after_secs: None,
+                status: "done".to_string(),
+                tokens_in: 1,
+                tokens_out: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "ok".to_string(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+            }
+        }
+    }
+
+    /// RAL-435 acceptance: the retry counter resets once a cell restarts --
+    /// a later, independent rate-limit episode gets a fresh retry budget
+    /// rather than immediately failing just because an earlier (now-failed
+    /// and restarted) episode already crossed the thrash count.
+    #[test]
+    fn a_later_independent_rate_limit_gets_a_fresh_retry_budget_after_a_restart() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = ThrashOnceThenHealthyRunner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        execute_squad(&store, &runner, &id);
+        assert_eq!(
+            store.lock().get_squad(&id).unwrap().tasks[0].cells[0].state,
+            "failed",
+            "first episode must thrash exactly like the dedicated thrash test"
+        );
+
+        store.lock().restart_cell(&id, 0, 0).unwrap();
+        execute_squad(&store, &runner, &id);
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(
+            squad.tasks[0].cells[0].state, "done",
+            "a single rate limit in the new episode must not immediately fail just because \
+             the previous, now-restarted episode already crossed the thrash count"
+        );
+        assert_eq!(
+            runner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "episode 1: 3 thrashing attempts; episode 2: rate-limited once, then done"
+        );
+    }
+
     fn store_with(toml: &str) -> (crate::store_lock::StoreHandle, String) {
         let mut store = Store::open_in_memory().unwrap();
         let file = toml::from_str(toml).unwrap();
@@ -4534,6 +5018,7 @@ mod tests {
             self.rendezvous();
             self.current.fetch_sub(1, Ordering::SeqCst);
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -5147,6 +5632,7 @@ mod tests {
                         RunnerResult::failure("first attempt fails")
                     } else {
                         RunnerResult {
+                            retry_after_secs: None,
                             status: "done".to_string(),
                             tokens_in: 1,
                             tokens_out: 1,
@@ -5168,6 +5654,7 @@ mod tests {
                     self.b_started.store(true, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(400));
                     RunnerResult {
+                        retry_after_secs: None,
                         status: "done".to_string(),
                         tokens_in: 1,
                         tokens_out: 1,
@@ -5293,6 +5780,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
@@ -5316,6 +5804,7 @@ mod tests {
                     return RunnerResult::failure("first proof attempt fails");
                 }
                 return RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
@@ -5337,6 +5826,7 @@ mod tests {
                 self.finalize_started.store(true, Ordering::SeqCst);
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
@@ -5474,6 +5964,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 return RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
@@ -5498,6 +5989,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 1,
@@ -5625,6 +6117,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 0,
                     tokens_out: 0,
@@ -6109,6 +6602,7 @@ mod tests {
                 ));
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -6176,6 +6670,7 @@ mod tests {
                 .unwrap()
                 .push((spec.proof, spec.system_prompt.clone()));
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -6396,6 +6891,7 @@ mod tests {
                     .push((spec.agent.clone(), spec.model.clone()));
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -6467,6 +6963,7 @@ mod tests {
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -6617,6 +7114,7 @@ mod tests {
                 RunnerResult::failure("intentional failure")
             } else {
                 RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 2,
@@ -6740,6 +7238,7 @@ mod tests {
                 return RunnerResult::failure("blocking runner was never cancelled");
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
@@ -7233,6 +7732,7 @@ mod tests {
                 .unwrap_or_default();
             self.calls.lock().unwrap().push(label);
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -7494,6 +7994,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.seen.lock().unwrap().push(spec.env_overrides.clone());
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -7636,6 +8137,7 @@ mod tests {
             git(&["add", "."]);
             git(&["commit", "--message", "cell work"]);
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -8001,6 +8503,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.resume_agent_session_id.clone()));
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,
@@ -8172,6 +8675,7 @@ mod tests {
                 .unwrap()
                 .push((spec.cell_id.clone(), spec.assigned_agent_session_id.clone()));
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 1,
                 tokens_out: 2,

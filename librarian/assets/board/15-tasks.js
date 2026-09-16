@@ -1111,7 +1111,7 @@
               ? "Watched via this cell's task or squad. Click to mute this cell only — the parent watch stays in effect for its other cells."
               : "Watching this cell. Click to unwatch.";
           const star = `<span class="tt-star ${starCls}" onclick="event.stopPropagation();ttToggleCellWatch('${esc(row.squadId)}',${row.taskIdx},${ci})" data-tip="${esc(starTip)}">${cw.inherited ? "◆" : "★"}</span>`;
-          return `<div class="kv-row" style="cursor:pointer${cell === c ? ";color:var(--accent)" : ""}" onclick="ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${ci})">${sdot(c.state)}<span class="k">${esc(c.name || c.id)}</span>${star}<span class="v">${pill(c.state)}</span></div>`;
+          return `<div class="kv-row" style="cursor:pointer${cell === c ? ";color:var(--accent)" : ""}" onclick="ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${ci})">${sdot(c.state)}<span class="k">${esc(c.name || c.id)}</span>${star}<span class="v">${pill(c.state)}${delayedGraphBadge(c.delayed_until_ms)}</span></div>`;
         }).join("");
         if (cell) {
           html += `<h4 style="margin:14px 0 6px">${esc(cell.name || cell.id)}</h4>`;

@@ -15,6 +15,7 @@
         --toast-warn: #d29922;
         --out-of-date: #d4a72c;
         --detached: #d2a8ff;
+        --delayed: #79c0ff;
         --arbiter: #7c3aed;
         --terminal-bg: #000000;
       }
@@ -147,6 +148,7 @@
       .p-solo { color: var(--solo); border-color: var(--solo); }
       .p-out-of-date { color: var(--out-of-date); border-color: var(--out-of-date); }
       .p-detached { color: var(--detached); border-color: var(--detached); }
+      .p-delayed { color: var(--delayed); border-color: var(--delayed); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
       .p-proof_pending { color: var(--running); border-color: var(--running); }
       .p-in_progress { color: var(--running); border-color: var(--running); }

@@ -11261,6 +11261,7 @@ mod tests {
 
     fn fake_result(tokens_in: i64, tokens_out: i64, cost_usd: f64) -> RunnerResult {
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in,
             tokens_out,
@@ -11437,6 +11438,7 @@ mod tests {
     impl Runner for FixedValueRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 1,
                 tokens_out: 1,
@@ -11586,6 +11588,7 @@ mod tests {
     impl Runner for NoOpFeedbackRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -14479,6 +14482,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             *self.last_prompt.lock().unwrap() = spec.prompt.clone();
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -14949,6 +14953,7 @@ mod tests {
     impl Runner for FailingAgentRunner {
         fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
             RunnerResult {
+                retry_after_secs: None,
                 status: "failed".to_string(),
                 tokens_in: 10,
                 tokens_out: 20,

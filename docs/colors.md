@@ -48,6 +48,7 @@ role in the table below, then use it.
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
 | `--out-of-date` | `#d4a72c` | *(shared)* | semantic (a task/cell/proof step's env overrides changed since it last ran, RAL-271) |
 | `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
+| `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
 | `--terminal-bg` | `#000000` | *(shared)* | surface (the remote terminal relay's xterm.js panel background, RAL-355 Phase 10) |
 
@@ -257,6 +258,23 @@ normal read-only field", losing the signal entirely); `--detached` exists
 only because no existing role fit this new concept (see "Adding a new UI
 element" below). Clears automatically the next time the cell is dispatched
 (a restart, or the explicit resume-automation trigger).
+
+### Rate-limited retry wait — `--delayed` only (RAL-435)
+A task cell's status pill grows a `⏳ delayed` badge while it reads `running`
+but is actually waiting out a recognized, retryable provider rate limit (a
+Pi 429 that also carried a suggested retry delay) before the daemon
+automatically resumes the same agent session — no human action needed,
+unlike a `⏸ detached` cell. It deliberately does not reuse `--detached`
+(that badge specifically means a human is or was in the driver's seat via
+"Open Agent"; this one means the daemon itself is waiting out a timer),
+`--stale` (reserved for a still-headlessly-running cell gone quiet, a sign
+something may be wrong, whereas a delayed cell is behaving exactly as
+expected), or `--waiting` (reserved for a `pending` *squad* held back by a
+scheduler down-time window — a different entity and a different cause);
+`--delayed` exists only because no existing role fit this new concept (see
+"Adding a new UI element" below). Clears automatically once the delay
+elapses and the cell resumes, or once repeated rate limits cross RAL-435's
+anti-thrash threshold and the cell fails outright instead of retrying again.
 
 ### Arbiter-created review — `--arbiter` only (RAL-318)
 The Reviews panel marks a review with a small "⚙ Arbiter" badge when its

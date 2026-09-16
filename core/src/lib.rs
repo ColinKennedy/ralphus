@@ -10,6 +10,7 @@ pub mod cors;
 pub mod license;
 pub mod redact;
 pub mod schema;
+pub mod thrash;
 pub mod uri;
 pub mod validate;
 

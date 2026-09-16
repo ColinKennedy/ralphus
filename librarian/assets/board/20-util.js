@@ -402,11 +402,36 @@
        */
       const sdot = (s) => { const safe = safeState(s); return `<span class="dot" style="background:${cvar("--"+safe)}"></span>`; };
       /**
-       * Renders a status pill for a state name.
+       * RAL-435: explanatory tooltip text for each of the shared entity-status
+       * values a squad/task/cell/proof `state` can hold (see docs/colors.md's
+       * "Entity status" table) -- shown on every {@link pill}, wherever it
+       * appears (graph, squad details/sidebar, Tasks tab). Deliberately
+       * doesn't cover the narrower, entity-specific statuses (review/PR
+       * states, etc.) that also flow through `pill()` -- only the states any
+       * squad/task/cell/proof can actually be in.
+       * @type {{[state: string]: string}}
+       */
+      const STATE_TOOLTIPS = {
+        pending: "Not yet started.\nWaiting on a dependency, a review-board slot, or just not yet picked up by the scheduler — normal for anything queued up behind other work.",
+        running: "Actively executing (or, for a squad/task, has at least one child still going).\nA cell that reads running can actually be paused for a human (⏸ detached) or automatically waiting out a provider rate limit (⏳ delayed) instead of making live progress — check for those badges rather than assuming steady progress from the state alone.",
+        done: "Finished successfully — completed its work (and any proof/verification steps) with no error.",
+        failed: "Finished unsuccessfully.\nCheck its error/log for why, then use Restart to try again from scratch.",
+        cancelled: "Stopped deliberately before finishing — a human or automated action cancelled it, not a crash or provider error.",
+        ignored: "Manually marked as skipped via Set Status — satisfies downstream dependencies without actually running.\nReversible back to pending.",
+        queued: "Squad accepted but not yet materializing worktrees or dispatching cells — normal briefly after submission; a long queue usually means the daemon is busy with other squads.",
+        materializing: "Squad is creating its worktrees and deriving its review plan — normal briefly after submission, before any cell can start.",
+      };
+      /**
+       * Renders a status pill for a state name, with an explanatory tooltip
+       * for any of the shared entity-status values in {@link STATE_TOOLTIPS}.
        * @param {string} s
        * @returns {string}
        */
-      const pill = (s) => { const safe = safeState(s); return `<span class="pill p-${safe}">${safe}</span>`; };
+      const pill = (s) => {
+        const safe = safeState(s);
+        const tip = STATE_TOOLTIPS[safe];
+        return `<span class="pill p-${safe}"${tip ? ` data-tip="${esc(tip)}"` : ""}>${safe}</span>`;
+      };
       /**
        * Renders a "soloed" badge for a task (RAL-157), or an empty string when
        * the task isn't soloed.
@@ -449,6 +474,29 @@
        */
       const detachedGraphBadge = (detachedAtMs) => detachedAtMs
         ? ` <span class="pill p-detached" data-tip="This cell cleanly stopped so a real interactive agent session could take over — it is not stuck.\nWho/when: 'Open Agent' was clicked and the live conversation continues in a separate terminal (tmux session), outside this board.\nUse 'Open Agent' again to reattach, or 'Resume Automation' to continue unattended from where it left off.">detached</span>`
+        : "";
+      /**
+       * Renders a "delayed" badge (RAL-435) for a cell that reads `running`
+       * but is actually waiting out a recognized, retryable provider rate
+       * limit's suggested delay before the daemon automatically resumes it
+       * — not stuck, and not waiting on a human the way a detached cell is.
+       * `delayedUntilMs` is the cell's own `delayed_until_ms` field (present
+       * only while genuinely delayed).
+       * @param {number|null|undefined} delayedUntilMs
+       * @returns {string}
+       */
+      const delayedBadge = (delayedUntilMs) => delayedUntilMs
+        ? ` <span class="pill p-delayed" data-tip="This cell hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\nWho/when: the agent backend (Pi) reported a recognized, retryable 429 with a suggested delay; the daemon will resume the same agent session on its own once the delay elapses.\nRepeated rate limits in quick succession (3 within 2 turns) are treated as a real failure instead of retrying forever.">⏳ delayed — resumes in ~${fmtRelativeAge(Math.max(0, delayedUntilMs - Date.now()))}</span>`
+        : "";
+      /**
+       * Compact "delayed" badge (RAL-435) for the graph tree's cell node,
+       * where space is tight — same signal and tooltip as {@link delayedBadge},
+       * just the bare word instead of the full explanatory label.
+       * @param {number|null|undefined} delayedUntilMs
+       * @returns {string}
+       */
+      const delayedGraphBadge = (delayedUntilMs) => delayedUntilMs
+        ? ` <span class="pill p-delayed" data-tip="This cell hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\nWho/when: the agent backend (Pi) reported a recognized, retryable 429 with a suggested delay; the daemon will resume the same agent session on its own once the delay elapses.\nRepeated rate limits in quick succession (3 within 2 turns) are treated as a real failure instead of retrying forever.">delayed</span>`
         : "";
       /** @type {{[key: string]: ("task"|"cell"|"proof")[]}} */
       const GRAPH_NODE_ACTION_COMPAT = {
