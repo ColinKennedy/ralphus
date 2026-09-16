@@ -410,6 +410,7 @@ Rules:
 - Profile env values may be literal strings or `{ from_env = "VAR" }`; indirection is resolved in the daemon's own OS environment, so secrets never appear in task TOML or HTTP request/response bodies.
 - `model` supplies the profile's default model whenever a task or cell does not declare one. A task- or cell-level `model` overrides the profile default.
 - The old implicit fallback from an unknown `agent` name to a generic harness executable is gone. Use a named profile instead.
+- **Pi provider-qualified model names**: The `pi` backend supports model names that include a provider prefix. This allows you to specify non-default providers alongside the model name. For example, `openrouter/z-ai/glm-5.3-flash` or `openrouter/deepseek/deepseek-v4-flash-0731`. The provider prefix follows the format `<provider>/<model-path>`, and you must set the corresponding authentication environment variable (e.g., `OPENROUTER_API_KEY` for OpenRouter providers).
 
 #### What `--command` accepts (RAL-189)
 
