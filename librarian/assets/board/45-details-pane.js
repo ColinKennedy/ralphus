@@ -610,6 +610,7 @@
         renderReviews();
         if (!findGuardian(id)) reviewDetailLoading = id;
         renderReviewDetail();
+        ensureGuardianDetailLoaded(id);
       }
       // RALPHUS-GOTO-REVIEW:END
       /**
@@ -622,9 +623,13 @@
         selectedGuardian = gid;
         revealedGuardianId = gid;
         selectedBranch[gid] = branch;
-        // Auto-expand the branch so its detail is visible.
+        // Auto-expand the branch so its detail is visible. `g.branches` is
+        // only present once full detail has been merged in (see the
+        // `guardians` declaration in `05-engines.js`) -- if this review
+        // hasn't been opened before, there's nothing to expand yet, and
+        // `ensureGuardianDetailLoaded` below re-renders once it arrives.
         const g = guardians.find((x) => x.id === gid);
-        if (g) {
+        if (g && g.branches) {
           const b = g.branches.find((br) => br.branch === branch);
           if (b != null) expandedBranches.add(`${gid}:${b.id}`);
         }
@@ -636,6 +641,7 @@
         if (!findGuardian(gid)) reviewDetailLoading = gid;
         renderReviews();
         renderReviewDetail();
+        ensureGuardianDetailLoaded(gid);
       }
       /**
        * Toggles a branch row's selection within a review's branch list.
@@ -1441,7 +1447,12 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
         const reviewList = (/** @type {any} */ (window)._daemonStatus && /** @type {any} */ (window)._daemonStatus.running_reviews) || [];
         for (const rv of reviewList) {
           const g = guardians.find((x) => x.id === rv.id);
-          const inProg = g && g.branches.find((b) => b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning");
+          // `g.branches` is only present once this review's full detail has
+          // been fetched (see the `guardians` declaration in
+          // `05-engines.js`) -- most reviews in this "what's running" widget
+          // were never opened, so degrade to the generic tooltip below
+          // instead of fetching full detail just to populate one.
+          const inProg = g && g.branches && g.branches.find((b) => b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning");
           const tip = inProg
             ? inProg.merge_status === "proof_pending"
               ? `Guardian review '${esc(rv.name)}' is running final verification on branch ${esc(inProg.branch)}.\nClick to jump to this worktree row and expand it.`

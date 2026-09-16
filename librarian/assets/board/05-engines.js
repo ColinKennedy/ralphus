@@ -271,7 +271,21 @@
       let gotoSearchSelected = 0;
       /** Whether the go-to search overlay's own "show hidden" checkbox (RAL-365) is on -- independent of the Squads-tab sidebar's `filters.showHidden`. Reset to `false` every time the overlay opens. */
       let gotoSearchShowHidden = false;
-      /** @type {GuardianView[]} */
+      /**
+       * The Reviews tab's review list. Every entry starts out as a lean
+       * `GuardianIndexEntry` from `/api/guardian-index` (id/name/status/
+       * origin/branch_count/...); once a review is actually opened,
+       * `pollReviews` fetches its full `GuardianView` via `GET
+       * /api/guardians/{id}` and merges those extra fields onto its existing
+       * entry in place (`Object.assign`), rather than replacing it or
+       * caching it elsewhere -- so every existing `guardians.find(...)` call
+       * site keeps working unchanged once a review has been opened. Typed
+       * as `GuardianView[]` (the superset) even though an entry may still be
+       * lean-only at runtime: `g.branches` being present is the signal that
+       * an entry has actually been upgraded -- see `GuardianView.branches`'s
+       * own doc and `renderReviewDetail`'s `!g.branches` guard.
+       * @type {GuardianView[]}
+       */
       let guardians = [];
       /** @type {ResourceEntry[]} */
       let resources = [];

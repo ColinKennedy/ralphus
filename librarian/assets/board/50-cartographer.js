@@ -173,7 +173,7 @@
        * @param {string} gid
        * @returns {void}
        */
-      function gotoCartoGuardian(e, gid) { e.stopPropagation(); showTab("reviews", true); selectedGuardian = gid; revealedGuardianId = gid; syncHash(true); renderReviews(); renderReviewDetail(); }
+      function gotoCartoGuardian(e, gid) { e.stopPropagation(); showTab("reviews", true); selectedGuardian = gid; revealedGuardianId = gid; syncHash(true); renderReviews(); renderReviewDetail(); ensureGuardianDetailLoaded(gid); }
       /**
        * Navigates from a Cartographer row to a specific task/cell/proof item.
        * @param {MouseEvent} e

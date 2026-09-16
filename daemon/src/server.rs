@@ -1505,6 +1505,7 @@ fn route_for_user(
         ) => proof_terminal_log_attempt(daemon, id, task_idx, scope, cell_idx, proof_idx, attempt),
         ("DELETE", ["api", "squads", id]) => delete_squad(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
+        ("GET", ["api", "guardian-index"]) => guardian_index(daemon),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
         ("GET", ["api", "guardians", id, "logs"]) => guardian_logs(daemon, id),
@@ -11203,6 +11204,71 @@ struct IdResponse {
 #[derive(Serialize)]
 struct PositionResponse {
     position: i64,
+}
+
+/// Lean per-review projection for the Reviews tab's sidebar list, its
+/// status/origin/agent filters, and cross-review notice toasts
+/// (`checkGuardianNotices` in the board JS, which needs notice fields for
+/// every review, not just the one currently open) -- everything the list
+/// needs without hydrating or serializing the full [`crate::guardian::GuardianView`]
+/// (env overrides, build/manual-checks environments, resolver session ids,
+/// token/cost accounting, per-branch detail, ...) for every review on every
+/// poll. Mirrors the `TaskIndex*` structs' relationship to the full board
+/// view (see `task_index` below).
+#[derive(Serialize)]
+struct GuardianIndexEntry {
+    id: String,
+    name: String,
+    status: String,
+    origin: String,
+    /// Just the count -- the sidebar list shows "N branches", never a
+    /// per-branch breakdown; that only renders once a review is open.
+    branch_count: usize,
+    resolver_agent: Option<String>,
+    git_root: String,
+    projects: Vec<String>,
+    notice_kind: Option<String>,
+    notice_message: Option<String>,
+    notice_at_ms: Option<i64>,
+}
+
+impl From<crate::guardian::GuardianView> for GuardianIndexEntry {
+    fn from(value: crate::guardian::GuardianView) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            status: value.status,
+            origin: value.origin,
+            branch_count: value.branches.len(),
+            resolver_agent: value.resolver_agent,
+            git_root: value.git_root,
+            projects: value.projects,
+            notice_kind: value.notice_kind,
+            notice_message: value.notice_message,
+            notice_at_ms: value.notice_at_ms,
+        }
+    }
+}
+
+/// `GET /api/guardian-index` -- the Reviews tab's list poll. Same read as
+/// `guardian_list` below, served from the same read-pool snapshot: this
+/// doesn't avoid the per-row hydration cost noted there, only the
+/// serialization/transfer cost of the ~50 detail-only fields the sidebar
+/// list never reads.
+fn guardian_index(daemon: &Daemon) -> Reply {
+    match daemon.with_read_snapshot(Store::list_guardians_conn) {
+        Ok(gs) => {
+            let queue = daemon.summary_queue_handle();
+            for g in &gs {
+                if g.status == "collecting" {
+                    queue.enqueue(&g.id, crate::summary_worker::Priority::Low);
+                }
+            }
+            let entries: Vec<GuardianIndexEntry> = gs.into_iter().map(Into::into).collect();
+            json(200, &entries)
+        }
+        Err(e) => store_error(&e),
+    }
 }
 
 fn guardian_list(daemon: &Daemon) -> Reply {
@@ -20993,6 +21059,34 @@ command = "true"
             route(&d, "GET", &format!("/api/guardians/{gid}"), "").status,
             404
         );
+    }
+
+    #[test]
+    fn guardian_index_returns_lean_summary_only() {
+        let d = daemon();
+        let body = serde_json::json!({
+            "name": "r", "base_branch": "main", "git_root": "/repo",
+        })
+        .to_string();
+        let created = route(&d, "POST", "/api/guardians", &body);
+        assert_eq!(created.status, 201, "{}", created.body);
+        let gid = "guardian-000000000001";
+
+        let index = route(&d, "GET", "/api/guardian-index", "");
+        assert_eq!(index.status, 200, "{}", index.body);
+        assert!(index.body.contains(&format!("\"id\":\"{gid}\"")));
+        assert!(index.body.contains("\"name\":\"r\""));
+        assert!(index.body.contains("\"origin\":"));
+        assert!(index.body.contains("\"branch_count\":0"));
+        // Detail-only fields the sidebar list never reads must not be
+        // serialized here -- that's the entire point of this endpoint.
+        assert!(!index.body.contains("\"skip_auto_build\""));
+        assert!(!index.body.contains("\"combined_env\""));
+        assert!(!index.body.contains("\"attempt_tokens_in\""));
+
+        // The full endpoint is unaffected by this one's existence.
+        let full = route(&d, "GET", "/api/guardians", "");
+        assert!(full.body.contains("\"skip_auto_build\""));
     }
 
     #[test]

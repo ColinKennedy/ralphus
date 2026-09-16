@@ -1279,20 +1279,19 @@ Work submitted against it will fail — fix the machine or deregister the provid
         renderPrefs();
       }
       /**
+       * Polls the caller's own watch list (`GET /api/watches`) and
+       * preferences, and refreshes `entityWatchers` for whatever's currently
+       * on screen via {@link pollEntityWatchers}. Runs on every `tick()`
+       * regardless of tab -- kept cheap on purpose (one bulk fetch plus at
+       * most two per-entity ones), so it can never be the slow part of a
+       * tick.
        * @returns {Promise<void>}
        */
       async function pollWatches() {
         try {
           const own = await fetch("/api/watches", { headers: prefsUserHeaders() });
           if (own.ok) watches = (await own.json()).watches || [];
-          const uris = new Set(watches.map((w) => w.entity_uri));
-          if (selectedSquadId) uris.add(`squad:${selectedSquadId}`);
-          if (selectedGuardian) uris.add(`guardian:${selectedGuardian}`);
-          const pairs = await Promise.all([...uris].map(async (uri) => {
-            const r = await fetch(`/api/watches/${uri}`);
-            return /** @type {[string, WatchView[]]} */ ([uri, r.ok ? ((await r.json()).watches || []) : []]);
-          }));
-          entityWatchers = new Map(pairs);
+          await pollEntityWatchers();
           const name = prefsUserName();
           if (name) {
             const p = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`);
@@ -1305,11 +1304,36 @@ Work submitted against it will fail — fix the machine or deregister the provid
         } catch (_) { /* transient -- the next live refresh retries */ }
       }
       /**
+       * Refreshes `entityWatchers` for only the squad and/or review
+       * currently on screen. `watchersHtml` is only ever called for those
+       * two entities (the open squad's detail pane, `45-details-pane.js`,
+       * and the open review's detail pane, `65-reviews.js`) -- fetching
+       * "who else watches this" for anything beyond them, e.g. every entity
+       * the caller personally watches, would be pure waste and could easily
+       * become the single slowest thing in a tick on an account with many
+       * watched items.
+       * @returns {Promise<void>}
+       */
+      async function pollEntityWatchers() {
+        /** @type {string[]} */
+        const uris = [];
+        if (selectedSquadId) uris.push(`squad:${selectedSquadId}`);
+        if (selectedGuardian) uris.push(`guardian:${selectedGuardian}`);
+        if (!uris.length) { entityWatchers = new Map(); return; }
+        try {
+          const pairs = await Promise.all(uris.map(async (uri) => {
+            const r = await fetch(`/api/watches/${uri}`);
+            return /** @type {[string, WatchView[]]} */ ([uri, r.ok ? ((await r.json()).watches || []) : []]);
+          }));
+          entityWatchers = new Map(pairs);
+        } catch (_) { /* transient -- the next live refresh retries */ }
+      }
+      /**
        * Polls `GET /api/hidden` for the current (or, under RAL-332's "Edit
        * Profile", visited) user's hidden squads/reviews (RAL-328/RAL-329),
-       * plus `GET /api/tasks`/`GET /api/guardians` to resolve their display names,
-       * the full personal-mailbox message history (RAL-401), and
-       * re-renders the Preferences tab.
+       * plus `GET /api/task-index`/`GET /api/guardian-index` to resolve
+       * their display names, the full personal-mailbox message history
+       * (RAL-401), and re-renders the Preferences tab.
        * @returns {Promise<void>}
        */
       async function pollPrefs() {
@@ -1318,13 +1342,13 @@ Work submitted against it will fail — fix the machine or deregister the provid
           await pollMailboxHistory();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
-            // `/api/task-index`, not `/api/tasks`: the only fields read below
-            // are each squad's id/label and its tasks' names, all of which the
-            // compact index carries. The full board view is ~9x larger (6.2MB
-            // vs 684KB against a real squad history) and every byte past those
-            // three fields is discarded here.
+            // Lean sibling endpoints, not the full board/guardian views: the
+            // only fields read below are id/label/name, all of which the
+            // compact indexes carry. The full board view is ~9x larger
+            // (6.2MB vs 684KB against a real squad history) and every byte
+            // past those fields is discarded here.
             fetch("/api/task-index"),
-            fetch("/api/guardians"),
+            fetch("/api/guardian-index"),
           ]);
           byId("conn").className = "dot on";
           markUpdated();
@@ -1346,7 +1370,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           }
           if (guardiansResp.ok) {
             const g = await guardiansResp.json();
-            hiddenGuardianNames = new Map((g || []).map((/** @type {GuardianView} */ x) => [x.id, x.name || x.id]));
+            hiddenGuardianNames = new Map((g || []).map((/** @type {GuardianIndexEntry} */ x) => [x.id, x.name || x.id]));
           }
         } catch (e) {
           markUnreachable();

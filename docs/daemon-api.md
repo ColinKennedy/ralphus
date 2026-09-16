@@ -111,6 +111,7 @@ where one exists.
 | Method | Path | What |
 |---|---|---|
 | GET | `/api/guardians` | List all reviews (returns a **bare JSON array**, not `{guardians:[...]}`) |
+| GET | `/api/guardian-index` | [Compact review list](#get-apiguardian-index) for the Reviews tab's sidebar (returns a **bare JSON array**) |
 | POST | `/api/guardians` | Create a review |
 | GET | `/api/guardians/{id}` | [One review's full detail](#get-apiguardiansid) |
 | GET | `/api/guardians/{id}/logs` | State-transition audit log (bare array) |
@@ -1546,6 +1547,22 @@ modified. A dependency that is already present is a no-op. Returns `200` with
 the updated squad. A self-reference or a reference that would create a cycle in
 the cross-squad dependency graph is a `409`; an unknown `id`/`target_id` is a
 `404`; a malformed body is a `400`.
+
+### `GET /api/guardian-index`
+
+Compact review list for the Reviews tab's sidebar, its status/origin/agent
+filters, and cross-review notice toasts. It carries `id`, `name`, `status`,
+`origin`, `branch_count` (just the count — the sidebar list shows "N
+branches", never a per-branch breakdown), `resolver_agent`, `git_root`,
+`projects`, and `notice_kind`/`notice_message`/`notice_at_ms`, and omits
+everything else `GET /api/guardians` returns per review — env overrides,
+build/manual-checks environments, resolver session ids, token/cost
+accounting, per-branch detail, and more. This keeps a review list with a lot
+of history from repeatedly transferring detail that's only ever read once a
+specific review is opened (via `GET /api/guardians/{id}`). It is read-only
+and has no query parameters. `GET /api/guardians` is unaffected by this
+endpoint's existence and keeps returning full detail for every consumer that
+already depends on it (the CLI, the MCP server, docs generation).
 
 ### `GET /api/guardians/{id}`
 A single review's full detail, including its ordered `branches` list.

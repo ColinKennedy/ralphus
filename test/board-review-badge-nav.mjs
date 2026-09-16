@@ -86,7 +86,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
-    `const { showTab, findGuardian, renderReviews, renderReviewDetail } = deps;
+    `const { showTab, findGuardian, renderReviews, renderReviewDetail, ensureGuardianDetailLoaded } = deps;
      var selectedGuardian = null, revealedGuardianId = null, reviewDetailLoading = null;
      ${sliceRegion(REGIONS.gotoReview)}
      return {
@@ -99,6 +99,7 @@ export function makeGotoReview({ showTab = () => {}, findGuardian = () => false 
     findGuardian,
     renderReviews: () => { calls.renderReviews++; },
     renderReviewDetail: () => { calls.renderReviewDetail++; },
+    ensureGuardianDetailLoaded: () => {},
   });
   return { ...api, calls };
 }
@@ -136,6 +137,7 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
     pollBranchConflicts: async () => {},
     pollPullRequests: async () => {},
     pollPrErrors: async () => {},
+    fetchGuardianDetail: async () => {},
     preserveUserState: (_el, fn) => fn(),
     renderReviews: () => { calls.renderReviews++; },
     renderReviewDetail: () => { calls.renderReviewDetail++; },
@@ -147,7 +149,7 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
     "deps",
     "fetchImpl",
     `const { checkGuardianNotices, byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
-             pollBranchConflicts, pollPullRequests, pollPrErrors, preserveUserState, renderReviews, renderReviewDetail,
+             pollBranchConflicts, pollPullRequests, pollPrErrors, fetchGuardianDetail, preserveUserState, renderReviews, renderReviewDetail,
              selectionWithin, document } = deps;
      const fetch = fetchImpl;
      var guardians = ${JSON.stringify(initialGuardians)}, selectedGuardian = null, revealedGuardianId = null,

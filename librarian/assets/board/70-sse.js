@@ -440,25 +440,32 @@
         // moment its POST returns, so that duplicate was doubling the delay
         // before the board showed the new status.
         const selfCountingTab = tab === "squads" || tab === "tasks";
-        await Promise.all([
+        const globalPolls = Promise.all([
           pollWhoAmI(), pollHidden(), pollWatches(), pollMailbox(),
           ...(selfCountingTab ? [] : [updateCounter()]),
         ]);
+        // The active tab's own fetch runs *alongside* the four global polls
+        // above, not after them -- none of the four is reviews/tasks/etc.
+        // data, so a slow whoami/hidden/watches/mailbox must never delay the
+        // tab the user is actually looking at from painting.
         // `findLinkedCells` runs inside the Reviews tab's synchronous render,
         // so the index it reads has to be in place before `pollReviews`.
-        if (tab === "reviews") { await loadTaskIndex(); await pollReviews(); }
-        else if (tab === "resources") { await pollResources(); }
-        else if (tab === "queue") { if (queueUI.autoUpdate || !queueLoaded) await pollQueue(); }
-        else if (tab === "cartographer") { await pollCartographer(); }
-        else if (tab === "projects") { await pollProjects(); }
-        else if (tab === "machines") { await pollMachines(); }
-        else if (tab === "triage") { await pollTriage(); }
-        else if (tab === "users") { await pollUsers(); }
-        else if (tab === "secrets") { await pollSecretEnvNames(); }
-        else if (tab === "worktree-retirement") { await pollWorktreeRetirements(); }
-        else if (tab === "prefs") { await pollPrefs(); }
-        else if (tab === "tasks") { await ensureProjectsLoadedForFilters(); await pollTasksTab(); }
-        else { await ensureProjectsLoadedForFilters(); await pollTasks(); }
+        /** @type {Promise<void>} */
+        let tabPoll;
+        if (tab === "reviews") tabPoll = loadTaskIndex().then(() => pollReviews());
+        else if (tab === "resources") tabPoll = pollResources();
+        else if (tab === "queue") tabPoll = (queueUI.autoUpdate || !queueLoaded) ? pollQueue() : Promise.resolve();
+        else if (tab === "cartographer") tabPoll = pollCartographer();
+        else if (tab === "projects") tabPoll = pollProjects();
+        else if (tab === "machines") tabPoll = pollMachines();
+        else if (tab === "triage") tabPoll = pollTriage();
+        else if (tab === "users") tabPoll = pollUsers();
+        else if (tab === "secrets") tabPoll = pollSecretEnvNames();
+        else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
+        else if (tab === "prefs") tabPoll = pollPrefs();
+        else if (tab === "tasks") tabPoll = ensureProjectsLoadedForFilters().then(() => pollTasksTab());
+        else tabPoll = ensureProjectsLoadedForFilters().then(() => pollTasks());
+        await Promise.all([globalPolls, tabPoll]);
         await refreshBanner();
       }
 
@@ -805,7 +812,11 @@
        */
       async function pollBranchConflicts(gid) {
         const g = guardians.find((x) => x.id === gid);
-        if (!g) return;
+        // `g.branches` may not have merged in yet on the very first poll
+        // after selecting a review -- that fetch runs concurrently with
+        // this one, not before it. Skip for this cycle; the next poll picks
+        // it up once full detail has landed.
+        if (!g || !g.branches) return;
         const failedIds = new Set(g.branches.filter((b) => b.merge_status === "failed").map((b) => b.id));
         Object.keys(branchConflicts).forEach((k) => {
           if (k.startsWith(`${gid}:`) && !failedIds.has(k.slice(gid.length + 1))) delete branchConflicts[k];
@@ -859,11 +870,57 @@
           open.forEach((p) => { fetchPrSyncStatus(p.id); });
         } catch (e) { /* transient -- the next poll retries */ }
       }
+      /** @type {{[id: string]: Promise<void>}} in-flight per-guardian full-detail fetches, keyed by guardian id -- a selection-triggered fetch (`ensureGuardianDetailLoaded`) and a concurrently-running `pollReviews` cycle for the same id share one request instead of firing two. */
+      const guardianDetailFetches = {};
+      /**
+       * Fetches one guardian's full `GuardianView` detail and merges it onto
+       * its existing `guardians[]` entry in place (see the `guardians`
+       * declaration in `05-engines.js`) -- does not render; callers decide
+       * when/whether to. Concurrent calls for the same id share one in-flight
+       * fetch rather than issuing duplicate requests.
+       * @param {string} gid
+       * @returns {Promise<void>}
+       */
+      function fetchGuardianDetail(gid) {
+        const inFlight = guardianDetailFetches[gid];
+        if (inFlight) return inFlight;
+        const p = fetch(`/api/guardians/${gid}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((detail) => {
+            if (!detail) return;
+            const entry = guardians.find((x) => x.id === gid);
+            if (entry) Object.assign(entry, detail);
+          })
+          .catch(() => {})
+          .finally(() => { delete guardianDetailFetches[gid]; });
+        guardianDetailFetches[gid] = p;
+        return p;
+      }
+      /**
+       * Kicks off `fetchGuardianDetail` for `id` if it isn't already loaded
+       * on `guardians[]`, and re-renders the detail pane once it lands.
+       * `pollReviews` keeps a selected guardian's detail fresh on every poll,
+       * but that only runs on the next incidental SSE event or the 60s
+       * reconciliation fallback -- without this, a review selected outside
+       * that cycle (a click, a hash/cross-tab navigation) sat on "Loading
+       * review…" until whatever poll happened to fire next, which could be
+       * many seconds away. Callers should still do their own synchronous
+       * `renderReviewDetail()` first, for the immediate loading-placeholder
+       * paint -- this only handles the async follow-up once data arrives.
+       * @param {string} id
+       * @returns {void}
+       */
+      function ensureGuardianDetailLoaded(id) {
+        const g = guardians.find((x) => x.id === id);
+        if (!g || g.branches) return;
+        fetchGuardianDetail(id).then(() => { if (selectedGuardian === id) renderReviewDetail(); });
+      }
       // RALPHUS-REVIEW-POLL:BEGIN
       /** Monotonic sequence over `pollReviews` invocations — each call captures its number at start; a call that is no longer the freshest abandons itself (RAL-382). */
       let reviewPollSeq = 0;
       /**
-       * Polls `/api/guardians` and re-renders the Reviews tab.
+       * Polls `/api/guardian-index` (the lean per-review summary -- see
+       * `GuardianIndexEntry`) and re-renders the Reviews tab.
        * RAL-382: overlapping invocations are guarded by a monotonic sequence
        * counter — each call captures its number at start and abandons itself if
        * a newer poll has started by the time any of its awaits resolve, so an
@@ -873,11 +930,24 @@
       async function pollReviews() {
         const seq = ++reviewPollSeq;
         try {
-          const fresh = await (await fetch("/api/guardians")).json();
+          const fresh = await (await fetch("/api/guardian-index")).json();
           // A newer poll started while this fetch was in flight — abandon this
           // one without touching `guardians`, whose fresher value belongs to it.
           if (seq !== reviewPollSeq) { console.debug("pollReviews: superseded, abandoning"); return; }
-          guardians = fresh;
+          // `fresh` is the lean `/api/guardian-index` shape -- carry forward
+          // any full detail a prior `fetchGuardianDetail` already merged
+          // onto the outgoing `guardians[]` entry (its `.branches` etc.),
+          // rather than discarding it wholesale. Without this, the entry
+          // reverts to lean-only on every single poll (this fires on every
+          // SSE event, often every 1-2s), which made `renderReviewDetail`'s
+          // "is full detail loaded?" check flip back to "no" and flash the
+          // loading placeholder even for a review that was already fully
+          // loaded and hasn't changed.
+          const priorById = new Map(guardians.map((g) => [g.id, g]));
+          guardians = /** @type {GuardianView[]} */ (fresh).map((lean) => {
+            const prior = priorById.get(lean.id);
+            return prior && prior.branches ? Object.assign({}, prior, lean) : lean;
+          });
           checkGuardianNotices(guardians);
           byId("conn").className = "dot on";
           markUpdated();
@@ -900,48 +970,56 @@
           }
           if (selectedGuardian) revealedGuardianId = selectedGuardian;
           syncHash();  // keep URL in sync with selectedGuardian (replaceState)
-          // RAL-121: fetching a single guardian is the daemon's "the user is
-          // looking at this one" signal — it promotes that guardian's
-          // preliminary change-summary job to high priority (or wakes a cold
-          // one) on a background worker, instead of every review in this
-          // list computing its git-log summary eagerly. Fire-and-forget: the
-          // response isn't used since `guardians` (from the list fetch above)
-          // already has everything `renderReviewDetail` needs, and the next
-          // poll picks up the summary once that worker finishes it.
-          if (selectedGuardian) fetch(`/api/guardians/${selectedGuardian}`).catch(() => {});
-          // Render now, with whatever's already loaded (the guardian list
-          // itself, plus any branch/PR/conflict data cached from a previous
-          // poll) -- don't make the whole tab wait on the four
-          // per-selected-guardian refreshes below. `pollPullRequests` hits
-          // `GET /api/pull-requests/{id}/sync-status`, which does a real
-          // `git fetch` and can take many seconds per open PR (serialized
-          // per repo on the daemon side) -- the list/sidebar has no reason to
-          // sit blank that whole time when its own data already arrived.
-          const renderIfNotSelecting = () => {
+          /**
+           * Renders now, with whatever's already loaded (the lean guardian
+           * list itself, plus any detail/branch/PR/conflict data cached
+           * from a previous poll) -- don't make the whole tab wait on the
+           * per-selected-guardian refreshes below. `pollPullRequests` hits
+           * `GET /api/pull-requests/{id}/sync-status`, which does a real
+           * `git fetch` and can take many seconds per open PR (serialized
+           * per repo on the daemon side) -- the list/sidebar has no reason
+           * to sit blank that whole time when its own data already
+           * arrived. A `function` declaration (not `const`) so it's
+           * hoisted and safe to call from the async detail-fetch callback
+           * below, wherever that callback happens to land relative to this
+           * point in the function body.
+           * @returns {void}
+           */
+          function renderIfNotSelecting() {
             renderReviews();
             const detail = document.getElementById("review-detail");
             if (selectionWithin(detail)) return; // keep the user's in-pane selection intact
             preserveUserState(detail, renderReviewDetail);
-          };
+          }
           renderIfNotSelecting();
           // Keep every expanded branch's feedback thread fresh (RAL-272) so a
-          // guardian's async acknowledgment appears without a manual refresh.
-          // These four fetches are independent of each other (each caches
-          // into its own state and none reads another's result), so they run
-          // concurrently (RAL-234) instead of as a sequential await chain --
-          // the old chained-await version summed all round-trips instead of
-          // taking the max of them.
+          // guardian's async acknowledgment appears without a manual refresh,
+          // and fetch this guardian's full detail (RAL-121: also the
+          // daemon's "the user is looking at this one" signal -- promotes
+          // its preliminary change-summary job to high priority instead of
+          // every review in the list computing one eagerly). These are
+          // independent of each other (each caches into its own state and
+          // none reads another's result), so they run concurrently
+          // (RAL-234) instead of as a sequential await chain -- the old
+          // chained-await version summed all round-trips instead of taking
+          // the max of them. Folding `fetchGuardianDetail` into this same
+          // batch (not a separate, uncoordinated fetch+render) means the
+          // detail pane updates once, coherently, when everything lands --
+          // three independent chains each re-rendering on their own used to
+          // race and visibly flash back to the loading placeholder.
           if (selectedGuardian) {
+            const gid = selectedGuardian;
             await Promise.all([
-              refreshExpandedBranchMessages(selectedGuardian, { silent: true }),
-              pollBranchConflicts(selectedGuardian),
-              pollPullRequests(selectedGuardian),
-              pollPrErrors(selectedGuardian),
+              fetchGuardianDetail(gid),
+              refreshExpandedBranchMessages(gid, { silent: true }),
+              pollBranchConflicts(gid),
+              pollPullRequests(gid),
+              pollPrErrors(gid),
             ]);
             // The awaited refreshes may have been overtaken by a newer poll
             // (or re-selection) — a stale render now would show old data.
             if (seq !== reviewPollSeq) { console.debug("pollReviews: superseded, abandoning"); return; }
-            // Re-render now that the slower per-branch/PR data has landed.
+            // Re-render now that the slower per-branch/PR/detail data has landed.
             renderIfNotSelecting();
           }
         } catch (e) { byId("conn").className = "dot off"; }

@@ -162,13 +162,22 @@
       /**
        * Opens the Edit Details modal for a review, seeding the draft from its
        * current server state. Nothing this modal does reaches the server
-       * until Save.
+       * until Save. This can be reached from a sidebar row's own "..." menu
+       * for a review that has never been the selected/open one -- unlike
+       * `renderReviewDetail`, this can't just wait for the next poll to fill
+       * in full detail, so it fetches it itself via `fetchGuardianDetail`
+       * (see `70-sse.js`) when missing.
        * @param {string} gid
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function openEditReviewDetails(gid) {
-        const g = guardians.find((x) => x.id === gid);
+      async function openEditReviewDetails(gid) {
+        let g = guardians.find((x) => x.id === gid);
         if (!g) return;
+        if (!g.branches) {
+          await fetchGuardianDetail(gid);
+          g = guardians.find((x) => x.id === gid);
+          if (!g || !g.branches) { alert("failed to load review details"); return; }
+        }
         reviewEditDraft = buildReviewEditDraft(g);
         renderReviewEditModal();
       }
