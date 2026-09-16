@@ -35,6 +35,18 @@
        */
       let triageThresholdPreviews = {};
       /**
+       * RAL-449: pending manual-drain confirmations for the Triage tab's
+       * pool table -- keyed the same way as `triageThresholdPreviews`,
+       * present only after the human clicks "Drain now" on a row and
+       * cleared on Confirm/Cancel (or when the row disappears from the pool
+       * list). Populated straight from the row's already-known pool state
+       * (no round trip needed -- unlike a threshold preview, there is
+       * nothing to compute server-side: draining now always takes every
+       * currently eligible candidate).
+       * @type {{[key: string]: TriagePoolDrainConfirm}}
+       */
+      let triageDrainConfirms = {};
+      /**
        * RAL-421: the same live-preview state for the Projects-tab
        * auto-review-thresholds popup, keyed by triage type (`"__add__"`
        * holds the not-yet-added row's preview). Cleared on Confirm/Cancel
