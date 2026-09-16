@@ -507,9 +507,11 @@ fn default_branch(root: &Path) -> Result<String, String> {
         }
     }
     Err(format!(
-        "no default branch found. Fix: run `git remote set-head origin --auto` in {} \
-         (needed to resolve \"?upstream=<<default>>\"), or type a literal branch name in \
-         the upstream field instead",
+        "\"?upstream=<<default>>\" could not resolve a default branch in {}: no remote has a \
+         configured symbolic HEAD (no remote's `refs/remotes/<remote>/HEAD` is set), so there \
+         is no default branch for \"<<default>>\" to resolve to. Fix: run \
+         `git remote set-head origin --auto` in this repository, or use a literal branch name \
+         in the upstream field instead",
         root.display()
     ))
 }
@@ -940,7 +942,20 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // `<<...>>` (which no ref can resolve to, and which
         // `set_explicit_upstream` rejects). Failing to resolve is a hard error,
         // never a guess at `main`/`master`.
-        let upstream = resolve_upstream(Path::new(&project.path), upstream)?;
+        //
+        // Wrapped with cell + placeholder context here, at the source, rather
+        // than relying on a caller to add it: `resolve_placeholders_inner`
+        // does wrap its own cwd-resolution call, but `materialize_env_overrides`
+        // (RAL-447) resolves env-override placeholders through this same
+        // adapter without any equivalent wrap, so this is the one place that
+        // reliably preserves which cell and placeholder a resolution failure
+        // came from regardless of caller.
+        let upstream = resolve_upstream(Path::new(&project.path), upstream).map_err(|e| {
+            format!(
+                "cell '{}': could not resolve upstream for \"{placeholder}\": {e}",
+                ctx.cell_id
+            )
+        })?;
         // RAL-337: the placeholder names a *base* branch; which branch this
         // squad actually gets depends on whether another squad already owns
         // it. Without this, a resubmission of the same task file resolves to
@@ -2007,8 +2022,20 @@ mod tests {
         let err = resolve_upstream(&repo, "<<default>>")
             .expect_err("no remote HEAD must be a hard error, not a guess");
         assert!(
-            err.contains("<<default>>") && err.contains("git remote set-head origin --auto"),
-            "{err}"
+            err.contains("<<default>>"),
+            "should name the sentinel: {err}"
+        );
+        assert!(
+            err.contains("symbolic HEAD"),
+            "should explain the remote default branch is unconfigured: {err}"
+        );
+        assert!(
+            err.contains("git remote set-head origin --auto"),
+            "should recommend the remediation command: {err}"
+        );
+        assert!(
+            err.contains("literal branch name"),
+            "should offer a literal upstream branch as the alternative: {err}"
         );
     }
 
@@ -2637,6 +2664,46 @@ mod tests {
             .expect_err("a placeholder cwd with no ?upstream= must fail");
         assert!(err.contains("upstream"), "{err}");
         assert!(err.contains("s0"), "error should name the cell: {err}");
+    }
+
+    #[test]
+    fn resolve_placeholders_surfaces_a_clear_error_when_default_sentinel_has_no_remote_head() {
+        // RAL-447: an unresolvable `<<default>>` (no configured remote
+        // symbolic HEAD) must surface a self-service error identifying the
+        // cell, the placeholder, and the repository -- not just the bare
+        // low-level git failure `resolve_upstream_default_fails_...` covers
+        // on its own.
+        let repo = init_repo("cwd-default-no-remote");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat?upstream=<<default>>"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect_err("no remote HEAD must be a hard error, not a guess");
+        assert!(err.contains("s0"), "error should name the cell: {err}");
+        assert!(
+            err.contains("<<default>>"),
+            "error should identify the sentinel: {err}"
+        );
+        assert!(
+            err.contains("symbolic HEAD"),
+            "error should explain the remote default branch is unconfigured: {err}"
+        );
+        assert!(
+            err.contains("git remote set-head origin --auto"),
+            "error should recommend the remediation command: {err}"
+        );
+        assert!(
+            err.contains(&repo.display().to_string()),
+            "error should name the affected repository: {err}"
+        );
     }
 
     #[test]
