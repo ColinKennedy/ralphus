@@ -213,9 +213,21 @@ fn resolve_task_worktree_dir_with_existing(
     let mut candidate = base.clone();
     let mut n = 2;
     loop {
-        match existing.get(&candidate) {
+        // Case-insensitive lookup: `w/<short>` and a branch's loose ref file
+        // both live on the OS filesystem, which is case-*insensitive* on
+        // Windows and on a default-configured macOS -- "RAL-428-x" and
+        // "ral-428-x" are the SAME directory and the SAME ref there, even
+        // though a plain `HashMap::get`/`==` sees them as different keys. A
+        // case-sensitive comparison here let a placeholder that differed
+        // only in case from an existing (possibly dirty, unowned) worktree
+        // conclude its slot was free and collide straight into that
+        // worktree's real on-disk directory and branch.
+        match existing
+            .iter()
+            .find(|(short, _)| short.eq_ignore_ascii_case(&candidate))
+        {
             None => break,
-            Some(owner) if owner == branch => break,
+            Some((_, owner)) if owner.eq_ignore_ascii_case(branch) => break,
             Some(_) => {
                 candidate = format!("{base}-{n}");
                 n += 1;
@@ -305,10 +317,19 @@ fn resolve_squad_branch(
         .map_err(|e| e.to_string())?;
     let claimed: HashSet<&str> = claims.iter().map(|c| c.branch.as_str()).collect();
     let occupied: HashSet<&str> = on_disk.values().map(String::as_str).collect();
+    // Case-insensitive: see the matching comment on
+    // `resolve_task_worktree_dir_with_existing` -- a branch differing only in
+    // case from an already-claimed or already-checked-out one is the same
+    // ref/directory on a case-insensitive filesystem, so `HashSet::contains`
+    // (case-sensitive) must not be trusted to catch that collision.
+    let is_taken = |candidate: &str| {
+        claimed.iter().any(|c| c.eq_ignore_ascii_case(candidate))
+            || occupied.iter().any(|o| o.eq_ignore_ascii_case(candidate))
+    };
 
     let mut candidate = base_branch.to_string();
     let mut n = 2;
-    while claimed.contains(candidate.as_str()) || occupied.contains(candidate.as_str()) {
+    while is_taken(&candidate) {
         if n > MAX_BRANCH_SUFFIX {
             return Err(format!(
                 "could not find a free worktree branch for \"{base_branch}\" in project \
@@ -3146,6 +3167,52 @@ mod tests {
             !Path::new(&fresh).join("old.txt").exists(),
             "an unowned pre-existing worktree must not be inherited either"
         );
+    }
+
+    #[test]
+    fn ral337_a_worktree_of_a_differently_cased_branch_is_still_treated_as_occupied() {
+        // Regression: "ral-428-admin-system-prompt-tab" (a legacy worktree's
+        // actual branch, left dirty by some earlier, now-unowned run) and
+        // "RAL-428-admin-system-prompt-tab" (a fresh submission's placeholder
+        // branch, differing only in case) are the SAME ref and the SAME
+        // `w/<short>` directory on a case-insensitive filesystem (Windows,
+        // default-configured macOS). A case-sensitive string comparison in
+        // `resolve_squad_branch`/`resolve_task_worktree_dir_with_existing`
+        // didn't know that, so a squad whose placeholder branch differed
+        // only in case from an unowned leftover worktree was silently handed
+        // that worktree -- and its dirty, uncommitted state -- instead of a
+        // fresh "-2" slot.
+        let repo = init_repo("ral337-legacy-worktree-case");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let legacy = ensure_worktree(&repo, "ral-428-admin-system-prompt-tab", "main")
+            .expect("legacy worktree");
+        // Left dirty (uncommitted), exactly like the real incident: an agent
+        // run that started editing and never committed.
+        std::fs::write(legacy.join("in-progress.txt"), "dirty leftover work\n").unwrap();
+
+        let fresh = resolve_for_squad(
+            &store,
+            &repo,
+            "squad-1",
+            "ralphus:new-worktree/RAL-428-admin-system-prompt-tab?upstream=main",
+        );
+
+        assert_ne!(
+            PathBuf::from(&fresh),
+            legacy,
+            "a differently-cased branch must not collide into the legacy worktree's directory"
+        );
+        assert_eq!(w_dir(&fresh), "RAL-428-2");
+        assert_eq!(head_branch(&fresh), "RAL-428-admin-system-prompt-tab-2");
+        assert!(
+            !Path::new(&fresh).join("in-progress.txt").exists(),
+            "the fresh squad must not inherit the legacy worktree's dirty, uncommitted state"
+        );
+        // And the legacy worktree is left exactly as it was.
+        assert!(legacy.join("in-progress.txt").exists());
     }
 
     #[test]
