@@ -613,6 +613,44 @@ impl DaemonClient {
         self.delete(&format!("/api/triage/types/{name}"))
     }
 
+    /// Register (or update) a preset (RAL-…): a named bundle of field
+    /// defaults an `extends` sentinel stamps into a task's/cell's/proof
+    /// step's own unset fields at submit time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_preset(
+        &self,
+        name: &str,
+        system_prompt: Option<&str>,
+        system_prompt_position: Option<&str>,
+        maximum_context: Option<u64>,
+        auto_compact_threshold: Option<u64>,
+        maximum_tool_output_tokens: Option<u64>,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/presets",
+            Some(json!({
+                "name": name,
+                "system_prompt": system_prompt,
+                "system_prompt_position": system_prompt_position,
+                "maximum_context": maximum_context,
+                "auto_compact_threshold": auto_compact_threshold,
+                "maximum_tool_output_tokens": maximum_tool_output_tokens,
+            })),
+        )
+    }
+
+    pub fn list_presets(&self) -> Result<Value, DaemonError> {
+        self.get("/api/presets")
+    }
+
+    pub fn get_preset(&self, name: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/presets/{name}"))
+    }
+
+    pub fn deregister_preset(&self, name: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/presets/{name}"))
+    }
+
     /// `ralphus triage pool list` (RAL-318): every `(project, triage_type)`
     /// pool key with pooled cells and/or a configured count threshold.
     pub fn list_triage_pools(&self) -> Result<Value, DaemonError> {

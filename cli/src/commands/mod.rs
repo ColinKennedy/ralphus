@@ -17,6 +17,7 @@ pub mod env;
 pub mod machine;
 pub mod mailbox;
 pub mod misc;
+pub mod preset;
 pub mod project;
 pub mod proof;
 pub mod queue;
@@ -191,6 +192,7 @@ pub enum Command {
     Mailbox(mailbox::MailboxCommand),
     QuickStart(quick_start::QuickStartCommand),
     Triage(triage::TriageCommand),
+    Preset(preset::PresetCommand),
     UsageError(String),
 }
 
@@ -271,6 +273,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("mailbox") => Command::Mailbox(mailbox::parse(&scanner.remaining())),
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
         Some("triage") => Command::Triage(triage::parse(&scanner.remaining())),
+        Some("preset") => Command::Preset(preset::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
 }
@@ -341,6 +344,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Mailbox(c) => mailbox::dispatch(c, opts),
         Command::QuickStart(c) => quick_start::dispatch(c, opts),
         Command::Triage(c) => triage::dispatch(c, opts),
+        Command::Preset(c) => preset::dispatch(c, opts),
     }
 }
 

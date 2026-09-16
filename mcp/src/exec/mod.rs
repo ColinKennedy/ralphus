@@ -18,6 +18,7 @@ mod agent;
 mod cell;
 mod machine;
 mod mailbox;
+mod preset;
 mod project;
 mod proof;
 mod queue;
@@ -95,6 +96,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Mailbox(c) => mailbox::execute(c, client),
         Command::QuickStart(_) => Err(usage("quick-start is excluded from the MCP tool surface")),
         Command::Triage(c) => triage::execute(c, client),
+        Command::Preset(c) => preset::execute(c, client),
         Command::UsageError(m) => Err(usage(m)),
     }
 }
