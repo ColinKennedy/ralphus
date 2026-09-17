@@ -904,6 +904,26 @@ fn execute_squad_inner(
         }
         resolved
     };
+    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
+    // `w/<short>` directory) under a brief lock, then actually create/resync
+    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
+    // held, concurrently. Without this, the locked pass just below would run
+    // that same real git work serially, one cell at a time, for the ENTIRE
+    // duration the store lock is held -- stalling every other request the
+    // daemon serves meanwhile, not just this squad's own dispatch. See
+    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    let prefetched_worktrees = {
+        let guard = store.lock();
+        let jobs = crate::worktrees::plan_local_worktree_jobs(
+            &guard,
+            squad_id,
+            &cells,
+            &tasks,
+            &prefetched_upstreams,
+        );
+        drop(guard);
+        crate::worktrees::execute_local_worktree_jobs(&jobs)
+    };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
     // placeholder repeated across cells/tasks materializes exactly one
     // worktree, and the resolved real path is persisted immediately, so a
@@ -912,12 +932,13 @@ fn execute_squad_inner(
     // submit) fails the whole squad cleanly rather than panicking mid-dispatch.
     {
         let guard = store.lock();
-        let result = crate::worktrees::resolve_placeholders_with_prefetch(
+        let result = crate::worktrees::resolve_placeholders_with_full_prefetch(
             &guard,
             squad_id,
             &mut cells,
             &tasks,
             &prefetched_upstreams,
+            &prefetched_worktrees,
             &_squad_span.cx,
         );
         drop(guard);
