@@ -45,17 +45,17 @@
         try {
           resp = await post(`/api/projects/${encodeURIComponent(project)}/default-branch/autofix`);
         } catch (e) {
-          alert("Autofix failed: daemon unreachable");
+          notify("error", "Autofix failed: daemon unreachable");
           return;
         }
         if (!resp.ok) {
           let msg = `autofix failed (${resp.status})`;
           try { const body = await resp.json(); if (body && body.error && body.error.message) msg = body.error.message; } catch (_) {}
-          alert(`Autofix failed: ${msg}`);
+          notify("error", `Autofix failed: ${msg}`);
           return;
         }
         const body = await resp.json();
-        alert(`Default branch set to "${body.branch}". You can now restart this task.`);
+        notify("success", `Default branch set to "${body.branch}". You can now restart this task.`);
         await restartTask(squadId, taskIdx);
       }
       /**
@@ -631,9 +631,9 @@
         let timeline;
         try {
           const resp = await fetch(`/api/squads/${id}/timeline`);
-          if (!resp.ok) { closeModal(); alert("Failed to generate the timeline."); return; }
+          if (!resp.ok) { closeModal(); notify("error", "Failed to generate the timeline."); return; }
           timeline = await resp.json();
-        } catch (_) { closeModal(); alert("Failed to generate the timeline: network error."); return; }
+        } catch (_) { closeModal(); notify("error", "Failed to generate the timeline: network error."); return; }
         renderSquadTimeline(squad, timeline);
       }
       /**
@@ -690,11 +690,14 @@
           succeeded.push(f);
         }
         if (succeeded.length < ntFiles.length) {
+          const failedCount = ntFiles.length - succeeded.length;
           ntFiles = ntFiles.filter((f) => !succeeded.includes(f));
           renderNewTaskModal();
           byId("nt-err").innerHTML = `${succeeded.length}/${succeeded.length + ntFiles.length} queued — ${ntFiles.length} failed, see errors above.`;
+          notify("error", `${succeeded.length}/${succeeded.length + failedCount} squad(s) queued — ${failedCount} failed.`);
           return;
         }
+        notify("success", succeeded.length > 1 ? `${succeeded.length} squads queued.` : "Squad queued.");
         if (ntSubmitAnotherActive()) { ntFiles = []; renderNewTaskModal(); } else { closeModal(); }
         tick();
       }
@@ -712,7 +715,13 @@
         const v = await ntValidate();
         if (!v || !v.valid) return; // errors are already rendered by ntValidate
         const resp = await fetch("/api/squads", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ toml, label: label || null }) });
-        if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        if (!resp.ok) {
+          const b = await resp.json().catch(() => ({}));
+          errEl.textContent = (b.error && b.error.message) || "submit failed";
+          notify("error", (b.error && b.error.message) || "Squad submission failed.");
+          return;
+        }
+        notify("success", label ? `Squad "${label}" submitted.` : "Squad submitted.");
         if (ntSubmitAnotherActive()) { ntPasteToml = ""; ntLabel = ""; renderNewTaskModal(); } else { closeModal(); }
         tick();
       }

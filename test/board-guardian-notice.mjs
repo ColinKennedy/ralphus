@@ -6,8 +6,7 @@
 // files can't simply be imported. The region between the RALPHUS-GUARDIAN-NOTICE
 // markers is deliberately free of DOM, fetch and module-level state so it
 // can be evaluated on its own; `checkGuardianNotices` itself (which mutates
-// the shown-map and calls `showInfoToast`) stays out of scope here by
-// design.
+// the shown-map and calls `notify()`) stays out of scope here by design.
 
 import { boardScript } from "./board-source.mjs";
 import { fileURLToPath } from "node:url";

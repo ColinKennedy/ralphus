@@ -227,15 +227,54 @@
       .history-item:last-child { border-bottom: none; }
       .history-item:hover { background: var(--panel-2); }
       .warn { background: rgba(248,81,73,.12); border: 1px solid var(--failed); color: var(--failed); border-radius: 6px; padding: 8px; font-size: 12px; margin: 8px 0; }
-      /* RAL-108: review-action failure toasts. Fixed bottom-right stack so a
-         rejected action (e.g. a 409) is visible without blocking the UI like
-         alert() does; showReviewError() dedupes so repeated identical
-         failures don't pile these up. */
+      /* RAL-433 (originally RAL-108, review-actions only): board-action
+         outcome toasts. Fixed bottom-right stack so a rejected action (e.g.
+         a 409) is visible without blocking the UI like alert() does;
+         notify() dedupes repeated identical messages so they don't pile up. */
       .toast-root { position: fixed; right: 16px; bottom: 16px; z-index: 100; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
       .toast { background: var(--panel); border: 1px solid var(--failed); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 12px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4); pointer-events: auto; display: flex; flex-direction: column; gap: 8px; }
       .toast.info { border-color: var(--accent); }
       .toast.warn { border-color: var(--toast-warn); }
+      /* RAL-433: success is the fourth toast kind (alongside the pre-existing
+         error/info/warn) -- reuses the shared --done status green rather than
+         inventing a new hue, same as any other "completed successfully" cue. */
+      .toast.success { border-color: var(--done); }
       .toast-actions { display: flex; justify-content: flex-end; gap: 8px; }
+      /* RAL-433: a burst of distinct board-action notifications that land within
+         the same short debounce window renders as one grouped toast (one row
+         per message, left-bordered by that row's own kind) instead of stacking
+         several separate toasts at once. */
+      .toast.group { border-color: var(--border); gap: 6px; }
+      .toast-group-row { padding-left: 8px; border-left: 3px solid var(--muted); }
+      .toast-group-row.success { border-left-color: var(--done); }
+      .toast-group-row.error { border-left-color: var(--failed); }
+      .toast-group-row.warn { border-left-color: var(--toast-warn); }
+      .toast-group-row.info { border-left-color: var(--accent); }
+      /* RAL-433: notification-center bell -- a persistent history of every
+         debounced board-action toast, reachable after the toast itself has
+         auto-dismissed. Unread count badge mirrors the mailbox widget's own
+         summary-count convention elsewhere in the header. */
+      .notif-badge { position: absolute; top: -5px; right: -5px; background: var(--failed); color: #fff; border-radius: 999px; font-size: 10px; line-height: 1.5; min-width: 15px; padding: 0 3px; text-align: center; }
+      .notif-panel { position: absolute; right: 0; top: 110%; width: 340px; max-width: calc(100vw - 32px); z-index: 40; }
+      .notif-panel.hidden { display: none; }
+      .notif-panel-inner { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+      .notif-panel-head { padding: 8px 12px; font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--border); }
+      .notif-panel-list { max-height: 360px; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+      .notif-row { position: relative; background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 6px; padding: 6px 24px 6px 10px; font-size: 12px; }
+      .notif-row.success { border-left-color: var(--done); }
+      .notif-row.error { border-left-color: var(--failed); }
+      .notif-row.warn { border-left-color: var(--toast-warn); }
+      .notif-row.info { border-left-color: var(--accent); }
+      .notif-row.unread .notif-row-msg { font-weight: 600; }
+      /* A dismissed notification stays in the list -- read, but never removed
+         -- so dismissing can't be mistaken for deleting the record; red marks
+         it "acknowledged and set aside" regardless of its original kind. */
+      .notif-row.dismissed { border-left-color: var(--failed); background: rgba(248,81,73,.08); opacity: .7; }
+      .notif-row.dismissed .notif-row-msg { color: var(--muted); }
+      .notif-row-meta { color: var(--muted); font-size: 10px; margin-bottom: 2px; text-transform: uppercase; letter-spacing: .02em; }
+      .notif-row-msg { white-space: pre-line; word-break: break-word; }
+      .notif-dismiss { position: absolute; top: 2px; right: 4px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 6px; }
+      .notif-dismiss:hover { color: var(--text); }
       /* RAL-401: persistent personal-mailbox inbox widget. Collapsed to one
          summary line until expanded, sitting where the old fire-and-forget
          toasts used to; unlike a toast it never disappears on its own -- a

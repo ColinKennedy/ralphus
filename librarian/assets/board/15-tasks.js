@@ -836,13 +836,13 @@
         const qs = currentUserName ? `?user=${encodeURIComponent(currentUserName)}` : "";
         if (hasExplicit) {
           let resp;
-          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { alert("daemon unreachable"); return; }
-          if (!resp.ok) { alert(await responseError(resp, "unwatch failed")); return; }
+          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { notify("error", "daemon unreachable"); return; }
+          if (!resp.ok) { notify("error", await responseError(resp, "unwatch failed")); return; }
           taskTabWatches = taskTabWatches.filter((w) => w.entity_uri !== uri);
         } else {
           let resp;
-          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { alert("daemon unreachable"); return; }
-          if (!resp.ok) { alert(await responseError(resp, "watch failed")); return; }
+          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { notify("error", "daemon unreachable"); return; }
+          if (!resp.ok) { notify("error", await responseError(resp, "watch failed")); return; }
           taskTabWatches.push(await resp.json());
         }
         renderTasksTab();
@@ -864,13 +864,13 @@
         const qs = currentUserName ? `?user=${encodeURIComponent(currentUserName)}` : "";
         if (hasExplicit) {
           let resp;
-          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { alert("daemon unreachable"); return; }
-          if (!resp.ok) { alert(await responseError(resp, "unwatch failed")); return; }
+          try { resp = await del(`/api/watches/${encodeURIComponent(uri)}${qs}`); } catch (e) { notify("error", "daemon unreachable"); return; }
+          if (!resp.ok) { notify("error", await responseError(resp, "unwatch failed")); return; }
           taskTabWatches = taskTabWatches.filter((w) => w.entity_uri !== uri);
         } else {
           let resp;
-          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { alert("daemon unreachable"); return; }
-          if (!resp.ok) { alert(await responseError(resp, "watch failed")); return; }
+          try { resp = await post(`/api/watches${qs}`, { entity_uri: uri }); } catch (e) { notify("error", "daemon unreachable"); return; }
+          if (!resp.ok) { notify("error", await responseError(resp, "watch failed")); return; }
           taskTabWatches.push(await resp.json());
         }
         renderTasksTab();
@@ -1006,8 +1006,8 @@
         if (!squadIds.length) return;
         for (const squadId of squadIds) {
           let resp;
-          try { resp = await (hide ? post(`/api/hidden/squads/${squadId}`) : del(`/api/hidden/squads/${squadId}`)); } catch (e) { alert("daemon unreachable"); return; }
-          if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+          try { resp = await (hide ? post(`/api/hidden/squads/${squadId}`) : del(`/api/hidden/squads/${squadId}`)); } catch (e) { notify("error", "daemon unreachable"); return; }
+          if (!resp.ok) { notify("error", await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
           if (hide) hiddenSquadIds.add(squadId); else hiddenSquadIds.delete(squadId);
         }
         renderTasksTab();
@@ -1032,8 +1032,8 @@
             tasks: refs.map((r) => ({ squad_id: r.squadId, task_idx: r.taskIdx })),
             hidden: hide,
           });
-        } catch (e) { alert("daemon unreachable"); return; }
-        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
         /** @type {HiddenTasksBatchResult} */
         const result = await resp.json();
         const failedKeys = new Set(result.failed.map((f) => `${f.squad_id}:${f.task_idx}`));
@@ -1042,7 +1042,7 @@
           if (failedKeys.has(key)) continue;
           if (hide) hiddenTaskKeys.add(key); else hiddenTaskKeys.delete(key);
         }
-        if (result.failed.length) alert(`${result.failed.length} task(s) could not be ${hide ? "hidden" : "unhidden"} (already deleted?).`);
+        if (result.failed.length) notify("error", `${result.failed.length} task(s) could not be ${hide ? "hidden" : "unhidden"} (already deleted?).`);
         renderTasksTab();
       }
       // RALPHUS-TT-SCROLL-SELECTION:BEGIN

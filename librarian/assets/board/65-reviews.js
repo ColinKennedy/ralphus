@@ -253,7 +253,7 @@
         closeSquadMenu();
         const g = guardians.find((x) => x.id === id);
         if (!confirm(`Delete review "${g ? g.name : id}"? This removes its review worktrees and cannot be undone.`)) return;
-        await del(`/api/guardians/${id}`);
+        await del(`/api/guardians/${id}`, { success: `Review "${g ? g.name : id}" deleted.`, errorLabel: "delete review" });
         if (selectedGuardian === id) selectedGuardian = null;
         guardianMultiSel.delete(id);
         tick();
@@ -275,14 +275,14 @@
         let resp;
         try {
           resp = await (hide ? post(`/api/hidden/reviews/${id}`) : del(`/api/hidden/reviews/${id}`));
-        } catch (e) { alert("daemon unreachable"); return; }
-        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
         if (hide) hiddenGuardianIds.add(id); else hiddenGuardianIds.delete(id);
         renderReviews();
       }
       /**
        * Hides every multi-selected review from the current user's own view
-       * (RAL-331). Reports (via `alert`) any review the daemon refused to hide.
+       * (RAL-331). Reports any review the daemon refused to hide via notify().
        * @returns {Promise<void>}
        */
       async function bulkHideReviews() {
@@ -294,11 +294,11 @@
           } catch (e) { failed.push(`${id}: daemon unreachable`); }
         }
         renderReviews();
-        if (failed.length) alert(failed.join("\n"));
+        if (failed.length) notify("error", failed.join("; "));
       }
       /**
        * Re-enables every multi-selected review in the current user's own view
-       * (RAL-331). Reports (via `alert`) any review the daemon refused to unhide.
+       * (RAL-331). Reports any review the daemon refused to unhide via notify().
        * @returns {Promise<void>}
        */
       async function bulkUnhideReviews() {
@@ -310,7 +310,7 @@
           } catch (e) { failed.push(`${id}: daemon unreachable`); }
         }
         renderReviews();
-        if (failed.length) alert(failed.join("\n"));
+        if (failed.length) notify("error", failed.join("; "));
       }
       /**
        * Opens the review detail pane's title-bar ⋯ context menu.
@@ -1335,7 +1335,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           prErrorHighWater.set(gid, maxId);
           fresh.sort((a, b) => a.id - b.id).forEach((r) => {
             const detail = (r.payload && r.payload.error) || r.message;
-            showReviewError(`PR submission failed: ${detail}`);
+            notify("error", `PR submission failed: ${detail}`);
           });
           return true;
         } catch (e) { return false; }
@@ -1368,16 +1368,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const sinceMs = Date.now();
         const resp = await guardianAction(`/api/guardians/${gid}/pull-requests`, { prs: [{}] });
         if (!resp || !resp.ok) return;
-        showInfoToast("PR stack requested — pushing branches and opening PRs in the background.");
+        notify("info", "PR stack requested — pushing branches and opening PRs in the background.");
         const outcome = await waitForPrOutcome(gid, sinceMs);
         if (!outcome.errored) {
           const parts = [];
           if (outcome.created > 0) parts.push(`${outcome.created} PR${outcome.created === 1 ? "" : "s"} opened`);
           if (outcome.resynced > 0) parts.push(`${outcome.resynced} base${outcome.resynced === 1 ? "" : "s"} corrected`);
           if (parts.length) {
-            showInfoToast(`PR stack: ${parts.join(", ")}.`);
+            notify("info", `PR stack: ${parts.join(", ")}.`);
           } else if (outcome.completed) {
-            showInfoToast("PR stack already up to date — nothing to open.");
+            notify("info", "PR stack already up to date — nothing to open.");
           }
         }
         renderReviewDetail();
@@ -1708,92 +1708,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const resp = await fetch("/api/guardians", { method: "POST", body: JSON.stringify(body) });
         if (!resp.ok) { byId("cr-err").textContent = "create failed"; return; }
         const g = await resp.json(); selectedGuardian = g.id; closeModal(); tick();
+        notify("success", `Review "${g.name || g.id}" created.`);
       }
 
-      // ---- Review-action error surfacing (RAL-108) ----
       // Review-action POSTs (merge, approve, force-start, ...) used to ignore
       // response.ok entirely, so a rejected request (e.g. a 409 on an invalid
       // state transition) looked exactly like success — the button appeared to
-      // silently do nothing. showReviewError() surfaces the real failure, but
-      // dedupes identical messages within a cooldown window so a burst of the
-      // same failure (a double-click, a few failed polls in a row) doesn't
-      // flood the screen with toasts.
-      /** @type {Map<string, number>} message -> ms timestamp */
-      const _reviewErrLastShown = new Map();
-      const REVIEW_ERR_COOLDOWN_MS = 8000;
-      /**
-       * Shows a deduped toast for a failed review/guardian action.
-       * @param {string} message
-       * @returns {void}
-       */
-      function showReviewError(message) {
-        const now = Date.now();
-        const last = _reviewErrLastShown.get(message) || 0;
-        if (now - last < REVIEW_ERR_COOLDOWN_MS) return;
-        _reviewErrLastShown.set(message, now);
-        const root = document.getElementById("toast-root");
-        if (!root) return;
-        const el = document.createElement("div");
-        el.className = "toast";
-        el.textContent = message;
-        el.setAttribute("data-tip", "A review/guardian action was rejected by the daemon — this is the real error, not a silent no-op.\nShown when a button like Merge / rebase or Approve fails (e.g. an invalid state transition).\nDisappears automatically; identical errors are suppressed for a short cooldown so repeated failures don't spam the screen.");
-        root.appendChild(el);
-        setTimeout(() => el.remove(), 6000);
-      }
-      /**
-       * Shows a neutral, non-error acknowledgement toast (accent-colored
-       * border, distinct from `showReviewError`'s red one) for an action that
-       * was accepted but whose real outcome is only known later -- e.g. a
-       * background PR submission. Not deduped (unlike `showReviewError`):
-       * each call is a distinct action the user just took.
-       * @param {string} message
-       * @returns {void}
-       */
-      function showInfoToast(message) {
-        const root = document.getElementById("toast-root");
-        if (!root) return;
-        const el = document.createElement("div");
-        el.className = "toast info";
-        el.textContent = message;
-        el.setAttribute("data-tip", "Confirms the action was accepted and is running in the background.\nDisappears automatically after a few seconds; if it fails, a separate red error toast follows once the failure is detected.");
-        root.appendChild(el);
-        setTimeout(() => el.remove(), 4000);
-      }
-      /**
-       * Shows a warning toast, optionally with a one-click follow-up action.
-       * @param {string} message
-       * @param {{label: string, run: () => Promise<void>}} [action]
-       * @returns {void}
-       */
-      function showWarningToast(message, action) {
-        const root = document.getElementById("toast-root");
-        if (!root) return;
-        const el = document.createElement("div");
-        el.className = "toast warn";
-        const msg = document.createElement("div");
-        msg.textContent = message;
-        el.appendChild(msg);
-        if (action) {
-          const actions = document.createElement("div");
-          actions.className = "toast-actions";
-          const btn = document.createElement("button");
-          btn.className = "btn";
-          btn.textContent = action.label;
-          btn.onclick = async () => {
-            btn.disabled = true;
-            try {
-              await action.run();
-            } finally {
-              el.remove();
-            }
-          };
-          actions.appendChild(btn);
-          el.appendChild(actions);
-        }
-        el.setAttribute("data-tip", "Warns that the base change was saved while a review rebase was already in progress.\nUse the button to safely stop and restart now, or leave it alone and the board will rebuild again after the current rebase finishes.");
-        root.appendChild(el);
-        setTimeout(() => el.remove(), 8000);
-      }
+      // silently do nothing. `guardianAction` below surfaces the real failure
+      // through the shared notify() system (RAL-433; originally a
+      // review-only `showReviewError` helper introduced by RAL-108), which
+      // dedupes identical messages within a cooldown window so a burst of
+      // the same failure (a double-click, a few failed polls in a row)
+      // doesn't flood the screen with toasts.
 
       // ---- Guardian notices -> toast (RAL-273) ----
       // A guardian notice (`notice_kind`/`notice_message`/`notice_at_ms`) is
@@ -1841,7 +1767,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       function checkGuardianNotices(list) {
         for (const toast of pendingGuardianNoticeToasts(list, _guardianNoticeShown)) {
           _guardianNoticeShown.set(toast.id, toast.notice_at_ms);
-          showInfoToast(toast.text);
+          notify("info", toast.text);
         }
       }
       // POST to a guardian/review action endpoint; on failure, surfaces a
@@ -1859,12 +1785,12 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         try {
           resp = await fetch(url, { method: "POST", body: body !== undefined ? JSON.stringify(body) : undefined });
         } catch (_) {
-          showReviewError("Action failed: network error");
+          notify("error", "Action failed: network error");
           return null;
         }
         if (!resp.ok) {
           const e = await resp.json().catch(() => ({}));
-          showReviewError(((e.error || {}).message) || `Action failed (${resp.status})`);
+          notify("error", ((e.error || {}).message) || `Action failed (${resp.status})`);
         }
         return resp;
       }
@@ -1904,7 +1830,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         }
         pendingMergeActions.add(id);
         if (!userIsSelecting()) renderReviewDetail();
-        showInfoToast(mergeRequestedToast(status));
+        notify("info", mergeRequestedToast(status));
         try {
           const path = status === "merging" ? "cancel_and_merge" : "merge";
           // A non-2xx already surfaced the red error toast inside
@@ -1941,7 +1867,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function stopMerge(id) {
         if (!confirm("Stop this rebase mid-flight? It will halt at the next checkpoint and pause the review (resumable). Nothing is discarded — this is not a cancel.")) return;
-        await guardianAction(`/api/guardians/${id}/stop`);
+        const resp = await guardianAction(`/api/guardians/${id}/stop`);
+        if (resp && resp.ok) notify("success", "Rebase stopped — resumable from where it left off.");
         tick();
       }
       /**
@@ -1957,7 +1884,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         pendingGuardianActions.add(id);
         if (!userIsSelecting()) renderReviewDetail();
         try {
-          await guardianAction(`/api/guardians/${id}/approve`);
+          const resp = await guardianAction(`/api/guardians/${id}/approve`);
+          if (resp && resp.ok) notify("success", "Review approved.");
           // Stay pending through the reload too, so the button can't be
           // double-clicked in the gap between the write completing and the
           // board picking up the new (no-longer-in_review) status.
@@ -1981,7 +1909,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       async function syncPrReview(id) {
         await guardianAction(`/api/guardians/${id}/sync-pr`);
-        showInfoToast("Checking GitHub/GitLab for a stack reorder…");
+        notify("info", "Checking GitHub/GitLab for a stack reorder…");
         tick();
       }
 

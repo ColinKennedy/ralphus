@@ -902,10 +902,10 @@
         const resp = await post(`/api/pull-requests/${prId}/refresh-ci`);
         if (!resp.ok) {
           const e = await resp.json().catch(() => ({}));
-          showReviewError(((e.error || {}).message) || `Refresh failed (${resp.status})`);
+          notify("error", ((e.error || {}).message) || `Refresh failed (${resp.status})`);
           return;
         }
-        showInfoToast("Refreshed PR status.");
+        notify("info", "Refreshed PR status.");
         tick();
       }
       /**
@@ -922,10 +922,10 @@
         const resp = await post(`/api/pull-requests/${prId}/action-feedback`);
         if (!resp.ok) {
           const e = await resp.json().catch(() => ({}));
-          showReviewError(((e.error || {}).message) || `Action feedback failed (${resp.status})`);
+          notify("error", ((e.error || {}).message) || `Action feedback failed (${resp.status})`);
           return;
         }
-        showInfoToast("Actioning PR feedback…");
+        notify("info", "Actioning PR feedback…");
         tick();
       }
       // RALPHUS-PR-BADGE-MENU:END

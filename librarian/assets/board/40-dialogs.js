@@ -72,7 +72,9 @@
           const head = succeeded.length
             ? `Set ${succeeded.length} of ${items.length} squad(s) to "${state}".`
             : `Failed to set any squads to "${state}".`;
-          alert(`${head}\n\nFailures:\n${failed.map((msg) => `- ${msg}`).join("\n")}`);
+          notify("error", `${head} Failures: ${failed.join("; ")}`);
+        } else {
+          notify("success", items.length > 1 ? `Set ${items.length} squad(s) to "${state}".` : `Set "${items[0].label}" to "${state}".`);
         }
         tick();
         if (tab === "queue") pollQueue();
@@ -221,7 +223,9 @@
             return; // leave the dialog open so the user can pick a different target
           }
         }
+        const sourceCount = _addDepSourceIds.length;
         closeAddDependencyDialog();
+        notify("success", sourceCount > 1 ? `Dependency added for ${sourceCount} squad(s).` : "Dependency added.");
         tick();
       }
       /**
@@ -285,7 +289,10 @@
        */
       async function soloTaskAct(squadId, ti, solo) {
         closeGraphMenu();
-        await post(`/api/squads/${squadId}/tasks/${ti}/${solo ? "solo" : "unsolo"}`);
+        await post(`/api/squads/${squadId}/tasks/${ti}/${solo ? "solo" : "unsolo"}`, undefined, {
+          success: solo ? "Task soloed — other tasks in this squad are paused." : "Task un-soloed.",
+          errorLabel: solo ? "solo task" : "un-solo task",
+        });
         tick();
       }
       /**
@@ -361,7 +368,7 @@
         if (!confirm(`Stop "${label}"? This cannot be undone.`)) return;
         await post(`/api/squads/${squadId}/set-status`, {
           kind, task_idx: ti, cell_idx: si, proof_idx: vi, proof_scope: proofScope, state: "cancelled"
-        });
+        }, { success: `Stopped "${label}".`, errorLabel: "stop" });
         tick();
         if (tab === "queue") pollQueue();
       }
@@ -373,7 +380,8 @@
       async function deleteSquad(id) {
         closeSquadMenu();
         if (!confirm("Delete this squad? This cannot be undone.")) return;
-        await del(`/api/squads/${id}`);
+        const label = findSquad(id)?.label || id;
+        await del(`/api/squads/${id}`, { success: `Squad "${label}" deleted.`, errorLabel: "delete squad" });
         if (selectedSquadId === id) selectedSquadId = null;
         multiSel.delete(id); tick();
       }
@@ -394,8 +402,8 @@
         let resp;
         try {
           resp = await (hide ? post(`/api/hidden/squads/${id}`) : del(`/api/hidden/squads/${id}`));
-        } catch (e) { alert("daemon unreachable"); return; }
-        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
         if (hide) hiddenSquadIds.add(id); else hiddenSquadIds.delete(id);
         renderSquads();
       }
@@ -415,7 +423,7 @@
       /**
        * Hides or unhides every multi-selected squad in a single request
        * (RAL-331) -- one POST to the batch endpoint instead of one round
-       * trip per squad. Reports (via `alert`) any squad the daemon refused
+       * trip per squad. Reports (via notify()) any squad the daemon refused
        * to hide/unhide; a squad that fails does not block the rest of the
        * batch.
        * @param {boolean} hide
@@ -427,8 +435,8 @@
         let resp;
         try {
           resp = await post("/api/hidden/squads/batch", { ids, hidden: hide });
-        } catch (e) { alert("daemon unreachable"); return; }
-        if (!resp.ok) { alert(await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, hide ? "hide failed" : "unhide failed")); return; }
         /** @type {HiddenBatchResult} */
         const result = await resp.json();
         const failedIds = new Set(result.failed.map((f) => f.id));
@@ -437,7 +445,8 @@
           if (hide) hiddenSquadIds.add(id); else hiddenSquadIds.delete(id);
         }
         renderSquads();
-        if (result.failed.length) alert(result.failed.map((f) => `${f.id}: ${f.error}`).join("\n"));
+        if (result.failed.length) notify("error", result.failed.map((f) => `${f.id}: ${f.error}`).join("; "));
+        else notify("success", `${ids.length} squad(s) ${hide ? "hidden" : "unhidden"}.`);
       }
       /**
        * Hides every multi-selected squad from the current user's own view
@@ -472,17 +481,42 @@
         renderAll();
       }
       /**
-       * Cancels every multi-selected squad.
+       * Cancels every multi-selected squad. Reports any squad the daemon
+       * refused to cancel via notify() -- one squad failing does not block
+       * the rest of the batch.
        * @returns {Promise<void>}
        */
-      async function bulkCancel() { for (const id of [...multiSel]) { try { await post(`/api/squads/${id}/cancel`); } catch (_) {} } tick(); }
+      async function bulkCancel() {
+        const ids = [...multiSel];
+        const failed = [];
+        for (const id of ids) {
+          try {
+            const resp = await post(`/api/squads/${id}/cancel`);
+            if (!resp.ok) failed.push(`${findSquad(id)?.label || id}: ${await responseError(resp, "cancel failed")}`);
+          } catch (_) { failed.push(`${findSquad(id)?.label || id}: network error`); }
+        }
+        if (failed.length) notify("error", failed.join("; "));
+        else if (ids.length) notify("success", `Cancelled ${ids.length} squad(s).`);
+        tick();
+      }
       /**
-       * Deletes every multi-selected squad after confirmation.
+       * Deletes every multi-selected squad after confirmation. Reports any
+       * squad the daemon refused to delete via notify() -- one squad
+       * failing does not block the rest of the batch.
        * @returns {Promise<void>}
        */
       async function bulkDelete() {
         if (!confirm(`Delete ${multiSel.size} squad(s)? This cannot be undone.`)) return;
-        for (const id of [...multiSel]) { try { await del(`/api/squads/${id}`); } catch (_) {} }
+        const ids = [...multiSel];
+        const failed = [];
+        for (const id of ids) {
+          try {
+            const resp = await del(`/api/squads/${id}`);
+            if (!resp.ok) failed.push(`${findSquad(id)?.label || id}: ${await responseError(resp, "delete failed")}`);
+          } catch (_) { failed.push(`${findSquad(id)?.label || id}: network error`); }
+        }
+        if (failed.length) notify("error", failed.join("; "));
+        else notify("success", `Deleted ${ids.length} squad(s).`);
         multiSel.clear(); selectedSquadId = null; tick();
       }
       /**

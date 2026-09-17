@@ -1150,14 +1150,21 @@
             resp = await postSquad(null);
           } else {
             errEl.textContent = (b.error && b.error.message) || "submit failed";
+            notify("error", (b.error && b.error.message) || "Squad submission failed.");
             return;
           }
         }
-        if (!resp.ok) { const b = await resp.json().catch(() => ({})); errEl.textContent = (b.error && b.error.message) || "submit failed"; return; }
+        if (!resp.ok) {
+          const b = await resp.json().catch(() => ({}));
+          errEl.textContent = (b.error && b.error.message) || "submit failed";
+          notify("error", (b.error && b.error.message) || "Squad submission failed.");
+          return;
+        }
         if (naming.needsGeneration) {
           const created = await resp.json().catch(() => null);
           if (created && created.squad_id) ntRequestSuggestedName(created.squad_id, fallbackName);
         }
+        notify("success", squadLabel ? `Squad "${squadLabel}" submitted.` : "Squad submitted.");
         ntSimpleResetKeepingProjectFields();
         if (ntSubmitAnotherActive()) { renderNewTaskModal(); } else { closeModal(); }
         tick();
