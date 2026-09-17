@@ -176,7 +176,7 @@
         if (!g.branches) {
           await fetchGuardianDetail(gid);
           g = guardians.find((x) => x.id === gid);
-          if (!g || !g.branches) { alert("failed to load review details"); return; }
+          if (!g || !g.branches) { notify("error", "Failed to load review details."); return; }
         }
         reviewEditDraft = buildReviewEditDraft(g);
         renderReviewEditModal();
@@ -659,12 +659,15 @@
                   },
                 }
               : undefined;
-            showWarningToast(
+            notify(
+              "warn",
               change.message || "A rebase is already in progress. We'll trigger a new rebase once this one completes.",
-              action,
+              { action },
             );
           } else if (change && change.message) {
-            showInfoToast(change.message);
+            notify("info", change.message);
+          } else {
+            notify("success", "Review details saved.");
           }
           closeEditReviewDetails();
           tick();
