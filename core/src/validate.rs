@@ -36,6 +36,9 @@ pub enum ErrorKind {
     /// An `upstream = "<<task:...>>"` sentinel references a task (or
     /// task/cell) that does not exist anywhere in this submission.
     UnknownTaskRef,
+    /// A `"<<ralphus:link/<field>>>"` sentinel (RAL-460) references a field
+    /// that does not exist on the same table it was declared in.
+    UnknownLinkedField,
 }
 
 /// A single validation finding.
@@ -1029,6 +1032,19 @@ fn is_valid_env_key(key: &str) -> bool {
 /// Validate an `environment` table (RAL-172): must be a table whose values
 /// are all strings and whose keys are all valid environment-variable
 /// identifiers. Silently returns when the key is absent.
+///
+/// RAL-460: a value may also be a "linked field" sentinel
+/// (`"<<ralphus:link/<field>>>"`, optionally with a `?suffix=<relpath>`) --
+/// see [`crate::schema::parse_wrapped_cell_link`]. `<field>` must exist on
+/// this SAME owning `table` -- whichever scope this call is validating; task,
+/// cell, and proof-step tables all share this one function -- as either
+/// `"cwd"` (that table's own `cwd` key) or `"environment.<key>"` (a sibling
+/// entry in this same `environment` table). A dangling reference (a field
+/// that doesn't exist here) or a malformed sentinel/suffix is a hard
+/// validation failure, never a silent fallback. A chain of
+/// `environment.<key>` links within this table that cycles back on itself is
+/// also rejected here rather than only surfacing as a runtime resolution
+/// error.
 fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
     let Some(v) = table.get("environment") else {
         return;
@@ -1046,6 +1062,7 @@ fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
         );
         return;
     };
+    let mut link_edges: Vec<(String, String)> = Vec::new();
     for (key, value) in env_table {
         if !value.is_str() {
             let line = ctx.key_line(header, "environment");
@@ -1071,7 +1088,154 @@ fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
                 line,
             );
         }
+        let Some(raw) = value.as_str() else { continue };
+        check_environment_link(
+            ctx,
+            table,
+            env_table,
+            path,
+            header,
+            key,
+            raw,
+            &mut link_edges,
+        );
     }
+    if let Some(cycle_key) = find_link_cycle(&link_edges) {
+        let line = ctx.key_line(header, "environment");
+        ctx.error(
+            &format!("{path}.environment.{cycle_key}"),
+            ErrorKind::InvalidValue,
+            format!("environment key \"{cycle_key}\" is part of a circular linked-field chain"),
+            line,
+        );
+    }
+}
+
+/// Validate one `environment` entry's value as a possible `ralphus:link/...`
+/// sentinel (RAL-460). No-op (returns immediately) when `raw` isn't wrapped
+/// in `<<...>>` at all, or wraps some other sentinel kind -- those are out of
+/// scope here (a plain literal is always valid; a worktree placeholder is
+/// validated separately, the same way it always has been). When `raw` IS a
+/// linked-field sentinel targeting `"environment.<key>"`, records a
+/// `(key, target_key)` edge in `link_edges` for the caller's cycle check.
+#[allow(clippy::too_many_arguments)]
+fn check_environment_link(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    env_table: &toml::Table,
+    path: &str,
+    header: Option<u32>,
+    key: &str,
+    raw: &str,
+    link_edges: &mut Vec<(String, String)>,
+) {
+    let link = match crate::schema::parse_wrapped_cell_link(raw) {
+        Ok(None) => return,
+        Ok(Some(link)) => link,
+        Err(e) => {
+            use crate::schema::CellLinkParseError as E;
+            let detail = match e {
+                E::EmptyField => "must name a field, e.g. \"<<ralphus:link/cwd>>\"",
+                E::UnknownQueryKey => "only a \"?suffix=<relative-path>\" query is supported",
+                E::EmptySuffix => "\"?suffix=\" must not be empty",
+            };
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment value for \"{key}\" is a malformed linked-field sentinel: {detail}"
+                ),
+                line,
+            );
+            return;
+        }
+    };
+    if let Some(suffix) = link.suffix {
+        if !crate::schema::is_valid_cell_link_suffix(suffix) {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment value for \"{key}\" has an invalid link suffix {suffix:?}: \
+                     must be a relative path starting with \"./\" or \"../\""
+                ),
+                line,
+            );
+        }
+    }
+    match crate::schema::parse_cell_link_target(link.field) {
+        None => {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment value for \"{key}\" links to unsupported field \"{}\" \
+                     (expected \"cwd\" or \"environment.<key>\")",
+                    link.field
+                ),
+                line,
+            );
+        }
+        Some(crate::schema::CellLinkTarget::Cwd) => {
+            if !table.contains_key("cwd") {
+                let line = ctx.key_line(header, "environment");
+                ctx.error(
+                    &format!("{path}.environment.{key}"),
+                    ErrorKind::UnknownLinkedField,
+                    format!(
+                        "environment value for \"{key}\" links to \"cwd\", which is not set here"
+                    ),
+                    line,
+                );
+            }
+        }
+        Some(crate::schema::CellLinkTarget::Environment(target_key)) => {
+            if !env_table.contains_key(target_key) {
+                let line = ctx.key_line(header, "environment");
+                ctx.error(
+                    &format!("{path}.environment.{key}"),
+                    ErrorKind::UnknownLinkedField,
+                    format!(
+                        "environment value for \"{key}\" links to \"environment.{target_key}\", \
+                         which does not exist here"
+                    ),
+                    line,
+                );
+            } else {
+                link_edges.push((key.to_string(), target_key.to_string()));
+            }
+        }
+    }
+}
+
+/// Does `edges` (each a `(key, target_key)` linked-field dependency within
+/// one `environment` table) contain a cycle? Each key has at most one
+/// outgoing edge (one value = one link), so this is a functional graph --
+/// following edges from any node either terminates or revisits a node,
+/// which is the cycle. Returns the first such key found, for the caller's
+/// error message.
+fn find_link_cycle(edges: &[(String, String)]) -> Option<String> {
+    let next: HashMap<&str, &str> = edges
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    for (start, _) in edges {
+        let mut seen = HashSet::new();
+        let mut cur = start.as_str();
+        loop {
+            if !seen.insert(cur) {
+                return Some(start.clone());
+            }
+            match next.get(cur) {
+                Some(&nxt) => cur = nxt,
+                None => break,
+            }
+        }
+    }
+    None
 }
 
 /// Validate a `machine` value's *syntax* (RAL-185).
@@ -3088,6 +3252,150 @@ prompt = "make it build"
             r.errors
                 .iter()
                 .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("1BAD")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_to_cwd_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:link/cwd>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_cwd_with_valid_suffix_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=./logs>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_cwd_with_parent_suffix_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={SIBLING=\"<<ralphus:link/cwd?suffix=../sibling>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_with_suffix_missing_dot_slash_prefix_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=logs>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("suffix")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_with_absolute_suffix_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=/etc/passwd>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("suffix")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_to_unknown_field_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/model>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("unsupported field")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_to_cwd_on_a_task_scope_environment_is_rejected() {
+        // A task table has no `cwd` field at all -- only a cell does.
+        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"<<ralphus:link/cwd>>\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownLinkedField),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_to_unknown_environment_key_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.MISSING>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownLinkedField
+                    && e.message.contains("environment.MISSING")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_chained_link_to_environment_key_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:link/cwd>>\", SUB=\"<<ralphus:link/environment.BASE?suffix=./sub>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_self_cycle_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.A>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("circular")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_two_key_cycle_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.B>>\", B=\"<<ralphus:link/environment.A>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("circular")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_target_that_is_a_plain_literal_is_valid() {
+        // Linking to a target field that's already a plain literal (no
+        // placeholder) is valid -- it just resolves to that literal.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo/checkout\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:link/cwd>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_malformed_sentinel_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/cwd?bogus=1>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("malformed")),
             "{:?}",
             r.errors
         );
