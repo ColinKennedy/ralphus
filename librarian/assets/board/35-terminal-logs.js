@@ -908,14 +908,13 @@
        */
       function reportGraphActionOutcome(verbPast, items, succeeded, failed) {
         if (!failed.length) {
-          if (items.length > 1) alert(`${verbPast} ${succeeded.length} selected node(s).`);
+          if (items.length > 1) notify("success", `${verbPast} ${succeeded.length} selected node(s).`);
           return;
         }
         const head = succeeded.length
           ? `${verbPast} ${succeeded.length} of ${items.length} selected node(s).`
           : `Failed to ${verbPast.toLowerCase()} any selected nodes.`;
-        const detail = failed.map((msg) => `- ${msg}`).join("\n");
-        alert(`${head}\n\nFailures:\n${detail}`);
+        notify("error", `${head} Failures: ${failed.join("; ")}`);
       }
 
       /**

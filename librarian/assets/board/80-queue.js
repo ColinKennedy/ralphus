@@ -622,13 +622,15 @@
        */
       async function queueSave() {
         try {
-          const r = await fetch("/api/queue/reorder", { method: "POST", body: JSON.stringify({ order: queueOrder }) });
+          const r = await fetch("/api/queue/reorder", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ order: queueOrder }) });
+          if (!r.ok) { notify("error", await responseError(r, "Queue reorder failed")); return; }
           const d = await r.json();
           queueDirty = false;
           queuePulled = new Set();
           if (d.items) { queueItems = d.items; queueItemMap = new Map(d.items.map((/** @type {QueueItem} */ i) => [i.path, i])); queueOrder = d.order || d.items.map((/** @type {QueueItem} */ i) => i.path); }
           renderQueue(); updateQueueFooter();
-        } catch (_) {}
+          notify("success", "Queue order saved.");
+        } catch (_) { notify("error", "Queue reorder failed: network error"); }
       }
       /**
        * Discards the staged queue reorder, reverting to the last server order.

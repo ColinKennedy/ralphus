@@ -555,8 +555,8 @@
         }
         const value = prompt(`Value for ${key}:`);
         if (value === null) return;
-        const res = await post(apiPath, { set: { [key]: value } });
-        if (!res.ok) { alert("Failed to set the environment override."); return; }
+        const res = await post(apiPath, { set: { [key]: value } }, { success: `Set "${key}" override.`, errorLabel: "set the environment override" });
+        if (!res.ok) return;
         tick();
       }
       /**
@@ -573,8 +573,8 @@
       async function editEnvOverrideAt(apiPath, key, currentValue) {
         const value = prompt(`New value for ${key}:`, currentValue);
         if (value === null || value === currentValue) return;
-        const res = await post(apiPath, { set: { [key]: value } });
-        if (!res.ok) { alert("Failed to update the environment override."); return; }
+        const res = await post(apiPath, { set: { [key]: value } }, { success: `Updated "${key}" override.`, errorLabel: "update the environment override" });
+        if (!res.ok) return;
         tick();
       }
       /**
@@ -587,8 +587,8 @@
        */
       async function removeEnvOverrideAt(apiPath, key) {
         if (!confirm(`Remove environment override "${key}"?\nThis cannot be undone.`)) return;
-        const res = await post(apiPath, { unset: [key] });
-        if (!res.ok) { alert("Failed to remove the environment override."); return; }
+        const res = await post(apiPath, { unset: [key] }, { success: `Removed "${key}" override.`, errorLabel: "remove the environment override" });
+        if (!res.ok) return;
         tick();
       }
       // RALPHUS-GOTO-REVIEW:BEGIN

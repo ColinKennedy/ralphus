@@ -78,12 +78,12 @@
         try {
           resp = await post(`/api/squads/${squadId}/cells/${ti}/${si}/terminal-ticket`);
         } catch (_) {
-          alert("Failed to open remote terminal: network error");
+          notify("error", "Failed to open remote terminal: network error");
           return;
         }
         if (!resp.ok) {
           const e = await resp.json().catch(() => ({}));
-          alert(`Failed to open remote terminal: ${((e.error || {}).message) || "unknown error"}`);
+          notify("error", `Failed to open remote terminal: ${((e.error || {}).message) || "unknown error"}`);
           return;
         }
         const data = await resp.json();

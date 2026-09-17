@@ -712,24 +712,36 @@
        * `tick()` refresh callers almost always issue right after can't land
        * pre-mutation data by piggybacking on a request sent before this
        * mutation committed server-side.
+       * RAL-433: passing `notifyOpts` wires this call into the shared board
+       * notification center (see `withActionNotify` in
+       * `board/21-notifications.js`) for free, without changing what the
+       * caller gets back -- still a `Response` it can inspect/read itself.
+       * Most call sites that already have their own bespoke success/failure
+       * handling (a dry-run preview, an inline form error, ...) should keep
+       * doing that instead of also passing `notifyOpts`, to avoid reporting
+       * the same outcome twice.
        * @param {string} path
        * @param {*} [body]
+       * @param {NotifyOpts} [notifyOpts]
        * @returns {Promise<Response>}
        */
-      const post = (path, body) => {
+      const post = (path, body, notifyOpts) => {
         if (path.startsWith("/api/squads/")) invalidateTasksFetch();
-        return fetch(path, { method: "POST", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
+        const resp = fetch(path, { method: "POST", headers: traceHeaders(), body: body ? JSON.stringify(body) : undefined });
+        return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };
       /**
        * Sends a DELETE to the daemon API with a fresh trace header. Same
        * squad-mutation invalidation as `post` above (RAL-406) -- covers
-       * squad deletion.
+       * squad deletion. See `post`'s doc comment above for `notifyOpts`.
        * @param {string} path
+       * @param {NotifyOpts} [notifyOpts]
        * @returns {Promise<Response>}
        */
-      const del = (path) => {
+      const del = (path, notifyOpts) => {
         if (path.startsWith("/api/squads/")) invalidateTasksFetch();
-        return fetch(path, { method: "DELETE", headers: traceHeaders() });
+        const resp = fetch(path, { method: "DELETE", headers: traceHeaders() });
+        return notifyOpts ? withActionNotify(resp, notifyOpts) : resp;
       };
       // RALPHUS-POST-DEL:END
       // copy-to-clipboard: a small button carrying its payload in data-copy.

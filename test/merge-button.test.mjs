@@ -125,7 +125,7 @@ test("mergeReview marks the button pending and toasts before awaiting the daemon
   const body = boardSource.slice(boardSource.indexOf("async function mergeReview(id, status)"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
   const pendingAt = fn.indexOf("pendingMergeActions.add(id)");
-  const toastAt = fn.indexOf("showInfoToast(mergeRequestedToast(status))");
+  const toastAt = fn.indexOf('notify("info", mergeRequestedToast(status))');
   const awaitAt = fn.indexOf("await guardianAction(");
   const clearAt = fn.indexOf("pendingMergeActions.delete(id)");
   const tickAt = fn.indexOf("tick();");

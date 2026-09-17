@@ -1077,9 +1077,9 @@
         let impact;
         try {
           const resp = await post(previewUrl);
-          if (!resp.ok) { alert("Failed to compute restart preview."); return; }
+          if (!resp.ok) { notify("error", "Failed to compute restart preview."); return; }
           impact = await resp.json();
-        } catch (_) { alert("Failed to compute restart preview: network error."); return; }
+        } catch (_) { notify("error", "Failed to compute restart preview: network error."); return; }
         const cellRows = (impact.cells || []).map((s) =>
           `<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
             <span style="flex:1">${esc(s.task_name)} · ${esc(s.cell_id)}</span>
@@ -1118,7 +1118,9 @@
         const applyAllEl = /** @type {HTMLInputElement|null} */ (document.getElementById("restart-note-apply-all"));
         const note = (noteEl?.value || "").trim();
         closeModal();
-        await post(restartUrl, note ? { note, apply_to_all: !!applyAllEl?.checked } : undefined);
+        await post(restartUrl, note ? { note, apply_to_all: !!applyAllEl?.checked } : undefined, {
+          success: "Restart requested.", errorLabel: "restart",
+        });
         tick();
       }
       // RAL-116: cancel this squad and every squad transitively dependent on it.
@@ -1154,9 +1156,9 @@
         let impact;
         try {
           const resp = await post(previewUrl);
-          if (!resp.ok) { alert("Failed to compute cancel preview."); return; }
+          if (!resp.ok) { notify("error", "Failed to compute cancel preview."); return; }
           impact = await resp.json();
-        } catch (_) { alert("Failed to compute cancel preview: network error."); return; }
+        } catch (_) { notify("error", "Failed to compute cancel preview: network error."); return; }
         const squadRows = (impact.squads || []).map((r) =>
           `<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
             <span style="flex:1">${esc(r.label || r.id)}</span>
@@ -1182,7 +1184,7 @@
        */
       async function confirmCancelSquad(cancelUrl) {
         closeModal();
-        await post(cancelUrl);
+        await post(cancelUrl, undefined, { success: "Squad cancelled.", errorLabel: "cancel squad" });
         tick();
       }
       // Attach an interactive terminal to a task cell's live tmux cell
@@ -1202,10 +1204,10 @@
           const resp = await fetch(`/api/squads/${squadId}/cells/${ti}/${si}/open-terminal`, {method:'POST', headers: traceHeaders()});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open terminal: network error');
+          notify("error", 'Failed to open terminal: network error');
         }
       }
       /**
@@ -1223,10 +1225,10 @@
           const resp = await fetch(`/api/squads/${squadId}/proofs/${taskIdx}/${scope}/${cellIdx}/${proofIdx}/open-terminal`, {method:'POST', headers: traceHeaders()});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open terminal: network error');
+          notify("error", 'Failed to open terminal: network error');
         }
       }
       // mode is "open" (attach to the resolver's live tmux cell), "worktree"
@@ -1245,10 +1247,10 @@
           const resp = await fetch(`/api/guardians/${guardianId}/branches/${branchId}/open-terminal?mode=${mode}`, {method:'POST'});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open terminal: network error');
+          notify("error", 'Failed to open terminal: network error');
         }
       }
       // mode is "open" (attach to the manual-checks generation's live tmux
@@ -1265,10 +1267,10 @@
           const resp = await fetch(`/api/guardians/${guardianId}/manual-checks/open-terminal?mode=${mode}`, {method:'POST'});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open terminal: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open terminal: network error');
+          notify("error", 'Failed to open terminal: network error');
         }
       }
       /**
@@ -1286,10 +1288,10 @@
           const resp = await fetch(`/api/squads/${squadId}/cells/${ti}/${si}/open-terminal?mode=agent`, {method:'POST', headers: traceHeaders()});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open agent: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open agent: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open agent: network error');
+          notify("error", 'Failed to open agent: network error');
         }
       }
       /**
@@ -1304,7 +1306,7 @@
         try {
           const resp = await fetch(`/api/squads/${squadId}/cells/${ti}/${si}/resume-automation`, {method:'POST', headers: traceHeaders()});
           if (resp.ok) {
-            showInfoToast('Resuming automation on this cell.');
+            notify("info", 'Resuming automation on this cell.');
             // RAL-406: this bypasses the `post()` helper's automatic
             // invalidation (it's a raw fetch, not `post()`), so invalidate
             // the shared `/api/tasks` in-flight request by hand before the
@@ -1313,10 +1315,10 @@
             tick();
           } else {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to resume automation: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to resume automation: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to resume automation: network error');
+          notify("error", 'Failed to resume automation: network error');
         }
       }
       /**
@@ -1334,10 +1336,10 @@
           const resp = await fetch(`/api/squads/${squadId}/proofs/${taskIdx}/${scope}/${cellIdx}/${proofIdx}/open-terminal?mode=agent`, {method:'POST', headers: traceHeaders()});
           if (!resp.ok) {
             const e = await resp.json().catch(() => ({}));
-            alert(`Failed to open agent: ${((e.error || {}).message) || 'unknown error'}`);
+            notify("error", `Failed to open agent: ${((e.error || {}).message) || 'unknown error'}`);
           }
         } catch (_) {
-          alert('Failed to open agent: network error');
+          notify("error", 'Failed to open agent: network error');
         }
       }
       /**

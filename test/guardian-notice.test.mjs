@@ -83,15 +83,16 @@ test("multiple guardians each newer than last-shown all produce a popup", () => 
 });
 
 // The assertion below is about wiring rather than pure logic: it reads the
-// shipped board.html directly, because the code it covers (`showInfoToast`,
-// the `_guardianNoticeShown` map update) needs a live document and so cannot
-// be evaluated here.
+// shipped board.html directly, because the code it covers (`notify`, the
+// `_guardianNoticeShown` map update) needs a live document and so cannot be
+// evaluated here. RAL-433 consolidated the old review-only `showInfoToast`
+// helper into the shared `notify()` board-notification system.
 
 test("checkGuardianNotices records the shown notice and toasts it", () => {
   const body = boardSource.slice(boardSource.indexOf("function checkGuardianNotices(list)"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
   assert.match(fn, /pendingGuardianNoticeToasts\(list, _guardianNoticeShown\)/);
   const setAt = fn.indexOf("_guardianNoticeShown.set(");
-  const toastAt = fn.indexOf("showInfoToast(toast.text)");
+  const toastAt = fn.indexOf('notify("info", toast.text)');
   assert.ok(setAt > -1 && toastAt > -1, "checkGuardianNotices shape changed");
 });
