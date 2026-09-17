@@ -4849,6 +4849,139 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
 }
 
 #[test]
+fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
+    // RAL-457: the conflict-resolver system prompt no longer instructs a
+    // blind `git add -A` -- it directs the agent to stage only the files it
+    // actually resolved. This exercises a resolver that stages selectively
+    // while a build artifact happens to sit untracked in the worktree (e.g.
+    // left over from something the agent ran, or already present), and
+    // confirms the artifact never reaches the review branch's commit.
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+
+    git(&root, &["checkout", "-b", "feature/x"]);
+    write(&root, "conflict.txt", "line1\nX\nline3\n");
+    git(&root, &["commit", "-am", "x"]);
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["checkout", "-b", "feature/y"]);
+    write(&root, "conflict.txt", "line1\nY\nline3\n");
+    git(&root, &["commit", "-am", "y"]);
+    git(&root, &["checkout", "main"]);
+
+    /// A fake resolver that strips conflict markers, drops an unrelated build
+    /// artifact into the worktree (standing in for a stray/generated file
+    /// that just happens to be sitting there), and stages ONLY the file it
+    /// actually resolved by name -- never `-A` -- mirroring what the new
+    /// system prompt instructs a real agent to do.
+    struct SelectiveStagingRunner;
+    impl Runner for SelectiveStagingRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            let cwd = PathBuf::from(&spec.cwd);
+            let artifact_dir = cwd.join("build");
+            let _ = std::fs::create_dir_all(&artifact_dir);
+            let _ = std::fs::write(artifact_dir.join("output.bin"), b"stale build output");
+
+            let mut resolved_files = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&cwd) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if content.contains("<<<<<<<") {
+                            let cleaned: String = content
+                                .lines()
+                                .filter(|l| {
+                                    !l.starts_with("<<<<<<<")
+                                        && !l.starts_with("=======")
+                                        && !l.starts_with(">>>>>>>")
+                                })
+                                .map(|l| format!("{l}\n"))
+                                .collect();
+                            let _ = std::fs::write(&path, cleaned);
+                            resolved_files
+                                .push(path.file_name().unwrap().to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+            for f in &resolved_files {
+                let ok = Command::new("git")
+                    .args(["add", "--", f])
+                    .current_dir(&cwd)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "selective git add failed for {f} in {}", cwd.display());
+            }
+            RunnerResult {
+                retry_after_secs: None,
+                status: "done".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+                cost_usd: 0.0,
+                cost_is_estimated: false,
+                summary: "resolved\nRALPHUS_STAGE: DONE".into(),
+                error: None,
+                proofed: None,
+                agent_session_id: None,
+                ghost: None,
+                turns: None,
+            }
+        }
+    }
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("selective-stage", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/x").unwrap();
+        g.add_guardian_branch(&id, "feature/y").unwrap();
+        id
+    };
+
+    run_merge(&store, &SelectiveStagingRunner, &id);
+
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+
+    let y = view
+        .branches
+        .iter()
+        .find(|b| b.branch == "feature/y")
+        .unwrap();
+    assert_eq!(y.merge_status, "conflict_resolved");
+
+    let review = view.review_branch.expect("review branch");
+    let show = git(&root, &["show", &format!("{review}:conflict.txt")]);
+    assert!(
+        !show.contains("<<<<<<<"),
+        "markers remain in review branch: {show}"
+    );
+
+    // The build artifact must never have been swept into the review branch's
+    // commit -- the resolver staged only the file it actually resolved.
+    let ls_tree = git(&root, &["ls-tree", "-r", "--name-only", &review]);
+    assert!(
+        !ls_tree.contains("build/output.bin"),
+        "untouched build artifact was swept into the review branch commit:\n{ls_tree}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn review_resolver_agent_resolves_a_custom_agent_profile() {
     // A review's `resolver_agent` naming a configured `.ralphus.toml` custom
     // profile (the pattern used to reach e.g. OpenRouter through the
