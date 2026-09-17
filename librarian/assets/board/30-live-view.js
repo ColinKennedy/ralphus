@@ -805,8 +805,7 @@
           delete peekSystemPrompt[key]; // RAL-428: refetch the System Prompt tab on the next open
         }
         terminalMenuOpen[key] = false; // pressing the primary button should collapse the actions dropdown too
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
         // Fetch immediately on open (rather than waiting up to 2s for the next
         // poll tick) and force it to the bottom — a freshly opened box has no
         // prior scroll position to preserve, and the most recent output is what
@@ -862,8 +861,7 @@
         if (tab !== "terminal" && tab !== "prompt") tab = "terminal";
         peekTab[key] = tab;
         if (tab === "prompt") void ensurePeekSystemPrompt(key);
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Ensures peek key `key`'s System Prompt tab text has been fetched

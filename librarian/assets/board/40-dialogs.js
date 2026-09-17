@@ -258,7 +258,7 @@
         const item = graphNodeItem(squadId, "proof", ti, si, vi); if (!item) return;
         const items = graphMenuSelection(squadId, item);
         if (items.length === 1) selectSingleGraphNode(squadId, "proof", ti, si, vi);
-        renderGraph(); renderDetails(); syncHash(true);
+        renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); syncHash(true);
         openGraphNodeMenu(e, items);
       }
       /**
@@ -272,7 +272,7 @@
         const item = graphNodeItem(squadId, "task", ti, -1, -1); if (!item) return;
         const items = graphMenuSelection(squadId, item);
         if (items.length === 1) selectSingleGraphNode(squadId, "task", ti, -1, -1);
-        renderGraph(); renderDetails(); syncHash(true);
+        renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); syncHash(true);
         openGraphNodeMenu(e, items);
       }
       /**
@@ -300,7 +300,7 @@
         const item = graphNodeItem(squadId, "cell", ti, si, -1); if (!item) return;
         const items = graphMenuSelection(squadId, item);
         if (items.length === 1) selectSingleGraphNode(squadId, "cell", ti, si, -1);
-        renderGraph(); renderDetails(); syncHash(true);
+        renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); syncHash(true);
         openGraphNodeMenu(e, items);
       }
       /**

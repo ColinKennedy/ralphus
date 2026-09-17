@@ -3,6 +3,7 @@
       // scroll position and wipes in-progress text in a pane's inputs. Captures
       // the user's scroll position and focused field beforehand and restores them
       // after render — live updates keep flowing without clobbering typing.
+      // RALPHUS-PRESERVE-USER-STATE:BEGIN
       /**
        * Re-renders `el` via `render()` while preserving scroll position and focused-input state (RAL-7).
        * @param {HTMLElement|null} el
@@ -73,6 +74,7 @@
         const s = window.getSelection && window.getSelection();
         return !!(s && !s.isCollapsed && String(s).length && s.anchorNode && el.contains(s.anchorNode));
       }
+      // RALPHUS-PRESERVE-USER-STATE:END
       /**
        * Re-renders the sidebar and graph unconditionally, and the details pane unless the user is mid-selection inside it.
        * @returns {void}
@@ -84,6 +86,28 @@
         if (selectionWithin(details)) return; // keep the user's in-pane selection intact
         preserveUserState(details, renderDetails);
       }
+      // RAL-430: dozens of local UI toggles (peek boxes, terminal-log
+      // attempt history, prompt tabs, menus) each re-render whichever of the
+      // details pane / review-detail pane currently owns them with a plain
+      // `if (sel.kind) renderDetails(); if (selectedGuardian)
+      // renderReviewDetail();` pair -- every one of those innerHTML swaps
+      // reset the pane's scroll position (and any nested peek box's) back to
+      // the top, which is what made the live terminal viewer and system
+      // prompt view keep jumping. Routing both branches through
+      // `preserveUserState` here gives every such call site the same fix in
+      // one place, rather than each needing its own bespoke save/restore.
+      // RALPHUS-RERENDER-OWNING-PANE:BEGIN
+      /**
+       * Re-renders whichever of the details pane / review-detail pane is
+       * currently showing something, preserving scroll position and focused-
+       * input state on each (RAL-430).
+       * @returns {void}
+       */
+      function rerenderOwningPane() {
+        if (sel.kind) preserveUserState(document.getElementById("details"), renderDetails);
+        if (selectedGuardian) preserveUserState(document.getElementById("review-detail"), renderReviewDetail);
+      }
+      // RALPHUS-RERENDER-OWNING-PANE:END
       /**
        * Formats the daemon status counter text, showing "unlimited" in place
        * of the cap when `maxConcurrent` is 0 (no limit).
@@ -281,7 +305,7 @@
         ensurePromptCache(selectedSquadId).then((loaded) => {
           if (!loaded) return;
           applyPromptCache();
-          renderDetails();
+          preserveUserState(document.getElementById("details"), renderDetails);
         });
       }
       /**
@@ -913,7 +937,9 @@
       function ensureGuardianDetailLoaded(id) {
         const g = guardians.find((x) => x.id === id);
         if (!g || g.branches) return;
-        fetchGuardianDetail(id).then(() => { if (selectedGuardian === id) renderReviewDetail(); });
+        fetchGuardianDetail(id).then(() => {
+          if (selectedGuardian === id) preserveUserState(document.getElementById("review-detail"), renderReviewDetail);
+        });
       }
       // RALPHUS-REVIEW-POLL:BEGIN
       /** Monotonic sequence over `pollReviews` invocations — each call captures its number at start; a call that is no longer the freshest abandons itself (RAL-382). */
