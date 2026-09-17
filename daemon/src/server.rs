@@ -10033,6 +10033,25 @@ fn kill_squad_tmux_sessions(squad_id: &str) -> usize {
     tmux.kill_sessions_with_prefix(&format!("ralphus_{squad_id}_"))
 }
 
+/// The cascade counterpart to [`kill_squad_tmux_sessions`]: kills every live
+/// tmux session belonging to any squad in `squad_ids`, sharing one
+/// `list-sessions` round trip across the whole cascade
+/// (`Tmux::kill_sessions_with_any_prefix`, RAL-407) instead of resolving tmux
+/// and listing sessions once per squad. A cancel that cascades to several
+/// dependent squads previously paid one full discovery round trip per squad
+/// before this ran (and used to do so synchronously on the request thread —
+/// see [`cancel`]'s doc comment for why it doesn't anymore).
+fn kill_squads_tmux_sessions(squad_ids: &[String]) -> usize {
+    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
+        return 0;
+    };
+    let prefixes: Vec<String> = squad_ids
+        .iter()
+        .map(|id| format!("ralphus_{id}_"))
+        .collect();
+    tmux.kill_sessions_with_any_prefix(&prefixes)
+}
+
 /// The guardian-cell counterpart to [`kill_squad_tmux_sessions`]: kills
 /// every live tmux session belonging to guardian `guardian_id`. Guardian
 /// resolver/PR-description/summary cells are named via
@@ -10058,21 +10077,36 @@ struct CancelResponse {
 /// the squad's current state — even an already-terminal squad is (re-)cancelled,
 /// so it can never be picked up again by another trigger (a restart,
 /// cross-squad gating, etc).
+///
+/// Returns as soon as cancellation is durable: the store write above and
+/// `Cancellations::cancel` below are both fast, in-memory-or-single-write
+/// operations, and the response already reflects every affected squad's
+/// final `cancelled` state at that point. The tmux/psmux teardown
+/// (`kill_squads_tmux_sessions`) is *not* awaited before replying — it
+/// shells out per session and, on a cascade spanning several squads, used to
+/// make this endpoint itself take several seconds (RAL-407), even though
+/// cancellation was already effectively decided. It runs in the background
+/// instead: mux sessions are still killed, just not on this request's
+/// critical path. `BackgroundWork::Immediate` (every `Daemon::new()`-built
+/// test daemon) keeps this synchronous for tests that assert on it.
 fn cancel(daemon: &Daemon, id: &str) -> Reply {
     match daemon.lock().cancel_squad(id, false) {
         Ok(impact) => {
-            // The store has flipped every affected squad (and their non-terminal
-            // nodes) to cancelled; now stop each one's worker thread and kill
-            // its subprocess, if it has one in flight.
-            for r in &impact.squads {
-                daemon.cancellations.cancel(&r.id);
-                kill_squad_tmux_sessions(&r.id);
+            let squad_ids: Vec<String> = impact.squads.into_iter().map(|r| r.id).collect();
+            // Trip each worker's cooperative cancel token now -- cheap,
+            // in-memory, and safe to do before the mux teardown below.
+            for squad_id in &squad_ids {
+                daemon.cancellations.cancel(squad_id);
             }
+            let teardown_ids = squad_ids.clone();
+            daemon.background().spawn(move || {
+                kill_squads_tmux_sessions(&teardown_ids);
+            });
             json(
                 200,
                 &CancelResponse {
                     state: "cancelled",
-                    cancelled: impact.squads.into_iter().map(|r| r.id).collect(),
+                    cancelled: squad_ids,
                 },
             )
         }
@@ -10740,11 +10774,18 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 );
             };
             if state == SquadState::Cancelled {
+                // Mirrors `cancel`'s doc comment: trip tokens synchronously,
+                // defer mux teardown to the background so this endpoint is
+                // just as fast as the "Cancel Squad" button it's meant to
+                // match (RAL-407).
                 store.cancel_squad(id, false).map(|impact| {
-                    for r in &impact.squads {
-                        daemon.cancellations.cancel(&r.id);
-                        kill_squad_tmux_sessions(&r.id);
+                    let squad_ids: Vec<String> = impact.squads.into_iter().map(|r| r.id).collect();
+                    for squad_id in &squad_ids {
+                        daemon.cancellations.cancel(squad_id);
                     }
+                    daemon.background().spawn(move || {
+                        kill_squads_tmux_sessions(&squad_ids);
+                    });
                 })
             } else {
                 store.set_squad_state(id, state)
