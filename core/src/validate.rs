@@ -192,6 +192,7 @@ const TASK_KEYS: &[&str] = &[
     "environment",
     "no_commit_required",
     "share_session",
+    "extends",
     "cell",
     "proof",
 ];
@@ -224,6 +225,7 @@ const CELL_KEYS: &[&str] = &[
     "share_session",
     "triage",
     "triage_type",
+    "extends",
 ];
 /// The full set of top-level `[[review]]` keys -- also the source of truth
 /// `daemon`'s `REVIEW_FIELD_PARITY` test (RAL-342/RAL-338) checks against, so
@@ -294,6 +296,7 @@ const PROOF_KEYS: &[&str] = &[
     "requires_approval",
     "restart_on",
     "environment",
+    "extends",
 ];
 
 // ── Type expectations ────────────────────────────────────────────────────────
@@ -661,6 +664,8 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_environment(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
+        check_type(ctx, table, "extends", Ty::StrArray, &path, header);
+        check_extends(ctx, table, &path, header);
 
         let task_agents = agent_names_in_table(table).unwrap_or_default();
         let task_project = table.get("project").and_then(toml::Value::as_str);
@@ -913,6 +918,9 @@ fn validate_cells(
         check_type(ctx, table, "triage", Ty::Bool, &path, header);
         check_type(ctx, table, "triage_type", Ty::StrOrStrArray, &path, header);
         check_triage(ctx, table, &path, header, &mut has_auto_review);
+
+        check_type(ctx, table, "extends", Ty::StrArray, &path, header);
+        check_extends(ctx, table, &path, header);
 
         let cell_agents = agent_names_in_table(table).unwrap_or_else(|| task_agents.to_vec());
         validate_proof_array(
@@ -1735,6 +1743,37 @@ fn check_review(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u
     }
 }
 
+/// Validate an `extends` array -- valid on a task, a cell, or a proof step.
+/// Each entry must be a wrapped `<<ralphus:presets/<name>>>` sentinel naming
+/// a preset (`daemon::presets`) to stamp field defaults from; see
+/// [`crate::schema::parse_preset_sentinel`]. `core` has no store access, so
+/// this only checks shape -- whether the named preset is actually
+/// registered is checked daemon-side at submit time
+/// (`daemon::presets::validate_task_file_presets`), the same two-phase
+/// pattern as `project`/`review`/Triage type names.
+fn check_extends(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(arr) = table.get("extends").and_then(toml::Value::as_array) else {
+        return;
+    };
+    let line = ctx.key_line(header, "extends");
+    for entry in arr {
+        // A non-string entry was already reported by the preceding
+        // `check_type(..., Ty::StrArray, ...)` call for the whole array.
+        let Some(s) = entry.as_str() else { continue };
+        if crate::schema::parse_preset_sentinel(s).is_none() {
+            ctx.error(
+                &format!("{path}.extends"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'extends' entries must be wrapped in \"<<...>>\" sentinel syntax naming a \
+                     preset, e.g. \"<<ralphus:presets/commit_and_push>>\" (got \"{s}\")"
+                ),
+                line,
+            );
+        }
+    }
+}
+
 /// Validate a cell's Triage opt-in (RAL-318): `triage = true` pools this cell
 /// for an automatic review instead of naming an explicit `[[review]]` block,
 /// optionally with an inline `triage_type` naming which pool(s) -- a bare
@@ -2040,6 +2079,8 @@ fn validate_proof_array(value: Option<&toml::Value>, path: &str, agents: &[&str]
         check_maximum_tool_output_tokens(ctx, table, agents, &vpath, None);
         check_type(ctx, table, "arguments", Ty::StrArray, &vpath, None);
         check_type(ctx, table, "restart_on", Ty::StrArray, &vpath, None);
+        check_type(ctx, table, "extends", Ty::StrArray, &vpath, None);
+        check_extends(ctx, table, &vpath, None);
 
         if let Some(restarts) = table.get("restart_on").and_then(toml::Value::as_array) {
             for r in restarts.iter().filter_map(toml::Value::as_str) {
@@ -3899,6 +3940,88 @@ command = "cargo build"
             validate_toml(src).is_ok(),
             "{:?}",
             validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn task_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nextends=[\"<<ralphus:presets/complex_task>>\"]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn task_extends_bare_unwrapped_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\nextends=[\"ralphus:presets/complex_task\"]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<ralphus:presets/commit_and_push>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_empty_name_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<ralphus:presets/>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn cell_extends_unrecognized_sentinel_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"<<review:backend>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_extends_wrapped_preset_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nextends=[\"<<ralphus:presets/commit_and_push>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn proof_extends_bare_unwrapped_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nextends=[\"ralphus:presets/commit_and_push\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("extends")),
+            "{:?}",
+            r.errors
         );
     }
 

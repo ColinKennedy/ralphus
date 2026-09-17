@@ -546,6 +546,20 @@
        * @property {number} created_at_ms
        */
       /**
+       * A registered preset -- a named bundle of field defaults an `extends
+       * = ["<<ralphus:presets/<name>>>"]` entry stamps into a task's,
+       * cell's, or proof step's own unset fields at submit time. Every
+       * field below is optional; a field this preset doesn't set is `null`.
+       * @typedef {object} PresetView
+       * @property {string} name
+       * @property {string|null} system_prompt
+       * @property {string|null} system_prompt_position
+       * @property {number|null} maximum_context
+       * @property {number|null} auto_compact_threshold
+       * @property {number|null} maximum_tool_output_tokens
+       * @property {number} created_at_ms
+       */
+      /**
        * The Arbiter's pooled-cell count for one `(project, triage_type)` key
        * (RAL-318) -- cells classified into this type, from any squad, waiting
        * for a threshold or schedule to fire and drain them into one fresh

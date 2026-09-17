@@ -27,6 +27,8 @@ __all__ = [
     "PATH_PURGE",
     "PREFS_HIDDEN_ITEMS",
     "PREFS_ROUTES",
+    "PRESETS_ROUTES",
+    "PRESETS_ROWS",
     "PROJECTS_ROUTES",
     "PROJECTS_ROWS",
     "QUEUE_ITEMS",
@@ -61,6 +63,7 @@ __all__ = [
     "hidden_item_entry",
     "machine_provider",
     "message",
+    "preset_entry",
     "project",
     "proof_step",
     "queue_item",
@@ -433,6 +436,27 @@ def user_entry(name: str, *, created_at_ms: int) -> Json:
 
 def secret_env_name_entry(name: str, *, created_at_ms: int) -> Json:
     return {"name": name, "created_at_ms": created_at_ms}
+
+
+def preset_entry(
+    name: str,
+    *,
+    system_prompt: str | None = None,
+    system_prompt_position: str | None = None,
+    maximum_context: int | None = None,
+    auto_compact_threshold: int | None = None,
+    maximum_tool_output_tokens: int | None = None,
+    created_at_ms: int,
+) -> Json:
+    return {
+        "name": name,
+        "system_prompt": system_prompt,
+        "system_prompt_position": system_prompt_position,
+        "maximum_context": maximum_context,
+        "auto_compact_threshold": auto_compact_threshold,
+        "maximum_tool_output_tokens": maximum_tool_output_tokens,
+        "created_at_ms": created_at_ms,
+    }
 
 
 def triage_type_entry(name: str, *, label: str, description: str, created_at_ms: int) -> Json:
@@ -1186,6 +1210,43 @@ TRIAGE_ROUTES: Routes = {
     "/api/triage/types": {"types": list(TRIAGE_TYPES)},
     "/api/triage/pools": {"pools": list(TRIAGE_POOLS)},
     "/api/triage/schedules": {"schedules": list(TRIAGE_SCHEDULES)},
+}
+
+# ---------------------------------------------------------------------------
+# Presets scenario — a few registered presets an `extends` sentinel can
+# stamp field defaults from.
+# ---------------------------------------------------------------------------
+
+PRESETS_ROWS: tuple[Json, ...] = (
+    preset_entry(
+        "complex_task",
+        maximum_context=200_000,
+        auto_compact_threshold=150_000,
+        maximum_tool_output_tokens=15_000,
+        created_at_ms=1_783_000_000_000,
+    ),
+    preset_entry(
+        "no_git_commit",
+        system_prompt="Do NOT commit and do NOT push under any circumstances. You are working "
+        "in a dedicated git worktree.",
+        system_prompt_position="append",
+        created_at_ms=1_783_010_000_000,
+    ),
+    preset_entry(
+        "commit_and_push",
+        system_prompt="Do NOT run formatters, linters, or tests. Just stage the intended source "
+        "changes, commit, and push.",
+        system_prompt_position="append",
+        created_at_ms=1_783_020_000_000,
+    ),
+)
+
+PRESETS_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/presets": {"presets": list(PRESETS_ROWS)},
 }
 
 # ---------------------------------------------------------------------------

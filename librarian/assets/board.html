@@ -22,6 +22,7 @@
           <!-- RAL-332: admin-only tabs start hidden and are revealed by applyAdminTabVisibility() once GET /api/whoami confirms is_admin -- avoids a flash of admin-only chrome for a non-admin caller before that first resolves. -->
           <button id="tab-machines" class="tab" style="display:none" onclick="showTab('machines', true)" data-tip="Machines — registered providers that remote tasks, cells and proof steps run on (RAL-185).\nA task declares machine = &quot;&lt;scheme&gt;:&lt;uri&gt;&quot;; the daemon looks the scheme up here to find the program that reaches that machine.\nRegistering is an admin action and is deliberately not declarable in a task file.\nAdmin-only (RAL-332).">🖥 Machines</button>
           <button id="tab-triage" class="tab" style="display:none" onclick="showTab('triage', true)" data-tip="Triage (RAL-318) — manage Triage types, pool thresholds, and drain schedules for the Arbiter subsystem.\nA cell opts in with triage = true instead of naming an explicit [[review]]; the Arbiter classifies it and drains its pool into a fresh review once a count threshold or cron schedule fires.\nAdmin-only (RAL-332).">📥 Triage</button>
+          <button id="tab-presets" class="tab" style="display:none" onclick="showTab('presets', true)" data-tip="Presets — named bundles of field defaults an &quot;extends = [&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;&quot;]&quot; entry stamps into a task's, cell's, or proof step's own unset fields at submit time.\nAdmin-only (RAL-332).">🧩 Presets</button>
           <button id="tab-projects" class="tab" style="display:none" onclick="showTab('projects', true)" data-tip="Projects — registered git repositories a task's cell cwd can materialize a worktree under (RAL-100).\nDouble-click Description, Path, or VCS to edit a field, then Save or Cancel.\nA row highlighted in red failed validation — hover its name for why.\nAdmin-only (RAL-332) -- registering/editing a project is gated, but every user's task submissions still read the underlying project/branch list.">📦 Projects</button>
           <button id="tab-users" class="tab" style="display:none" onclick="showTab('users', true)" data-tip="Users — placeholder identities a request can attribute itself to (see AgentAccess/UserContext).\nThis is NOT authentication: no password, no session, no permissions — a name grants nothing on its own.\nTODO: replace with user auth once RAL-252 is done.\nAdmin-only (RAL-332).">👤 Users</button>
           <button id="tab-secrets" class="tab" style="display:none" onclick="showTab('secrets', true)" data-tip="Secrets — env-var names treated as secret (RAL-281).\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, in addition to the existing from_env-sourced agent-profile secrets.\nChanges apply immediately, no daemon restart needed.\nAdmin-only (RAL-332).">🔐 Secrets</button>
@@ -262,6 +263,14 @@
       <div id="triage"><div class="empty">Loading…</div></div>
     </main>
 
+    <main id="presets-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b data-tip="Presets — named bundles of field defaults an &quot;extends = [&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;&quot;]&quot; entry stamps into a task's, cell's, or proof step's own unset fields at submit time.\nA field the author already set explicitly is never overridden; when more than one named preset in the list sets the same field, the last one wins.">Presets</b>
+        <button class="btn" onclick="pollPresets()" data-tip="Re-query the daemon for registered presets.">↻ Refresh</button>
+      </div>
+      <div id="presets"><div class="empty">Loading…</div></div>
+    </main>
+
     <main id="worktree-retirement-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Review worktrees idle for 30 days are retired by a daily daemon sweep.\nscheduled = too young; eligible = old enough -- watchers of the review get one mailbox heads-up, then the sweep after that removes it; claimed = kept because a live task/proof/review still needs it; failed = the last attempt failed; deferred = a machine provider asked to try again later; opted_out = a machine provider or policy declined to ever retire this worktree; retired = removed (kept here as history for as long as the review exists).">Worktree retirement</b>
@@ -322,5 +331,6 @@
     <script src="/board/77-mailbox.js"></script>
     <script src="/board/80-queue.js"></script>
     <script src="/board/81-worktree-retirement.js"></script>
+    <script src="/board/83-presets.js"></script>
   </body>
 </html>

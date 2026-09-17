@@ -740,7 +740,8 @@ unclaimed rows.
 `GET /api/users`, `POST /api/users`, `DELETE /api/users/{name}`,
 `POST /api/users/{name}/rename`, `POST /api/users/{name}/admin`,
 `POST /api/users/{name}/visit`, everything under `/api/machines`,
-everything under `/api/triage`, everything under `/api/secret-env-names`,
+everything under `/api/triage`, everything under `/api/presets`,
+everything under `/api/secret-env-names`,
 and `POST /api/projects` (registering/editing a project) all require the
 current placeholder identity (`X-Ralphus-User`, falling back to
 `[daemon].default_user`) to be a registered admin (`is_admin: true`).

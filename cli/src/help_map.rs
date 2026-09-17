@@ -778,6 +778,53 @@ const TRIAGE_POOL_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const PRESET_CHILDREN: &[HelpNode] = &[
+    node(
+        "deregister",
+        &["name [str]"],
+        &[],
+        "Remove a preset. Any preset, including a starter default, may be freely removed.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "get",
+        &["name [str]"],
+        &[],
+        "Show one registered preset by exact name.",
+        false,
+        true, // ("preset", "get")
+        &[],
+    ),
+    node(
+        "list",
+        &[],
+        &[],
+        "List every registered preset.",
+        false,
+        true, // ("preset", "list")
+        &[],
+    ),
+    node(
+        "register",
+        &["name [str]"],
+        &[
+            "--auto-compact-threshold [integer]",
+            "--maximum-context [integer]",
+            "--maximum-tool-output-tokens [integer]",
+            "--system-prompt [text]",
+            "--system-prompt-position [text]",
+        ],
+        "Register (or update) a preset -- a named bundle of field defaults an \"extends\" \
+         sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad \
+         is submitted.",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const TRIAGE_CHILDREN: &[HelpNode] = &[
     node(
         "pool",
@@ -1757,6 +1804,17 @@ tailing and --wait-until-valid are not yet ported).",
             false,
             false,
             MAILBOX_CHILDREN,
+        ),
+        node(
+            "preset",
+            &[],
+            &[],
+            "Register and inspect presets -- named bundles of field defaults an \
+             \"extends = [\\\"<<ralphus:presets/<name>>>\\\"]\" entry stamps into a task's, \
+             cell's, or proof step's own unset fields when the squad is submitted.",
+            false,
+            false,
+            PRESET_CHILDREN,
         ),
         node(
             "project",

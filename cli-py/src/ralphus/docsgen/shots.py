@@ -225,6 +225,18 @@ def _triage_overview(page: Page) -> None:
         _shoot(page, "triage-overview")
 
 
+def _presets_overview(page: Page) -> None:
+    # Same no-dedicated-hash situation as Machines/Users/Secrets/Triage above.
+    with (
+        fixture_server(fixtures.PRESETS_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('presets', true)")
+        page.wait_for_selector("#presets .proj-table")
+        _shoot(page, "presets-overview")
+
+
 def _worktree_retirement_overview(page: Page) -> None:
     # Same no-dedicated-hash situation as Machines/Users/Secrets/Triage above.
     with (
@@ -260,6 +272,7 @@ SCENARIOS = (
     _users_overview,
     _secrets_overview,
     _triage_overview,
+    _presets_overview,
     _worktree_retirement_overview,
     _prefs_overview,
 )
