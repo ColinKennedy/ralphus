@@ -2388,6 +2388,24 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
                     return store_error(&e);
                 }
             }
+            // RAL-445: `validate_project_location` above already confirmed
+            // `req.path` is a real, local git repository, so this is safe to
+            // do inline -- a worktree cell run will re-sync it anyway
+            // (`worktrees::sync_coauthor_hook_best_effort`), but doing it at
+            // registration too covers a cell whose `cwd` is the project root
+            // itself rather than a `ralphus:new-worktree/...` placeholder.
+            if req.vcs == "git" {
+                let enabled =
+                    crate::config::load_commit_config(Path::new(&req.path)).add_coauthor();
+                if let Err(e) = crate::git_hooks::sync_coauthor_hook(Path::new(&req.path), enabled)
+                {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [server] could not sync co-author hook for project {:?}: {e}",
+                        req.name
+                    );
+                }
+            }
             let mut body = serde_json::json!({"name": req.name});
             if let Some(warning) = credential_warning {
                 body["warnings"] = serde_json::json!([warning]);
@@ -15039,6 +15057,55 @@ mod tests {
         );
         assert_eq!(r.status, 201, "{}", r.body);
         assert!(r.body.contains("proj"));
+    }
+
+    /// RAL-445: registering a git project installs the co-author hook
+    /// immediately, without waiting for a cell to materialize a worktree
+    /// through `ensure_worktree_with_existing` -- this covers a cell whose
+    /// `cwd` is the project root itself.
+    #[test]
+    fn register_project_route_installs_coauthor_hook() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-hook");
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), "a test project"),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let hook_path = repo.join(".git").join("hooks").join("prepare-commit-msg");
+        assert!(
+            hook_path.exists(),
+            "expected a prepare-commit-msg hook at {}",
+            hook_path.display()
+        );
+        let contents = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(contents.contains("ralphus:coauthor-hook"));
+    }
+
+    /// RAL-445: `[commits] add_coauthor = false` in the registered project's
+    /// `.ralphus.toml` means no hook is installed at registration time.
+    #[test]
+    fn register_project_route_skips_hook_when_project_disables_it() {
+        let d = daemon();
+        let repo = tmp_git_repo("register-hook-disabled");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[commits]\nadd_coauthor = false\n",
+        )
+        .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), "a test project"),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let hook_path = repo.join(".git").join("hooks").join("prepare-commit-msg");
+        assert!(!hook_path.exists());
     }
 
     #[test]
