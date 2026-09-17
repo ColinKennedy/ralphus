@@ -1098,6 +1098,19 @@ impl ForgeClient {
     /// `"cannot_be_merged"` for a real conflict; other non-`"can_be_merged"`
     /// values (`"unchecked"`, `"checking"`) mean GitLab hasn't finished
     /// computing it yet, so they're treated as pending, not failing.
+    ///
+    /// RAL-462: unlike GitHub's check-runs/status calls (each scoped to a
+    /// specific commit sha by its own URL), the MR endpoint's `pipeline`
+    /// field is simply "the latest pipeline for this MR" -- if the MR's head
+    /// just moved (rebase, force-push, a new feedback commit) and GitLab
+    /// hasn't registered a pipeline for that new commit yet, this field still
+    /// holds the *previous* commit's pipeline, verdict and all. Reusing that
+    /// verdict verbatim would let a stale "failed" badge survive a rebase
+    /// until GitLab gets around to creating the new pipeline. Comparing the
+    /// pipeline's own `sha` against the MR's current head sha (both in the
+    /// same response, so no extra state to track) tells the two apart: a
+    /// mismatch means the pipeline belongs to a commit that's no longer the
+    /// head, so there's genuinely no verdict yet for the current one.
     fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
         let mr_url = format!(
@@ -1118,6 +1131,14 @@ impl ForgeClient {
             // No pipeline has run against this MR yet.
             return Ok(PrCiState::Pending);
         };
+        let head_sha = mr["sha"]
+            .as_str()
+            .or_else(|| mr["diff_refs"]["head_sha"].as_str());
+        if let (Some(head_sha), Some(pipeline_sha)) = (head_sha, mr["pipeline"]["sha"].as_str()) {
+            if head_sha != pipeline_sha {
+                return Ok(PrCiState::Pending);
+            }
+        }
         match pipeline_status {
             "success" => Ok(PrCiState::Passing),
             "failed" => {
@@ -4415,6 +4436,74 @@ mod tests {
     }
 
     #[test]
+    fn check_pr_ci_status_reports_github_pending_after_a_rebase_moves_the_head_sha() {
+        // RAL-462 (GitHub side of the same scenario the GitLab staleness
+        // tests cover): a prior poll saw "oldsha" failing; the PR then gets
+        // rebased/force-pushed to "newsha". Because every GitHub call here is
+        // freshly re-fetched and its check-runs/status URLs are scoped to
+        // whatever the *current* poll's head sha is, the stale failing
+        // check-run for "oldsha" must never be consulted for "newsha" -- the
+        // poll must report the new head's own (in this case still pending)
+        // state instead of resurfacing the old failure.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "unstable", "head": {"sha": "oldsha"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/oldsha/check-runs");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "unknown", "head": {"sha": "newsha"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/newsha/check-runs");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "in_progress", "conclusion": null}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        assert!(matches!(
+            client.check_pr_ci_status(4).unwrap(),
+            PrCiState::Failing(_)
+        ));
+        assert_eq!(
+            client.check_pr_ci_status(4).unwrap(),
+            PrCiState::Pending,
+            "polling again after the head sha moved must reflect the new commit's own state, \
+             not the previous commit's failure"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn check_pr_ci_status_reports_github_passing_when_everything_is_green() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
@@ -4566,6 +4655,72 @@ mod tests {
                 checks: vec![],
             })
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_gitlab_pending_when_the_pipeline_is_stale_for_the_current_head() {
+        // RAL-462: the MR moved (rebase/force-push/new commit) to "newsha",
+        // but the `pipeline` field GitLab hands back still belongs to the
+        // *previous* head ("oldsha") and reports it as failed -- a fresh
+        // pipeline for "newsha" simply hasn't been created yet. The stale
+        // pipeline's own verdict must not resurface as this PR's status.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "newsha", "pipeline": {"id": 55, "sha": "oldsha", "status": "failed", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert_eq!(
+            state,
+            PrCiState::Pending,
+            "a pipeline belonging to a commit that's no longer the MR's head must not be reported \
+             as the current status -- badge must read pending, not a stale failure/success"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_the_gitlab_pipelines_verdict_when_it_matches_the_current_head() {
+        // Same shape as the staleness test above, but the pipeline's sha now
+        // matches the MR's current head -- its "failed" verdict is genuine
+        // and must still surface (the sha check must not swallow real
+        // failures for the commit it's actually meant to report on).
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "samesha", "pipeline": {"id": 55, "sha": "samesha", "status": "success", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let state = client.check_pr_ci_status(9).unwrap();
+        assert_eq!(state, PrCiState::Passing);
         handle.join().unwrap();
     }
 

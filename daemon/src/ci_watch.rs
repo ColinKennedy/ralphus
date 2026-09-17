@@ -336,7 +336,18 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
-            Ok(PrCiState::Pending) => {}
+            Ok(PrCiState::Pending) => {
+                // RAL-462: persist this immediately rather than leaving
+                // whatever terminal status (e.g. a prior "failing") was
+                // recorded before this watch started -- without this, a
+                // board badge stays stuck on that stale verdict for as long
+                // as this watch keeps polling, potentially its entire
+                // `MAX_WATCH_DURATION`, instead of reflecting that the
+                // forge already considers the new commit's CI in flight.
+                let _ = store
+                    .lock()
+                    .set_pr_ci_status(&pr.id, PrCiState::Pending.as_str(), None);
+            }
             Err(e) => {
                 log_ci_watch(
                     store,
