@@ -32,6 +32,7 @@ const {
   ttTaskNeedsMe,
   ttCompareRows,
   ttRowMatchesFilters,
+  prsMatchStatusFilter,
   ttRowMatchesPrFilter,
   ttGroupAggregate,
   ttGroupAggregateWithGeneration,
@@ -354,81 +355,64 @@ test("ttRowMatchesFilters applies the name filter, status set, project set, hidd
   assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["other"]) }, new Set(), new Set()), false);
 });
 
-// ---------- RAL-353 PR-state filter ----------
+// ---------- RAL-463 PR-status filter ----------
 
-const pr = (/** @type {object} */ overrides) => ({ id: "pr-x", state: "open", draft: false, ci_status: null, ...overrides });
+const pr = (/** @type {object} */ overrides) => ({ id: "pr-x", state: "open", ci_status: null, ...overrides });
 const prRow = (/** @type {object[]} */ prs) => ({ key: "s1:0", name: "T", state: "running", squadId: "s1", task: { project: "acme" }, prs });
-const anyFilter = () => ({ pr: false, prDraft: "any", prCi: "any" });
 
-test("ttRowMatchesPrFilter passes everything when no dimension is active", () => {
-  assert.equal(ttRowMatchesPrFilter(prRow([]), anyFilter()), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({})]), anyFilter()), true);
+test("prsMatchStatusFilter passes everything when \"any\" (off by default)", () => {
+  assert.equal(prsMatchStatusFilter([], "any"), true);
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "failing" })], "any"), true);
 });
 
-test("ttRowMatchesPrFilter with has-PR shows only tasks with at least one PR", () => {
-  const f = { ...anyFilter(), pr: true };
-  assert.equal(ttRowMatchesPrFilter(prRow([]), f), false);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ pr_number: 1 })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({}), pr({})]), f), true);
+test("prsMatchStatusFilter excludes an empty PR list once a status is chosen (RAL-463 Q4 empty state)", () => {
+  assert.equal(prsMatchStatusFilter([], "passing"), false);
+  assert.equal(prsMatchStatusFilter([], "pending"), false);
 });
 
-test("ttRowMatchesPrFilter draft matches only PRs the forge reports as draft", () => {
-  const f = { ...anyFilter(), prDraft: "draft" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: false })]), f), false);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: true })]), f), true);
-  // A PR whose draft state was never observed (null) is not known to be a draft.
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: null })]), f), false);
-  // At least one matching PR suffices, even beside non-matching siblings.
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: false }), pr({ draft: true })]), f), true);
+test("prsMatchStatusFilter matches only when EVERY PR shares the chosen status -- one mismatch excludes the whole set", () => {
+  const f = "passing";
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "passing" })], f), true);
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "passing" }), pr({ ci_status: "passing" })], f), true);
+  // Mixed statuses (e.g. one passing + one pending) match nothing -- RAL-463's
+  // tie-break for mixed-status rows, replacing RAL-353's original `.some()`.
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "passing" }), pr({ ci_status: "pending" })], f), false);
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "passing" }), pr({ ci_status: "failing" })], f), false);
 });
 
-test("ttRowMatchesPrFilter non-draft matches false and never-observed (null), excluding drafts", () => {
-  const f = { ...anyFilter(), prDraft: "non-draft" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: false })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: null })]), f), true, "legacy-unknown counts as not-draft");
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: true })]), f), false);
+test("prsMatchStatusFilter supports the pending value (RAL-463 adds it to RAL-353's passing/failing pair)", () => {
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "pending" })], "pending"), true);
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: "failing" })], "pending"), false);
 });
 
-test("ttRowMatchesPrFilter CI failing matches only the forge-reported failing status", () => {
-  const f = { ...anyFilter(), prCi: "failing" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "failing" })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "passing" })]), f), false);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "pending" })]), f), false, "pending is not failing");
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: null })]), f), false, "never-polled is not failing");
+test("prsMatchStatusFilter treats a never-polled (null) ci_status as matching no specific status", () => {
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: null })], "passing"), false);
+  assert.equal(prsMatchStatusFilter([pr({ ci_status: null })], "pending"), false);
 });
 
-test("ttRowMatchesPrFilter CI passing matches only the forge-reported passing status", () => {
-  const f = { ...anyFilter(), prCi: "passing" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "passing" })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "failing" })]), f), false);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: null })]), f), false);
-});
-
-test("ttRowMatchesPrFilter composes dimensions: draft + failing needs ONE PR that is both", () => {
-  const f = { ...anyFilter(), prDraft: "draft", prCi: "failing" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: true, ci_status: "failing" })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: true, ci_status: "passing" })]), f), false);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ draft: false, ci_status: "failing" })]), f), false);
-  // A failing non-draft PR and a passing draft PR are two different PRs:
-  // no single PR satisfies both dimensions, so the task does not match.
+test("ttRowMatchesPrFilter scopes to currently-open PRs only, ignoring closed/merged/dropped ones (RAL-463 Q3)", () => {
+  const f = { prStatus: "failing" };
+  // A merged, would-be-passing PR is ignored entirely -- the row still
+  // matches on its one open, failing PR alone.
   assert.equal(
-    ttRowMatchesPrFilter(prRow([pr({ draft: false, ci_status: "failing" }), pr({ draft: true, ci_status: "passing" })]), f),
-    false,
+    ttRowMatchesPrFilter(prRow([pr({ ci_status: "failing" }), pr({ state: "merged", ci_status: "passing" })]), f),
+    true,
   );
+  // Every PR closed/merged/dropped -- zero open PRs -- never matches a chosen status.
+  assert.equal(ttRowMatchesPrFilter(prRow([pr({ state: "merged", ci_status: "passing" })]), f), false);
 });
 
-test("ttRowMatchesPrFilter has-PR combines with CI: any PR that is failing", () => {
-  const f = { ...anyFilter(), pr: true, prCi: "failing" };
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "passing" }), pr({ ci_status: "failing" })]), f), true);
-  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "pending" })]), f), false);
+test("ttRowMatchesPrFilter passes every row when the filter is off", () => {
+  assert.equal(ttRowMatchesPrFilter(prRow([]), { prStatus: "any" }), true);
+  assert.equal(ttRowMatchesPrFilter(prRow([pr({ ci_status: "failing" })]), { prStatus: "any" }), true);
 });
 
-test("ttRowMatchesFilters wires the PR-state filter into the row predicate", () => {
-  const row = prRow([pr({ draft: true })]);
+test("ttRowMatchesFilters wires the PR-status filter into the row predicate", () => {
+  const row = prRow([pr({ ci_status: "failing" })]);
   const base = { q: "", status: new Set(["running"]), showHidden: false, needsMe: false, project: new Set() };
-  assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "any", prCi: "any" }, new Set(), new Set()), true);
-  assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "draft", prCi: "any" }, new Set(), new Set()), true);
-  assert.equal(ttRowMatchesFilters(row, { ...base, pr: true, prDraft: "non-draft", prCi: "any" }, new Set(), new Set()), false);
+  assert.equal(ttRowMatchesFilters(row, { ...base, prStatus: "any" }, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...base, prStatus: "failing" }, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...base, prStatus: "passing" }, new Set(), new Set()), false);
 });
 
 test("ttGroupAggregate sums usage only across the rows passed in (post-filter scoping)", () => {

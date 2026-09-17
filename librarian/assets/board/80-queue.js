@@ -831,6 +831,7 @@
             renderReviewStatusFilters();
             renderReviewResolverFilters();
             renderReviewOriginFilters();
+            renderReviewPrStatusFilter();
             showTab("reviews");
           } else if (h.tab === "resources") {
             showTab("resources");
@@ -858,7 +859,7 @@
       });
       pendingHash = parseHash();
       loadTaskTabPrefs();
-      renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters();
+      renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
       else if (pendingHash && pendingHash.tab === "tasks") { showTab("tasks"); }  // keep pendingHash for pollTasksTab to apply the selection
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }

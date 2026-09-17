@@ -125,6 +125,7 @@
        */
       function renderTasksTab() {
         renderTtProjectFilter();
+        renderTtPrStatusFilter();
         ttAllRows = ttBuildRows();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
         const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys));
@@ -811,11 +812,36 @@
         return names.map((name) => `<div class="ctx-check ${taskTabFilters.projects.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${taskTabFilters.projects.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
       /**
-       * Opens the Tasks toolbar's project dropdown (RAL-345), a `.ctx-menu`
-       * popup of project checkboxes, and dismisses any other open
-       * project/column menu first. A global click handler closes it on
-       * outside interaction; checkbox clicks keep it open so several
-       * projects can be picked in one visit.
+       * Renders the Tasks toolbar's PR-status filter (RAL-463): a
+       * single-select dropdown over the three PR CI statuses, off ("any")
+       * by default -- left there, `ttRowMatchesPrFilter` never even looks at
+       * a row's PRs, so the filter is genuinely deferred rather than merely
+       * hidden.
+       * @returns {void}
+       */
+      function renderTtPrStatusFilter() {
+        const opt = (/** @type {string} */ value, /** @type {string} */ label) =>
+          `<option value="${value}" ${taskTabFilters.prStatus === value ? "selected" : ""}>${label}</option>`;
+        byId("tt-pr-filter").innerHTML = `<select onchange="ttSetPrStatusFilter(this.value)" data-tip="Show only tasks where every one of their currently-open PRs share this status.\nWho/when: use this to find fully-passing or fully-failing work at a glance, or PRs still waiting on CI.\nOff (any) by default. A task with no open PRs never matches a status here.">`
+          + opt("any", "PR status: any")
+          + opt("passing", "PR status: passing")
+          + opt("failing", "PR status: failing")
+          + opt("pending", "PR status: pending")
+          + `</select>`;
+      }
+      /**
+       * Sets the Tasks toolbar's PR-status filter and re-renders (RAL-463).
+       * @param {"any"|"passing"|"failing"|"pending"} v
+       * @returns {void}
+       */
+      function ttSetPrStatusFilter(v) {
+        taskTabFilters.prStatus = v;
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+        syncHash();
+      }
+      /**
+       * Opens the Tasks toolbar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
        * @param {MouseEvent} e
        * @returns {void}
        */
@@ -1179,9 +1205,9 @@
 
       const REVIEW_ORIGINS = ["explicit", "arbiter"];
       /**
-       * @returns {{q: string, status: Set<string>, resolver: Set<string>, origin: Set<string>, showHidden: boolean}}
+       * @returns {{q: string, status: Set<string>, resolver: Set<string>, origin: Set<string>, showHidden: boolean, prStatus: "any"|"passing"|"failing"|"pending"}}
        */
-      function defaultReviewFilters() { return { q: "", status: new Set(GUARDIAN_STATES), resolver: new Set(), origin: new Set(REVIEW_ORIGINS), showHidden: false }; }
+      function defaultReviewFilters() { return { q: "", status: new Set(GUARDIAN_STATES), resolver: new Set(), origin: new Set(REVIEW_ORIGINS), showHidden: false, prStatus: "any" }; }
       /** @type {string|null} */
       let selectedSquadId = null;
       /** @type {SelStateTasks} what's shown in the details pane */
