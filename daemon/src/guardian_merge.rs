@@ -1640,6 +1640,7 @@ fn synthesize_proof_instructions(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     let result = runner.run_cancellable(&spec, cancel);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
@@ -2136,6 +2137,7 @@ fn resolve_conflicts_with_agent(
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            hide_thinking: false,
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -2549,6 +2551,7 @@ fn run_final_proof(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
     // branch's Live-View start time. COALESCE means a branch that already
@@ -5711,6 +5714,7 @@ fn run_commit_step(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);
@@ -6039,6 +6043,7 @@ pub fn run_feedback(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     // Stash any pre-existing dirty state so we only include the resolver's
     // own changes in the new commit -- run unconditionally now (RAL-<new>): a
@@ -7849,6 +7854,7 @@ fn run_review_auto_build(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
@@ -9989,6 +9995,7 @@ fn generate_final_summary(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
@@ -10331,6 +10338,7 @@ fn generate_manual_commands(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -10546,6 +10554,7 @@ pub(crate) fn resolve_check_input(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        hide_thinking: false,
     };
 
     let result = runner.run(&spec);

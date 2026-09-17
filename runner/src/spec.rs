@@ -85,6 +85,13 @@ pub struct CellSpec {
     /// personal cross-project memory (e.g. Claude Code's global `CLAUDE.md`).
     /// Defaults to `false` (isolated) when omitted.
     pub allow_personal_memory: bool,
+    /// RAL-434: the daemon's resolved `[live_view] hide_thinking`, forwarded
+    /// so a backend that distinguishes thinking/reasoning events from
+    /// ordinary text (currently only pi) can collapse each thinking block
+    /// into a compact marker instead of streaming it verbatim. Defaults to
+    /// `false` (unset) when omitted, matching `RunOptions::hide_thinking`'s
+    /// own default.
+    pub hide_thinking: bool,
 }
 
 impl CellSpec {
@@ -126,6 +133,7 @@ impl CellSpec {
         let maximum_tool_output_tokens = opt_uint(obj, "maximum_tool_output_tokens")?;
         let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
         let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
+        let hide_thinking = opt_bool(obj, "hide_thinking")?.unwrap_or(false);
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -160,6 +168,7 @@ impl CellSpec {
             maximum_tool_output_tokens,
             allow_personal_settings,
             allow_personal_memory,
+            hide_thinking,
         })
     }
 }
@@ -529,6 +538,28 @@ mod tests {
         v["allow_personal_settings"] = serde_json::json!("yes");
         let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("allow_personal_settings"));
+    }
+
+    #[test]
+    fn hide_thinking_defaults_to_false_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert!(!spec.hide_thinking);
+    }
+
+    #[test]
+    fn hide_thinking_parses_explicit_true() {
+        let mut v = base();
+        v["hide_thinking"] = serde_json::json!(true);
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert!(spec.hide_thinking);
+    }
+
+    #[test]
+    fn hide_thinking_rejects_wrong_type() {
+        let mut v = base();
+        v["hide_thinking"] = serde_json::json!("yes");
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("hide_thinking"));
     }
 
     #[test]
