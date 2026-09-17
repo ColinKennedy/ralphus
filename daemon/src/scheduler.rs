@@ -3680,12 +3680,16 @@ fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<
     Some(format!(
         "This cell is followed by proof step(s) that will check your work once you \
          finish:\n{rows}\n\n\
-         Focus your turn on completing the task itself. You may still run checks you \
-         are confident are lightweight and fast — static analysis, linters, compile \
-         checks, and auto-formatters usually qualify — but skip anything you are not \
-         sure is fast, or that you know is slow (such as a full test suite): you do \
-         not need to cover ground the proof step(s) above already own, since they \
-         run right after you and will catch it."
+         Focus your turn on completing the task itself. Do not treat running the \
+         proof step(s)' own commands as your task — invoking them yourself does not \
+         substitute for doing the implementation work they are meant to check, and \
+         a cell that only reruns those checks without changing anything has not \
+         completed its task. You may still run checks you are confident are \
+         lightweight and fast — static analysis, linters, compile checks, and \
+         auto-formatters usually qualify — but skip anything you are not sure is \
+         fast, or that you know is slow (such as a full test suite): you do not \
+         need to cover ground the proof step(s) above already own, since they run \
+         right after you and will catch it."
     ))
 }
 
@@ -6765,6 +6769,11 @@ mod tests {
         assert!(
             cell_system_prompt
                 .contains("- `web`: will check web-related work once this cell finishes"),
+            "{cell_system_prompt}"
+        );
+        assert!(
+            cell_system_prompt
+                .contains("Do not treat running the proof step(s)' own commands as your task"),
             "{cell_system_prompt}"
         );
     }
