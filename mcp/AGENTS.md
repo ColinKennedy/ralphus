@@ -7,6 +7,12 @@ installed at all. Talks to the daemon directly through `ralphus-cli`'s
 `DaemonClient`, reused as a library (`cli` is both a `[[bin]]` and a
 `[lib]`) -- this crate never shells out to the compiled `ralphus` binary.
 
+**Setting it up as a client's MCP server** -- building it, where to put the
+binary so cargo can still relink it, registering it with Claude Code and its
+config scopes, how the daemon URL and bearer token resolve, and `--read-only`
+registration -- is [`docs/mcp-server.md`](../docs/mcp-server.md). This file
+covers the crate's internals.
+
 ## Module map
 
 - `src/protocol.rs` -- the MCP stdio transport: newline-delimited JSON-RPC
