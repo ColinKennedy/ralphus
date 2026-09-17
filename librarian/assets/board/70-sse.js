@@ -844,7 +844,7 @@
           ensurePromptCache(selectedSquadId).then((loaded) => {
             if (!loaded || seq !== tasksPollSeq) return;
             applyPromptCache();
-            renderAll();
+            if (!editing) renderAll();
           });
         } catch (e) {
           if (seq !== tasksPollSeq) return;
