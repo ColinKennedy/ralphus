@@ -97,12 +97,18 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
     renderSortChips: () => {},
     renderStatusFilters: () => {},
     syncHash: () => { calls.syncHash++; },
+    // RAL-430: `syncPromptCache`'s post-fetch re-render now routes through
+    // `preserveUserState` rather than calling `renderDetails()` directly --
+    // a no-op passthrough is all this poll-sequencing suite needs, since
+    // scroll/focus preservation itself is covered by preserve-scroll.test.mjs.
+    preserveUserState: (_el, fn) => fn(),
+    document: { getElementById: () => ({}) },
   };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
     "fetchImpl",
-    `const { byId, window, formatConcurrencyStatus, userIsSelecting, renderAll, renderDetails, renderSquads, renderSortChips, renderStatusFilters, syncHash, squadForPendingHash, selForPendingHash, reconcileSquadSelection, snapshotSel, pruneSquadSelCache, applySquadFocus } = deps;
+    `const { byId, window, document, formatConcurrencyStatus, userIsSelecting, renderAll, renderDetails, renderSquads, renderSortChips, renderStatusFilters, syncHash, preserveUserState, squadForPendingHash, selForPendingHash, reconcileSquadSelection, snapshotSel, pruneSquadSelCache, applySquadFocus } = deps;
      const fetch = fetchImpl;
      var squads = [], pendingHash = ${JSON.stringify(pendingHash)}, selectedSquadId = ${JSON.stringify(selectedSquadId)}, editing = ${JSON.stringify(editing)};
      var squadSelCache = {}, squadNodeCache = {}, lastSquadId = null, nodeMultiSel = new Set();

@@ -331,10 +331,7 @@
           // from the `/pane` snapshot fallback.
           if (usingTape && peekTape[key]) renderPeekTape(key);
           else renderPeekFallback(key, paneContent);
-          if (next.headerChanged) {
-            if (sel.kind) renderDetails();
-            if (selectedGuardian) renderReviewDetail();
-          }
+          if (next.headerChanged) rerenderOwningPane();
           const pre = document.getElementById(preId);
           if (!pre) return;
           // A just-revived (or just-ended) box gets pinned to the bottom
@@ -553,8 +550,7 @@
           delete historyAttempts[key];
           delete historyViewing[key];
         }
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
         if (historyOpen[key]) fetchHistoryList(key);
       }
       /**
@@ -574,8 +570,7 @@
         } catch (_) {
           historyAttempts[key] = [];
         }
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Fetches one historical attempt's content and shows it inline in the
@@ -600,8 +595,7 @@
         if (!url) return;
         const merged = !!debugUrl;
         historyViewing[key] = { attempt, content: "Loading…", merged };
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
         try {
           const resp = await fetch(url);
           if (!resp.ok) { historyViewing[key] = { attempt, content: "Could not load this attempt's log.", merged }; return; }
@@ -620,8 +614,7 @@
         } catch (_) {
           historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error).", merged };
         }
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Returns to the attempt list from the single-attempt content view.
@@ -630,8 +623,7 @@
        */
       function closeHistoryAttempt(key) {
         delete historyViewing[key];
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Formats a byte count as a short human-readable size ("1.2 KB").
@@ -864,7 +856,7 @@
           sel = { kind, taskIdx: ti, cellIdx: si, proofIdx: vi };
           storeSquadSelection(selectedSquadId, sel, [...nodeMultiSel]);
           editing = false;
-          renderGraph(); renderDetails(); syncHash(true);
+          renderGraph(); preserveUserState(document.getElementById("details"), renderDetails); syncHash(true);
           return;
         }
         pick(kind, ti, si, vi);

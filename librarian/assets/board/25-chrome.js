@@ -1348,8 +1348,7 @@
        */
       function toggleTerminalMenu(key) {
         terminalMenuOpen[key] = !terminalMenuOpen[key];
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Closes a terminal actions dropdown — called before running one of its
@@ -1359,8 +1358,7 @@
        */
       function closeTerminalMenu(key) {
         terminalMenuOpen[key] = false;
-        if (sel.kind) renderDetails();
-        if (selectedGuardian) renderReviewDetail();
+        rerenderOwningPane();
       }
       /**
        * Renders the "▾" dropdown toggle plus its menu (when open) for the

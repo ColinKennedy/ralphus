@@ -825,9 +825,9 @@
           : "—";
         const specSection = v.kind === "command"
           ? `<h3 class="section">command</h3>${cmdBox(v.spec || "")}`
-          : (v.spec ? `<h3 class="section">prompt</h3>${promptBox(v.spec)}` : "");
+          : (v.spec ? `<h3 class="section">prompt</h3>${promptBox(v.spec, `prompt-box-proof-${ti}-${si}-${vi}`)}` : "");
         const systemPromptSection = v.system_prompt
-          ? `<h3 class="section">system prompt</h3>${promptBox(v.system_prompt, null, SYSTEM_PROMPT_TIP)}`
+          ? `<h3 class="section">system prompt</h3>${promptBox(v.system_prompt, `system-prompt-box-proof-${ti}-${si}-${vi}`, SYSTEM_PROMPT_TIP)}`
           : "";
         const terminalBtns = (() => {
           const scope = si === -1 ? "task" : "cell";
@@ -895,7 +895,7 @@
           /** @type {{[key: string]: CellPathInfo}} */
           const map = {}; arr.forEach((p) => { map[`${p.task_idx}:${p.cell_idx}`] = p; });
           squadPaths[id] = map;
-          if (selectedSquadId === id && sel.kind === "cell") renderDetails();
+          if (selectedSquadId === id && sel.kind === "cell") preserveUserState(document.getElementById("details"), renderDetails);
         } catch (_) { delete squadPaths[id]; }
       }
       /**
@@ -1050,7 +1050,7 @@
               `<button class="btn" data-click="pick" data-kind="proof" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-vi="${vi}" data-tip="Jump to this proof step's detail pane — view its kind, state, and output.">Go</button></div>`).join("")
           : "";
         const systemPromptSection = (!s.command && s.system_prompt)
-          ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, null, SYSTEM_PROMPT_TIP)}`
+          ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, `system-prompt-box-${sel.taskIdx}-${sel.cellIdx}`, SYSTEM_PROMPT_TIP)}`
           : "";
         return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span></div>
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
@@ -1263,12 +1263,12 @@
        * Switches the details pane into edit mode.
        * @returns {void}
        */
-      function startEdit() { editing = true; renderDetails(); }
+      function startEdit() { editing = true; preserveUserState(document.getElementById("details"), renderDetails); }
       /**
        * Exits edit mode without saving.
        * @returns {void}
        */
-      function cancelEdit() { editing = false; renderDetails(); }
+      function cancelEdit() { editing = false; preserveUserState(document.getElementById("details"), renderDetails); }
       // Cell edit form: purely cosmetic show/hide of the active mode's fields.
       // It writes nothing and clears nothing — values stay in the DOM so an
       // accidental toggle back loses no input. saveEdit() reads the dropdown.
