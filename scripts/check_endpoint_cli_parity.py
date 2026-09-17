@@ -86,7 +86,6 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/triage/types/{name}": ["triage type get"],
     "DELETE /api/triage/types/{name}": ["triage type deregister"],
     "GET /api/triage/pools": ["triage pool list"],
-    "POST /api/triage/pools/threshold/preview": ["triage pool threshold"],
     "POST /api/triage/pools/threshold": ["triage pool threshold"],
     "GET /api/resources": ["resources"],
     "GET /api/health/agent-profiles": ["check health"],

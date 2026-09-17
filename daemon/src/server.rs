@@ -1133,6 +1133,7 @@ fn route_for_user(
                 set_triage_pool_threshold(daemon, body)
             })
         }
+        // ralphus[ignore-endpoint-cli]: board Triage tab force-drain action (RAL-449); board-only by design
         ("POST", ["api", "triage", "pools", "drain"]) => admin_gated(daemon, user_header, || {
             force_drain_triage_pool(daemon, body)
         }),
@@ -1314,13 +1315,6 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: board URI-bar resolution; the CLI resolves selectors itself by fetching squad/guardian views
         ("GET", ["api", "resolve"]) => resolve_uri_endpoint(daemon, query),
         ("GET", ["api", "squads", id]) => get_squad(daemon, id),
-        // RAL-420: pre-work generation cost — per-squad detail + cross-squad audit.
-        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
-        ("GET", ["api", "squads", id, "generation-costs"]) => {
-            squad_generation_cost_rows(daemon, id)
-        }
-        // ralphus[ignore-endpoint-cli]: board cost display (RAL-420); CLI has no cost reporting leaf
-        ("GET", ["api", "generation-costs"]) => generation_costs_audit(daemon),
         ("GET", ["api", "squads", id, "worktrees"]) => squad_worktrees(daemon, id),
         ("GET", ["api", "squads", id, "logs"]) => squad_logs(daemon, id),
         ("GET", ["api", "squads", id, "timeline"]) => squad_timeline(daemon, id),
@@ -1440,6 +1434,7 @@ fn route_for_user(
         // terminal viewer reads the step's exact effective system prompt
         // from these endpoints (the board never fetches them for
         // non-admins, and the daemon enforces admin-only here regardless).
+        // ralphus[ignore-endpoint-cli]: board 'System Prompt' tab (RAL-428); no CLI equivalent
         ("GET", ["api", "squads", id, "cells", ti, si, "system-prompt"]) => {
             admin_gated(daemon, user_header, || {
                 cell_system_prompt(daemon, id, ti, si)
@@ -1530,7 +1525,11 @@ fn route_for_user(
                 "debug-events",
             ],
         ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
-        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
+        // RAL-428: the admin-only System Prompt tab in the shared live
+        // terminal viewer reads the step's exact effective system prompt
+        // from these endpoints (the board never fetches them for
+        // non-admins, and the daemon enforces admin-only here regardless).
+        // ralphus[ignore-endpoint-cli]: board 'System Prompt' tab (RAL-428); no CLI equivalent
         (
             "GET",
             [
@@ -1547,6 +1546,7 @@ fn route_for_user(
         ) => admin_gated(daemon, user_header, || {
             proof_system_prompt(daemon, id, task_idx, scope, cell_idx, proof_idx)
         }),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1579,6 +1579,7 @@ fn route_for_user(
         ) => proof_terminal_log_attempt(daemon, id, task_idx, scope, cell_idx, proof_idx, attempt),
         ("DELETE", ["api", "squads", id]) => delete_squad(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
+        // ralphus[ignore-endpoint-cli]: board Reviews tab lean-summary list poll; CLI `review list` uses GET /api/guardians instead
         ("GET", ["api", "guardian-index"]) => guardian_index(daemon),
         ("POST", ["api", "guardians"]) => guardian_create(daemon, user_header, body),
         ("GET", ["api", "guardians", id]) => guardian_get(daemon, id),
@@ -1705,6 +1706,7 @@ fn route_for_user(
         ) => admin_gated(daemon, user_header, || {
             guardian_branch_system_prompt(daemon, id, branch_id)
         }),
+        // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
             [
@@ -1745,6 +1747,7 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "manual-checks", "debug-events"]) => {
             guardian_manual_checks_debug_events(daemon, id)
         }
+        // ralphus[ignore-endpoint-cli]: board 'System Prompt' tab for manual checks (RAL-428); no CLI equivalent
         ("GET", ["api", "guardians", id, "manual-checks", "system-prompt"]) => {
             admin_gated(daemon, user_header, || {
                 guardian_manual_checks_system_prompt(daemon, id)
@@ -6222,7 +6225,7 @@ fn suggest_task_name(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
             }
             _ => (req.fallback_name.clone(), None),
         };
-        let guard = store.lock().expect("store mutex poisoned");
+        let guard = store.lock();
         let task_idx_ref = format!("{task_idx}");
         if let Err(e) = guard.rename_task(&squad_id, task_idx, &name) {
             crate::rlog!(
