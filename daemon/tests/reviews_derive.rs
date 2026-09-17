@@ -2041,9 +2041,14 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     );
 
     // Task B finishes too -- now every worktree-sharing session is done.
+    // Both owning tasks (RAL-442) also need to reach `done` -- mirroring
+    // `run_task_finalizer` clearing task-level proofs -- before the branch
+    // may promote.
     store
         .set_cell_state(&run_id, 1, 0, NodeState::Done)
         .unwrap();
+    store.set_task_state(&run_id, 0, NodeState::Done).unwrap();
+    store.set_task_state(&run_id, 1, NodeState::Done).unwrap();
     let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
     assert_eq!(n, 1, "promotes exactly the one branch");
     assert_eq!(
@@ -2104,6 +2109,13 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
         .collect();
     for h in set_handles {
         h.join().unwrap();
+    }
+    // Both owning tasks (RAL-442) must also reach `done` before the branch
+    // may promote -- mirrors `run_task_finalizer` clearing task-level proofs.
+    {
+        let g = store.lock();
+        g.set_task_state(&run_id, 0, NodeState::Done).unwrap();
+        g.set_task_state(&run_id, 1, NodeState::Done).unwrap();
     }
 
     // Phase 2: race two concurrent "task just finished" readiness checks.
