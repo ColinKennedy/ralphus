@@ -56,7 +56,7 @@ function makeFakeDocument() {
  * with injectable collaborator stubs.
  */
 export function makeSquadsProjectFilterMenu({
-  filters = { project: new Set() },
+  filters = { projects: new Set() },
   projects = [{ name: "acme" }, { name: "beta" }],
 } = {}) {
   const { doc, byIdMap, clickListeners } = makeFakeDocument();
@@ -78,6 +78,7 @@ export function makeSquadsProjectFilterMenu({
     `const { document, byId, esc, renderSquads, syncHash } = deps;
      var filters = deps.filters;
      var projects = deps.projects;
+     var registeredProjectNames = projects.map((p) => p.name);
      ${sliceRegion(REGIONS.squads)}
      return { toggleProjectFilter, clearProjectFilter, renderProjectFilterChips, projectFilterMenuRowsHtml, openProjectFilterMenu, closeProjectFilterMenu };`,
   );
@@ -92,7 +93,7 @@ export function makeSquadsProjectFilterMenu({
  * with injectable collaborator stubs.
  */
 export function makeTasksProjectFilterMenu({
-  taskTabFilters = { project: new Set() },
+  taskTabFilters = { projects: new Set() },
   projects = [{ name: "acme" }, { name: "beta" }],
 } = {}) {
   const { doc, byIdMap, clickListeners } = makeFakeDocument();
@@ -116,6 +117,7 @@ export function makeTasksProjectFilterMenu({
     `const { document, byId, esc, renderTasksTab, syncHash, ttScrollSelectionIntoView, ttCloseColMenu } = deps;
      var taskTabFilters = deps.taskTabFilters;
      var projects = deps.projects;
+     var registeredProjectNames = projects.map((p) => p.name);
      ${sliceRegion(REGIONS.tasks)}
      return { ttToggleProjectFilter, ttClearProjectFilter, renderTtProjectFilter, ttProjectFilterMenuRowsHtml, ttOpenProjectFilterMenu, ttCloseProjectFilterMenu };`,
   );
