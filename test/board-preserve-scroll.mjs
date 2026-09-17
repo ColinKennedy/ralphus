@@ -38,6 +38,7 @@ function sliceRegion([BEGIN, END]) {
 const REGIONS = {
   preserve: ["// RALPHUS-PRESERVE-USER-STATE:BEGIN", "// RALPHUS-PRESERVE-USER-STATE:END"],
   rerenderOwningPane: ["// RALPHUS-RERENDER-OWNING-PANE:BEGIN", "// RALPHUS-RERENDER-OWNING-PANE:END"],
+  renderAll: ["// RALPHUS-RENDER-ALL:BEGIN", "// RALPHUS-RENDER-ALL:END"],
 };
 
 /** The raw board script (all chunks concatenated), for source-level wiring assertions. */
@@ -145,6 +146,38 @@ export function makeRerenderOwningPane({ sel = { kind: null }, selectedGuardian 
   );
   const api = factory({ document, window, sel, selectedGuardian, renderDetails, renderReviewDetail });
   return { ...api, document };
+}
+
+/**
+ * Builds the real `renderAll` (RAL-436) wired to the *real*
+ * `preserveUserState`/`selectionWithin` (both regions evaluated together,
+ * exactly as they ship), with injectable `editing` and mocked
+ * `renderSquads`/`renderGraph`/`renderDetails` -- the point is to prove that
+ * `editing` only ever gates the details-pane re-render, never the sidebar or
+ * graph.
+ * @param {{editing?: boolean}} [opts]
+ */
+export function makeRenderAll({ editing = false } = {}) {
+  const { document, window } = makeFakeDom();
+  const calls = { renderSquads: 0, renderGraph: 0, renderDetails: 0 };
+  // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
+  const factory = new Function(
+    "deps",
+    `const { document, window, renderSquads, renderGraph, renderDetails } = deps;
+     var editing = deps.editing;
+     ${sliceRegion(REGIONS.preserve)}
+     ${sliceRegion(REGIONS.renderAll)}
+     return { renderAll };`,
+  );
+  const api = factory({
+    document,
+    window,
+    editing,
+    renderSquads: () => { calls.renderSquads++; },
+    renderGraph: () => { calls.renderGraph++; },
+    renderDetails: () => { calls.renderDetails++; },
+  });
+  return { ...api, document, calls };
 }
 
 export { FakeNode, FakeInput };

@@ -75,17 +75,29 @@
         return !!(s && !s.isCollapsed && String(s).length && s.anchorNode && el.contains(s.anchorNode));
       }
       // RALPHUS-PRESERVE-USER-STATE:END
+      // RALPHUS-RENDER-ALL:BEGIN
       /**
-       * Re-renders the sidebar and graph unconditionally, and the details pane unless the user is mid-selection inside it.
+       * Re-renders the sidebar and graph unconditionally, and the details
+       * pane unless it would clobber an open edit form or the user's
+       * in-pane selection.
+       *
+       * RAL-436 (follow-up to RAL-431): `editing` used to gate this whole
+       * function at each call site (`pollTasks`), so opening any edit form
+       * anywhere froze the sidebar *and* graph -- every status pill and the
+       * whole dependency graph sat stale until the form was closed, no
+       * matter what elsewhere on the board changed. Scoping the skip to just
+       * the details pane, the same fix RAL-431 already applied to
+       * `selectionWithin`, lets the rest of the board keep updating live.
        * @returns {void}
        */
       function renderAll() {
         renderSquads();
         renderGraph();
         const details = document.getElementById("details");
-        if (selectionWithin(details)) return; // keep the user's in-pane selection intact
+        if (editing || selectionWithin(details)) return; // keep the open edit form / user's in-pane selection intact
         preserveUserState(details, renderDetails);
       }
+      // RALPHUS-RENDER-ALL:END
       // RAL-430: dozens of local UI toggles (peek boxes, terminal-log
       // attempt history, prompt tabs, menus) each re-render whichever of the
       // details pane / review-detail pane currently owns them with a plain
@@ -789,15 +801,14 @@
             pruneSquadSelCache(squadSelCache, squadNodeCache, squads.map((r) => r.id));
             reconcileLiveSelection();
             if (!selectedSquadId && squads.length) { pendingHash = null; restoreInitialSquadSelection(); renderAll(); syncHash(); }
-            else if (!editing) renderAll();
-            else renderSquads();
+            else renderAll(); // renderAll() itself skips the details pane while editing -- see its doc comment
           }
           // Fire-and-forget: only actually fetches when the focused squad
           // changed, so a standing poll costs nothing here.
           ensurePromptCache(selectedSquadId).then((loaded) => {
             if (!loaded || seq !== tasksPollSeq) return;
             applyPromptCache();
-            if (!editing) renderAll();
+            renderAll();
           });
         } catch (e) {
           if (seq !== tasksPollSeq) return;
