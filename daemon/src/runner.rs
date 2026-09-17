@@ -323,7 +323,6 @@ impl MaximumTimeoutCaps {
         self.self_cap_sec.is_some() || self.cell_cap_sec.is_some() || self.task_cap_sec.is_some()
     }
 }
-}
 
 /// Generate a fresh RFC 4122 version-4 (random) UUID, formatted as the
 /// standard 8-4-4-4-12 hex string Claude Code's `--session-id` expects
@@ -1016,6 +1015,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: Some(usage.turns),
             ghost: None,
+            retry_after_secs: None,
         }
     }
 

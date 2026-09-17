@@ -3180,13 +3180,8 @@ impl Store {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
                 tx.execute(
-<<<<<<< HEAD
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-=======
                     "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec)
                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
->>>>>>> 24fbb9af (RAL-308: Add cumulative maximum-timeout-seconds stall detection)
                     params![
                         squad_id,
                         t_idx_i,
@@ -3210,6 +3205,7 @@ impl Store {
                         maximum_context,
                         auto_compact_threshold,
                         maximum_tool_output_tokens,
+                        None::<i64>,
                         cell.upstream,
                         // Seed the queue rank from the cell's own priority, or
                         // the owning task's priority as a fallback, so a task-level
@@ -5779,13 +5775,8 @@ fn insert_proof(
         None
     };
     tx.execute(
-<<<<<<< HEAD
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-=======
         "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
->>>>>>> 24fbb9af (RAL-308: Add cumulative maximum-timeout-seconds stall detection)
         params![
             squad_id,
             task_idx,
@@ -5803,6 +5794,7 @@ fn insert_proof(
             maximum_timeout_sec,
             budget_tokens,
             maximum_tool_output_tokens,
+            None::<i64>,
             // RAL-191: the step's TOML-declared `environment` seeds the same
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
@@ -6096,18 +6088,13 @@ pub struct CancelImpact {
 impl Store {
     /// All cells of a squad, in insertion order.
     pub fn cells_of(&self, squad_id: &str) -> Result<Vec<CellRow>> {
-<<<<<<< HEAD
         Self::cells_of_conn(&self.conn, squad_id)
     }
     /// [`Self::cells_of`] against any connection, so the read pool
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session
-=======
-        let mut stmt = self.conn.prepare(
             "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec
->>>>>>> 24fbb9af (RAL-308: Add cumulative maximum-timeout-seconds stall detection)
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;

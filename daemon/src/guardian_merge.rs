@@ -2151,11 +2151,8 @@ fn resolve_conflicts_with_agent(
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
-<<<<<<< HEAD
             hide_thinking: false,
-=======
             maximum_timeout: None,
->>>>>>> 24fbb9af (RAL-308: Add cumulative maximum-timeout-seconds stall detection)
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -5734,6 +5731,7 @@ fn run_commit_step(
         allow_personal_settings: false,
         allow_personal_memory: false,
         hide_thinking: false,
+        maximum_timeout: None,
     };
     let result = runner.run_cancellable(&spec, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);

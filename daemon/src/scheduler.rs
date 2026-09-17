@@ -3781,16 +3781,19 @@ fn run_proofs(
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
     for (
-        idx,
-        proof_id,
-        kind,
-        spec,
-        proof_model,
-        proof_timeout,
-        proof_budget,
-        proof_maximum_tool_output_tokens,
-        proof_maximum_timeout_sec,
-    ) in specs
+        position,
+        (
+            idx,
+            proof_id,
+            kind,
+            spec,
+            proof_model,
+            proof_timeout,
+            proof_budget,
+            proof_maximum_tool_output_tokens,
+            proof_maximum_timeout_sec,
+        ),
+    ) in specs.iter().cloned().enumerate()
     {
         if cancel.is_cancelled() {
             return ProofOutcome {
