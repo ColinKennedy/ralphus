@@ -60,9 +60,11 @@ fn temp_repo() -> PathBuf {
 /// instruction. Every `Runner` double used with `run_feedback` or
 /// `dispatch_pr_auto_fix` must call this first and return its result when
 /// `Some`, falling through to its own resolver-editing behavior otherwise --
-/// the fixer prompt itself is `"Do not run any git commands"`, so without
-/// this the worktree would never actually get committed and every such test
-/// would see `committed: false` regardless of what the resolver wrote.
+/// the fixer prompt itself (RAL-456) tells the resolver it may inspect the
+/// worktree with read-only git commands but must not commit or push, so
+/// without this the worktree would never actually get committed and every
+/// such test would see `committed: false` regardless of what the resolver
+/// wrote.
 fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
     if !spec.cell_id.ends_with("-commit") {
         return None;
@@ -4298,10 +4300,12 @@ command = "cargo test --workspace"
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// RAL-408 regression: the auto-fix resolver prompt says "Do not run any git
-/// commands", but nothing enforces that -- an agent that commits its own fix
-/// anyway (observed in the wild with a Haiku resolver) leaves the worktree
-/// clean afterward. That used to read as a genuine no-op (the whole worktree
+/// RAL-408 regression: the auto-fix resolver prompt tells the resolver to
+/// leave committing to a separate step (RAL-456: read-only git inspection is
+/// fine, but committing/pushing is not), but nothing enforces that -- an
+/// agent that commits its own fix anyway (observed in the wild with a Haiku
+/// resolver) leaves the worktree clean afterward. That used to read as a
+/// genuine no-op (the whole worktree
 /// looked untouched to `run_feedback`'s dirty-tree check) and stranded the
 /// real commit in the worktree forever: never pushed, never reflected on the
 /// linked PR, while the branch status claimed "auto-fix made no changes to
