@@ -1417,6 +1417,49 @@ impl Store {
         Ok(branches)
     }
 
+    /// Names of `guardian_id`'s enabled branches whose *most recently created*
+    /// linked cell is still actively in flight (`queued`/`pending`/`running`)
+    /// -- the subset of [`Self::guardian_unfinished_linked_branches`]'s
+    /// "not done" branches that could plausibly still *become* done on their
+    /// own, deliberately excluding one stuck at a terminal `failed`/
+    /// `cancelled` state that never will.
+    ///
+    /// [`crate::guardian_merge::kickoff_merge`] uses this (rather than
+    /// [`Self::guardian_unfinished_linked_branches`]) for a re-trigger past
+    /// `collecting` -- Save after a branch disable/reorder, a base-branch
+    /// change, "Merge / rebase" -- because such a re-trigger must not
+    /// silently defer forever on a cell that is never coming back. But a
+    /// stack whose earlier branch failed first never got far enough to
+    /// rebase what comes after it, so a branch further down the stack can
+    /// still be validly `queued`/`pending`/`running` even though the
+    /// guardian itself has already left `collecting`; running ahead of that
+    /// branch races the rebase against a worktree its own task hasn't
+    /// pushed to yet, which reads back as a false "branch is empty" failure.
+    /// During `collecting` itself this distinction does not matter (nothing
+    /// has been reachable yet, so a `failed` cell there genuinely should
+    /// hold the review back), which is why that method keeps its broader
+    /// "not done" definition and is not replaced by this one.
+    pub fn guardian_branches_still_in_flight(&self, guardian_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT branch FROM (
+                 SELECT gb.branch AS branch,
+                        (
+                            SELECT s.state FROM cells s
+                            WHERE s.review_branch = gb.branch
+                            ORDER BY s.rowid DESC LIMIT 1
+                        ) AS latest_state
+                 FROM guardian_branches gb
+                 WHERE gb.guardian_id = ?1 AND gb.enabled = 1
+             )
+             WHERE latest_state IN ('queued', 'pending', 'running')
+             ORDER BY branch",
+        )?;
+        let branches = stmt
+            .query_map(params![guardian_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(branches)
+    }
+
     /// Ids of guardians that have already left `collecting` (`in_review` or
     /// `merge_failed`) but still have an enabled branch stuck at `pending` whose
     /// contributing cell has since finished. This is the straggler case: a
@@ -7518,6 +7561,46 @@ mod tests {
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
 
+        assert_eq!(
+            store.guardian_unfinished_linked_branches(&id).unwrap(),
+            vec!["feat".to_string()]
+        );
+    }
+
+    #[test]
+    fn guardian_branches_still_in_flight_reports_a_branch_whose_cell_has_not_finished() {
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch(&mut store, "feat", NodeState::Running);
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(
+            store.guardian_branches_still_in_flight(&id).unwrap(),
+            vec!["feat".to_string()],
+            "a branch whose cell is still running has not been reached yet and \
+             must not be raced ahead of by a post-collecting re-trigger"
+        );
+    }
+
+    #[test]
+    fn guardian_branches_still_in_flight_ignores_a_dead_failed_cell() {
+        // The scenario this method exists to fix: a branch whose latest cell
+        // is stuck at a terminal `failed`/`cancelled` state must not block a
+        // re-trigger forever (unlike `guardian_unfinished_linked_branches`,
+        // which would report it) -- there is nothing left to wait for unless
+        // someone retries that task, which produces a fresh cell row anyway.
+        let mut store = Store::open_in_memory().unwrap();
+        insert_cell_for_branch(&mut store, "feat", NodeState::Failed);
+
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+
+        assert_eq!(
+            store.guardian_branches_still_in_flight(&id).unwrap(),
+            Vec::<String>::new()
+        );
+        // Contrast: the broader, `collecting`-only check still reports it.
         assert_eq!(
             store.guardian_unfinished_linked_branches(&id).unwrap(),
             vec!["feat".to_string()]
