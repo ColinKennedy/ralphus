@@ -2610,6 +2610,7 @@ fn maybe_promote_fork_root(
     ) {
         Ok(route) => route,
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: pre-promotion routing diagnostic; a successful promotion emits the structured outcome below
             crate::rlog!(
                 ERROR,
                 "ralphus [pr] review {id} cannot promote pr={}: {e}",
@@ -12069,6 +12070,8 @@ mod tests {
             "stack-1",
             None,
             None,
+            None,
+            false,
         )
         .expect("a per-branch failure must not fail the whole batch");
 
