@@ -35,6 +35,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
 | `<<default>>` | the `?upstream=` value of a new-worktree placeholder | the repository's default branch — recommended |
 | `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
+| `<<ralphus:link/<field>[?suffix=<relative-path>]>>` | cell `environment` value | that same cell's own `<field>` (`cwd`, or another `environment.<key>`), resolved, optionally joined with the `?suffix=` path (RAL-460) |
 | `<<review:<id>>>` | `[[task.cell]].review` | an existing `[[review]]`'s id in the same submission (RAL-269) |
 | `<<ralphus:new-review/<key>>>` | `[[task.cell]].review` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269) |
 
@@ -51,7 +52,10 @@ Rules and risks:
   `project`, a wrapped new-worktree placeholder repeated there expands to
   the *same* materialized path as the `cwd` (memoized by the literal
   placeholder string, so the same value repeated across cells only
-  materializes once).
+  materializes once). Retyping the exact placeholder text a second time
+  risks the two copies drifting out of sync after an edit to one of them —
+  for the common case of "another field on this same cell, plus a literal
+  suffix," a linked field (below) is the safer alternative.
 - **`?upstream=` is required** on a new-worktree placeholder cwd, so ralphus
   always knows what the created branch tracks instead of guessing from HEAD.
 - **`depends_on` is deliberately not a sentinel** — it is a bare-string
@@ -61,6 +65,92 @@ Rules and risks:
   `[[review]] upstream` declares the review's **base branch**; a cell
   placeholder's `?upstream=` sets *that cell's worktree's* git tracking
   upstream at creation time. See the glossary's Reviews section.
+
+### Linked field (`environment`, RAL-460)
+
+An `environment` value may link to another field on the *same* cell instead
+of re-embedding that field's placeholder text (or its eventual resolved
+value):
+
+```toml
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+environment.WORKTREE = "<<ralphus:link/cwd>>"
+environment.LOG_DIR = "<<ralphus:link/cwd?suffix=./logs>>"
+```
+
+`environment.WORKTREE` resolves to this cell's own `cwd`, once the daemon has
+materialized (or reused) that worktree -- the real on-disk path, exactly the
+same value `cwd` itself ends up holding, and at the same point in
+materialization timing. `environment.LOG_DIR` resolves to that same path
+plus the literal `./logs` suffix.
+
+**Grammar:**
+
+```
+"<<ralphus:link/<field>>>"
+"<<ralphus:link/<field>?suffix=<relative-path>>>"
+```
+
+- The **entire** `environment` value must be exactly this sentinel -- unlike
+  a worktree placeholder, a linked field is never embedded inside
+  surrounding literal text. Any extra literal content goes in `?suffix=`
+  instead of string concatenation, precisely so it can be validated as a
+  real relative path rather than accepted as arbitrary text.
+- `<field>` names a field on the **same cell** this `environment` entry is
+  declared on:
+  - `cwd` -- that cell's own `cwd`.
+  - `environment.<key>` -- another entry in that cell's own `environment`
+    table (see **Chaining** below).
+
+  This is deliberately narrow -- there is no cross-cell or cross-task
+  linking, and no other field names are recognized.
+- `?suffix=<relative-path>` is optional. When given, it **must** start with
+  `./` or `../` -- an absolute path, or a bare relative-looking string with
+  no prefix, is a hard validation failure at submit time. The resolved value
+  is the linked-to field's own resolved value joined with this suffix.
+
+**Resolution timing:** a linked field resolves once its target field has a
+real value:
+
+- Linking to `cwd` resolves once that cell's own worktree placeholder (if it
+  had one) has been materialized -- the same point at which any other
+  `cwd`-embedding `environment` value already resolved before RAL-460.
+- Linking to a target that was **never** a placeholder (a cell `cwd` that's
+  already a plain literal path) resolves directly to that literal. No
+  placeholder-resolution pass runs for it -- there's nothing to resolve, just
+  a value to read.
+
+The linked field does not need to (and does not) preserve or re-embed the
+literal placeholder text on itself -- once resolved, the `environment` value
+simply *is* the resolved value.
+
+**Chaining:** a linked field may itself be the target of another linked
+field:
+
+```toml
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+environment.BASE = "<<ralphus:link/cwd>>"
+environment.LOG_DIR = "<<ralphus:link/environment.BASE?suffix=./logs>>"
+```
+
+Here `LOG_DIR` links to `BASE`, which itself links to `cwd`. The daemon
+resolves these in dependency order -- `cwd`, then `BASE`, then `LOG_DIR` --
+regardless of which order the `environment` keys happen to be declared or
+iterated in. A chain that cycles back on itself (`A` links to `B`, `B` links
+to `A`) is rejected: at submit time when the cycle is fully declared in one
+`environment` table, and defensively at run time either way.
+
+**Validation:**
+
+- The linked-to field must actually exist on the same cell, or submission
+  fails validation -- typo protection, no silent fallback. Linking to `cwd`
+  on a table that has no `cwd` (a task- or proof-step-level `environment`
+  entry, neither of which has a `cwd` field) fails the same way.
+- A malformed sentinel (an empty field, an unrecognized query key, an empty
+  `?suffix=`) fails validation with a message naming the problem.
+- An invalid suffix (missing the `./`/`../` prefix) fails validation.
 
 ### `restart_on` grammar (proof steps)
 

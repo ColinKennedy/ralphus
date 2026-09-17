@@ -552,6 +552,138 @@ pub fn first_worktree_placeholder_in_text(text: &str) -> Option<&str> {
     })
 }
 
+/// Scheme prefix for a "linked field" placeholder (RAL-460), e.g.
+/// `"ralphus:link/cwd"` or `"ralphus:link/environment.BASE_DIR?suffix=./sub"`.
+/// Lets a field -- today only a cell's own `environment` entries -- say "give
+/// me this same cell's `<field>`, once it's resolved, plus this literal
+/// relative-path suffix" instead of re-embedding another field's placeholder
+/// text (or retyping its eventual resolved value) verbatim.
+///
+/// Unlike a worktree placeholder, a linked field is never embedded inside
+/// surrounding literal text -- the WHOLE value must be exactly one
+/// `<<...>>` sentinel (see [`parse_wrapped_cell_link`]); any extra literal
+/// content is expressed through the sentinel's own `?suffix=` query (see
+/// [`CellLinkRef::suffix`]) rather than string concatenation, so it can be
+/// validated as a real relative path instead of accepted as arbitrary text.
+///
+/// `<field>` names another field on the SAME cell -- `"cwd"`, or
+/// `"environment.<key>"` for a sibling entry in that cell's own
+/// `environment` table (see [`CellLinkTarget`]). This is deliberately
+/// narrow: no cross-cell or cross-task references. A linked field may itself
+/// be the target of another linked field ("chaining"), so
+/// `daemon::worktrees` resolves these in dependency order rather than via a
+/// single hardcoded hop.
+pub const CELL_LINK_PREFIX: &str = "ralphus:link/";
+
+/// A parsed `ralphus:link/<field>[?suffix=<relpath>]` sentinel body (already
+/// unwrapped from its `<<...>>` delimiters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellLinkRef<'a> {
+    /// The referenced field, e.g. `"cwd"` or `"environment.BASE_DIR"`. See
+    /// [`CellLinkTarget`] for how this is interpreted.
+    pub field: &'a str,
+    /// The optional `?suffix=<relpath>` value, unvalidated here -- see
+    /// [`is_valid_cell_link_suffix`].
+    pub suffix: Option<&'a str>,
+}
+
+/// Why a `ralphus:link/...` sentinel body failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellLinkParseError {
+    /// `ralphus:link/` was followed by nothing (or immediately by `?`).
+    EmptyField,
+    /// A query string was present but wasn't `suffix=...`.
+    UnknownQueryKey,
+    /// `?suffix=` was present with an empty value.
+    EmptySuffix,
+}
+
+/// Parse a `ralphus:link/<field>[?suffix=<relpath>]` sentinel body (the text
+/// already unwrapped from `<<...>>` -- see [`parse_wrapped_cell_link`], the
+/// entry point real callers use). Returns `Ok(None)` for text that isn't this
+/// scheme at all, so callers can fall through to other sentinel kinds.
+///
+/// # Errors
+/// Returns a [`CellLinkParseError`] describing the first malformed part found.
+pub fn parse_cell_link(body: &str) -> Result<Option<CellLinkRef<'_>>, CellLinkParseError> {
+    let Some(rest) = body.strip_prefix(CELL_LINK_PREFIX) else {
+        return Ok(None);
+    };
+    let (field, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(f, q)| (f, Some(q)));
+    if field.is_empty() {
+        return Err(CellLinkParseError::EmptyField);
+    }
+    let suffix = match query {
+        None => None,
+        Some(q) => {
+            let Some(value) = q.strip_prefix("suffix=") else {
+                return Err(CellLinkParseError::UnknownQueryKey);
+            };
+            if value.is_empty() {
+                return Err(CellLinkParseError::EmptySuffix);
+            }
+            Some(value)
+        }
+    };
+    Ok(Some(CellLinkRef { field, suffix }))
+}
+
+/// Parse a field value as a *whole-value* `<<ralphus:link/...>>` sentinel
+/// (RAL-460). Returns `Ok(None)` for a value that isn't wrapped in `<<...>>`
+/// at all, or whose body isn't a `ralphus:link/` sentinel (a plain literal
+/// value, a worktree placeholder, or some other placeholder kind) -- callers
+/// fall through to their existing handling for those.
+///
+/// # Errors
+/// Returns a [`CellLinkParseError`] when the value IS wrapped and does start
+/// with [`CELL_LINK_PREFIX`], but is otherwise malformed.
+pub fn parse_wrapped_cell_link(value: &str) -> Result<Option<CellLinkRef<'_>>, CellLinkParseError> {
+    let Some(body) = value.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) else {
+        return Ok(None);
+    };
+    parse_cell_link(body)
+}
+
+/// A [`CellLinkRef::field`], interpreted as one of the field shapes a linked
+/// field may target (RAL-460): the owning cell's own `cwd`, or another entry
+/// in that same cell's own `environment` table (by key). Any other shape is
+/// not a recognized target -- see [`parse_cell_link_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellLinkTarget<'a> {
+    /// This cell's own `cwd` field.
+    Cwd,
+    /// Another entry (`key`) in this cell's own `environment` table.
+    Environment(&'a str),
+}
+
+/// Interpret a [`CellLinkRef::field`] string as a [`CellLinkTarget`]. Returns
+/// `None` for any shape other than `"cwd"` or `"environment.<key>"` (with a
+/// non-empty `<key>`) -- callers report that as an unsupported link target.
+#[must_use]
+pub fn parse_cell_link_target(field: &str) -> Option<CellLinkTarget<'_>> {
+    if field == "cwd" {
+        return Some(CellLinkTarget::Cwd);
+    }
+    field
+        .strip_prefix("environment.")
+        .filter(|key| !key.is_empty())
+        .map(CellLinkTarget::Environment)
+}
+
+/// Whether a linked field's `?suffix=<value>` is a valid literal suffix
+/// (RAL-460): a relative path that starts with `./` or `../`. Anything else
+/// (an absolute path, or a bare relative-looking string with no prefix) is
+/// rejected at validation time -- deliberately stricter than a worktree
+/// placeholder's freeform trailing literal text, precisely because this
+/// suffix is a structured part of the sentinel rather than arbitrary text
+/// concatenated after it.
+#[must_use]
+pub fn is_valid_cell_link_suffix(suffix: &str) -> bool {
+    suffix.starts_with("./") || suffix.starts_with("../")
+}
+
 /// Reserved `?upstream=` sentinel value meaning "the repository's default
 /// branch" — expanded daemon-side against the project root (see
 /// `ralphus_daemon::worktrees::resolve_upstream`). Authored as
@@ -2517,5 +2649,110 @@ mod tests {
         let sess = &parsed.task[0].cell[0];
         assert!(sess.prompt.is_none());
         assert_eq!(sess.command.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn parse_cell_link_reads_field_and_no_suffix() {
+        let link = parse_cell_link("ralphus:link/cwd")
+            .expect("parse ok")
+            .expect("is a link");
+        assert_eq!(link.field, "cwd");
+        assert_eq!(link.suffix, None);
+    }
+
+    #[test]
+    fn parse_cell_link_reads_field_and_suffix() {
+        let link = parse_cell_link("ralphus:link/environment.BASE?suffix=./sub")
+            .expect("parse ok")
+            .expect("is a link");
+        assert_eq!(link.field, "environment.BASE");
+        assert_eq!(link.suffix, Some("./sub"));
+    }
+
+    #[test]
+    fn parse_cell_link_ignores_non_matching_scheme() {
+        assert_eq!(
+            parse_cell_link("ralphus:new-worktree/foo?upstream=main"),
+            Ok(None)
+        );
+        assert_eq!(parse_cell_link("plain text"), Ok(None));
+    }
+
+    #[test]
+    fn parse_cell_link_rejects_empty_field() {
+        assert_eq!(
+            parse_cell_link("ralphus:link/"),
+            Err(CellLinkParseError::EmptyField)
+        );
+        assert_eq!(
+            parse_cell_link("ralphus:link/?suffix=./x"),
+            Err(CellLinkParseError::EmptyField)
+        );
+    }
+
+    #[test]
+    fn parse_cell_link_rejects_unknown_query_key() {
+        assert_eq!(
+            parse_cell_link("ralphus:link/cwd?bogus=1"),
+            Err(CellLinkParseError::UnknownQueryKey)
+        );
+    }
+
+    #[test]
+    fn parse_cell_link_rejects_empty_suffix() {
+        assert_eq!(
+            parse_cell_link("ralphus:link/cwd?suffix="),
+            Err(CellLinkParseError::EmptySuffix)
+        );
+    }
+
+    #[test]
+    fn parse_wrapped_cell_link_requires_the_whole_value_to_be_wrapped() {
+        assert_eq!(
+            parse_wrapped_cell_link("<<ralphus:link/cwd>>"),
+            Ok(Some(CellLinkRef {
+                field: "cwd",
+                suffix: None
+            }))
+        );
+        // Not wrapped at all -- a plain literal or bare placeholder, not a
+        // linked-field sentinel.
+        assert_eq!(parse_wrapped_cell_link("ralphus:link/cwd"), Ok(None));
+        // Extra literal text around the sentinel is not supported -- the
+        // whole value must be exactly the sentinel.
+        assert_eq!(
+            parse_wrapped_cell_link("prefix<<ralphus:link/cwd>>"),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_wrapped_cell_link("<<ralphus:link/cwd>>suffix"),
+            Ok(None)
+        );
+        // A different sentinel kind wrapped the same way is not a link.
+        assert_eq!(
+            parse_wrapped_cell_link("<<ralphus:new-worktree/foo?upstream=main>>"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn parse_cell_link_target_recognizes_cwd_and_environment() {
+        assert_eq!(parse_cell_link_target("cwd"), Some(CellLinkTarget::Cwd));
+        assert_eq!(
+            parse_cell_link_target("environment.BASE"),
+            Some(CellLinkTarget::Environment("BASE"))
+        );
+        assert_eq!(parse_cell_link_target("environment."), None);
+        assert_eq!(parse_cell_link_target("prompt"), None);
+        assert_eq!(parse_cell_link_target("model"), None);
+    }
+
+    #[test]
+    fn is_valid_cell_link_suffix_requires_dot_slash_prefix() {
+        assert!(is_valid_cell_link_suffix("./sub"));
+        assert!(is_valid_cell_link_suffix("../sibling"));
+        assert!(!is_valid_cell_link_suffix("sub"));
+        assert!(!is_valid_cell_link_suffix("/abs/path"));
+        assert!(!is_valid_cell_link_suffix(""));
     }
 }
