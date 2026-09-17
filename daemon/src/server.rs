@@ -11915,7 +11915,10 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // walk straight into a branch whose upstream cell never finished (RAL-424:
     // exactly what happened to a triage-created review edited while
     // `merge_failed`).
-    if matches!(status.as_str(), "merging" | "in_review" | "merge_failed" | "finalizing") {
+    if matches!(
+        status.as_str(),
+        "merging" | "in_review" | "merge_failed" | "finalizing"
+    ) {
         if rebase_relevant {
             let runner = guardian_agent_runner(daemon);
             let restarted = crate::guardian_merge::restart_guardian_merge(
