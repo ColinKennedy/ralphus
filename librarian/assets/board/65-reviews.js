@@ -1553,61 +1553,140 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const dl = document.getElementById("base-datalist");
         if (dl) dl.innerHTML = baseBranchCache[gid].map(b => `<option value="${esc(b)}"></option>`).join('');
       }
+      // RALPHUS-RESOLVER-AGENT-SELECT:BEGIN
+      /** Hardcoded resolver-agent options used only when the real list from `GET /api/agents` isn't available for a `cwd` yet (or a fetch ultimately fails/times out) -- RAL-444 added "pi" as a fourth safety-net entry alongside the pre-existing three built-ins. */
+      const RESOLVER_AGENT_FALLBACK_AGENTS = [
+        { id: "claude", kind: "builtin", backend: "claude" },
+        { id: "claude-code", kind: "builtin", backend: "claude-code" },
+        { id: "codex-cli", kind: "builtin", backend: "codex" },
+        { id: "pi", kind: "builtin", backend: "pi" },
+      ];
+      const RESOLVER_AGENT_FALLBACK_DEFAULT = "ollama";
+      /** How long a resolver-agent dropdown open waits on `GET /api/agents` before giving up and painting the hardcoded fallback list instead -- RAL-444. */
+      const RESOLVER_AGENT_LOAD_TIMEOUT_MS = 5000;
+      /** @type {Map<string, Promise<AgentOptionsCacheEntry>>} cwd -> in-flight `GET /api/agents` fetch, so concurrent resolver-dropdown opens for the same cwd share one request instead of firing duplicates -- RAL-444. */
+      const agentOptionsLoading = new Map();
+
       /**
-       * Builds the resolver `<select>`'s `<option>`s for `cwd`: every real
-       * agent (built-ins plus configured custom profiles) cached from
-       * `GET /api/agents`, sorted alphabetically, falling back to a hardcoded
-       * 3 while the fetch is in flight (or if it fails) so the dropdown is
-       * never empty. Whichever agent matches the effective
-       * `[review].default_resolver_agent` (`GET /api/agents`'s
-       * `default_agent`, or `"ollama"` while that hasn't loaded yet) gets
-       * " (default)" appended to its label and is preselected when `selected`
-       * is `""` (unset) -- there's no separate synthetic "(default)" entry.
+       * Builds one resolver-agent `<select>`'s `<option>`s from an
+       * already-resolved agent list, sorted alphabetically. Whichever agent
+       * matches `entry.defaultAgent` gets " (default)" appended to its label
+       * and is preselected when `selected` is `""` (unset) -- there's no
+       * separate synthetic "(default)" entry.
+       * @param {AgentOptionsCacheEntry} entry
+       * @param {string} selected
+       * @returns {string}
+       */
+      function resolverOptionHtmlFromEntry(entry, selected) {
+        const sorted = [...entry.agents].sort((a, b) => a.id.localeCompare(b.id));
+        return sorted.map((a) => {
+          const isSelected = selected === a.id || (selected === "" && a.id === entry.defaultAgent);
+          const profileSuffix = a.kind === "profile" ? ` (profile → ${esc(a.backend)})` : "";
+          const defaultSuffix = a.id === entry.defaultAgent ? " (default)" : "";
+          return `<option value="${esc(a.id)}" ${isSelected ? "selected" : ""}>${esc(a.id)}${profileSuffix}${defaultSuffix}</option>`;
+        }).join("");
+      }
+      /**
+       * Builds the resolver `<select>`'s *initial* `<option>`s for `cwd`,
+       * RAL-444: synchronous, and built only from state already known --
+       * never a guessed/incomplete list -- so the box can never default away
+       * from the review's real value while `GET /api/agents` is still
+       * loading (the "defaults to claude" race this fixes). Renders the
+       * complete list immediately once one is already cached for this `cwd`
+       * (e.g. an earlier dropdown open this page load, or another review
+       * sharing the same `cwd`); otherwise renders exactly one option --
+       * `selected` itself, or a generic "agent default" placeholder when
+       * unset -- so there is nothing else for the browser to fall back to.
+       * The real, complete list loads lazily the moment the dropdown is
+       * actually opened; see `onResolverSelectMouseDown`.
        * @param {string} cwd
        * @param {string} selected
        * @returns {string}
        */
       function resolverOptionHtml(cwd, selected) {
         const cached = agentOptionsByCwd.get(cwd);
-        if (!cached) {
-          fetchAgentOptions(cwd);
-        }
-        const agents = cached && cached.agents.length
-          ? cached.agents
-          : [
-              { id: "claude", kind: "builtin", backend: "claude" },
-              { id: "claude-code", kind: "builtin", backend: "claude-code" },
-              { id: "codex-cli", kind: "builtin", backend: "codex" },
-            ];
-        const defaultAgent = cached && cached.agents.length ? cached.defaultAgent : "ollama";
-        const sorted = [...agents].sort((a, b) => a.id.localeCompare(b.id));
-        return sorted.map((a) => {
-          const isSelected = selected === a.id || (selected === "" && a.id === defaultAgent);
-          const profileSuffix = a.kind === "profile" ? ` (profile → ${esc(a.backend)})` : "";
-          const defaultSuffix = a.id === defaultAgent ? " (default)" : "";
-          return `<option value="${esc(a.id)}" ${isSelected ? "selected" : ""}>${esc(a.id)}${profileSuffix}${defaultSuffix}</option>`;
-        }).join("");
+        if (cached && cached.agents.length) return resolverOptionHtmlFromEntry(cached, selected);
+        const label = selected || "agent default";
+        return `<option value="${esc(selected)}" selected>${esc(label)}</option>`;
       }
       /**
-       * Fetches `GET /api/agents` for `cwd` and caches the agents plus the
-       * effective default, re-rendering the review detail pane once it lands.
-       * A no-op (beyond the cache miss already having triggered it) while a
-       * fetch for this `cwd` is in flight.
+       * Fetches `GET /api/agents` for `cwd`, caches a successful non-empty
+       * result, and refreshes the review-detail pane so its read-only
+       * resolver-agent label (`resolverOf`) picks up the newly-known
+       * effective default. Never throws -- a network failure or an empty
+       * agent list resolves to the hardcoded fallback list instead.
        * @param {string} cwd
-       * @returns {Promise<void>}
+       * @returns {Promise<AgentOptionsCacheEntry>}
        */
-      async function fetchAgentOptions(cwd) {
-        if (!cwd || agentOptionsByCwd.has(cwd)) return;
-        agentOptionsByCwd.set(cwd, { agents: [], defaultAgent: "ollama" }); // placeholder so concurrent renders don't refetch
+      async function fetchAgentOptionsEntry(cwd) {
         try {
           const d = await (await fetch(`/api/agents?cwd=${encodeURIComponent(cwd)}`)).json();
-          agentOptionsByCwd.set(cwd, { agents: d.agents || [], defaultAgent: d.default_agent || "ollama" });
+          const entry = { agents: d.agents || [], defaultAgent: d.default_agent || RESOLVER_AGENT_FALLBACK_DEFAULT };
+          if (!entry.agents.length) return { agents: RESOLVER_AGENT_FALLBACK_AGENTS, defaultAgent: entry.defaultAgent };
+          agentOptionsByCwd.set(cwd, entry);
+          renderReviewDetail();
+          return entry;
         } catch (e) {
-          agentOptionsByCwd.delete(cwd); // transient failure — allow a later render to retry
+          return { agents: RESOLVER_AGENT_FALLBACK_AGENTS, defaultAgent: RESOLVER_AGENT_FALLBACK_DEFAULT };
+        }
+      }
+      /**
+       * Resolves to the complete agent list + effective default for `cwd`,
+       * RAL-444. Returns the cached entry immediately if one is already
+       * loaded; otherwise reuses an in-flight fetch for this `cwd` rather
+       * than firing a duplicate, or starts one now. Bounded to
+       * RESOLVER_AGENT_LOAD_TIMEOUT_MS so a stalled request can't hang a
+       * dropdown open forever -- degrades to the hardcoded fallback list on
+       * timeout, same as on a fetch error.
+       * @param {string} cwd
+       * @returns {Promise<AgentOptionsCacheEntry>}
+       */
+      async function ensureAgentOptionsLoaded(cwd) {
+        const cached = agentOptionsByCwd.get(cwd);
+        if (cached && cached.agents.length) return cached;
+        if (!cwd) return { agents: RESOLVER_AGENT_FALLBACK_AGENTS, defaultAgent: RESOLVER_AGENT_FALLBACK_DEFAULT };
+        let pending = agentOptionsLoading.get(cwd);
+        if (!pending) {
+          pending = fetchAgentOptionsEntry(cwd);
+          agentOptionsLoading.set(cwd, pending);
+          pending.finally(() => { if (agentOptionsLoading.get(cwd) === pending) agentOptionsLoading.delete(cwd); });
+        }
+        const timeout = new Promise((resolve) => setTimeout(() => resolve({ agents: RESOLVER_AGENT_FALLBACK_AGENTS, defaultAgent: RESOLVER_AGENT_FALLBACK_DEFAULT }), RESOLVER_AGENT_LOAD_TIMEOUT_MS));
+        return Promise.race([pending, timeout]);
+      }
+      /**
+       * `mousedown` handler for a resolver-agent `<select>`, RAL-444: makes
+       * sure the native dropdown never opens showing anything less than the
+       * complete agent list. A cached list is spliced in synchronously (no
+       * visible delay, and the native popup opens normally); otherwise the
+       * native popup is suppressed for this event while
+       * `ensureAgentOptionsLoaded` resolves (reusing any fetch already in
+       * flight), then reopened via `showPicker()` once the real options are
+       * in place -- falling back to just refocusing the element on browsers
+       * without `showPicker`, where the next click opens it with an
+       * already-warm cache.
+       * @param {MouseEvent} e
+       * @param {HTMLSelectElement} select
+       * @param {string} cwd
+       * @returns {void}
+       */
+      function onResolverSelectMouseDown(e, select, cwd) {
+        const cached = agentOptionsByCwd.get(cwd);
+        if (cached && cached.agents.length) {
+          select.innerHTML = resolverOptionHtmlFromEntry(cached, select.value);
           return;
         }
-        renderReviewDetail();
+        e.preventDefault();
+        ensureAgentOptionsLoaded(cwd).then((entry) => {
+          select.innerHTML = resolverOptionHtmlFromEntry(entry, select.value);
+          if (typeof select.showPicker === "function") {
+            try { select.showPicker(); } catch (_) { select.focus(); }
+          } else {
+            select.focus();
+          }
+        });
       }
+      // RALPHUS-RESOLVER-AGENT-SELECT:END
       /**
        * Opens the Create Review modal.
        * @returns {void}
