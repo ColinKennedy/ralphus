@@ -93,17 +93,24 @@ pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-co
                 Understand what each side contributes and write the correct merged result — \
                 preserving the intent of both sides, with ALL markers removed.\n\
              3. Call write_file with the fully resolved content. Repeat for every file.\n\
-             4. Once every file is marker-free, call run_bash with exactly: git add -A\n\
-             5. After git add -A succeeds, output the following line and stop:\n\
+             4. Once every file is marker-free, call run_bash with `git status` to see \
+                everything currently changed in the worktree. Stage the files you actually \
+                resolved conflicts in by name (e.g. `git add <file1> <file2>`). If `git \
+                status` shows other changed files beyond the ones you resolved, leave them \
+                unstaged unless you can confirm each one is also a genuine, intentional part \
+                of this merge -- never sweep in build artifacts, generated files, or unrelated \
+                local changes. Only run `git add -A` instead if you have confirmed every \
+                changed file in the worktree genuinely belongs in this commit.\n\
+             5. After staging succeeds, output the following line and stop:\n\
                 RALPHUS_STAGE: DONE\n\
              \n\
              Do NOT run formatters, linters, or tests, and do NOT attempt to fix quality \
              issues beyond resolving the conflict markers themselves -- a dedicated \
              proof pass runs afterward and will handle formatting/linting/testing, \
              including auto-fixing any failures it finds. Do NOT call `git rebase --continue`, \
-             `git commit`, `git push`, or any other git command besides `git add -A`. The \
-             orchestrator advances the rebase as soon as it sees RALPHUS_STAGE: DONE in your \
-             output.";
+             `git commit`, `git push`, or any other git command besides `git status` and \
+             `git add`. The orchestrator advances the rebase as soon as it sees \
+             RALPHUS_STAGE: DONE in your output.";
 
 /// The static authored system prompt the dedicated final-proof pass feeds its
 /// agent (RAL-149) -- hoisted to a module constant (RAL-428) so
@@ -114,7 +121,12 @@ pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-co
 pub(crate) const FINAL_PROOF_SYSTEM_PROMPT: &str = "You are running the dedicated final-proof pass of a git rebase \
          conflict-resolution cycle, in a checked-out worktree. Confirm the code meets the \
          quality bar described in the prompt, fixing anything you reasonably can. If you edit \
-         any files, run `git add -A` with run_bash to stage them before you finish. Do NOT call \
+         any files, run `git status` and `git diff` with run_bash to see everything that \
+         changed, then `git add` each file that is a genuine part of your fix before you \
+         finish. Leave out anything that looks like an incidental build/test byproduct \
+         (compiled artifacts, caches, coverage output, logs, etc.) rather than an intentional \
+         source change. Only run `git add -A` instead if you have confirmed every changed file \
+         in the worktree genuinely belongs in this commit. Do NOT call \
          `git rebase --continue`, `git commit`, `git push`, `git rebase --abort`, or any other \
          rebase-affecting git command -- the orchestrator owns the rebase and has already \
          advanced past the conflict this branch was resolving.";
@@ -140,8 +152,9 @@ pub(crate) enum StartMergeOutcome {
     AlreadyMerged,
 }
 
-/// Marker the conflict-resolver agent outputs after `git add -A` to signal the
-/// orchestrator that the index is ready for `git rebase --continue`.
+/// Marker the conflict-resolver agent outputs after staging its resolved
+/// files to signal the orchestrator that the index is ready for `git rebase
+/// --continue`.
 const STAGE_DONE_MARKER: &str = "RALPHUS_STAGE: DONE";
 
 /// Run `git` with `args` in `root`, returning stdout on success or a message.
