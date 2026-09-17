@@ -316,6 +316,8 @@
       .chat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 2px; }
       .chat-bubble-wrap.user .chat-label { text-align: right; }
       .chat-time { text-transform: none; letter-spacing: 0; opacity: .7; font-weight: 400; cursor: default; }
+      /* RAL-446: per-message feedback action-status marker (eye/check/x/superseded). */
+      .chat-status { margin-left: 5px; font-size: 11px; text-transform: none; letter-spacing: 0; cursor: default; }
       /* RAL-272: expand/collapse toggle pinned to a bubble's corner. */
       .chat-expand-btn { position: absolute; top: 4px; right: 4px; background: transparent; border: none; color: inherit; opacity: .65; cursor: pointer; font-size: 11px; line-height: 1; padding: 2px 4px; }
       .chat-expand-btn:hover { opacity: 1; }

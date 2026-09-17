@@ -1420,6 +1420,29 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function firstLine(t) { return t.split("\n")[0]; }
       /**
+       * Maps a feedback message's `action_status` (RAL-380) to the marker
+       * shown in its chat bubble (RAL-446): an eye once ralphus has seen the
+       * feedback and started acting on it, a checkmark or x-mark once that
+       * action reaches a terminal outcome, and a distinct fourth icon when a
+       * newer message on the same branch superseded it before it finished.
+       * `None`/unrecognized status (e.g. a guardian-role message) renders
+       * nothing.
+       * @param {ChatMessage} m
+       * @returns {string}
+       */
+      function actionStatusMarker(m) {
+        let icon = "";
+        let label = "";
+        switch (m.action_status) {
+          case "received": icon = "\u{1F441}️"; label = "Seen — ralphus has started applying this feedback."; break;
+          case "done": icon = "✅"; label = "Done — this feedback was applied successfully."; break;
+          case "failed": icon = "❌"; label = "Failed — applying this feedback did not succeed."; break;
+          case "superseded": icon = "\u{1F504}"; label = "Superseded — a newer feedback message arrived on this branch before this one finished, so its outcome (if any) is stale."; break;
+          default: return "";
+        }
+        return `<span class="chat-status" data-tip="${esc(label)}">${icon}</span>`;
+      }
+      /**
        * Fetches and caches one review branch's read-only feedback thread (RAL-272), re-rendering unless `opts.silent`.
        * @param {string} gid
        * @param {string} bid
@@ -1493,8 +1516,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           // posting on someone else's behalf) is audit-only and never
           // rendered in the UI.
           const label = isUser ? (m.author || "you") : "guardian";
+          const status = actionStatusMarker(m);
           return `<div class="chat-msg chat-bubble-wrap ${isUser ? "user" : "guardian"}"><div>
-              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${esc(label)}${ts}</div>
+              <div class="chat-label"${isUser ? ' style="text-align:right"' : ""}>${esc(label)}${ts}${status}</div>
               <div class="chat-bubble">${esc(shown)}${expandBtn}</div>
             </div></div>`;
         }).join("");
