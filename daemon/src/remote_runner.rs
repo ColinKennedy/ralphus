@@ -1622,6 +1622,7 @@ mod tests {
         fn run(&self, spec: &RunnerSpec) -> RunnerResult {
             self.seen.lock().unwrap().push(spec.cell_id.clone());
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".to_string(),
                 tokens_in: 7,
                 tokens_out: 8,

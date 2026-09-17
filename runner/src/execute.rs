@@ -430,6 +430,29 @@ fn run_with_backend(
             );
         }
 
+        // RAL-435: a recognized, retryable Pi 429 with a suggested delay --
+        // report it as-is rather than entering the bg-job-nudge/still-
+        // working/budget/proof logic below, which all assume the backend
+        // actually finished a turn. The daemon (not this in-process attempt
+        // loop) owns waiting out the delay and resuming this same agent
+        // session, since that wait must release scheduler capacity the way
+        // this subprocess-scoped loop cannot.
+        if let Some(delay) = outcome.rate_limit_retry_after {
+            return CellResult::rate_limited(
+                delay.as_secs(),
+                outcome.summary,
+                total_tokens_in,
+                total_tokens_out,
+                total_cache_creation_tokens,
+                total_cache_read_tokens,
+                total_compaction_input_tokens,
+                total_compaction_count,
+                total_turns.unwrap_or(0),
+                total_cost_usd,
+                agent_session_id,
+            );
+        }
+
         // RAL-292: a turn that ended with an unresolved backgrounded job
         // (launched but never checked) is a silent-completion bug, not a
         // sanctioned `RALPHUS_STILL_WORKING:` escape hatch -- give the same
@@ -467,6 +490,7 @@ fn run_with_backend(
                     agent_session_id,
                     ghost: None,
                     turns: total_turns,
+                    retry_after_secs: None,
                 };
             }
             bg_nudge_attempt += 1;
@@ -527,6 +551,7 @@ fn run_with_backend(
                         agent_session_id,
                         ghost: None,
                         turns: total_turns,
+                        retry_after_secs: None,
                     };
                 }
                 Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -544,6 +569,21 @@ fn run_with_backend(
                 return thrash_cell_result(
                     spec,
                     &detail,
+                    outcome.summary,
+                    total_tokens_in,
+                    total_tokens_out,
+                    total_cache_creation_tokens,
+                    total_cache_read_tokens,
+                    total_compaction_input_tokens,
+                    total_compaction_count,
+                    total_turns.unwrap_or(0),
+                    total_cost_usd,
+                    agent_session_id,
+                );
+            }
+            if let Some(delay) = outcome.rate_limit_retry_after {
+                return CellResult::rate_limited(
+                    delay.as_secs(),
                     outcome.summary,
                     total_tokens_in,
                     total_tokens_out,
@@ -595,6 +635,7 @@ fn run_with_backend(
                     agent_session_id,
                     ghost: None,
                     turns: total_turns,
+                    retry_after_secs: None,
                 };
             }
             return CellResult {
@@ -615,6 +656,7 @@ fn run_with_backend(
                 agent_session_id,
                 ghost: None,
                 turns: total_turns,
+                retry_after_secs: None,
             };
         }
 
@@ -648,6 +690,7 @@ fn run_with_backend(
                 agent_session_id,
                 ghost: None,
                 turns: total_turns,
+                retry_after_secs: None,
             };
         }
 
@@ -672,6 +715,7 @@ fn run_with_backend(
                 agent_session_id,
                 ghost: None,
                 turns: total_turns,
+                retry_after_secs: None,
             };
         }
 
@@ -709,6 +753,7 @@ fn run_with_backend(
             agent_session_id,
             ghost,
             turns: total_turns,
+            retry_after_secs: None,
         };
     }
 
@@ -764,6 +809,7 @@ fn thrash_cell_result(
         agent_session_id,
         turns: Some(turns),
         ghost: None,
+        retry_after_secs: None,
     }
 }
 
@@ -1277,6 +1323,44 @@ mod tests {
         let error = result.error.unwrap();
         assert!(error.contains("autocompaction thrashing"), "{error}");
         assert!(error.contains("claude"), "{error}"); // spec.agent from test_spec
+    }
+
+    /// RAL-435: a recognized, retryable Pi rate limit must be reported as a
+    /// `"rate_limited"` `CellResult` carrying the suggested delay and
+    /// whatever was captured live -- not a hard failure, and not routed
+    /// through the bg-job-nudge/still-working/budget/proof logic below it
+    /// (the `nudge_calls` assertion below is what proves that).
+    #[test]
+    fn run_with_backend_reports_a_retryable_rate_limit_instead_of_failing() {
+        let spec = test_spec(false);
+        let ws = Workspace::create(std::env::temp_dir()).unwrap();
+        let backend = ScriptedBackend::new(
+            vec![Ok(BackendOutcome {
+                summary: "partial work before the rate limit".to_string(),
+                tokens_in: 42,
+                tokens_out: 84,
+                cost_usd: 0.25,
+                agent_session_id: Some("sess-rate-limited".to_string()),
+                rate_limit_retry_after: Some(std::time::Duration::from_secs(30)),
+                ..Default::default()
+            })],
+            vec![],
+        );
+
+        let result = run_with_backend(&spec, "do the thing", &ws, &backend);
+
+        assert_eq!(backend.nudge_calls.get(), 0);
+        assert!(result.is_rate_limited());
+        assert!(!result.ok());
+        assert_eq!(result.retry_after_secs, Some(30));
+        assert_eq!(result.tokens_in, 42);
+        assert_eq!(result.tokens_out, 84);
+        assert_eq!(result.summary, "partial work before the rate limit");
+        assert_eq!(
+            result.agent_session_id.as_deref(),
+            Some("sess-rate-limited")
+        );
+        assert_eq!(result.error, None);
     }
 
     /// RAL-339: a healthy run (no thrash) must be entirely unaffected by the

@@ -4,8 +4,11 @@
 //! compaction boundary itself rather than let its process run to whatever
 //! conclusion it eventually reaches, so its proof steps never start.
 //!
-//! [`ThrashTracker`] is the single, shared counter every backend
-//! (`claude-code`, `pi`, `codex`) drives through the same two calls --
+//! [`ThrashTracker`] is a thin, compaction-flavored wrapper around
+//! [`ralphus_core::thrash::OccurrenceTracker`] -- the same shared "N
+//! occurrences within M turns" rule RAL-435 reuses for `daemon`'s Pi
+//! rate-limit retry guard. Every backend (`claude-code`, `pi`, `codex`)
+//! drives the one shared counter through the same two calls --
 //! [`ThrashTracker::record_assistant_turn`] and
 //! [`ThrashTracker::record_compaction`] -- so the thrash rule itself lives in
 //! exactly one place regardless of which backend's stream produced the
@@ -14,15 +17,17 @@
 //! subprocess per attempt), so "reset on any cell/proof restart" falls out
 //! for free -- there is nothing to explicitly reset.
 
+use ralphus_core::thrash::{OccurrenceThresholds, OccurrenceTracker};
+
 use crate::cartographer::EventContext;
 
 /// N: how many compactions must occur in one run before thrash detection can
 /// fire at all, absent a project-level `.ralphus.toml` `[thrash]` override.
-pub const DEFAULT_MAX_COMPACTIONS: u32 = 3;
+pub const DEFAULT_MAX_COMPACTIONS: u32 = ralphus_core::thrash::DEFAULT_MAX_OCCURRENCES;
 /// M: the previous-compaction gap (in assistant turns) below which a
 /// compaction at/after [`DEFAULT_MAX_COMPACTIONS`] counts as thrash, absent
 /// an override.
-pub const DEFAULT_MIN_TURN_GAP: u32 = 2;
+pub const DEFAULT_MIN_TURN_GAP: u32 = ralphus_core::thrash::DEFAULT_MIN_TURN_GAP;
 
 /// Resolved N/M thresholds for one run, forwarded daemon -> runner per cell
 /// via `CellSpec`/`RunOptions` (daemon-resolved from `.ralphus.toml`'s
@@ -39,6 +44,15 @@ impl Default for ThrashThresholds {
         Self {
             max_compactions: DEFAULT_MAX_COMPACTIONS,
             min_turn_gap: DEFAULT_MIN_TURN_GAP,
+        }
+    }
+}
+
+impl From<ThrashThresholds> for OccurrenceThresholds {
+    fn from(t: ThrashThresholds) -> Self {
+        Self {
+            max_occurrences: t.max_compactions,
+            min_turn_gap: t.min_turn_gap,
         }
     }
 }
@@ -61,23 +75,19 @@ pub struct ThrashDetail {
 /// with no compaction event of its own, inferred) it recognizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ThrashTracker {
-    thresholds: ThrashThresholds,
-    compaction_count: u32,
-    turns_since_last_compaction: u32,
+    inner: OccurrenceTracker,
 }
 
 impl ThrashTracker {
     #[must_use]
     pub fn new(thresholds: ThrashThresholds) -> Self {
         Self {
-            thresholds,
-            compaction_count: 0,
-            turns_since_last_compaction: 0,
+            inner: OccurrenceTracker::new(thresholds.into()),
         }
     }
 
     pub fn record_assistant_turn(&mut self) {
-        self.turns_since_last_compaction = self.turns_since_last_compaction.saturating_add(1);
+        self.inner.record_turn();
     }
 
     /// Records one compaction. Returns `Some(detail)` the moment the run
@@ -88,24 +98,12 @@ impl ThrashTracker {
     /// compare its gap against.
     #[must_use]
     pub fn record_compaction(&mut self) -> Option<ThrashDetail> {
-        self.compaction_count += 1;
-        let gap = self.turns_since_last_compaction;
-        self.turns_since_last_compaction = 0;
-
-        let has_preceding_compaction = self.compaction_count > 1;
-        if has_preceding_compaction
-            && self.compaction_count >= self.thresholds.max_compactions
-            && gap < self.thresholds.min_turn_gap
-        {
-            Some(ThrashDetail {
-                compaction_count: self.compaction_count,
-                turns_since_previous_compaction: gap,
-                max_compactions: self.thresholds.max_compactions,
-                min_turn_gap: self.thresholds.min_turn_gap,
-            })
-        } else {
-            None
-        }
+        self.inner.record_occurrence().map(|detail| ThrashDetail {
+            compaction_count: detail.occurrence_count,
+            turns_since_previous_compaction: detail.turns_since_previous_occurrence,
+            max_compactions: detail.max_occurrences,
+            min_turn_gap: detail.min_turn_gap,
+        })
     }
 }
 

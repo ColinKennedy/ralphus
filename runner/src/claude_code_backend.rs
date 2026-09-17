@@ -525,6 +525,7 @@ fn drive_stream_json(
             agent_session_id: state.agent_session_id,
             abandoned_background_job: state.open_background_job,
             compaction_thrash: Some(detail),
+            rate_limit_retry_after: None,
             compaction_input_tokens: state.compaction_input_tokens,
             compaction_count: state.compaction_count,
         });
@@ -562,6 +563,7 @@ fn drive_stream_json(
         agent_session_id: state.agent_session_id,
         abandoned_background_job: state.open_background_job,
         compaction_thrash: None,
+        rate_limit_retry_after: None,
         compaction_input_tokens: state.compaction_input_tokens,
         compaction_count: state.compaction_count,
     })

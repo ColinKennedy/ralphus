@@ -130,6 +130,7 @@ impl Runner for CapturingRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         self.specs.lock().unwrap().push(spec.clone());
         RunnerResult {
+            retry_after_secs: None,
             status: "done".to_string(),
             tokens_in: 0,
             tokens_out: 0,

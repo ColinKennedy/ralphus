@@ -82,6 +82,17 @@ pub struct BackendOutcome {
     /// point. `execute.rs::run_with_backend` checks this before anything
     /// else and fails the cell outright.
     pub compaction_thrash: Option<crate::thrash::ThrashDetail>,
+    /// RAL-435: set when this run ended on a recognized, retryable Pi 429
+    /// rate-limit error that also carried a parseable suggested delay (see
+    /// `pi_backend::parse_retryable_rate_limit`) -- every other field still
+    /// carries whatever was captured live up to that terminal event, the
+    /// same "live snapshot, not a crash" shape `compaction_thrash` uses.
+    /// `execute.rs::run_with_backend` turns this into a `"rate_limited"`
+    /// `CellResult` rather than a hard failure, so the daemon can wait out
+    /// the delay and resume the same agent session instead of ending the
+    /// cell. `None` for every other outcome, including an unrecognized or
+    /// delay-less rate limit (treated as a genuine failure, not guessed at).
+    pub rate_limit_retry_after: Option<std::time::Duration>,
 }
 
 /// Options common to every backend's `run` call, bundled to keep the trait's

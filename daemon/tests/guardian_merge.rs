@@ -83,6 +83,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         git(&cwd, &["commit", "-m", "test: commit step"]);
     }
     Some(RunnerResult {
+        retry_after_secs: None,
         status: "done".into(),
         tokens_in: 0,
         tokens_out: 0,
@@ -155,6 +156,7 @@ impl Runner for StageDoneRunner {
             cwd.display()
         );
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -216,6 +218,7 @@ impl Runner for LossyRunner {
             .unwrap_or(false);
         assert!(ok, "LossyRunner: git add -A failed in {}", cwd.display());
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -264,6 +267,7 @@ impl Runner for MarkerStrippingRunner {
             }
         }
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -292,6 +296,7 @@ impl Runner for FeedbackRunner {
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -332,6 +337,7 @@ impl Runner for RaceInjectingRunner {
             Some("simulated concurrent failure"),
         );
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -359,6 +365,7 @@ struct SilentNoOpFeedbackRunner;
 impl Runner for SilentNoOpFeedbackRunner {
     fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -387,6 +394,7 @@ impl Runner for NamedFeedbackRunner {
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join(self.0), "reviewed\n");
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -441,6 +449,7 @@ impl Runner for AutoFixRunner {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("fix.txt"), "fixed\n");
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -2563,6 +2572,7 @@ impl Runner for FailingAutoBuildRunner {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         if spec.task == "auto_build" {
             return RunnerResult {
+                retry_after_secs: None,
                 status: "failed".to_string(),
                 tokens_in: 5,
                 tokens_out: 5,
@@ -2705,6 +2715,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -4125,6 +4136,7 @@ command = "cargo test --workspace"
 
             if spec.task == "proof-synthesis" {
                 return RunnerResult {
+                    retry_after_secs: None,
                     status: "done".into(),
                     tokens_in: 15,
                     tokens_out: 30,
@@ -4167,6 +4179,7 @@ command = "cargo test --workspace"
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -4319,6 +4332,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             git(&cwd, &["commit", "-m", "fix: agent self-committed"]);
         }
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -4765,6 +4779,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -4946,6 +4961,7 @@ impl Runner for PartialResolutionRunner {
             }
         }
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -5080,6 +5096,7 @@ impl Runner for NeverResolvesRunner {
             Some("sess-other-task".to_string())
         };
         RunnerResult {
+            retry_after_secs: None,
             status: "done".into(),
             tokens_in: 0,
             tokens_out: 0,
@@ -6291,6 +6308,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 }
             }
             RunnerResult {
+                retry_after_secs: None,
                 status: "done".into(),
                 tokens_in: 0,
                 tokens_out: 0,

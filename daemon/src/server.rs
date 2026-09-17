@@ -20371,6 +20371,7 @@ command = "true"
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,
@@ -20523,6 +20524,7 @@ command = "true"
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 RunnerResult {
+                    retry_after_secs: None,
                     status: "done".to_string(),
                     tokens_in: 1,
                     tokens_out: 1,

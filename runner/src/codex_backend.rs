@@ -487,6 +487,7 @@ fn drive_thread_events(
             agent_session_id,
             abandoned_background_job: None,
             compaction_thrash: Some(detail),
+            rate_limit_retry_after: None,
             // RAL-373: this backend reports no compaction data, not "never
             // compacts".
             compaction_input_tokens: 0,
@@ -523,6 +524,7 @@ fn drive_thread_events(
         agent_session_id,
         abandoned_background_job: None,
         compaction_thrash: None,
+        rate_limit_retry_after: None,
         // RAL-373: this backend reports no compaction data, not "never
         // compacts".
         compaction_input_tokens: 0,
