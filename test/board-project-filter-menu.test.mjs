@@ -14,11 +14,11 @@ import { makeSquadsProjectFilterMenu, makeTasksProjectFilterMenu } from "./board
 test("toggleProjectFilter (squads) adds and removes a project from the filter", () => {
   const { toggleProjectFilter, filters, calls } = makeSquadsProjectFilterMenu();
   toggleProjectFilter("acme", true);
-  assert.deepEqual([...filters.project], ["acme"]);
+  assert.deepEqual([...filters.projects], ["acme"]);
   assert.equal(calls.renderSquads, 1);
   assert.equal(calls.syncHash, 1);
   toggleProjectFilter("acme", false);
-  assert.deepEqual([...filters.project], []);
+  assert.deepEqual([...filters.projects], []);
   assert.equal(calls.renderSquads, 2);
 });
 
@@ -41,7 +41,7 @@ test("projectFilterMenuRowsHtml (squads) stops row clicks from bubbling to the d
 });
 
 test("projectFilterMenuRowsHtml (squads) reflects current selection via the 'on'/'checked' state", () => {
-  const { projectFilterMenuRowsHtml } = makeSquadsProjectFilterMenu({ filters: { project: new Set(["beta"]) } });
+  const { projectFilterMenuRowsHtml } = makeSquadsProjectFilterMenu({ filters: { projects: new Set(["beta"]) } });
   const rowsHtml = projectFilterMenuRowsHtml();
   assert.match(rowsHtml, /ctx-check on"><label[^>]*><input type="checkbox" checked[^>]*onchange="toggleProjectFilter\('beta'/);
   assert.doesNotMatch(rowsHtml, /ctx-check on"><label[^>]*><input type="checkbox" checked[^>]*onchange="toggleProjectFilter\('acme'/);
@@ -52,7 +52,7 @@ test("clearProjectFilter (squads) empties the filter and closes the menu", () =>
   toggleProjectFilter("acme", true);
   byIdMap.set("project-filter-menu", { innerHTML: "", remove: () => byIdMap.delete("project-filter-menu") });
   clearProjectFilter();
-  assert.equal(filters.project.size, 0);
+  assert.equal(filters.projects.size, 0);
   assert.equal(byIdMap.has("project-filter-menu"), false);
 });
 
@@ -61,12 +61,12 @@ test("clearProjectFilter (squads) empties the filter and closes the menu", () =>
 test("ttToggleProjectFilter (tasks) adds and removes a project from its own filter, independent of the squads filter", () => {
   const { ttToggleProjectFilter, taskTabFilters, calls } = makeTasksProjectFilterMenu();
   ttToggleProjectFilter("acme", true);
-  assert.deepEqual([...taskTabFilters.project], ["acme"]);
+  assert.deepEqual([...taskTabFilters.projects], ["acme"]);
   assert.equal(calls.renderTasksTab, 1);
   assert.equal(calls.ttScrollSelectionIntoView, 1);
   assert.equal(calls.syncHash, 1);
   ttToggleProjectFilter("acme", false);
-  assert.deepEqual([...taskTabFilters.project], []);
+  assert.deepEqual([...taskTabFilters.projects], []);
 });
 
 test("ttToggleProjectFilter (tasks) updates an already-open menu's checkmarks in place rather than closing it", () => {
@@ -90,7 +90,7 @@ test("ttClearProjectFilter (tasks) empties the filter and closes the menu", () =
   ttToggleProjectFilter("acme", true);
   byIdMap.set("tt-project-filter-menu", { innerHTML: "", remove: () => byIdMap.delete("tt-project-filter-menu") });
   ttClearProjectFilter();
-  assert.equal(taskTabFilters.project.size, 0);
+  assert.equal(taskTabFilters.projects.size, 0);
   assert.equal(byIdMap.has("tt-project-filter-menu"), false);
 });
 
@@ -98,6 +98,6 @@ test("Squads and Tasks project filters are independent Set instances", () => {
   const squads = makeSquadsProjectFilterMenu();
   const tasks = makeTasksProjectFilterMenu();
   squads.toggleProjectFilter("acme", true);
-  assert.deepEqual([...squads.filters.project], ["acme"]);
-  assert.equal(tasks.taskTabFilters.project.size, 0);
+  assert.deepEqual([...squads.filters.projects], ["acme"]);
+  assert.equal(tasks.taskTabFilters.projects.size, 0);
 });
