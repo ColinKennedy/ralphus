@@ -916,6 +916,35 @@ impl Tmux {
         count
     }
 
+    /// Kill every currently-registered session whose name starts with any of
+    /// `prefixes`, sharing a single `list-sessions` round trip across all of
+    /// them (RAL-407). A cascade-cancel sweeping N squads previously paid N
+    /// separate `list-sessions` subprocess round trips (one per
+    /// [`Self::kill_sessions_with_prefix`] call) before it could even start
+    /// killing anything; this collapses that to one. Otherwise identical,
+    /// best-effort semantics to [`Self::kill_sessions_with_prefix`]. Returns
+    /// the total number of sessions matched (attempted) across all prefixes.
+    pub fn kill_sessions_with_any_prefix(&self, prefixes: &[String]) -> usize {
+        let Ok(output) = self.run(&["list-sessions"]) else {
+            return 0;
+        };
+        let names: Vec<String> = output
+            .lines()
+            .filter_map(|line| line.split(':').next())
+            .filter(|name| {
+                prefixes
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix.as_str()))
+            })
+            .map(str::to_string)
+            .collect();
+        let count = names.len();
+        for name in names {
+            let _ = self.kill_session(&name);
+        }
+        count
+    }
+
     /// Create a detached session named `name` rooted at `cwd`, with
     /// `remain-on-exit` enabled, then start the program `program` with `args`
     /// as the pane's process.
