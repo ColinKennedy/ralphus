@@ -293,7 +293,7 @@
        * Loads the Simple tab's template list and agent catalog, then
        * re-renders if the modal is still open on the Simple tab. Never
        * throws — a network failure just leaves the hardcoded fallbacks in
-       * place, the same graceful-degradation pattern `fetchAgentOptions`
+       * place, the same graceful-degradation pattern `fetchAgentOptionsEntry`
        * uses for the review-resolver dropdown.
        * @returns {Promise<void>}
        */
