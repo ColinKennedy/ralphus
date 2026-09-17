@@ -4848,6 +4848,160 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-458: the resolver's system prompt used to claim "a dedicated proof
+// pass runs afterward and will handle formatting/linting/testing" -- true
+// only under proof_scope="each_branch", or for the final branch under
+// "final_branch". Under "nothing", and for a non-final branch under
+// "final_branch", no such pass ever runs for that branch, so the promise was
+// dishonest. The fix reworded the prompt to a scope-agnostic framing that
+// never claims a specific follow-up will happen, rather than branching the
+// prompt text per scope. This test asserts that framing across all three
+// scopes -- including a non-final branch under "final_branch" -- both
+// dropping the old dishonest claim and keeping the resolver's system prompt
+// byte-for-byte identical regardless of scope (i.e. confirming no per-scope
+// branching crept back in).
+#[test]
+fn resolver_system_prompt_is_scope_agnostic_and_honest() {
+    fn resolver_prompt_for_scope(scope: Option<&str>) -> String {
+        let root = temp_repo();
+        init_repo(&root);
+        write(&root, "conflict.txt", "line1\nBASE\nline3\n");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+
+        git(&root, &["checkout", "-b", "feature/x"]);
+        write(&root, "conflict.txt", "line1\nX\nline3\n");
+        git(&root, &["commit", "-am", "x"]);
+
+        git(&root, &["checkout", "main"]);
+        git(&root, &["checkout", "-b", "feature/y"]);
+        write(&root, "conflict.txt", "line1\nY\nline3\n");
+        git(&root, &["commit", "-am", "y"]);
+        git(&root, &["checkout", "main"]);
+
+        // feature/z stacks on top of feature/y so the resolved-conflict
+        // branch (feature/y) is never the final one in the stack -- this is
+        // the case the old wording got wrong under proof_scope="final_branch".
+        git(&root, &["checkout", "-b", "feature/z", "feature/y"]);
+        write(&root, "other.txt", "z\n");
+        git(&root, &["add", "other.txt"]);
+        git(&root, &["commit", "-m", "z"]);
+        git(&root, &["checkout", "main"]);
+
+        struct MarkerStrippingRunner {
+            specs: Arc<Mutex<Vec<RunnerSpec>>>,
+        }
+        impl Runner for MarkerStrippingRunner {
+            fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+                self.specs.lock().unwrap().push(spec.clone());
+                let cwd = PathBuf::from(&spec.cwd);
+                if let Ok(entries) = std::fs::read_dir(&cwd) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if content.contains("<<<<<<<") {
+                                    let cleaned: String = content
+                                        .lines()
+                                        .filter(|l| {
+                                            !l.starts_with("<<<<<<<")
+                                                && !l.starts_with("=======")
+                                                && !l.starts_with(">>>>>>>")
+                                        })
+                                        .map(|l| format!("{l}\n"))
+                                        .collect();
+                                    let _ = std::fs::write(&path, cleaned);
+                                }
+                            }
+                        }
+                    }
+                }
+                RunnerResult {
+                    retry_after_secs: None,
+                    status: "done".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
+                    cost_usd: 0.0,
+                    cost_is_estimated: false,
+                    summary: "resolved".into(),
+                    error: None,
+                    proofed: spec.proof.then_some(true),
+                    agent_session_id: None,
+                    ghost: None,
+                    turns: None,
+                }
+            }
+        }
+
+        let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+        let guardian_id = {
+            let g = store.lock();
+            let id = g
+                .create_guardian("scope-agnostic-prompt", "main", root.to_str().unwrap())
+                .unwrap();
+            // feature/x rebases cleanly; feature/y (stacked on top) conflicts
+            // and is resolved by the fake agent; feature/z stacks on top of
+            // feature/y, so feature/y is never the final branch in the stack.
+            g.add_guardian_branch(&id, "feature/x").unwrap();
+            g.add_guardian_branch(&id, "feature/y").unwrap();
+            g.add_guardian_branch(&id, "feature/z").unwrap();
+            g.set_guardian_proof_scope(&id, scope).unwrap();
+            id
+        };
+
+        let captured: Arc<Mutex<Vec<RunnerSpec>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner = MarkerStrippingRunner {
+            specs: captured.clone(),
+        };
+
+        run_merge(&store, &runner, &guardian_id);
+
+        let specs = captured.lock().unwrap();
+        let resolve = specs
+            .iter()
+            .find(|s| s.task == "resolve")
+            .expect("resolve spec not found — conflict resolver was never invoked");
+        let sys = resolve.system_prompt.clone().unwrap_or_default();
+
+        let _ = std::fs::remove_dir_all(&root);
+        sys
+    }
+
+    let each_branch = resolver_prompt_for_scope(Some("each_branch"));
+    let final_branch_non_final = resolver_prompt_for_scope(Some("final_branch"));
+    let nothing = resolver_prompt_for_scope(Some("nothing"));
+
+    for (label, sys) in [
+        ("each_branch", &each_branch),
+        ("final_branch (non-final branch)", &final_branch_non_final),
+        ("nothing", &nothing),
+    ] {
+        assert!(
+            !sys.contains("a dedicated proof pass runs afterward"),
+            "[{label}] resolver system prompt must not promise a dedicated proof pass \
+             will follow, since that isn't true under every proof_scope:\n{sys}"
+        );
+        assert!(
+            sys.contains("that is not this pass's job"),
+            "[{label}] resolver system prompt must use scope-agnostic framing \
+             that doesn't promise a specific follow-up action:\n{sys}"
+        );
+    }
+
+    assert_eq!(
+        each_branch, final_branch_non_final,
+        "resolver system prompt must not vary by proof_scope"
+    );
+    assert_eq!(
+        each_branch, nothing,
+        "resolver system prompt must not vary by proof_scope"
+    );
+}
+
 #[test]
 fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
     // RAL-457: the conflict-resolver system prompt no longer instructs a

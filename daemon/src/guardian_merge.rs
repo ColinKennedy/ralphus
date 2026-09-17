@@ -105,9 +105,9 @@ pub(crate) const CONFLICT_RESOLVER_SYSTEM_PROMPT: &str = "You are a git merge-co
                 RALPHUS_STAGE: DONE\n\
              \n\
              Do NOT run formatters, linters, or tests, and do NOT attempt to fix quality \
-             issues beyond resolving the conflict markers themselves -- a dedicated \
-             proof pass runs afterward and will handle formatting/linting/testing, \
-             including auto-fixing any failures it finds. Do NOT call `git rebase --continue`, \
+             issues beyond resolving the conflict markers themselves -- that is not this \
+             pass's job, and whether/how formatting, linting, and testing get checked \
+             afterward is decided elsewhere. Do NOT call `git rebase --continue`, \
              `git commit`, `git push`, or any other git command besides `git status` and \
              `git add`. The orchestrator advances the rebase as soon as it sees \
              RALPHUS_STAGE: DONE in your output.";
