@@ -2271,6 +2271,11 @@ fn run_cell_worker(
                     // targets (that's only read by remote worktree
                     // provisioning) -- empty is correct here, not a stub.
                     targets: &std::collections::BTreeMap::new(),
+                    // RAL-460: `resolve_placeholders` already resolved this
+                    // cell's `cwd` (real path, or an untouched literal) before
+                    // any cell dispatched -- lets an `environment` value link
+                    // to it via "<<ralphus:link/cwd>>".
+                    cwd: row.cwd.as_deref(),
                     // No prefetch pass covers env-override placeholders (a
                     // rarer case than a cell's own cwd) -- an unresolved
                     // registered-remote bare upstream here falls back to a
@@ -3880,6 +3885,10 @@ fn run_proofs(
                         // See the sibling call site above: env-override
                         // placeholder expansion never reads machine targets.
                         targets: &std::collections::BTreeMap::new(),
+                        // RAL-460: same already-resolved `cwd` this proof
+                        // scope's cell/task-representative-cell runs in --
+                        // see the sibling call site above.
+                        cwd: Some(cwd),
                         // See the sibling call site above: no prefetch pass
                         // covers env-override placeholders; a miss here falls
                         // back to a live fetch under this lock, unchanged
