@@ -5974,7 +5974,9 @@ pub fn run_feedback(
     let prompt = format!(
         "You are revising branch '{feature}' in response to reviewer feedback. \
          Edit the files in this worktree to satisfy the feedback, then stop. \
-         Feedback: {feedback}. Do not run any git commands."
+         Feedback: {feedback}. You may run read-only git commands (e.g. `git \
+         status`, `git diff`, `git log`) to inspect the worktree or the change \
+         so far, but do not commit or push -- a separate step handles that."
     );
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),

@@ -211,6 +211,13 @@ What sending feedback routes:
   quick-start prompt states this in its CRITICAL paragraph precisely because
   prior sessions reached for the visible, writable worktree instead of the
   command.
+- **The resolver's own git-command boundary.** The automated resolver
+  `review feedback` dispatches into the branch's worktree may run read-only
+  git commands (`git status`, `git diff`, `git log`, etc.) to inspect the
+  worktree or the diff so far — that's allowed and often necessary to make an
+  accurate, scoped edit. It must not commit or push itself; a separate,
+  dedicated commit-step call stages and commits the genuine part of the
+  diff afterward, preserving the same gating and audit trail.
 - **Why the word itself feels loaded:** in the board's per-branch feedback
   threads, a human types a note and the guardian agent applies it — the word
   appears in every review conversation, but nothing parses it. It routes
