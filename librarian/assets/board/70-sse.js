@@ -519,6 +519,14 @@
       // `scheduleSseRefresh`. A much slower 60s `setInterval(tick, ...)`
       // stays as a reconciliation fallback for a missed/dropped event -- see
       // the bottom of this script.
+      /**
+       * The live `/api/events` connection, tracked so a tab that regains
+       * visibility (see the `visibilitychange` handler below) can tell
+       * whether it needs to reconnect instead of trusting that the 60s
+       * fallback alone will catch up.
+       * @type {EventSource|null}
+       */
+      let currentEventSource = null;
       /** @type {ReturnType<typeof setTimeout>|null} */
       let sseRefreshTimer = null;
       /** @type {Set<string>} event kinds ("squad"/"guardian"/"other") seen since the last flush */
@@ -655,10 +663,12 @@
           return;
         }
         const es = new EventSource(`/api/events?ticket=${encodeURIComponent(ticket)}`);
+        currentEventSource = es;
         es.onopen = () => { byId("conn").className = "dot on"; };
         es.onerror = () => {
           byId("conn").className = "dot off";
           es.close();
+          if (currentEventSource === es) currentEventSource = null;
           setTimeout(connectEventStream, SSE_RECONNECT_DELAY_MS);
         };
         /**
@@ -677,6 +687,20 @@
         es.addEventListener("guardian", (e) => onEvent(/** @type {MessageEvent} */ (e), "guardian"));
         es.addEventListener("other", (e) => onEvent(/** @type {MessageEvent} */ (e), "other"));
       }
+      // A backgrounded/minimized tab has both its `setInterval` fallback and
+      // (per browser) its SSE delivery throttled or fully paused -- without
+      // this, a tab left in the background across a dropped connection can
+      // sit on stale data indefinitely, since nothing ever runs to notice the
+      // connection is dead or to catch up once it's looked at again. Firing
+      // an immediate reconcile plus a connection-health check the moment the
+      // tab becomes visible closes that gap without waiting on the 60s timer.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") return;
+        tick();
+        if (!currentEventSource || currentEventSource.readyState === EventSource.CLOSED) {
+          connectEventStream();
+        }
+      });
       /**
        * Resolves a pending hash route's squad reference against the loaded squad
        * list: a squad id, or — for a hand-written RAL-188 URI that omitted the
