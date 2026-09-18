@@ -283,12 +283,7 @@ fn seed_worktree_retirement_fixture(store: &mut Store, count: usize) -> usize {
                 .id
                 .clone();
             store
-                .set_branch_review(
-                    &id,
-                    &branch_id_2,
-                    "review-branch-2",
-                    &format!("{root}/wt2"),
-                )
+                .set_branch_review(&id, &branch_id_2, "review-branch-2", &format!("{root}/wt2"))
                 .expect("set second branch review");
             records += 1;
         }

@@ -2042,7 +2042,6 @@ fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
 /// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`).
 fn board(daemon: &Daemon, query: &str) -> Reply {
     let mut timer = perf_timing::PhaseTimer::start();
-    let read_started = Instant::now();
     let (squads, merging) = match daemon.read_board_snapshot() {
         Ok(v) => v,
         Err(e) => return store_error(&e),

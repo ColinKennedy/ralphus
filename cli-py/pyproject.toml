@@ -66,6 +66,7 @@ ignore_missing_imports = true
 ignore_names = [
     "do_GET",
     "do_POST",
+    "pytestmark",
 ]
 
 [tool.pytest.ini_options]
