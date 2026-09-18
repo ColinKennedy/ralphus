@@ -20,6 +20,7 @@ use ralphus_core::validate::{ValidationError, validate_toml};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::Cancellations;
+use crate::perf_timing;
 use crate::procreg::ProcRegistry;
 use crate::runner::{Runner, SubprocessRunner};
 use crate::scheduler::Semaphore;
@@ -465,12 +466,18 @@ pub struct Reply {
     pub status: u16,
     /// JSON body.
     pub body: String,
+    /// RAL-414: an opt-in `Server-Timing` header value (see
+    /// `crate::perf_timing`), set only when `RALPHUS_BOARD_TIMING` is
+    /// enabled and the handler recorded at least one phase. `None` for
+    /// every un-instrumented handler and whenever timing is disabled.
+    pub server_timing: Option<String>,
 }
 
 fn json<T: Serialize>(status: u16, value: &T) -> Reply {
     Reply {
         status,
         body: serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        server_timing: None,
     }
 }
 
@@ -2028,20 +2035,18 @@ fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
     }
 }
 
+///
+/// Drives the Squads tab and (via `fetchTasksShared()`) the header task
+/// counter; this is the board's heaviest, least-bounded payload -- every
+/// squad ever submitted, every time -- so it carries the same RAL-414 stage
+/// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`).
 fn board(daemon: &Daemon, query: &str) -> Reply {
-    // Served from the read pool, not the writer lock. This is the single
-    // largest response the daemon produces (megabytes once a real squad
-    // history has accumulated) and every open board polls it, so running it
-    // under the daemon-wide mutex stalled the scheduler, every
-    // guardian-merge worker, and every mutation for its whole duration.
-    // `read_board_snapshot` reads both halves inside one read transaction,
-    // which is what preserves the atomicity the mutex used to provide.
-    let read_started = Instant::now();
+    let mut timer = perf_timing::PhaseTimer::start();
     let (squads, merging) = match daemon.read_board_snapshot() {
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let view_ms = read_started.elapsed().as_millis();
+    timer.phase(perf_timing::PHASE_LOCK_WAIT);
     // Ground truth is the shared concurrency semaphore, not a DB row count:
     // a permit is held for a cell/proof/review-merge's entire time in
     // flight, which outlasts the windows where any single row actually reads
@@ -2057,8 +2062,8 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
     let mut squads =
         filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
     strip_prompt_text(&mut squads);
-    let serialize_started = Instant::now();
-    let reply = json(
+    timer.phase(perf_timing::PHASE_VIEW);
+    let mut reply = json(
         200,
         &Board {
             daemon: DaemonStatus {
@@ -2070,18 +2075,13 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
             squads,
         },
     );
-    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
-    crate::rlog!(
-        INFO,
-        "ralphus [performance] board read={}ms serialize={}ms bytes={}",
-        view_ms,
-        serialize_started.elapsed().as_millis(),
-        reply.body.len()
-    );
+    timer.phase(perf_timing::PHASE_SERIALIZE);
+    reply.server_timing = timer.finish("board", reply.body.len());
     reply
 }
 
-/// Compact cross-squad task data for the Tasks tab, with stage timings that
+/// Compact cross-squad task data for the Tasks tab, with stage timings (RAL-
+/// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
 /// separate store-lock contention, view construction, and serialization.
 fn task_index(daemon: &Daemon) -> Reply {
     // Same read as `board` above, served from the same pooled snapshot --
@@ -2089,12 +2089,12 @@ fn task_index(daemon: &Daemon) -> Reply {
     // returns, so there is no reason for it to take the writer lock either.
     // The Tasks tab polls it, and `updateCounter` polls it from every other
     // tab, so it is nearly as hot as `/api/tasks` itself.
-    let read_started = Instant::now();
+    let mut timer = perf_timing::PhaseTimer::start();
     let (squads, merging) = match daemon.read_board_snapshot() {
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let view_ms = read_started.elapsed().as_millis();
+    timer.phase(perf_timing::PHASE_LOCK_WAIT);
     let running = daemon.sem.in_use();
     let running_reviews = merging
         .into_iter()
@@ -2109,16 +2109,10 @@ fn task_index(daemon: &Daemon) -> Reply {
         },
         squads: squads.into_iter().map(Into::into).collect(),
     };
-    let serialize_started = Instant::now();
-    let reply = json(200, &response);
-    // ralphus[ignore-rlog-pair]: per-poll perf timing on a hot GET endpoint; a Cartographer row per request would flood the table
-    crate::rlog!(
-        INFO,
-        "ralphus [performance] task-index read={}ms serialize={}ms bytes={}",
-        view_ms,
-        serialize_started.elapsed().as_millis(),
-        reply.body.len()
-    );
+    timer.phase(perf_timing::PHASE_VIEW);
+    let mut reply = json(200, &response);
+    timer.phase(perf_timing::PHASE_SERIALIZE);
+    reply.server_timing = timer.finish("task-index", reply.body.len());
     reply
 }
 
@@ -3466,9 +3460,20 @@ fn list_triage_candidates(daemon: &Daemon) -> Reply {
     }
 }
 
+/// `GET /api/projects` — drives the Projects tab. RAL-414 stage timing (opt
+/// in with `RALPHUS_BOARD_TIMING`); no `view` phase since the store method
+/// returns the wire shape directly.
 fn list_projects(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_projects() {
-        Ok(projects) => json(200, &ProjectsResponse { projects }),
+    let mut timer = perf_timing::PhaseTimer::start();
+    let store = daemon.lock();
+    timer.phase(perf_timing::PHASE_LOCK_WAIT);
+    match store.list_projects() {
+        Ok(projects) => {
+            let mut reply = json(200, &ProjectsResponse { projects });
+            timer.phase(perf_timing::PHASE_SERIALIZE);
+            reply.server_timing = timer.finish("projects", reply.body.len());
+            reply
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -4497,9 +4502,27 @@ fn list_all_project_forks(daemon: &Daemon) -> Reply {
 /// `failed`/`deferred`/`opted_out`/`retired`, see
 /// [`crate::guardian_merge::WorktreeRetirementEntry`]), plus durable history
 /// for already-removed worktrees.
+///
+/// This view was once the board's worst cold-load offender: deriving it used
+/// to be O(records * (retirements + claims)) and froze every other endpoint
+/// (the whole daemon runs under one store lock) for over a minute once a
+/// project accumulated a few hundred worktrees of history -- see
+/// `guardian_merge::worktree_retirement_view`'s doc comment. Carries RAL-414
+/// stage timing (opt in with `RALPHUS_BOARD_TIMING`) so a future regression
+/// at this same scale shows up as a `view` phase spike, not just a slow
+/// request.
 fn worktree_retirements(daemon: &Daemon) -> Reply {
-    match crate::guardian_merge::worktree_retirement_view(&daemon.lock()) {
-        Ok(view) => json(200, &view),
+    let mut timer = perf_timing::PhaseTimer::start();
+    let store = daemon.lock();
+    timer.phase(perf_timing::PHASE_LOCK_WAIT);
+    match crate::guardian_merge::worktree_retirement_view(&store) {
+        Ok(view) => {
+            timer.phase(perf_timing::PHASE_VIEW);
+            let mut reply = json(200, &view);
+            timer.phase(perf_timing::PHASE_SERIALIZE);
+            reply.server_timing = timer.finish("worktree-retirements", reply.body.len());
+            reply
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -14290,11 +14313,18 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     let handler_ms = handler_started.elapsed().as_millis();
     let lock_wait_ms = crate::store_lock::take_request_lock_wait_ms();
     let status = reply.status;
+    let server_timing = reply.server_timing;
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("valid header");
     let mut response = tiny_http::Response::from_string(reply.body)
         .with_status_code(status)
         .with_header(header);
+    // RAL-414: only present when `RALPHUS_BOARD_TIMING` is enabled and the
+    // handler recorded at least one phase (see `crate::perf_timing`) --
+    // absent otherwise, so this adds no header on the default hot path.
+    if let Some(timing) = &server_timing {
+        response = response.with_header(cors_header(b"Server-Timing", timing.as_str()));
+    }
     if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
         for h in cors_response_headers(origin) {
             response = response.with_header(h);
