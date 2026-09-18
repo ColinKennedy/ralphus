@@ -99,6 +99,7 @@
               task,
               name: task.name,
               state: task.state,
+              project: task.project,
               cells: task.cells || [],
               reviews,
               reviewBadge: ttPickReviewBadge(reviews),
@@ -749,18 +750,36 @@
       // project shown), unlike the status filter's "empty means hide
       // everything" -- the project universe grows over time (new
       // registrations) so a first-time visitor must see every project
-      // without opting in project-by-project. Kept outside the
-      // RALPHUS-TT-FILTER-SELECTION-SCROLL region above (like `ttOpenColMenu`
-      // et al.) since it touches `document` directly, which the region's own
-      // sandboxed test harness (board-filter-selection-scroll.mjs) never stubs.
+      // without opting in project-by-project. The dropdown's project-name
+      // source is `registeredProjectNames`, refreshed from `GET /api/projects`
+      // on every poll of the Tasks tab (75-projects-machines.js) -- never a
+      // stale snapshot (RAL-332: reads are open to every caller; only
+      // mutations are admin-gated).
       /**
-       * Toggles one project in/out of the Tasks tab's filter, from the project dropdown's checkbox list. Updates the open dropdown's checkmarks in place rather than closing it. Re-centers the retained selection (RAL-383).
+       * Renders the Tasks toolbar's project filter: a button that opens the
+       * multi-select checkbox dropdown (RAL-345), followed by one removable
+       * chip per selected project (X on the left, matching the Squads/Triage
+       * chips). Called from `renderTasksTab` on every poll so the chips
+       * always reflect the live selection.
+       * @returns {void}
+       */
+      function renderTtProjectFilter() {
+        const chips = [...taskTabFilters.projects].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="ttToggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
+        byId("tt-project-filter").innerHTML = `<button type="button" class="btn" onclick="ttOpenProjectFilterMenu(event)" data-tip="Filter tasks by project. No projects selected shows every project.">Project ▾</button>${chips}`
+          + (taskTabFilters.projects.size ? `<span class="chip" onclick="ttClearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
+      }
+      /**
+       * Toggles one project in/out of the Tasks tab's filter, from the
+       * dropdown's checkbox list (RAL-345). The open dropdown stays open
+       * (its checkmarks update natively) so picking several projects in a
+       * row is a single visit; the table re-renders and the selection is
+       * re-persisted to the URL hash.
        * @param {string} name
        * @param {boolean} on
        * @returns {void}
        */
       function ttToggleProjectFilter(name, on) {
-        if (on) taskTabFilters.project.add(name); else taskTabFilters.project.delete(name);
+        if (on) taskTabFilters.projects.add(name); else taskTabFilters.projects.delete(name);
         renderTasksTab();
         ttScrollSelectionIntoView();
         syncHash();
@@ -768,45 +787,43 @@
         if (menu) menu.innerHTML = ttProjectFilterMenuRowsHtml();
       }
       /**
-       * Clears the Tasks tab's project filter back to "no filter" (every project shown). Re-centers the retained selection (RAL-383).
+       * Clears the Tasks tab's project filter back to "no filter" (every project shown).
        * @returns {void}
        */
       function ttClearProjectFilter() {
-        taskTabFilters.project = new Set();
+        taskTabFilters.projects.clear();
         ttCloseProjectFilterMenu();
         renderTasksTab();
         ttScrollSelectionIntoView();
         syncHash();
       }
       /**
-       * Renders the Tasks toolbar's project-filter dropdown trigger and its removable chips (RAL-345) -- chip markup matches the Squads tab's `.filter-chip` exactly, per the ticket's "same as existing label-lists" instruction.
-       * @returns {void}
-       */
-      function renderTtProjectFilter() {
-        const chips = [...taskTabFilters.project].sort().map((p) => `<span class="filter-chip"><span class="x" onclick="ttToggleProjectFilter('${esc(p)}',false)" data-tip="Remove this project from the filter.">✕</span>${esc(p)}</span>`).join("");
-        byId("tt-project-filter").innerHTML = `<button type="button" class="btn" onclick="ttOpenProjectFilterMenu(event)" data-tip="Filter rows by project. No projects selected shows every project.">Project ▾</button>${chips}`
-          + (taskTabFilters.project.size ? `<span class="chip" onclick="ttClearProjectFilter()" data-tip="Clear the project filter -- show every project again.">clear</span>` : "");
-      }
-      /**
-       * Builds the checkbox rows for the Tasks toolbar's project-filter dropdown, alphabetical by registered project name (RAL-345).
+       * Builds the checkbox rows for the Tasks toolbar's project dropdown, alphabetical by registered project name (RAL-345).
        * @returns {string}
        */
       function ttProjectFilterMenuRowsHtml() {
-        const names = projects.map((p) => p.name).sort((a, b) => a.localeCompare(b));
+        const names = registeredProjectNames.slice().sort((a, b) => a.localeCompare(b));
         if (!names.length) return `<div style="color:var(--muted);cursor:default">No registered projects.</div>`;
         // A click on the row must not bubble to the document-level
         // ttCloseProjectFilterMenu listener -- otherwise the very click that's
         // meant to check the box also tears the menu down underneath it,
         // undermining the "stays open across individual clicks" design above.
-        return names.map((name) => `<div class="ctx-check ${taskTabFilters.project.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${taskTabFilters.project.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
+        return names.map((name) => `<div class="ctx-check ${taskTabFilters.projects.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${taskTabFilters.projects.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
       /**
-       * Opens the Tasks toolbar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
+       * Opens the Tasks toolbar's project dropdown (RAL-345), a `.ctx-menu`
+       * popup of project checkboxes, and dismisses any other open
+       * project/column menu first. A global click handler closes it on
+       * outside interaction; checkbox clicks keep it open so several
+       * projects can be picked in one visit.
        * @param {MouseEvent} e
        * @returns {void}
        */
       function ttOpenProjectFilterMenu(e) {
-        e.preventDefault(); e.stopPropagation(); ttCloseColMenu(); ttCloseProjectFilterMenu();
+        e.preventDefault(); e.stopPropagation();
+        ttCloseColMenu(); closeProjectFilterMenu(); triageCloseProjectFilterMenu();
+        const existing = document.getElementById("tt-project-filter-menu");
+        if (existing) { existing.remove(); return; }
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "tt-project-filter-menu";
         menu.innerHTML = ttProjectFilterMenuRowsHtml();
@@ -815,7 +832,10 @@
         menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
         menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 360) + "px";
       }
-      /** Closes the Tasks toolbar's project-filter dropdown, if open. @returns {void} */
+      /**
+       * Closes the Tasks toolbar's project dropdown, if open.
+       * @returns {void}
+       */
       function ttCloseProjectFilterMenu() { const m = document.getElementById("tt-project-filter-menu"); if (m) m.remove(); }
       document.addEventListener("click", ttCloseProjectFilterMenu);
       // RALPHUS-TT-PROJECT-FILTER-MENU:END
