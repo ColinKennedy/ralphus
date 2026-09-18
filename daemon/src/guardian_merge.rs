@@ -1241,19 +1241,28 @@ fn resolver_model_chain(
 }
 
 /// [`resolve_resolver_agent`] without a `Store`: resolves a review's resolver
-/// agent through `.ralphus.toml` agent profiles using file config only, with
-/// no database-backed project defaults (RAL-408).
+/// agent to a bare built-in backend only (RAL-460 -- agent profiles live in
+/// the daemon's store now, and this call site has none in reach), with no
+/// database-backed project defaults either (RAL-408).
 ///
 /// Backs `pr.rs`'s best-effort PR-title/description synthesis, which runs from
 /// a `GuardianView` with no store handle in reach -- see [`resolver_agent`]'s
-/// doc comment for why that call site doesn't warrant the extra plumbing.
+/// doc comment for why that call site doesn't warrant the extra plumbing. A
+/// guardian configured with a *custom* resolver profile falls back to this
+/// function's error path (same as an unknown name) for this one cosmetic
+/// synthesis step only -- the real conflict-resolution path
+/// ([`resolve_resolver_agent`]) is unaffected, since it always has a store.
 pub(crate) fn resolve_resolver_agent_from_config(
     stored_agent: Option<&str>,
     stored_model: Option<&str>,
     cwd: &Path,
 ) -> Result<ResolvedResolverAgent, String> {
     let raw = resolver_agent(stored_agent, cwd);
-    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
+    // RAL-460: agent profiles moved from `.ralphus.toml` into the daemon's
+    // store, and this call site has no store handle in reach (see the doc
+    // comment above) -- only a bare built-in backend name resolves here
+    // now; a custom profile name is indistinguishable from unknown.
+    let selection = crate::agent_profiles::resolve_builtin_agent_only(&raw)?;
     let config_default = crate::config::resolve(cwd)
         .default_resolver_model()
         .map(ToString::to_string);
@@ -1307,7 +1316,10 @@ fn resolve_resolver_agent(
         .map(ToString::to_string)
         .or_else(|| std::env::var("RALPHUS_RESOLVER_AGENT").ok())
         .unwrap_or_else(|| db_cfg.default_resolver_agent().to_string());
-    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
+    let selection = {
+        let guard = store.lock();
+        crate::agent_profiles::resolve_agent(&raw, &guard)
+    }?;
     let model = resolver_model_chain(
         stored_model,
         &selection,
@@ -11396,40 +11408,46 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // An agent profile's own `model` reaches the resolver
+    // An agent profile's own `model` reaches the resolver (RAL-460: profiles
+    // now live in the daemon's store, not `.ralphus.toml` -- these all go
+    // through the database-backed `resolve_resolver_agent`, which is the
+    // path a real review's merge actually runs through. The no-store
+    // `resolve_resolver_agent_from_config` can no longer resolve a custom
+    // profile at all -- see the test at the end of this section.)
     //
     // A profile like `backend = "pi", model = "openrouter/..."` resolved to
     // `model: None`, so the backend CLI was launched with no `--model` and
-    // silently billed against its own built-in default model instead. Written
-    // against a project-local `.ralphus.toml` (the highest-precedence profile
-    // layer) so an ambient `$RALPHUS_CONFIGURATION_PATH` cannot shadow it.
+    // silently billed against its own built-in default model instead.
     // -----------------------------------------------------------------------
 
-    fn dir_with_pi_profile(label: &str, extra: &str) -> PathBuf {
-        let dir = tmp_dir(label);
-        std::fs::write(
-            dir.join(".ralphus.toml"),
-            format!(
-                "[agent.profiles.pi-openrouter-deepseek]\n\
-                 backend = \"pi\"\n\
-                 model = \"openrouter/deepseek/deepseek-v4-flash-0731\"\n\
-                 \n\
-                 [agent.profiles.pi-openrouter-deepseek.env]\n\
-                 OPENROUTER_API_KEY = \"key-from-profile\"\n\
-                 {extra}"
-            ),
-        )
-        .unwrap();
-        dir
+    fn store_with_pi_profile() -> Arc<crate::store_lock::StoreMutex> {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .upsert_agent_profile(
+                "pi-openrouter-deepseek",
+                "pi",
+                None,
+                Some("openrouter/deepseek/deepseek-v4-flash-0731"),
+                &[crate::agent_profiles::AgentProfileEnvVar {
+                    key: "OPENROUTER_API_KEY".to_string(),
+                    kind: crate::agent_profiles::EnvValueKind::Literal,
+                    value: "key-from-profile".to_string(),
+                }],
+            )
+            .expect("upsert profile");
+        store
     }
 
     #[test]
     fn profile_model_is_used_when_the_review_stores_no_model_of_its_own() {
-        let dir = dir_with_pi_profile("resolver-profile-model", "");
+        let dir = tmp_dir("resolver-profile-model");
+        let store = store_with_pi_profile();
 
-        let resolved =
-            resolve_resolver_agent_from_config(Some("pi-openrouter-deepseek"), None, &dir)
-                .expect("profile resolves");
+        let resolved = resolve_resolver_agent(Some("pi-openrouter-deepseek"), None, &store, &dir)
+            .expect("profile resolves");
 
         assert_eq!(resolved.backend, "pi");
         assert!(resolved.custom_profile);
@@ -11451,49 +11469,16 @@ mod tests {
     fn profile_model_beats_an_agent_blind_project_default() {
         // `default_resolver_model` says nothing meaningful about a `pi`
         // profile, so it must not displace the profile's own model.
-        let dir = dir_with_pi_profile(
-            "resolver-profile-model-vs-default",
-            "\n[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n",
-        );
-
-        assert_eq!(
-            resolved_model(None, "pi-openrouter-deepseek", &dir),
-            Some("openrouter/deepseek/deepseek-v4-flash-0731".to_string())
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_stored_review_model_still_wins_over_the_profile_model() {
-        let dir = dir_with_pi_profile("resolver-profile-model-overridden", "");
-
-        assert_eq!(
-            resolved_model(
-                Some("openrouter/z-ai/glm-5.3-flash"),
-                "pi-openrouter-deepseek",
-                &dir
-            ),
-            Some("openrouter/z-ai/glm-5.3-flash".to_string())
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The conflict-resolution path (database-backed project defaults, RAL-408)
-    /// must reach the same model as the file-config path above -- this is the
-    /// resolution a real review's merge actually runs through.
-    #[test]
-    fn profile_model_reaches_the_database_backed_resolver_path_too() {
-        let dir = dir_with_pi_profile("resolver-profile-model-db", "");
-        let store = Arc::new(crate::store_lock::StoreMutex::new(
-            Store::open_in_memory().unwrap(),
-        ));
+        let dir = tmp_dir("resolver-profile-model-vs-default");
+        std::fs::write(
+            dir.join(".ralphus.toml"),
+            "[review]\ndefault_resolver_model = \"claude-haiku-4-5\"\n",
+        )
+        .unwrap();
+        let store = store_with_pi_profile();
 
         let resolved = resolve_resolver_agent(Some("pi-openrouter-deepseek"), None, &store, &dir)
             .expect("profile resolves");
-
-        assert_eq!(resolved.backend, "pi");
         assert_eq!(
             resolved.model.as_deref(),
             Some("openrouter/deepseek/deepseek-v4-flash-0731")
@@ -11503,19 +11488,56 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_review_model_still_wins_over_the_profile_model() {
+        let dir = tmp_dir("resolver-profile-model-overridden");
+        let store = store_with_pi_profile();
+
+        let resolved = resolve_resolver_agent(
+            Some("pi-openrouter-deepseek"),
+            Some("openrouter/z-ai/glm-5.3-flash"),
+            &store,
+            &dir,
+        )
+        .expect("profile resolves");
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some("openrouter/z-ai/glm-5.3-flash")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_profile_without_a_model_still_resolves_to_the_backends_own_default() {
         let dir = tmp_dir("resolver-profile-no-model");
-        std::fs::write(
-            dir.join(".ralphus.toml"),
-            "[agent.profiles.pi-plain]\nbackend = \"pi\"\n",
-        )
-        .unwrap();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .upsert_agent_profile("pi-plain", "pi", None, None, &[])
+            .expect("upsert profile");
 
-        let resolved = resolve_resolver_agent_from_config(Some("pi-plain"), None, &dir)
-            .expect("profile resolves");
+        let resolved =
+            resolve_resolver_agent(Some("pi-plain"), None, &store, &dir).expect("profile resolves");
         assert_eq!(resolved.backend, "pi");
         assert_eq!(resolved.model, None);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_resolver_agent_from_config_cannot_resolve_a_custom_profile() {
+        // RAL-460: this call site has no Store handle in reach, and profiles
+        // no longer have a TOML fallback -- a custom profile name is
+        // indistinguishable from an unknown one here now.
+        let dir = tmp_dir("resolver-from-config-no-store");
+        let result = resolve_resolver_agent_from_config(Some("pi-openrouter-deepseek"), None, &dir);
+        let err = match result {
+            Ok(_) => panic!("a custom profile cannot resolve without a Store"),
+            Err(e) => e,
+        };
+        assert!(err.contains("pi-openrouter-deepseek"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
