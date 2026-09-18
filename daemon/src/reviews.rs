@@ -1625,6 +1625,12 @@ fn add_new_branches(
 /// this is called; a cell with no resolved type yet is skipped rather than
 /// pooled with an unknown type (should not happen in the normal submit path).
 ///
+/// A firing pool's reviews ask `orderer` for a semantic order of their
+/// candidates (RAL-412) exactly like the cron-drain path: see
+/// [`fire_triage_pool_in_threshold_batches`]. Production callers pass the
+/// configured-Arbiter request (`arbiter_pool_order`); tests substitute a
+/// canned closure.
+///
 /// Race-safety: the threshold-check here and the scheduler's independent
 /// cron-check race on the same pool, but both ultimately call
 /// [`Store::drain_triage_pool`], a single atomic `DELETE ... RETURNING`
@@ -1640,6 +1646,7 @@ pub fn derive_triage_pools(
     store: &Store,
     squad_id: &str,
     file: &TaskFile,
+    orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
     if !file.task.iter().any(|t| t.cell.iter().any(|c| c.triage)) {
         return Ok(Vec::new());
@@ -1823,7 +1830,9 @@ pub fn derive_triage_pools(
             .get_triage_pool_threshold(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
         if threshold.is_some_and(|t| count >= t) {
-            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+            if let Some(gid) =
+                create_review_from_triage_pool(store, &project, &triage_type, &orderer)?
+            {
                 created.push(gid);
             }
         }
@@ -1858,7 +1867,11 @@ pub(crate) fn fire_ready_triage_thresholds(
             .get_triage_pool_threshold(&project, &triage_type)
             .map_err(|e| ReviewError::new(e.to_string()))?;
         if threshold.is_some_and(|t| count >= t) {
-            if let Some(gid) = create_review_from_triage_pool(store, &project, &triage_type)? {
+            if let Some(gid) =
+                create_review_from_triage_pool(store, &project, &triage_type, |cands| {
+                    arbiter_pool_order(store, cands)
+                })?
+            {
                 created.push(gid);
             }
         }
@@ -1872,6 +1885,11 @@ pub(crate) fn fire_ready_triage_thresholds(
 /// Returns `None` when the pool was already empty by the time this drained it
 /// -- not an error, just "someone else already fired it".
 ///
+/// The review asks `orderer` for a semantic order of its candidates
+/// (RAL-412): one aggregate Arbiter request carrying every candidate's
+/// bounded prompt context, applied when the reply is a valid permutation,
+/// otherwise the deterministic pool order.
+///
 /// `project` may be a plain project key or a RAL-346 `base::subproject`
 /// composite key -- either way the guardian's `git_root`/project identity
 /// resolves off [`crate::triage::base_project_key`], since a subproject is
@@ -1884,11 +1902,61 @@ pub(crate) fn create_review_from_triage_pool(
     store: &Store,
     project: &str,
     triage_type: &str,
+    orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Option<String>, ReviewError> {
     let drained = store
         .drain_triage_pool(project, triage_type)
         .map_err(|e| ReviewError::new(e.to_string()))?;
-    build_review_from_drained_pool(store, project, triage_type, drained)
+    build_review_from_drained_pool(store, project, triage_type, drained, orderer)
+}
+
+/// The production RAL-412 ordering request: ask the currently configured
+/// Arbiter (`crate::arbiter::Arbiter::current()`) to propose a semantic
+/// review order over the drained pool's stable candidate ids. Returns
+/// `None` on every failure path (budget cap, unsupported backend, transport
+/// error, or a reply that is not an exact permutation), which
+/// [`build_review_from_drained_pool`] treats as "keep the deterministic
+/// pool order".
+#[must_use]
+fn arbiter_pool_order(
+    store: &Store,
+    candidates: &[crate::arbiter::OrderingCandidate],
+) -> Option<Vec<String>> {
+    crate::arbiter::order_pooled_candidates(store, &crate::arbiter::Arbiter::current(), candidates)
+}
+
+/// Reorder `drained` to the Arbiter's proposed order (RAL-412): rows named
+/// in `proposed` (the pool's stable candidate ids, see
+/// [`crate::arbiter::ordering_candidate_id`]) move to `proposed`'s
+/// positions; any row not named — impossible for a validated permutation,
+/// defended against anyway for a misbehaving `orderer` — keeps its
+/// original pool-relative position. Every drained row appears exactly once
+/// in the result, so the review's linear branch stack can never omit or
+/// duplicate a pooled candidate.
+#[must_use]
+fn apply_arbiter_pool_order(
+    drained: Vec<crate::triage::TriagePoolCellRow>,
+    proposed: &[String],
+) -> Vec<crate::triage::TriagePoolCellRow> {
+    let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered: Vec<crate::triage::TriagePoolCellRow> = Vec::with_capacity(drained.len());
+    for id in proposed {
+        if !placed.insert(id.clone()) {
+            continue; // duplicate in a broken proposal: first position wins
+        }
+        if let Some(cell) = drained.iter().find(|c| {
+            crate::arbiter::ordering_candidate_id(&c.squad_id, c.task_idx, c.idx) == id.as_str()
+        }) {
+            ordered.push(cell.clone());
+        }
+    }
+    for cell in drained {
+        let id = crate::arbiter::ordering_candidate_id(&cell.squad_id, cell.task_idx, cell.idx);
+        if !placed.contains(&id) {
+            ordered.push(cell);
+        }
+    }
+    ordered
 }
 
 /// RAL-346: the Arbiter's cron straggler sweep. Unlike
@@ -1912,6 +1980,7 @@ pub(crate) fn create_review_from_triage_project_sweep(
     store: &Store,
     base_project: &str,
     triage_type: &str,
+    orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Option<String>, ReviewError> {
     let keys = crate::triage::project_pool_keys(store, base_project, triage_type);
     let mut drained = Vec::new();
@@ -1922,7 +1991,7 @@ pub(crate) fn create_review_from_triage_project_sweep(
                 .map_err(|e| ReviewError::new(e.to_string()))?,
         );
     }
-    build_review_from_drained_pool(store, base_project, triage_type, drained)
+    build_review_from_drained_pool(store, base_project, triage_type, drained, orderer)
 }
 
 /// Shared tail of [`create_review_from_triage_pool`]/
@@ -1931,11 +2000,23 @@ pub(crate) fn create_review_from_triage_project_sweep(
 /// from them. `pool_key` is used only for logging
 /// (the Cartographer note and its payload); the *real* project identity
 /// always resolves off [`crate::triage::base_project_key`].
+///
+/// RAL-412: with viable candidates in hand, every one contributes a bounded
+/// prompt excerpt to one aggregate Arbiter ordering request (`orderer`),
+/// and the proposed order — accepted only as an exact permutation of the
+/// pool's stable candidate ids — becomes the order its branches are
+/// attached in, i.e. the review's linear worktree/branch stack. `orderer`
+/// returning `None` (or a reply that fails validation) leaves the
+/// deterministic pool order, which is [`arbiter_pool_order`]'s default
+/// behavior; tests substitute a canned closure. The negligible cost of a
+/// failed/failed-validating request is that the review is simply created in
+/// pool order — every candidate still appears exactly once either way.
 fn build_review_from_drained_pool(
     store: &Store,
     pool_key: &str,
     triage_type: &str,
     drained: Vec<crate::triage::TriagePoolCellRow>,
+    orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Option<String>, ReviewError> {
     // Defense in depth: `drain_triage_pool` already selects only completed
     // cells. Keep that invariant here in case a future caller supplies rows
@@ -1953,6 +2034,34 @@ fn build_review_from_drained_pool(
     if drained.is_empty() {
         return Ok(None);
     }
+    // RAL-412: hand the Arbiter one bounded, labeled request covering every
+    // candidate's prompt context, and apply a validated proposed order. A
+    // cell whose prompt/command text can't be read (row absent, e.g. in a
+    // test, or a store hiccup) still participates by stable id with an empty
+    // excerpt -- it must never be dropped from the review.
+    let candidates: Vec<crate::arbiter::OrderingCandidate> = drained
+        .iter()
+        .map(|cell| {
+            let context = store
+                .get_cell_prompt_context(&cell.squad_id, cell.task_idx, cell.idx)
+                // A squad/cell row missing from the store (e.g. in a test
+                // fixture) contributes an empty context, never an error.
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let cell_id = store
+                .get_cell_id(&cell.squad_id, cell.task_idx, cell.idx)
+                .unwrap_or_default();
+            crate::arbiter::OrderingCandidate {
+                id: crate::arbiter::ordering_candidate_id(&cell.squad_id, cell.task_idx, cell.idx),
+                cell_id,
+                context,
+            }
+        })
+        .collect();
+    let drained = match orderer(&candidates) {
+        Some(proposed) => apply_arbiter_pool_order(drained, &proposed),
+        None => drained,
+    };
     let upstream = drained
         .first()
         .map(|c| c.upstream.clone())
@@ -2372,7 +2481,9 @@ pub fn repair_triage_pool_keys(store: &Store) {
             Err(_) => continue,
         };
         if threshold.is_some_and(|t| count >= t) {
-            match create_review_from_triage_pool(store, &project, &triage_type) {
+            match create_review_from_triage_pool(store, &project, &triage_type, |cands| {
+                arbiter_pool_order(store, cands)
+            }) {
                 Ok(Some(gid)) => crate::rlog!(
                     INFO,
                     "ralphus [triage] pool-key repair fired ({project}, {triage_type}) -> review {gid}"
@@ -2395,7 +2506,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_auto_build,
+        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order, apply_auto_build,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
         derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
         rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
@@ -3517,7 +3628,7 @@ print(json.dumps(result))
             .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
 
-        let gid = create_review_from_triage_pool(&store, "proj", "security")
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
         let g = store.get_guardian(&gid).unwrap();
@@ -3531,9 +3642,169 @@ print(json.dumps(result))
         // the scheduler tick and a concurrent submission's own threshold
         // check must both tolerate).
         assert!(
-            create_review_from_triage_pool(&store, "proj", "security")
+            create_review_from_triage_pool(&store, "proj", "security", |_| None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// RAL-412: the review's branch stack follows the Arbiter's proposed
+    /// semantic order rather than pool membership order.
+    #[test]
+    fn create_review_from_triage_pool_applies_the_proposed_semantic_order_to_the_branch_stack() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
+        let squad_3 = completed_pool_cell(&mut store);
+        store
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", &squad_3, 0, 0, "b3", "main")
+            .unwrap();
+        let gid = create_review_from_triage_pool(
+            &store,
+            "proj",
+            "security",
+            // A canned Arbiter reply proposing the exact reverse of pool order.
+            |cands| Some(cands.iter().map(|c| c.id.clone()).rev().collect::<Vec<_>>()),
+        )
+        .unwrap()
+        .expect("pool was non-empty, must create a review");
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.branches
+                .iter()
+                .map(|b| b.branch.clone())
+                .collect::<Vec<_>>(),
+            vec!["b3".to_string(), "b2".to_string(), "b1".to_string()],
+            "the Arbiter's proposed order becomes the review's branch-stack order"
+        );
+    }
+
+    /// RAL-412: a proposal that is not an exact permutation of the drained
+    /// pool must fall back to the deterministic pool order -- every candidate
+    /// still appears in the review exactly once, in pool order.
+    #[test]
+    fn create_review_from_triage_pool_falls_back_to_pool_order_for_an_invalid_proposal() {
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
+        store
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .unwrap();
+        let gid = create_review_from_triage_pool(
+            &store,
+            "proj",
+            "security",
+            // Not a permutation: names an id outside the pool and omits one.
+            |_| Some(vec!["made-up-id".to_string(), format!("{squad_1}/t0:c0")]),
+        )
+        .unwrap()
+        .expect("pool was non-empty, must create a review");
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.branches
+                .iter()
+                .map(|b| b.branch.clone())
+                .collect::<Vec<_>>(),
+            vec!["b1".to_string(), "b2".to_string()],
+            "an invalid proposal must not drop, duplicate, or reorder a candidate"
+        );
+    }
+
+    /// RAL-412: the whole-pool (cron/straggler) drain hands the Arbiter every
+    /// candidate's cell prompt context (prompt, else command), labeled with
+    /// the candidate's stable id.
+    #[test]
+    fn build_review_from_drained_pool_carries_each_candidates_prompt_context() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\nid=\"work\"\ncwd=\".\"\nprompt=\"fix the core module\"\n";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b-work", "main")
+            .unwrap();
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |cands| {
+            assert_eq!(cands.len(), 1, "one pooled cell, one candidate");
+            assert_eq!(
+                cands[0].id,
+                format!("{squad_id}/t0:c0"),
+                "the candidate id is the stable squad/task:cell form"
+            );
+            assert_eq!(
+                cands[0].context, "fix the core module",
+                "the cell's prompt is the candidate's context"
+            );
+            Some(vec![cands[0].id.clone()])
+        })
+        .unwrap()
+        .expect("pool was non-empty, must create a review");
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(g.branches.len(), 1);
+    }
+
+    /// RAL-412: `apply_arbiter_pool_order` is the safety net that turns any
+    /// proposal -- even one that is not an exact permutation -- into a
+    /// complete, duplication-free candidate ordering: proposed ids reorder
+    /// their rows, everything else keeps pool-relative order, and every row
+    /// appears exactly once.
+    #[test]
+    fn apply_arbiter_pool_order_defends_against_an_incomplete_or_duplicate_proposal() {
+        use crate::triage::TriagePoolCellRow;
+        let row = |(squad, t, i, branch): (&str, i64, i64, &str)| TriagePoolCellRow {
+            squad_id: squad.to_string(),
+            task_idx: t,
+            idx: i,
+            branch: branch.to_string(),
+            upstream: "main".to_string(),
+        };
+        let drained = vec![
+            row(("squad-1", 0, 0, "b1")),
+            row(("squad-2", 0, 0, "b2")),
+            row(("squad-3", 0, 0, "b3")),
+        ];
+        // Valid permutation: b3 then b1 then b2.
+        let ordered = apply_arbiter_pool_order(
+            drained.clone(),
+            &[
+                "squad-3/t0:c0".to_string(),
+                "squad-1/t0:c0".to_string(),
+                "squad-2/t0:c0".to_string(),
+            ],
+        );
+        assert_eq!(
+            ordered.iter().map(|c| c.branch.clone()).collect::<Vec<_>>(),
+            vec!["b3".to_string(), "b1".to_string(), "b2".to_string()]
+        );
+        // Broken proposal: duplicate of b2's id, one unknown id, b1 omitted.
+        let ordered = apply_arbiter_pool_order(
+            drained.clone(),
+            &[
+                "squad-3/t0:c0".to_string(),
+                "squad-2/t0:c0".to_string(),
+                "squad-2/t0:c0".to_string(),
+                "not-a-candidate".to_string(),
+            ],
+        );
+        assert_eq!(
+            ordered.iter().map(|c| c.branch.clone()).collect::<Vec<_>>(),
+            vec!["b3".to_string(), "b2".to_string(), "b1".to_string()],
+            "the unproposed row keeps its place and nothing is dropped or duplicated"
+        );
+        assert_eq!(
+            ordered.len(),
+            drained.len(),
+            "every drained candidate still appears exactly once"
         );
     }
 
@@ -3567,7 +3838,7 @@ print(json.dumps(result))
             .record_triage_pool_cell("proj", "security", &ok_squad, 0, 0, "b-ok", "main")
             .unwrap();
 
-        let gid = create_review_from_triage_pool(&store, "proj", "security")
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("one viable cell remains, must still create a review");
         let g = store.get_guardian(&gid).unwrap();
@@ -3646,7 +3917,7 @@ print(json.dumps(result))
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
-        let gid = create_review_from_triage_pool(&store, "proj", "security")
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
 
@@ -3733,7 +4004,7 @@ print(json.dumps(result))
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
-        let gid = create_review_from_triage_pool(&store, "proj", "security")
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
 
@@ -4036,7 +4307,7 @@ print(json.dumps(result))
             .unwrap();
 
         // No threshold configured yet: pools, but does not fire.
-        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        let created = derive_triage_pools(&store, &squad_id, &file, |_| None).unwrap();
         assert!(created.is_empty());
         let keys = store.triage_pool_keys().unwrap();
         assert_eq!(keys.len(), 1);
@@ -4061,7 +4332,7 @@ print(json.dumps(result))
         store
             .set_cell_triage_types(&squad_id_2, 0, 0, &["security".to_string()])
             .unwrap();
-        let created = derive_triage_pools(&store, &squad_id_2, &file).unwrap();
+        let created = derive_triage_pools(&store, &squad_id_2, &file, |_| None).unwrap();
         assert!(
             created.is_empty(),
             "pending work must not fire the threshold"
@@ -4115,7 +4386,7 @@ print(json.dumps(result))
             )
             .unwrap();
 
-        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        let created = derive_triage_pools(&store, &squad_id, &file, |_| None).unwrap();
         assert!(created.is_empty(), "no threshold configured yet");
         // The pool key's `project` resolves to the registered project's name
         // (RAL-318 bug 3 fix), so it agrees with a threshold set against
@@ -4194,7 +4465,7 @@ print(json.dumps(result))
             .set_cell_subprojects(&squad_a, 0, 0, &["core".to_string()], false)
             .unwrap();
         assert!(
-            derive_triage_pools(&store, &squad_a, &file)
+            derive_triage_pools(&store, &squad_a, &file, |_| None)
                 .unwrap()
                 .is_empty()
         );
@@ -4226,7 +4497,7 @@ print(json.dumps(result))
             )
             .unwrap();
         assert!(
-            derive_triage_pools(&store, &squad_b, &file)
+            derive_triage_pools(&store, &squad_b, &file, |_| None)
                 .unwrap()
                 .is_empty()
         );
@@ -4249,7 +4520,7 @@ print(json.dumps(result))
             .set_cell_subprojects(&squad_c, 0, 0, &["steam".to_string()], false)
             .unwrap();
         assert!(
-            derive_triage_pools(&store, &squad_c, &file)
+            derive_triage_pools(&store, &squad_c, &file, |_| None)
                 .unwrap()
                 .is_empty()
         );
@@ -4301,7 +4572,7 @@ print(json.dumps(result))
         // `Unresolved` even though the project IS configured as a monorepo.
 
         assert!(
-            derive_triage_pools(&store, &squad_id, &file)
+            derive_triage_pools(&store, &squad_id, &file, |_| None)
                 .unwrap()
                 .is_empty()
         );
@@ -4320,7 +4591,7 @@ print(json.dumps(result))
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\n";
         let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
         assert!(
-            derive_triage_pools(&store, "squad-1", &file)
+            derive_triage_pools(&store, "squad-1", &file, |_| None)
                 .unwrap()
                 .is_empty()
         );
@@ -4374,7 +4645,7 @@ print(json.dumps(result))
             .set_triage_pool_threshold(&triage_project, "security", Some(1))
             .unwrap();
 
-        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        let created = derive_triage_pools(&store, &squad_id, &file, |_| None).unwrap();
         assert!(created.is_empty(), "pending work must not create a review");
 
         // Completing the Triage candidate makes it eligible and re-checks the
@@ -4461,7 +4732,7 @@ print(json.dumps(result))
             .set_triage_pool_threshold(&triage_project, "security", Some(1))
             .unwrap();
 
-        let created = derive_triage_pools(&store, &squad_id, &file).unwrap();
+        let created = derive_triage_pools(&store, &squad_id, &file, |_| None).unwrap();
         assert!(created.is_empty(), "pending work must not create a review");
 
         store

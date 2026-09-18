@@ -1273,6 +1273,13 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
                 &guard,
                 &sched.project,
                 &sched.triage_type,
+                |cands| {
+                    crate::arbiter::order_pooled_candidates(
+                        &guard,
+                        &crate::arbiter::Arbiter::current(),
+                        cands,
+                    )
+                },
             ) {
                 Ok(Some(gid)) => crate::cartographer::Note::new("scheduler")
                     .guardian(&gid)
