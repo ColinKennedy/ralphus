@@ -222,7 +222,17 @@ def _failure_message(
 #: slow-but-completing one) is retried this many times before failing the
 #: test outright -- see `_cold_nav`'s doc comment for why this doesn't
 #: weaken the actual performance assertion.
-_MAX_ATTEMPTS = 2
+_MAX_ATTEMPTS = 3
+
+#: Playwright's own default (30s) has, on a contended CI runner, been
+#: observed to fire on a load that was still genuinely progressing rather
+#: than hung -- indistinguishable from a real hang until it's too late to
+#: tell the difference. Raising it gives a merely-slow (not stuck) load room
+#: to actually finish, at which point `BUDGET_MS` below -- a much stricter,
+#: separate wall-clock check -- still fails it correctly if it really was
+#: too slow. A load that's truly hung still eventually times out here and
+#: falls into `_cold_nav`'s retry.
+_NAV_TIMEOUT_MS = 90_000
 
 
 def _cold_nav(
@@ -253,6 +263,7 @@ def _cold_nav(
     last_error: Exception | None = None
     for _ in range(_MAX_ATTEMPTS):
         context = browser.new_context()
+        context.set_default_navigation_timeout(_NAV_TIMEOUT_MS)
         try:
             page = context.new_page()
             start = time.perf_counter()
