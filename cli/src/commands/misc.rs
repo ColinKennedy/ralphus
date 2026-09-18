@@ -1150,6 +1150,12 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
         _ => "?",
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let config = crate::config::load_config(&cwd, true);
+    let config_sources: Vec<String> = config
+        .sources
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
     let results = crate::health::run_checks(
         &opts.daemon_url,
         &cwd,
@@ -1168,6 +1174,7 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
             issues: Vec<String>,
         }
         let payload = serde_json::json!({
+            "configuration_sources": config_sources,
             "checks": results,
             "file_issues": file_issues.iter().map(|fi| FileIssueJson {
                 path: fi.path.display().to_string(),
@@ -1182,6 +1189,16 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
         return if failed > 0 { 1 } else { 0 };
+    }
+
+    if config_sources.is_empty() {
+        println!("Configuration: (none found; using built-in defaults)\n");
+    } else {
+        println!("Configuration:");
+        for src in &config_sources {
+            println!("  {src}");
+        }
+        println!();
     }
 
     for (section, title) in [
