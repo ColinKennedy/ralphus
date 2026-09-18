@@ -666,6 +666,15 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
     None
 }
 
+/// Human-readable label for each [`resolve_tmux_program_with_source`]
+/// resolution path -- shared with `ralphus check health`
+/// (`cli/src/health.rs`'s `check_tmux`), which reports this alongside the
+/// resolved value so a user can tell *why* a particular binary won without
+/// re-deriving the priority order themselves.
+pub const TMUX_SOURCE_ENV_OVERRIDE: &str = "RALPHUS_TMUX_CMD override";
+pub const TMUX_SOURCE_EMBEDDED: &str = "embedded psmux (vendored)";
+pub const TMUX_SOURCE_PATH: &str = "PATH";
+
 /// Resolve which tmux-compatible binary to invoke, per the priority in the
 /// module doc comment.
 ///
@@ -673,14 +682,23 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 /// Returns an error when no override is set, this build has no embedded
 /// fallback, and nothing named `tmux` is on `PATH`.
 pub fn resolve_tmux_program() -> Result<String, TmuxError> {
+    resolve_tmux_program_with_source().map(|(cmd, _source)| cmd)
+}
+
+/// Like [`resolve_tmux_program`], but also reports which resolution source
+/// won, as one of the `TMUX_SOURCE_*` labels above.
+///
+/// # Errors
+/// See [`resolve_tmux_program`].
+pub fn resolve_tmux_program_with_source() -> Result<(String, &'static str), TmuxError> {
     if let Ok(cmd) = std::env::var(TMUX_CMD_ENV) {
-        return Ok(cmd);
+        return Ok((cmd, TMUX_SOURCE_ENV_OVERRIDE));
     }
     if let Ok(path) = embedded::extract() {
-        return Ok(path.to_string_lossy().into_owned());
+        return Ok((path.to_string_lossy().into_owned(), TMUX_SOURCE_EMBEDDED));
     }
     if find_on_path("tmux").is_some() {
-        return Ok("tmux".to_string());
+        return Ok(("tmux".to_string(), TMUX_SOURCE_PATH));
     }
     Err(TmuxError(
         "no tmux-compatible binary found: this build has no embedded psmux (rebuild with \

@@ -157,7 +157,7 @@ list of candidates.
 | `graph [squad_id] [--global] [--all] [--format ascii\|dot]` | Render the task-order dependency graph |
 | `get <selector> [field.path]` | jq-lite field query over any entity's JSON view |
 | `clear [--all\|--status STATES] [--keep-temporary] [--yes]` | Bulk-delete tasks and reviews |
-| `check health [--enable-developer-checks]` | System/environment health check |
+| `check health [--enable-developer-checks] [--all-remotes] [--enable-live-agent-check]` | System/environment health check, grouped into Core/Harness/Machine sections. See [Check health](#check-health) below |
 | `completion bash` | Print a bash tab-completion script |
 | `configuration show [--no-local]` | Show sourced `.ralphus.toml` files and resolved values |
 | `task show-tutor` | Print the Task TOML schema reference |
@@ -188,6 +188,46 @@ aborts the remaining batch).
   TOML server-side either way, so this doesn't let anything through; it only
   trades the fuller pre-submit report for the daemon's single summary error
   message. To validate without submitting at all, use `ralphus validate`.
+
+### Check health
+
+`check health` groups every diagnostic into three sections, each clearly
+indented under its own heading:
+
+- **Core** -- daemon reachability, every layered `.ralphus.toml` source in
+  precedence order (`config-sources`/`config-sources-project`), registered
+  projects' path/git validity, and every `.ralphus.toml`-driven setting
+  (timeouts, concurrency, forge/PR conventions, templates, agent
+  profiles/resolver).
+- **Harness** -- `git` (only required when a registered project actually
+  uses it; otherwise reported `SKIP`, not `FAIL`), `tmux`/psmux (resolved the
+  same way the daemon does, reporting both the resolved binary and which
+  resolution source won: an explicit `RALPHUS_TMUX_CMD` override, the
+  embedded vendored build, or `PATH`), the runner binary, agent backend
+  commands (`claude`/`codex`/`pi`/`ollama`), and the optional `gh`/`glab`
+  forge-auth fallbacks (never fail if missing -- see
+  [`docs/dependencies.md`](dependencies.md)).
+- **Machine** -- `nvidia-smi` (GPU sampling), the opt-in developer toolchain
+  (`cargo`, via `--enable-developer-checks`), and opt-in `--all-remotes`
+  target-inventory health.
+
+Every result states three things: the observation (`detail` -- what was
+found), the `impact` (what's at stake if it isn't a clean pass), and a
+`remediation` (the concrete next step, or "No action needed." for a pass);
+a `provenance` field additionally names the contributing config file/env
+var/resolution source where one exists. A `SKIP` status marks a check that
+plainly does not apply (e.g. git validation for a non-Git project) rather
+than one that ran and passed -- only `FAIL` makes the command exit non-zero.
+
+`--enable-live-agent-check` additionally runs a live, cost-incurring
+completion round-trip against the configured Arbiter agent/model
+(`POST /api/health/arbiter`) -- off by default, since every other check here
+is reachability/config-shape only and free to run.
+
+`--json` (the global flag, not a per-subcommand one) emits the same
+`checks`/`file_issues`/`failed` payload as machine-readable JSON, with each
+check's `section`/`status`/`detail`/`impact`/`remediation`/`provenance`
+fields intact.
 
 ## squad
 
