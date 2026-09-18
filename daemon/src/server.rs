@@ -5206,12 +5206,37 @@ fn run_submit_followup(
         resolved
     };
 
+    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
+    // `w/<short>` directory) under a brief lock, then actually create/resync
+    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
+    // held, concurrently. Without this, `derive_reviews_with_prefetch` below
+    // would run that same real git work serially, one cell at a time, for
+    // the ENTIRE duration the store lock is held -- which stalls not just
+    // this squad's own submission but every other request the daemon
+    // serves meanwhile (board reads, other squads' dispatch), since it's
+    // the same single global lock. See
+    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    let prefetched_worktrees = {
+        let guard = store_handle.lock();
+        let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
+        let jobs = crate::worktrees::plan_local_worktree_jobs(
+            &guard,
+            &squad_id,
+            &cells,
+            &tasks,
+            &prefetched_upstreams,
+        );
+        drop(guard);
+        crate::worktrees::execute_local_worktree_jobs(&jobs)
+    };
+
     let guard = store_handle.lock();
-    if let Err(e) = crate::reviews::derive_reviews_with_prefetch(
+    if let Err(e) = crate::reviews::derive_reviews_with_full_prefetch(
         &guard,
         &squad_id,
         &file,
         &prefetched_upstreams,
+        &prefetched_worktrees,
     ) {
         let _ = guard.set_squad_error(&squad_id, Some(&e.message));
         let _ = guard.set_squad_state(&squad_id, SquadState::Failed);

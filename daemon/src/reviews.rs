@@ -472,6 +472,16 @@ fn rows_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInf
     (cells, tasks, cell_info)
 }
 
+/// Like [`rows_from_file`], but for a caller (`server::run_submit_followup`)
+/// that only needs the planner's cell/task rows themselves, not each cell's
+/// review opt-in -- e.g. to build [`crate::worktrees::plan_local_worktree_jobs`]'s
+/// input before [`derive_reviews_with_full_prefetch`] runs its own,
+/// unchanged pass over the same file.
+pub(crate) fn cells_and_tasks_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>) {
+    let (cells, tasks, _cell_info) = rows_from_file(file);
+    (cells, tasks)
+}
+
 /// Convert `[[review.action]]` entries into `GuardianCheck` values for storage.
 fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
     actions
@@ -766,6 +776,23 @@ pub fn derive_reviews_with_prefetch(
     file: &TaskFile,
     prefetched_upstreams: &HashMap<(String, String), String>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
+    derive_reviews_with_full_prefetch(store, squad_id, file, prefetched_upstreams, &HashMap::new())
+}
+
+/// Like [`derive_reviews_with_prefetch`], but `prefetched_worktrees`
+/// additionally supplies already-materialized LOCAL worktree paths -- see
+/// [`crate::worktrees::resolve_placeholders_with_full_prefetch`]'s doc
+/// comment for how to build this map, and why (it's what lets this
+/// function's own [`resolve_placeholders_with_prefetch`] call below skip the
+/// real, slow `git worktree add`/`fetch`/rebase for every cell the caller
+/// already materialized ahead of time, without the store lock held).
+pub fn derive_reviews_with_full_prefetch(
+    store: &Store,
+    squad_id: &str,
+    file: &TaskFile,
+    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_worktrees: &HashMap<String, String>,
+) -> std::result::Result<Vec<String>, ReviewError> {
     if file.review.is_empty() {
         return Ok(Vec::new());
     }
@@ -791,12 +818,13 @@ pub fn derive_reviews_with_prefetch(
     // this preflight needs a real worktree path *now* to run git against it.
     // Resolving here (persisted via `Store::set_cell_cwd`, same as the
     // scheduler's resolution) means a restarted squad never re-resolves it.
-    crate::worktrees::resolve_placeholders_with_prefetch(
+    crate::worktrees::resolve_placeholders_with_full_prefetch(
         store,
         squad_id,
         &mut cells,
         &tasks,
         prefetched_upstreams,
+        prefetched_worktrees,
         &Context::new(),
     )
     .map_err(ReviewError::new)?;
