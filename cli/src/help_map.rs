@@ -720,6 +720,7 @@ const CHECK_CHILDREN: &[HelpNode] = &[
         true, // ("check", "health")
         &[],
     ),
+    // ralphus[ignore-endpoint-cli]: pure in-memory ralphus_core::health_catalog lookup, no daemon round trip
     node(
         "catalog",
         &[],
