@@ -319,7 +319,10 @@ pub struct CreatedPr {
     pub number: i64,
     /// Web URL a human can open.
     pub url: String,
-    /// Whether the forge created the PR/MR as a draft.
+    /// RAL-353: whether the forge reports the new PR/MR as a draft (WIP).
+    /// `false` when the create response doesn't state it either way (legacy
+    /// response shapes) -- matching the adopt-side default, so an adoption or
+    /// refresh can never flip a recorded PR into "draft" by accident.
     pub draft: bool,
 }
 
@@ -451,17 +454,21 @@ impl ForgeClient {
 
     /// Create a pull/merge request. `head` is the source branch (already
     /// pushed to the remote); `base` is the target branch/ref it merges into.
-    /// Logs the outbound call (start/done/error) via `rlog!`, matching
-    /// `chat_client::call_direct`'s boundary-logging convention for direct
-    /// provider HTTP calls.
+    /// `draft` (RAL-196) opens it as a draft (work-in-progress) on the forge
+    /// instead of ready-for-review: GitHub via the REST `draft` field, GitLab
+    /// by prefixing the title with `Draft: ` (its draft mechanism is purely
+    /// title-based). Logs the outbound call (start/done/error) via `rlog!`,
+    /// matching `chat_client::call_direct`'s boundary-logging convention for
+    /// direct provider HTTP calls.
     pub fn create_pull_request(
         &self,
         title: &str,
         body: &str,
         head: &str,
         base: &str,
+        draft: bool,
     ) -> Result<CreatedPr, String> {
-        self.create_pull_request_routed(title, body, head, base, None)
+        self.create_pull_request_routed(title, body, head, base, None, draft)
     }
 
     /// Like [`Self::create_pull_request`], but additionally accepts a GitLab
@@ -480,15 +487,17 @@ impl ForgeClient {
         head: &str,
         base: &str,
         target_project_id: Option<i64>,
+        draft: bool,
     ) -> Result<CreatedPr, String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             INFO,
-            "ralphus [forge] create pr start kind={} repo={} head={head} base={base}",
+            "ralphus [forge] create pr start kind={} repo={} head={head} base={base} draft={draft}",
             self.kind.as_str(),
             self.repo_path
         );
-        let result = self.create_pull_request_inner(title, body, head, base, target_project_id);
+        let result =
+            self.create_pull_request_inner(title, body, head, base, target_project_id, draft);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(pr) => crate::rlog!(
@@ -517,6 +526,7 @@ impl ForgeClient {
         head: &str,
         base: &str,
         target_project_id: Option<i64>,
+        draft: bool,
     ) -> Result<CreatedPr, String> {
         let token = self.require_token()?;
         match self.kind {
@@ -527,6 +537,7 @@ impl ForgeClient {
                     "body": body,
                     "head": head,
                     "base": base,
+                    "draft": draft,
                 });
                 let resp = self.send(
                     ureq::post(&url)
@@ -552,7 +563,18 @@ impl ForgeClient {
                 let mut payload = serde_json::json!({
                     "source_branch": head,
                     "target_branch": base,
-                    "title": title,
+                    // RAL-196: GitLab drafts are a `Draft: ` title prefix, not a
+                    // body field -- prefixing here is what makes the created MR
+                    // a real draft (and `pr_object_draft`'s legacy
+                    // `work_in_progress` fallback reads it back out of the
+                    // response). A title that already carries the prefix (e.g.
+                    // a round-tripped title pulled from a prior draft) is left
+                    // alone rather than double-prefixed.
+                    "title": if draft && !title.to_lowercase().starts_with("draft: ") {
+                        format!("Draft: {title}")
+                    } else {
+                        title.to_string()
+                    },
                     "description": body,
                 });
                 if let Some(id) = target_project_id {
@@ -1306,6 +1328,70 @@ impl ForgeClient {
                     self.api_base, self.repo_path
                 );
                 let payload = serde_json::json!({ "target_branch": new_base });
+                self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Toggle an already-open PR/MR's draft (WIP) state (RAL-196), used when
+    /// a submission adopts a pre-existing PR/MR for a branch and the state
+    /// the submission asked for differs from what the forge currently has --
+    /// e.g. a whole-stack submission as drafts must not leave a sibling PR
+    /// ready-for-review. GitHub PATCHes the `draft` field; GitLab sends the
+    /// `wip_event` toggle, which manages the same `Draft: ` title prefix its
+    /// draft mechanism is built on. Logs the outbound call (start/done/error)
+    /// via `rlog!`, matching [`Self::update_pull_request_base`].
+    pub fn update_pull_request_draft(&self, number: i64, draft: bool) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] update pr draft start kind={} repo={} number={number} draft={draft}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.update_pull_request_draft_inner(number, draft);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] update pr draft done kind={} repo={} number={number} draft={draft}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] update pr draft failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn update_pull_request_draft_inner(&self, number: i64, draft: bool) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({ "draft": draft });
+                self.send(
+                    ureq::patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({
+                    "wip_event": if draft { "wip" } else { "unwip" },
+                });
                 self.send(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
                 Ok(())
             }
@@ -2437,18 +2523,36 @@ pub struct PrRoute {
 }
 
 impl PrRoute {
-    /// Create the PR/MR this route describes.
+    /// Create the PR/MR this route describes. `draft` (RAL-196) opens it as
+    /// a draft on the forge; `false` opens it ready-for-review.
     ///
     /// # Errors
     /// Propagates the underlying forge API failure.
-    pub fn create_pull_request(&self, title: &str, body: &str) -> Result<CreatedPr, String> {
+    pub fn create_pull_request(
+        &self,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<CreatedPr, String> {
         self.client.create_pull_request_routed(
             title,
             body,
             &self.head,
             &self.base,
             self.target_project_id,
+            draft,
         )
+    }
+
+    /// Toggle this route's PR/MR's draft state (RAL-196), used when a
+    /// submission adopts a pre-existing open PR/MR whose draft state differs
+    /// from what was asked for. See
+    /// [`ForgeClient::update_pull_request_draft`].
+    ///
+    /// # Errors
+    /// Propagates the underlying forge API failure.
+    pub fn update_draft(&self, number: i64, draft: bool) -> Result<(), String> {
+        self.client.update_pull_request_draft(number, draft)
     }
 
     /// Look up whether this route's exact head already has an open PR/MR --
@@ -3070,7 +3174,7 @@ mod tests {
             Some("tok".to_string()),
         );
         client
-            .create_pull_request_routed("t", "b", "alias", "main", Some(42))
+            .create_pull_request_routed("t", "b", "alias", "main", Some(42), false)
             .unwrap();
         handle.join().unwrap();
     }
@@ -3098,8 +3202,225 @@ mod tests {
             Some("tok".to_string()),
         );
         client
-            .create_pull_request("t", "b", "alias", "main")
+            .create_pull_request("t", "b", "alias", "main", false)
             .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_github_sends_draft_field_when_requested() {
+        // RAL-196: GitHub drafts are the REST `draft` field -- the same flag a
+        // human's "convert to draft" GUI toggle sets, so the created PR is
+        // indistinguishable from one marked draft by hand.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["draft"], serde_json::json!(true));
+            assert_eq!(json["title"], serde_json::json!("t"));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"number": 7, "html_url": "http://x", "draft": true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let created = client
+            .create_pull_request("t", "b", "alias", "main", true)
+            .unwrap();
+        assert!(created.draft);
+        assert_eq!(created.number, 7);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_github_sends_draft_false_when_ready_for_review() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["draft"], serde_json::json!(false));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number": 8, "html_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let created = client
+            .create_pull_request("t", "b", "alias", "main", false)
+            .unwrap();
+        assert!(!created.draft);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_gitlab_draft_prefixes_the_title() {
+        // RAL-196: GitLab drafts are purely a `Draft: ` title prefix (there is
+        // no draft body field on the create API) -- the created MR is a real
+        // draft, the same thing the "Mark as draft" GUI action produces.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["title"], serde_json::json!("Draft: t"));
+            assert_eq!(json["source_branch"], serde_json::json!("alias"));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"iid": 1, "web_url": "http://x", "work_in_progress": true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let created = client
+            .create_pull_request("t", "b", "alias", "main", true)
+            .unwrap();
+        assert!(created.draft);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_gitlab_ready_for_review_leaves_title_unprefixed() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["title"], serde_json::json!("t"));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid": 2, "web_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let created = client
+            .create_pull_request("t", "b", "alias", "main", false)
+            .unwrap();
+        assert!(!created.draft);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_gitlab_does_not_double_prefix_an_already_draft_title() {
+        // A title that already opens with the draft prefix (e.g. one pulled
+        // back out of a prior draft MR and re-submitted) must not be
+        // double-prefixed into `Draft: Draft: ...`.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["title"], serde_json::json!("Draft: t"));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"iid": 3, "web_url": "http://x", "work_in_progress": true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let created = client
+            .create_pull_request("Draft: t", "b", "alias", "main", true)
+            .unwrap();
+        assert!(created.draft);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_pull_request_draft_github_patches_the_draft_field() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/42");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["draft"], serde_json::json!(true));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"draft": true}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.update_pull_request_draft(42, true).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_pull_request_draft_gitlab_sends_wip_event_toggle() {
+        // GitLab toggles drafts through the `wip_event` update parameter, which
+        // adds/removes the `Draft: ` title prefix its drafts are built on.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Put);
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["wip_event"], serde_json::json!("unwip"));
+            req.respond(tiny_http::Response::from_string(r#"{}"#).with_status_code(200))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.update_pull_request_draft(42, false).unwrap();
         handle.join().unwrap();
     }
 

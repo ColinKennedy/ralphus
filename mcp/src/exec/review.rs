@@ -397,6 +397,7 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
             title,
             description,
             use_worktree_branch_name,
+            draft,
             allow_unlinked_fork,
         } => {
             let mut pr_spec = serde_json::Map::new();
@@ -417,6 +418,11 @@ fn exec_pr(cmd: ReviewPrCommand, client: &DaemonClient) -> ExecResult {
                     "use_worktree_branch_name".to_string(),
                     Value::Bool(use_worktree_branch_name),
                 );
+            }
+            if let Some(draft) = draft {
+                // RAL-196: `--draft`/`--ready-for-review` tool arguments map
+                // onto the same per-submission override the CLI sends.
+                pr_spec.insert("draft".to_string(), Value::Bool(draft));
             }
             let resolved =
                 resolve_guardian_selector(client, &selector, "ralphus review list --pr-ready")?;

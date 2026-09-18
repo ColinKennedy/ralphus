@@ -235,13 +235,19 @@ worktree, resolving conflicts and restacking downstream branches (RAL-190).",
             "--allow-unlinked-fork",
             "--combined",
             "--description [text]",
+            "--draft",
             "--position [integer]",
+            "--ready-for-review",
             "--title [text]",
             "--use-worktree-branch-name",
         ],
         "Submit a PR/MR for one stacked branch or the combined worktree. --allow-unlinked-fork \
 (RAL-338) downgrades a definite \"no forge relationship\" fork pre-flight result from a hard \
-error to a logged warning; ignored for a project with no registered fork.",
+error to a logged warning; ignored for a project with no registered fork. --draft/--ready-for-review \
+(RAL-196) override the project's [github]/[gitlab] draft_by_default for this submission only: \
+--draft opens them as drafts (work-in-progress), --ready-for-review forces them ready; without \
+either, the project default applies (ready-for-review when unset). The two flags are mutually \
+exclusive.",
         false,
         false,
         &[],
