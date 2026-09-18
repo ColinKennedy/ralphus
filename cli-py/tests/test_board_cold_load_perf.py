@@ -188,6 +188,20 @@ def browser() -> Any:
         # back to `/tmp` for that shared memory instead.
         b = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
         try:
+            # A freshly launched Chromium's very first navigation pays a
+            # one-off renderer-process spawn/warm-up cost on top of whatever
+            # that navigation itself does -- on a resource-constrained CI
+            # runner this can be slow enough to blow past even Playwright's
+            # own 30s navigation timeout, well before this module's own
+            # (much stricter) budget assertion ever gets a chance to run.
+            # Paying that cost here, against a trivial page in a throwaway
+            # context, keeps it off of whichever real test happens to run
+            # first -- it doesn't affect what's measured (a fresh
+            # `new_context()` per test already means zero cookie/cache
+            # carryover regardless of this).
+            warm_context = b.new_context()
+            warm_context.new_page().goto("about:blank")
+            warm_context.close()
             yield b
         finally:
             b.close()
