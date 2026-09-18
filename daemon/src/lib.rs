@@ -26,6 +26,7 @@ pub mod ghost;
 pub mod git_hooks;
 pub mod guardian;
 pub mod guardian_merge;
+pub mod health_sweep;
 pub mod health_targets;
 pub mod hidden;
 pub mod jobobject;

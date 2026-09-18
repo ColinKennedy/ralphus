@@ -6,16 +6,20 @@
 //! and without expanding the SSH provider's `run` verb beyond git (a
 //! security-relevant restriction `ssh-provider/src/fileops.rs` imposes
 //! deliberately): SSH reachability, `capabilities`, the remote-root
-//! readiness probe, git version, and git identity. Not implemented here --
-//! see each check's own comment or `REMOTE_IMPROVEMENTS.local.md`'s Phase 9
-//! notes for why: remote clock/timezone skew (no non-git remote command
-//! verb exists to ask for it), push-credential verification (no safe
-//! non-mutating check exists), per-agent executable/version verification
-//! (would need a generic "run this program and read its version" verb,
-//! which raises the same remote-command-execution scope question `run`'s
-//! git-only restriction was deliberately drawn to avoid), and
-//! project-specific clone-URL reachability (needs project context this
-//! target-scoped sweep doesn't have).
+//! readiness probe, git version, and git identity. Two checks are
+//! *documented as unverified* rather than genuinely probed, and always
+//! report `warn` with an explanation instead of a real pass/fail --
+//! push-credential verification (no safe, non-mutating way to confirm push
+//! authorization exists yet) and, as of RAL-416, remote runner-executable
+//! resolution (`runner`, catalog id `remote-runner`): confirming the
+//! configured `runner_command` resolves on the remote would need the SSH
+//! provider's `run` verb to accept an arbitrary program, the same
+//! remote-command-execution scope question `run`'s git-only restriction was
+//! deliberately drawn to avoid. Not implemented at all here -- see each
+//! check's own comment or `REMOTE_IMPROVEMENTS.local.md`'s Phase 9 notes for
+//! why: remote clock/timezone skew (no non-git remote command verb exists to
+//! ask for it) and project-specific clone-URL reachability (needs project
+//! context this target-scoped sweep doesn't have).
 
 use std::sync::Arc;
 
@@ -24,6 +28,11 @@ use crate::remote_runner::{Capabilities, RunRequest};
 use crate::runner::RunnerSpec;
 #[cfg(test)]
 use crate::store::Store;
+use ralphus_core::health_catalog::{
+    ID_REMOTE_CAPABILITIES, ID_REMOTE_GIT_IDENTITY_EMAIL, ID_REMOTE_GIT_IDENTITY_NAME,
+    ID_REMOTE_GIT_VERSION, ID_REMOTE_PUSH_CREDENTIALS, ID_REMOTE_RESOLVE, ID_REMOTE_ROOT,
+    ID_REMOTE_RUNNER, ID_REMOTE_SSH_REACHABLE,
+};
 
 const PASS: &str = "pass";
 const WARN: &str = "warn";
@@ -40,6 +49,13 @@ pub struct TargetCheck {
     pub name: String,
     pub status: &'static str,
     pub detail: String,
+    /// RAL-416: the stable `ralphus_core::health_catalog` entry id this
+    /// check belongs to (e.g. `"remote-ssh-reachable"`) -- see
+    /// `cli::health::CheckResult::id`'s doc comment for the same
+    /// name-vs-id distinction. Always one of this module's `remote-*`
+    /// catalog entries; never empty, unlike the CLI's own defensive-fallback
+    /// cases, since every check here is a normal, always-executed probe.
+    pub id: &'static str,
 }
 
 /// Every check run against one configured target.
@@ -89,6 +105,7 @@ fn capability_check(caps: &Capabilities) -> TargetCheck {
         name: "capabilities".to_string(),
         status: PASS,
         detail: parts.join(", "),
+        id: ID_REMOTE_CAPABILITIES,
     }
 }
 
@@ -108,11 +125,17 @@ fn git_identity_check(
             key.to_string(),
         ],
     };
+    let id = if key == "user.name" {
+        ID_REMOTE_GIT_IDENTITY_NAME
+    } else {
+        ID_REMOTE_GIT_IDENTITY_EMAIL
+    };
     match provider.run_vcs(&req, spec) {
         Ok(out) if !out.trim().is_empty() => TargetCheck {
             name: format!("git_{key}"),
             status: PASS,
             detail: out.trim().to_string(),
+            id,
         },
         Ok(_) | Err(_) => TargetCheck {
             name: format!("git_{key}"),
@@ -121,6 +144,7 @@ fn git_identity_check(
                 "no global git {key} is set for the remote account -- commits will fail until \
                  it is, unless every repository sets it per-repo instead"
             ),
+            id,
         },
     }
 }
@@ -154,6 +178,7 @@ fn check_one_target(
                     "{:?} resolves to the local machine, not a remote provider",
                     target.machine
                 ),
+                id: ID_REMOTE_RESOLVE,
             });
             return report(checks);
         }
@@ -163,6 +188,7 @@ fn check_one_target(
                 name: "resolve".to_string(),
                 status: FAIL,
                 detail: format!("{e} ({kind})"),
+                id: ID_REMOTE_RESOLVE,
             });
             return report(checks);
         }
@@ -174,12 +200,14 @@ fn check_one_target(
             name: "ssh_reachable".to_string(),
             status: PASS,
             detail: detail.unwrap_or_default(),
+            id: ID_REMOTE_SSH_REACHABLE,
         }),
         Err(e) => {
             checks.push(TargetCheck {
                 name: "ssh_reachable".to_string(),
                 status: FAIL,
                 detail: e,
+                id: ID_REMOTE_SSH_REACHABLE,
             });
             return report(checks);
         }
@@ -191,11 +219,13 @@ fn check_one_target(
             name: "capabilities".to_string(),
             status: WARN,
             detail: "provider does not implement the optional capabilities verb".to_string(),
+            id: ID_REMOTE_CAPABILITIES,
         }),
         Err(e) => checks.push(TargetCheck {
             name: "capabilities".to_string(),
             status: WARN,
             detail: e,
+            id: ID_REMOTE_CAPABILITIES,
         }),
     }
 
@@ -207,11 +237,13 @@ fn check_one_target(
                 "create/read/rename/delete all succeeded under {:?}",
                 target.remote_root
             ),
+            id: ID_REMOTE_ROOT,
         }),
         Err(e) => checks.push(TargetCheck {
             name: "remote_root".to_string(),
             status: FAIL,
             detail: e,
+            id: ID_REMOTE_ROOT,
         }),
     }
 
@@ -225,11 +257,13 @@ fn check_one_target(
             name: "git_version".to_string(),
             status: PASS,
             detail: out.trim().to_string(),
+            id: ID_REMOTE_GIT_VERSION,
         }),
         Err(e) => checks.push(TargetCheck {
             name: "git_version".to_string(),
             status: FAIL,
             detail: e,
+            id: ID_REMOTE_GIT_VERSION,
         }),
     }
 
@@ -252,6 +286,19 @@ fn check_one_target(
         detail: "not verified -- no safe, non-mutating way to confirm push authorization exists \
                  yet"
         .to_string(),
+        id: ID_REMOTE_PUSH_CREDENTIALS,
+    });
+
+    checks.push(TargetCheck {
+        name: "runner".to_string(),
+        status: WARN,
+        detail: format!(
+            "not verified -- confirming '{}' resolves on the remote would require the SSH \
+             provider's run verb to accept an arbitrary program, which is deliberately scoped \
+             to git only",
+            target.runner_command
+        ),
+        id: ID_REMOTE_RUNNER,
     });
 
     report(checks)
@@ -294,6 +341,7 @@ fn check_targets(
                         name: "panic".to_string(),
                         status: FAIL,
                         detail: "the health check itself panicked".to_string(),
+                        id: ID_REMOTE_SSH_REACHABLE,
                     }],
                 }));
             }
