@@ -85,7 +85,7 @@ from ralphus.docsgen.librarian_server import librarian_server
 from ralphus.docsgen.stub_server import fixture_server
 
 if TYPE_CHECKING:
-    from playwright.sync_api import Browser, BrowserContext
+    from playwright.sync_api import Browser
 
 _playwright_sync_api = pytest.importorskip("playwright.sync_api")
 sync_playwright = _playwright_sync_api.sync_playwright
@@ -218,8 +218,15 @@ def _failure_message(
     )
 
 
+#: A hard navigation timeout (Chromium never resolving `load` at all, not a
+#: slow-but-completing one) is retried this many times before failing the
+#: test outright -- see `_cold_nav`'s doc comment for why this doesn't
+#: weaken the actual performance assertion.
+_MAX_ATTEMPTS = 2
+
+
 def _cold_nav(
-    context: BrowserContext,
+    browser: Browser,
     base_url: str,
     hash_: str,
     ready_selector: str,
@@ -232,18 +239,38 @@ def _cold_nav(
     `post_goto_js` (the `worktree-retirement` `showTab()` workaround, see the
     module docstring) in between, and returns
     `(elapsed_ms, RalphusTiming.getLast(tab))`.
+
+    Retries up to `_MAX_ATTEMPTS` times, each on a brand-new
+    `browser.new_context()` (so a retry is exactly as "cold" as the first
+    attempt), but ONLY when Chromium hits Playwright's own hard navigation
+    timeout -- observed on CI as an intermittent, environment-level renderer
+    hang unrelated to any code change (GitHub Actions runner contention),
+    never as a merely-slow-but-completing load. This does not mask a real
+    performance regression: a page that's genuinely too slow still completes
+    (no `TimeoutError`) and gets measured against `BUDGET_MS` below exactly
+    as before, on the first attempt.
     """
-    page = context.new_page()
-    start = time.perf_counter()
-    page.goto(f"{base_url}/?ralphusTiming=1{hash_}")
-    if post_goto_js is not None:
-        page.evaluate(post_goto_js)
-    page.wait_for_selector(ready_selector)
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    timing = page.evaluate(
-        "(t) => (window.RalphusTiming ? window.RalphusTiming.getLast(t) : null)", tab
-    )
-    return elapsed_ms, timing
+    last_error: Exception | None = None
+    for _ in range(_MAX_ATTEMPTS):
+        context = browser.new_context()
+        try:
+            page = context.new_page()
+            start = time.perf_counter()
+            page.goto(f"{base_url}/?ralphusTiming=1{hash_}")
+            if post_goto_js is not None:
+                page.evaluate(post_goto_js)
+            page.wait_for_selector(ready_selector)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            timing = page.evaluate(
+                "(t) => (window.RalphusTiming ? window.RalphusTiming.getLast(t) : null)", tab
+            )
+            return elapsed_ms, timing
+        except _playwright_sync_api.TimeoutError as e:
+            last_error = e
+        finally:
+            context.close()
+    assert last_error is not None
+    raise last_error
 
 
 def test_squads_tab_cold_load_under_budget(browser: Browser) -> None:
@@ -252,11 +279,7 @@ def test_squads_tab_cold_load_under_budget(browser: Browser) -> None:
         fixture_server(SQUADS_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        context = browser.new_context()
-        try:
-            elapsed_ms, timing = _cold_nav(context, base_url, "#/", "#squads .squad-item", "squads")
-        finally:
-            context.close()
+        elapsed_ms, timing = _cold_nav(browser, base_url, "#/", "#squads .squad-item", "squads")
     assert elapsed_ms < BUDGET_MS, _failure_message("squads", fixture_size, elapsed_ms, timing)
 
 
@@ -266,11 +289,7 @@ def test_tasks_tab_cold_load_under_budget(browser: Browser) -> None:
         fixture_server(TASKS_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        context = browser.new_context()
-        try:
-            elapsed_ms, timing = _cold_nav(context, base_url, "#/tasks", ".tt-row", "tasks")
-        finally:
-            context.close()
+        elapsed_ms, timing = _cold_nav(browser, base_url, "#/tasks", ".tt-row", "tasks")
     assert elapsed_ms < BUDGET_MS, _failure_message("tasks", fixture_size, elapsed_ms, timing)
 
 
@@ -280,18 +299,14 @@ def test_worktree_retirement_tab_cold_load_under_budget(browser: Browser) -> Non
         fixture_server(WORKTREE_RETIREMENT_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        context = browser.new_context()
-        try:
-            elapsed_ms, timing = _cold_nav(
-                context,
-                base_url,
-                "#/tasks",
-                "#worktree-retirement .proj-table",
-                "worktree-retirement",
-                post_goto_js="showTab('worktree-retirement', true)",
-            )
-        finally:
-            context.close()
+        elapsed_ms, timing = _cold_nav(
+            browser,
+            base_url,
+            "#/tasks",
+            "#worktree-retirement .proj-table",
+            "worktree-retirement",
+            post_goto_js="showTab('worktree-retirement', true)",
+        )
     assert elapsed_ms < BUDGET_MS, _failure_message(
         "worktree-retirement", fixture_size, elapsed_ms, timing
     )
@@ -303,11 +318,7 @@ def test_projects_tab_cold_load_under_budget(browser: Browser) -> None:
         fixture_server(PROJECTS_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        context = browser.new_context()
-        try:
-            elapsed_ms, timing = _cold_nav(
-                context, base_url, "#/projects", "#projects .proj-table", "projects"
-            )
-        finally:
-            context.close()
+        elapsed_ms, timing = _cold_nav(
+            browser, base_url, "#/projects", "#projects .proj-table", "projects"
+        )
     assert elapsed_ms < BUDGET_MS, _failure_message("projects", fixture_size, elapsed_ms, timing)
