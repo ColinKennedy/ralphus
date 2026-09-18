@@ -1,16 +1,43 @@
+//! Daemon-managed agent profiles (RAL-460).
+//!
+//! An agent profile is a named, reusable agent configuration -- a backend,
+//! an optional default model, and a table of environment variables --
+//! stored entirely in the daemon's own SQLite store (`agent_profiles` /
+//! `agent_profile_env`, see `store.rs`'s schema block). There is no TOML
+//! source for this anymore: `[agent.profiles.*]` is no longer read by
+//! anything. Profiles are created/edited/removed through `POST`/`DELETE
+//! /api/agent-profiles` (the board's admin-only Agent Profiles tab, or
+//! `ralphus agent profile ...`), and are global across every project --
+//! there is no more per-project override layering.
+//!
+//! Two rows are always present and `locked` ([`LOCKED_BUILTIN_PROFILES`]):
+//! `"claude-code"` and `"codex"`, representing the built-in CLI-forking
+//! backends. A locked row's `name`/`backend` can never change and it can
+//! never be deleted; the *only* thing an admin can change on it is
+//! `executable` (via [`Store::set_locked_agent_profile_executable`]), which
+//! replaces the old `RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`
+//! env-var overrides for daemon-run cells (`runner/src/claude_code_backend.rs`,
+//! `runner/src/codex_backend.rs`, and the daemon-side resume/reattach paths
+//! in `server.rs`/`terminal_relay.rs` now resolve through here instead of
+//! reading those env vars directly). `pi`'s `RALPHUS_PI_COMMAND` is
+//! untouched -- it is not yet one of the seeded backends.
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ralphus_core::schema::TaskFile;
 use ralphus_core::validate::{ErrorKind, ValidationError};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{find_project_config, global_config_path};
-use crate::store::Store;
+use crate::store::{Result as StoreResult, Store, now_ms};
 
 pub const RAW_BACKEND: &str = "raw";
 
-const PROFILE_BACKENDS: &[&str] = &[
+/// Every backend a profile may declare. Mirrors `RESERVED_AGENT_NAMES`
+/// (`core/src/schema.rs`) minus nothing -- every reserved name is also a
+/// valid profile backend, since a profile is how you *customize* a built-in
+/// backend's executable/model/env, not a way to invent a new one.
+pub const PROFILE_BACKENDS: &[&str] = &[
     "claude",
     "claude-code",
     "codex",
@@ -19,212 +46,157 @@ const PROFILE_BACKENDS: &[&str] = &[
     "anthropic",
     "raw",
 ];
-use ralphus_core::schema::RESERVED_AGENT_NAMES;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentProfile {
-    pub backend: String,
-    pub executable: Option<String>,
-    pub model: Option<String>,
-    pub env: BTreeMap<String, String>,
-    /// The resolved values of every `env` entry that was indirection via
-    /// `from_env` (as opposed to a literal authored in the config file).
-    /// These are treated as secrets for RAL-264: the daemon registers them
-    /// with `crate::redact` so the resolved value never lands in durable pane
-    /// text / failure `detail`s even when the agent echoes it into its own
-    /// terminal (e.g. `$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-...'`). Literal
-    /// values are excluded — they are already plaintext in the config file.
-    pub secret_values: BTreeSet<String>,
+/// The permanent, locked agent-profile rows every daemon seeds on startup
+/// (`Store::init_schema`) -- `(name, backend, default executable)`. `name`
+/// doubles as the row's fixed `backend`; only `executable` is ever mutable
+/// on these rows afterward. `pi` is intentionally not included yet -- its
+/// existing `RALPHUS_PI_COMMAND` env-var path is untouched.
+pub const LOCKED_BUILTIN_PROFILES: &[(&str, &str, &str)] = &[
+    ("claude-code", "claude-code", "claude"),
+    ("codex", "codex", "codex"),
+];
+
+/// How one `agent_profile_env` row's `value` should be interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvValueKind {
+    /// `value` is the raw value to set, stored plaintext but redacted in
+    /// every API/UI response and registered with `crate::redact` the moment
+    /// it is written (see [`Store::upsert_agent_profile`]).
+    Literal,
+    /// `value` is the *name* of another environment variable to resolve
+    /// from at cell-run time (mirrors the old TOML `from_env` indirection) --
+    /// re-resolved on every [`resolve_agent`] call, since the target
+    /// variable's value can change without the profile itself changing.
+    Link,
 }
 
+impl EnvValueKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Literal => "literal",
+            Self::Link => "link",
+        }
+    }
+}
+
+/// One `env` row of a stored agent profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentProfileEnvVar {
+    pub key: String,
+    pub kind: EnvValueKind,
+    /// Literal: the raw value. Link: the target environment variable's name
+    /// (never the resolved value itself).
+    pub value: String,
+}
+
+/// A stored agent profile, as read back from the `agent_profiles` table --
+/// unredacted, for internal (resolution) use only. API responses go through
+/// [`AgentProfileView`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub name: String,
+    pub backend: String,
+    pub executable: Option<String>,
+    pub default_model: Option<String>,
+    /// Whether this is one of [`LOCKED_BUILTIN_PROFILES`] -- fixed
+    /// name/backend, never deletable, only `executable` is mutable.
+    pub locked: bool,
+    pub env: Vec<AgentProfileEnvVar>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// A stored profile's `env` row, redacted for an API/UI response.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentProfileEnvVarView {
+    pub key: String,
+    pub kind: EnvValueKind,
+    /// Literal: a masked placeholder (see [`crate::redact`]). Link: the
+    /// real target variable name -- that is a pointer, not a secret.
+    pub value: String,
+    pub redacted: bool,
+}
+
+/// [`AgentProfile`], redacted for an API/UI response -- see
+/// [`redact_agent_profile`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentProfileView {
+    pub name: String,
+    pub backend: String,
+    pub executable: Option<String>,
+    pub default_model: Option<String>,
+    pub locked: bool,
+    pub env: Vec<AgentProfileEnvVarView>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Masks every literal `env` value so a `GET`/`POST` response never carries
+/// a secret in the clear -- link values pass through unmasked, since a
+/// target variable *name* is not itself sensitive (mirrors RAL-264's
+/// existing value-based, not name-based, secret model).
+#[must_use]
+pub fn redact_agent_profile(p: &AgentProfile) -> AgentProfileView {
+    AgentProfileView {
+        name: p.name.clone(),
+        backend: p.backend.clone(),
+        executable: p.executable.clone(),
+        default_model: p.default_model.clone(),
+        locked: p.locked,
+        env: p
+            .env
+            .iter()
+            .map(|v| match v.kind {
+                EnvValueKind::Literal => AgentProfileEnvVarView {
+                    key: v.key.clone(),
+                    kind: v.kind,
+                    value: crate::redact::REDACTED.to_string(),
+                    redacted: true,
+                },
+                EnvValueKind::Link => AgentProfileEnvVarView {
+                    key: v.key.clone(),
+                    kind: v.kind,
+                    value: v.value.clone(),
+                    redacted: false,
+                },
+            })
+            .collect(),
+        created_at_ms: p.created_at_ms,
+        updated_at_ms: p.updated_at_ms,
+    }
+}
+
+/// What a `agent = "..."` name resolves to -- a built-in backend, or a
+/// stored profile (locked or custom).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgentSelection {
     pub backend: String,
     pub executable: Option<String>,
     pub model: Option<String>,
     pub env: BTreeMap<String, String>,
+    /// True for a genuinely custom (non-locked) profile -- false for a bare
+    /// built-in name and for a locked row, since both are backends `core`'s
+    /// own offline validator already recognizes via `RESERVED_AGENT_NAMES`.
     pub custom_profile: bool,
-    /// The agent-profile `from_env`-resolved secret values in play for this
-    /// selection (empty for a built-in backend, which has no `env`).
-    /// Propagated from [`AgentProfile::secret_values`]; see its doc comment.
+    /// The resolved values of every `env` entry (literal or link) --
+    /// registered with `crate::redact` so none of them land in durable pane
+    /// text / failure `detail`s.
     pub secret_values: BTreeSet<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct AgentProfilesFile {
-    #[serde(default)]
-    agent: Option<AgentTable>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct AgentTable {
-    #[serde(default)]
-    profiles: BTreeMap<String, RawAgentProfile>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAgentProfile {
-    backend: String,
-    #[serde(default)]
-    executable: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    env: BTreeMap<String, RawEnvValue>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawEnvValue {
-    Literal(String),
-    FromEnv { from_env: String },
-}
-
-fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
-    let parsed: AgentProfilesFile =
-        toml::from_str(&text).map_err(|e| format!("could not parse {}: {e}", path.display()))?;
-    let mut out = BTreeMap::new();
-    for (name, profile) in parsed.agent.unwrap_or_default().profiles {
-        if RESERVED_AGENT_NAMES.contains(&name.as_str()) {
-            return Err(format!(
-                "{}: agent profile name \"{name}\" collides with a reserved built-in backend name",
-                path.display()
-            ));
-        }
-        if !PROFILE_BACKENDS.contains(&profile.backend.as_str()) {
-            return Err(format!(
-                "{}: agent profile \"{name}\" has unknown backend {:?}; expected one of {}",
-                path.display(),
-                profile.backend,
-                PROFILE_BACKENDS.join(", ")
-            ));
-        }
-        if is_native_backend(&profile.backend) && profile.executable.is_some() {
-            return Err(format!(
-                "{}: agent profile \"{name}\" sets executable for native backend {:?}; executable is only meaningful for claude-code, codex, pi, or raw",
-                path.display(),
-                profile.backend
-            ));
-        }
-        if profile.backend == RAW_BACKEND && profile.executable.is_none() {
-            return Err(format!(
-                "{}: agent profile \"{name}\" uses backend \"raw\" but does not set executable",
-                path.display()
-            ));
-        }
-        let mut env = BTreeMap::new();
-        // RAL-264: the resolved values of every `from_env`-indirected entry are
-        // secret-shaped and must be scrubbed out of any durable pane text.
-        // Collected here (where the parse still distinguishes
-        // `RawEnvValue::FromEnv` from `RawEnvValue::Literal`) so resolution can
-        // hand them to the redaction layer; see [`AgentProfile::secret_values`].
-        let mut secret_values = BTreeSet::new();
-        for (key, value) in profile.env {
-            let resolved = match value {
-                RawEnvValue::Literal(s) => s,
-                RawEnvValue::FromEnv { from_env } => {
-                    let resolved = std::env::var(&from_env).map_err(|_| {
-                        format!(
-                            "{}: agent profile \"{name}\" requires environment variable {from_env:?}, but it is not set in the daemon process environment. \
-                            Set {from_env} in the environment the `ralphus-daemon serve` process runs in (not just your shell), then restart the daemon.",
-                            path.display()
-                        )
-                    })?;
-                    secret_values.insert(resolved.clone());
-                    resolved
-                }
-            };
-            env.insert(key, resolved);
-        }
-        out.insert(
-            name,
-            AgentProfile {
-                backend: profile.backend,
-                executable: profile.executable,
-                model: profile.model,
-                env,
-                secret_values,
-            },
-        );
-    }
-    Ok(out)
-}
-
-fn merge_profiles(
-    mut global: BTreeMap<String, AgentProfile>,
-    local: BTreeMap<String, AgentProfile>,
-) -> BTreeMap<String, AgentProfile> {
-    for (name, profile) in local {
-        global.insert(name, profile);
-    }
-    global
-}
-
-/// Parses `$RALPHUS_CONFIGURATION_PATH` (a `PATH`-separated list of
-/// `.ralphus.toml` files, left-to-right, later wins) -- the same env var
-/// `cli/src/config.rs` and `runner/src/config.rs` already read for every
-/// other config field. Agent profiles didn't honor it, so a profile placed
-/// via that established convention (rather than `$RALPHUS_CONFIG_HOME/config.toml`,
-/// or a `.ralphus.toml` an ancestor of the resolved project path) silently
-/// never loaded.
-///
-/// Takes the raw env value explicitly (rather than reading `std::env`
-/// itself) so callers can test against a fixed value instead of whatever
-/// `$RALPHUS_CONFIGURATION_PATH` happens to be set to in the real process
-/// environment -- `std::env::set_var`/`remove_var` can't be used to override
-/// it in-process, since both are `unsafe fn` and this workspace forbids
-/// `unsafe_code` outright. Same rationale as
-/// `cli_rs::config::get_candidates`'s `configuration_path_env` parameter.
-fn configuration_path_entries(configuration_path_env: Option<&str>) -> Vec<PathBuf> {
-    let Some(raw) = configuration_path_env else {
-        return Vec::new();
-    };
-    std::env::split_paths(raw).collect()
-}
-
-/// Precedence, lowest to highest: `$RALPHUS_CONFIG_HOME/config.toml` (or its
-/// `~/.config/ralphus/` default), then `$RALPHUS_CONFIGURATION_PATH` entries
-/// in order, then the project-local `.ralphus.toml` found by walking up from
-/// `cwd` -- matching the precedence `runner::config::load_with` already uses
-/// for its own fields (configuration-path entries, then the nearest
-/// git-root file, win over anything earlier).
-fn load_profiles_for_path_with(
-    cwd: &Path,
-    configuration_path_env: Option<&str>,
-) -> Result<BTreeMap<String, AgentProfile>, String> {
-    let mut merged = match global_config_path() {
-        Some(path) if path.is_file() => parse_profile_file(&path)?,
-        _ => BTreeMap::new(),
-    };
-    for path in configuration_path_entries(configuration_path_env) {
-        if path.is_file() {
-            merged = merge_profiles(merged, parse_profile_file(&path)?);
-        }
-    }
-    let local = match find_project_config(cwd) {
-        Some(path) => parse_profile_file(&path)?,
-        None => BTreeMap::new(),
-    };
-    Ok(merge_profiles(merged, local))
-}
-
-pub fn load_profiles_for_path(cwd: &Path) -> Result<BTreeMap<String, AgentProfile>, String> {
-    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    load_profiles_for_path_with(cwd, raw.as_deref())
-}
-
-pub fn load_profiles_for_current_dir() -> Result<BTreeMap<String, AgentProfile>, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("could not read current directory: {e}"))?;
-    load_profiles_for_path(&cwd)
-}
-
+/// Whether `agent` is a backend ralphus talks to directly (no external CLI
+/// process to fork).
+#[must_use]
 pub fn is_native_backend(agent: &str) -> bool {
     matches!(agent, "claude" | "anthropic" | "ollama")
 }
 
+/// Normalizes a built-in backend name/alias, or `None` if `agent` names
+/// neither a built-in nor (necessarily) a stored profile.
+#[must_use]
 pub fn normalize_builtin_agent(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" => Some("claude"),
@@ -238,36 +210,51 @@ pub fn normalize_builtin_agent(agent: &str) -> Option<&'static str> {
     }
 }
 
-pub fn resolve_agent_for_path(agent: &str, cwd: &Path) -> Result<ResolvedAgentSelection, String> {
-    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    resolve_agent_for_path_with(agent, cwd, raw.as_deref())
+/// Resolves `agent` against the daemon's own agent-profile store, falling
+/// back to a bare built-in backend name/alias. Profiles are global now
+/// (no more per-project `.ralphus.toml` layering), so no `cwd` is needed.
+///
+/// # Errors
+/// Returns an error string when `agent` names neither a stored profile nor
+/// a built-in backend, or when a `link`-kind env entry's target variable is
+/// not set in the daemon process's own environment.
+/// [`resolve_agent`] for a call site with no `Store` handle in reach (see
+/// `guardian_merge::resolve_resolver_agent_from_config`'s doc comment for
+/// the one place this is used) -- resolves a bare built-in backend
+/// name/alias only. A name that would resolve to a stored **custom**
+/// profile is indistinguishable from an unknown name here, since profiles
+/// live only in the store now and there is no TOML fallback left to check
+/// instead; this is a narrow, documented capability gap on that one
+/// best-effort call site, not a general resolution path.
+///
+/// # Errors
+/// Returns an error string when `agent` names neither a built-in backend
+/// nor its alias.
+pub fn resolve_builtin_agent_only(agent: &str) -> Result<ResolvedAgentSelection, String> {
+    let Some(backend) = normalize_builtin_agent(agent) else {
+        return Err(format!(
+            "unknown agent \"{agent}\": not a built-in backend (custom agent profiles cannot be \
+             resolved from this call site -- see resolve_builtin_agent_only's doc comment)"
+        ));
+    };
+    Ok(ResolvedAgentSelection {
+        backend: backend.to_string(),
+        executable: None,
+        model: None,
+        env: BTreeMap::new(),
+        custom_profile: false,
+        secret_values: BTreeSet::new(),
+    })
 }
 
-/// [`resolve_agent_for_path`] with `$RALPHUS_CONFIGURATION_PATH` passed in
-/// explicitly -- see [`configuration_path_entries`] for why.
-fn resolve_agent_for_path_with(
-    agent: &str,
-    cwd: &Path,
-    configuration_path_env: Option<&str>,
-) -> Result<ResolvedAgentSelection, String> {
-    let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
-    if let Some(profile) = profiles.get(agent) {
-        // RAL-264: this profile is about to be used to run a cell, so its
-        // `from_env`-resolved secret values must be scrubbed everywhere raw
-        // pane text gets persisted. Even though the profile may already be
-        // registered from a prior resolution (idempotent), registering here
-        // guarantees the values are in place before any tmux pane capture.
-        crate::redact::register_all(profile.secret_values.iter().cloned());
-        return Ok(ResolvedAgentSelection {
-            backend: profile.backend.clone(),
-            executable: profile.executable.clone(),
-            model: profile.model.clone(),
-            env: profile.env.clone(),
-            custom_profile: true,
-            secret_values: profile.secret_values.clone(),
-        });
-    }
-    if let Some(backend) = normalize_builtin_agent(agent) {
+pub fn resolve_agent(agent: &str, store: &Store) -> Result<ResolvedAgentSelection, String> {
+    let profile = store.get_agent_profile(agent).map_err(|e| e.to_string())?;
+    let Some(profile) = profile else {
+        let Some(backend) = normalize_builtin_agent(agent) else {
+            return Err(format!(
+                "unknown agent \"{agent}\": not a configured agent profile and not a built-in backend"
+            ));
+        };
         return Ok(ResolvedAgentSelection {
             backend: backend.to_string(),
             executable: None,
@@ -276,43 +263,43 @@ fn resolve_agent_for_path_with(
             custom_profile: false,
             secret_values: BTreeSet::new(),
         });
+    };
+    let mut env = BTreeMap::new();
+    let mut secret_values = BTreeSet::new();
+    for var in &profile.env {
+        let resolved = match var.kind {
+            EnvValueKind::Literal => var.value.clone(),
+            EnvValueKind::Link => std::env::var(&var.value).map_err(|_| {
+                format!(
+                    "agent profile \"{agent}\" requires environment variable {:?}, but it is not set in the daemon process environment. \
+                    Set {} in the environment the `ralphus-daemon serve` process runs in (not just your shell), then restart the daemon.",
+                    var.value, var.value
+                )
+            })?,
+        };
+        secret_values.insert(resolved.clone());
+        env.insert(var.key.clone(), resolved);
     }
-    Err(format!(
-        "unknown agent \"{agent}\": not a configured agent profile and not a built-in backend"
-    ))
-}
-
-fn config_cwd_for_cell(
-    store: &Store,
-    task_project: Option<&str>,
-    cell: &ralphus_core::schema::CellDef,
-) -> Option<PathBuf> {
-    if let Some(cwd) = cell.cwd.as_deref() {
-        if ralphus_core::schema::first_worktree_placeholder_in_text(cwd).is_none() {
-            return Some(PathBuf::from(cwd));
-        }
-    }
-    task_project
-        .and_then(|name| store.resolve_project(name).ok().flatten())
-        .map(|p| PathBuf::from(p.path))
+    // RAL-264, extended: every resolved env value (literal or link) is
+    // treated as secret-shaped now, not just `link` resolutions -- see the
+    // module doc's "Secrets" decision. Also registered at write time
+    // (`Store::upsert_agent_profile`); registering again here is
+    // idempotent and covers a `link` target whose value changed since.
+    crate::redact::register_all(secret_values.iter().cloned());
+    Ok(ResolvedAgentSelection {
+        backend: profile.backend,
+        executable: profile.executable,
+        model: profile.default_model,
+        env,
+        custom_profile: !profile.locked,
+        secret_values,
+    })
 }
 
 pub fn validate_task_file_profiles(
     store: &Store,
-    raw_toml: &str,
-    file: &TaskFile,
-) -> Vec<ValidationError> {
-    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    validate_task_file_profiles_with(store, raw_toml, file, raw.as_deref())
-}
-
-/// [`validate_task_file_profiles`] with `$RALPHUS_CONFIGURATION_PATH` passed
-/// in explicitly -- see [`configuration_path_entries`] for why.
-fn validate_task_file_profiles_with(
-    store: &Store,
     _raw_toml: &str,
     file: &TaskFile,
-    configuration_path_env: Option<&str>,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     for (task_idx, task) in file.task.iter().enumerate() {
@@ -332,13 +319,10 @@ fn validate_task_file_profiles_with(
                     )
                 });
             let names = spec.names();
-            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
-                continue;
-            };
             let mut selections = Vec::with_capacity(names.len());
             let mut resolution_failed = false;
             for (candidate_idx, name) in names.iter().enumerate() {
-                match resolve_agent_for_path_with(name, &cwd, configuration_path_env) {
+                match resolve_agent(name, store) {
                     Ok(s) => selections.push(s),
                     Err(message) => {
                         let path = if names.len() > 1 {
@@ -370,11 +354,6 @@ fn validate_task_file_profiles_with(
             // additionally covers a custom profile, whose backend `core`
             // cannot see).
             for (name, selection) in names.iter().zip(selections.iter()) {
-                // `core`'s offline validator only rejects system_prompt for
-                // agent names it recognizes itself (RESERVED_AGENT_NAMES) --
-                // it defers on any custom profile, since it can't see the
-                // profile's backend. Now that the profile is resolved, check
-                // its backend the same way.
                 if selection.custom_profile
                     && (cell.system_prompt.is_some() || cell.system_prompt_position.is_some())
                     && !ralphus_core::schema::agent_supports_system_prompt(&selection.backend)
@@ -396,17 +375,6 @@ fn validate_task_file_profiles_with(
                         line: None,
                     });
                 }
-                // RAL-304: same deferral shape as system_prompt above --
-                // `core` can't classify a custom profile's backend itself,
-                // so it only rejects `maximum_context`/`auto_compact_threshold`
-                // for a RESERVED_AGENT_NAMES agent; check the resolved
-                // backend here. Either field cascades from the task, so both
-                // are checked at their effective (cell-or-task) value, not
-                // just the cell's own. The two fields are checked
-                // independently, not as a pair -- claude-code accepts
-                // auto_compact_threshold but not maximum_context (see
-                // `agent_supports_auto_compact_threshold`'s doc comment for
-                // why).
                 let has_maximum_context =
                     cell.maximum_context.is_some() || task.maximum_context.is_some();
                 let has_auto_compact_threshold =
@@ -444,13 +412,6 @@ fn validate_task_file_profiles_with(
                         line: None,
                     });
                 }
-                // RAL-333: same deferral shape as maximum_context/
-                // auto_compact_threshold above -- `core` can't classify a
-                // custom profile's backend itself, so it only rejects
-                // `maximum_tool_output_tokens` for a RESERVED_AGENT_NAMES
-                // agent; check the resolved backend here. Cascades from the
-                // task, so it's checked at its effective (cell-or-task)
-                // value.
                 let has_maximum_tool_output_tokens = cell.maximum_tool_output_tokens.is_some()
                     || task.maximum_tool_output_tokens.is_some();
                 if selection.custom_profile
@@ -477,42 +438,21 @@ fn validate_task_file_profiles_with(
         }
     }
 
-    // `[[review]].agent` gets the same treatment as a cell's `agent`, but a
-    // review has no `cwd`/`project` of its own -- it's inferred from
-    // whichever cells opt in via `cell.review = "<<review:<id>>>"` (a review
-    // can span several projects, materializing one guardian per project).
-    // Resolve against every distinct project a matching cell resolves to.
+    // `[[review]].agent` gets the same treatment as a cell's `agent`.
+    // Profiles are global now, so (unlike before) this no longer needs to
+    // find a matching cell's cwd first -- every review that sets `agent`
+    // is checked directly.
     for (review_idx, review) in file.review.iter().enumerate() {
-        let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
+        let Some(agent) = review.agent.as_deref() else {
             continue;
         };
-        let mut seen_cwds = BTreeSet::new();
-        for task in &file.task {
-            for cell in &task.cell {
-                let cell_review_id = cell
-                    .review
-                    .as_deref()
-                    .and_then(ralphus_core::schema::parse_cell_review_sentinel);
-                if cell_review_id != Some(review_id) {
-                    continue;
-                }
-                let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
-                    continue;
-                };
-                if !seen_cwds.insert(cwd.clone()) {
-                    continue;
-                }
-                if let Err(message) =
-                    resolve_agent_for_path_with(agent, &cwd, configuration_path_env)
-                {
-                    errors.push(ValidationError {
-                        path: format!("review[{review_idx}].agent"),
-                        kind: ErrorKind::InvalidValue,
-                        message: format!("{message} (for project {})", cwd.display()),
-                        line: None,
-                    });
-                }
-            }
+        if let Err(message) = resolve_agent(agent, store) {
+            errors.push(ValidationError {
+                path: format!("review[{review_idx}].agent"),
+                kind: ErrorKind::InvalidValue,
+                message,
+                line: None,
+            });
         }
     }
 
@@ -543,10 +483,7 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
                 Some(ralphus_core::schema::AgentSpec::Candidates(_)) => continue,
                 None => ralphus_core::schema::DEFAULT_AGENT,
             };
-            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
-                continue;
-            };
-            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
+            if let Ok(selection) = resolve_agent(agent, store) {
                 cell.model = selection.model;
             }
         }
@@ -556,49 +493,13 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
         if review.model.is_some() {
             continue;
         }
-        let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
+        let Some(agent) = review.agent.as_deref() else {
             continue;
         };
-        let matching_cwd = file.task.iter().find_map(|task| {
-            task.cell.iter().find_map(|cell| {
-                (cell
-                    .review
-                    .as_deref()
-                    .and_then(ralphus_core::schema::parse_cell_review_sentinel)
-                    == Some(review_id))
-                .then(|| config_cwd_for_cell(store, task.project.as_deref(), cell))
-                .flatten()
-            })
-        });
-        if let Some(cwd) = matching_cwd {
-            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
-                review.model = selection.model;
-            }
+        if let Ok(selection) = resolve_agent(agent, store) {
+            review.model = selection.model;
         }
     }
-}
-
-/// Cell/task cwd used to resolve an `agent` value that has no cell of its
-/// own to read a `cwd` from -- a cell-less task's own `agent` candidate
-/// list. Mirrors [`config_cwd_for_cell`]'s own project-path fallback, since
-/// there's no cell here to check for an inline `cwd` first. Only matters for
-/// resolving a *custom profile* candidate name (a builtin resolves
-/// regardless of cwd, see [`resolve_agent_for_path_with`]) -- falling back
-/// to the daemon's own working directory when even the project can't be
-/// resolved just means a profile-named candidate in that edge case won't be
-/// found, which is the correct outcome when there's no project to look one
-/// up in.
-fn task_level_cwd(store: &Store, task: &ralphus_core::schema::TaskDef) -> PathBuf {
-    task.cell
-        .first()
-        .and_then(|cell| config_cwd_for_cell(store, task.project.as_deref(), cell))
-        .or_else(|| {
-            task.project
-                .as_deref()
-                .and_then(|name| store.resolve_project(name).ok().flatten())
-                .map(|p| PathBuf::from(p.path))
-        })
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Walk every task/cell whose `agent` is a candidate list (RAL-4xx) and
@@ -614,19 +515,12 @@ fn task_level_cwd(store: &Store, task: &ralphus_core::schema::TaskDef) -> PathBu
 /// `ralphus-runner preflight`) -- not a live/billed reachability probe, so a
 /// bad API key or rejected model name still only surfaces once the picked
 /// candidate actually runs, same as it already does today for a literal
-/// `agent`. Only checked on the daemon's own host: resolution happens once,
-/// at submit time, before any worktree exists to know which remote machine
-/// (RAL-185) a cell will actually run on.
+/// `agent`.
 ///
 /// Every candidate name has already been confirmed to exist by
 /// [`validate_task_file_profiles`] (the caller runs that first and rejects
 /// the submission outright on any unknown name), so a resolution failure
 /// here is only ever "not installed/configured on this host," never a typo.
-///
-/// Takes `runner` rather than constructing a
-/// [`crate::runner::SubprocessRunner`] itself, mirroring
-/// `guardian_merge::preflight_resolver_agent`'s injected-`&dyn Runner` shape
-/// -- lets a test substitute a fake without spawning a real subprocess.
 pub fn resolve_agent_candidate_lists(
     store: &Store,
     file: &mut TaskFile,
@@ -635,8 +529,7 @@ pub fn resolve_agent_candidate_lists(
     let mut errors = Vec::new();
     for (task_idx, task) in file.task.iter_mut().enumerate() {
         if let Some(ralphus_core::schema::AgentSpec::Candidates(candidates)) = &task.agent {
-            let cwd = task_level_cwd(store, task);
-            match pick_available_candidate(runner, candidates, &cwd) {
+            match pick_available_candidate(runner, candidates, store) {
                 Some(winner) => {
                     task.model = winner.model.clone();
                     task.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
@@ -651,10 +544,7 @@ pub fn resolve_agent_candidate_lists(
             let Some(ralphus_core::schema::AgentSpec::Candidates(candidates)) = &cell.agent else {
                 continue;
             };
-            let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
-                continue;
-            };
-            match pick_available_candidate(runner, candidates, &cwd) {
+            match pick_available_candidate(runner, candidates, store) {
                 Some(winner) => {
                     cell.model = winner.model.clone();
                     cell.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
@@ -674,12 +564,12 @@ pub fn resolve_agent_candidate_lists(
 fn pick_available_candidate(
     runner: &dyn crate::runner::Runner,
     candidates: &[ralphus_core::schema::AgentCandidate],
-    cwd: &Path,
+    store: &Store,
 ) -> Option<ralphus_core::schema::AgentCandidate> {
     candidates
         .iter()
         .find(|c| {
-            resolve_agent_for_path(&c.agent, cwd).is_ok_and(|selection| {
+            resolve_agent(&c.agent, store).is_ok_and(|selection| {
                 runner
                     .preflight_agent(&selection.backend, selection.executable.as_deref(), None)
                     .is_ok()
@@ -706,14 +596,18 @@ fn no_candidate_available_error(
 
 /// One agent-profile health finding, as returned by `GET
 /// /api/health/agent-profiles` and rendered by `ralphus check health`.
-/// Runs entirely inside the daemon process (`Store::list_projects` for the
-/// project roots, `std::env::var`/[`resolve_executable`] for resolution) so
-/// the result reflects the daemon's actual environment/PATH -- not whatever
-/// shell happened to run the `ralphus` CLI, which can silently differ from
-/// the environment `ralphus-daemon serve` was started in.
+/// Runs entirely inside the daemon process (`Store::list_agent_profiles`,
+/// `std::env::var`/[`resolve_executable`]) so the result reflects the
+/// daemon's actual environment/PATH -- not whatever shell happened to run
+/// the `ralphus` CLI, which can silently differ from the environment
+/// `ralphus-daemon serve` was started in.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileHealthResult {
     pub name: String,
+    /// `"pass"`, `"fail"`, or `"skip"` (a multi-word `executable` -- see
+    /// [`is_single_word_command`] -- is not one resolvable PATH token, so it
+    /// is deliberately not checked rather than reported as a false
+    /// failure).
     pub status: &'static str,
     pub detail: String,
 }
@@ -776,21 +670,49 @@ pub(crate) fn resolve_executable(program: &str) -> Result<String, String> {
     Err(format!("{program:?} is not resolvable on PATH"))
 }
 
-fn check_profiles_for_root(root: &Path, suffix: &str) -> Vec<ProfileHealthResult> {
-    let profiles = match load_profiles_for_path(root) {
-        Ok(profiles) => profiles,
+/// Whether `s` is a single bare token (no whitespace) -- the only shape
+/// [`resolve_executable`]'s PATH/PATHEXT lookup can meaningfully check. A
+/// multi-word value (e.g. `"wsl.exe claude"`) names a command *line*, not
+/// one resolvable program, so [`check_profiles_health`] skips it rather
+/// than reporting a false failure.
+#[must_use]
+fn is_single_word_command(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && !s.chars().any(char::is_whitespace)
+}
+
+/// Health-checks every stored agent profile's `executable`. Flat over the
+/// whole (global) profile store now -- no more per-project-root repetition,
+/// since profiles no longer have per-project TOML layers.
+#[must_use]
+pub fn check_profiles_health(store: &Store) -> Vec<ProfileHealthResult> {
+    let profiles = match store.list_agent_profiles() {
+        Ok(p) => p,
         Err(e) => {
             return vec![ProfileHealthResult {
-                name: format!("agent-profiles{suffix}"),
+                name: "agent-profiles".to_string(),
                 status: "fail",
-                detail: e,
+                detail: e.to_string(),
             }];
         }
     };
-    let mut results = Vec::new();
-    for (name, profile) in profiles {
-        let check_name = format!("agent-profile:{name}{suffix}");
-        let Some(executable) = profile.executable.as_deref() else {
+    let mut results = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let check_name = format!("agent-profile:{}", profile.name);
+        // A `link`-kind env entry whose target variable isn't set in the
+        // daemon process's own environment makes this profile unusable --
+        // `resolve_agent` already does exactly this check (and, as a
+        // beneficial side effect, registers any resolved secret with
+        // `crate::redact`), so reuse it rather than re-walking `env` here.
+        if let Err(e) = resolve_agent(&profile.name, store) {
+            results.push(ProfileHealthResult {
+                name: check_name,
+                status: "fail",
+                detail: e,
+            });
+            continue;
+        }
+        let Some(executable) = profile.executable.as_deref().filter(|e| !e.is_empty()) else {
             results.push(ProfileHealthResult {
                 name: check_name,
                 status: "pass",
@@ -798,6 +720,18 @@ fn check_profiles_for_root(root: &Path, suffix: &str) -> Vec<ProfileHealthResult
             });
             continue;
         };
+        if !is_single_word_command(executable) {
+            results.push(ProfileHealthResult {
+                name: check_name,
+                status: "skip",
+                detail: format!(
+                    "backend={} executable={executable:?} is a multi-word command; not checked \
+                     against PATH (only a single bare program name can be resolved this way)",
+                    profile.backend
+                ),
+            });
+            continue;
+        }
         match resolve_executable(executable) {
             Ok(resolved) => results.push(ProfileHealthResult {
                 name: check_name,
@@ -821,49 +755,256 @@ fn check_profiles_for_root(root: &Path, suffix: &str) -> Vec<ProfileHealthResult
     results
 }
 
-/// Health-checks every agent profile the daemon can see for `cwd` plus
-/// every registered project's `.ralphus.toml` (deduped by config path) --
-/// mirrors the root discovery `validate_task_file_profiles` uses at submit
-/// time, so `ralphus check health` and `ralphus submit` agree on which
-/// profiles are in scope.
-pub fn check_profiles_health(store: &Store, cwd: &Path) -> Vec<ProfileHealthResult> {
-    let mut results = check_profiles_for_root(cwd, "");
-    let mut seen_configs = BTreeSet::new();
-    if let Some(path) = find_project_config(cwd) {
-        seen_configs.insert(path);
-    }
-    let projects = store.list_projects().unwrap_or_default();
-    for project in projects {
-        let project_path = PathBuf::from(&project.path);
-        let Some(config_path) = find_project_config(&project_path) else {
-            continue;
-        };
-        if !seen_configs.insert(config_path.clone()) {
-            continue;
+/// Outcome of [`Store::set_locked_agent_profile_executable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetLockedExecutableOutcome {
+    Updated,
+    NotFound,
+    /// The named row exists but is not locked -- use
+    /// [`Store::upsert_agent_profile`] for a custom profile instead.
+    NotLocked,
+}
+
+/// Outcome of [`Store::delete_agent_profile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteAgentProfileOutcome {
+    Deleted,
+    NotFound,
+    /// A locked (built-in-backend) row can never be deleted.
+    Locked,
+}
+
+impl Store {
+    /// Every stored agent profile (locked built-ins first, then custom
+    /// profiles alphabetically), each with its full `env` table.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn list_agent_profiles(&self) -> StoreResult<Vec<AgentProfile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, backend, executable, default_model, locked, created_at_ms, updated_at_ms
+             FROM agent_profiles ORDER BY locked DESC, name",
+        )?;
+        let mut profiles: Vec<AgentProfile> = stmt
+            .query_map([], |r| {
+                Ok(AgentProfile {
+                    name: r.get(0)?,
+                    backend: r.get(1)?,
+                    executable: r.get(2)?,
+                    default_model: r.get(3)?,
+                    locked: r.get::<_, i64>(4)? != 0,
+                    env: Vec::new(),
+                    created_at_ms: r.get(5)?,
+                    updated_at_ms: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut env_stmt = self.conn.prepare(
+            "SELECT profile_name, key, kind, value FROM agent_profile_env ORDER BY profile_name, key",
+        )?;
+        let rows = env_stmt.query_map([], |r| {
+            let profile_name: String = r.get(0)?;
+            let key: String = r.get(1)?;
+            let kind_raw: String = r.get(2)?;
+            let value: String = r.get(3)?;
+            Ok((profile_name, key, kind_raw, value))
+        })?;
+        let mut env_by_profile: BTreeMap<String, Vec<AgentProfileEnvVar>> = BTreeMap::new();
+        for row in rows {
+            let (profile_name, key, kind_raw, value) = row?;
+            let kind = if kind_raw == "link" {
+                EnvValueKind::Link
+            } else {
+                EnvValueKind::Literal
+            };
+            env_by_profile
+                .entry(profile_name)
+                .or_default()
+                .push(AgentProfileEnvVar { key, kind, value });
         }
-        let suffix = format!(" ({})", config_path.display());
-        results.extend(check_profiles_for_root(&project_path, &suffix));
+        for profile in &mut profiles {
+            if let Some(env) = env_by_profile.remove(&profile.name) {
+                profile.env = env;
+            }
+        }
+        Ok(profiles)
     }
-    results
+
+    /// One profile by name (case-insensitive), or `None`.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn get_agent_profile(&self, name: &str) -> StoreResult<Option<AgentProfile>> {
+        Ok(self
+            .list_agent_profiles()?
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name.trim())))
+    }
+
+    /// Create or update a **custom** agent profile (upsert on `name`).
+    /// Refuses to touch a locked (built-in-backend) row -- returns
+    /// `Ok(false)` in that case; see
+    /// [`Store::set_locked_agent_profile_executable`] for the one thing a
+    /// locked row can still be changed through. Callers are expected to
+    /// have already validated `backend`/`executable`/reserved-name
+    /// collisions (mirrors `register_machine`'s split in `server.rs`: the
+    /// route validates, the store just writes).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn upsert_agent_profile(
+        &self,
+        name: &str,
+        backend: &str,
+        executable: Option<&str>,
+        default_model: Option<&str>,
+        env: &[AgentProfileEnvVar],
+    ) -> StoreResult<bool> {
+        let name = name.trim();
+        if let Some(existing) = self.get_agent_profile(name)? {
+            if existing.locked {
+                return Ok(false);
+            }
+        }
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO agent_profiles(name, backend, executable, default_model, locked, created_at_ms, updated_at_ms)
+             VALUES(?,?,?,?,0,?,?)
+             ON CONFLICT(name) DO UPDATE SET
+                backend=excluded.backend,
+                executable=excluded.executable,
+                default_model=excluded.default_model,
+                updated_at_ms=excluded.updated_at_ms",
+            rusqlite::params![name, backend, executable, default_model, now, now],
+        )?;
+        self.conn.execute(
+            "DELETE FROM agent_profile_env WHERE profile_name = ?",
+            rusqlite::params![name],
+        )?;
+        for var in env {
+            self.conn.execute(
+                "INSERT INTO agent_profile_env(profile_name, key, kind, value) VALUES(?,?,?,?)",
+                rusqlite::params![name, var.key, var.kind.as_str(), var.value],
+            )?;
+            // RAL-264, extended: register at write time too (not just at
+            // resolution) so a secret is scrubbed from durable pane text
+            // from the moment it's saved, even before the profile is ever
+            // used. `link`-kind values are re-registered again at
+            // resolution time, since the target variable can change later.
+            if var.kind == EnvValueKind::Literal {
+                crate::redact::register_all(std::iter::once(var.value.clone()));
+            } else if let Ok(resolved) = std::env::var(&var.value) {
+                crate::redact::register_all(std::iter::once(resolved));
+            }
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [store] agent profile {name:?} registered backend={backend}"
+        );
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "agent profile registered",
+            scope: Some("agent"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"name": name, "backend": backend}),
+            admin_only: false,
+        });
+        Ok(true)
+    }
+
+    /// Changes a **locked** profile row's `executable` -- the only field a
+    /// locked (built-in-backend) row can ever have changed on it.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_locked_agent_profile_executable(
+        &self,
+        name: &str,
+        executable: &str,
+    ) -> StoreResult<SetLockedExecutableOutcome> {
+        let name = name.trim();
+        let Some(existing) = self.get_agent_profile(name)? else {
+            return Ok(SetLockedExecutableOutcome::NotFound);
+        };
+        if !existing.locked {
+            return Ok(SetLockedExecutableOutcome::NotLocked);
+        }
+        self.conn.execute(
+            "UPDATE agent_profiles SET executable=?, updated_at_ms=? WHERE name=?",
+            rusqlite::params![executable, now_ms(), name],
+        )?;
+        crate::rlog!(
+            INFO,
+            "ralphus [store] built-in agent profile {name:?} executable set to {executable:?}"
+        );
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "built-in agent profile executable changed",
+            scope: Some("agent"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"name": name, "executable": executable}),
+            admin_only: false,
+        });
+        Ok(SetLockedExecutableOutcome::Updated)
+    }
+
+    /// Remove a **custom** agent profile. A locked row is never deleted --
+    /// returns [`DeleteAgentProfileOutcome::Locked`] instead.
+    ///
+    /// Deliberately does **not** check whether any stored squad still
+    /// references the profile name: that squad already resolved its agent
+    /// when it was submitted, and a historical squad's record should not
+    /// block cleaning up the registry. A *new* submission naming a removed
+    /// profile fails validation with an "unknown agent" error.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn delete_agent_profile(&self, name: &str) -> StoreResult<DeleteAgentProfileOutcome> {
+        let name = name.trim();
+        let Some(existing) = self.get_agent_profile(name)? else {
+            return Ok(DeleteAgentProfileOutcome::NotFound);
+        };
+        if existing.locked {
+            return Ok(DeleteAgentProfileOutcome::Locked);
+        }
+        self.conn.execute(
+            "DELETE FROM agent_profiles WHERE name = ?",
+            rusqlite::params![name],
+        )?;
+        crate::rlog!(INFO, "ralphus [store] agent profile {name:?} removed");
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "agent profile removed",
+            scope: Some("agent"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"name": name}),
+            admin_only: false,
+        });
+        Ok(DeleteAgentProfileOutcome::Deleted)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
 
-    fn tempdir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ralphus-agent-profiles-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create tempdir");
-        dir
+    fn store() -> Store {
+        Store::open_in_memory().expect("open store")
     }
 
     #[test]
@@ -874,58 +1015,224 @@ mod tests {
     }
 
     #[test]
-    fn parse_profile_file_resolves_from_env_indirection() {
-        let project_root = tempdir("project-root");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.shared]
-backend = "raw"
-executable = "my-raw-runner"
+    fn locked_builtin_profiles_are_seeded_on_open() {
+        let store = store();
+        let claude_code = store
+            .get_agent_profile("claude-code")
+            .expect("query")
+            .expect("seeded");
+        assert!(claude_code.locked);
+        assert_eq!(claude_code.executable.as_deref(), Some("claude"));
+        let codex = store
+            .get_agent_profile("codex")
+            .expect("query")
+            .expect("seeded");
+        assert!(codex.locked);
+        assert_eq!(codex.executable.as_deref(), Some("codex"));
+    }
 
-[agent.profiles.shared.env]
-PATH_COPY = { from_env = "PATH" }
-"#,
-        )
-        .expect("write project config");
-
-        let profiles =
-            parse_profile_file(&project_root.join(".ralphus.toml")).expect("parse profiles");
-        let shared = profiles.get("shared").expect("shared profile");
-        assert_eq!(shared.backend, "raw");
-        assert_eq!(shared.executable.as_deref(), Some("my-raw-runner"));
+    #[test]
+    fn locked_profile_cannot_be_upserted_or_deleted() {
+        let store = store();
+        let committed = store
+            .upsert_agent_profile("claude-code", "claude-code", Some("my-claude"), None, &[])
+            .expect("upsert call");
+        assert!(!committed, "a locked row must refuse the general upsert");
+        // Untouched.
+        let claude_code = store
+            .get_agent_profile("claude-code")
+            .expect("query")
+            .expect("still present");
+        assert_eq!(claude_code.executable.as_deref(), Some("claude"));
         assert_eq!(
-            shared.env.get("PATH_COPY").map(String::as_str),
+            store.delete_agent_profile("claude-code").expect("delete"),
+            DeleteAgentProfileOutcome::Locked
+        );
+    }
+
+    #[test]
+    fn locked_profile_executable_can_be_changed_through_dedicated_method() {
+        let store = store();
+        assert_eq!(
+            store
+                .set_locked_agent_profile_executable("codex", "my-codex-fork")
+                .expect("set"),
+            SetLockedExecutableOutcome::Updated
+        );
+        let codex = store
+            .get_agent_profile("codex")
+            .expect("query")
+            .expect("present");
+        assert_eq!(codex.executable.as_deref(), Some("my-codex-fork"));
+    }
+
+    #[test]
+    fn set_locked_executable_refuses_a_non_locked_row() {
+        let store = store();
+        store
+            .upsert_agent_profile("my-custom", "claude-code", None, None, &[])
+            .expect("upsert");
+        assert_eq!(
+            store
+                .set_locked_agent_profile_executable("my-custom", "x")
+                .expect("set"),
+            SetLockedExecutableOutcome::NotLocked
+        );
+    }
+
+    #[test]
+    fn custom_profile_round_trips_through_upsert_get_delete() {
+        let store = store();
+        let env = vec![
+            AgentProfileEnvVar {
+                key: "FEATURE_FLAG".to_string(),
+                kind: EnvValueKind::Literal,
+                value: "enabled".to_string(),
+            },
+            AgentProfileEnvVar {
+                key: "PATH_COPY".to_string(),
+                kind: EnvValueKind::Link,
+                value: "PATH".to_string(),
+            },
+        ];
+        let committed = store
+            .upsert_agent_profile("my-openrouter", "claude-code", None, Some("gpt-5"), &env)
+            .expect("upsert");
+        assert!(committed);
+        let profile = store
+            .get_agent_profile("my-openrouter")
+            .expect("query")
+            .expect("present");
+        assert!(!profile.locked);
+        assert_eq!(profile.backend, "claude-code");
+        assert_eq!(profile.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(profile.env.len(), 2);
+
+        assert_eq!(
+            store.delete_agent_profile("my-openrouter").expect("delete"),
+            DeleteAgentProfileOutcome::Deleted
+        );
+        assert!(
+            store
+                .get_agent_profile("my-openrouter")
+                .expect("query")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redact_agent_profile_masks_literal_but_not_link_values() {
+        let profile = AgentProfile {
+            name: "custom".to_string(),
+            backend: "pi".to_string(),
+            executable: None,
+            default_model: None,
+            locked: false,
+            env: vec![
+                AgentProfileEnvVar {
+                    key: "API_KEY".to_string(),
+                    kind: EnvValueKind::Literal,
+                    value: "sk-secret".to_string(),
+                },
+                AgentProfileEnvVar {
+                    key: "TOKEN".to_string(),
+                    kind: EnvValueKind::Link,
+                    value: "MY_TOKEN_VAR".to_string(),
+                },
+            ],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let view = redact_agent_profile(&profile);
+        let literal = view.env.iter().find(|v| v.key == "API_KEY").expect("row");
+        assert!(literal.redacted);
+        assert_ne!(literal.value, "sk-secret");
+        let link = view.env.iter().find(|v| v.key == "TOKEN").expect("row");
+        assert!(!link.redacted);
+        assert_eq!(link.value, "MY_TOKEN_VAR");
+    }
+
+    #[test]
+    fn resolve_agent_finds_locked_builtin_with_customized_executable() {
+        let store = store();
+        store
+            .set_locked_agent_profile_executable("claude-code", "my-claude-fork")
+            .expect("set");
+        let selection = resolve_agent("claude-code", &store).expect("resolve");
+        assert_eq!(selection.backend, "claude-code");
+        assert_eq!(selection.executable.as_deref(), Some("my-claude-fork"));
+        assert!(
+            !selection.custom_profile,
+            "a locked row must not be treated as a custom profile"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_finds_custom_profile_and_falls_back_to_builtin() {
+        let store = store();
+        store
+            .upsert_agent_profile("my-ollama", "ollama", None, Some("qwen3:8b"), &[])
+            .expect("upsert");
+        let selection = resolve_agent("my-ollama", &store).expect("resolve");
+        assert_eq!(selection.backend, "ollama");
+        assert_eq!(selection.model.as_deref(), Some("qwen3:8b"));
+        assert!(selection.custom_profile);
+
+        let builtin = resolve_agent("ollama", &store).expect("resolve builtin");
+        assert!(!builtin.custom_profile);
+    }
+
+    #[test]
+    fn resolve_agent_resolves_link_env_from_process_environment() {
+        let store = store();
+        store
+            .upsert_agent_profile(
+                "shared",
+                "raw",
+                Some("my-raw-runner"),
+                None,
+                &[AgentProfileEnvVar {
+                    key: "PATH_COPY".to_string(),
+                    kind: EnvValueKind::Link,
+                    value: "PATH".to_string(),
+                }],
+            )
+            .expect("upsert");
+        let selection = resolve_agent("shared", &store).expect("resolve");
+        assert_eq!(
+            selection.env.get("PATH_COPY").map(String::as_str),
             std::env::var("PATH").ok().as_deref()
         );
-        // RAL-264: the `from_env`-resolved value is tracked as a secret value
-        // (scrubbed from durable pane text), even though it isn't itself an
-        // API key — `from_env` is the marker for "could be sensitive".
         assert!(
-            shared
+            selection
                 .secret_values
                 .contains(std::env::var("PATH").ok().unwrap_or_default().as_str())
         );
     }
 
     #[test]
+    fn resolve_agent_rejects_unknown_name() {
+        let store = store();
+        let err = resolve_agent("not-a-real-profile", &store).expect_err("should fail");
+        assert!(err.contains("not-a-real-profile"));
+    }
+
+    #[test]
     fn profile_default_model_applies_unless_task_or_cell_declares_one() {
-        let project_root = tempdir("profile-default-model");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.deepseek]
-backend = "pi"
-model = "openrouter/deepseek/deepseek-v4-flash-0731"
-"#,
+        let store = store();
+        store
+            .upsert_agent_profile(
+                "deepseek",
+                "pi",
+                None,
+                Some("openrouter/deepseek/deepseek-v4-flash-0731"),
+                &[],
+            )
+            .expect("upsert");
+        let mut file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\nagent=\"deepseek\"\n[[task.cell]]\nid=\"default\"\nprompt=\"p\"\n[[task.cell]]\nid=\"override\"\nmodel=\"openrouter/other\"\nprompt=\"p\"\n"
         )
-        .expect("write project config");
-        let cwd = project_root.to_string_lossy().replace('\\', "/");
-        let mut file: TaskFile = toml::from_str(&format!(
-            "[[task]]\nname=\"t\"\nagent=\"deepseek\"\n[[task.cell]]\nid=\"default\"\ncwd=\"{cwd}\"\nprompt=\"p\"\n[[task.cell]]\nid=\"override\"\ncwd=\"{cwd}\"\nmodel=\"openrouter/other\"\nprompt=\"p\"\n"
-        ))
         .expect("parse task file");
-        let store = Store::open_in_memory().expect("open store");
 
         apply_profile_model_defaults(&store, &mut file);
 
@@ -939,146 +1246,21 @@ model = "openrouter/deepseek/deepseek-v4-flash-0731"
         );
     }
 
-    #[test]
-    fn literal_env_values_are_not_treated_as_secrets() {
-        let root = tempdir("literal-not-secret");
-        fs::write(
-            root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom]
-backend = "raw"
-executable = "my-raw-runner"
-
-[agent.profiles.custom.env]
-FEATURE_FLAG = "enabled"
-"#,
-        )
-        .expect("write project config");
-
-        let profiles = parse_profile_file(&root.join(".ralphus.toml")).expect("parse profiles");
-        let custom = profiles.get("custom").expect("custom profile");
-        assert_eq!(
-            custom.env.get("FEATURE_FLAG").map(String::as_str),
-            Some("enabled")
-        );
-        // A literal authored in the config file is already plaintext there, so
-        // it is not promoted to the redaction set (RAL-264).
-        assert!(custom.secret_values.is_empty());
-    }
-
-    #[test]
-    fn load_profiles_for_path_with_reads_configuration_path_entries() {
-        let config_dir = tempdir("configuration-path-source");
-        let config_file = config_dir.join(".ralphus.toml");
-        fs::write(
-            &config_file,
-            r#"
-[agent.profiles.from-configuration-path]
-backend = "claude-code"
-"#,
-        )
-        .expect("write configuration-path file");
-
-        // `cwd` is unrelated to `config_dir` -- no ancestor `.ralphus.toml` and
-        // no `$RALPHUS_CONFIG_HOME`, so the only way this profile can be found
-        // is through the `$RALPHUS_CONFIGURATION_PATH` entry.
-        let cwd = tempdir("configuration-path-unrelated-cwd");
-        let profiles = load_profiles_for_path_with(&cwd, Some(config_file.to_str().unwrap()))
-            .expect("load profiles");
-        assert!(profiles.contains_key("from-configuration-path"));
-    }
-
-    #[test]
-    fn load_profiles_for_path_with_project_local_wins_over_configuration_path() {
-        let config_dir = tempdir("configuration-path-loser");
-        let config_file = config_dir.join(".ralphus.toml");
-        fs::write(
-            &config_file,
-            r#"
-[agent.profiles.shared]
-backend = "codex"
-"#,
-        )
-        .expect("write configuration-path file");
-
-        let project_root = tempdir("configuration-path-project-local-winner");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.shared]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let profiles =
-            load_profiles_for_path_with(&project_root, Some(config_file.to_str().unwrap()))
-                .expect("load profiles");
-        assert_eq!(
-            profiles.get("shared").map(|p| p.backend.as_str()),
-            Some("claude-code")
-        );
-    }
-
-    #[test]
-    fn merge_profiles_prefers_project_layer_on_name_collision() {
-        let mut global = BTreeMap::new();
-        global.insert(
-            "shared".to_string(),
-            AgentProfile {
-                backend: "codex".to_string(),
-                executable: Some("codex-global".to_string()),
-                model: None,
-                env: BTreeMap::from([("GLOBAL_ONLY".to_string(), "1".to_string())]),
-                secret_values: BTreeSet::new(),
-            },
-        );
-        let mut project = BTreeMap::new();
-        project.insert(
-            "shared".to_string(),
-            AgentProfile {
-                backend: "raw".to_string(),
-                executable: Some("project-runner".to_string()),
-                model: None,
-                env: BTreeMap::from([("PROJECT_ONLY".to_string(), "1".to_string())]),
-                secret_values: BTreeSet::new(),
-            },
-        );
-
-        let merged = merge_profiles(global, project);
-        let shared = merged.get("shared").expect("shared profile");
-        assert_eq!(shared.backend, "raw");
-        assert_eq!(shared.executable.as_deref(), Some("project-runner"));
-        assert_eq!(
-            shared.env.get("PROJECT_ONLY").map(String::as_str),
-            Some("1")
-        );
-        assert!(!shared.env.contains_key("GLOBAL_ONLY"));
-    }
-
-    fn task_file_with_agent_and_system_prompt(cwd: &Path, agent: &str) -> TaskFile {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
+    fn task_file_with_agent_and_system_prompt(agent: &str) -> TaskFile {
         let src = format!(
-            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n"
+            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\nagent=\"{agent}\"\nprompt=\"p\"\nsystem_prompt=\"be terse\"\nsystem_prompt_position=\"append\"\n"
         );
         toml::from_str(&src).expect("parse task file")
     }
 
     #[test]
     fn validate_task_file_profiles_rejects_system_prompt_for_non_supporting_profile_backend() {
-        let project_root = tempdir("system-prompt-ollama-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-ollama]
-backend = "ollama"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_system_prompt(&project_root, "custom-ollama");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("custom-ollama", "ollama", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_agent_and_system_prompt("custom-ollama");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1090,19 +1272,12 @@ backend = "ollama"
 
     #[test]
     fn validate_task_file_profiles_allows_system_prompt_for_claude_code_profile_backend() {
-        let project_root = tempdir("system-prompt-claude-code-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_system_prompt(&project_root, "custom-claude");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("custom-claude", "claude-code", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_agent_and_system_prompt("custom-claude");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors.iter().all(|e| !e.path.contains("system_prompt")),
@@ -1110,29 +1285,21 @@ backend = "claude-code"
         );
     }
 
-    fn task_file_with_agent_and_maximum_context(cwd: &Path, agent: &str) -> TaskFile {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
+    fn task_file_with_agent_and_maximum_context(agent: &str) -> TaskFile {
         let src = format!(
-            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nmaximum_context=100000\n"
+            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\nagent=\"{agent}\"\nprompt=\"p\"\nmaximum_context=100000\n"
         );
         toml::from_str(&src).expect("parse task file")
     }
 
     #[test]
     fn validate_task_file_profiles_rejects_maximum_context_for_non_supporting_profile_backend() {
-        let project_root = tempdir("maximum-context-ollama-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-ollama]
-backend = "ollama"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-ollama");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("custom-ollama", "ollama", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_agent_and_maximum_context("custom-ollama");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1144,19 +1311,12 @@ backend = "ollama"
 
     #[test]
     fn validate_task_file_profiles_rejects_maximum_context_for_claude_code_profile_backend() {
-        let project_root = tempdir("maximum-context-claude-code-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-claude");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("custom-claude", "claude-code", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_agent_and_maximum_context("custom-claude");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1168,19 +1328,12 @@ backend = "claude-code"
 
     #[test]
     fn validate_task_file_profiles_allows_maximum_context_for_pi_profile_backend() {
-        let project_root = tempdir("maximum-context-pi-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-pi]
-backend = "pi"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_context(&project_root, "custom-pi");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("custom-pi", "pi", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_agent_and_maximum_context("custom-pi");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors.iter().all(|e| !e.path.contains("maximum_context")),
@@ -1188,164 +1341,20 @@ backend = "pi"
         );
     }
 
-    fn task_file_with_agent_and_auto_compact_threshold(cwd: &Path, agent: &str) -> TaskFile {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
-        let src = format!(
-            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nauto_compact_threshold=80000\n"
-        );
-        toml::from_str(&src).expect("parse task file")
-    }
-
-    #[test]
-    fn validate_task_file_profiles_allows_auto_compact_threshold_for_claude_code_profile_backend() {
-        let project_root = tempdir("auto-compact-threshold-claude-code-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_auto_compact_threshold(&project_root, "custom-claude");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
-
-        assert!(
-            errors
-                .iter()
-                .all(|e| !e.path.contains("auto_compact_threshold")),
-            "{errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_task_file_profiles_rejects_auto_compact_threshold_for_non_supporting_profile_backend()
-     {
-        let project_root = tempdir("auto-compact-threshold-ollama-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-ollama]
-backend = "ollama"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_auto_compact_threshold(&project_root, "custom-ollama");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
-
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path.contains("auto_compact_threshold") && e.message.contains("ollama")),
-            "{errors:?}"
-        );
-    }
-
-    fn task_file_with_agent_and_maximum_tool_output_tokens(cwd: &Path, agent: &str) -> TaskFile {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
-        let src = format!(
-            "[[task]]\nname=\"t\"\nproject=\"unused\"\n[[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nagent=\"{agent}\"\nprompt=\"p\"\nmaximum_tool_output_tokens=40000\n"
-        );
-        toml::from_str(&src).expect("parse task file")
-    }
-
-    #[test]
-    fn validate_task_file_profiles_allows_maximum_tool_output_tokens_for_claude_code_profile_backend()
-     {
-        let project_root = tempdir("tool-output-max-tokens-claude-code-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file =
-            task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-claude");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
-
-        assert!(
-            errors
-                .iter()
-                .all(|e| !e.path.contains("maximum_tool_output_tokens")),
-            "{errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_task_file_profiles_rejects_maximum_tool_output_tokens_for_non_supporting_profile_backend()
-     {
-        let project_root = tempdir("tool-output-max-tokens-ollama-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-ollama]
-backend = "ollama"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file =
-            task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-ollama");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
-
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.path.contains("maximum_tool_output_tokens")
-                    && e.message.contains("ollama")),
-            "{errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_task_file_profiles_allows_maximum_tool_output_tokens_for_pi_profile_backend() {
-        let project_root = tempdir("tool-output-max-tokens-pi-profile");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-pi]
-backend = "pi"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_agent_and_maximum_tool_output_tokens(&project_root, "custom-pi");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
-
-        assert!(
-            errors
-                .iter()
-                .all(|e| !e.path.contains("maximum_tool_output_tokens")),
-            "{errors:?}"
-        );
-    }
-
-    fn task_file_with_review_agent(cwd: &Path, review_agent: &str) -> TaskFile {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
+    fn task_file_with_review_agent(review_agent: &str) -> TaskFile {
         let src = format!(
             "[[review]]\nid=\"r\"\nagent=\"{review_agent}\"\n\
              [[task]]\nname=\"t\"\nproject=\"unused\"\n\
-             [[task.cell]]\nid=\"work\"\ncwd=\"{cwd}\"\nreview=\"<<review:r>>\"\nprompt=\"p\"\n"
+             [[task.cell]]\nid=\"work\"\nreview=\"<<review:r>>\"\nprompt=\"p\"\n"
         );
         toml::from_str(&src).expect("parse task file")
     }
 
     #[test]
     fn validate_task_file_profiles_rejects_unresolvable_review_agent() {
-        let project_root = tempdir("review-agent-unresolvable");
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_review_agent(&project_root, "not-a-real-profile");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        let file = task_file_with_review_agent("not-a-real-profile");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1357,19 +1366,12 @@ backend = "pi"
 
     #[test]
     fn validate_task_file_profiles_allows_resolvable_review_agent() {
-        let project_root = tempdir("review-agent-resolvable");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.openrouter-deepseek]
-backend = "claude-code"
-"#,
-        )
-        .expect("write project config");
-
-        let store = Store::open_in_memory().expect("open store");
-        let file = task_file_with_review_agent(&project_root, "openrouter-deepseek");
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let store = store();
+        store
+            .upsert_agent_profile("openrouter-deepseek", "claude-code", None, None, &[])
+            .expect("upsert");
+        let file = task_file_with_review_agent("openrouter-deepseek");
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors.iter().all(|e| !e.path.starts_with("review[")),
@@ -1380,28 +1382,21 @@ backend = "claude-code"
     #[test]
     fn validate_task_file_profiles_rejects_when_any_candidate_in_a_list_lacks_system_prompt_support()
      {
-        let project_root = tempdir("candidate-list-system-prompt-mixed");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-
-[agent.profiles.custom-ollama]
-backend = "ollama"
-"#,
-        )
-        .expect("write project config");
-        let cwd = project_root.to_string_lossy().replace('\\', "/");
-        let store = Store::open_in_memory().expect("open store");
-        let file: TaskFile = toml::from_str(&format!(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
+        let store = store();
+        store
+            .upsert_agent_profile("custom-claude", "claude-code", None, None, &[])
+            .expect("upsert");
+        store
+            .upsert_agent_profile("custom-ollama", "ollama", None, None, &[])
+            .expect("upsert");
+        let file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n\
              system_prompt=\"be terse\"\n\
-             agent = [{{ agent = \"custom-claude\" }}, {{ agent = \"custom-ollama\" }}]\n"
-        ))
+             agent = [{ agent = \"custom-claude\" }, { agent = \"custom-ollama\" }]\n",
+        )
         .expect("parse task file");
 
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1414,28 +1409,21 @@ backend = "ollama"
     #[test]
     fn validate_task_file_profiles_accepts_a_candidate_list_when_every_entry_supports_system_prompt()
      {
-        let project_root = tempdir("candidate-list-system-prompt-all-ok");
-        fs::write(
-            project_root.join(".ralphus.toml"),
-            r#"
-[agent.profiles.custom-claude]
-backend = "claude-code"
-
-[agent.profiles.custom-codex]
-backend = "codex"
-"#,
-        )
-        .expect("write project config");
-        let cwd = project_root.to_string_lossy().replace('\\', "/");
-        let store = Store::open_in_memory().expect("open store");
-        let file: TaskFile = toml::from_str(&format!(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
+        let store = store();
+        store
+            .upsert_agent_profile("custom-claude", "claude-code", None, None, &[])
+            .expect("upsert");
+        store
+            .upsert_agent_profile("custom-codex", "codex", None, None, &[])
+            .expect("upsert");
+        let file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n\
              system_prompt=\"be terse\"\n\
-             agent = [{{ agent = \"custom-claude\" }}, {{ agent = \"custom-codex\" }}]\n"
-        ))
+             agent = [{ agent = \"custom-claude\" }, { agent = \"custom-codex\" }]\n",
+        )
         .expect("parse task file");
 
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors.iter().all(|e| !e.path.contains("system_prompt")),
@@ -1445,16 +1433,14 @@ backend = "codex"
 
     #[test]
     fn validate_task_file_profiles_rejects_an_unknown_name_inside_a_candidate_list() {
-        let project_root = tempdir("candidate-list-unknown-name");
-        let cwd = project_root.to_string_lossy().replace('\\', "/");
-        let store = Store::open_in_memory().expect("open store");
-        let file: TaskFile = toml::from_str(&format!(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"{cwd}\"\nprompt=\"p\"\n\
-             agent = [{{ agent = \"codex\" }}, {{ agent = \"not-a-real-profile\" }}]\n"
-        ))
+        let store = store();
+        let file: TaskFile = toml::from_str(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n\
+             agent = [{ agent = \"codex\" }, { agent = \"not-a-real-profile\" }]\n",
+        )
         .expect("parse task file");
 
-        let errors = validate_task_file_profiles_with(&store, "", &file, None);
+        let errors = validate_task_file_profiles(&store, "", &file);
 
         assert!(
             errors
@@ -1466,8 +1452,7 @@ backend = "codex"
 
     /// Test-only [`crate::runner::Runner`] that reports a fixed set of agent
     /// names as available, without spawning a real `ralphus-runner`
-    /// subprocess (mirrors `guardian_merge::preflight_resolver_agent`'s
-    /// injected-`&dyn Runner` seam).
+    /// subprocess.
     struct FakeAvailabilityRunner {
         available: Vec<&'static str>,
     }
@@ -1493,9 +1478,9 @@ backend = "codex"
 
     #[test]
     fn resolve_agent_candidate_lists_picks_the_first_available_and_collapses_to_single() {
-        let store = Store::open_in_memory().expect("open store");
+        let store = store();
         let mut file: TaskFile = toml::from_str(concat!(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n",
             "agent = [\n",
             "    { agent = \"claude-code\", model = \"opus\" },\n",
             "    { agent = \"codex\", model = \"gpt-5\" },\n",
@@ -1518,9 +1503,9 @@ backend = "codex"
 
     #[test]
     fn resolve_agent_candidate_lists_errors_naming_every_tried_candidate_when_none_are_available() {
-        let store = Store::open_in_memory().expect("open store");
+        let store = store();
         let mut file: TaskFile = toml::from_str(concat!(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\n",
             "agent = [{ agent = \"claude-code\" }, { agent = \"codex\" }]\n",
         ))
         .expect("parse task file");
@@ -1538,11 +1523,11 @@ backend = "codex"
 
     #[test]
     fn resolve_agent_candidate_lists_collapses_a_task_level_list_with_no_cell_override() {
-        let store = Store::open_in_memory().expect("open store");
+        let store = store();
         let mut file: TaskFile = toml::from_str(concat!(
             "[[task]]\nname=\"t\"\n",
             "agent = [{ agent = \"claude-code\" }, { agent = \"codex\" }]\n",
-            "[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task.cell]]\nprompt=\"p\"\n",
         ))
         .expect("parse task file");
         let runner = FakeAvailabilityRunner {
@@ -1562,9 +1547,9 @@ backend = "codex"
 
     #[test]
     fn resolve_agent_candidate_lists_leaves_a_literal_agent_completely_untouched() {
-        let store = Store::open_in_memory().expect("open store");
+        let store = store();
         let mut file: TaskFile = toml::from_str(
-            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nagent=\"claude-code\"\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nprompt=\"p\"\nagent=\"claude-code\"\n",
         )
         .expect("parse task file");
         // No candidate would resolve -- proves a literal `agent` never goes
@@ -1583,31 +1568,59 @@ backend = "codex"
     }
 
     #[test]
-    fn parse_profile_file_rejects_reserved_name_and_native_executable() {
-        let root = tempdir("invalid-root");
-        let config = root.join(".ralphus.toml");
-        fs::write(
-            &config,
-            r#"
-[agent.profiles.claude]
-backend = "codex"
-executable = "codex"
-"#,
-        )
-        .expect("write config");
-        let err = parse_profile_file(&config).expect_err("reserved name error");
-        assert!(err.contains("collides with a reserved built-in backend name"));
+    fn check_profiles_health_fails_a_profile_with_an_unresolved_link_env_var() {
+        let store = store();
+        store
+            .upsert_agent_profile(
+                "deepseek",
+                "anthropic",
+                None,
+                None,
+                &[AgentProfileEnvVar {
+                    key: "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    kind: EnvValueKind::Link,
+                    value: "RALPHUS_AGENT_PROFILES_HEALTH_TEST_VAR_UNSET".to_string(),
+                }],
+            )
+            .expect("upsert");
+        let results = check_profiles_health(&store);
+        let deepseek = results
+            .iter()
+            .find(|r| r.name == "agent-profile:deepseek")
+            .expect("row present");
+        assert_eq!(deepseek.status, "fail");
+        assert!(
+            deepseek
+                .detail
+                .contains("RALPHUS_AGENT_PROFILES_HEALTH_TEST_VAR_UNSET")
+        );
+    }
 
-        fs::write(
-            &config,
-            r#"
-[agent.profiles.custom]
-backend = "ollama"
-executable = "should-not-be-here"
-"#,
-        )
-        .expect("rewrite config");
-        let err = parse_profile_file(&config).expect_err("native executable error");
-        assert!(err.contains("executable is only meaningful for claude-code, codex, pi, or raw"));
+    #[test]
+    fn check_profiles_health_skips_multi_word_executables() {
+        let store = store();
+        store
+            .set_locked_agent_profile_executable("claude-code", "wsl.exe claude")
+            .expect("set");
+        let results = check_profiles_health(&store);
+        let claude_code = results
+            .iter()
+            .find(|r| r.name == "agent-profile:claude-code")
+            .expect("row present");
+        assert_eq!(claude_code.status, "skip");
+    }
+
+    #[test]
+    fn check_profiles_health_checks_single_word_executables() {
+        let store = store();
+        // "codex" is seeded by default -- almost certainly not literally on
+        // PATH in a test sandbox, so this exercises the pass/fail branch
+        // without asserting which of the two it lands on.
+        let results = check_profiles_health(&store);
+        let codex = results
+            .iter()
+            .find(|r| r.name == "agent-profile:codex")
+            .expect("row present");
+        assert!(codex.status == "pass" || codex.status == "fail");
     }
 }

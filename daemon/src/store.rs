@@ -1930,6 +1930,38 @@ impl Store {
                 ON task_worktree_claims(project, base_branch);
             CREATE INDEX IF NOT EXISTS idx_wt_claims_squad
                 ON task_worktree_claims(project, base_branch, squad_id);
+            -- RAL-460: daemon-managed agent profiles -- there is no TOML
+            -- source for these anymore ([agent.profiles.*] is no longer
+            -- read at all). Two rows are always present and `locked`: \"claude-code\"
+            -- and \"codex\", representing the built-in CLI-forking backends --
+            -- their `executable` is the only field a locked row's admin can
+            -- change (see `crate::agent_profiles::set_locked_agent_profile_executable`),
+            -- replacing the old RALPHUS_CLAUDE_COMMAND/RALPHUS_CODEX_COMMAND
+            -- env-var overrides for daemon-run cells. A non-locked row is a
+            -- fully custom profile, created via `POST /api/agent-profiles`.
+            CREATE TABLE IF NOT EXISTS agent_profiles (
+                name          TEXT PRIMARY KEY,
+                backend       TEXT NOT NULL,
+                executable    TEXT,
+                default_model TEXT,
+                locked        INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            -- One row per environment variable a profile sets. `kind` is
+            -- 'literal' (the raw value -- stored plaintext here, but
+            -- redacted in every API/UI response and registered with
+            -- `crate::redact`) or 'link' (the value is the NAME of another
+            -- environment variable to resolve from at cell-run time, not
+            -- the resolved value itself -- mirrors the old TOML `from_env`
+            -- indirection).
+            CREATE TABLE IF NOT EXISTS agent_profile_env (
+                profile_name TEXT NOT NULL REFERENCES agent_profiles(name) ON DELETE CASCADE,
+                key          TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                value        TEXT NOT NULL,
+                PRIMARY KEY (profile_name, key)
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
@@ -1955,6 +1987,23 @@ impl Store {
                     params![name, label, description, now_ms()],
                 )?;
             }
+        }
+        // RAL-460: "claude-code" and "codex" are permanent, locked
+        // agent-profile rows (see the `agent_profiles` table comment above
+        // and `crate::agent_profiles::LOCKED_BUILTIN_PROFILES`). Re-seeded
+        // harmlessly on every startup rather than gated on first-ever-
+        // creation, same rationale as `UNCLASSIFIED_TYPE` above: a locked
+        // row is a permanent invariant, not a user-editable starter set,
+        // and it can never be deleted or renamed -- only its `executable`
+        // is ever mutated after this, through a dedicated update path that
+        // never touches `name`/`backend`, so re-seeding those two columns
+        // here can never clobber a deliberate change.
+        for (name, backend, default_executable) in crate::agent_profiles::LOCKED_BUILTIN_PROFILES {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO agent_profiles(name, backend, executable, default_model, locked, created_at_ms, updated_at_ms)
+                 VALUES(?,?,?,NULL,1,?,?)",
+                params![name, backend, default_executable, now_ms(), now_ms()],
+            )?;
         }
         if !secret_env_names_preexisting {
             for name in crate::secret_env_names::DEFAULT_SECRET_ENV_NAMES {

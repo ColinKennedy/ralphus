@@ -142,30 +142,12 @@ fn main() -> ExitCode {
                 daemon_cfg.log_path.as_deref(),
                 daemon_cfg.log_level.as_deref(),
             );
-            // A misconfigured agent profile (e.g. a `from_env` var that isn't
-            // set yet) is not fatal here -- the var may be provided later, or
-            // the profile may never be used this session. `ralphus check
-            // health` (`GET /api/health/agent-profiles`) re-validates this
-            // independently and surfaces it there instead of blocking every
-            // daemon startup on one profile's config.
-            match ralphus_daemon::agent_profiles::load_profiles_for_current_dir() {
-                Ok(profiles) => {
-                    // RAL-264: seed the secret-redaction registry from every
-                    // agent profile the daemon can see from its cwd, so resolved
-                    // `from_env` values are scrubbed from durable pane text even
-                    // for a profile that is first used before (or without) a
-                    // fresh `resolve_agent_for_path` call.
-                    ralphus_daemon::redact::register_all(
-                        profiles
-                            .values()
-                            .flat_map(|p| p.secret_values.iter().cloned()),
-                    );
-                }
-                Err(e) => ralphus_daemon::logging::write_line(
-                    ralphus_daemon::logging::LogLevel::WARNING,
-                    &format!("agent profile config issue (see `ralphus check health`): {e}"),
-                ),
-            }
+            // RAL-460: agent profiles are stored in the daemon's own SQLite
+            // store now, not TOML -- there is nothing to eagerly load here.
+            // Every profile's env values are registered with `redact` at
+            // write time (`Store::upsert_agent_profile`) and again at each
+            // resolution (`agent_profiles::resolve_agent`), so there is no
+            // gap to close by scanning everything at startup either.
             let db = db.unwrap_or_else(default_db_path);
             let bind_host = ralphus_daemon::resolve_bind_host(
                 std::env::var(ralphus_daemon::BIND_ADDR_ENV).ok().as_deref(),

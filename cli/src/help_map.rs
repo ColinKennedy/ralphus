@@ -688,15 +688,81 @@ the review worktree.",
 
 // ---- other top-level groups' children -------------------------------------
 
-const AGENT_CHILDREN: &[HelpNode] = &[node(
-    "list",
-    &[],
-    &[],
-    "List supported agent backends and the models each is allowed to run.",
-    false,
-    true, // ("agent", "list")
-    &[],
-)];
+const AGENT_PROFILE_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "List every stored agent profile (locked built-ins and custom), plus the fixed backend list (RAL-460).",
+        false,
+        true, // ("agent", "profile", "list")
+        &[],
+    ),
+    node(
+        "show",
+        &["name [str]"],
+        &[],
+        "Show one stored agent profile by exact name.",
+        false,
+        true, // ("agent", "profile", "show")
+        &[],
+    ),
+    node(
+        "register",
+        &[],
+        &[
+            "--backend [name]",
+            "--default-model [name]",
+            "--env [name=value...]",
+            "--env-link [name=value...]",
+            "--executable [path]",
+            "--name [name]",
+        ],
+        "Register (or update) a custom agent profile a task's 'agent' field can reference. --env sets a literal KEY=VALUE; --env-link sets KEY=TARGET_ENV_VAR_NAME (resolved from the daemon process's own environment at cell-run time). Refuses to touch a locked built-in-backend row -- use 'set-executable' for that.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "set-executable",
+        &["name [str]"],
+        &["--executable [path]"],
+        "Change a locked (built-in-backend) agent profile's executable -- the only field such a row can have changed on it.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["name [str]"],
+        &[],
+        "Remove a custom agent profile. A locked built-in-backend row can never be removed.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const AGENT_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "List supported agent backends and the models each is allowed to run.",
+        false,
+        true, // ("agent", "list")
+        &[],
+    ),
+    node(
+        "profile",
+        &[],
+        &[],
+        "Register and inspect daemon-managed agent profiles (RAL-460).",
+        false,
+        false,
+        AGENT_PROFILE_CHILDREN,
+    ),
+];
 
 const CHECK_CHILDREN: &[HelpNode] = &[node(
     "health",

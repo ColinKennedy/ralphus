@@ -1104,6 +1104,28 @@ fn route_for_user(
         ("GET", ["api", "machines", "targets", "health"]) => {
             admin_gated(daemon, user_header, || health_all_targets(daemon))
         }
+        // Agent profile registry (RAL-460) -- admin-only, client and server
+        // side. `GET /api/agents`/`/api/agents/catalog` (below) are the
+        // separate, non-admin-gated "what can I submit a task against"
+        // views every user needs; this family is the Agent Profiles tab's
+        // own management surface.
+        ("GET", ["api", "agent-profiles"]) => {
+            admin_gated(daemon, user_header, || list_agent_profiles_route(daemon))
+        }
+        ("POST", ["api", "agent-profiles"]) => {
+            admin_gated(daemon, user_header, || register_agent_profile(daemon, body))
+        }
+        ("GET", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
+            get_agent_profile_route(daemon, name)
+        }),
+        ("DELETE", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
+            deregister_agent_profile(daemon, name)
+        }),
+        ("POST", ["api", "agent-profiles", name, "executable"]) => {
+            admin_gated(daemon, user_header, || {
+                set_agent_profile_executable(daemon, name, body)
+            })
+        }
         // Triage type registry (RAL-318) -- RAL-332: admin-only, client and
         // server side. Nothing outside the Triage tab reads this.
         ("GET", ["api", "triage", "types"]) => {
@@ -1148,7 +1170,7 @@ fn route_for_user(
         ("GET", ["api", "agents"]) => list_agents(daemon, query, user_header),
         // RAL-297: cwd-independent agent+model catalog for the Simple task
         // form's agent picker -- see `crate::agent_catalog`.
-        ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(),
+        ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(daemon),
         // RAL-332: the current caller's resolved identity and admin flag --
         // lets the board decide whether to show its admin-only tabs without
         // it ever needing to know its own claimed name (it deliberately
@@ -3012,6 +3034,269 @@ fn deregister_machine(daemon: &Daemon, scheme: &str) -> Reply {
     }
 }
 
+/// `POST /api/agent-profiles` body (RAL-460): create/update a **custom**
+/// agent profile. `env` entries mirror the stored shape 1:1 -- `kind` is
+/// `"literal"` (raw value) or `"link"` (target env var name).
+#[derive(Deserialize)]
+struct RegisterAgentProfileBody {
+    name: String,
+    backend: String,
+    #[serde(default)]
+    executable: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    env: Vec<RegisterAgentProfileEnvVar>,
+}
+
+#[derive(Deserialize)]
+struct RegisterAgentProfileEnvVar {
+    key: String,
+    kind: crate::agent_profiles::EnvValueKind,
+    value: String,
+}
+
+/// `POST /api/agent-profiles/{name}/executable` body (RAL-460): the only
+/// thing a **locked** (built-in-backend) profile row can have changed on it.
+#[derive(Deserialize)]
+struct SetAgentProfileExecutableBody {
+    executable: String,
+}
+
+#[derive(Serialize)]
+struct AgentProfilesResponse {
+    profiles: Vec<crate::agent_profiles::AgentProfileView>,
+    /// The fixed backend list every profile's `backend` dropdown must pick
+    /// from -- served here so the UI never keeps its own copy that could
+    /// drift from `PROFILE_BACKENDS`.
+    available_backends: Vec<&'static str>,
+}
+
+fn agent_profiles_response(daemon: &Daemon) -> Result<AgentProfilesResponse, StoreError> {
+    let profiles = daemon
+        .lock()
+        .list_agent_profiles()?
+        .iter()
+        .map(crate::agent_profiles::redact_agent_profile)
+        .collect();
+    Ok(AgentProfilesResponse {
+        profiles,
+        available_backends: crate::agent_profiles::PROFILE_BACKENDS.to_vec(),
+    })
+}
+
+/// `GET /api/agent-profiles`: every stored profile (locked built-ins and
+/// custom), redacted, plus the fixed backend list for the UI's dropdown.
+fn list_agent_profiles_route(daemon: &Daemon) -> Reply {
+    match agent_profiles_response(daemon) {
+        Ok(resp) => json(200, &resp),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/agent-profiles/{name}`.
+fn get_agent_profile_route(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_agent_profile(name) {
+        Ok(Some(p)) => json(200, &crate::agent_profiles::redact_agent_profile(&p)),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("agent profile \"{name}\" does not exist"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/agent-profiles`: register (or update) a **custom** agent
+/// profile. Refuses to touch a locked (built-in-backend) row -- see
+/// `set_agent_profile_executable` for the one thing that can change on one.
+fn register_agent_profile(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<RegisterAgentProfileBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"name\" and \"backend\" strings",
+            vec![],
+        );
+    };
+    let name = req.name.trim();
+    if name.is_empty() {
+        return error(400, "invalid_value", "'name' must not be empty", vec![]);
+    }
+    if !crate::agent_profiles::PROFILE_BACKENDS.contains(&req.backend.as_str()) {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "'backend' {:?} is not one of {}",
+                req.backend,
+                crate::agent_profiles::PROFILE_BACKENDS.join(", ")
+            ),
+            vec![],
+        );
+    }
+    // Only a brand-new profile name is checked against the reserved list --
+    // an existing row (locked or not) is handled by `upsert_agent_profile`
+    // itself (a locked row refuses the write entirely; a non-locked custom
+    // profile is simply updated in place).
+    let existing_profile = match daemon.lock().get_agent_profile(name) {
+        Ok(existing) => existing,
+        Err(e) => return store_error(&e),
+    };
+    if existing_profile.is_none() && ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&name) {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "agent profile name \"{name}\" collides with a reserved built-in backend name"
+            ),
+            vec![],
+        );
+    }
+    if crate::agent_profiles::is_native_backend(&req.backend) && req.executable.is_some() {
+        return error(
+            400,
+            "invalid_value",
+            &format!(
+                "backend {:?} is native (no external CLI to fork) -- 'executable' is only meaningful for claude-code, codex, pi, or raw",
+                req.backend
+            ),
+            vec![],
+        );
+    }
+    if req.backend == crate::agent_profiles::RAW_BACKEND && req.executable.is_none() {
+        return error(
+            400,
+            "invalid_value",
+            "backend \"raw\" requires 'executable'",
+            vec![],
+        );
+    }
+    // The board never sees a literal value's real content (GET redacts it) --
+    // an edit form that leaves a literal row untouched round-trips the
+    // redaction placeholder back verbatim rather than a blank/guessed value.
+    // Resolve that placeholder back to whatever is already stored under the
+    // same key, so "didn't touch this row" actually means "unchanged"
+    // instead of silently overwriting the secret with the literal placeholder
+    // text. A placeholder with no matching prior literal key is left as-is
+    // (an admin typing the literal placeholder string by hand for a brand
+    // new key is indistinguishable from this, and storing it verbatim is a
+    // harmless, self-correcting mistake -- not worth a special error path).
+    let env: Vec<crate::agent_profiles::AgentProfileEnvVar> = req
+        .env
+        .into_iter()
+        .map(|v| {
+            if v.kind == crate::agent_profiles::EnvValueKind::Literal
+                && v.value == crate::redact::REDACTED
+            {
+                if let Some(prior) = existing_profile.as_ref().and_then(|p| {
+                    p.env.iter().find(|e| {
+                        e.key == v.key && e.kind == crate::agent_profiles::EnvValueKind::Literal
+                    })
+                }) {
+                    return crate::agent_profiles::AgentProfileEnvVar {
+                        key: v.key,
+                        kind: v.kind,
+                        value: prior.value.clone(),
+                    };
+                }
+            }
+            crate::agent_profiles::AgentProfileEnvVar {
+                key: v.key,
+                kind: v.kind,
+                value: v.value,
+            }
+        })
+        .collect();
+    match daemon.lock().upsert_agent_profile(
+        name,
+        &req.backend,
+        req.executable.as_deref(),
+        req.default_model.as_deref(),
+        &env,
+    ) {
+        Ok(true) => json(201, &serde_json::json!({"name": name})),
+        Ok(false) => error(
+            400,
+            "invalid_value",
+            &format!(
+                "\"{name}\" is a built-in backend profile and is read-only; only its executable command can be changed (POST /api/agent-profiles/{name}/executable)"
+            ),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/agent-profiles/{name}/executable`: the only field a locked
+/// (built-in-backend) row can have changed on it.
+fn set_agent_profile_executable(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetAgentProfileExecutableBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include an \"executable\" string",
+            vec![],
+        );
+    };
+    if req.executable.trim().is_empty() {
+        return error(
+            400,
+            "invalid_value",
+            "'executable' must not be empty",
+            vec![],
+        );
+    }
+    match daemon
+        .lock()
+        .set_locked_agent_profile_executable(name, req.executable.trim())
+    {
+        Ok(crate::agent_profiles::SetLockedExecutableOutcome::Updated) => json(
+            200,
+            &serde_json::json!({"name": name, "executable": req.executable}),
+        ),
+        Ok(crate::agent_profiles::SetLockedExecutableOutcome::NotFound) => error(
+            404,
+            "not_found",
+            &format!("agent profile \"{name}\" does not exist"),
+            vec![],
+        ),
+        Ok(crate::agent_profiles::SetLockedExecutableOutcome::NotLocked) => error(
+            400,
+            "invalid_value",
+            &format!(
+                "\"{name}\" is a custom profile, not a built-in backend -- use POST /api/agent-profiles to edit it"
+            ),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/agent-profiles/{name}`: removes a **custom** profile. A
+/// locked (built-in-backend) row can never be deleted.
+fn deregister_agent_profile(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().delete_agent_profile(name) {
+        Ok(crate::agent_profiles::DeleteAgentProfileOutcome::Deleted) => {
+            json(200, &serde_json::json!({"deleted": true}))
+        }
+        Ok(crate::agent_profiles::DeleteAgentProfileOutcome::NotFound) => error(
+            404,
+            "not_found",
+            &format!("agent profile \"{name}\" does not exist"),
+            vec![],
+        ),
+        Ok(crate::agent_profiles::DeleteAgentProfileOutcome::Locked) => error(
+            400,
+            "invalid_value",
+            &format!("\"{name}\" is a built-in backend profile and can never be deleted"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// `POST /api/triage/types` body (RAL-318). Mirrors [`RegisterMachineBody`]'s
 /// shape/rationale: registering a Triage type is an explicit administrative
 /// action, not declarable inside a submitted task file.
@@ -3367,16 +3652,19 @@ fn list_projects(daemon: &Daemon) -> Reply {
 /// silently diverge from whatever environment `ralphus-daemon serve` was
 /// actually started in.
 fn agent_profiles_health(daemon: &Daemon, query: &str) -> Reply {
-    let Some(cwd) = query_param(query, "cwd").map(url_decode) else {
+    // `cwd` is accepted-but-unused now: agent profiles are global (no more
+    // per-project TOML layering), but the query parameter stays required so
+    // no caller (CLI, board) needs to change.
+    if query_param(query, "cwd").is_none() {
         return error(
             400,
             "bad_request",
             "cwd query parameter is required",
             vec![],
         );
-    };
+    }
     let store = daemon.lock();
-    let profiles = crate::agent_profiles::check_profiles_health(&store, Path::new(&cwd));
+    let profiles = crate::agent_profiles::check_profiles_health(&store);
     json(200, &AgentProfilesHealthResponse { profiles })
 }
 
@@ -3683,7 +3971,8 @@ fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply
         Ok(id) => crate::agent_access::UserContext { id },
         Err(reply) => return reply,
     };
-    match daemon.agent_access.available_agents(&user, Path::new(&cwd)) {
+    let store = daemon.lock();
+    match daemon.agent_access.available_agents(&user, &store) {
         Ok(agents) => {
             let default_agent = crate::config::resolve(Path::new(&cwd))
                 .default_resolver_agent()
@@ -7945,11 +8234,11 @@ struct AgentCatalogResponse {
     default_agent: String,
 }
 
-fn agent_catalog_reply() -> Reply {
+fn agent_catalog_reply(daemon: &Daemon) -> Reply {
     json(
         200,
         &AgentCatalogResponse {
-            agents: crate::agent_catalog::agent_catalog(),
+            agents: crate::agent_catalog::agent_catalog(&daemon.lock()),
             default_agent: ralphus_core::schema::DEFAULT_AGENT.to_string(),
         },
     )
@@ -8502,7 +8791,12 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
             };
             return detach_and_open_agent(daemon, id, &cwd, &task, &cell_id, &agent, &session_id);
         }
-        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
+        return open_agent_terminal(
+            daemon,
+            &cwd,
+            Some(agent.as_str()),
+            agent_session_id.as_deref(),
+        );
     }
     let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
         Ok(v) => v,
@@ -8819,7 +9113,12 @@ fn open_proof_terminal(
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
+        return open_agent_terminal(
+            daemon,
+            &cwd,
+            Some(agent.as_str()),
+            agent_session_id.as_deref(),
+        );
     }
     let task = match daemon.lock().get_task_name(id, task_idx_n) {
         Ok(v) => v,
@@ -9085,6 +9384,7 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
             .ok()
             .and_then(|g| g.resolver_agent);
         return open_agent_terminal(
+            daemon,
             &wt_path,
             resolver_agent.as_deref(),
             agent_session_id.as_deref(),
@@ -9235,24 +9535,39 @@ use ralphus_core::agent_resume::{
 /// [`open_agent_terminal_via_tmux`] (RAL-288 Stage 6: tmux-wrapped, just
 /// detached from a live cell) -- both ultimately run the exact same real
 /// CLI resume command, just handed to a different spawn mechanism.
-fn resume_shell_invocation(agent: Option<&str>, agent_session_id: &str) -> (String, Vec<String>) {
+fn resume_shell_invocation(
+    daemon: &Daemon,
+    agent: Option<&str>,
+    agent_session_id: &str,
+) -> (String, Vec<String>) {
     let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
+    // RAL-460: the "claude-code"/"codex" locked agent-profile rows' own
+    // `executable` is now the single source of truth for which binary this
+    // resumes, replacing the old `RALPHUS_CLAUDE_COMMAND`/
+    // `RALPHUS_CODEX_COMMAND` env-var overrides -- both are seeded with the
+    // same defaults those env vars used to fall back to, so an unconfigured
+    // daemon behaves identically. `pi` is not yet a locked row, so it keeps
+    // reading `RALPHUS_PI_COMMAND` directly.
     let command = if is_codex_agent(agent) {
-        // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
-        // override point resolves both the headless squad and this resumed
-        // one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
+        let program = daemon
+            .lock()
+            .get_agent_profile("codex")
+            .ok()
+            .flatten()
+            .and_then(|p| p.executable)
+            .unwrap_or_else(|| "codex".to_string());
         resume_codex_agent_command(&program, agent_session_id)
     } else if is_pi_agent(agent) {
         let program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
         resume_pi_agent_command(&program, agent_session_id)
     } else {
-        // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
-        // same override point resolves both the headless squad and this
-        // resumed one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+        let program = daemon
+            .lock()
+            .get_agent_profile("claude-code")
+            .ok()
+            .flatten()
+            .and_then(|p| p.executable)
+            .unwrap_or_else(|| "claude".to_string());
         resume_agent_command(&program, agent_session_id)
     };
     let shell_args = vec![
@@ -9360,7 +9675,12 @@ fn mint_terminal_ticket_route(daemon: &Daemon, id: &str, ti: &str, si: &str) -> 
     )
 }
 
-fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
+fn open_agent_terminal(
+    daemon: &Daemon,
+    cwd: &str,
+    agent: Option<&str>,
+    agent_session_id: Option<&str>,
+) -> Reply {
     let Some(cell_id) = agent_session_id else {
         return error(
             409,
@@ -9374,7 +9694,7 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
     // argument below so it goes through wt's `-d` flag / `current_dir`
     // instead of a semicolon `wt.exe` can't pass through to the agent (see
     // `spawn_in_terminal`'s doc comment).
-    let (shell_cmd, shell_args) = resume_shell_invocation(agent, cell_id);
+    let (shell_cmd, shell_args) = resume_shell_invocation(daemon, agent, cell_id);
     match spawn_in_terminal(
         Some(cwd),
         &shell_cmd,
@@ -9402,6 +9722,7 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
 /// session itself), this skips straight to spawning another local terminal
 /// attached to it instead of trying to create a duplicate.
 fn open_agent_terminal_via_tmux(
+    daemon: &Daemon,
     cwd: &str,
     squad_id: &str,
     task: &str,
@@ -9421,7 +9742,7 @@ fn open_agent_terminal_via_tmux(
     // existing live session rather than trying to create a duplicate, which
     // psmux/tmux both reject outright.
     if !tmux.has_session(&resume_session_name) {
-        let (shell_cmd, shell_args) = resume_shell_invocation(agent, agent_session_id);
+        let (shell_cmd, shell_args) = resume_shell_invocation(daemon, agent, agent_session_id);
         if let Err(e) = tmux.new_detached_session_with_command(
             &resume_session_name,
             cwd,
@@ -9504,7 +9825,15 @@ fn detach_and_open_agent(
         std::thread::sleep(DETACH_POLL_INTERVAL);
     }
     std::thread::sleep(DETACH_SETTLE_DELAY);
-    open_agent_terminal_via_tmux(cwd, squad_id, task, cell_id, Some(agent), agent_session_id)
+    open_agent_terminal_via_tmux(
+        daemon,
+        cwd,
+        squad_id,
+        task,
+        cell_id,
+        Some(agent),
+        agent_session_id,
+    )
 }
 
 /// The live pane content of a review branch's conflict-resolver tmux
@@ -9679,7 +10008,7 @@ fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) 
             Err(e) => return store_error(&e),
         };
     if mode == "agent" {
-        return open_agent_terminal(&cwd, agent.as_deref(), agent_session_id.as_deref());
+        return open_agent_terminal(daemon, &cwd, agent.as_deref(), agent_session_id.as_deref());
     }
     // open: attach to the generation pass's tmux session — keyed the same way
     // `guardian_merge.rs::generate_manual_commands` builds its `RunnerSpec`.
@@ -15759,32 +16088,22 @@ mod tests {
     }
 
     #[test]
-    fn agent_profiles_health_route_reports_unresolved_from_env() {
+    fn agent_profiles_health_route_reports_unresolved_link_env_var() {
         let d = daemon();
-        let dir = std::env::temp_dir().join(format!(
-            "ral-agent-profiles-health-route-{}-{}",
-            std::process::id(),
-            PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(".ralphus.toml"),
-            r#"
-[agent.profiles.deepseek]
-backend = "anthropic"
-
-[agent.profiles.deepseek.env]
-ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VAR_UNSET" }
-"#,
-        )
-        .unwrap();
-        let r = route(
-            &d,
-            "GET",
-            &format!("/api/health/agent-profiles?cwd={}", dir.display()),
-            "",
-        );
+        d.lock()
+            .upsert_agent_profile(
+                "deepseek",
+                "anthropic",
+                None,
+                None,
+                &[crate::agent_profiles::AgentProfileEnvVar {
+                    key: "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    kind: crate::agent_profiles::EnvValueKind::Link,
+                    value: "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VAR_UNSET".to_string(),
+                }],
+            )
+            .expect("upsert profile");
+        let r = route(&d, "GET", "/api/health/agent-profiles?cwd=.", "");
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"status\":\"fail\""), "{}", r.body);
         assert!(
@@ -15997,6 +16316,127 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         assert_eq!(r.status, 200, "{}", r.body);
         let r = route(&d, "GET", "/api/machines/incredibuild", "");
         assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_register_list_get_and_deregister_roundtrip() {
+        let d = daemon();
+        let body = serde_json::json!({
+            "name": "my-openrouter",
+            "backend": "claude-code",
+            "default_model": "deepseek/deepseek-chat",
+            "env": [
+                {"key": "API_KEY", "kind": "literal", "value": "sk-secret"},
+                {"key": "PATH_COPY", "kind": "link", "value": "PATH"},
+            ],
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/agent-profiles", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("my-openrouter"), "{}", r.body);
+        // Locked built-in rows always appear too.
+        assert!(r.body.contains("claude-code"), "{}", r.body);
+        assert!(r.body.contains("\"locked\":true"), "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles/my-openrouter", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        // The literal value is never sent back in the clear...
+        assert!(!r.body.contains("sk-secret"), "{}", r.body);
+        assert!(r.body.contains("\"redacted\":true"), "{}", r.body);
+        // ...but a link's target var name is not a secret, so it passes through.
+        assert!(r.body.contains("PATH_COPY"), "{}", r.body);
+        assert!(r.body.contains("\"redacted\":false"), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/agent-profiles/my-openrouter", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/agent-profiles/my-openrouter", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_locked_row_refuses_register_and_delete_but_accepts_set_executable() {
+        let d = daemon();
+        let body = serde_json::json!({
+            "name": "claude-code",
+            "backend": "claude-code",
+            "executable": "sneaky-override",
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/agent-profiles", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/agent-profiles/claude-code", "");
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles/claude-code/executable",
+            &serde_json::json!({"executable": "my-claude-fork"}).to_string(),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/agent-profiles/claude-code", "");
+        assert!(r.body.contains("my-claude-fork"), "{}", r.body);
+
+        // The same "executable" endpoint refuses a non-locked (custom) row --
+        // that one goes through the general register endpoint instead.
+        let custom_body = serde_json::json!({"name": "custom", "backend": "pi"}).to_string();
+        assert_eq!(
+            route(&d, "POST", "/api/agent-profiles", &custom_body).status,
+            201
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles/custom/executable",
+            &serde_json::json!({"executable": "x"}).to_string(),
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_register_rejects_a_reserved_name_for_a_brand_new_profile() {
+        let d = daemon();
+        let body = serde_json::json!({"name": "ollama", "backend": "claude-code"}).to_string();
+        let r = route(&d, "POST", "/api/agent-profiles", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("reserved"), "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_re_registering_with_the_redacted_placeholder_keeps_the_prior_literal_value() {
+        let d = daemon();
+        let register = |value: &str| {
+            serde_json::json!({
+                "name": "my-openrouter",
+                "backend": "claude-code",
+                "env": [{"key": "API_KEY", "kind": "literal", "value": value}],
+            })
+            .to_string()
+        };
+        assert_eq!(
+            route(&d, "POST", "/api/agent-profiles", &register("sk-secret")).status,
+            201
+        );
+        // Simulate the board re-submitting an untouched literal row: it only
+        // ever has the redaction placeholder to send back, never the real
+        // value.
+        assert_eq!(
+            route(&d, "POST", "/api/agent-profiles", &register("<redacted>")).status,
+            201
+        );
+        let stored = d
+            .lock()
+            .get_agent_profile("my-openrouter")
+            .expect("query")
+            .expect("present");
+        assert_eq!(
+            stored.env[0].value, "sk-secret",
+            "a round-tripped placeholder must not clobber the real stored value"
+        );
     }
 
     #[test]

@@ -536,6 +536,31 @@
        * @property {boolean} [supports_channel] - Provider reuses one process for many commands (RAL-185).
        */
       /**
+       * One `env` row of a stored agent profile (RAL-460), redacted for
+       * display -- see `AgentProfileView`.
+       * @typedef {object} AgentProfileEnvVarView
+       * @property {string} key
+       * @property {"literal"|"link"} kind
+       * @property {string} value - Literal: a masked placeholder. Link: the real target env var name (not a secret).
+       * @property {boolean} redacted
+       */
+      /**
+       * A daemon-managed agent profile (RAL-460) -- what a task's
+       * `agent = "..."` resolves against. `locked` is true for the two
+       * permanent built-in-backend rows ("claude-code", "codex"): their
+       * name/backend can never change and the row can never be deleted;
+       * the only field an admin can change on one is `executable`.
+       * @typedef {object} AgentProfileView
+       * @property {string} name
+       * @property {string} backend
+       * @property {string|null} executable
+       * @property {string|null} default_model
+       * @property {boolean} locked
+       * @property {AgentProfileEnvVarView[]} env
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+      /**
        * A registered Triage type (RAL-318) -- a `[[cell]]` with `triage = true`
        * classifies into one of these by name instead of naming an explicit
        * `[[review]]`. `"unclassified"` is a built-in that always exists and

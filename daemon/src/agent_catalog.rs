@@ -1,21 +1,21 @@
 //! Cwd-independent agent + model catalog for the board's Simple task form
 //! (RAL-297).
 //!
-//! `GET /api/agents?cwd=...` (`crate::agent_access`) scopes its answer to one
-//! project's `.ralphus.toml`, so a review's agent picker can only be
-//! populated once a `cwd` is already in hand. The Simple tab's agent picker
-//! is deliberately independent of the project/`cwd` picker (an interview
-//! decision for RAL-297: the two selections happen side by side, neither
-//! blocking the other), so it needs a catalog that doesn't require a `cwd`
-//! at all -- this module reuses [`crate::agent_access::DefaultAgentAccess`]
-//! against the daemon process's own current directory (the same
-//! current-dir-based convention `crate::config`'s daemon-level loaders use)
+//! `GET /api/agents?cwd=...` (`crate::agent_access`) requires a `cwd`, so a
+//! review's agent picker can only be populated once a project is already in
+//! hand. The Simple tab's agent picker is deliberately independent of the
+//! project/`cwd` picker (an interview decision for RAL-297: the two
+//! selections happen side by side, neither blocking the other), so it needs
+//! a catalog that doesn't require a `cwd` at all -- this module reuses
+//! [`crate::agent_access::DefaultAgentAccess`] (agent profiles are global
+//! now, RAL-460, so there is no `cwd` to scope them by even in principle)
 //! and layers on a small per-backend model list so the board can also scope
 //! its model dropdown to whichever agent is selected.
 
 use serde::Serialize;
 
 use crate::agent_access::AgentAccess;
+use crate::store::Store;
 
 /// One agent the Simple tab's agent dropdown can offer.
 #[derive(Debug, Clone, Serialize)]
@@ -52,18 +52,16 @@ fn models_for_backend(backend: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The cwd-independent agent catalog: built-in backends plus any
-/// globally-discoverable `[agent.profiles.*]` entries, each with its known
-/// model list. Never fails -- an error loading profiles (e.g. a malformed
-/// `.ralphus.toml`) degrades to the builtin-only list, matching this
+/// The cwd-independent agent catalog: built-in backends plus every stored
+/// custom agent profile, each with its known model list. Never fails -- an
+/// error reading the store degrades to the builtin-only list, matching this
 /// codebase's "malformed config never blocks" rule (see `crate::config`'s
 /// module doc comment).
 #[must_use]
-pub fn agent_catalog() -> Vec<CatalogAgent> {
-    let cwd = std::env::current_dir().unwrap_or_default();
+pub fn agent_catalog(store: &Store) -> Vec<CatalogAgent> {
     let user = crate::agent_access::UserContext::default();
     let agents = crate::agent_access::DefaultAgentAccess
-        .available_agents(&user, &cwd)
+        .available_agents(&user, store)
         .unwrap_or_default();
     agents
         .into_iter()
@@ -82,7 +80,8 @@ mod tests {
 
     #[test]
     fn agent_catalog_includes_claude_code_with_its_restricted_models() {
-        let agents = agent_catalog();
+        let store = Store::open_in_memory().expect("open store");
+        let agents = agent_catalog(&store);
         let claude_code = agents
             .iter()
             .find(|a| a.id == "claude-code")
@@ -93,7 +92,8 @@ mod tests {
 
     #[test]
     fn agent_catalog_backend_with_no_known_models_is_empty_not_missing() {
-        let agents = agent_catalog();
+        let store = Store::open_in_memory().expect("open store");
+        let agents = agent_catalog(&store);
         let ollama = agents
             .iter()
             .find(|a| a.id == "ollama")

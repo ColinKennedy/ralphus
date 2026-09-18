@@ -103,9 +103,10 @@ pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60
 
 fn resolve_agent_selection(
     agent: &str,
-    cwd: &str,
+    store: &crate::store_lock::StoreHandle,
 ) -> Result<crate::agent_profiles::ResolvedAgentSelection, String> {
-    crate::agent_profiles::resolve_agent_for_path(agent, Path::new(cwd))
+    let guard = store.lock();
+    crate::agent_profiles::resolve_agent(agent, &guard)
 }
 
 /// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
@@ -202,9 +203,9 @@ fn resolve_shared_session_id(
         return SessionShare::None;
     }
     // Collect each dependency's stored session id in one short DB read, then
-    // release the store lock before doing any config-file I/O below
-    // (`resolve_agent_selection` reads `.ralphus.toml` from disk, which must
-    // not happen while holding the global store mutex).
+    // release the store lock before the loop below -- `resolve_agent_selection`
+    // takes its own short-lived lock per call, so holding this one across the
+    // whole loop would just serialize unnecessarily.
     let dep_sessions: Vec<(usize, String)> = {
         let guard = store.lock();
         plan.deps[i]
@@ -223,7 +224,7 @@ fn resolve_shared_session_id(
     let mut blocked_reason: Option<String> = None;
     for (d, session_id) in dep_sessions {
         let dep = &cells[d];
-        let dep_backend = resolve_agent_selection(&dep.agent, dep.cwd.as_deref().unwrap_or("."))
+        let dep_backend = resolve_agent_selection(&dep.agent, store)
             .map(|s| s.backend)
             .unwrap_or_else(|_| dep.agent.clone());
         if let Some(reason) = sharing_blocked_reason(
@@ -2166,7 +2167,7 @@ fn run_cell_worker(
             .collect();
         crate::ghost::format_context_block(own.as_ref(), &parents)
     };
-    let selection = match resolve_agent_selection(&row.agent, row.cwd.as_deref().unwrap_or(".")) {
+    let selection = match resolve_agent_selection(&row.agent, store) {
         Ok(selection) => selection,
         Err(message) => {
             let outcome = crate::store::CellOutcome {
@@ -3720,7 +3721,7 @@ fn run_proofs(
     trace_context: Option<&str>,
 ) -> ProofOutcome {
     let cx = otel::context_from_traceparent(trace_context);
-    let selection = match resolve_agent_selection(cell_agent, cwd) {
+    let selection = match resolve_agent_selection(cell_agent, store) {
         Ok(selection) => selection,
         Err(message) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome

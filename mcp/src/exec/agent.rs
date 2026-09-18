@@ -1,20 +1,18 @@
-//! Mirrors `ralphus_cli::commands::agent::dispatch` -- the `agent list`
-//! leaf never touches the daemon (reads `.ralphus.toml` directly), hence no
-//! `DaemonClient` parameter.
+//! Mirrors `ralphus_cli::commands::agent::dispatch`. `AgentCommand::List`
+//! never touches the daemon (built-in backends only, RAL-460); the `Profile`
+//! subgroup is the new daemon-backed CRUD surface and needs a `DaemonClient`.
 
 use ralphus_cli::agents::KNOWN_AGENTS;
-use ralphus_cli::commands::agent::{
-    AgentCommand, AgentProfileSummary, load_agent_profile_summaries,
-};
+use ralphus_cli::client::DaemonClient;
+use ralphus_cli::commands::agent::{AgentCommand, ProfileCommand};
 use serde_json::json;
 
 use super::{ExecResult, usage};
 
-pub fn execute(cmd: AgentCommand) -> ExecResult {
+pub fn execute(cmd: AgentCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         AgentCommand::Help | AgentCommand::UsageError(_) => Err(usage("no such tool")),
         AgentCommand::List => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let builtins: Vec<_> = KNOWN_AGENTS
                 .iter()
                 .map(|a| {
@@ -27,12 +25,35 @@ pub fn execute(cmd: AgentCommand) -> ExecResult {
                     })
                 })
                 .collect();
-            let profiles: Vec<AgentProfileSummary> = load_agent_profile_summaries(&cwd);
-            let profiles: Vec<_> = profiles
-                .iter()
-                .map(|p| json!({"name": p.name, "backend": p.backend}))
-                .collect();
-            Ok(json!({"builtin": builtins, "profiles": profiles}))
+            Ok(json!({"builtin": builtins}))
         }
+        AgentCommand::Profile(cmd) => execute_profile(cmd, client),
+    }
+}
+
+fn execute_profile(cmd: ProfileCommand, client: &DaemonClient) -> ExecResult {
+    match cmd {
+        ProfileCommand::Help | ProfileCommand::UsageError(_) => Err(usage("no such tool")),
+        ProfileCommand::List => Ok(client.list_agent_profiles()?),
+        ProfileCommand::Show { name } => Ok(client.get_agent_profile(&name)?),
+        ProfileCommand::Register {
+            name,
+            backend,
+            executable,
+            default_model,
+            env,
+            env_link,
+        } => Ok(client.register_agent_profile(
+            &name,
+            &backend,
+            executable.as_deref(),
+            default_model.as_deref(),
+            &env,
+            &env_link,
+        )?),
+        ProfileCommand::SetExecutable { name, executable } => {
+            Ok(client.set_agent_profile_executable(&name, &executable)?)
+        }
+        ProfileCommand::Remove { name } => Ok(client.deregister_agent_profile(&name)?),
     }
 }

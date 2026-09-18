@@ -102,7 +102,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 
 ### Key module map
 
-- `core/src/schema.rs` — `TaskFile`/`TaskDef`/`CellDef`/`ProofStep`, `ResolvedAgent` inheritance. Cell `prompt` XOR `command`. Also owns `RESERVED_AGENT_NAMES` (the built-in agent backend names + aliases, e.g. `claude-code`/`codex`/`ollama`) — **whenever a new agent backend/harness is added, update this list too** (`daemon/src/agent_profiles.rs` reuses it as the reserved set custom `[agent.profiles.*]` names can't collide with, and `core/src/validate.rs`'s `system_prompt` check uses it to decide which agent names it can classify offline vs. must defer to the daemon).
+- `core/src/schema.rs` — `TaskFile`/`TaskDef`/`CellDef`/`ProofStep`, `ResolvedAgent` inheritance. Cell `prompt` XOR `command`. Also owns `RESERVED_AGENT_NAMES` (the built-in agent backend names + aliases, e.g. `claude-code`/`codex`/`ollama`) — **whenever a new agent backend/harness is added, update this list too** (`daemon/src/agent_profiles.rs` reuses it as the reserved set a custom agent profile's *name* can't collide with — profiles live in the daemon's own store now, RAL-460, not TOML — and `core/src/validate.rs`'s `system_prompt` check uses it to decide which agent names it can classify offline vs. must defer to the daemon).
 - `core/src/validate.rs` — raw-`toml::Value` validator: unknown keys, required fields, types, proof one-of, `restart_on` grammar, within-task dep cycles, 1-based line numbers.
 - `daemon/src/store.rs` — `Store` (the only place SQL lives), `SquadState`/`NodeState`, board views.
 - `daemon/src/server.rs` — `route()` (pure, unit-testable) + `serve()` (tiny_http; starts the scheduler thread).

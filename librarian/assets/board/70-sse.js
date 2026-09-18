@@ -494,6 +494,7 @@
         else if (tab === "cartographer") tabPoll = pollCartographer();
         else if (tab === "projects") tabPoll = pollProjects();
         else if (tab === "machines") tabPoll = pollMachines();
+        else if (tab === "agent-profiles") tabPoll = pollAgentProfiles();
         else if (tab === "triage") tabPoll = pollTriage();
         else if (tab === "users") tabPoll = pollUsers();
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();

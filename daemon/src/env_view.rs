@@ -30,7 +30,6 @@
 //! existing `POST .../env` routes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use serde::Serialize;
 
@@ -183,9 +182,8 @@ fn assemble(
 /// Returns the layer and, when resolution failed, the reason to surface as
 /// [`EnvView::warning`]: a profile that doesn't resolve is reported rather
 /// than silently dropped, because its absence changes what the view claims.
-fn agent_profile_layer(agent: &str, cwd: &str) -> (Option<Layer>, Option<String>) {
-    let cwd = if cwd.is_empty() { "." } else { cwd };
-    match crate::agent_profiles::resolve_agent_for_path(agent, Path::new(cwd)) {
+fn agent_profile_layer(agent: &str, store: &Store) -> (Option<Layer>, Option<String>) {
+    match crate::agent_profiles::resolve_agent(agent, store) {
         Ok(selection) if selection.env.is_empty() => (None, None),
         Ok(selection) => (
             Some(("agent profile".to_string(), plain(selection.env))),
@@ -201,7 +199,7 @@ fn agent_profile_layer(agent: &str, cwd: &str) -> (Option<Layer>, Option<String>
     }
 }
 
-/// The `(agent, cwd)` a surface's backend resolves from: the cell itself for a
+/// The `agent` a surface's backend resolves from: the cell itself for a
 /// cell-scoped surface, and the task's *first* cell for a task-scoped one --
 /// mirroring `scheduler::run_task_finalizer`, which borrows exactly that cell
 /// for a task-level proof.
@@ -210,13 +208,13 @@ fn backend_of(
     squad_id: &str,
     task_idx: i64,
     cell_idx: Option<i64>,
-) -> Option<(String, String)> {
+) -> Option<String> {
     store
         .cells_of(squad_id)
         .ok()?
         .into_iter()
         .find(|c| c.task_idx == task_idx && cell_idx.is_none_or(|si| c.idx == si))
-        .map(|c| (c.agent, c.cwd.unwrap_or_default()))
+        .map(|c| c.agent)
 }
 
 /// The `agent profile < squad < task [< cell]` prefix every task/cell surface
@@ -230,7 +228,7 @@ fn base_layers(
 ) -> StoreResult<(Vec<Layer>, Option<String>)> {
     let (profile, warning) = match task_idx.and_then(|ti| backend_of(store, squad_id, ti, cell_idx))
     {
-        Some((agent, cwd)) => agent_profile_layer(&agent, &cwd),
+        Some(agent) => agent_profile_layer(&agent, store),
         None => (None, None),
     };
     let mut layers: Vec<Layer> = profile.into_iter().collect();

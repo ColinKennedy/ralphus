@@ -588,6 +588,64 @@ impl DaemonClient {
         self.delete(&format!("/api/machines/{scheme}"))
     }
 
+    /// List every stored agent profile (RAL-460), locked built-ins and
+    /// custom, plus the fixed backend list for a `--backend` dropdown.
+    pub fn list_agent_profiles(&self) -> Result<Value, DaemonError> {
+        self.get("/api/agent-profiles")
+    }
+
+    pub fn get_agent_profile(&self, name: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/agent-profiles/{}", urlencode(name)))
+    }
+
+    /// Register (or update) a **custom** agent profile. `env`/`env_link` are
+    /// `(key, value)`/`(key, target_var)` pairs -- the daemon stores them as
+    /// `kind: "literal"`/`"link"` rows respectively.
+    pub fn register_agent_profile(
+        &self,
+        name: &str,
+        backend: &str,
+        executable: Option<&str>,
+        default_model: Option<&str>,
+        env: &[(String, String)],
+        env_link: &[(String, String)],
+    ) -> Result<Value, DaemonError> {
+        let env_json: Vec<Value> = env
+            .iter()
+            .map(|(key, value)| json!({"key": key, "kind": "literal", "value": value}))
+            .chain(
+                env_link
+                    .iter()
+                    .map(|(key, target)| json!({"key": key, "kind": "link", "value": target})),
+            )
+            .collect();
+        let mut body = json!({"name": name, "backend": backend, "env": env_json});
+        set_if_some(&mut body, "executable", executable.map(str::to_string));
+        set_if_some(
+            &mut body,
+            "default_model",
+            default_model.map(str::to_string),
+        );
+        self.post("/api/agent-profiles", Some(body))
+    }
+
+    /// Changes a **locked** (built-in-backend) profile row's `executable` --
+    /// the only field such a row can have changed on it.
+    pub fn set_agent_profile_executable(
+        &self,
+        name: &str,
+        executable: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/agent-profiles/{}/executable", urlencode(name)),
+            Some(json!({"executable": executable})),
+        )
+    }
+
+    pub fn deregister_agent_profile(&self, name: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/agent-profiles/{}", urlencode(name)))
+    }
+
     /// Register (or update) a Triage type (RAL-318).
     pub fn register_triage_type(
         &self,

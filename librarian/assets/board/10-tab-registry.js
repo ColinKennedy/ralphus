@@ -5,6 +5,33 @@
       let machineBuiltins = [];
       /** Message from the last failed register/remove, shown inline above the table. */
       let machineError = "";
+      // ---- Agent Profiles tab (RAL-460) ----
+      // The daemon-managed registry a task's `agent = "..."` resolves
+      // against. Two rows ("claude-code", "codex") are always present and
+      // locked -- only their `executable` can be changed; every other row
+      // is a fully custom profile.
+      /** @type {AgentProfileView[]} */
+      let agentProfiles = [];
+      /** @type {string[]} the fixed backend list the register form's dropdown offers */
+      let agentProfileBackends = [];
+      /** Message from the last failed register/remove/set-executable, shown inline above the table. */
+      let agentProfileError = "";
+      /** @type {string|null} name of the profile row currently in edit mode, or null */
+      let agentProfileEditName = null;
+      /**
+       * @typedef {object} AgentProfileEnvDraftRow
+       * @property {string} key
+       * @property {"literal"|"link"} kind
+       * @property {string} value - blank on a literal row being edited (see the tab's own module doc) means "keep the existing value"
+       */
+      /** @type {AgentProfileEnvDraftRow[]} the env table for the row currently being edited or added, edited entirely client-side until submitted */
+      let agentProfileEnvDraft = [];
+      /** @type {{name: string, backend: string, executable: string, default_model: string}} draft for the row being edited (or the "+ Add profile" form when agentProfileEditName === "__add__") */
+      let agentProfileFieldsDraft = { name: "", backend: "", executable: "", default_model: "" };
+      /** @type {string|null} name of the LOCKED row currently editing its executable inline, or null -- a separate, narrower edit mode from agentProfileEditName since a locked row can only ever change this one field. */
+      let agentProfileExecutableEditName = null;
+      /** Draft value for the locked-row executable inline edit above. */
+      let agentProfileExecutableDraft = "";
       // ---- Triage tab (RAL-318) ----
       /** @type {TriageTypeView[]} registered Triage types */
       let triageTypes = [];
@@ -248,7 +275,7 @@
       // must not misfire just because the very first fetch hasn't landed.
       let whoAmIResolved = false;
       /** Tab names only ever shown to an admin (client-side hide -- the daemon enforces this server-side too). */
-      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets", "worktree-retirement"];
+      const ADMIN_ONLY_TABS = ["machines", "agent-profiles", "triage", "projects", "users", "secrets", "worktree-retirement"];
       // RAL-332 "Edit Profile": the target user name an admin is viewing
       // RAL-329's Preferences page as, or null for "viewing your own". Set by
       // `editUserProfile`, cleared the moment the admin navigates off the

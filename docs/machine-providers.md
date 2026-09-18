@@ -737,11 +737,13 @@ other target.
 
 ### Per-agent executable overrides
 
-An agent profile's explicit executable override (`[agent.profiles.*]`, or a
-cell's own `executable` field) resolves to a path on the **daemon's own**
-filesystem. Forwarding that verbatim to a remote machine is essentially
-never correct — `/Users/alice/.claude/local/claude` almost certainly doesn't
-exist on `buildbox`. So before dispatch, `daemon/src/remote_runner.rs`'s
+An agent profile's explicit executable override (RAL-460, stored in the
+daemon's own `agent_profiles` table rather than TOML — see the **agent
+profile** glossary entry — or a cell's own `executable` field) resolves to
+a path on the **daemon's own** filesystem. Forwarding that verbatim to a
+remote machine is essentially never correct —
+`/Users/alice/.claude/local/claude` almost certainly doesn't exist on
+`buildbox`. So before dispatch, `daemon/src/remote_runner.rs`'s
 `ProviderRunner::resolve_remote_executable` refuses a path-shaped override
 (anything containing `/` or `\`) for a remote cell unless the target
 configures a deliberate replacement, keyed by agent name:
@@ -753,10 +755,9 @@ codex = "/opt/tools/codex-wrapper"
 ```
 
 A bare command name (no `/`/`\`) is always forwarded unchanged — the remote
-runner resolves it on the remote account's own `PATH`, or falls back to its
-usual `RALPHUS_CLAUDE_COMMAND`-style environment default, exactly as a local
-cell would. `[machine.targets.<name>.agents]` is optional; most targets
-never need it.
+runner resolves it on the remote account's own `PATH`, exactly as a local
+cell's own `claude-code`/`codex` agent profile `executable` does (RAL-460).
+`[machine.targets.<name>.agents]` is optional; most targets never need it.
 
 ### Durable asynchronous jobs
 

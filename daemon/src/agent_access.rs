@@ -14,9 +14,9 @@
 //! whatever real authentication resolves the caller to, and should actually
 //! filter by grant rather than always allow.
 
-use std::path::Path;
-
 use serde::Serialize;
+
+use crate::store::Store;
 
 /// A caller's identity for agent-access purposes. `id: None` means no user
 /// identity was presented or configured -- today's common case.
@@ -40,7 +40,7 @@ pub struct AvailableAgent {
     /// `"builtin"` or `"profile"`.
     pub kind: &'static str,
     /// The backend this ultimately resolves to (see
-    /// `agent_profiles::resolve_agent_for_path`). Same as `id` for a builtin.
+    /// `agent_profiles::resolve_agent`). Same as `id` for a builtin.
     pub backend: String,
 }
 
@@ -57,7 +57,7 @@ const BUILTIN_AGENTS: &[&str] = &[
     "anthropic",
 ];
 
-/// Decides which agents a given user may see/select for a given project.
+/// Decides which agents a given user may see/select.
 ///
 /// Only one implementation exists today ([`DefaultAgentAccess`]), which
 /// ignores [`UserContext`] entirely -- everyone sees the same list. This
@@ -67,11 +67,11 @@ const BUILTIN_AGENTS: &[&str] = &[
 /// submission/execution path yet -- see the module doc comment.
 pub trait AgentAccess: Send + Sync {
     /// # Errors
-    /// Propagates any failure loading `.ralphus.toml` agent profiles for `cwd`.
+    /// Propagates any failure reading the daemon's agent-profile store.
     fn available_agents(
         &self,
         user: &UserContext,
-        cwd: &Path,
+        store: &Store,
     ) -> Result<Vec<AvailableAgent>, String>;
 }
 
@@ -84,7 +84,7 @@ impl AgentAccess for DefaultAgentAccess {
     fn available_agents(
         &self,
         _user: &UserContext,
-        cwd: &Path,
+        store: &Store,
     ) -> Result<Vec<AvailableAgent>, String> {
         let mut agents: Vec<AvailableAgent> = BUILTIN_AGENTS
             .iter()
@@ -94,9 +94,15 @@ impl AgentAccess for DefaultAgentAccess {
                 backend: (*name).to_string(),
             })
             .collect();
-        for (name, profile) in crate::agent_profiles::load_profiles_for_path(cwd)? {
+        for profile in store.list_agent_profiles().map_err(|e| e.to_string())? {
+            // A locked row already appears above as its own built-in name
+            // (e.g. "claude-code") -- listing it again under `kind:
+            // "profile"` would just duplicate the same id.
+            if profile.locked {
+                continue;
+            }
             agents.push(AvailableAgent {
-                id: name,
+                id: profile.name,
                 kind: "profile",
                 backend: profile.backend,
             });
@@ -108,27 +114,12 @@ impl AgentAccess for DefaultAgentAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn tempdir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ralphus-agent-access-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create tempdir");
-        dir
-    }
 
     #[test]
-    fn default_agent_access_lists_builtins_with_no_profiles() {
-        let cwd = tempdir("no-profiles");
+    fn default_agent_access_lists_builtins_with_no_custom_profiles() {
+        let store = Store::open_in_memory().expect("open store");
         let agents = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &store)
             .expect("agents");
         assert!(
             agents
@@ -139,15 +130,13 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_access_includes_configured_profiles() {
-        let cwd = tempdir("with-profile");
-        fs::write(
-            cwd.join(".ralphus.toml"),
-            "[agent.profiles.my-openrouter]\nbackend = \"claude-code\"\n",
-        )
-        .expect("write project config");
+    fn default_agent_access_includes_custom_profiles_but_not_locked_rows_twice() {
+        let store = Store::open_in_memory().expect("open store");
+        store
+            .upsert_agent_profile("my-openrouter", "claude-code", None, None, &[])
+            .expect("upsert");
         let agents = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &store)
             .expect("agents");
         let profile = agents
             .iter()
@@ -155,20 +144,23 @@ mod tests {
             .expect("profile present");
         assert_eq!(profile.kind, "profile");
         assert_eq!(profile.backend, "claude-code");
+        // The locked "claude-code" row must not also appear as a `kind:
+        // "profile"` duplicate of the built-in entry above.
+        assert_eq!(agents.iter().filter(|a| a.id == "claude-code").count(), 1);
     }
 
     #[test]
     fn default_agent_access_ignores_user_identity() {
-        let cwd = tempdir("ignores-user");
+        let store = Store::open_in_memory().expect("open store");
         let anonymous = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &store)
             .expect("agents");
         let named = DefaultAgentAccess
             .available_agents(
                 &UserContext {
                     id: Some("colin".to_string()),
                 },
-                &cwd,
+                &store,
             )
             .expect("agents");
         let anon_ids: Vec<&str> = anonymous.iter().map(|a| a.id.as_str()).collect();

@@ -1250,9 +1250,7 @@ fn classify_placeholder(cwd: &str) -> Result<Option<&str>, String> {
 /// this function through [`resolve_placeholders_with_targets`] instead,
 /// since they cannot safely override those environment variables in-process
 /// (this workspace forbids `unsafe_code`, so `std::env::set_var` is
-/// unavailable) — the same rationale `agent_profiles`'s own
-/// `load_profiles_for_path_with` documents for its `configuration_path_env`
-/// parameter.
+/// unavailable).
 #[allow(clippy::too_many_arguments)]
 fn provision_remote_with_targets(
     store: &Store,

@@ -199,6 +199,9 @@
       CLICK_HANDLERS.jumpToTask = (e, ds) => jumpToTask(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.checkMachine = (e, ds) => checkMachine(ds.scheme || "");
       CLICK_HANDLERS.removeMachine = (e, ds) => removeMachine(ds.scheme || "");
+      CLICK_HANDLERS.startEditAgentProfile = (e, ds) => startEditAgentProfile(ds.name || "");
+      CLICK_HANDLERS.removeAgentProfile = (e, ds) => removeAgentProfile(ds.name || "");
+      CLICK_HANDLERS.startSetLockedExecutable = (e, ds) => startSetLockedExecutable(ds.name || "");
       CLICK_HANDLERS.removeTriageType = (e, ds) => removeTriageType(ds.name || "");
       CLICK_HANDLERS.previewPoolThreshold = (e, ds) => previewPoolThreshold(e, ds.project || "", ds.triageType || "");
       CLICK_HANDLERS.confirmPoolThreshold = (e, ds) => confirmPoolThreshold(ds.project || "", ds.triageType || "");

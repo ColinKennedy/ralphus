@@ -1987,8 +1987,9 @@ fn configuration_path_entries(configuration_path_env: Option<&str>) -> Vec<PathB
 /// `$RALPHUS_CONFIG_HOME/config.toml` (or its `~/.config/ralphus/` default),
 /// then `$RALPHUS_CONFIGURATION_PATH` entries in order, then the
 /// project-local `.ralphus.toml` found by walking up from `cwd` --
-/// matching the precedence `agent_profiles::load_profiles_for_path_with`
-/// and `machine_targets`'s equivalent already use. `load_daemon_config`
+/// matching the precedence `machine_targets`'s equivalent already uses
+/// (agent profiles no longer have a TOML layering precedence of their own --
+/// RAL-460 moved them into the daemon's own store). `load_daemon_config`
 /// used to skip the `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a
 /// field (e.g. `default_user`) set only via that established convention
 /// silently never loaded.

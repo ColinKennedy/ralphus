@@ -241,8 +241,18 @@ fn run_session(
         return Err(format!("machine {machine:?} resolved to the local host"));
     };
 
-    let claude_program =
-        std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+    // RAL-460: the "claude-code" locked agent-profile row's own `executable`
+    // is now the single source of truth for which binary this reattaches
+    // to, replacing the old `RALPHUS_CLAUDE_COMMAND` env-var override --
+    // seeded with the same "claude" default that env var used to fall back
+    // to, so an unconfigured daemon behaves identically.
+    let claude_program = daemon
+        .lock()
+        .get_agent_profile("claude-code")
+        .ok()
+        .flatten()
+        .and_then(|p| p.executable)
+        .unwrap_or_else(|| "claude".to_string());
     let command =
         ralphus_core::agent_resume::resume_agent_command_posix(&claude_program, &session_id);
 

@@ -89,12 +89,13 @@ fn dummy_json(chip: &ralphus_mcp::chip::Chip) -> serde_json::Value {
     if !chip.takes_value {
         return serde_json::Value::Bool(true);
     }
-    // `--input [name=value...]` (review checks/action run) parses each
-    // value as `KEY=VALUE` and errors on anything else -- `Chip` doesn't
-    // retain the original `name=value` hint text, so this is matched by
-    // property name instead, the same way `chip.rs`'s own module doc singles
-    // this shape out as a special case.
-    let scalar = if chip.property_name() == "input" {
+    // `--input [name=value...]` (review checks/action run) and
+    // `--env`/`--env-link [name=value...]` (agent profile register,
+    // RAL-460) each parse their value as `KEY=VALUE` and error on anything
+    // else -- `Chip` doesn't retain the original `name=value` hint text, so
+    // this is matched by property name instead, the same way `chip.rs`'s
+    // own module doc singles this shape out as a special case.
+    let scalar = if matches!(chip.property_name().as_str(), "input" | "env" | "env_link") {
         serde_json::Value::String("x=1".to_string())
     } else {
         chip.choices.as_ref().map_or_else(

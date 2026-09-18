@@ -21,6 +21,7 @@
           <button id="tab-cartographer" class="tab" onclick="showTab('cartographer', true)" data-tip="Logs — the unified, chronological, structured event log across the whole system.\nFilter by source, scope, level, squad/cell/guardian id, or time range; click a squad/review id to jump straight to it.">📜 Logs</button>
           <!-- RAL-332: admin-only tabs start hidden and are revealed by applyAdminTabVisibility() once GET /api/whoami confirms is_admin -- avoids a flash of admin-only chrome for a non-admin caller before that first resolves. -->
           <button id="tab-machines" class="tab" style="display:none" onclick="showTab('machines', true)" data-tip="Machines — registered providers that remote tasks, cells and proof steps run on (RAL-185).\nA task declares machine = &quot;&lt;scheme&gt;:&lt;uri&gt;&quot;; the daemon looks the scheme up here to find the program that reaches that machine.\nRegistering is an admin action and is deliberately not declarable in a task file.\nAdmin-only (RAL-332).">🖥 Machines</button>
+          <button id="tab-agent-profiles" class="tab" style="display:none" onclick="showTab('agent-profiles', true)" data-tip="Agent Profiles — the daemon-managed registry a task's agent = &quot;...&quot; resolves against (RAL-460).\n&quot;claude-code&quot; and &quot;codex&quot; are permanent built-in rows: their name/backend are fixed and they can never be deleted, but their executable command can be changed. Any other row is a fully custom profile with its own backend, default model, and environment variables.\nAdmin-only (RAL-332).">🤖 Agent Profiles</button>
           <button id="tab-triage" class="tab" style="display:none" onclick="showTab('triage', true)" data-tip="Triage (RAL-318) — manage Triage types, pool thresholds, and drain schedules for the Arbiter subsystem.\nA cell opts in with triage = true instead of naming an explicit [[review]]; the Arbiter classifies it and drains its pool into a fresh review once a count threshold or cron schedule fires.\nAdmin-only (RAL-332).">📥 Triage</button>
           <button id="tab-projects" class="tab" style="display:none" onclick="showTab('projects', true)" data-tip="Projects — registered git repositories a task's cell cwd can materialize a worktree under (RAL-100).\nDouble-click Description, Path, or VCS to edit a field, then Save or Cancel.\nA row highlighted in red failed validation — hover its name for why.\nAdmin-only (RAL-332) -- registering/editing a project is gated, but every user's task submissions still read the underlying project/branch list.">📦 Projects</button>
           <button id="tab-users" class="tab" style="display:none" onclick="showTab('users', true)" data-tip="Users — placeholder identities a request can attribute itself to (see AgentAccess/UserContext).\nThis is NOT authentication: no password, no session, no permissions — a name grants nothing on its own.\nTODO: replace with user auth once RAL-252 is done.\nAdmin-only (RAL-332).">👤 Users</button>
@@ -258,6 +259,14 @@
       <div id="machines"><div class="empty">Loading…</div></div>
     </main>
 
+    <main id="agent-profiles-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b data-tip="Agent Profiles (RAL-460) — every agent profile the daemon knows about.\nA task's cell sets agent = &quot;...&quot;; this is the name it resolves against, either a permanent built-in row or a custom profile you register here.">Agent Profiles</b>
+        <span style="color:var(--muted)" id="agent-profile-summary">—</span>
+      </div>
+      <div id="agent-profiles"><div class="empty">Loading…</div></div>
+    </main>
+
     <main id="triage-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Triage (RAL-318) — Triage types, pool state, and drain schedules for the Arbiter subsystem.\nA cell opts in with triage = true instead of naming an explicit [[review]]; classified cells sit pooled per (project, triage type) until a count threshold or cron schedule fires, then the Arbiter drains the pool into one fresh review.">Triage</b>
@@ -325,6 +334,7 @@
     <script src="/board/75-projects-machines.js"></script>
     <script src="/board/76-project-review-settings-modal.js"></script>
     <script src="/board/77-mailbox.js"></script>
+    <script src="/board/78-agent-profiles.js"></script>
     <script src="/board/80-queue.js"></script>
     <script src="/board/81-worktree-retirement.js"></script>
   </body>
