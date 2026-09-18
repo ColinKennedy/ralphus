@@ -3753,25 +3753,28 @@ pub fn restart_guardian_merge(
     start_merge(store, runner, id, sem, cancellations)
 }
 
-/// Reopen a `cancelled` review (status → `collecting`) and immediately try an
-/// incremental staged merge (RAL-265, [`run_merge_staged`]) -- the same pass
-/// a task completion would have triggered via `start_reviews`
-/// (`daemon/src/scheduler.rs`) had this review not been cancelled at the
-/// time. Deliberately *not* the all-or-nothing [`start_merge`] that the
-/// manual "Merge / rebase" button uses: that path waits for every enabled
-/// branch's cell to finish before rebasing anything, so a review reopened
-/// while one branch is still pending would sit doing nothing until that last
-/// cell completes, even though every earlier branch's cell finished (and
-/// would already have been rebased into the review) while the review was
-/// dormant. Staging the ready prefix now catches it up immediately instead
-/// of waiting on that last cell or the periodic maintenance sweep.
+/// Reopen a `cancelled` or `approved` review (status → `collecting`) and
+/// immediately try an incremental staged merge (RAL-265, [`run_merge_staged`])
+/// -- the same pass a task completion would have triggered via
+/// `start_reviews` (`daemon/src/scheduler.rs`) had this review not been
+/// cancelled/approved at the time. Deliberately *not* the all-or-nothing
+/// [`start_merge`] that the manual "Merge / rebase" button uses: that path
+/// waits for every enabled branch's cell to finish before rebasing anything,
+/// so a review reopened while one branch is still pending would sit doing
+/// nothing until that last cell completes, even though every earlier
+/// branch's cell finished (and would already have been rebased into the
+/// review) while the review was dormant. Staging the ready prefix now
+/// catches it up immediately instead of waiting on that last cell or the
+/// periodic maintenance sweep.
 ///
 /// A cancelled review can still be winding down after its cancellation reply
 /// has returned. Wait for that worker here, where a fresh merge could reuse
 /// the same worktrees; if it does not stop within the bounded budget, leave
 /// the review cancelled and ask the caller to retry instead of overlapping two
-/// workers.
-pub fn reopen_cancelled_guardian_merge(
+/// workers. An approved review never has a worker to wait for -- it only
+/// ever arrives at `approved` from `in_review`, which has none either -- so
+/// this wait resolves immediately for that case.
+pub fn reopen_guardian_merge(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
@@ -3788,7 +3791,7 @@ pub fn reopen_cancelled_guardian_merge(
             ),
         );
     }
-    if let Err(e) = store.lock().reopen_cancelled_guardian(id) {
+    if let Err(e) = store.lock().reopen_guardian(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
     let claimed = store.lock().claim_guardian_merge(id).unwrap_or(false);

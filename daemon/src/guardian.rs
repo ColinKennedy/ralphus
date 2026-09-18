@@ -2202,8 +2202,8 @@ impl Store {
             // A cancelled review is terminal. Merge workers can observe their
             // cancellation after a slow operation completes, so their final
             // status write must not revive a review the user has cancelled.
-            // Explicit reopening uses `reopen_cancelled_guardian`, whose
-            // transition is deliberately separate from this generic setter.
+            // Explicit reopening uses `reopen_guardian`, whose transition is
+            // deliberately separate from this generic setter.
             if old == "cancelled" && status != GuardianStatus::Cancelled {
                 return Ok(());
             }
@@ -4720,23 +4720,26 @@ impl Store {
         }
     }
 
-    /// Reopen a `cancelled` guardian back to `collecting` so a fresh merge can
-    /// be attempted. Distinct from [`Self::reset_guardian_to_collecting`]
-    /// (which resumes an in-flight `merging`/`in_review` guardian whose
-    /// worker must be stopped first): a cancelled review's merge worker was
-    /// already stopped before the `cancelled` write landed (see
-    /// `stop_merge_worker_for_cancel`), so there is nothing to interrupt here
-    /// -- only the terminal status itself blocks a fresh start.
-    pub fn reopen_cancelled_guardian(&self, id: &str) -> Result<()> {
+    /// Reopen a `cancelled` or `approved` guardian back to `collecting` so a
+    /// fresh merge can be attempted. Distinct from
+    /// [`Self::reset_guardian_to_collecting`] (which resumes an in-flight
+    /// `merging`/`in_review` guardian whose worker must be stopped first):
+    /// neither `cancelled` nor `approved` can have a merge worker still
+    /// running against them (a cancelled review's worker was already stopped
+    /// before the `cancelled` write landed, see `stop_merge_worker_for_cancel`;
+    /// an approved review only ever arrives there from `in_review`, which has
+    /// none), so there is nothing to interrupt here -- only the terminal
+    /// status itself blocks a fresh start.
+    pub fn reopen_guardian(&self, id: &str) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET status='collecting', detail=NULL, updated_at_ms=? \
-             WHERE id=? AND status='cancelled'",
+             WHERE id=? AND status IN ('cancelled','approved')",
             params![crate::store::now_ms(), id],
         )?;
         if n == 0 {
             let status = self.guardian_status_str(id)?; // propagate NotFound if missing
             return Err(StoreError::InvalidTransition(format!(
-                "can only reopen a guardian that is cancelled, it is {status}"
+                "can only reopen a guardian that is cancelled or approved, it is {status}"
             )));
         }
         let _ = self.log_event(
@@ -6213,13 +6216,13 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_guardian_only_accepts_cancelled() {
+    fn reopen_guardian_only_accepts_cancelled_or_approved() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
 
-        // Not cancelled yet: reopen must be rejected.
-        assert!(store.reopen_cancelled_guardian(&id).is_err());
+        // Not cancelled or approved yet: reopen must be rejected.
+        assert!(store.reopen_guardian(&id).is_err());
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
 
         store.claim_guardian_merge(&id).unwrap();
@@ -6229,11 +6232,30 @@ mod tests {
         );
         assert_eq!(store.get_guardian(&id).unwrap().status, "cancelled");
 
-        store.reopen_cancelled_guardian(&id).unwrap();
+        store.reopen_guardian(&id).unwrap();
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
 
         // Already reopened: a second reopen call must be rejected.
-        assert!(store.reopen_cancelled_guardian(&id).is_err());
+        assert!(store.reopen_guardian(&id).is_err());
+    }
+
+    #[test]
+    fn reopen_guardian_accepts_approved() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        store.claim_guardian_merge(&id).unwrap();
+        store
+            .set_guardian_status(&id, GuardianStatus::InReview, None)
+            .unwrap();
+        assert_eq!(
+            store.approve_guardian(&id).unwrap(),
+            GuardianStatus::Approved
+        );
+        assert_eq!(store.get_guardian(&id).unwrap().status, "approved");
+
+        store.reopen_guardian(&id).unwrap();
+        assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
     }
 
     #[test]

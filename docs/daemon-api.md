@@ -149,7 +149,7 @@ where one exists.
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review guardian |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
-| POST | `/api/guardians/{id}/reopen` | Reopen a cancelled review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
+| POST | `/api/guardians/{id}/reopen` | Reopen a cancelled or approved review (→ `collecting`) and immediately try a fresh merge pass if the daemon has capacity |
 | POST | `/api/guardians/{id}/run-manual-commands` | Spawn manual-check commands **on the daemon host** |
 | POST | `/api/guardians/{id}/run-action-hint` | Spawn a `command`-kind action hint **on the daemon host**; `prompt`-kind is `501` |
 | POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |

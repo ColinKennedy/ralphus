@@ -1488,5 +1488,5 @@
       let historyViewing = {};
       /** @type {Set<string>} gid -> an Approve is in flight, so the button shows a pending/disabled state until it resolves (RAL-234) */
       let pendingGuardianActions = new Set();
-      /** @type {Set<string>} gid -> a Merge / rebase kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
+      /** @type {Set<string>} gid -> a Merge / rebase (or, once cancelled/approved, Reopen) kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
       let pendingMergeActions = new Set();
