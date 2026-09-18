@@ -1185,9 +1185,11 @@ fn route_for_user(
         ("GET", ["api", "health", "catalog"]) => {
             admin_gated(daemon, user_header, health_catalog_reply)
         }
+        // ralphus[ignore-endpoint-cli]: board-only cached daemon health-sweep row (RAL-416); no CLI equivalent, unlike `check health`'s live on-demand probes.
         ("GET", ["api", "health", "report"]) => {
             admin_gated(daemon, user_header, || health_report(daemon))
         }
+        // ralphus[ignore-endpoint-cli]: board's "check now" affordance re-running the daemon-local sweep (RAL-416); has no CLI counterpart.
         ("POST", ["api", "health", "report", "refresh"]) => {
             admin_gated(daemon, user_header, || health_report_refresh(daemon))
         }
