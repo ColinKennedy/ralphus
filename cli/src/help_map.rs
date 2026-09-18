@@ -1019,6 +1019,17 @@ cwds against.",
         &[],
     ),
     node(
+        "remove",
+        &["name [str]"],
+        &[],
+        "Unregister a project by exact name. Existing squads/tasks/reviews that reference it \
+are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) \
+are left in place as orphaned rows.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "review-settings",
         &[],
         &[],

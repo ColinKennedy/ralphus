@@ -220,6 +220,7 @@
       CLICK_HANDLERS.openProjectMenu = (e, ds) => openProjectMenu(e, ds.name || "");
       CLICK_HANDLERS.openProjectTriageThresholds = (e, ds) => openProjectTriageThresholds(ds.name || "");
       CLICK_HANDLERS.openProjectReviewSettings = (e, ds) => openProjectReviewSettings(ds.name || "");
+      CLICK_HANDLERS.removeProject = (e, ds) => removeProject(ds.name || "");
       CLICK_HANDLERS.openProjectForksModal = (e, ds) => openProjectForksModal(ds.name || "");
       CLICK_HANDLERS.startProjectForkEdit = (e, ds) => startProjectForkEdit(ds.user || "");
       CLICK_HANDLERS.saveProjectForkEdit = (e, ds) => saveProjectForkEdit(ds.user || "");

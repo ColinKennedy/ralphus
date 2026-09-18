@@ -34,6 +34,7 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         }
         ProjectCommand::List { short: _ } => Ok(client.list_projects()?),
         ProjectCommand::Get { name } => Ok(client.get_project(&name)?),
+        ProjectCommand::Remove { name } => Ok(client.remove_project(&name)?),
         ProjectCommand::Fork(cmd) => exec_fork(cmd, client),
         ProjectCommand::ReviewSettings(cmd) => exec_review_settings(cmd, client),
     }

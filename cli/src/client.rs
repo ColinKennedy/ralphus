@@ -397,6 +397,13 @@ impl DaemonClient {
         self.get(&format!("/api/projects/{name}"))
     }
 
+    /// `DELETE /api/projects/{name}`: unregisters a project. Project-scoped
+    /// rows keyed by name in other tables (forks, Triage thresholds,
+    /// review-settings defaults) are left in place, not cascaded away.
+    pub fn remove_project(&self, name: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/projects/{name}"))
+    }
+
     /// `GET /api/projects/{name}/review-settings` (RAL-408): this project's
     /// raw database-backed review-setting overrides plus the fully resolved
     /// effective defaults (file config + database).

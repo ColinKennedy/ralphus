@@ -4864,6 +4864,40 @@ impl Store {
         Ok(())
     }
 
+    /// Unregisters a project. Only the `projects` row itself is removed --
+    /// rows in other tables keyed by project name (`project_forks`,
+    /// `project_review_settings`, Triage pools/schedules) are deliberately
+    /// left in place as orphaned data rather than cascaded away, matching
+    /// how those tables already tolerate a project whose path no longer
+    /// resolves. Existing squads/tasks that reference this project by name
+    /// are unaffected.
+    ///
+    /// # Errors
+    /// If no project named `name` is registered.
+    pub fn delete_project(&self, name: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        crate::rlog!(INFO, "ralphus [store] project \"{name}\" removed");
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "project removed",
+            scope: Some("project"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"name": name}),
+            admin_only: false,
+        });
+        Ok(())
+    }
+
     /// RAL-408: this project's live-editable review-setting defaults --
     /// `ProjectReviewSettings::default()` (every field `None`, meaning
     /// "not configured here") when the project has never had one saved.
@@ -14260,6 +14294,25 @@ command = "e"
         let store = Store::open_in_memory().unwrap();
         assert!(matches!(
             store.clear_project_clone_url("nope"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn delete_project_removes_a_registered_project() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "", "C:/repos/ralphus", "git")
+            .unwrap();
+        store.delete_project("ralphus").unwrap();
+        assert!(store.get_project("ralphus").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_project_on_an_unregistered_project_is_not_found() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(matches!(
+            store.delete_project("nope"),
             Err(StoreError::NotFound)
         ));
     }
