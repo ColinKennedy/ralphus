@@ -298,25 +298,6 @@ pub(crate) fn any_workspace_ahead_of_upstream(workspaces: &[Workspace]) -> bool 
         .any(workspace_has_commits_ahead_of_upstream)
 }
 
-/// Whether the checked-out `HEAD` is already contained in its configured
-/// upstream. Missing or unresolvable upstream state returns `false` so callers
-/// never treat an uncertain git state as merged. `Workspace` keeps the check
-/// valid for review worktrees on configured remote machines too.
-#[must_use]
-pub(crate) fn workspace_head_is_ancestor_of_upstream(workspace: &Workspace) -> bool {
-    let Ok(upstream) = workspace.git(&[
-        "rev-parse",
-        "--abbrev-ref",
-        "--symbolic-full-name",
-        "@{upstream}",
-    ]) else {
-        return false;
-    };
-    workspace
-        .git(&["merge-base", "--is-ancestor", "HEAD", upstream.trim()])
-        .is_ok()
-}
-
 /// The read-only "upstream" value to show for a cell's git worktree in the
 /// board's detail pane. Two cases, per the RAL-50 branch-chaining sentinel:
 ///
@@ -2543,7 +2524,6 @@ mod tests {
         repair_triage_pool_keys, require_auto_build_declaration,
         require_auto_build_declaration_early, review_branch_order, rows_from_file,
         set_worktree_commit_baseline, workspace_has_commits_ahead_of_upstream,
-        workspace_head_is_ancestor_of_upstream,
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
@@ -3536,28 +3516,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote);
-    }
-
-    #[test]
-    fn head_is_ancestor_of_upstream_only_after_upstream_contains_it() {
-        let root = temp_repo();
-        git(&root, &["init", "--initial-branch", "main"]);
-        std::fs::write(root.join("base.txt"), "base\n").unwrap();
-        git(&root, &["add", "."]);
-        git(&root, &["commit", "--message", "base"]);
-        git(&root, &["branch", "upstream"]);
-        git(&root, &["branch", "--set-upstream-to=upstream", "main"]);
-
-        let workspace = Workspace::on(&root, None);
-        assert!(workspace_head_is_ancestor_of_upstream(&workspace));
-        std::fs::write(root.join("more.txt"), "more\n").unwrap();
-        git(&root, &["add", "."]);
-        git(&root, &["commit", "--message", "more"]);
-        assert!(!workspace_head_is_ancestor_of_upstream(&workspace));
-        git(&root, &["branch", "--force", "upstream", "HEAD"]);
-        assert!(workspace_head_is_ancestor_of_upstream(&workspace));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A fake provider script that answers the exact sequence

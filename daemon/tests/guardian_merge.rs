@@ -3215,8 +3215,18 @@ fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() 
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-460: a review-branch worktree's own `@{upstream}` is, in production,
+// the PR's own head branch on the fork -- ralphus pushes that worktree's
+// HEAD there on every push, so HEAD is trivially always an ancestor of it,
+// whether or not the PR ever merged into the guardian's actual base. This
+// reproduces that shape (an arbitrary branch parked at the worktree's HEAD
+// and set as its upstream, same as a freshly-pushed PR branch would be) and
+// asserts it must NOT be enough to approve -- only the guardian's real base
+// branch landing the work should. See `manual_merge_approves_when_the_review_
+// worktree_is_already_in_the_base_branch` below for the case that legitimately
+// should approve.
 #[test]
-fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
+fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
     let before = store.lock().get_guardian(&id).unwrap();
@@ -3229,6 +3239,52 @@ fn manual_merge_approves_when_the_review_worktree_is_already_in_its_upstream() {
         Path::new(worktree),
         &["branch", "--set-upstream-to=landed", review_branch],
     );
+
+    let reply = start_merge(
+        Arc::clone(&store),
+        Arc::new(NoopRunner),
+        &id,
+        Arc::new(Semaphore::new(4)),
+        Cancellations::new(),
+    );
+    assert_eq!(reply.status, 202, "body={}", reply.body);
+
+    // The re-merge runs on a spawned thread since this isn't actually
+    // already-landed work -- poll until it settles past the transient
+    // `merging` state `claim_guardian_merge` set.
+    let mut guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    for _ in 0..600 {
+        if guardian.status != "merging" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    }
+    assert_eq!(
+        guardian.status, "in_review",
+        "must not auto-approve from the worktree's own upstream alone: detail {:?}",
+        guardian.detail
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// The legitimate counterpart to the regression test above: when the feature
+// has actually landed on the guardian's real base branch (e.g. a manual
+// `git merge --ff-only` + push outside of any tracked PR), the manual
+// "Merge / rebase" trigger must still recognize that and approve.
+#[test]
+fn manual_merge_approves_when_the_review_worktree_is_already_in_the_base_branch() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let review_branch = before.branches[0]
+        .review_branch
+        .clone()
+        .expect("review branch built");
+
+    git(&root, &["checkout", "main"]);
+    git(&root, &["merge", "--ff-only", &review_branch]);
 
     let reply = start_merge(
         Arc::clone(&store),
