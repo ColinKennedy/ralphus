@@ -19,6 +19,10 @@ from typing import Any
 __all__ = [
     "CARTOGRAPHER_ROUTES",
     "CARTOGRAPHER_ROWS",
+    "HEALTH_CATALOG",
+    "HEALTH_REPORT",
+    "HEALTH_ROUTES",
+    "HEALTH_TARGETS",
     "MACHINES_ROUTES",
     "MACHINES_ROWS",
     "PATH_DEPLOY",
@@ -58,6 +62,8 @@ __all__ = [
     "carto_row",
     "cell",
     "guardian",
+    "health_catalog_entry",
+    "health_sweep_check",
     "hidden_item_entry",
     "machine_provider",
     "many_projects",
@@ -70,6 +76,7 @@ __all__ = [
     "resource_row",
     "secret_env_name_entry",
     "squad",
+    "target_health_check",
     "task",
     "task_index_squads_from",
     "triage_pool_entry",
@@ -528,6 +535,38 @@ def hidden_item_entry(
         "guardian_id": guardian_id,
         "hidden_at_ms": hidden_at_ms,
     }
+
+
+def health_catalog_entry(
+    id_: str,
+    *,
+    label: str,
+    section: str,
+    applicability: str,
+    cost_tier: str,
+    requirement: str,
+    impact: str,
+    remediation: str,
+) -> Json:
+    return {
+        "id": id_,
+        "label": label,
+        "section": section,
+        "applicability": applicability,
+        "cost_tier": cost_tier,
+        "requirement": requirement,
+        "probe": {"kind": "local"},
+        "impact": impact,
+        "remediation": remediation,
+    }
+
+
+def health_sweep_check(id_: str, *, status: str, detail: str) -> Json:
+    return {"id": id_, "status": status, "detail": detail}
+
+
+def target_health_check(id_: str, *, name: str, status: str, detail: str) -> Json:
+    return {"id": id_, "name": name, "status": status, "detail": detail}
 
 
 def project(
@@ -1293,6 +1332,84 @@ PREFS_ROUTES: Routes = {
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
     "/api/hidden": {"hidden": list(PREFS_HIDDEN_ITEMS)},
+}
+
+# ---------------------------------------------------------------------------
+# Health scenario (RAL-416) — catalog-driven daemon-local sweep plus one
+# always-live remote [machine.targets.*] report.
+# ---------------------------------------------------------------------------
+
+HEALTH_CATALOG: tuple[Json, ...] = (
+    health_catalog_entry(
+        "daemon",
+        label="daemon reachability",
+        section="core",
+        applicability="daemon_local",
+        cost_tier="free",
+        requirement="required",
+        impact="No task can be submitted, monitored, or managed without a reachable daemon.",
+        remediation="Start the daemon (`ralphus-daemon`), or fix --daemon-url/$RALPHUS_DAEMON_URL.",
+    ),
+    health_catalog_entry(
+        "git",
+        label="git",
+        section="harness",
+        applicability="daemon_local",
+        cost_tier="free",
+        requirement="required",
+        impact="Guardian reviews and worktree creation both shell out to git.",
+        remediation="Install git and ensure it resolves on PATH.",
+    ),
+    health_catalog_entry(
+        "daemon-opentelemetry",
+        label="OpenTelemetry export",
+        section="core",
+        applicability="daemon_local",
+        cost_tier="free",
+        requirement="optional",
+        impact="No traces are exported; tracing tools have nothing to show for this daemon.",
+        remediation="Set [daemon] opentelemetry = true if you want to export traces.",
+    ),
+)
+
+HEALTH_REPORT: Json = {
+    "machine": "daemon (local)",
+    "checked_at_ms": 1_783_150_000_000,
+    "checks": [
+        health_sweep_check("daemon", status="pass", detail="reachable"),
+        health_sweep_check("git", status="pass", detail="git version 2.43.0"),
+        health_sweep_check(
+            "daemon-opentelemetry", status="pass", detail="OpenTelemetry has been disabled"
+        ),
+    ],
+}
+
+HEALTH_TARGETS: tuple[Json, ...] = (
+    {
+        "target": "build-farm",
+        "machine": "build-farm-01",
+        "checks": [
+            target_health_check(
+                "daemon", name="daemon reachability", status="pass", detail="reachable"
+            ),
+            target_health_check(
+                "git",
+                name="git",
+                status="warn",
+                detail="git version 2.30.0 (older than recommended)",
+            ),
+        ],
+    },
+)
+
+HEALTH_ROUTES: Routes = {
+    "/api/tasks": _empty_board(),
+    "/api/guardians": [],
+    "/api/resources": {"resources": []},
+    "/api/queue": {"items": []},
+    "/api/health/catalog": {"catalog": list(HEALTH_CATALOG)},
+    "/api/health/report": dict(HEALTH_REPORT),
+    "/api/machines/targets/health": {"targets": list(HEALTH_TARGETS)},
 }
 
 # ---------------------------------------------------------------------------

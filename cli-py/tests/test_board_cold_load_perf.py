@@ -178,7 +178,15 @@ def browser() -> Any:
     """
     _skip_if_no_librarian()
     with sync_playwright() as p:
-        b = p.chromium.launch(headless=True)
+        # `--disable-dev-shm-usage`: GitHub Actions' `ubuntu-latest` runners
+        # ship a tiny (64MB) `/dev/shm`, which Chromium uses for renderer
+        # shared memory by default. These fixtures render hundreds/thousands
+        # of DOM rows per tab -- enough that a renderer can exhaust that
+        # 64MB and wedge instead of cleanly crashing, which reads back as
+        # `page.goto()` hanging until Playwright's own navigation timeout
+        # rather than a fast, obvious failure. This flag makes Chromium fall
+        # back to `/tmp` for that shared memory instead.
+        b = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
         try:
             yield b
         finally:
