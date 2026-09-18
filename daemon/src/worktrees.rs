@@ -932,6 +932,8 @@ fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
         upstream: None,
         machine: ctx.machine.map(str::to_string),
         share_session: false,
+        maximum_timeout_sec: None,
+        task_maximum_timeout_sec: None,
     }
 }
 
@@ -1783,6 +1785,8 @@ mod tests {
             upstream: None,
             machine: None,
             share_session: false,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         }
     }
 

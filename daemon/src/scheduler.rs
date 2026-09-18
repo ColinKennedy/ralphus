@@ -101,6 +101,15 @@ pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 *
 /// into a single fetch per cycle regardless of how many reviews target it.
 pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often to run the RAL-308 CPU-flat stall sweep
+/// (`crate::cpu_stall::CpuStallTracker::sweep`). A minute is fine enough
+/// granularity relative to the multi-minute span the sweep itself requires
+/// before escalating (`crate::cpu_stall::CPU_STALL_MIN_SAMPLES` consecutive
+/// flat readings), and cheap: each tick is a handful of already-cheap
+/// per-OS CPU-time reads (see `crate::resources::cpu_seconds`), not a
+/// blocking two-sample delta the way the Resources tab's own CPU% needs.
+pub const CPU_STALL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 fn resolve_agent_selection(
     agent: &str,
     cwd: &str,
@@ -420,6 +429,7 @@ pub fn run_loop(
     cancellations: Cancellations,
     sem: Arc<Semaphore>,
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
+    procs: crate::procreg::ProcRegistry,
 ) {
     let mut last_maintenance = std::time::Instant::now();
     let mut last_summary_sweep = std::time::Instant::now();
@@ -427,6 +437,11 @@ pub fn run_loop(
     let mut last_terminal_log_prune = std::time::Instant::now();
     let mut last_forge_reorder_poll = std::time::Instant::now();
     let mut last_triage_schedule_check = std::time::Instant::now();
+    let mut last_cpu_stall_sweep = std::time::Instant::now();
+    // RAL-308: one tracker for this thread's whole lifetime, so CPU-flat
+    // streaks accumulate correctly across sweeps -- see
+    // `crate::cpu_stall::CpuStallTracker`.
+    let cpu_stall_tracker = crate::cpu_stall::CpuStallTracker::new();
     // Ark persists its per-project due times, so calling once at startup is
     // cheap for projects whose configured interval has not elapsed.
     crate::ark::periodic_sweep(&store, &cancellations, &sem);
@@ -551,6 +566,10 @@ pub fn run_loop(
         if last_triage_schedule_check.elapsed() >= TRIAGE_SCHEDULE_INTERVAL {
             crate::triage::run_schedule_tick(&store);
             last_triage_schedule_check = std::time::Instant::now();
+        }
+        if last_cpu_stall_sweep.elapsed() >= CPU_STALL_SWEEP_INTERVAL {
+            cpu_stall_tracker.sweep(&store, &procs);
+            last_cpu_stall_sweep = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -2637,6 +2656,8 @@ fn run_cell_worker(
         &row.agent,
         row.model.as_deref(),
         row.machine.as_deref(),
+        row.maximum_timeout_sec,
+        row.task_maximum_timeout_sec,
         cancel,
         cell_trace_context.as_deref(),
     );
@@ -2746,6 +2767,8 @@ fn run_proof_only_worker(
         &row.agent,
         row.model.as_deref(),
         row.machine.as_deref(),
+        row.maximum_timeout_sec,
+        row.task_maximum_timeout_sec,
         cancel,
         span_trace_context.as_deref(),
     );
@@ -2985,6 +3008,11 @@ fn run_task_finalizer(
         // rule), so borrowing the representative cell's value is exact
         // rather than approximate.
         let machine = task_cell.and_then(|s| s.machine.clone());
+        // RAL-308: a task-scope proof has no owning cell, so only the task's
+        // own cumulative cap applies (alongside the step's own, resolved
+        // inside `run_proofs`). Same representative-cell borrow as `machine`
+        // above -- every cell under one task shares the same task row.
+        let task_maximum_timeout_sec = task_cell.and_then(|s| s.task_maximum_timeout_sec);
         // Acquire a slot so task-level proofs count against max_concurrent.
         // Released before calling try_start_ready_reviews_for_task so the review
         // worker can acquire a slot of its own.
@@ -3017,6 +3045,8 @@ fn run_task_finalizer(
             &agent,
             model.as_deref(),
             machine.as_deref(),
+            None,
+            task_maximum_timeout_sec,
             cancel,
             span_trace_context.as_deref(),
         );
@@ -3716,6 +3746,12 @@ fn run_proofs(
     cell_agent: &str,
     cell_model: Option<&str>,
     cell_machine: Option<&str>,
+    // RAL-308: the owning cell's own cumulative `maximum_timeout_seconds`
+    // cap (covering the cell and its cell-scope proofs) -- `None` for a
+    // task-scope proof scope, where there is no owning cell. The owning
+    // task's cap, applying regardless of scope.
+    cell_maximum_timeout_sec: Option<i64>,
+    task_maximum_timeout_sec: Option<i64>,
     cancel: &CancelToken,
     trace_context: Option<&str>,
 ) -> ProofOutcome {
@@ -3744,8 +3780,9 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
-    for (position, row) in specs.iter().cloned().enumerate() {
-        let (
+    for (
+        position,
+        (
             idx,
             proof_id,
             kind,
@@ -3754,7 +3791,10 @@ fn run_proofs(
             proof_timeout,
             proof_budget,
             proof_maximum_tool_output_tokens,
-        ) = row;
+            proof_maximum_timeout_sec,
+        ),
+    ) in specs.iter().cloned().enumerate()
+    {
         if cancel.is_cancelled() {
             return ProofOutcome {
                 all_ok,
@@ -3902,6 +3942,16 @@ fn run_proofs(
                 runner_spec.env_overrides = std::mem::take(&mut env_overrides);
                 // RAL-185: a proof step runs where its owning cell/task does.
                 runner_spec.machine = cell_machine.map(str::to_string);
+                // RAL-308: this step's own cap, the owning cell's cumulative
+                // cap (cell-scope only), and the owning task's cumulative cap.
+                runner_spec = runner_spec.with_maximum_timeout_caps(
+                    squad_id,
+                    task_idx,
+                    (scope == "cell").then_some(cell_idx),
+                    proof_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                    cell_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                    task_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                );
                 let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
                 let passed = result.is_done();
                 let output = match &result.error {
@@ -3975,6 +4025,16 @@ fn run_proofs(
                 runner_spec.env_overrides = std::mem::take(&mut env_overrides);
                 // RAL-185: a proof step runs where its owning cell/task does.
                 runner_spec.machine = cell_machine.map(str::to_string);
+                // RAL-308: this step's own cap, the owning cell's cumulative
+                // cap (cell-scope only), and the owning task's cumulative cap.
+                runner_spec = runner_spec.with_maximum_timeout_caps(
+                    squad_id,
+                    task_idx,
+                    (scope == "cell").then_some(cell_idx),
+                    proof_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                    cell_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                    task_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
+                );
                 {
                     let guard = store.lock();
                     let _ = guard.set_proof_effective_system_prompt(
@@ -7589,6 +7649,8 @@ mod tests {
             maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         }
     }
 
@@ -7718,6 +7780,8 @@ mod tests {
             maximum_tool_output_tokens: None,
             upstream: None,
             machine: None,
+            maximum_timeout_sec: None,
+            task_maximum_timeout_sec: None,
         };
         let work_row = crate::store::CellRow {
             task_idx: 1,
