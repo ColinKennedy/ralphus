@@ -3652,15 +3652,18 @@ print(json.dumps(result))
     /// semantic order rather than pool membership order.
     #[test]
     fn create_review_from_triage_pool_applies_the_proposed_semantic_order_to_the_branch_stack() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
+        let squad_3 = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
             .unwrap();
         store
-            .record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
         store
-            .record_triage_pool_cell("proj", "security", "squad-3", 0, 0, "b3", "main")
+            .record_triage_pool_cell("proj", "security", &squad_3, 0, 0, "b3", "main")
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
@@ -3687,19 +3690,21 @@ print(json.dumps(result))
     /// still appears in the review exactly once, in pool order.
     #[test]
     fn create_review_from_triage_pool_falls_back_to_pool_order_for_an_invalid_proposal() {
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let squad_1 = completed_pool_cell(&mut store);
+        let squad_2 = completed_pool_cell(&mut store);
         store
-            .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
             .unwrap();
         store
-            .record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
+            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
             "proj",
             "security",
             // Not a permutation: names an id outside the pool and omits one.
-            |_| Some(vec!["made-up-id".to_string(), "squad-1/t0:c0".to_string()]),
+            |_| Some(vec!["made-up-id".to_string(), format!("{squad_1}/t0:c0")]),
         )
         .unwrap()
         .expect("pool was non-empty, must create a review");
@@ -3723,6 +3728,9 @@ print(json.dumps(result))
         let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\nid=\"work\"\ncwd=\".\"\nprompt=\"fix the core module\"\n";
         let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
         let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
         store
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b-work", "main")
             .unwrap();
