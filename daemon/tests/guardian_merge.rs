@@ -3252,13 +3252,13 @@ fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
     // The re-merge runs on a spawned thread since this isn't actually
     // already-landed work -- poll until it settles past the transient
     // `merging` state `claim_guardian_merge` set.
-    let mut guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+    let mut guardian = store.lock().get_guardian(&id).unwrap();
     for _ in 0..600 {
         if guardian.status != "merging" {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
-        guardian = store.lock().unwrap().get_guardian(&id).unwrap();
+        guardian = store.lock().get_guardian(&id).unwrap();
     }
     assert_eq!(
         guardian.status, "in_review",
@@ -3277,7 +3277,7 @@ fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
 fn manual_merge_approves_when_the_review_worktree_is_already_in_the_base_branch() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
-    let before = store.lock().unwrap().get_guardian(&id).unwrap();
+    let before = store.lock().get_guardian(&id).unwrap();
     let review_branch = before.branches[0]
         .review_branch
         .clone()
