@@ -655,19 +655,25 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// resolved commit SHA, once, *after* this function returns and the branch
 /// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
 /// Guards every `git config` WRITE this module makes to a worktree's branch
-/// tracking (`set_explicit_upstream`, below). A worktree's `.git/config` is
-/// the SAME physical file shared by every other worktree of the same
-/// project (worktrees each get their own index/HEAD, but not their own
-/// config) -- two `git config <key> <value>` invocations against different
-/// worktrees of the same repo, run at the same instant, race on git's own
-/// `.git/config.lock` and one of them fails outright ("could not lock config
-/// file: File exists"), rather than queuing. That never mattered while
-/// worktree materialization was fully serial; it does now that
-/// [`execute_local_worktree_jobs`] runs several worktrees' materialization
-/// concurrently, potentially against the same project root. A single global
-/// lock (not per-root) is simpler than tracking one per project and costs
-/// nothing worth measuring -- the critical section is a couple of
-/// millisecond-scale `git config` calls, not the actual (slow) checkout.
+/// tracking (`set_explicit_upstream` and `freeze_commit_baseline`, below).
+/// A worktree's `.git/config` is the SAME physical file shared by every
+/// other worktree of the same project (worktrees each get their own
+/// index/HEAD, but not their own config) -- two `git config <key> <value>`
+/// invocations against different worktrees of the same repo, run at the same
+/// instant, race on git's own `.git/config.lock` and one of them fails
+/// outright ("could not lock config file: File exists"), rather than
+/// queuing. That never mattered while worktree materialization was fully
+/// serial; it does now that [`execute_local_worktree_jobs`] runs several
+/// worktrees' materialization concurrently, potentially against the same
+/// project root. A single global lock (not per-root) is simpler than
+/// tracking one per project and costs nothing worth measuring -- the
+/// critical section is a couple of millisecond-scale `git config` calls, not
+/// the actual (slow) checkout. Every call `execute_worktree_plan` makes that
+/// can write to `.git/config` -- including `git worktree add`'s own implicit
+/// tracking-setup side effect for a newly created branch -- must be covered:
+/// `execute_worktree_plan` passes `--no-track` to every `worktree add -b`
+/// call for exactly this reason, so the *only* config writes are the two
+/// explicit, lock-guarded ones here.
 static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
@@ -745,6 +751,13 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
     ) else {
         return;
     };
+    // `set_worktree_commit_baseline` writes `ralphus.<branch>.baseline` to
+    // the same shared `.git/config` `set_explicit_upstream` writes to --
+    // needs the same `WORKTREE_CONFIG_LOCK` for the same reason (see that
+    // static's doc comment); a worktree's `freeze_commit_baseline` call can
+    // otherwise race a *different* worktree's concurrent
+    // `set_explicit_upstream` call on git's own `.git/config.lock`.
+    let _guard = WORKTREE_CONFIG_LOCK.lock();
     if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
         // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
         crate::rlog!(
@@ -956,10 +969,24 @@ fn execute_worktree_plan(
         }
         BranchMaterialization::NewFromRemote { remote_ref } => {
             preflight_worktree_budget(root, &plan.wt, remote_ref, path_budget_limit())?;
+            // `--no-track`, not `--track`: `set_explicit_upstream` below sets
+            // the real tracking config anyway (under `WORKTREE_CONFIG_LOCK`),
+            // and git's own implicit auto-tracking setup for a new branch
+            // writes to the SAME shared `.git/config` this worktree's
+            // siblings may be concurrently touching -- unlike the explicit
+            // call, this implicit write has no lock protecting it, and races
+            // on git's own `.git/config.lock` under real concurrency (see
+            // `WORKTREE_CONFIG_LOCK`'s doc comment).
             git(
                 root,
                 &[
-                    "worktree", "add", "--track", "-b", branch, &wt_str, remote_ref,
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    &wt_str,
+                    remote_ref,
                 ],
             )?;
         }
@@ -973,7 +1000,22 @@ fn execute_worktree_plan(
             // what the submitter named, not whatever the shared `root`
             // checkout happens to have checked out right now.
             preflight_worktree_budget(root, &plan.wt, upstream, path_budget_limit())?;
-            git(root, &["worktree", "add", "-b", branch, &wt_str, upstream])?;
+            // `--no-track`: see the `NewFromRemote` arm above -- `upstream`
+            // being a plain local branch still triggers git's own implicit,
+            // unlocked auto-tracking setup by default (`branch.autoSetupMerge`),
+            // which races the same way.
+            git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    &wt_str,
+                    upstream,
+                ],
+            )?;
         }
     }
     set_explicit_upstream(&plan.wt, branch, upstream)?;
