@@ -1850,6 +1850,7 @@ pub(crate) fn execute_local_worktree_jobs(jobs: &[LocalWorktreeJob]) -> HashMap<
                 Ok(path) => {
                     resolved.insert(key.to_string(), path.to_string_lossy().into_owned());
                 }
+                // ralphus[ignore-rlog-pair]: this prefetch pass has no `Store` access by design (see the doc comment above); the live fallback pass records the structured failure once it retries the cell inline.
                 Err(e) => crate::rlog!(
                     WARNING,
                     "ralphus [scheduler] prefetch worktree materialization failed (will retry \
