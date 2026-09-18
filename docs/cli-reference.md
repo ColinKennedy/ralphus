@@ -658,7 +658,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) terminal selector [uri] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --json (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9).}
+        - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
