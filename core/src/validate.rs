@@ -36,8 +36,9 @@ pub enum ErrorKind {
     /// An `upstream = "<<task:...>>"` sentinel references a task (or
     /// task/cell) that does not exist anywhere in this submission.
     UnknownTaskRef,
-    /// A `"<<ralphus:link/<field>>>"` sentinel (RAL-460) references a field
-    /// that does not exist on the same table it was declared in.
+    /// A `"<<ralphus:linked-field/<path>>>"` sentinel (RAL-460) references a
+    /// field that does not exist at the level its `.`/`..` navigation
+    /// reaches (including walking `..` past the top of the submission).
     UnknownLinkedField,
 }
 
@@ -175,7 +176,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
 
 // ── Allowed key sets (mirror old:src/tasks/validate.rs) ──────────────────────
 
-const DEFAULT_KEYS: &[&str] = &["depends_on"];
+const DEFAULT_KEYS: &[&str] = &["depends_on", "environment"];
 const TASK_KEYS: &[&str] = &[
     "name",
     "project",
@@ -550,6 +551,99 @@ fn validate_defaults(value: Option<&toml::Value>, ctx: &mut Ctx) {
         let header = ctx.idx.default_line(d);
         unknown_keys(ctx, table, DEFAULT_KEYS, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
+        check_environment_lenient(ctx, table, &path, header);
+    }
+}
+
+/// Validate an `environment` table whose entries apply to more than one
+/// leaf scope, so a linked field declared here has no single fixed table to
+/// check its target against (RAL-460 follow-up): `[[default]].environment`
+/// (seeded into every cell/task/proof step's own layer of the hierarchical
+/// env-override store, `squad < task < cell`, RAL-150 -- see
+/// [`crate::schema::DefaultBlock::environment`]) and a `[[task]]`'s own
+/// `environment` (inherited by every cell under that task the same way).
+/// Both get merged into a specific cell's (or proof step's) flat env map
+/// before any placeholder is ever resolved, so by the time a linked field
+/// here actually resolves, `.`/`..` are relative to whichever leaf it
+/// landed on -- not this table. Only sentinel *syntax* (a well-formed
+/// `<<ralphus:linked-field/<path>>>` path) is validated here; a dangling or
+/// out-of-scope target surfaces as a runtime resolution error instead, the
+/// same way an unresolvable placeholder anywhere else does. Contrast
+/// [`check_environment`], used for a cell's or a proof step's own
+/// `environment`, each of which resolves against exactly one fixed scope
+/// and so IS checked structurally at validate time.
+fn check_environment_lenient(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    let Some(v) = table.get("environment") else {
+        return;
+    };
+    let Some(env_table) = v.as_table() else {
+        let line = ctx.key_line(header, "environment");
+        ctx.error(
+            &format!("{path}.environment"),
+            ErrorKind::WrongType,
+            format!(
+                "key \"environment\" must be a table of string values, found {}",
+                type_name(v)
+            ),
+            line,
+        );
+        return;
+    };
+    for (key, value) in env_table {
+        if !value.is_str() {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::WrongType,
+                format!(
+                    "environment value for \"{key}\" must be a string, found {}",
+                    type_name(value)
+                ),
+                line,
+            );
+        }
+        if !is_valid_env_key(key) {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment key \"{key}\" is not a valid identifier \
+                     (must match [A-Za-z_][A-Za-z0-9_]*)"
+                ),
+                line,
+            );
+        }
+        let Some(raw) = value.as_str() else { continue };
+        for body in crate::schema::text_placeholders(raw) {
+            let Some(link) = crate::schema::parse_linked_field(body) else {
+                continue;
+            };
+            if let Err(e) = crate::schema::parse_linked_field_path(link.path) {
+                use crate::schema::LinkedFieldPathError as E;
+                let detail = match e {
+                    E::Empty => "the path after \"ralphus:linked-field/\" must not be empty",
+                    E::MissingNavigation => {
+                        "the path must start with \"./\" or \"../\", e.g. \"./cwd\""
+                    }
+                    E::InvalidNavigationSegment => {
+                        "every path segment before the last must be exactly \".\" or \"..\""
+                    }
+                    E::EmptyField => "the path must end in a field name, e.g. \"./cwd\"",
+                };
+                let line = ctx.key_line(header, "environment");
+                ctx.error(
+                    &format!("{path}.environment.{key}"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "environment value for \"{key}\" is a malformed linked-field sentinel \
+                         (\"{}\"): {detail}",
+                        link.path
+                    ),
+                    line,
+                );
+            }
+        }
     }
 }
 
@@ -677,7 +771,17 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
-        check_environment(ctx, table, &path, header);
+        let task_scope = Scope {
+            level: crate::schema::ScopeLevel::Task,
+            table,
+        };
+        // A task's own `environment` is inherited by every cell under it
+        // (like `[[default]].environment`), so it's validated leniently --
+        // see `check_environment_lenient`'s doc comment. `task_scope` is
+        // still built and threaded down below: a CELL's or PROOF STEP's own
+        // `environment` resolves against exactly this one task, so a `..`
+        // reference from there IS checked structurally.
+        check_environment_lenient(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
 
@@ -691,12 +795,14 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             task_project,
             header,
             &task_cell_index,
+            task_scope,
             ctx,
         );
         validate_proof_array(
             table.get("proof"),
             &format!("{path}.proof"),
             &task_agents,
+            &[task_scope],
             ctx,
         );
     }
@@ -713,6 +819,7 @@ fn validate_cells(
     task_project: Option<&str>,
     task_header: Option<u32>,
     task_cell_index: &HashMap<String, HashSet<String>>,
+    task_scope: Scope<'_>,
     ctx: &mut Ctx,
 ) {
     let Some(value) = value else { return };
@@ -922,7 +1029,12 @@ fn validate_cells(
         );
         check_type(ctx, table, "priority", Ty::Int, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
-        check_environment(ctx, table, &path, header);
+        let cell_scope = Scope {
+            level: crate::schema::ScopeLevel::Cell,
+            table,
+        };
+        let cell_chain = [task_scope, cell_scope];
+        check_environment(ctx, &cell_chain, &path, header);
 
         if let Some(deps) = table.get("depends_on").and_then(toml::Value::as_array) {
             for dep in deps.iter().filter_map(toml::Value::as_str) {
@@ -948,6 +1060,7 @@ fn validate_cells(
             table.get("proof"),
             &format!("{path}.proof"),
             &cell_agents,
+            &cell_chain,
             ctx,
         );
     }
@@ -1029,23 +1142,42 @@ fn is_valid_env_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// One level of TOML nesting a linked field can be declared on, or navigate
+/// to via `..` (RAL-460): pairs a [`crate::schema::ScopeLevel`] with the raw
+/// table it names. `check_environment`'s caller builds the chain from the
+/// submission root down to whichever table it's currently validating (a
+/// task, a cell, or a proof step), so `..` can walk it back up.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    level: crate::schema::ScopeLevel,
+    table: &'a toml::Table,
+}
+
 /// Validate an `environment` table (RAL-172): must be a table whose values
 /// are all strings and whose keys are all valid environment-variable
 /// identifiers. Silently returns when the key is absent.
 ///
-/// RAL-460: a value may also be a "linked field" sentinel
-/// (`"<<ralphus:link/<field>>>"`, optionally with a `?suffix=<relpath>`) --
-/// see [`crate::schema::parse_wrapped_cell_link`]. `<field>` must exist on
-/// this SAME owning `table` -- whichever scope this call is validating; task,
-/// cell, and proof-step tables all share this one function -- as either
-/// `"cwd"` (that table's own `cwd` key) or `"environment.<key>"` (a sibling
-/// entry in this same `environment` table). A dangling reference (a field
-/// that doesn't exist here) or a malformed sentinel/suffix is a hard
-/// validation failure, never a silent fallback. A chain of
-/// `environment.<key>` links within this table that cycles back on itself is
-/// also rejected here rather than only surfacing as a runtime resolution
-/// error.
-fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+/// RAL-460: a value may also embed one or more "linked field" sentinels
+/// (`"<<ralphus:linked-field/<path>>>"`, the same `<<...>>` embedding rule
+/// worktree placeholders already use -- see [`crate::schema::text_placeholders`]).
+/// `<path>` is a relative-path-shaped address: `.` means `chain`'s last
+/// (current) table, `..` walks `chain` back one entry per level (see
+/// [`crate::schema::parse_linked_field_path`]); the final path segment names
+/// the target field at whatever level that navigation reaches --
+/// `"cwd"`/`"id"` or `"environment.<key>"` -- interpreted by
+/// [`crate::schema::parse_link_target`] and checked against
+/// [`crate::schema::link_target_valid_for_scope`]. A dangling reference (a
+/// field that doesn't exist at the reached level), navigation past the top
+/// of `chain`, or a malformed sentinel is a hard validation failure, never a
+/// silent fallback. A chain of same-table `environment.<key>` links that
+/// cycles back on itself is also rejected here -- a link can only ever stay
+/// at its own level or move up, so a cycle can only form within one table's
+/// own `environment` (see `find_link_cycle`'s doc comment).
+fn check_environment(ctx: &mut Ctx, chain: &[Scope<'_>], path: &str, header: Option<u32>) {
+    let table = chain
+        .last()
+        .expect("caller always pushes at least the scope being validated")
+        .table;
     let Some(v) = table.get("environment") else {
         return;
     };
@@ -1089,16 +1221,7 @@ fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
             );
         }
         let Some(raw) = value.as_str() else { continue };
-        check_environment_link(
-            ctx,
-            table,
-            env_table,
-            path,
-            header,
-            key,
-            raw,
-            &mut link_edges,
-        );
+        check_environment_link(ctx, chain, path, header, key, raw, &mut link_edges);
     }
     if let Some(cycle_key) = find_link_cycle(&link_edges) {
         let line = ctx.key_line(header, "environment");
@@ -1111,128 +1234,236 @@ fn check_environment(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
     }
 }
 
-/// Validate one `environment` entry's value as a possible `ralphus:link/...`
-/// sentinel (RAL-460). No-op (returns immediately) when `raw` isn't wrapped
-/// in `<<...>>` at all, or wraps some other sentinel kind -- those are out of
-/// scope here (a plain literal is always valid; a worktree placeholder is
-/// validated separately, the same way it always has been). When `raw` IS a
-/// linked-field sentinel targeting `"environment.<key>"`, records a
-/// `(key, target_key)` edge in `link_edges` for the caller's cycle check.
-#[allow(clippy::too_many_arguments)]
+/// Validate every `<<ralphus:linked-field/...>>` sentinel embedded in one
+/// `environment` entry's raw value (RAL-460). No-op for a value with no such
+/// sentinel embedded -- a plain literal or a worktree placeholder is out of
+/// scope here (validated separately, the same way it always has been). Each
+/// linked-field sentinel that targets a same-table `"environment.<key>"`
+/// records a `(key, target_key)` edge in `link_edges` for the caller's cycle
+/// check -- a link that walks `..` to an ancestor's `environment.<key>`
+/// never can, see `find_link_cycle`'s doc comment.
 fn check_environment_link(
     ctx: &mut Ctx,
-    table: &toml::Table,
-    env_table: &toml::Table,
+    chain: &[Scope<'_>],
     path: &str,
     header: Option<u32>,
     key: &str,
     raw: &str,
     link_edges: &mut Vec<(String, String)>,
 ) {
-    let link = match crate::schema::parse_wrapped_cell_link(raw) {
-        Ok(None) => return,
-        Ok(Some(link)) => link,
-        Err(e) => {
-            use crate::schema::CellLinkParseError as E;
-            let detail = match e {
-                E::EmptyField => "must name a field, e.g. \"<<ralphus:link/cwd>>\"",
-                E::UnknownQueryKey => "only a \"?suffix=<relative-path>\" query is supported",
-                E::EmptySuffix => "\"?suffix=\" must not be empty",
-            };
-            let line = ctx.key_line(header, "environment");
-            ctx.error(
-                &format!("{path}.environment.{key}"),
-                ErrorKind::InvalidValue,
-                format!(
-                    "environment value for \"{key}\" is a malformed linked-field sentinel: {detail}"
-                ),
-                line,
-            );
-            return;
-        }
-    };
-    if let Some(suffix) = link.suffix {
-        if !crate::schema::is_valid_cell_link_suffix(suffix) {
-            let line = ctx.key_line(header, "environment");
-            ctx.error(
-                &format!("{path}.environment.{key}"),
-                ErrorKind::InvalidValue,
-                format!(
-                    "environment value for \"{key}\" has an invalid link suffix {suffix:?}: \
-                     must be a relative path starting with \"./\" or \"../\""
-                ),
-                line,
-            );
-        }
-    }
-    match crate::schema::parse_cell_link_target(link.field) {
-        None => {
-            let line = ctx.key_line(header, "environment");
-            ctx.error(
-                &format!("{path}.environment.{key}"),
-                ErrorKind::InvalidValue,
-                format!(
-                    "environment value for \"{key}\" links to unsupported field \"{}\" \
-                     (expected \"cwd\" or \"environment.<key>\")",
-                    link.field
-                ),
-                line,
-            );
-        }
-        Some(crate::schema::CellLinkTarget::Cwd) => {
-            if !table.contains_key("cwd") {
+    for body in crate::schema::text_placeholders(raw) {
+        let Some(link) = crate::schema::parse_linked_field(body) else {
+            continue;
+        };
+        let parsed = match crate::schema::parse_linked_field_path(link.path) {
+            Ok(p) => p,
+            Err(e) => {
+                use crate::schema::LinkedFieldPathError as E;
+                let detail = match e {
+                    E::Empty => "the path after \"ralphus:linked-field/\" must not be empty",
+                    E::MissingNavigation => {
+                        "the path must start with \"./\" or \"../\", e.g. \"./cwd\""
+                    }
+                    E::InvalidNavigationSegment => {
+                        "every path segment before the last must be exactly \".\" or \"..\""
+                    }
+                    E::EmptyField => "the path must end in a field name, e.g. \"./cwd\"",
+                };
                 let line = ctx.key_line(header, "environment");
                 ctx.error(
                     &format!("{path}.environment.{key}"),
-                    ErrorKind::UnknownLinkedField,
+                    ErrorKind::InvalidValue,
                     format!(
-                        "environment value for \"{key}\" links to \"cwd\", which is not set here"
+                        "environment value for \"{key}\" is a malformed linked-field sentinel \
+                         (\"{}\"): {detail}",
+                        link.path
                     ),
                     line,
                 );
+                continue;
             }
+        };
+        if parsed.ups >= chain.len() {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::UnknownLinkedField,
+                format!(
+                    "environment value for \"{key}\" links \"{}\" levels up, past the top of \
+                     this submission",
+                    parsed.ups
+                ),
+                line,
+            );
+            continue;
         }
-        Some(crate::schema::CellLinkTarget::Environment(target_key)) => {
-            if !env_table.contains_key(target_key) {
-                let line = ctx.key_line(header, "environment");
-                ctx.error(
-                    &format!("{path}.environment.{key}"),
-                    ErrorKind::UnknownLinkedField,
-                    format!(
-                        "environment value for \"{key}\" links to \"environment.{target_key}\", \
-                         which does not exist here"
-                    ),
-                    line,
-                );
-            } else {
-                link_edges.push((key.to_string(), target_key.to_string()));
+        let target_scope = chain[chain.len() - 1 - parsed.ups];
+        let Some(target) = crate::schema::parse_link_target(parsed.field) else {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::UnknownLinkedField,
+                format!(
+                    "environment value for \"{key}\" links to \"{}\", which does not name a \
+                     field (expected \"cwd\", \"id\", or \"environment.<key>\")",
+                    parsed.field
+                ),
+                line,
+            );
+            continue;
+        };
+        // `environment.<key>` targets are same-table only (`ups == 0`) --
+        // see `LINKED_FIELD_PREFIX`'s doc comment for why an ancestor's
+        // `environment.<key>` can't be addressed unambiguously once the
+        // daemon merges the whole hierarchy into one map at runtime. `cwd`
+        // and `id` don't have this problem and may still cross a `..`.
+        if matches!(target, crate::schema::LinkTarget::Environment(_)) && parsed.ups > 0 {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "environment value for \"{key}\" links to \"{}\" with \"..\" -- an \
+                     \"environment.<key>\" target must stay in the same table (use \
+                     \"./environment.{}\"); only \"cwd\"/\"id\" may reference a parent scope",
+                    crate::schema::link_target_field_name(&target),
+                    parsed
+                        .field
+                        .strip_prefix("environment.")
+                        .unwrap_or(parsed.field),
+                ),
+                line,
+            );
+            continue;
+        }
+        if !crate::schema::link_target_valid_for_scope(&target, target_scope.level) {
+            let line = ctx.key_line(header, "environment");
+            ctx.error(
+                &format!("{path}.environment.{key}"),
+                ErrorKind::UnknownLinkedField,
+                format!(
+                    "environment value for \"{key}\" links to \"{}\", which does not exist at \
+                     that level",
+                    crate::schema::link_target_field_name(&target)
+                ),
+                line,
+            );
+            continue;
+        }
+        match target {
+            crate::schema::LinkTarget::Cwd => {
+                if !target_scope.table.contains_key("cwd") {
+                    let line = ctx.key_line(header, "environment");
+                    ctx.error(
+                        &format!("{path}.environment.{key}"),
+                        ErrorKind::UnknownLinkedField,
+                        format!(
+                            "environment value for \"{key}\" links to \"cwd\", which is not set \
+                             there"
+                        ),
+                        line,
+                    );
+                }
+            }
+            crate::schema::LinkTarget::Id => {
+                // A cell's `id` always resolves -- an unset one falls back to
+                // an auto-generated `cell-<idx>` (see
+                // `daemon::store::insert_squad_with_id`). A proof step's
+                // `id` has no such fallback (`vid` is stored exactly as
+                // written, `None` if unset -- see the `INSERT INTO proofs`
+                // in `daemon::store`), so it must actually be set here.
+                if target_scope.level == crate::schema::ScopeLevel::ProofStep
+                    && !target_scope.table.contains_key("id")
+                {
+                    let line = ctx.key_line(header, "environment");
+                    ctx.error(
+                        &format!("{path}.environment.{key}"),
+                        ErrorKind::UnknownLinkedField,
+                        format!(
+                            "environment value for \"{key}\" links to \"id\", which is not set \
+                             on that proof step"
+                        ),
+                        line,
+                    );
+                }
+            }
+            crate::schema::LinkTarget::Environment(target_key) => {
+                // `ups == 0` is guaranteed here (checked above), so
+                // `target_scope.table` is this same `env_table`'s owning
+                // table -- this edge is always a same-table dependency.
+                let target_env = target_scope
+                    .table
+                    .get("environment")
+                    .and_then(toml::Value::as_table);
+                match target_env.filter(|t| t.contains_key(target_key)) {
+                    Some(_) => {
+                        link_edges.push((key.to_string(), target_key.to_string()));
+                    }
+                    None => {
+                        let line = ctx.key_line(header, "environment");
+                        ctx.error(
+                            &format!("{path}.environment.{key}"),
+                            ErrorKind::UnknownLinkedField,
+                            format!(
+                                "environment value for \"{key}\" links to \
+                                 \"environment.{target_key}\", which does not exist there"
+                            ),
+                            line,
+                        );
+                    }
+                }
             }
         }
     }
 }
 
-/// Does `edges` (each a `(key, target_key)` linked-field dependency within
-/// one `environment` table) contain a cycle? Each key has at most one
-/// outgoing edge (one value = one link), so this is a functional graph --
-/// following edges from any node either terminates or revisits a node,
-/// which is the cycle. Returns the first such key found, for the caller's
-/// error message.
+/// Does `edges` (each a same-table `(key, target_key)` linked-field
+/// dependency -- see [`check_environment_link`]) contain a cycle? A link
+/// that walks `..` to an ancestor can never contribute to a cycle: once a
+/// chain leaves a table for an ancestor's `environment.<key>`, everything it
+/// depends on from there is declared at that ancestor level or further up,
+/// so it can never depend on anything back at the table it left -- there is
+/// no "descend to a child scope" address to write. A cycle can therefore
+/// only form among entries of one single `environment` table referencing
+/// each other, which is exactly the graph `edges` describes. Runs a DFS with
+/// an explicit recursion stack (a node may have more than one outgoing edge,
+/// since one value can embed more than one linked-field sentinel) and
+/// returns the first key found on a cycle.
 fn find_link_cycle(edges: &[(String, String)]) -> Option<String> {
-    let next: HashMap<&str, &str> = edges
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (k, v) in edges {
+        adjacency.entry(k.as_str()).or_default().push(v.as_str());
+    }
+
+    fn visit<'a>(
+        node: &'a str,
+        adjacency: &HashMap<&'a str, Vec<&'a str>>,
+        on_stack: &mut HashSet<&'a str>,
+        done: &mut HashSet<&'a str>,
+    ) -> Option<&'a str> {
+        if done.contains(node) {
+            return None;
+        }
+        if !on_stack.insert(node) {
+            return Some(node);
+        }
+        if let Some(neighbors) = adjacency.get(node) {
+            for &next in neighbors {
+                if let Some(cyc) = visit(next, adjacency, on_stack, done) {
+                    return Some(cyc);
+                }
+            }
+        }
+        on_stack.remove(node);
+        done.insert(node);
+        None
+    }
+
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut done: HashSet<&str> = HashSet::new();
     for (start, _) in edges {
-        let mut seen = HashSet::new();
-        let mut cur = start.as_str();
-        loop {
-            if !seen.insert(cur) {
-                return Some(start.clone());
-            }
-            match next.get(cur) {
-                Some(&nxt) => cur = nxt,
-                None => break,
-            }
+        if let Some(cyc) = visit(start.as_str(), &adjacency, &mut on_stack, &mut done) {
+            return Some(cyc.to_string());
         }
     }
     None
@@ -2161,7 +2392,13 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
 
 // ── proof steps ─────────────────────────────────────────────────────────────
 
-fn validate_proof_array(value: Option<&toml::Value>, path: &str, agents: &[&str], ctx: &mut Ctx) {
+fn validate_proof_array(
+    value: Option<&toml::Value>,
+    path: &str,
+    agents: &[&str],
+    parent_chain: &[Scope<'_>],
+    ctx: &mut Ctx,
+) {
     let Some(value) = value else { return };
     let Some(arr) = value.as_array() else {
         ctx.error(
@@ -2188,7 +2425,16 @@ fn validate_proof_array(value: Option<&toml::Value>, path: &str, agents: &[&str]
         check_machine(ctx, table, &vpath, None);
         // RAL-191: a proof step carries its own `environment`, validated with
         // exactly the same key/value rules as a task's or cell's.
-        check_environment(ctx, table, &vpath, None);
+        let proof_scope = Scope {
+            level: crate::schema::ScopeLevel::ProofStep,
+            table,
+        };
+        let proof_chain: Vec<Scope<'_>> = parent_chain
+            .iter()
+            .copied()
+            .chain(std::iter::once(proof_scope))
+            .collect();
+        check_environment(ctx, &proof_chain, &vpath, None);
 
         let kinds = ["command", "brain", "prompt"];
         let set: Vec<&str> = kinds
@@ -3258,47 +3504,128 @@ prompt = "make it build"
     }
 
     #[test]
-    fn environment_link_to_cwd_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:link/cwd>>\"}\n";
+    fn ral_460_ticket_examples_validate_cleanly() {
+        // The exact worked examples from the RAL-460 ticket: a `[[default]]`
+        // linked field applying to every cell, a same-cell `./cwd`
+        // self-reference (one plain literal cwd, one worktree placeholder
+        // cwd), and a cell-scoped proof step reading its owning cell's `id`
+        // via `../id`.
+        let src = r#"
+[[default]]
+environment = { SOME_ENV_VAR = "<<ralphus:linked-field/./cwd>>" }
+
+[[task]]
+name = "t1"
+project = "ralphus"
+
+    [[task.cell]]
+    id = "foo"
+    cwd = "/tmp/foo"
+    prompt = "hello"
+    environment = { ENV_VAR_WORTREE = "<<ralphus:linked-field/./cwd>>", FOO = "bar" }
+
+    [[task.cell]]
+    id = "bar"
+    cwd = "<<ralphus:new-worktree/DEV-1234-some_ticket?upstream=main>>"
+    prompt = "hello"
+    environment = { ENV_VAR_WORTREE = "<<ralphus:linked-field/./cwd>>" }
+
+        [[task.cell.proof]]
+        id = "chk"
+        command = "true"
+        environment = { CELL_ID = "<<ralphus:linked-field/../id>>" }
+"#;
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn environment_link_to_cwd_with_valid_suffix_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=./logs>>\"}\n";
+    fn default_environment_with_linked_field_is_valid() {
+        let src = "[[default]]\nenvironment={SOME_ENV_VAR=\"<<ralphus:linked-field/./cwd>>\"}\n[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
-    fn environment_link_to_cwd_with_parent_suffix_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={SIBLING=\"<<ralphus:link/cwd?suffix=../sibling>>\"}\n";
-        let r = validate_toml(src);
-        assert!(r.is_ok(), "{:?}", r.errors);
-    }
-
-    #[test]
-    fn environment_link_with_suffix_missing_dot_slash_prefix_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=logs>>\"}\n";
+    fn default_environment_malformed_linked_field_is_rejected() {
+        let src = "[[default]]\nenvironment={SOME_ENV_VAR=\"<<ralphus:linked-field/cwd>>\"}\n[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
                 .iter()
-                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("suffix")),
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("malformed")),
             "{:?}",
             r.errors
         );
     }
 
     #[test]
-    fn environment_link_with_absolute_suffix_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:link/cwd?suffix=/etc/passwd>>\"}\n";
+    fn default_environment_wrong_type_is_rejected() {
+        let src = "[[default]]\nenvironment=\"nope\"\n[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_to_cwd_is_valid() {
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:linked-field/./cwd>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_cwd_with_trailing_literal_text_is_valid() {
+        // Trailing literal text after the closing ">>" -- the same embedding
+        // rule a worktree placeholder already uses, not a "?suffix=" query.
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:linked-field/./cwd>>/logs\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_parent_cell_id_from_a_proof_step_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"foo\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={CELL_ID=\"<<ralphus:linked-field/../id>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_own_proof_step_id_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"chk\"\ncommand=\"true\"\nenvironment={STEP_ID=\"<<ralphus:linked-field/./id>>\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_unset_proof_step_id_is_rejected() {
+        // Unlike a cell, a proof step's `id` has no auto-generated fallback
+        // -- it must actually be set in the TOML to be linkable.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={STEP_ID=\"<<ralphus:linked-field/./id>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
                 .iter()
-                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("suffix")),
+                .any(|e| e.kind == ErrorKind::UnknownLinkedField
+                    && e.message.contains("not set on that proof step")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn environment_link_missing_navigation_is_rejected() {
+        // A bare field name with no leading "./" or "../" is rejected --
+        // every linked field must read the same way at a glance.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:linked-field/cwd>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("malformed")),
             "{:?}",
             r.errors
         );
@@ -3306,22 +3633,39 @@ prompt = "make it build"
 
     #[test]
     fn environment_link_to_unknown_field_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/model>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:linked-field/./model>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
                 .iter()
-                .any(|e| e.kind == ErrorKind::InvalidValue
-                    && e.message.contains("unsupported field")),
+                .any(|e| e.kind == ErrorKind::UnknownLinkedField
+                    && e.message.contains("does not name a field")),
             "{:?}",
             r.errors
         );
     }
 
     #[test]
-    fn environment_link_to_cwd_on_a_task_scope_environment_is_rejected() {
-        // A task table has no `cwd` field at all -- only a cell does.
-        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"<<ralphus:link/cwd>>\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn task_level_environment_linked_field_is_validated_leniently() {
+        // A task's own `environment` is inherited by every cell under it
+        // (RAL-150), so by the time a linked field here actually resolves,
+        // it's relative to whichever cell it landed on -- not this task
+        // table. Validation only checks sentinel syntax here, same as
+        // `[[default]].environment`; a `./cwd` reference is accepted even
+        // though a task table has no `cwd` field of its own.
+        let src = "[[task]]\nname=\"t\"\nenvironment={A=\"<<ralphus:linked-field/./cwd>>\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_cwd_from_a_task_scoped_proof_step_is_rejected() {
+        // A task-scoped proof step's own `environment` DOES resolve against
+        // exactly one fixed scope (this proof step, whose parent is the
+        // task) -- unlike the task's own `environment` above. `..` reaches
+        // the task, which has no `cwd` field, so this is checked
+        // structurally at validate time.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.proof]]\ncommand=\"true\"\nenvironment={A=\"<<ralphus:linked-field/../cwd>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3333,8 +3677,24 @@ prompt = "make it build"
     }
 
     #[test]
+    fn environment_link_past_the_top_of_the_submission_is_rejected() {
+        // A task-scoped proof step's parent is the task, which has nowhere
+        // further up to walk to.
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.proof]]\ncommand=\"true\"\nenvironment={A=\"<<ralphus:linked-field/../../id>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownLinkedField
+                    && e.message.contains("past the top")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn environment_link_to_unknown_environment_key_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.MISSING>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:linked-field/./environment.MISSING>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3348,14 +3708,43 @@ prompt = "make it build"
 
     #[test]
     fn environment_chained_link_to_environment_key_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:link/cwd>>\", SUB=\"<<ralphus:link/environment.BASE?suffix=./sub>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\", SUB=\"<<ralphus:linked-field/./environment.BASE>>/sub\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
+    fn environment_link_to_a_parent_cwd_from_a_proof_step_is_valid() {
+        // A cell-scoped proof step links directly to its owning cell's own
+        // `cwd` -- `cwd` (unlike `environment.<key>`) may cross a `..`.
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={SUB=\"<<ralphus:linked-field/../cwd>>/logs\"}\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn environment_link_to_a_parent_environment_key_is_rejected() {
+        // A proof step linking `..` to its cell's `environment.<key>` is
+        // rejected -- once the daemon merges squad<task<cell<proof into one
+        // map at runtime, an ancestor's key can't be addressed unambiguously
+        // if the proof step shadows it with its own same-named key. `cwd`
+        // and `id` don't have this problem; `environment.<key>` must stay
+        // same-table (see `environment_link_to_a_parent_cwd_from_a_proof_step_is_valid`
+        // for the `cwd` case this restriction doesn't apply to).
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\"}\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={SUB=\"<<ralphus:linked-field/../environment.BASE>>/logs\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("same table")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
     fn environment_link_self_cycle_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.A>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:linked-field/./environment.A>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3368,7 +3757,7 @@ prompt = "make it build"
 
     #[test]
     fn environment_link_two_key_cycle_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/environment.B>>\", B=\"<<ralphus:link/environment.A>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:linked-field/./environment.B>>\", B=\"<<ralphus:linked-field/./environment.A>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -3383,14 +3772,14 @@ prompt = "make it build"
     fn environment_link_target_that_is_a_plain_literal_is_valid() {
         // Linking to a target field that's already a plain literal (no
         // placeholder) is valid -- it just resolves to that literal.
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo/checkout\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:link/cwd>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/repo/checkout\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:linked-field/./cwd>>\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn environment_link_malformed_sentinel_reported() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:link/cwd?bogus=1>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nenvironment={A=\"<<ralphus:linked-field/...>>\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors

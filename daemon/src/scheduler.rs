@@ -2274,8 +2274,12 @@ fn run_cell_worker(
                     // RAL-460: `resolve_placeholders` already resolved this
                     // cell's `cwd` (real path, or an untouched literal) before
                     // any cell dispatched -- lets an `environment` value link
-                    // to it via "<<ralphus:link/cwd>>".
+                    // to it via "<<ralphus:linked-field/./cwd>>".
                     cwd: row.cwd.as_deref(),
+                    // This is the cell's own `environment`, not a proof
+                    // step's -- "." is this cell itself.
+                    is_proof_scope: false,
+                    proof_id: None,
                     // No prefetch pass covers env-override placeholders (a
                     // rarer case than a cell's own cwd) -- an unresolved
                     // registered-remote bare upstream here falls back to a
@@ -3889,6 +3893,15 @@ fn run_proofs(
                         // scope's cell/task-representative-cell runs in --
                         // see the sibling call site above.
                         cwd: Some(cwd),
+                        // This IS a proof step's own `environment` -- "."
+                        // is this proof step, ".." is its owning cell
+                        // (`cell_id`/`cwd`, above). `proof_id` is this
+                        // step's own TOML-declared `id` (RAL-460 follow-up),
+                        // not the auto-generated `cell_sid.unwrap_or(scope)`
+                        // fallback `cell_id` above uses -- a proof step has
+                        // no such fallback.
+                        is_proof_scope: true,
+                        proof_id: proof_id.as_deref(),
                         // See the sibling call site above: no prefetch pass
                         // covers env-override placeholders; a miss here falls
                         // back to a live fetch under this lock, unchanged

@@ -67,11 +67,28 @@ pub(crate) struct PlaceholderContext<'a> {
     /// [`materialize_env_overrides`] runs -- [`resolve_placeholders`] always
     /// resolves every cell's `cwd` before any cell (or its proof steps)
     /// dispatches (RAL-460). Used to resolve an `environment` value that
-    /// links to `"cwd"` (see [`ralphus_core::schema::CellLinkTarget::Cwd`]).
+    /// links to `"cwd"` (see [`ralphus_core::schema::LinkTarget::Cwd`]).
     /// `None` only when there is no cwd to link to at all (irrelevant to
     /// [`GitProjectStartupAdapter::resolve_placeholder`], which is resolving
     /// `cwd` itself and so leaves this unset).
     pub(crate) cwd: Option<&'a str>,
+    /// Whether this context is resolving a PROOF STEP's own `environment`
+    /// (`true`) rather than a cell's own (`false`) -- distinguishes the two
+    /// possible "current" scopes a `<<ralphus:linked-field/...>>` `.`/`..`
+    /// resolves against (RAL-460 follow-up). When `true`, `.` is the proof
+    /// step itself (its own id is [`Self::proof_id`]) and `..` is its
+    /// owning cell (`cell_id`/`cwd`, above). When `false`, `.` is the cell
+    /// itself (`cell_id`/`cwd`) -- unrelated to
+    /// [`GitProjectStartupAdapter::resolve_placeholder`], which never
+    /// resolves linked fields at all and always leaves this `false`.
+    pub(crate) is_proof_scope: bool,
+    /// This proof step's own `id`, when [`Self::is_proof_scope`] is `true`
+    /// and the step set one (`core::validate` requires a step to set `id`
+    /// for a `"<<ralphus:linked-field/./id>>"` reference to it to validate
+    /// at all, so a `None` here for an otherwise-valid submission means
+    /// nothing in this scope's `environment` actually links to `./id`).
+    /// Meaningless (left `None`) when `is_proof_scope` is `false`.
+    pub(crate) proof_id: Option<&'a str>,
     /// `(registered project name, bare upstream) -> already-fetched
     /// "<remote>/<branch>"`, computed by [`collect_remote_upstream_prefetch_targets`]
     /// and the caller's own fetch loop OUTSIDE the store lock this whole
@@ -1073,6 +1090,10 @@ fn placeholder_context_for_cell<'a>(
         // This context resolves the cell's own `cwd` placeholder, so there is
         // no already-known `cwd` to link to yet.
         cwd: None,
+        // This context never resolves a linked field (only a cell's own
+        // `cwd`) -- irrelevant here.
+        is_proof_scope: false,
+        proof_id: None,
         prefetched_upstreams,
         on_disk_worktrees,
     }
@@ -1333,15 +1354,17 @@ fn resolve_placeholder_text_for_project(
     expand_placeholder_text(raw, resolve_known)
 }
 
-/// Resolve every `environment` value for one cell/proof-step scope,
-/// including `"<<ralphus:link/<field>>>"` linked fields (RAL-460) in
-/// dependency order: a value that links to another `environment` entry is
-/// only resolved once that entry's own value is fully resolved, however many
-/// links deep the chain goes -- never in one hardcoded hop. A value that
-/// isn't a linked field falls through to the existing worktree-placeholder
-/// expansion ([`resolve_placeholder_text_for_project`]) unchanged, so a plain
-/// literal or an embedded `ralphus:new-worktree/...` placeholder resolves
-/// exactly as it always has.
+/// Resolve every `environment` value for one cell's or proof step's own
+/// scope, including any embedded `"<<ralphus:linked-field/<path>>>"`
+/// sentinels (RAL-460) in dependency order: a value that links to another
+/// `environment` entry is only resolved once that entry's own value is
+/// fully resolved, however many links deep the chain goes -- never in one
+/// hardcoded hop. A linked field embeds using the exact same `<<...>>`
+/// mechanism a worktree placeholder does (see
+/// [`ralphus_core::schema::LINKED_FIELD_PREFIX`]'s doc comment), so trailing
+/// literal text after the closing `>>`, or a plain literal / embedded
+/// `ralphus:new-worktree/...` placeholder with no linked field at all,
+/// resolves exactly as it always has.
 pub(crate) fn materialize_env_overrides(
     store: &Store,
     ctx: PlaceholderContext<'_>,
@@ -1370,8 +1393,8 @@ pub(crate) fn materialize_env_overrides(
 
 /// Resolve one `environment` entry (`key`) of `env`, memoizing into
 /// `resolved` and recursing (with cycle detection via `resolving`) when its
-/// value links to another entry in the same `env` map. See
-/// [`materialize_env_overrides`].
+/// value embeds a linked field targeting another entry in this same `env`
+/// map. See [`materialize_env_overrides`].
 #[allow(clippy::too_many_arguments)]
 fn resolve_env_entry(
     store: &Store,
@@ -1394,74 +1417,176 @@ fn resolve_env_entry(
     }
     let raw = env
         .get(key)
-        .expect("key came from this same env map's own keys()");
-    let value = match ralphus_core::schema::parse_wrapped_cell_link(raw) {
-        Ok(None) => match project_name {
-            Some(project_name) => {
-                resolve_placeholder_text_for_project(store, project_name, raw, ctx, cache)?
-            }
-            None => raw.clone(),
-        },
-        Ok(Some(link)) => {
-            if let Some(suffix) = link.suffix {
-                if !ralphus_core::schema::is_valid_cell_link_suffix(suffix) {
-                    return Err(format!(
-                        "cell '{}': environment \"{key}\" has an invalid link suffix {suffix:?}",
+        .expect("key came from this same env map's own keys()")
+        .clone();
+    validate_worktree_placeholders(&raw, ctx.cell_id)?;
+    let project = match project_name {
+        Some(name) => Some(
+            store
+                .resolve_project(name)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "cell '{}': project \"{name}\" is not registered",
                         ctx.cell_id
-                    ));
-                }
-            }
-            let base = match ralphus_core::schema::parse_cell_link_target(link.field) {
-                Some(ralphus_core::schema::CellLinkTarget::Cwd) => {
-                    ctx.cwd.map(str::to_string).ok_or_else(|| {
-                        format!(
-                            "cell '{}': environment \"{key}\" links to \"cwd\", which has no \
-                             value in this scope",
-                            ctx.cell_id
-                        )
-                    })?
-                }
-                Some(ralphus_core::schema::CellLinkTarget::Environment(target_key)) => {
-                    if !env.contains_key(target_key) {
-                        return Err(format!(
-                            "cell '{}': environment \"{key}\" links to \
-                             \"environment.{target_key}\", which does not exist",
-                            ctx.cell_id
-                        ));
-                    }
-                    resolve_env_entry(
-                        store,
-                        project_name,
-                        env,
-                        target_key,
-                        ctx,
-                        cache,
-                        resolved,
-                        resolving,
-                    )?
-                }
-                None => {
-                    return Err(format!(
-                        "cell '{}': environment \"{key}\" links to unsupported field \"{}\"",
-                        ctx.cell_id, link.field
-                    ));
-                }
-            };
-            match link.suffix {
-                Some(suffix) => Path::new(&base).join(suffix).to_string_lossy().into_owned(),
-                None => base,
-            }
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let adapter = project
+        .as_ref()
+        .and_then(|p| project_startup_adapter(&p.vcs));
+    let mut resolve_known = |body: &str| -> Result<Option<String>, String> {
+        if let Some(link) = ralphus_core::schema::parse_linked_field(body) {
+            let value = resolve_linked_field(
+                store,
+                project_name,
+                env,
+                key,
+                link.path,
+                ctx,
+                cache,
+                resolved,
+                resolving,
+            )?;
+            return Ok(Some(value));
         }
-        Err(_) => {
-            return Err(format!(
-                "cell '{}': environment \"{key}\" is a malformed linked-field sentinel",
-                ctx.cell_id
-            ));
+        let (Some(adapter), Some(project)) = (adapter, project.as_ref()) else {
+            return Ok(None);
+        };
+        let cache_key = placeholder_cache_key(ctx.machine, body);
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(Some(cached.clone()));
         }
+        let Some(value) = adapter.resolve_placeholder(store, project, body, ctx)? else {
+            return Ok(None);
+        };
+        cache.insert(cache_key, value.clone());
+        Ok(Some(value))
+    };
+    let value = if classify_placeholder(&raw)?.is_some() {
+        resolve_known(&raw)?.unwrap_or_else(|| raw.clone())
+    } else {
+        expand_placeholder_text(&raw, resolve_known)?
     };
     resolving.remove(key);
     resolved.insert(key.to_string(), value.clone());
     Ok(value)
+}
+
+/// Resolve a single `<<ralphus:linked-field/<path>>>` sentinel body's
+/// `<path>` (already unwrapped by [`expand_placeholder_text`], so `path` is
+/// e.g. `"./cwd"` or `"../id"`) against `ctx`'s scope, recursing into a
+/// same-table `environment.<key>` sibling (via [`resolve_env_entry`]) when
+/// the target is itself another linked field (RAL-460). Mirrors
+/// `core::validate`'s structural checks exactly -- see
+/// [`ralphus_core::schema::LINKED_FIELD_PREFIX`]'s doc comment for the
+/// grammar and the `cwd`/`id` vs. `environment.<key>` cross-scope
+/// restriction both this and validation enforce.
+#[allow(clippy::too_many_arguments)]
+fn resolve_linked_field(
+    store: &Store,
+    project_name: Option<&str>,
+    env: &BTreeMap<String, String>,
+    key: &str,
+    path: &str,
+    ctx: PlaceholderContext<'_>,
+    cache: &mut HashMap<String, String>,
+    resolved: &mut BTreeMap<String, String>,
+    resolving: &mut HashSet<String>,
+) -> Result<String, String> {
+    let parsed = ralphus_core::schema::parse_linked_field_path(path).map_err(|_| {
+        format!(
+            "cell '{}': environment \"{key}\" is a malformed linked-field sentinel \"{path}\"",
+            ctx.cell_id
+        )
+    })?;
+    let Some(target) = ralphus_core::schema::parse_link_target(parsed.field) else {
+        return Err(format!(
+            "cell '{}': environment \"{key}\" links to \"{}\", which does not name a field",
+            ctx.cell_id, parsed.field
+        ));
+    };
+    match target {
+        ralphus_core::schema::LinkTarget::Cwd => resolve_linked_cwd(ctx, parsed.ups, key),
+        ralphus_core::schema::LinkTarget::Id => resolve_linked_id(ctx, parsed.ups, key),
+        ralphus_core::schema::LinkTarget::Environment(target_key) => {
+            if parsed.ups != 0 {
+                return Err(format!(
+                    "cell '{}': environment \"{key}\" links to \"environment.{target_key}\" \
+                     with \"..\" -- an environment.<key> target must stay in the same table",
+                    ctx.cell_id
+                ));
+            }
+            if !env.contains_key(target_key) {
+                return Err(format!(
+                    "cell '{}': environment \"{key}\" links to \"environment.{target_key}\", \
+                     which does not exist",
+                    ctx.cell_id
+                ));
+            }
+            resolve_env_entry(
+                store,
+                project_name,
+                env,
+                target_key,
+                ctx,
+                cache,
+                resolved,
+                resolving,
+            )
+        }
+    }
+}
+
+/// Resolve a linked field's `cwd` target `ups` levels up from `ctx`'s own
+/// scope. Both "current is the cell itself" (`ups == 0`,
+/// `!ctx.is_proof_scope`) and "current is a proof step whose immediate
+/// parent is the cell" (`ups == 1`, `ctx.is_proof_scope`) reach the same
+/// already-materialized [`PlaceholderContext::cwd`]. Any other `ups` has no
+/// `cwd` to reach; `core::validate` already rejects that at submit time, so
+/// this is defense in depth, not the primary gate.
+fn resolve_linked_cwd(
+    ctx: PlaceholderContext<'_>,
+    ups: usize,
+    key: &str,
+) -> Result<String, String> {
+    let reaches_cell = (ups == 0 && !ctx.is_proof_scope) || (ups == 1 && ctx.is_proof_scope);
+    if !reaches_cell {
+        return Err(format!(
+            "cell '{}': environment \"{key}\" links to \"cwd\", which has no value at that scope",
+            ctx.cell_id
+        ));
+    }
+    ctx.cwd.map(str::to_string).ok_or_else(|| {
+        format!(
+            "cell '{}': environment \"{key}\" links to \"cwd\", which has no value in this scope",
+            ctx.cell_id
+        )
+    })
+}
+
+/// Resolve a linked field's `id` target `ups` levels up from `ctx`'s own
+/// scope -- see [`resolve_linked_cwd`] for the scope-reaching logic this
+/// mirrors. `ups == 0` while `ctx.is_proof_scope` reads the proof step's own
+/// id ([`PlaceholderContext::proof_id`]); every other reachable case reads
+/// the owning cell's ([`PlaceholderContext::cell_id`]).
+fn resolve_linked_id(ctx: PlaceholderContext<'_>, ups: usize, key: &str) -> Result<String, String> {
+    match (ups, ctx.is_proof_scope) {
+        (0, true) => ctx.proof_id.map(str::to_string).ok_or_else(|| {
+            format!(
+                "cell '{}': environment \"{key}\" links to \"id\", which is not set on this \
+                 proof step",
+                ctx.cell_id
+            )
+        }),
+        (0, false) | (1, true) => Ok(ctx.cell_id.to_string()),
+        _ => Err(format!(
+            "cell '{}': environment \"{key}\" links to \"id\", which has no value at that scope",
+            ctx.cell_id
+        )),
+    }
 }
 
 /// Classify a cell `cwd` as a placeholder needing materialization, a plain
@@ -4056,5 +4181,375 @@ mod tests {
         assert_ne!(path_a, path_b);
         assert_eq!(head_branch(path_a), "test-pr-submission-a");
         assert_eq!(head_branch(path_b), "test-pr-submission-b");
+    }
+
+    fn env_ctx<'a>(
+        cwd: Option<&'a str>,
+        is_proof_scope: bool,
+        proof_id: Option<&'a str>,
+        targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+        prefetched_upstreams: &'a HashMap<(String, String), String>,
+        on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
+    ) -> PlaceholderContext<'a> {
+        PlaceholderContext {
+            squad_id: "squad-1",
+            task_idx: 0,
+            cell_idx: 0,
+            task_name: "task0",
+            cell_id: "s0",
+            machine: None,
+            targets,
+            cwd,
+            is_proof_scope,
+            proof_id,
+            prefetched_upstreams,
+            on_disk_worktrees,
+        }
+    }
+
+    #[test]
+    fn materialize_env_overrides_resolves_link_to_cwd() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "WT".to_string(),
+            "<<ralphus:linked-field/./cwd>>".to_string(),
+        )]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to cwd");
+        assert_eq!(resolved.get("WT").map(String::as_str), Some("/resolved/wt"));
+    }
+
+    #[test]
+    fn materialize_env_overrides_resolves_link_to_cwd_with_trailing_literal_text() {
+        // Trailing literal text after the closing ">>" -- the same embedding
+        // rule a worktree placeholder already uses, not a "?suffix=" query.
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "LOGS".to_string(),
+            "<<ralphus:linked-field/./cwd>>/logs".to_string(),
+        )]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to cwd with trailing text");
+        assert_eq!(
+            resolved.get("LOGS").map(String::as_str),
+            Some("/resolved/wt/logs")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_resolves_chained_environment_link() {
+        // SUB links to BASE, which itself links to cwd -- dependency-ordered
+        // resolution must resolve BASE before SUB reads it, regardless of
+        // BTreeMap iteration order ("BASE" < "SUB" alphabetically, so also
+        // test the reverse-name case below to rule out lucky ordering).
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([
+            (
+                "BASE".to_string(),
+                "<<ralphus:linked-field/./cwd>>".to_string(),
+            ),
+            (
+                "SUB".to_string(),
+                "<<ralphus:linked-field/./environment.BASE>>/sub".to_string(),
+            ),
+        ]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve chained link");
+        assert_eq!(
+            resolved.get("BASE").map(String::as_str),
+            Some("/resolved/wt")
+        );
+        assert_eq!(
+            resolved.get("SUB").map(String::as_str),
+            Some("/resolved/wt/sub")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_resolves_chained_link_regardless_of_map_key_order() {
+        // "AAA_LINKS_TO_ZZZ" sorts before "ZZZ_BASE" -- name the linking key
+        // so it would iterate *before* its dependency alphabetically,
+        // proving the resolver doesn't just get lucky with BTreeMap order.
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([
+            (
+                "AAA_LINKS_TO_ZZZ".to_string(),
+                "<<ralphus:linked-field/./environment.ZZZ_BASE>>".to_string(),
+            ),
+            (
+                "ZZZ_BASE".to_string(),
+                "<<ralphus:linked-field/./cwd>>".to_string(),
+            ),
+        ]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve chained link");
+        assert_eq!(
+            resolved.get("AAA_LINKS_TO_ZZZ").map(String::as_str),
+            Some("/resolved/wt")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_link_to_a_plain_literal_field_resolves_directly() {
+        // The linked-to field (`cwd`) is a plain literal here, never a
+        // worktree placeholder -- no project is registered and none is
+        // needed, since resolving a link never triggers worktree
+        // materialization.
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "WT".to_string(),
+            "<<ralphus:linked-field/./cwd>>".to_string(),
+        )]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/plain/checkout"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to a plain literal");
+        assert_eq!(
+            resolved.get("WT").map(String::as_str),
+            Some("/plain/checkout")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_leaves_non_link_values_untouched() {
+        // Regression guard (RAL-100/RAL-447): a plain literal or an embedded
+        // worktree placeholder must resolve exactly as it did before linked
+        // fields existed.
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([("PLAIN".to_string(), "just-a-literal".to_string())]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                None,
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve plain literal");
+        assert_eq!(
+            resolved.get("PLAIN").map(String::as_str),
+            Some("just-a-literal")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_errors_on_a_two_key_link_cycle() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([
+            (
+                "A".to_string(),
+                "<<ralphus:linked-field/./environment.B>>".to_string(),
+            ),
+            (
+                "B".to_string(),
+                "<<ralphus:linked-field/./environment.A>>".to_string(),
+            ),
+        ]);
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect_err("a circular link chain must fail resolution");
+        assert!(err.contains("circular"), "{err}");
+    }
+
+    #[test]
+    fn materialize_env_overrides_errors_when_cwd_link_has_no_cwd_in_scope() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "WT".to_string(),
+            "<<ralphus:linked-field/./cwd>>".to_string(),
+        )]);
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(
+                None,
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect_err("linking to cwd with no cwd in scope must fail");
+        assert!(err.contains("cwd"), "{err}");
+    }
+
+    #[test]
+    fn materialize_env_overrides_proof_step_resolves_own_id() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "STEP_ID".to_string(),
+            "<<ralphus:linked-field/./id>>".to_string(),
+        )]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/wt"),
+                true,
+                Some("chk"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve proof step's own id");
+        assert_eq!(resolved.get("STEP_ID").map(String::as_str), Some("chk"));
+    }
+
+    #[test]
+    fn materialize_env_overrides_proof_step_resolves_parent_cell_cwd_and_id() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([
+            (
+                "CELL_WT".to_string(),
+                "<<ralphus:linked-field/../cwd>>".to_string(),
+            ),
+            (
+                "CELL_ID".to_string(),
+                "<<ralphus:linked-field/../id>>".to_string(),
+            ),
+        ]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                true,
+                Some("chk"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve proof step's parent cell fields");
+        assert_eq!(
+            resolved.get("CELL_WT").map(String::as_str),
+            Some("/resolved/wt")
+        );
+        assert_eq!(resolved.get("CELL_ID").map(String::as_str), Some("s0"));
+    }
+
+    #[test]
+    fn materialize_env_overrides_proof_step_own_id_unset_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "STEP_ID".to_string(),
+            "<<ralphus:linked-field/./id>>".to_string(),
+        )]);
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/wt"),
+                true,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect_err("an unset proof step id must fail resolution");
+        assert!(err.contains("id"), "{err}");
     }
 }
