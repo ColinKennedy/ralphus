@@ -3679,6 +3679,41 @@ impl Store {
         Ok(())
     }
 
+    /// Force a cell to `done` via a manual `set-status` override (RAL-74),
+    /// including any of its own cell-level proof steps still sitting in a
+    /// non-terminal state.
+    ///
+    /// A plain `set_cell_state(..., Done)` only writes the cell row. If the
+    /// cell's own proof never ran to completion — e.g. the cell was
+    /// previously `blocked by a failed dependency` and so never even
+    /// started — that proof row is left `pending`, and `effective_cell_state`
+    /// (this file)'s read-time fold keeps reporting the cell back to the API
+    /// as `running`/`failed` regardless of what the cell row now says. From
+    /// the board this looks exactly like the override "swapping back to
+    /// running" and never sticking, no matter how many times it's retried.
+    /// It also leaves the cell ineligible for [`Self::done_cells`] (still
+    /// excluded by its own pending-proof check), so a later squad retry
+    /// classifies it as a proof-only restart
+    /// ([`Self::cells_needing_proof_only`]) and genuinely re-dispatches it.
+    ///
+    /// Also clears the cell's `error` (e.g. a stale "blocked by a failed
+    /// dependency" message) — it no longer applies once the cell is forced
+    /// done.
+    pub fn force_cell_done(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.set_cell_state(squad_id, task_idx, idx, NodeState::Done)?;
+        self.conn.execute(
+            "UPDATE cells SET error=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        self.conn.execute(
+            "UPDATE proofs SET state='done', env_out_of_date=0
+             WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?
+             AND state NOT IN ('done','failed','cancelled')",
+            params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
     /// Set a task node's state. Also stamps `started_at_ms`/`finished_at_ms` —
     /// see [`Store::set_squad_state`]'s doc comment for the shared semantics.
     pub fn set_task_state(&self, squad_id: &str, task_idx: i64, state: NodeState) -> Result<()> {
