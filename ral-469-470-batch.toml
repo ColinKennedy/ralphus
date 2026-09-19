@@ -1,0 +1,300 @@
+# RAL-470 / RAL-469.
+#
+# Per request:
+#   - upstream branch is "staging" everywhere (review + every cwd placeholder)
+#   - every agent is codex
+#   - proof_scope = "nothing", skip_auto_build = true, auto_submit_pr_stack = true,
+#     auto_fix_pr_errors = true
+#   - one shared [[review]] for the whole batch
+#
+# Dependencies:
+#   - RAL-470 (build-release --skip-tmux flag) and RAL-469 (restore
+#     CLAUDE.md/AGENTS.md loading for agent backends) touch unrelated parts
+#     of the codebase (scripts/ vs runner/) and have no ordering requirement
+#     between them, so they run in parallel.
+
+[[review]]
+id                   = "ralphus:new-review/ral-469-470"
+name                 = "RAL-470, RAL-469"
+upstream             = "staging"
+agent                = "codex"
+model                = "gpt-5.6-luna"
+proof_scope          = "nothing"
+skip_auto_build      = true
+auto_submit_pr_stack = true
+auto_fix_pr_errors   = true
+
+
+# ---------------------------------------------------------------------------
+# RAL-470 - build-release needs --skip-tmux flag
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-470-build-release-skip-tmux-flag"
+project = "ralphus"
+agent   = "codex"
+model   = "terra"
+
+[[task.cell]]
+id                         = "work"
+cwd                        = "<<ralphus:new-worktree/RAL-470-build-release-skip-tmux-flag?upstream=staging>>"
+review                     = "<<ralphus:new-review/ral-469-470>>"
+agent                      = "codex"
+model                      = "terra"
+maximum_context            = 120000
+auto_compact_threshold     = 86000
+maximum_tool_output_tokens = 12000
+system_prompt              = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position     = "append"
+prompt                     = """
+# RAL-470: Add --skip-tmux flag to build-release scripts
+
+## Summary
+
+`build-release.sh`/`build-release.cmd` currently only support skipping the tmux (2mux) build step via an environment variable. Add a `--skip-tmux` command-line flag to both scripts as the primary way to opt out, so a user can pass it directly instead of having to set an environment variable first.
+
+## Values
+
+A CLI flag is more discoverable and easier to use in one-off invocations than an environment variable — the user doesn't need to remember or look up the variable name, and it's visible in shell history and `--help` output.
+
+## Risks
+
+- Two release-build entry points (`.sh` and `.cmd`) must stay in parity; a flag added to one and not the other reintroduces the inconsistency this ticket is meant to fix.
+- Need a decision on whether the existing environment variable is kept as a fallback/deprecated path or removed outright — removing it could break existing CI or user scripts that already set it.
+
+## Acceptance Criteria
+
+- [ ] `build-release.sh --skip-tmux` skips the tmux build step.
+- [ ] `build-release.cmd --skip-tmux` (or its PowerShell equivalent) skips the tmux build step.
+- [ ] Behavior documented in `scripts/AGENTS.md`.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-470: Add --skip-tmux flag to build-release scripts — Interview Notes
+
+## Self-answered (codebase research)
+
+Q. Where does the tmux skip mechanism currently live, and what's the exact env var?
+A. `scripts/build-release.cmd:42-48` checks `RALPHUS_SKIP_VENDORED_TMUX=="1"`; documented in a comment at `:18-23`. `scripts/build-release.sh` has **no** tmux/psmux logic at all (confirmed by reading the full file) — the skip mechanism is Windows-only today. There's no `build-release.ps1`. The vendored component is called **psmux**, not "2mux" — embedded via the daemon Cargo feature `embedded-tmux`.
+
+Q. Is there existing CLI arg-parsing scaffolding to hook a new flag into?
+A. No — neither `build-release.cmd` nor `build-release.sh` parses any arguments today; `--skip-tmux` would be the first flag either script supports. `scripts/build-debug.sh:20,40-56` already has a `while [[ $# -gt 0 ]]` loop supporting `--daemon-port`/`--librarian-port`/`--db-path` (mirrored in `build-debug.cmd`) — a reusable pattern, though not required here.
+
+Q. What does "building tmux/2mux" actually involve?
+A. `scripts/build-vendored-tmux.ps1:1-49`: checks out the `vendor/psmux` git submodule, builds its `tmux` binary via `cargo build --release`, copies the resulting `tmux.exe` into `daemon/assets/tmux/windows/tmux.exe`, which `daemon/src/tmux.rs`'s embedded module `include_bytes!`s when the `embedded-tmux` Cargo feature is enabled. Skipping means: no submodule build, no PowerShell script invocation, and the release `cargo build` runs without `--features ralphus-daemon/embedded-tmux`.
+
+Q. Is this documented in `scripts/AGENTS.md`?
+A. No — grep for tmux/2mux in `scripts/AGENTS.md` found nothing; needs updating alongside the flag addition.
+
+Q. Do other scripts (build-debug) reference the same env var?
+A. No — `build-debug.sh`/`.cmd` never reference `RALPHUS_SKIP_VENDORED_TMUX` or build psmux at all; debug builds apparently never build embedded tmux.
+
+## Interview Q&A
+
+Q1. Since `build-release.sh` has no tmux-build logic today, does this ticket mean add `--skip-tmux` only to `.cmd`, or also port the vendored-tmux build path to `.sh` for parity?
+A. The `.cmd` currently has it. `.sh` should have feature parity with `.cmd` — port the vendored-tmux build path to `build-release.sh` too, gated by the same `--skip-tmux` flag. Action item: add a note to the agent-conduct docs to always keep `scripts/*.sh` in parity with `scripts/*.cmd` going forward (general rule, not just for this ticket).
+
+Q2. Should `--skip-tmux` fully replace `RALPHUS_SKIP_VENDORED_TMUX`, or keep the env var as a fallback?
+A. Replace entirely — no fallback. `--skip-tmux` becomes the only way to skip the tmux build; the env var check is removed.
+
+Q3. Copy the `build-debug.sh`-style multi-flag arg-parsing loop, or keep it minimal?
+A. Minimal is enough — a single-flag check, no need for the fuller parsing loop.
+
+---
+
+# Notes for this run
+
+This worktree is cut from `staging`, where the tmux-skip mechanism described
+above actually lives (it does not exist on `master`/other branches — that is
+expected, not a discrepancy). Re-locate the exact line numbers cited above in
+your own worktree before editing; they are approximate.
+
+Do the following:
+1. In `scripts/build-release.cmd`, replace the `RALPHUS_SKIP_VENDORED_TMUX`
+   environment-variable check with a `--skip-tmux` command-line flag that has
+   the same effect (skip building `vendor/psmux` and skip
+   `--features ralphus-daemon/embedded-tmux`). Remove the env var check
+   entirely — no fallback.
+2. Port the vendored-tmux build path (submodule build + `embedded-tmux`
+   feature flag) to `scripts/build-release.sh`, gated by the same
+   `--skip-tmux` flag, so both scripts are at parity. Keep arg parsing
+   minimal — a single-flag check, not a full multi-flag parsing loop.
+3. Update `scripts/AGENTS.md` to document `--skip-tmux` on both scripts.
+4. Add a short, general note to `.agent/agent-conduct.md` (or the most
+   appropriate existing conduct doc) that `scripts/*.sh` and `scripts/*.cmd`
+   must be kept in parity going forward — this is a standing rule, not
+   specific to this ticket.
+
+Your working directory is this worktree.
+"""
+
+[[task.cell.proof]]
+id                         = "skip-tmux-verify"
+agent                      = "codex"
+model                      = "gpt-5.6-luna"
+maximum_tool_output_tokens = 8000
+system_prompt              = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position     = "append"
+prompt                     = "Verify and report each item. 1) `scripts/build-release.cmd --skip-tmux` skips building the vendored psmux submodule and skips `--features ralphus-daemon/embedded-tmux`, with no remaining reference to `RALPHUS_SKIP_VENDORED_TMUX` anywhere in the script. 2) `scripts/build-release.sh --skip-tmux` has the same effect and now has the same vendored-tmux build path as the `.cmd` script gated behind the same flag (full parity). 3) `scripts/AGENTS.md` documents `--skip-tmux` for both scripts. 4) `.agent/agent-conduct.md` (or the nearest equivalent conduct doc) now states that `scripts/*.sh` and `scripts/*.cmd` must be kept in parity going forward. 5) Argument parsing in both scripts is minimal (single-flag check), not a full multi-flag loop. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/RAL-470-build-release-skip-tmux-flag?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "codex"
+model                  = "gpt-5.6-luna"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-470, stage only the intended files, commit with an appropriate RAL-470 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
+
+
+# ---------------------------------------------------------------------------
+# RAL-469 - CLAUDE.md/AGENTS.md not loaded by agents
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-469-restore-claude-md-agents-md-loading"
+project = "ralphus"
+agent   = "codex"
+model   = "terra"
+
+[[task.cell]]
+id                         = "work"
+cwd                        = "<<ralphus:new-worktree/RAL-469-restore-claude-md-agents-md-loading?upstream=staging>>"
+review                     = "<<ralphus:new-review/ral-469-470>>"
+agent                      = "codex"
+model                      = "terra"
+maximum_context            = 200000
+auto_compact_threshold     = 150000
+maximum_tool_output_tokens = 15000
+system_prompt              = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position     = "append"
+prompt                     = """
+# RAL-469: Restore CLAUDE.md/AGENTS.md loading for agent backends
+
+## Summary
+
+Agent-run cells no longer pick up project-level `CLAUDE.md`/`AGENTS.md` files. The suspected root cause is that Claude Code's `--setting-sources` flag is currently passed empty, which suppresses loading of project-level settings sources; it should include `"project"` so Claude Code reads the project's `CLAUDE.md`. This ticket covers fixing that flag for the Claude Code backend and auditing whether the Codex and Pi backends have an equivalent regression for their own project-instruction files.
+
+## Values
+
+Project-level instructions (build/test/lint rules, architecture notes, agent-conduct rules) are how this repo communicates non-obvious constraints to every agent that works in it. Silently dropping them means agents run without guardrails they were designed to have, producing work that violates documented conventions without any signal that the conventions were never seen.
+
+## Risks
+
+- The flag may be intentionally empty for a reason not yet understood (e.g. to avoid loading user-global settings) — need to confirm `"project"` is the correct value to add rather than a blanket fix.
+- Codex and Pi may use entirely different mechanisms (different flag, different file discovery, or none at all) for their own `AGENTS.md`-equivalent — this needs backend-specific investigation, not a copy-paste of the Claude Code fix.
+- Per repo convention, backend-specific behavior must live in the concrete Claude Code/Codex/Pi implementations, not in daemon-side lookup tables — a fix that centralizes this logic incorrectly would need to be redone.
+
+## Technical Notes
+
+- Suspected fix location: the `--setting-sources` argument construction for the Claude Code backend; add `"project"` to the currently-empty value.
+- Confirm behavior with a real project-level `CLAUDE.md`/`AGENTS.md` present, not just flag presence — an agent could ignore the file even with the correct flag set.
+
+## Acceptance Criteria
+
+- [ ] Claude Code backend cells read project-level `CLAUDE.md` when run.
+- [ ] Codex backend confirmed to read (or fixed to read) its project-level instructions file.
+- [ ] Pi backend confirmed to read (or fixed to read) its project-level instructions file.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-469: Restore CLAUDE.md/AGENTS.md loading for agent backends — Interview Notes
+
+## Self-answered (codebase research)
+
+Q. Where is the Claude Code `--setting-sources` flag constructed, and what value does it pass today?
+A. `runner/src/claude_code_backend.rs:248-258` (`setting_sources_args`): when `options.allow_personal_settings` is false (the default for agent-run cells), it returns `vec!["--setting-sources".to_string(), String::new()]` — i.e. `--setting-sources ""`. Per the doc comment at `:347-353`, this literal empty string disables loading settings from ALL three sources (user, project, AND local), not just user/local.
+
+Q. Is this a regression, or has it always been this way?
+A. Always been this way. `git log -S"setting-sources" --all` shows the flag was introduced already as `""` in the original RAL-336 "isolate agent config and memory directories" work (commits `2068492d`/`30062192`/`59000003`/`8aae2350`, later folded into batch commits). No prior commit had a non-empty value — this is the isolation feature's original design never distinguishing "project" from "user/local," not a value that regressed.
+
+Q. Do Codex and Pi have an equivalent flag/bug?
+A. No. `runner/src/codex_backend.rs:197-223` (`isolated_codex_home`) only redirects `CODEX_HOME` (settings/auth dir) — no flag touches project-directory reads. `runner/src/pi_backend.rs:74-128` only redirects `PI_CODING_AGENT_DIR`, same pattern. Neither backend has an AGENTS.md-loading toggle; both CLIs appear to read the project's instruction file straight from the workspace cwd regardless of home/config-dir isolation — meaning they may already achieve "project-only" behavior by construction, with no equivalent bug to fix.
+
+Q. Where should a Codex/Pi fix live, per repo convention, if one is needed?
+A. `AGENTS.md:52-55` + `runner/src/backend.rs:191` (`ModelBackend` trait) confirm one-trait/per-file-impl structure — `claude_code_backend.rs`, `codex_backend.rs`, `pi_backend.rs` each implement it separately. Any backend-specific change belongs solely in that backend's file.
+
+## Interview Q&A
+
+Q1. Given the flag currently disables all three sources, should `--setting-sources` include `"project"` only?
+A. Yes, just project.
+
+Q2. Preserve the RAL-336 isolation (project only, no user/local), or was suppressing all three the actual oversight?
+A. Preserve it — do NOT include local or user settings. Project settings are OK. **And this should be the target behavior for Claude, Codex, AND Pi** — not just Claude. (Note: research suggests Codex/Pi may already satisfy this by construction via their existing `CODEX_HOME`/`PI_CODING_AGENT_DIR` redirection + direct cwd reads — needs runtime confirmation per Q3, not just code reading.)
+
+Q3. Is it OK for Codex/Pi's acceptance criteria to become "confirmed not affected" rather than a code fix?
+A. Only if there's definite confirmation (i.e. an actual runtime test showing project files load and user/local ones don't), not just a conclusion from reading the code.
+
+---
+
+# Notes for this run
+
+Do the following:
+1. Fix `runner/src/claude_code_backend.rs`'s `setting_sources_args` so
+   `--setting-sources` includes `"project"` only — not `"user"`, not
+   `"local"` — preserving the RAL-336 isolation intent while restoring
+   project-level `CLAUDE.md`/`AGENTS.md` loading. Re-locate the function; the
+   cited line numbers are approximate.
+2. Audit `runner/src/codex_backend.rs` and `runner/src/pi_backend.rs` for an
+   equivalent gap. Per the research above, they likely already read the
+   project's instruction file from cwd regardless of home/config-dir
+   isolation — but do NOT close their acceptance criteria on code-reading
+   alone. Write and run an actual runtime/integration test per backend that:
+   (a) places a distinctive marker in a project-level `CLAUDE.md`/`AGENTS.md`
+   in a test workspace and confirms the backend's invocation surfaces or
+   respects it, and (b) places a distinctive marker in a user/local-level
+   settings location for that backend and confirms it is NOT loaded. If a
+   backend fails (a) or (b), fix it in that backend's own file — do not
+   centralize backend-specific logic in a daemon-side lookup table.
+3. Add/extend the same kind of confirmation for the Claude Code fix from
+   step 1 — a real project-level `CLAUDE.md` present in the test fixture,
+   confirming it is read, not just that the flag value changed.
+4. Keep every fix scoped to its own backend's implementation file
+   (`claude_code_backend.rs` / `codex_backend.rs` / `pi_backend.rs`), per the
+   `ModelBackend` trait's one-trait/per-file-impl convention.
+
+Your working directory is this worktree.
+"""
+
+[[task.cell.proof]]
+id                         = "rust"
+agent                      = "codex"
+model                      = "gpt-5.6-luna"
+maximum_tool_output_tokens = 8000
+system_prompt              = "Do NOT commit and do NOT push under any circumstances. Fix formatting, lint, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position     = "append"
+prompt                     = "Run `cargo fmt --all -- --check` (if it fails, run `cargo fmt --all` then re-check), then `cargo clippy -p ralphus-runner --all-targets -- -D warnings`, then `cargo nextest run -p ralphus-runner --all-targets`. Fix ticket-caused failures and re-run up to 3 times; if failures remain, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                         = "setting-sources-verify"
+agent                      = "codex"
+model                      = "gpt-5.6-luna"
+maximum_tool_output_tokens = 8000
+system_prompt              = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position     = "append"
+prompt                     = "Verify and report each item. 1) `runner/src/claude_code_backend.rs`'s `setting_sources_args` now passes `--setting-sources` with `\"project\"` only (not `\"user\"`, not `\"local\"`) for the default (non-`allow_personal_settings`) path. 2) There is an actual runtime/integration test (not just code inspection) proving a project-level `CLAUDE.md`/`AGENTS.md` is loaded by the Claude Code backend and a user/local-level settings file is not. 3) Codex and Pi backends each have their own runtime/integration test proving the same project-yes/user-local-no behavior for their respective project-instruction mechanism, with any needed fix living solely in that backend's own file (`codex_backend.rs` / `pi_backend.rs`), not centralized elsewhere. Fail if any item is unmet or backed only by code-reading rather than a real test run."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/RAL-469-restore-claude-md-agents-md-loading?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "codex"
+model                  = "gpt-5.6-luna"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-469, stage only the intended files, commit with an appropriate RAL-469 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
