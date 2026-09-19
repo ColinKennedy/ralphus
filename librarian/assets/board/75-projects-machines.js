@@ -1730,6 +1730,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const items = [
           `<div data-click="openProjectTriageThresholds" data-name="${esc(name)}" data-tip="Configure auto-review (Triage) thresholds for this project -- e.g. \"once 4 bug fixes for this project are recorded, make a review\".\nOnly registered Triage types (see the Triage tab) can be picked here.">⏱ Auto-review thresholds</div>`,
           `<div data-click="openProjectReviewSettings" data-name="${esc(name)}" data-tip="Configure this project's DEFAULT review settings -- resolver agent/model, machine, budget, proof scope, and more.\nApplies to future reviews only (an Arbiter-created review, or any review whose own [[review]] block leaves a field unset); existing reviews are unaffected.">⚙ Review settings</div>`,
+          `<div data-click="removeProject" data-name="${esc(name)}" data-tip="Remove this project's registration from ralphus.\nSquads, tasks, and reviews that already reference it are unaffected; a project-scoped setting (auto-review thresholds, review-settings defaults, fork registrations) becomes orphaned rather than deleted, the same as when a project's path stops resolving.\nThis cannot be undone.">🗑 Remove project</div>`,
         ];
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu"; menu.innerHTML = items.join("");
@@ -1745,11 +1746,15 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const el = byId("projects");
         byId("proj-summary").innerHTML =
           `${projects.length} registered ${projects.length === 1 ? "project" : "projects"} `
+          + `<button class="btn primary" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="openAddProjectModal()" data-tip="Register a new project with the daemon (equivalent to \`ralphus project git\`) so it can be picked as a task's cwd placeholder and shown across the board.\nOpens a popup to enter its name, path, and optional clone URL.">+ Add project</button>`
           + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="refreshProjects()" data-tip="Re-query the daemon for the registered project list and re-validate every row's path.\nUseful after fixing a broken path or repository outside of ralphus.">⟳ Refresh</button>`;
-        if (!projects.length) { el.innerHTML = `<div class="empty">No registered projects.</div>`; return; }
         const warningBanner = projectSaveWarnings.length
           ? `<div class="verr" style="margin-bottom:8px">${projectSaveWarnings.map((w) => `<span class="vwarn">⚠ ${esc(w)}</span>`).join("<br/>")}</div>`
           : "";
+        const removeErrorBanner = projectRemoveError
+          ? `<div class="verr" style="margin-bottom:8px">${esc(projectRemoveError)}</div>`
+          : "";
+        if (!projects.length) { el.innerHTML = `${warningBanner}${removeErrorBanner}<div class="empty">No registered projects.</div>`; return; }
         const head = `<th data-tip="Unique project name, set at registration. Cannot be renamed here.">Name</th>`
           + `<th data-tip="Human-readable description, also used for fuzzy project lookup by name/description.">Description</th>`
           + `<th data-tip="Absolute filesystem path to the project's git repository root.">Path</th>`
@@ -1758,7 +1763,125 @@ Work submitted against it will fail — fix the machine or deregister the provid
           + `<th data-tip="When this project was registered.">Registered</th>`
           + `<th></th>`;
         const rows = projects.map((p) => projectRowHtml(p)).join("");
-        el.innerHTML = `${warningBanner}<table class="proj-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+        el.innerHTML = `${warningBanner}${removeErrorBanner}<table class="proj-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+      }
+      /**
+       * Opens the "Add project" popup for registering a brand-new project
+       * from the board. `POST /api/projects` is upsert-by-name -- the same
+       * call `saveProjectEdit` makes for an existing row -- so this is that
+       * same request shape aimed at a name that doesn't exist yet, guarded
+       * client-side against colliding with one that does (see
+       * `submitAddProject`).
+       * @returns {void}
+       */
+      function openAddProjectModal() {
+        addProjectDraft = { name: "", path: "", description: "", clone_url: "", vcs: "git" };
+        addProjectError = "";
+        addProjectWarnings = [];
+        addProjectOpen = true;
+        renderAddProjectModal();
+      }
+      /**
+       * Closes the "Add project" popup without registering anything.
+       * @returns {void}
+       */
+      function closeAddProjectModal() {
+        addProjectOpen = false;
+        closeModal();
+      }
+      /**
+       * Renders the "Add project" popup into `#modal-root`.
+       * @returns {void}
+       */
+      function renderAddProjectModal() {
+        const d = addProjectDraft;
+        const err = addProjectError ? `<div class="verr" style="margin-top:8px">${esc(addProjectError)}</div>` : "";
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeAddProjectModal()"><div class="modal" style="width:480px;max-width:94vw">
+            <h2>Add project</h2>
+            <div class="k" style="margin-bottom:8px" data-tip="Registers a new project with the daemon (equivalent to \`ralphus project git\`), so it can be picked as a task's cwd placeholder and shown across the board.">Register a new git repository as a ralphus project.</div>
+            <div style="display:grid;grid-template-columns:110px 1fr;gap:8px;align-items:center">
+              <label for="ap-name">Name</label>
+              <input type="text" id="ap-name" value="${esc(d.name)}" oninput="addProjectDraft.name=this.value" placeholder="my-project" data-tip="Unique project name. Cannot be changed after registration -- remove and re-add to rename." />
+              <label for="ap-path">Path</label>
+              <input type="text" id="ap-path" value="${esc(d.path)}" oninput="addProjectDraft.path=this.value" placeholder="/absolute/path/to/repo" data-tip="Absolute filesystem path to the project's git repository root.\nMust exist on-disk and be a git working tree -- checked when you click Add." />
+              <label for="ap-desc">Description</label>
+              <input type="text" id="ap-desc" value="${esc(d.description)}" oninput="addProjectDraft.description=this.value" data-tip="Human-readable description, also used for fuzzy project lookup by name/description." />
+              <label for="ap-url">Clone URL</label>
+              <input type="text" id="ap-url" value="${esc(d.clone_url)}" placeholder="(none)" oninput="addProjectDraft.clone_url=this.value" data-tip="Clone URL a machine provider uses to provision this project on another machine (RAL-355).\nAccepts any form git accepts (ssh://, git@host:path, https://, ...). Optional -- remote work on this project will fail until one is set." />
+              <label for="ap-vcs">VCS</label>
+              <select id="ap-vcs" onchange="addProjectDraft.vcs=this.value" data-tip="Version control kind. Only \"git\" is implemented today.">
+                <option value="git" ${d.vcs === "git" ? "selected" : ""}>git</option>
+              </select>
+            </div>
+            ${err}
+            <div class="btn-row">
+              <button class="btn primary" onclick="submitAddProject()" data-tip="Register this project.\nIf the path does not exist or is not a git repository, registration is rejected and the reason is shown here.">Add project</button>
+              <button class="btn" onclick="closeAddProjectModal()" data-tip="Discard and close without registering.">Cancel</button>
+            </div>
+          </div></div>`;
+      }
+      /**
+       * Submits the open "Add project" popup's draft (`POST /api/projects`).
+       * Rejected client-side first if the name collides with an
+       * already-registered project, since the endpoint is upsert-by-name and
+       * would otherwise silently overwrite it instead of erroring.
+       * @returns {Promise<void>}
+       */
+      async function submitAddProject() {
+        const d = addProjectDraft;
+        const name = d.name.trim();
+        const path = d.path.trim();
+        addProjectError = "";
+        if (!name) { addProjectError = "Name is required."; renderAddProjectModal(); return; }
+        if (!path) { addProjectError = "Path is required."; renderAddProjectModal(); return; }
+        if (projects.some((p) => p.name === name)) {
+          addProjectError = `A project named "${name}" is already registered -- edit it from the table instead.`;
+          renderAddProjectModal();
+          return;
+        }
+        const trimmedUrl = (d.clone_url || "").trim();
+        const body = { name, path, description: d.description || "", vcs: d.vcs, ...(trimmedUrl ? { url: trimmedUrl } : {}) };
+        let resp;
+        try {
+          resp = await post("/api/projects", body);
+        } catch (e) {
+          addProjectError = "add failed: daemon unreachable";
+          renderAddProjectModal();
+          return;
+        }
+        if (!resp.ok) {
+          addProjectError = await responseError(resp, "add failed");
+          renderAddProjectModal();
+          return;
+        }
+        try { const respBody = await resp.json(); projectSaveWarnings = respBody.warnings || []; } catch (_) {}
+        addProjectOpen = false;
+        closeModal();
+        refreshProjects();
+      }
+      /**
+       * Removes a registered project's row after confirmation
+       * (`DELETE /api/projects/{name}`). Project-scoped settings that
+       * reference it by name (fork registrations, Triage thresholds,
+       * review-settings defaults) are left in place as orphaned rows rather
+       * than cascaded away -- the same state already surfaced elsewhere
+       * (e.g. the Triage-threshold popup's "orphaned pool" banner) when a
+       * project's path stops resolving on its own.
+       * @param {string} name
+       * @returns {Promise<void>}
+       */
+      async function removeProject(name) {
+        if (!confirm(`Remove the registered project "${name}"? This cannot be undone.`)) return;
+        closeSquadMenu();
+        projectRemoveError = "";
+        try {
+          const r = await del(`/api/projects/${encodeURIComponent(name)}`);
+          if (!r.ok) { projectRemoveError = await responseError(r, "remove failed"); renderProjects(); return; }
+        } catch (_) { projectRemoveError = "daemon unreachable"; renderProjects(); return; }
+        projects = projects.filter((p) => p.name !== name);
+        delete projectErrors[name];
+        renderProjects();
       }
       /**
        * Opens the "auto-review thresholds" popup for one project (RAL-318) --

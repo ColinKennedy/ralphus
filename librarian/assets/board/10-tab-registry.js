@@ -84,6 +84,16 @@
       let projectSaveError = "";   // message from the last failed save, shown inline in the edit row
       /** @type {string[]} non-blocking warnings (e.g. an inline credential) from the last successful save */
       let projectSaveWarnings = [];
+      /** Whether the "Add project" popup (registering a brand-new project from the board) is open. */
+      let addProjectOpen = false;
+      /** @type {{name: string, path: string, description: string, clone_url: string, vcs: string}} draft for the open "Add project" popup */
+      let addProjectDraft = { name: "", path: "", description: "", clone_url: "", vcs: "git" };
+      /** Message from the last failed "Add project" submission, shown inline in the popup. */
+      let addProjectError = "";
+      /** @type {string[]} non-blocking warnings (e.g. an inline credential) from the last successful "Add project" submission */
+      let addProjectWarnings = [];
+      /** Message from the last failed project removal, shown inline above the Projects table. */
+      let projectRemoveError = "";
       // ---- Users tab (placeholder identity registry; TODO: replace with user auth once RAL-252 is done) ----
       /** @type {UserView[]} */
       let users = [];

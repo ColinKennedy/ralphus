@@ -551,6 +551,20 @@ A single registered project by its exact name.
 lookup, unlike the fuzzy `resolve_project` matching used internally when a
 task's `project` field is resolved against the registry).
 
+### `DELETE /api/projects/{name}`
+Unregister a project by its exact name (`ralphus project remove`). Only the
+`projects` row itself is removed -- rows in other tables keyed by project
+name (fork registrations, Triage thresholds, review-settings defaults) are
+left in place as orphaned data rather than cascaded away, the same as when a
+project's path stops resolving on its own; existing squads/tasks/reviews
+that already reference this project by name are unaffected. Admin-gated
+like `POST /api/projects`.
+
+```json
+{ "removed": true }
+```
+`404` if no project is registered under that exact name.
+
 ### `GET /api/projects/{name}/validate`
 Re-check a registered project's on-disk path/vcs kind without writing
 anything (RAL-101) -- lets a client (e.g. the librarian's Projects tab) flag
@@ -741,7 +755,8 @@ unclaimed rows.
 `POST /api/users/{name}/rename`, `POST /api/users/{name}/admin`,
 `POST /api/users/{name}/visit`, everything under `/api/machines`,
 everything under `/api/triage`, everything under `/api/secret-env-names`,
-and `POST /api/projects` (registering/editing a project) all require the
+`POST /api/projects` (registering/editing a project), and
+`DELETE /api/projects/{name}` (unregistering one) all require the
 current placeholder identity (`X-Ralphus-User`, falling back to
 `[daemon].default_user`) to be a registered admin (`is_admin: true`).
 Non-admin (or unresolved-identity) callers get `403 admin_required`.

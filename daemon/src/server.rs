@@ -1051,6 +1051,9 @@ fn route_for_user(
             admin_gated(daemon, user_header, || register_project(daemon, body))
         }
         ("GET", ["api", "projects", name]) => get_project(daemon, name),
+        ("DELETE", ["api", "projects", name]) => {
+            admin_gated(daemon, user_header, || delete_project(daemon, name))
+        }
         // ralphus[ignore-endpoint-cli]: board 'Simple' form validation on save; the CLI's `validate` uses POST /api/squads/validate on whole task files
         ("GET", ["api", "projects", name, "validate"]) => validate_project(daemon, name),
         // ralphus[ignore-endpoint-cli]: board 'Simple' form branch picker for the project
@@ -4563,6 +4566,18 @@ fn get_project(daemon: &Daemon, name: &str) -> Reply {
             &format!("project \"{name}\" is not registered"),
             vec![],
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/projects/{name}`: unregisters a project. Project-scoped rows
+/// keyed by name in other tables (fork registrations, Triage thresholds,
+/// review-settings defaults) are intentionally left in place as orphaned
+/// data rather than cascaded away -- the same state those tables already
+/// tolerate when a project's path stops resolving on its own.
+fn delete_project(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().delete_project(name) {
+        Ok(()) => json(200, &serde_json::json!({"removed": true})),
         Err(e) => store_error(&e),
     }
 }
@@ -16075,6 +16090,30 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     fn get_project_route_unregistered_name_is_404() {
         let d = daemon();
         let r = route(&d, "GET", "/api/projects/nope", "");
+        assert_eq!(r.status, 404);
+        assert!(r.body.contains("not_found"));
+    }
+
+    #[test]
+    fn delete_project_route_removes_a_registered_project() {
+        let d = daemon();
+        let repo = tmp_git_repo("delete");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), "a test project"),
+        );
+        let r = route(&d, "DELETE", "/api/projects/proj", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let after = route(&d, "GET", "/api/projects/proj", "");
+        assert_eq!(after.status, 404, "{}", after.body);
+    }
+
+    #[test]
+    fn delete_project_route_unregistered_name_is_404() {
+        let d = daemon();
+        let r = route(&d, "DELETE", "/api/projects/nope", "");
         assert_eq!(r.status, 404);
         assert!(r.body.contains("not_found"));
     }

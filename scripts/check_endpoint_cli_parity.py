@@ -65,6 +65,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/projects": ["project list", "check health"],
     "POST /api/projects": ["project git"],
     "GET /api/projects/{name}": ["project get"],
+    "DELETE /api/projects/{name}": ["project remove"],
     "GET /api/projects/{name}/review-settings": ["project review-settings get"],
     "POST /api/projects/{name}/review-settings": ["project review-settings set"],
     "GET /api/project-forks": ["project fork list"],

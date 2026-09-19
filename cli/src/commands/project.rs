@@ -42,6 +42,9 @@ pub enum ProjectCommand {
     Get {
         name: String,
     },
+    Remove {
+        name: String,
+    },
     Fork(ProjectForkCommand),
     ReviewSettings(ProjectReviewSettingsCommand),
     UsageError(String),
@@ -129,6 +132,10 @@ pub fn parse(args: &[String]) -> ProjectCommand {
         Some("get") => match scanner.remaining().into_iter().next() {
             Some(name) => ProjectCommand::Get { name },
             None => ProjectCommand::UsageError("get requires a <name> argument".to_string()),
+        },
+        Some("remove") => match scanner.remaining().into_iter().next() {
+            Some(name) => ProjectCommand::Remove { name },
+            None => ProjectCommand::UsageError("remove requires a <name> argument".to_string()),
         },
         Some("fork") => ProjectCommand::Fork(parse_fork(&scanner.remaining())),
         Some("review-settings") => {
@@ -408,6 +415,16 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
         ProjectCommand::Get { name } => match client.get_project(&name) {
             Ok(p) => {
                 render_project_detail(&p);
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                2
+            }
+        },
+        ProjectCommand::Remove { name } => match client.remove_project(&name) {
+            Ok(_) => {
+                println!("removed project \"{name}\"");
                 0
             }
             Err(e) => {
@@ -934,6 +951,19 @@ mod tests {
     #[test]
     fn get_requires_name() {
         matches!(parse(&v(&["get"])), ProjectCommand::UsageError(_));
+    }
+
+    #[test]
+    fn parses_remove_name() {
+        match parse(&v(&["remove", "my-project"])) {
+            ProjectCommand::Remove { name } => assert_eq!(name, "my-project"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_requires_name() {
+        matches!(parse(&v(&["remove"])), ProjectCommand::UsageError(_));
     }
 
     #[test]
