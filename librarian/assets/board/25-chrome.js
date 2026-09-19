@@ -360,6 +360,7 @@
           if (reviewFilters.status.size !== GUARDIAN_STATES.length) p.set("status", [...reviewFilters.status].join(","));
           if (reviewResolverDefaulted) p.set("resolver", [...reviewFilters.resolver].join(","));
           if (reviewFilters.showHidden) p.set("hidden", "1");
+          if (reviewFilters.prStatus !== "any") p.set("prstatus", reviewFilters.prStatus);
           // The review's *name* is what makes the link legible; `?id=` keeps it
           // resolvable after a rename (§C.3). Falls back to the legacy
           // `#/reviews/<id>` path only when the guardian hasn't loaded yet.
@@ -379,9 +380,7 @@
           if (taskTabFilters.projects.size) p.set("project", [...taskTabFilters.projects].join(","));
           if (taskTabFilters.needsMe) p.set("needsme", "1");
           if (taskTabFilters.groupBySquad) p.set("group", "1");
-          if (taskTabFilters.pr) p.set("pr", "1");
-          if (taskTabFilters.prDraft !== "any") p.set("prdraft", taskTabFilters.prDraft);
-          if (taskTabFilters.prCi !== "any") p.set("prci", taskTabFilters.prCi);
+          if (taskTabFilters.prStatus !== "any") p.set("prstatus", taskTabFilters.prStatus);
           if (taskTabExpanded.size) p.set("expanded", [...taskTabExpanded].join(","));
           const squad = taskTabSel.squadId ? findSquad(taskTabSel.squadId) : null;
           const task = squad && taskTabSel.kind ? (squad.tasks || [])[taskTabSel.taskIdx] : null;
@@ -429,6 +428,8 @@
           reviewResolverDefaulted = presolver !== null;
           if (presolver !== null) reviewFilters.resolver = new Set(presolver.split(",").filter(Boolean));
           reviewFilters.showHidden = p.get("hidden") === "1";
+          const rprstatus = p.get("prstatus");
+          if (rprstatus === "passing" || rprstatus === "failing" || rprstatus === "pending") reviewFilters.prStatus = rprstatus;
           // `?id=` is authoritative; the REVIEW[...] label is the human-facing
           // half and is resolved against the loaded list in `pollReviews`.
           const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
@@ -532,11 +533,8 @@
         const pproject = p.get("project"); if (pproject !== null) taskTabFilters.projects = new Set(pproject.split(",").filter(Boolean));
         taskTabFilters.needsMe = p.get("needsme") === "1";
         taskTabFilters.groupBySquad = p.get("group") === "1";
-        taskTabFilters.pr = p.get("pr") === "1";
-        const prdraft = p.get("prdraft");
-        if (prdraft === "draft" || prdraft === "non-draft") taskTabFilters.prDraft = prdraft;
-        const prci = p.get("prci");
-        if (prci === "passing" || prci === "failing") taskTabFilters.prCi = prci;
+        const prstatus = p.get("prstatus");
+        if (prstatus === "passing" || prstatus === "failing" || prstatus === "pending") taskTabFilters.prStatus = prstatus;
         const pexpanded = p.get("expanded"); if (pexpanded !== null) taskTabExpanded = new Set(pexpanded.split(",").filter(Boolean));
         const uri = looksLikeUri(selValue) ? parseRalphusUri(/** @type {string} */ (selValue)) : null;
         return { tab: "tasks", uri, sel: uri ? null : selValue };
@@ -799,6 +797,48 @@
        */
       function onReviewFilter(v) { reviewFilters.q = v.toLowerCase(); renderReviews(); syncHash(); }
       /**
+       * RAL-463: whether a review's currently-open PRs all match the
+       * Reviews sidebar's PR-status filter -- the same "every PR must
+       * match, none excludes" semantics as the Tasks tab's
+       * `ttRowMatchesPrFilter`, one level up (a review's own PRs, not a
+       * task's union across reviews). "any" always matches without reading
+       * `pullRequests` at all, so the filter is genuinely deferred.
+       * @param {GuardianView} g
+       * @returns {boolean}
+       */
+      function reviewMatchesPrStatusFilter(g) {
+        if (!reviewFilters.prStatus || reviewFilters.prStatus === "any") return true;
+        const openPrs = (pullRequests[g.id] || []).filter((p) => p.state === "open");
+        return prsMatchStatusFilter(openPrs, reviewFilters.prStatus);
+      }
+      /**
+       * Renders the Reviews sidebar's PR-status filter (RAL-463): a
+       * single-select dropdown mirroring the Tasks tab's, off ("any") by
+       * default.
+       * @returns {void}
+       */
+      function renderReviewPrStatusFilter() {
+        const el = byId("review-pr-filter");
+        const opt = (/** @type {string} */ value, /** @type {string} */ label) =>
+          `<option value="${value}" ${reviewFilters.prStatus === value ? "selected" : ""}>${label}</option>`;
+        el.innerHTML = `<select onchange="setReviewPrStatusFilter(this.value)" data-tip="Show only reviews where every one of their PRs share this status.\nWho/when: use this to find fully-passing or fully-failing reviews at a glance, or PRs still waiting on CI.\nOff (any) by default. A review with no PRs never matches a status here.">`
+          + opt("any", "PR status: any")
+          + opt("passing", "PR status: passing")
+          + opt("failing", "PR status: failing")
+          + opt("pending", "PR status: pending")
+          + `</select>`;
+      }
+      /**
+       * Sets the Reviews sidebar's PR-status filter and re-renders (RAL-463).
+       * @param {"any"|"passing"|"failing"|"pending"} v
+       * @returns {void}
+       */
+      function setReviewPrStatusFilter(v) {
+        reviewFilters.prStatus = v;
+        renderReviews();
+        syncHash();
+      }
+      /**
        * Computes the Reviews sidebar list after guardian-status/text filtering.
        * @returns {GuardianView[]}
        */
@@ -808,6 +848,7 @@
           && reviewFilters.resolver.has(resolverOf(g))
           && reviewFilters.origin.has(originOf(g))
           && (g.id.toLowerCase().includes(reviewFilters.q) || g.name.toLowerCase().includes(reviewFilters.q))
+          && reviewMatchesPrStatusFilter(g)
           // RAL-331: a hidden review is a personal view preference, excluded
           // by default -- except the one just navigated to directly (§reveal).
           && (reviewFilters.showHidden || !hiddenGuardianIds.has(g.id) || g.id === revealedGuardianId));

@@ -442,9 +442,7 @@
        * @property {Set<string>} projects - RAL-345: project names whose tasks may be shown; an empty set means "every project" (no filter applied). AND-combined with `q`/`status`/`needsMe`.
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
-       * @property {boolean} pr - RAL-353: require at least one associated pull request
-       * @property {"any"|"draft"|"non-draft"} prDraft - RAL-353: the chosen draft-status dimension; "any" disables it
-       * @property {"any"|"passing"|"failing"} prCi - RAL-353: the chosen CI-status dimension; "any" disables it
+       * @property {"any"|"passing"|"failing"|"pending"} prStatus - RAL-463: single-select PR-status filter over a row's currently-open PRs; "any" disables it (off by default, computes nothing)
        */
       /**
        * @returns {TaskTabFilters}
@@ -453,7 +451,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set(), pr: false, prDraft: "any", prCi: "any" }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set(), prStatus: "any" }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -1068,44 +1066,47 @@
         }
       }
       /**
-       * RAL-353: whether a built row survives the Tasks toolbar's PR-state
-       * filter -- the composable "has a PR / draft status / CI status"
-       * triple local-decisioned by the ticket. The filter is active when any
-       * of the three dimensions is non-default; a task then matches when at
-       * least one of its associated PRs satisfies every active dimension
-       * (e.g. Draft + Failing means it has at least one failing draft PR).
-       * A PR whose `draft` is null (recorded before the column existed and
-       * never polled since) counts as not-draft, matching the daemon-side
-       * convention documented on `PullRequestView.draft`; CI "passing"/
-       * "failing" match the forge-reported `ci_status` string exactly, so
-       * pending/unknown/never-polled PRs match neither (only "any").
+       * RAL-463: whether a set of currently-open PRs all match a single
+       * PR-status filter value -- shared by the Tasks tab (one row's PRs)
+       * and the Review page (one review's PRs), since both aggregate the
+       * same way, just one level apart. "any" always matches without
+       * looking at `openPrs` at all, so leaving the filter off costs
+       * nothing. A row/review with zero open PRs never matches a non-"any"
+       * value -- there is nothing to compare, so it's excluded rather than
+       * left ambiguous (RAL-463 Q4).
+       * @param {{state: string, ci_status?: string|null}[]} openPrs - already scoped to `state === "open"`
+       * @param {"any"|"passing"|"failing"|"pending"} status
+       * @returns {boolean}
+       */
+      function prsMatchStatusFilter(openPrs, status) {
+        if (!status || status === "any") return true;
+        if (!openPrs.length) return false;
+        return openPrs.every((p) => p.ci_status === status);
+      }
+      /**
+       * RAL-463: whether a built row survives the Tasks toolbar's PR-status
+       * filter -- a single-select "passing"/"failing"/"pending" dimension,
+       * off ("any") by default. Once a status is chosen, a row matches only
+       * when EVERY one of its currently-open PRs share that CI status --
+       * mixed-status rows (e.g. one passing + one pending) match nothing,
+       * unlike RAL-353's original `.some()` groundwork this replaces.
+       * Closed/merged/dropped PRs from a superseded stack are ignored
+       * entirely -- only currently-open PRs count (RAL-463 Q3), matching
+       * the convention the Review page already uses.
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @returns {boolean}
        */
       function ttRowMatchesPrFilter(row, filters) {
-        // Missing/undefined dimensions count as "any" -- older callers that
-        // build a filter object without the RAL-353 fields must not suddenly
-        // be filtered to PR-carrying tasks only.
-        const wantHasPr = filters.pr === true;
-        const wantDraft = filters.prDraft != null && filters.prDraft !== "any";
-        const wantCi = filters.prCi != null && filters.prCi !== "any";
-        if (!wantHasPr && !wantDraft && !wantCi) return true;
-        const prs = row.prs || [];
-        if (!prs.length) return false;
-        return prs.some((p) => {
-          if (wantDraft && filters.prDraft === "draft" && p.draft !== true) return false;
-          if (wantDraft && filters.prDraft === "non-draft" && p.draft === true) return false;
-          if (wantCi && filters.prCi === "failing" && p.ci_status !== "failing") return false;
-          if (wantCi && filters.prCi === "passing" && p.ci_status !== "passing") return false;
-          return true;
-        });
+        if (!filters.prStatus || filters.prStatus === "any") return true;
+        const openPrs = (row.prs || []).filter((p) => p.state === "open");
+        return prsMatchStatusFilter(openPrs, filters.prStatus);
       }
       /**
        * Whether a built row survives the toolbar's filters (RAL-362 §2):
        * name substring, status set, hidden-squad/hidden-task inclusion
        * (RAL-365), "needs me", project set (RAL-345; empty means every
-       * project passes), and the PR-state filter (RAL-353; inactive by
+       * project passes), and the PR-status filter (RAL-463; inactive by
        * default). Re-run on every Tasks-tab poll, so a refreshed, async
        * pull-request index (new CI verdict, newly-observed draft state, a
        * brand-new PR row) re-evaluates the visible rows automatically.

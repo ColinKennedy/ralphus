@@ -178,6 +178,7 @@
         renderReviewStatusFilters();
         renderReviewResolverFilters();
         renderReviewOriginFilters();
+        renderReviewPrStatusFilter();
         if (!guardians.length) { el.innerHTML = `<div class="empty">No reviews.</div>`; return; }
         const list = visibleGuardians();
         if (!list.length) { el.innerHTML = `<div class="empty">No matching reviews.</div>`; return; }
