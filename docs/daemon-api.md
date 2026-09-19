@@ -232,6 +232,7 @@ produced no pane output.
 | POST | `/api/mailbox/register` | Register a new client, returns `{"client_id": "..."}` |
 | GET | `/api/mailbox/{client_id}/messages` | List messages visible to this client; `?unread=true`, `?priority=urgent\|high\|normal`, and `?category=<name>` (e.g. `review`, RAL-375) filter |
 | POST | `/api/mailbox/{client_id}/drain` | Mark messages read; `{"message_ids": [...]}` or an empty body to drain every unread message |
+| POST | `/api/mailbox/{client_id}/undrain` | Mark messages unread again (RAL-465), reverting a drain; `{"message_ids": [...]}` or an empty body to undrain every drained message |
 
 **Personal watches and notification preferences (RAL-320)**
 | Method | Path | What |
@@ -243,6 +244,7 @@ produced no pane output.
 | POST | `/api/users/{name}/preferences` | Set a user's `auto_watch`/`default_notify_tiers` preferences |
 | GET | `/api/mailbox/personal/messages` | The acting user's personal mailbox view, filtered through their watches |
 | POST | `/api/mailbox/personal/drain` | Mark personal mailbox messages read for the acting user |
+| POST | `/api/mailbox/personal/undrain` | Mark personal mailbox messages unread again for the acting user (RAL-465), reverting a drain |
 
 ## Conventions
 
@@ -3703,20 +3705,23 @@ POST /api/users/colin/preferences
 routes respond with the same `UserView` shape (`GET` is `404 not_found` for
 an unregistered user; `POST` never is, since it registers on demand).
 
-#### `GET /api/mailbox/personal/messages` / `POST /api/mailbox/personal/drain`
+#### `GET /api/mailbox/personal/messages` / `POST /api/mailbox/personal/drain` / `POST /api/mailbox/personal/undrain`
 The acting user's personal mailbox: the same broadcast mailbox stream
 (`GET /api/mailbox/{client_id}/messages`) filtered down to messages whose
 entity is covered by one of that user's watches and whose priority clears
 that watch's notify tiers. Not a separate message store — same rows, a
 narrower, per-user read. `GET` accepts the same `?unread=true` and
-`?priority=urgent|high|normal` filters as the broadcast mailbox; `POST`
-accepts the same `{"message_ids": [...]}` body (or an empty body to drain
-every unread message) as `POST /api/mailbox/{client_id}/drain`, scoped to the
-acting user. No `?category` filter here (RAL-375) — a watched entity's
-messages (e.g. a `review`-category PR/CI-watch notice, see the Mailbox row
-above) always surface through a personal watch regardless of category, so a
-client polling this endpoint sees them no matter which mode it's operating
-in.
+`?priority=urgent|high|normal` filters as the broadcast mailbox; `POST
+.../drain` accepts the same `{"message_ids": [...]}` body (or an empty body
+to drain every unread message) as `POST /api/mailbox/{client_id}/drain`,
+scoped to the acting user. `POST .../undrain` (RAL-465) is the inverse —
+`{"message_ids": [...]}` (or an empty body to undrain everything currently
+drained) moves messages back to unread for the acting user, letting a
+mis-dismissed message be recovered without re-triggering the underlying
+event. No `?category` filter here (RAL-375) — a watched entity's messages
+(e.g. a `review`-category PR/CI-watch notice, see the Mailbox row above)
+always surface through a personal watch regardless of category, so a client
+polling this endpoint sees them no matter which mode it's operating in.
 
 ## Notes on future evolution
 

@@ -85,20 +85,41 @@
       }
 
       /**
+       * Reverts one already-read message back to unread for the acting user
+       * only (RAL-465) -- the inverse of dismissMailboxMessage. Updates
+       * local state optimistically so the card moves back to the unread
+       * list immediately, before the daemon round-trip completes.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function undrainMailboxMessage(id) {
+        if (!id || !currentUserName) return;
+        const msg = mailboxMessages.find((m) => m.id === id);
+        if (msg) msg.read = false;
+        renderMailboxWidget();
+        try {
+          await post(`/api/mailbox/personal/undrain?user=${encodeURIComponent(currentUserName)}`, { message_ids: [id] });
+        } catch (e) { /* the next poll reconciles either way */ }
+      }
+
+      /**
        * Renders one message as a card. Unread cards get a dismiss ("×")
        * button in their upper-right corner; already-read cards (shown only
-       * when `mailboxShowRead` is on) don't, since they're already drained.
+       * when `mailboxShowRead` is on) get an "Unread" button instead, so a
+       * mis-dismissed message can be moved back to the unread list.
        * @param {MailboxMessageView} m
        * @returns {string}
        */
       function mailboxMsgHtml(m) {
         const when = new Date(m.created_at_ms).toLocaleString();
         const meta = [m.priority, when, m.category].filter(Boolean).map(esc).join(" · ");
-        const dismiss = m.read ? "" : `<button type="button" class="mailbox-msg-dismiss" data-click="dismissMailboxMessage" data-id="${esc(m.id)}" aria-label="Dismiss message" data-tip="Mark this message read for you only.\nOther watchers of the same squad/review keep seeing it as unread until they dismiss it themselves -- this never deletes the message.">×</button>`;
+        const action = m.read
+          ? `<button type="button" class="mailbox-msg-undrain" data-click="undrainMailboxMessage" data-id="${esc(m.id)}" aria-label="Mark message unread" data-tip="Move this message back to unread for you only.\nOther watchers of the same squad/review keep their own independent read state.">Unread</button>`
+          : `<button type="button" class="mailbox-msg-dismiss" data-click="dismissMailboxMessage" data-id="${esc(m.id)}" aria-label="Dismiss message" data-tip="Mark this message read for you only.\nOther watchers of the same squad/review keep seeing it as unread until they dismiss it themselves -- this never deletes the message.">×</button>`;
         return `<div class="mailbox-msg p-${esc(m.priority)}${m.read ? " read" : ""}">
             <div class="mailbox-msg-meta">${meta}</div>
             <div class="mailbox-msg-body">${esc(m.message)}</div>
-            ${dismiss}
+            ${action}
           </div>`;
       }
 

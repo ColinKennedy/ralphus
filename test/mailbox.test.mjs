@@ -78,14 +78,17 @@ test("renderMailboxWidget: stays visible while expanded even once the last unrea
   assert.equal(widget.els["mailbox-widget-summary"].textContent, "No unread messages");
 });
 
-test("mailboxMsgHtml: an unread message gets a dismiss control; a read one does not", () => {
+test("mailboxMsgHtml: an unread message gets a dismiss control; a read one gets an undrain (unread) control instead (RAL-465)", () => {
   const widget = makeMailboxWidget();
   const unreadHtml = widget.mailboxMsgHtml({ id: "m-1", read: false, created_at_ms: 0, priority: "urgent", message: "hi" });
   assert.match(unreadHtml, /data-click="dismissMailboxMessage"/);
   assert.match(unreadHtml, /data-id="m-1"/);
+  assert.doesNotMatch(unreadHtml, /undrainMailboxMessage/);
 
   const readHtml = widget.mailboxMsgHtml({ id: "m-2", read: true, created_at_ms: 0, priority: "normal", message: "hi" });
   assert.doesNotMatch(readHtml, /dismissMailboxMessage/);
+  assert.match(readHtml, /data-click="undrainMailboxMessage"/);
+  assert.match(readHtml, /data-id="m-2"/);
 });
 
 test("dismissMailboxMessage: drains for the acting user only, and applies optimistically before the request resolves", async () => {
@@ -108,6 +111,28 @@ test("dismissMailboxMessage: a no-op with no acting user or no id", async () => 
   await widget.dismissMailboxMessage("m-1");
   assert.equal(widget.calls.posts.length, 0);
   assert.equal(widget.state().mailboxMessages[0].read, false);
+});
+
+test("undrainMailboxMessage: reverts to unread for the acting user only, and applies optimistically before the request resolves (RAL-465)", async () => {
+  const widget = makeMailboxWidget({ currentUserName: "alice" });
+  widget.setMessages([{ id: "m-1", read: true, created_at_ms: 100, priority: "high", message: "x" }]);
+
+  const promise = widget.undrainMailboxMessage("m-1");
+  // Optimistic: read flips to false synchronously, before the post() call settles.
+  assert.equal(widget.state().mailboxMessages[0].read, false);
+  await promise;
+
+  assert.equal(widget.calls.posts.length, 1);
+  assert.equal(widget.calls.posts[0].path, "/api/mailbox/personal/undrain?user=alice");
+  assert.deepEqual(widget.calls.posts[0].body, { message_ids: ["m-1"] });
+});
+
+test("undrainMailboxMessage: a no-op with no acting user or no id", async () => {
+  const widget = makeMailboxWidget({ currentUserName: "" });
+  widget.setMessages([{ id: "m-1", read: true, created_at_ms: 100, priority: "high" }]);
+  await widget.undrainMailboxMessage("m-1");
+  assert.equal(widget.calls.posts.length, 0);
+  assert.equal(widget.state().mailboxMessages[0].read, true);
 });
 
 test("pollMailbox: fetches the acting user's personal mailbox, URL-encoding the name", async () => {

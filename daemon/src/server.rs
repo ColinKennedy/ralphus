@@ -1326,6 +1326,9 @@ fn route_for_user(
         ("POST", ["api", "mailbox", "personal", "drain"]) => {
             personal_mailbox_drain(daemon, query, body)
         }
+        ("POST", ["api", "mailbox", "personal", "undrain"]) => {
+            personal_mailbox_undrain(daemon, query, body)
+        }
         ("GET", ["api", "watches"]) => list_watches_endpoint(daemon, query, user_header),
         // ralphus[ignore-endpoint-cli]: board per-entity watchers list inside its view; CLI `mailbox watches` lists per user
         ("GET", ["api", "watches", entity_uri]) => watchers_endpoint(daemon, entity_uri),
@@ -1337,6 +1340,9 @@ fn route_for_user(
             mailbox_messages(daemon, client_id, query)
         }
         ("POST", ["api", "mailbox", client_id, "drain"]) => mailbox_drain(daemon, client_id, body),
+        ("POST", ["api", "mailbox", client_id, "undrain"]) => {
+            mailbox_undrain(daemon, client_id, body)
+        }
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
         ("POST", ["api", "squads"]) => submit(daemon, body, query),
         // RAL-297: Simple task form's opt-in "generation step" primitive.
@@ -4485,6 +4491,38 @@ fn personal_mailbox_drain(daemon: &Daemon, query: &str, body: &str) -> Reply {
     }
 }
 
+/// `POST /api/mailbox/personal/undrain?user=` (RAL-465) -- reverts
+/// previously-drained messages back to unread for the acting user, the
+/// inverse of [`personal_mailbox_drain`]. Mirrors its body handling.
+fn personal_mailbox_undrain(daemon: &Daemon, query: &str, body: &str) -> Reply {
+    let user = match require_acting_user(query) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let req: MailboxDrainBody = if body.trim().is_empty() {
+        MailboxDrainBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    400,
+                    "bad_request",
+                    "body must be JSON with an optional \"message_ids\" array of strings",
+                    vec![],
+                );
+            }
+        }
+    };
+    match daemon
+        .lock()
+        .undrain_personal_mailbox_messages(&user, req.message_ids.as_deref())
+    {
+        Ok(undrained) => json(200, &serde_json::json!({"undrained": undrained})),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// `GET /api/secret-env-names` (RAL-281) -- see `crate::secret_env_names`'s
 /// module doc comment.
 fn list_secret_env_names(daemon: &Daemon) -> Reply {
@@ -6230,6 +6268,38 @@ fn mailbox_drain(daemon: &Daemon, client_id: &str, body: &str) -> Reply {
     }
     match store.drain_mailbox_messages(client_id, req.message_ids.as_deref()) {
         Ok(drained) => json(200, &serde_json::json!({"drained": drained})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// RAL-465: revert previously-drained mailbox messages back to unread for
+/// `client_id`, the inverse of [`mailbox_drain`]. An empty/omitted body
+/// undrains everything currently drained for this client;
+/// `{"message_ids": [...]}` undrains exactly those ids.
+fn mailbox_undrain(daemon: &Daemon, client_id: &str, body: &str) -> Reply {
+    let req: MailboxDrainBody = if body.trim().is_empty() {
+        MailboxDrainBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    400,
+                    "bad_request",
+                    "body must be JSON with an optional \"message_ids\" array of strings",
+                    vec![],
+                );
+            }
+        }
+    };
+    let store = daemon.lock();
+    match store.mailbox_client_exists(client_id) {
+        Ok(true) => {}
+        Ok(false) => return error(404, "not_found", "no such mailbox client", vec![]),
+        Err(e) => return store_error(&e),
+    }
+    match store.undrain_mailbox_messages(client_id, req.message_ids.as_deref()) {
+        Ok(undrained) => json(200, &serde_json::json!({"undrained": undrained})),
         Err(e) => store_error(&e),
     }
 }
@@ -18311,6 +18381,10 @@ command=\"check\"
             route(&d, "POST", "/api/mailbox/client-bogus/drain", "").status,
             404
         );
+        assert_eq!(
+            route(&d, "POST", "/api/mailbox/client-bogus/undrain", "").status,
+            404
+        );
     }
 
     #[test]
@@ -18374,6 +18448,53 @@ command=\"check\"
         );
         let unread_json: serde_json::Value = serde_json::from_str(&unread_after.body).unwrap();
         assert!(unread_json.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mailbox_undrain_reverts_drained_messages_to_unread() {
+        let d = daemon();
+        let register = route(&d, "POST", "/api/mailbox/register", "");
+        let client_id =
+            serde_json::from_str::<serde_json::Value>(&register.body).unwrap()["client_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+        let msg_id = d
+            .lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::Urgent,
+                "cell failed",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let drain = route(&d, "POST", &format!("/api/mailbox/{client_id}/drain"), "");
+        assert_eq!(drain.status, 200, "body={}", drain.body);
+
+        let undrain = route(
+            &d,
+            "POST",
+            &format!("/api/mailbox/{client_id}/undrain"),
+            &serde_json::json!({"message_ids": [msg_id]}).to_string(),
+        );
+        assert_eq!(undrain.status, 200, "body={}", undrain.body);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&undrain.body).unwrap()["undrained"],
+            1
+        );
+
+        let unread_after = route(
+            &d,
+            "GET",
+            &format!("/api/mailbox/{client_id}/messages?unread=true"),
+            "",
+        );
+        let unread_json: serde_json::Value = serde_json::from_str(&unread_after.body).unwrap();
+        assert_eq!(unread_json.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -25215,6 +25336,71 @@ command=\"cargo test\"
         );
         let alex_msgs: Vec<serde_json::Value> = serde_json::from_str(&alex_unread.body).unwrap();
         assert_eq!(alex_msgs.len(), 1, "{}", alex_unread.body);
+    }
+
+    #[test]
+    fn personal_mailbox_undrain_reverts_a_message_to_unread_for_that_user_only() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let entity_uri = format!("squad:{squad_id}");
+        for user in ["colin", "alex"] {
+            let body =
+                serde_json::to_string(&serde_json::json!({"entity_uri": entity_uri})).unwrap();
+            assert_eq!(
+                route(&d, "POST", &format!("/api/watches?user={user}"), &body).status,
+                201
+            );
+        }
+        let msg_id = d
+            .lock()
+            .enqueue_mailbox_message(
+                crate::mailbox::MailboxPriority::Urgent,
+                "urgent thing",
+                Some(squad_id.as_str()),
+                None,
+                None,
+                Some(entity_uri.as_str()),
+            )
+            .unwrap();
+
+        for user in ["colin", "alex"] {
+            let drain = route(
+                &d,
+                "POST",
+                &format!("/api/mailbox/personal/drain?user={user}"),
+                "",
+            );
+            assert_eq!(drain.status, 200, "{}", drain.body);
+        }
+
+        let undrain = route(
+            &d,
+            "POST",
+            "/api/mailbox/personal/undrain?user=colin",
+            &serde_json::json!({"message_ids": [msg_id]}).to_string(),
+        );
+        assert_eq!(undrain.status, 200, "{}", undrain.body);
+        let undrained: serde_json::Value = serde_json::from_str(&undrain.body).unwrap();
+        assert_eq!(undrained["undrained"], 1);
+
+        let colin_unread = route(
+            &d,
+            "GET",
+            "/api/mailbox/personal/messages?user=colin&unread=1",
+            "",
+        );
+        let colin_msgs: Vec<serde_json::Value> = serde_json::from_str(&colin_unread.body).unwrap();
+        assert_eq!(colin_msgs.len(), 1, "{}", colin_unread.body);
+
+        // Undraining as colin must not affect alex's own read state.
+        let alex_unread = route(
+            &d,
+            "GET",
+            "/api/mailbox/personal/messages?user=alex&unread=1",
+            "",
+        );
+        let alex_msgs: Vec<serde_json::Value> = serde_json::from_str(&alex_unread.body).unwrap();
+        assert!(alex_msgs.is_empty(), "{}", alex_unread.body);
     }
 
     #[test]

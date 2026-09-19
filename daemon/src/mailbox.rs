@@ -387,6 +387,72 @@ impl Store {
         Ok(drained)
     }
 
+    /// Revert previously-drained messages back to unread for `user_name`'s
+    /// personal mailbox (RAL-465) -- mirrors
+    /// [`Self::undrain_mailbox_messages`]'s shape, but keyed on
+    /// `user_mailbox_drains` instead of `mailbox_drains`. `message_ids: None`
+    /// undrains everything currently drained for this user; `Some(ids)`
+    /// undrains exactly those ids (silently ignoring ids that were never
+    /// drained or don't exist). Returns the number of messages newly
+    /// undrained.
+    pub fn undrain_personal_mailbox_messages(
+        &self,
+        user_name: &str,
+        message_ids: Option<&[String]>,
+    ) -> Result<usize> {
+        match message_ids {
+            Some(ids) if !ids.is_empty() => {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "DELETE FROM user_mailbox_drains WHERE user_name = ? AND message_id IN ({placeholders})"
+                );
+                let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&user_name];
+                bound.extend(ids.iter().map(|s| s as &dyn rusqlite::ToSql));
+                Ok(self.conn.execute(&sql, bound.as_slice())?)
+            }
+            Some(_) => Ok(0),
+            None => Ok(self.conn.execute(
+                "DELETE FROM user_mailbox_drains WHERE user_name = ?1",
+                params![user_name],
+            )?),
+        }
+    }
+
+    /// Revert previously-drained messages back to unread for `client_id`
+    /// (RAL-465) -- the inverse of [`Self::drain_mailbox_messages`], so a
+    /// client that dismissed a message in error (or wants to re-surface it)
+    /// can move it back to the unread set. `message_ids: None` undrains
+    /// every message currently drained for this client; `Some(ids)`
+    /// undrains exactly those ids (silently ignoring ids that were never
+    /// drained or don't exist). Returns the number of messages newly
+    /// undrained.
+    pub fn undrain_mailbox_messages(
+        &self,
+        client_id: &str,
+        message_ids: Option<&[String]>,
+    ) -> Result<usize> {
+        match message_ids {
+            Some(ids) if !ids.is_empty() => {
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "DELETE FROM mailbox_drains WHERE client_id = ? AND message_id IN ({placeholders})"
+                );
+                let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&client_id];
+                bound.extend(ids.iter().map(|s| s as &dyn rusqlite::ToSql));
+                Ok(self.conn.execute(&sql, bound.as_slice())?)
+            }
+            Some(_) => Ok(0),
+            None => Ok(self.conn.execute(
+                "DELETE FROM mailbox_drains WHERE client_id = ?1",
+                params![client_id],
+            )?),
+        }
+    }
+
     /// Mark messages as drained (read) for `client_id`. `message_ids: None`
     /// drains every currently unread message for this client; `Some(ids)`
     /// drains exactly those ids (silently ignoring ids that don't exist or
@@ -559,6 +625,168 @@ mod tests {
             .mailbox_messages_for_client(&client_id, true, None)
             .unwrap();
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn undrain_reverts_a_drained_message_to_unread_for_that_client_only() {
+        let store = Store::open_in_memory().unwrap();
+        let client_a = store.register_mailbox_client().unwrap();
+        let client_b = store.register_mailbox_client().unwrap();
+        let msg_id = store
+            .enqueue_mailbox_message(MailboxPriority::High, "stalled", None, None, None, None)
+            .unwrap();
+
+        assert_eq!(store.drain_mailbox_messages(&client_a, None).unwrap(), 1);
+        assert_eq!(store.drain_mailbox_messages(&client_b, None).unwrap(), 1);
+
+        let undrained = store
+            .undrain_mailbox_messages(&client_a, Some(std::slice::from_ref(&msg_id)))
+            .unwrap();
+        assert_eq!(undrained, 1);
+
+        let unread_a = store
+            .mailbox_messages_for_client(&client_a, true, None)
+            .unwrap();
+        assert_eq!(
+            unread_a.len(),
+            1,
+            "client_a's undrain moved it back to unread"
+        );
+        assert_eq!(unread_a[0].id, msg_id);
+
+        // client_b's independent drain state is untouched.
+        let unread_b = store
+            .mailbox_messages_for_client(&client_b, true, None)
+            .unwrap();
+        assert!(unread_b.is_empty());
+    }
+
+    #[test]
+    fn undrain_with_no_ids_reverts_everything_drained_for_that_client() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        store
+            .enqueue_mailbox_message(MailboxPriority::Normal, "a", None, None, None, None)
+            .unwrap();
+        store
+            .enqueue_mailbox_message(MailboxPriority::Normal, "b", None, None, None, None)
+            .unwrap();
+        assert_eq!(store.drain_mailbox_messages(&client_id, None).unwrap(), 2);
+
+        let undrained = store.undrain_mailbox_messages(&client_id, None).unwrap();
+        assert_eq!(undrained, 2);
+
+        let unread = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(unread.len(), 2);
+    }
+
+    #[test]
+    fn undrain_ignores_ids_that_were_never_drained() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        let msg_id = store
+            .enqueue_mailbox_message(MailboxPriority::Normal, "m", None, None, None, None)
+            .unwrap();
+
+        let undrained = store
+            .undrain_mailbox_messages(&client_id, Some(&[msg_id, "mailbox-bogus".to_string()]))
+            .unwrap();
+        assert_eq!(undrained, 0);
+    }
+
+    #[test]
+    fn personal_undrain_reverts_a_drained_message_to_unread_for_that_user_only() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_watch("alice", "squad:squad-1", &[MailboxPriority::High])
+            .unwrap();
+        store
+            .create_watch("bob", "squad:squad-1", &[MailboxPriority::High])
+            .unwrap();
+        let msg_id = store
+            .enqueue_mailbox_message(
+                MailboxPriority::High,
+                "stalled",
+                None,
+                None,
+                None,
+                Some("squad:squad-1"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .drain_personal_mailbox_messages("alice", None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.drain_personal_mailbox_messages("bob", None).unwrap(),
+            1
+        );
+
+        let undrained = store
+            .undrain_personal_mailbox_messages("alice", Some(std::slice::from_ref(&msg_id)))
+            .unwrap();
+        assert_eq!(undrained, 1);
+
+        let unread_alice = store
+            .personal_mailbox_messages_for_user("alice", true, None)
+            .unwrap();
+        assert_eq!(unread_alice.len(), 1);
+        assert_eq!(unread_alice[0].id, msg_id);
+
+        // bob's independent drain state is untouched.
+        let unread_bob = store
+            .personal_mailbox_messages_for_user("bob", true, None)
+            .unwrap();
+        assert!(unread_bob.is_empty());
+    }
+
+    #[test]
+    fn personal_undrain_with_no_ids_reverts_everything_drained_for_that_user() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_watch("alice", "squad:squad-1", &[MailboxPriority::High])
+            .unwrap();
+        store
+            .enqueue_mailbox_message(
+                MailboxPriority::High,
+                "a",
+                None,
+                None,
+                None,
+                Some("squad:squad-1"),
+            )
+            .unwrap();
+        store
+            .enqueue_mailbox_message(
+                MailboxPriority::High,
+                "b",
+                None,
+                None,
+                None,
+                Some("squad:squad-1"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .drain_personal_mailbox_messages("alice", None)
+                .unwrap(),
+            2
+        );
+
+        let undrained = store
+            .undrain_personal_mailbox_messages("alice", None)
+            .unwrap();
+        assert_eq!(undrained, 2);
+
+        let unread = store
+            .personal_mailbox_messages_for_user("alice", true, None)
+            .unwrap();
+        assert_eq!(unread.len(), 2);
     }
 
     #[test]
