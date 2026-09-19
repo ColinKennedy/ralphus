@@ -433,7 +433,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         "reopen",
         &["selector [str]"],
         &[],
-        "Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.",
+        "Reopen a cancelled or approved review and immediately stage in whatever branches are already ready, without waiting for the rest.",
         false,
         false,
         &[],

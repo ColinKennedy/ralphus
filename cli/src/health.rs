@@ -902,7 +902,13 @@ fn check_max_concurrent(cwd: &Path) -> CheckResult {
 fn check_opentelemetry(cwd: &Path) -> CheckResult {
     let config = crate::config::load_config(cwd, true);
     if config.daemon.opentelemetry {
-        return CheckResult::new("daemon-opentelemetry", PASS, "enabled");
+        return CheckResult::new(
+            "daemon-opentelemetry",
+            PASS,
+            "enabled",
+            "Cell/scheduler activity is exported as OpenTelemetry traces.",
+            "No action needed.",
+        );
     }
     let src = config
         .provenance
@@ -915,6 +921,8 @@ fn check_opentelemetry(cwd: &Path) -> CheckResult {
         "daemon-opentelemetry",
         PASS,
         format!("OpenTelemetry has been disabled{src}"),
+        "No traces are exported; tracing tools have nothing to show for this daemon.",
+        "Set [daemon] opentelemetry = true if you want to export traces.",
     )
 }
 
@@ -1591,6 +1599,7 @@ pub fn run_checks(
 
     results.push(check_config(cwd).with_id(ID_CONFIG));
     results.push(check_max_concurrent(cwd).with_id(ID_DAEMON_MAX_CONCURRENT));
+    results.push(check_opentelemetry(cwd));
     results.push(check_tool_arg_truncate_chars(cwd).with_id(ID_TOOL_ARG_TRUNCATE_CHARS));
     results.push(check_thrash_max_compactions(cwd).with_id(ID_THRASH_MAX_COMPACTIONS));
     results.push(check_thrash_min_turn_gap(cwd).with_id(ID_THRASH_MIN_TURN_GAP));

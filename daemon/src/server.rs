@@ -1185,9 +1185,11 @@ fn route_for_user(
         ("GET", ["api", "health", "catalog"]) => {
             admin_gated(daemon, user_header, health_catalog_reply)
         }
+        // ralphus[ignore-endpoint-cli]: board-only cached daemon health-sweep row (RAL-416); no CLI equivalent, unlike `check health`'s live on-demand probes.
         ("GET", ["api", "health", "report"]) => {
             admin_gated(daemon, user_header, || health_report(daemon))
         }
+        // ralphus[ignore-endpoint-cli]: board's "check now" affordance re-running the daemon-local sweep (RAL-416); has no CLI counterpart.
         ("POST", ["api", "health", "report", "refresh"]) => {
             admin_gated(daemon, user_header, || health_report_refresh(daemon))
         }
@@ -5204,12 +5206,37 @@ fn run_submit_followup(
         resolved
     };
 
+    // RAL-<pending>: decide every LOCAL cell's worktree (branch claim +
+    // `w/<short>` directory) under a brief lock, then actually create/resync
+    // them -- the real `git worktree add`/`fetch`/rebase -- with NO lock
+    // held, concurrently. Without this, `derive_reviews_with_prefetch` below
+    // would run that same real git work serially, one cell at a time, for
+    // the ENTIRE duration the store lock is held -- which stalls not just
+    // this squad's own submission but every other request the daemon
+    // serves meanwhile (board reads, other squads' dispatch), since it's
+    // the same single global lock. See
+    // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    let prefetched_worktrees = {
+        let guard = store_handle.lock();
+        let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
+        let jobs = crate::worktrees::plan_local_worktree_jobs(
+            &guard,
+            &squad_id,
+            &cells,
+            &tasks,
+            &prefetched_upstreams,
+        );
+        drop(guard);
+        crate::worktrees::execute_local_worktree_jobs(&jobs)
+    };
+
     let guard = store_handle.lock();
-    if let Err(e) = crate::reviews::derive_reviews_with_prefetch(
+    if let Err(e) = crate::reviews::derive_reviews_with_full_prefetch(
         &guard,
         &squad_id,
         &file,
         &prefetched_upstreams,
+        &prefetched_worktrees,
     ) {
         let _ = guard.set_squad_error(&squad_id, Some(&e.message));
         let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
@@ -12905,12 +12932,12 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-/// Reopen a `cancelled` review (status → `collecting`) and immediately try a
-/// fresh merge pass if the daemon has capacity -- see
-/// [`crate::guardian_merge::reopen_cancelled_guardian_merge`].
+/// Reopen a `cancelled` or `approved` review (status → `collecting`) and
+/// immediately try a fresh merge pass if the daemon has capacity -- see
+/// [`crate::guardian_merge::reopen_guardian_merge`].
 fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
     let runner = guardian_agent_runner(daemon);
-    crate::guardian_merge::reopen_cancelled_guardian_merge(
+    crate::guardian_merge::reopen_guardian_merge(
         daemon.store_handle(),
         runner,
         id,

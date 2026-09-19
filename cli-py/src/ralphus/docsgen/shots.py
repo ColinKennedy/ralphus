@@ -237,6 +237,19 @@ def _worktree_retirement_overview(page: Page) -> None:
         _shoot(page, "worktree-retirement-overview")
 
 
+def _health_overview(page: Page) -> None:
+    # Same no-dedicated-hash situation as Machines/Users/Secrets/Triage/
+    # Worktree-retirement above.
+    with (
+        fixture_server(fixtures.HEALTH_ROUTES) as daemon_url,
+        librarian_server(daemon_url) as base_url,
+    ):
+        _goto(page, base_url, "#/tasks")
+        page.evaluate("showTab('health', true)")
+        page.wait_for_selector("#health .proj-table")
+        _shoot(page, "health-overview")
+
+
 def _prefs_overview(page: Page) -> None:
     with (
         fixture_server(fixtures.PREFS_ROUTES) as daemon_url,
@@ -261,6 +274,7 @@ SCENARIOS = (
     _secrets_overview,
     _triage_overview,
     _worktree_retirement_overview,
+    _health_overview,
     _prefs_overview,
 )
 

@@ -3501,30 +3501,41 @@ pub(crate) fn kickoff_merge(
             Ok(g) => g,
             Err(e) => return Err(StartMergeError::NotFound(e.to_string())),
         };
-        // Only a still-`collecting` guardian can have a branch genuinely
-        // waiting on its upstream Cell -- see the check below for why.
+        // A still-`collecting` guardian can have a branch genuinely waiting
+        // on its upstream Cell in the broadest sense -- nothing has been
+        // reachable yet, so any non-`done` state (including a dead
+        // `failed`/`cancelled` cell) legitimately holds the whole review
+        // back. Past `collecting`, a re-trigger (Save after a disable/
+        // reorder, a base-branch shift, "Merge / rebase") is a deliberate
+        // re-run that must not silently defer forever just because some
+        // cell's `cells.state` will never reach `done` (e.g. it was never
+        // wired to a real task, like a manually added test branch, the
+        // review outlived its squad, or that cell simply failed and was
+        // never retried) -- so only a branch that could still plausibly
+        // finish on its own (`queued`/`pending`/`running`) blocks a
+        // post-`collecting` re-trigger. That narrower check still matters
+        // there: an earlier branch failing first can mean the stack never
+        // got far enough to even attempt a later branch's rebase, so that
+        // later branch can still be validly in flight even though the
+        // guardian itself has moved on -- racing ahead of it reads back as
+        // a false "branch is empty" failure instead of the real "its task
+        // hasn't finished yet".
         let unfinished = if guardian.status == GuardianStatus::Collecting.as_str() {
             match guard.guardian_unfinished_linked_branches(id) {
                 Ok(b) => b,
                 Err(e) => return Err(StartMergeError::Store(e.to_string())),
             }
         } else {
-            Vec::new()
+            match guard.guardian_branches_still_in_flight(id) {
+                Ok(b) => b,
+                Err(e) => return Err(StartMergeError::Store(e.to_string())),
+            }
         };
         (guardian, unfinished)
     };
     if guardian.branches.is_empty() {
         return Err(StartMergeError::NoBranches);
     }
-    // A non-`collecting` guardian never reports unfinished branches (see
-    // above): once it has left `collecting` -- reached `in_review`/
-    // `merge_failed`, or is already `merging` -- every enabled branch has
-    // gone through a full merge pass at least once, and a re-trigger (the
-    // "Merge / rebase" button, a settings-change restart, a base-branch shift
-    // on an already-built review) is a deliberate re-run that must not
-    // silently no-op just because some cell's `cells.state` still reads back
-    // non-`done` (e.g. it was never wired to a real task, like a manually
-    // added test branch, or the review outlived its squad).
     if !unfinished.is_empty() {
         crate::rlog!(
             INFO,
@@ -3742,25 +3753,28 @@ pub fn restart_guardian_merge(
     start_merge(store, runner, id, sem, cancellations)
 }
 
-/// Reopen a `cancelled` review (status → `collecting`) and immediately try an
-/// incremental staged merge (RAL-265, [`run_merge_staged`]) -- the same pass
-/// a task completion would have triggered via `start_reviews`
-/// (`daemon/src/scheduler.rs`) had this review not been cancelled at the
-/// time. Deliberately *not* the all-or-nothing [`start_merge`] that the
-/// manual "Merge / rebase" button uses: that path waits for every enabled
-/// branch's cell to finish before rebasing anything, so a review reopened
-/// while one branch is still pending would sit doing nothing until that last
-/// cell completes, even though every earlier branch's cell finished (and
-/// would already have been rebased into the review) while the review was
-/// dormant. Staging the ready prefix now catches it up immediately instead
-/// of waiting on that last cell or the periodic maintenance sweep.
+/// Reopen a `cancelled` or `approved` review (status → `collecting`) and
+/// immediately try an incremental staged merge (RAL-265, [`run_merge_staged`])
+/// -- the same pass a task completion would have triggered via
+/// `start_reviews` (`daemon/src/scheduler.rs`) had this review not been
+/// cancelled/approved at the time. Deliberately *not* the all-or-nothing
+/// [`start_merge`] that the manual "Merge / rebase" button uses: that path
+/// waits for every enabled branch's cell to finish before rebasing anything,
+/// so a review reopened while one branch is still pending would sit doing
+/// nothing until that last cell completes, even though every earlier
+/// branch's cell finished (and would already have been rebased into the
+/// review) while the review was dormant. Staging the ready prefix now
+/// catches it up immediately instead of waiting on that last cell or the
+/// periodic maintenance sweep.
 ///
 /// A cancelled review can still be winding down after its cancellation reply
 /// has returned. Wait for that worker here, where a fresh merge could reuse
 /// the same worktrees; if it does not stop within the bounded budget, leave
 /// the review cancelled and ask the caller to retry instead of overlapping two
-/// workers.
-pub fn reopen_cancelled_guardian_merge(
+/// workers. An approved review never has a worker to wait for -- it only
+/// ever arrives at `approved` from `in_review`, which has none either -- so
+/// this wait resolves immediately for that case.
+pub fn reopen_guardian_merge(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
     id: &str,
@@ -3777,7 +3791,7 @@ pub fn reopen_cancelled_guardian_merge(
             ),
         );
     }
-    if let Err(e) = store.lock().reopen_cancelled_guardian(id) {
+    if let Err(e) = store.lock().reopen_guardian(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
     let claimed = store.lock().claim_guardian_merge(id).unwrap_or(false);
@@ -11569,6 +11583,92 @@ mod tests {
         let r = start_resolve_input(store, runner, &id, "port", sem);
         assert_eq!(r.status, 409);
         assert!(r.body.contains("already_in_progress"));
+    }
+
+    /// Links `branch` to a fresh single-cell squad in state `state`, mirroring
+    /// `guardian.rs`'s own `insert_cell_for_branch` test helper (private to
+    /// that module's `mod tests`, so duplicated here rather than exposed).
+    fn insert_cell_for_branch(
+        store: &mut Store,
+        branch: &str,
+        state: crate::store::NodeState,
+    ) -> String {
+        let src = "[[task]]\nname=\"t0\"\n[[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let tf: ralphus_core::schema::TaskFile = toml::from_str(src).expect("valid fixture");
+        let squad_id = store.insert_squad(&tf, None, false).unwrap();
+        store
+            .set_cell_review_branch(&squad_id, 0, 0, branch)
+            .unwrap();
+        store.set_cell_state(&squad_id, 0, 0, state).unwrap();
+        squad_id
+    }
+
+    /// Live bug this guards: disabling/re-ordering a branch and hitting Save
+    /// (`POST branches/reorder` immediately followed by `POST .../merge` --
+    /// see `saveReorder` in `librarian/assets/board/65-reviews.js`) on a
+    /// guardian that has already left `collecting` must not race ahead of a
+    /// downstream branch whose upstream Cell genuinely has not finished --
+    /// e.g. an earlier branch in the stack failed first, so this one was
+    /// never actually reached on the prior pass. Racing ahead of it rebases
+    /// an empty/not-yet-pushed worktree and reads back as a false "branch is
+    /// empty" failure instead of "its task hasn't finished yet".
+    #[test]
+    fn kickoff_merge_defers_past_collecting_when_an_enabled_branch_is_still_in_flight() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let mut guard = store.lock();
+            insert_cell_for_branch(&mut guard, "feat", crate::store::NodeState::Running);
+            let id = guard.create_guardian("r", "main", "/repo").unwrap();
+            guard.add_guardian_branch(&id, "feat").unwrap();
+            guard
+                .set_guardian_status(&id, GuardianStatus::MergeFailed, Some("boom"))
+                .unwrap();
+            id
+        };
+
+        let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("unused"));
+        let sem = Arc::new(Semaphore::new(4));
+        let cancellations = Cancellations::new();
+
+        let outcome = kickoff_merge(Arc::clone(&store), runner, &id, sem, cancellations)
+            .expect("kickoff must not error");
+        assert_eq!(outcome, StartMergeOutcome::Deferred);
+
+        // No claim/rebase must have been kicked off -- the guardian is left
+        // exactly as it was so the straggler sweep can pick it back up once
+        // the cell actually finishes.
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(g.status.as_str(), GuardianStatus::MergeFailed.as_str());
+    }
+
+    /// Contrast case: once that same branch's cell reaches a terminal
+    /// `failed` state (dead, will never become `done` on its own), the same
+    /// re-trigger must proceed rather than defer forever.
+    #[test]
+    fn kickoff_merge_does_not_defer_past_collecting_for_a_dead_failed_cell() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let mut guard = store.lock();
+            insert_cell_for_branch(&mut guard, "feat", crate::store::NodeState::Failed);
+            let id = guard.create_guardian("r", "main", "/repo").unwrap();
+            guard.add_guardian_branch(&id, "feat").unwrap();
+            guard
+                .set_guardian_status(&id, GuardianStatus::MergeFailed, Some("boom"))
+                .unwrap();
+            id
+        };
+
+        let runner: Arc<dyn Runner> = Arc::new(FixedValueRunner("unused"));
+        let sem = Arc::new(Semaphore::new(4));
+        let cancellations = Cancellations::new();
+
+        let outcome = kickoff_merge(Arc::clone(&store), runner, &id, sem, cancellations)
+            .expect("kickoff must not error");
+        assert_eq!(outcome, StartMergeOutcome::Merging);
     }
 
     /// Returns `(base_dir, repo_root, feature_worktree_path)`.

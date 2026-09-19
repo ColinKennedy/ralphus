@@ -30,6 +30,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
@@ -168,6 +169,60 @@ fn existing_task_worktree_branches(root: &Path) -> HashMap<String, String> {
         }
     }
     out
+}
+
+/// In-process registry of `w/<short>` worktree directory slots already
+/// claimed by an in-flight materialization but not yet visible via a live
+/// `git worktree list --porcelain` query. [`resolve_task_worktree_dir_with_existing`]'s
+/// collision avoidance (and [`resolve_squad_branch`]'s "is this branch
+/// already checked out somewhere" check) used to be safe purely because the
+/// daemon's global store lock serialized a submission's whole
+/// materialization pass start to finish, INCLUDING the actual `git worktree
+/// add` -- see [`resolve_task_worktree_dir_with_existing`]'s doc comment.
+/// Splitting slot *decision* (fast, still made under the lock -- see
+/// [`plan_local_worktree_jobs`]) from slot *creation* (slow, deliberately
+/// run WITHOUT the lock so it can also run in parallel) broke that: a second
+/// submission's locked planning pass can now run before the first
+/// submission's `git worktree add` has actually landed on disk, and would
+/// otherwise see a stale, still-empty `w/` directory and pick the same slot
+/// for a different branch. This registry closes that gap -- a slot is
+/// recorded the moment a decision is made to use it, before any git command
+/// runs. Entries are never removed: once a worktree genuinely exists, a live
+/// git query agrees anyway, so a stale entry is harmless.
+static RESERVED_WORKTREE_SLOTS: LazyLock<
+    parking_lot::Mutex<HashMap<PathBuf, HashMap<String, String>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// [`existing_task_worktree_branches`] merged with any slot this process has
+/// already reserved for `root` (see [`RESERVED_WORKTREE_SLOTS`]) but not yet
+/// materialized on disk. Use this wherever a materialization DECISION is
+/// made; the plain query alone is only safe for read-only/display purposes.
+fn existing_and_reserved_worktree_branches(root: &Path) -> HashMap<String, String> {
+    let mut out = existing_task_worktree_branches(root);
+    if let Some(reserved) = RESERVED_WORKTREE_SLOTS.lock().get(root) {
+        for (short, branch) in reserved {
+            out.entry(short.clone()).or_insert_with(|| branch.clone());
+        }
+    }
+    out
+}
+
+/// Record that `plan`'s directory is now claimed for `branch` under `root`,
+/// even though the worktree may not exist on disk yet -- see
+/// [`RESERVED_WORKTREE_SLOTS`]'s doc comment. A no-op for a plan that reuses
+/// an already-existing worktree (nothing new to protect).
+fn reserve_worktree_slot(root: &Path, plan: &WorktreePlan, branch: &str) {
+    if plan.already_exists {
+        return;
+    }
+    let Some(short) = plan.wt.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    RESERVED_WORKTREE_SLOTS
+        .lock()
+        .entry(root.to_path_buf())
+        .or_default()
+        .insert(short.to_string(), branch.to_string());
 }
 
 /// The on-disk worktree directory to actually materialize `branch` into,
@@ -599,7 +654,31 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// ([`ensure_worktree_with_existing`]) instead freezes the marker to a
 /// resolved commit SHA, once, *after* this function returns and the branch
 /// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
+/// Guards every `git config` WRITE this module makes to a worktree's branch
+/// tracking (`set_explicit_upstream` and `freeze_commit_baseline`, below).
+/// A worktree's `.git/config` is the SAME physical file shared by every
+/// other worktree of the same project (worktrees each get their own
+/// index/HEAD, but not their own config) -- two `git config <key> <value>`
+/// invocations against different worktrees of the same repo, run at the same
+/// instant, race on git's own `.git/config.lock` and one of them fails
+/// outright ("could not lock config file: File exists"), rather than
+/// queuing. That never mattered while worktree materialization was fully
+/// serial; it does now that [`execute_local_worktree_jobs`] runs several
+/// worktrees' materialization concurrently, potentially against the same
+/// project root. A single global lock (not per-root) is simpler than
+/// tracking one per project and costs nothing worth measuring -- the
+/// critical section is a couple of millisecond-scale `git config` calls, not
+/// the actual (slow) checkout. Every call `execute_worktree_plan` makes that
+/// can write to `.git/config` -- including `git worktree add`'s own implicit
+/// tracking-setup side effect for a newly created branch -- must be covered:
+/// `execute_worktree_plan` passes `--no-track` to every `worktree add -b`
+/// call for exactly this reason, so the *only* config writes are the two
+/// explicit, lock-guarded ones here.
+static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
+    LazyLock::new(|| parking_lot::Mutex::new(()));
+
 fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
+    let _guard = WORKTREE_CONFIG_LOCK.lock();
     // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
     // They must be expanded by `resolve_upstream` before materialization; a
     // literal `<<...>>` here means resolution was skipped, not a real ref to
@@ -672,6 +751,13 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
     ) else {
         return;
     };
+    // `set_worktree_commit_baseline` writes `ralphus.<branch>.baseline` to
+    // the same shared `.git/config` `set_explicit_upstream` writes to --
+    // needs the same `WORKTREE_CONFIG_LOCK` for the same reason (see that
+    // static's doc comment); a worktree's `freeze_commit_baseline` call can
+    // otherwise race a *different* worktree's concurrent
+    // `set_explicit_upstream` call on git's own `.git/config.lock`.
+    let _guard = WORKTREE_CONFIG_LOCK.lock();
     if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
         // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
         crate::rlog!(
@@ -818,43 +904,89 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
 /// holds the daemon's single global `Mutex<Store>`. No worktree is created
 /// between those two reads, so one shared snapshot is exactly as fresh as
 /// querying twice.
-pub fn ensure_worktree_with_existing(
+/// The decision [`ensure_worktree_with_existing`] makes about how to
+/// materialize `branch`'s worktree, split out so it can be made (fast,
+/// local-only, safe under the store lock) separately from actually doing it
+/// (slow, safe to run without the lock and concurrently with another
+/// root/branch's plan) -- see [`plan_local_worktree_jobs`].
+struct WorktreePlan {
+    wt: PathBuf,
+    materialization: BranchMaterialization,
+    already_exists: bool,
+}
+
+/// The fast half of [`ensure_worktree_with_existing`]: everything needed to
+/// know WHERE `branch`'s worktree will live and HOW it must be created,
+/// using only local git plumbing (`branch_materialization`) and the
+/// caller-supplied on-disk snapshot -- no network, no checkout. Safe to call
+/// while holding the store lock.
+fn plan_worktree(
+    root: &Path,
+    branch: &str,
+    existing: &HashMap<String, String>,
+) -> Result<WorktreePlan, String> {
+    let materialization = branch_materialization(root, branch)?;
+    let wt = resolve_task_worktree_dir_with_existing(root, branch, existing);
+    let already_exists = wt.join(".git").exists();
+    Ok(WorktreePlan {
+        wt,
+        materialization,
+        already_exists,
+    })
+}
+
+/// The slow half of [`ensure_worktree_with_existing`]: perform `plan`'s git
+/// work. An already-existing worktree only needs resyncing
+/// (`set_explicit_upstream` + `resync_remote_tracking_branch`, a real `git
+/// fetch`+rebase when it tracks a remote); a new one is created with `git
+/// worktree add` first. No store access, so this is safe to call with no
+/// lock held, and safe to call concurrently with another call for a
+/// DIFFERENT `root`/`branch` -- see [`plan_worktree`]'s doc comment for why
+/// the decision itself must already be final (and, for a brand-new slot,
+/// already reserved via [`reserve_worktree_slot`]) before this runs.
+fn execute_worktree_plan(
     root: &Path,
     branch: &str,
     upstream: &str,
-    existing: &HashMap<String, String>,
+    plan: &WorktreePlan,
 ) -> Result<PathBuf, String> {
     sync_coauthor_hook_best_effort(root);
-    let materialization = branch_materialization(root, branch)?;
-    let wt = resolve_task_worktree_dir_with_existing(root, branch, existing);
-    if wt.join(".git").exists() {
-        set_explicit_upstream(&wt, branch, upstream)?;
-        resync_remote_tracking_branch(&wt)?;
-        freeze_commit_baseline(&wt, branch);
-        return Ok(wt);
+    if plan.already_exists {
+        set_explicit_upstream(&plan.wt, branch, upstream)?;
+        resync_remote_tracking_branch(&plan.wt)?;
+        freeze_commit_baseline(&plan.wt, branch);
+        return Ok(plan.wt.clone());
     }
-    if let Some(parent) = wt.parent() {
+    if let Some(parent) = plan.wt.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create worktree parent directory: {e}"))?;
     }
-    let wt_str = wt.to_string_lossy().to_string();
-    match materialization {
+    let wt_str = plan.wt.to_string_lossy().to_string();
+    match &plan.materialization {
         BranchMaterialization::ExistingLocal => {
-            preflight_worktree_budget(root, &wt, branch, path_budget_limit())?;
+            preflight_worktree_budget(root, &plan.wt, branch, path_budget_limit())?;
             git(root, &["worktree", "add", &wt_str, branch])?;
         }
         BranchMaterialization::NewFromRemote { remote_ref } => {
-            preflight_worktree_budget(root, &wt, &remote_ref, path_budget_limit())?;
+            preflight_worktree_budget(root, &plan.wt, remote_ref, path_budget_limit())?;
+            // `--no-track`, not `--track`: `set_explicit_upstream` below sets
+            // the real tracking config anyway (under `WORKTREE_CONFIG_LOCK`),
+            // and git's own implicit auto-tracking setup for a new branch
+            // writes to the SAME shared `.git/config` this worktree's
+            // siblings may be concurrently touching -- unlike the explicit
+            // call, this implicit write has no lock protecting it, and races
+            // on git's own `.git/config.lock` under real concurrency (see
+            // `WORKTREE_CONFIG_LOCK`'s doc comment).
             git(
                 root,
                 &[
                     "worktree",
                     "add",
-                    "--track",
+                    "--no-track",
                     "-b",
                     branch,
                     &wt_str,
-                    &remote_ref,
+                    remote_ref,
                 ],
             )?;
         }
@@ -867,14 +999,39 @@ pub fn ensure_worktree_with_existing(
             // implicit `HEAD` -- so this new branch's content always reflects
             // what the submitter named, not whatever the shared `root`
             // checkout happens to have checked out right now.
-            preflight_worktree_budget(root, &wt, upstream, path_budget_limit())?;
-            git(root, &["worktree", "add", "-b", branch, &wt_str, upstream])?;
+            preflight_worktree_budget(root, &plan.wt, upstream, path_budget_limit())?;
+            // `--no-track`: see the `NewFromRemote` arm above -- `upstream`
+            // being a plain local branch still triggers git's own implicit,
+            // unlocked auto-tracking setup by default (`branch.autoSetupMerge`),
+            // which races the same way.
+            git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    &wt_str,
+                    upstream,
+                ],
+            )?;
         }
     }
-    set_explicit_upstream(&wt, branch, upstream)?;
-    resync_remote_tracking_branch(&wt)?;
-    freeze_commit_baseline(&wt, branch);
-    Ok(wt)
+    set_explicit_upstream(&plan.wt, branch, upstream)?;
+    resync_remote_tracking_branch(&plan.wt)?;
+    freeze_commit_baseline(&plan.wt, branch);
+    Ok(plan.wt.clone())
+}
+
+pub fn ensure_worktree_with_existing(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+    existing: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    let plan = plan_worktree(root, branch, existing)?;
+    execute_worktree_plan(root, branch, upstream, &plan)
 }
 
 fn project_startup_adapter(vcs: &str) -> Option<&'static dyn ProjectStartupAdapter> {
@@ -988,7 +1145,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // branch -- see `PlaceholderContext::on_disk_worktrees`'s doc comment.
         let root_key = Path::new(&project.path).to_path_buf();
         if !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
-            let snapshot = existing_task_worktree_branches(&root_key);
+            let snapshot = existing_and_reserved_worktree_branches(&root_key);
             ctx.on_disk_worktrees
                 .borrow_mut()
                 .insert(root_key.clone(), snapshot);
@@ -1419,6 +1576,41 @@ pub fn resolve_placeholders_with_prefetch(
     prefetched_upstreams: &HashMap<(String, String), String>,
     parent: &Context,
 ) -> Result<(), String> {
+    resolve_placeholders_with_full_prefetch(
+        store,
+        squad_id,
+        cells,
+        tasks,
+        prefetched_upstreams,
+        &HashMap::new(),
+        parent,
+    )
+}
+
+/// Like [`resolve_placeholders_with_prefetch`], but `prefetched_worktrees`
+/// additionally supplies already-materialized LOCAL worktree paths, keyed
+/// exactly like [`placeholder_cache_key`] -- see [`plan_local_worktree_jobs`]
+/// and [`execute_local_worktree_jobs`] for how to build this map, and why:
+/// running the actual `git worktree add`/`fetch`/rebase for every cell
+/// OUTSIDE the store lock, in parallel, is what turns a squad with N
+/// independent branches from N sequential git operations -- held under the
+/// daemon's single global lock, so it stalls the *entire* daemon meanwhile
+/// (board reads, every other squad's dispatch, everything) -- into one
+/// bounded-concurrency batch that finishes in roughly the time of the
+/// slowest single worktree. A cache miss (any cell the prefetch pass didn't
+/// cover, e.g. a `machine`-provisioned one, or one that failed to
+/// materialize during prefetch) falls back to resolving live, under this
+/// call's lock, exactly as before -- this parameter only ever makes the
+/// common case faster, never changes what a given input resolves to.
+pub fn resolve_placeholders_with_full_prefetch(
+    store: &Store,
+    squad_id: &str,
+    cells: &mut [CellRow],
+    tasks: &[TaskRow],
+    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_worktrees: &HashMap<String, String>,
+    parent: &Context,
+) -> Result<(), String> {
     let span = otel::start_span("scheduler.resolve_worktrees", parent, SpanKind::Internal);
     span.set_attribute("squad_id", squad_id.to_string());
     // RAL-355 Phase 2: loaded once per call (not per cell) and threaded down
@@ -1442,6 +1634,7 @@ pub fn resolve_placeholders_with_prefetch(
         tasks,
         &targets,
         prefetched_upstreams,
+        prefetched_worktrees,
     ) {
         Ok(materialized) => {
             span.set_attribute("worktrees.materialized", materialized as i64);
@@ -1532,6 +1725,187 @@ pub fn collect_remote_upstream_prefetch_targets(
     out
 }
 
+/// A local git worktree one of this submission's cells needs, decided (RAL-337
+/// branch claim + `w/<short>` directory assignment) but not yet created --
+/// see [`plan_local_worktree_jobs`]'s doc comment for why the decision and
+/// the (possibly slow) git work that realizes it are split into separate
+/// steps.
+pub(crate) struct LocalWorktreeJob {
+    cache_key: String,
+    root: PathBuf,
+    branch: String,
+    upstream: String,
+    plan: WorktreePlan,
+}
+
+/// Decide every LOCAL (no `machine` set) worktree placeholder among `cells`'
+/// materialization up front -- the branch this squad gets (RAL-337) and the
+/// `w/<short>` directory it lands in -- WITHOUT running the slow `git
+/// worktree add`/`fetch`/rebase that used to follow immediately. Everything
+/// here is fast (DB reads/writes plus local git plumbing, no network, no
+/// checkout), so it's safe to run under the store lock exactly like the rest
+/// of placeholder resolution always has -- only the returned jobs' actual
+/// execution ([`execute_local_worktree_jobs`]) is meant to run afterward,
+/// WITHOUT the lock, in parallel.
+///
+/// Each decided slot is immediately reserved ([`reserve_worktree_slot`]) so
+/// neither a later cell in this same call nor a concurrent submission's own
+/// planning pass (which may run before this call's worktrees are actually
+/// created -- that's the whole point) can pick the same directory for a
+/// different branch.
+///
+/// A cell this can't confidently handle (its project can't be resolved, its
+/// `vcs` isn't `git`, its cwd isn't a direct placeholder, or it carries a
+/// `machine`) is simply left out of the returned list -- the caller's later,
+/// unchanged locked pass through [`resolve_placeholders_with_prefetch`]
+/// resolves it exactly as it always has, live. A miss here only costs time,
+/// never correctness.
+#[must_use]
+pub(crate) fn plan_local_worktree_jobs(
+    store: &Store,
+    squad_id: &str,
+    cells: &[CellRow],
+    tasks: &[TaskRow],
+    prefetched_upstreams: &HashMap<(String, String), String>,
+) -> Vec<LocalWorktreeJob> {
+    let task_projects: HashMap<i64, Option<&str>> = tasks
+        .iter()
+        .map(|t| (t.idx, t.project.as_deref()))
+        .collect();
+    let mut on_disk: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    let mut jobs: HashMap<String, LocalWorktreeJob> = HashMap::new();
+    for cell in cells {
+        if cell
+            .machine
+            .as_deref()
+            .is_some_and(|m| !m.trim().is_empty())
+        {
+            continue;
+        }
+        let Some(cwd) = cell.cwd.as_deref() else {
+            continue;
+        };
+        // Only a cwd that IS a placeholder directly -- the rarer case of one
+        // embedded via `<<...>>` inside a larger string (env-override
+        // expansion) isn't worth this fast path's complexity.
+        let Ok(Some(branch)) = classify_placeholder(cwd) else {
+            continue;
+        };
+        let cache_key = placeholder_cache_key(None, cwd);
+        if jobs.contains_key(&cache_key) {
+            continue;
+        }
+        let Some(project_name) = task_projects.get(&cell.task_idx).copied().flatten() else {
+            continue;
+        };
+        let Ok(Some(project)) = store.resolve_project(project_name) else {
+            continue;
+        };
+        if project_startup_adapter(&project.vcs).is_none() {
+            continue;
+        }
+        let Some(raw_upstream) = ralphus_core::schema::parse_worktree_placeholder_upstream(cwd)
+        else {
+            continue;
+        };
+        let root = PathBuf::from(&project.path);
+        let Ok(upstream) = resolve_upstream(&root, raw_upstream) else {
+            continue;
+        };
+        let upstream = prefetched_upstreams
+            .get(&(project.name.clone(), upstream.clone()))
+            .cloned()
+            .unwrap_or(upstream);
+        if !on_disk.contains_key(&root) {
+            on_disk.insert(root.clone(), existing_and_reserved_worktree_branches(&root));
+        }
+        let branch_result = {
+            let snapshot = on_disk.get(&root).expect("just inserted above");
+            resolve_squad_branch(store, &project, branch, squad_id, snapshot)
+        };
+        let Ok(branch) = branch_result else {
+            continue;
+        };
+        let Ok(plan) = plan_worktree(&root, &branch, on_disk.get(&root).expect("populated above"))
+        else {
+            continue;
+        };
+        if !plan.already_exists {
+            reserve_worktree_slot(&root, &plan, &branch);
+            if let Some(short) = plan.wt.file_name().and_then(|n| n.to_str()) {
+                on_disk
+                    .get_mut(&root)
+                    .expect("populated above")
+                    .insert(short.to_string(), branch.clone());
+            }
+        }
+        jobs.insert(
+            cache_key.clone(),
+            LocalWorktreeJob {
+                cache_key,
+                root,
+                branch,
+                upstream,
+                plan,
+            },
+        );
+    }
+    jobs.into_values().collect()
+}
+
+/// How many [`LocalWorktreeJob`]s [`execute_local_worktree_jobs`] runs at
+/// once. A ceiling on concurrent `git`/subprocess load, not tuned to any
+/// particular machine -- a submission with more jobs than this just runs in
+/// several back-to-back batches instead of a single one.
+const MAX_PARALLEL_WORKTREE_JOBS: usize = 8;
+
+/// Execute every planned job's (possibly slow) git work -- see
+/// [`plan_local_worktree_jobs`] -- concurrently, with no store lock held.
+/// Safe to run several jobs at once even against the same project root:
+/// each targets a distinct, already-reserved directory and a distinct
+/// branch, which is what git itself needs for concurrent `worktree add`
+/// calls to be safe.
+///
+/// Returns resolved paths keyed exactly like [`placeholder_cache_key`], for
+/// only the jobs that succeeded -- a failed job is logged and left out, so
+/// the caller's later live pass (through [`resolve_placeholders_with_prefetch`])
+/// retries it and surfaces the real error through the normal failure path,
+/// exactly as it would if this prefetch pass had never run at all.
+#[must_use]
+pub(crate) fn execute_local_worktree_jobs(jobs: &[LocalWorktreeJob]) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    for chunk in jobs.chunks(MAX_PARALLEL_WORKTREE_JOBS) {
+        let outcomes: Vec<(&str, Result<PathBuf, String>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|job| {
+                    scope.spawn(move || {
+                        (
+                            job.cache_key.as_str(),
+                            execute_worktree_plan(&job.root, &job.branch, &job.upstream, &job.plan),
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for (key, outcome) in outcomes {
+            match outcome {
+                Ok(path) => {
+                    resolved.insert(key.to_string(), path.to_string_lossy().into_owned());
+                }
+                // ralphus[ignore-rlog-pair]: this prefetch pass has no `Store` access by design (see the doc comment above); the live fallback pass records the structured failure once it retries the cell inline.
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [scheduler] prefetch worktree materialization failed (will retry \
+                     inline): {e}"
+                ),
+            }
+        }
+    }
+    resolved
+}
+
 /// Test-only entry point mirroring [`resolve_placeholders`] but taking the
 /// configured machine targets directly instead of loading them from real
 /// process environment variables -- tests cannot safely override
@@ -1547,7 +1921,16 @@ fn resolve_placeholders_with_targets(
     tasks: &[TaskRow],
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<(), String> {
-    resolve_placeholders_inner(store, squad_id, cells, tasks, targets, &HashMap::new()).map(|_| ())
+    resolve_placeholders_inner(
+        store,
+        squad_id,
+        cells,
+        tasks,
+        targets,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .map(|_| ())
 }
 
 /// The count returned is how many distinct placeholders were newly
@@ -1561,12 +1944,18 @@ fn resolve_placeholders_inner(
     tasks: &[TaskRow],
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
     prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_worktrees: &HashMap<String, String>,
 ) -> Result<usize, String> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
         .map(|t| (t.idx, t.project.as_deref()))
         .collect();
-    let mut cache: HashMap<String, String> = HashMap::new();
+    // Seeded from `prefetched_worktrees` (RAL-<pending>): a cell whose
+    // placeholder was already materialized by an earlier, unlocked, parallel
+    // pass (see `plan_local_worktree_jobs`/`execute_local_worktree_jobs`)
+    // hits this cache immediately below and skips `GitProjectStartupAdapter`
+    // entirely -- no store call, no git call, all under this call's lock.
+    let mut cache: HashMap<String, String> = prefetched_worktrees.clone();
     // Shared across every cell below, not just within one cell's own
     // resolution -- see `PlaceholderContext::on_disk_worktrees`'s doc
     // comment for why this is safe (every worktree this pass itself creates
@@ -1575,7 +1964,10 @@ fn resolve_placeholders_inner(
     // per project root per submission, rather than once per branch, is the
     // whole point).
     let on_disk_worktrees = RefCell::new(HashMap::new());
-    let mut materialized = 0usize;
+    // Prefetched entries were materialized moments ago, outside this call --
+    // still real work worth reflecting in the `worktrees.materialized` span
+    // attribute, even though the loop below never "discovers" them as new.
+    let mut materialized = prefetched_worktrees.len();
     for cell in cells.iter_mut() {
         let Some(cwd) = cell.cwd.clone() else {
             continue;
@@ -3405,5 +3797,140 @@ mod tests {
             "base-branch",
             "the new branch must track the project's checked-out branch"
         );
+    }
+
+    /// RAL-<pending>: the fast-path prefetch (`plan_local_worktree_jobs` +
+    /// `execute_local_worktree_jobs`) must produce results identical to the
+    /// live path it's meant to short-circuit -- one worktree per distinct
+    /// branch, correctly resolved and persisted -- for several cells across
+    /// several tasks in one project, the exact squad-168 shape this
+    /// optimization targets.
+    #[test]
+    fn plan_and_execute_local_worktree_jobs_materializes_every_distinct_branch() {
+        let repo = init_repo("prefetch-multi-branch");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "s0",
+                Some("ralphus:new-worktree/feat-a?upstream=main"),
+            ),
+            cell_row(
+                1,
+                0,
+                "s0",
+                Some("ralphus:new-worktree/feat-b?upstream=main"),
+            ),
+            cell_row(
+                2,
+                0,
+                "s0",
+                Some("ralphus:new-worktree/feat-c?upstream=main"),
+            ),
+        ];
+        let tasks = vec![
+            task_row(0, Some("proj")),
+            task_row(1, Some("proj")),
+            task_row(2, Some("proj")),
+        ];
+
+        let jobs = plan_local_worktree_jobs(&store, "squad-1", &cells, &tasks, &HashMap::new());
+        assert_eq!(jobs.len(), 3, "one job per distinct branch");
+        let prefetched = execute_local_worktree_jobs(&jobs);
+        assert_eq!(prefetched.len(), 3, "every job must succeed");
+
+        resolve_placeholders_with_full_prefetch(
+            &store,
+            "squad-1",
+            &mut cells,
+            &tasks,
+            &HashMap::new(),
+            &prefetched,
+            &Context::new(),
+        )
+        .expect("resolution seeded entirely from the prefetch cache");
+
+        let mut branches: Vec<String> = cells
+            .iter()
+            .map(|c| head_branch(c.cwd.as_deref().expect("resolved")))
+            .collect();
+        branches.sort();
+        assert_eq!(branches, vec!["feat-a", "feat-b", "feat-c"]);
+
+        // Restart safety must still hold: re-resolving the now-plain paths
+        // (nothing left to prefetch) is a no-op that returns the same paths.
+        let before: Vec<String> = cells.iter().map(|c| c.cwd.clone().unwrap()).collect();
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("restart no-op");
+        let after: Vec<String> = cells.iter().map(|c| c.cwd.clone().unwrap()).collect();
+        assert_eq!(before, after);
+    }
+
+    /// RAL-<pending>: the whole reason [`RESERVED_WORKTREE_SLOTS`] exists.
+    /// Two branches whose short names collide (`short_name` truncates them to
+    /// the same value -- see the existing `ensure_worktree_disambiguates_branches_sharing_a_short_name`
+    /// test), planned by two SEPARATE calls to `plan_local_worktree_jobs`
+    /// (simulating two submissions whose planning passes each take, use, and
+    /// release the store lock before either one's worktree is actually
+    /// created -- exactly what the deferred, parallel execution step makes
+    /// possible), must still land in two DIFFERENT `w/<short>` directories,
+    /// never the same one.
+    #[test]
+    fn plan_local_worktree_jobs_reserves_a_slot_before_it_is_ever_created() {
+        let repo = init_repo("prefetch-collision");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+
+        let cells_a = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+        )];
+        let tasks_a = vec![task_row(0, Some("proj"))];
+        let jobs_a =
+            plan_local_worktree_jobs(&store, "squad-1", &cells_a, &tasks_a, &HashMap::new());
+        assert_eq!(jobs_a.len(), 1);
+
+        // Squad 2's planning pass runs (and completes) BEFORE squad 1's
+        // worktree has actually been created on disk -- the race this
+        // registry exists to close.
+        let cells_b = vec![cell_row(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+        )];
+        let tasks_b = vec![task_row(0, Some("proj"))];
+        let jobs_b =
+            plan_local_worktree_jobs(&store, "squad-2", &cells_b, &tasks_b, &HashMap::new());
+        assert_eq!(jobs_b.len(), 1);
+
+        assert_eq!(
+            jobs_a[0].plan.wt,
+            worktree_dir(&repo, "test-pr-submission-a")
+        );
+        assert_ne!(
+            jobs_a[0].plan.wt, jobs_b[0].plan.wt,
+            "two colliding-short-name branches planned by two separate calls must not \
+             be assigned the same directory"
+        );
+
+        // Both still execute cleanly into their distinct, reserved slots.
+        let resolved_a = execute_local_worktree_jobs(&jobs_a);
+        let resolved_b = execute_local_worktree_jobs(&jobs_b);
+        assert_eq!(resolved_a.len(), 1);
+        assert_eq!(resolved_b.len(), 1);
+        let path_a = resolved_a.values().next().unwrap();
+        let path_b = resolved_b.values().next().unwrap();
+        assert_ne!(path_a, path_b);
+        assert_eq!(head_branch(path_a), "test-pr-submission-a");
+        assert_eq!(head_branch(path_b), "test-pr-submission-b");
     }
 }

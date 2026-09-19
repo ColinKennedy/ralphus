@@ -91,6 +91,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/health/agent-profiles": ["check health"],
     "GET /api/health/project-forks": ["check health"],
     "POST /api/health/arbiter": ["check health"],
+    "GET /api/health/catalog": ["check catalog"],
     "GET /api/cartographer": ["cartographer"],
     "POST /api/mailbox/register": ["mailbox check"],
     "POST /api/mailbox/personal/drain": ["mailbox personal-drain"],

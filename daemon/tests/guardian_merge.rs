@@ -19,9 +19,9 @@ use ralphus_daemon::guardian::{
 };
 use ralphus_daemon::guardian_merge::{
     poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees, rebase_command_progress,
-    rebase_on_manual_push, rebuild_on_base_shift, reopen_cancelled_guardian_merge,
-    reopen_straggler, restart_guardian_merge, run_feedback, run_merge, run_merge_staged,
-    start_feedback, start_merge, stop_guardian_merge, stop_merge_worker_for_cancel,
+    rebase_on_manual_push, rebuild_on_base_shift, reopen_guardian_merge, reopen_straggler,
+    restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
+    stop_guardian_merge, stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
@@ -613,7 +613,7 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
     store.lock().cancel_guardian(&gid).unwrap();
     assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "cancelled");
 
-    let reply = reopen_cancelled_guardian_merge(
+    let reply = reopen_guardian_merge(
         Arc::clone(&store),
         Arc::new(NoopRunner),
         &gid,
@@ -652,16 +652,16 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
 }
 
 #[test]
-fn reopen_cancelled_guardian_merge_rejects_a_guardian_that_is_not_cancelled() {
+fn reopen_guardian_merge_rejects_a_guardian_that_is_neither_cancelled_nor_approved() {
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (root, gid) = {
         let mut guard = store.lock();
         setup_review_with_pending_last_branch(&mut guard)
     };
 
-    // Still `collecting`, never cancelled: reopen must be rejected and the
-    // guardian state left untouched.
-    let reply = reopen_cancelled_guardian_merge(
+    // Still `collecting`, never cancelled or approved: reopen must be
+    // rejected and the guardian state left untouched.
+    let reply = reopen_guardian_merge(
         Arc::clone(&store),
         Arc::new(NoopRunner),
         &gid,
@@ -702,7 +702,7 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
     });
 
     let started = Instant::now();
-    let reply = reopen_cancelled_guardian_merge(
+    let reply = reopen_guardian_merge(
         Arc::clone(&store),
         Arc::new(NoopRunner),
         &gid,

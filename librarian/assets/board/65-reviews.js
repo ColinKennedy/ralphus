@@ -348,13 +348,25 @@
         tick();
       }
       /**
-       * Reopens a cancelled review, immediately trying a fresh merge pass.
+       * Reopens a cancelled or approved review, immediately trying a fresh
+       * merge pass. Shares its pending/disabled tracking with the
+       * "Merge / rebase" button (`pendingMergeActions`) since "Reopen"
+       * occupies that same button slot once a review is cancelled or
+       * approved (see `REOPEN_ELIGIBLE`).
        * @param {string} id
        * @returns {Promise<void>}
        */
       async function reopenReview(id) {
+        if (pendingMergeActions.has(id)) return;
         closeSquadMenu();
-        await guardianAction(`/api/guardians/${id}/reopen`);
+        pendingMergeActions.add(id);
+        if (!userIsSelecting()) renderReviewDetail();
+        try {
+          await guardianAction(`/api/guardians/${id}/reopen`);
+        } finally {
+          pendingMergeActions.delete(id);
+          if (!userIsSelecting()) renderReviewDetail();
+        }
         tick();
       }
       /**
@@ -812,6 +824,36 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
       // RALPHUS-MERGE-BUTTON:END
 
+      /** Review statuses whose primary action button is "Reopen" instead of "Merge / rebase" -- mirrors the backend's `Store::reopen_guardian` (daemon/src/guardian.rs). */
+      const REOPEN_ELIGIBLE = ["cancelled", "approved"];
+
+      /**
+       * How the "Reopen" button should read, for a review that occupies the
+       * "Merge / rebase" button's slot once it is cancelled or approved --
+       * both are otherwise dead ends for that button (see
+       * `MERGE_DISABLED_REASON`), so reopening back into `collecting` is the
+       * only way to continue one instead of starting over from scratch.
+       * @param {string} status the review's current status ("cancelled" or "approved")
+       * @param {boolean} pending whether a reopen kickoff is already in flight
+       * @returns {{label: string, enabled: boolean, tip: string}}
+       */
+      function reopenButtonView(status, pending) {
+        if (pending) {
+          return {
+            label: "Reopening…",
+            enabled: false,
+            tip: "The request has been sent — waiting for the daemon to confirm the review reopened.\nReopening also immediately stages whatever branches are already ready.\nDisabled so the same reopen cannot be submitted twice.",
+          };
+        }
+        return {
+          label: "↺ Reopen review",
+          enabled: true,
+          tip: status === "approved"
+            ? "Reopen this approved review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-approved review instead of starting a new one from scratch."
+            : "Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.",
+        };
+      }
+
       /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
@@ -1018,6 +1060,17 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               // global `.btn[disabled]` rule, so the tooltip engine's
               // mouseover listener never sees it — data-tip must live on a
               // wrapping <span> instead whenever the button may be disabled.
+              //
+              // Once a review is cancelled or approved, "Merge / rebase" is a
+              // dead end (see MERGE_DISABLED_REASON) -- this same slot becomes
+              // "Reopen" instead, so there is always a live action here rather
+              // than a permanently greyed-out button.
+              if (REOPEN_ELIGIBLE.includes(g.status)) {
+                const reopen = reopenButtonView(g.status, pendingMergeActions.has(g.id));
+                const reopenTip = esc(reopen.tip);
+                const reopenBtn = `<button class="btn primary" data-click="reopenReview" data-guardian-id="${esc(g.id)}" ${reopen.enabled ? "" : "disabled"} data-tip="${reopenTip}">${esc(reopen.label)}</button>`;
+                return reopen.enabled ? reopenBtn : `<span data-tip="${reopenTip}">${reopenBtn}</span>`;
+              }
               const merge = mergeButtonView(g.status, pendingMergeActions.has(g.id));
               const mergeTip = esc(merge.tip);
               const mergeBtn = `<button class="btn primary" data-click="mergeReview" data-guardian-id="${esc(g.id)}" data-status="${esc(g.status)}" ${merge.enabled ? "" : "disabled"} data-tip="${mergeTip}">${esc(merge.label)}</button>`;
@@ -1034,11 +1087,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             })()}
             ${(() => {
               const isPending = pendingGuardianActions.has(g.id);
+              const alreadyApproved = g.status === "approved";
+              const disabled = isPending || alreadyApproved;
               const approveTip = isPending
                 ? "Approval is in flight — waiting for the daemon to confirm."
-                : "Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
-              const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${isPending ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
-              return isPending ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
+                : alreadyApproved
+                  ? "This review is already approved.\nPress Reopen review above to make further changes, then approve again."
+                  : "Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
+              const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${disabled ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
+              return disabled ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
             })()}
             ${(() => {
               const canCancel = G_CANCELLABLE.includes(g.status);

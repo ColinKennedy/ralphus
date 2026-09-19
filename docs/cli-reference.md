@@ -304,7 +304,7 @@ the daemon's hourly Free-tier background sweep
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
-| `review reopen <selector>` | Reopen a cancelled review, immediately staging in whatever branches are already ready |
+| `review reopen <selector>` | Reopen a cancelled or approved review, immediately staging in whatever branches are already ready |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
@@ -658,7 +658,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) terminal selector [uri] --mode [open|readonly]  {Print the command to resume a cell's conversation locally.}
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --json (subagent)  {Check the local ralphus setup (daemon, git, runner, ollama). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9).}
+        - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
@@ -748,7 +749,7 @@ use; see `READ_ONLY_NOTE`.
             - unlink selector [uri]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
             - update pr_id [id] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [uri] name [str]  {Rename a review.}
-        - reopen selector [uri]  {Reopen a cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.}
+        - reopen selector [uri]  {Reopen a cancelled or approved review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
         - settings selector [uri] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
