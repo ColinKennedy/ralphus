@@ -48,6 +48,8 @@
       let _notifySeq = 0;
       /** Whether the notification-center dropdown is currently open. */
       let notifCenterOpen = false;
+      /** RAL-465: opt-in "show read messages" toggle -- off by default, so dismissed notifications stay out of the way until asked for. */
+      let notifShowRead = false;
       /** Oldest history kept; older entries are dropped so this never grows unbounded across a long-lived tab. */
       const NOTIFY_HISTORY_LIMIT = 200;
       /** An identical (kind, message) pair repeated within this window bumps the existing entry instead of spawning a new toast. */
@@ -204,7 +206,9 @@
 
       /**
        * Marks one notification dismissed (rendered in red, retained) rather
-       * than removing it from the history.
+       * than removing it from the history. Once dismissed and hidden by the
+       * default "show read messages" toggle, the next-newest notification
+       * becomes the first row shown, so dismissing effectively promotes it.
        * @param {string} id
        * @returns {void}
        */
@@ -215,7 +219,33 @@
       }
 
       /**
-       * Renders one notification-center row.
+       * Reverts one dismissed notification back to unread (RAL-465) --
+       * the inverse of dismissNotification. Removes it from the read
+       * list and returns it to the main (unread) view.
+       * @param {string} id
+       * @returns {void}
+       */
+      function undismissNotification(id) {
+        const n = boardNotifications.find((x) => x.id === id);
+        if (n) { n.dismissed = false; n.read = false; }
+        renderNotificationCenter();
+      }
+
+      /**
+       * Toggles whether already-dismissed ("read") notifications are shown
+       * in the notification-center list, mirroring the mailbox widget's
+       * toggleMailboxShowRead.
+       * @returns {void}
+       */
+      function toggleNotifShowRead() {
+        notifShowRead = !notifShowRead;
+        renderNotificationCenter();
+      }
+
+      /**
+       * Renders one notification-center row. Dismissed rows get a "mark
+       * unread" action instead of a dismiss button, so they can be moved
+       * back to the main view.
        * @param {BoardNotification} n
        * @returns {string}
        */
@@ -223,19 +253,21 @@
         const when = new Date(n.at_ms).toLocaleTimeString();
         const countSuffix = n.count > 1 ? ` ×${n.count}` : "";
         const cls = `notif-row ${n.kind}${n.dismissed ? " dismissed" : ""}${n.read ? "" : " unread"}`;
-        const dismissBtn = n.dismissed
-          ? ""
+        const actionBtn = n.dismissed
+          ? `<button type="button" class="notif-undismiss" data-click="undismissNotification" data-id="${esc(n.id)}" aria-label="Mark notification unread" data-tip="Move this notification back to unread.\nIt leaves the read list and reappears in the main view.">↺</button>`
           : `<button type="button" class="notif-dismiss" data-click="dismissNotification" data-id="${esc(n.id)}" aria-label="Dismiss notification" data-tip="Mark this notification dismissed.\nIt stays in this history, shown in red, instead of being removed -- so you can still see what happened.">×</button>`;
         return `<div class="${cls}" data-tip="${esc(NOTIFY_TIP[n.kind])}">
             <div class="notif-row-meta">${esc(when)}</div>
             <div class="notif-row-msg">${esc(n.message)}${countSuffix}</div>
-            ${dismissBtn}
+            ${actionBtn}
           </div>`;
       }
 
       /**
        * Renders the header bell's unread badge and, when open, the
-       * notification-center dropdown (newest first).
+       * notification-center dropdown (newest first). Dismissed ("read")
+       * notifications are hidden by default; the "show read messages"
+       * checkbox in the panel head opts back into seeing them (RAL-465).
        * @returns {void}
        */
       function renderNotificationCenter() {
@@ -250,11 +282,20 @@
         panel.classList.toggle("hidden", !notifCenterOpen);
         if (!notifCenterOpen) return;
         preserveUserState(panel, () => {
-          const list = boardNotifications.length
-            ? boardNotifications.map(notifRowHtml).join("")
+          const visible = notifShowRead
+            ? boardNotifications
+            : boardNotifications.filter((n) => !n.dismissed);
+          const list = visible.length
+            ? visible.map(notifRowHtml).join("")
             : `<div class="empty">No notifications yet.</div>`;
           panel.innerHTML = `<div class="notif-panel-inner" onclick="event.stopPropagation()">
-              <div class="notif-panel-head">Notifications</div>
+              <div class="notif-panel-head">
+                <span>Notifications</span>
+                <label class="notif-show-read" data-tip="Show notifications you've already dismissed, alongside the current ones.">
+                  <input type="checkbox" ${notifShowRead ? "checked" : ""} onchange="toggleNotifShowRead()">
+                  Show read
+                </label>
+              </div>
               <div id="notif-panel-list" class="notif-panel-list">${list}</div>
             </div>`;
         });
