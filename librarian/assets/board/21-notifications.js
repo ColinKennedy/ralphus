@@ -249,13 +249,15 @@
         if (!panel) return;
         panel.classList.toggle("hidden", !notifCenterOpen);
         if (!notifCenterOpen) return;
-        const list = boardNotifications.length
-          ? boardNotifications.map(notifRowHtml).join("")
-          : `<div class="empty">No notifications yet.</div>`;
-        panel.innerHTML = `<div class="notif-panel-inner" onclick="event.stopPropagation()">
-            <div class="notif-panel-head">Notifications</div>
-            <div class="notif-panel-list">${list}</div>
-          </div>`;
+        preserveUserState(panel, () => {
+          const list = boardNotifications.length
+            ? boardNotifications.map(notifRowHtml).join("")
+            : `<div class="empty">No notifications yet.</div>`;
+          panel.innerHTML = `<div class="notif-panel-inner" onclick="event.stopPropagation()">
+              <div class="notif-panel-head">Notifications</div>
+              <div id="notif-panel-list" class="notif-panel-list">${list}</div>
+            </div>`;
+        });
       }
 
       /**
