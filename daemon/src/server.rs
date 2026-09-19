@@ -11113,6 +11113,13 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 } else {
                     store.set_cell_state(id, req.task_idx, req.cell_idx, state)
                 }
+            } else if state == NodeState::Done {
+                // RAL-74/163: a plain `set_cell_state` here would leave any of
+                // this cell's own pending cell-level proofs untouched, which
+                // `effective_cell_state`'s read-time fold then reports right
+                // back as `running`/`failed` — making the override look like
+                // it never took. See `Store::force_cell_done`'s doc comment.
+                store.force_cell_done(id, req.task_idx, req.cell_idx)
             } else {
                 store.set_cell_state(id, req.task_idx, req.cell_idx, state)
             }
@@ -22363,6 +22370,50 @@ command = "true"
         assert_eq!(r.status, 200);
         let squad: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], false);
+    }
+
+    /// A cell whose own proof never ran (e.g. it was previously blocked by a
+    /// failed dependency, so it went straight to `failed` without its proof
+    /// ever leaving `pending`) must actually report `done` -- not silently
+    /// keep reading back as `running` -- once a manual `set-status` override
+    /// forces it to `done`. Before the fix, `effective_cell_state`'s
+    /// read-time fold saw the still-`pending` proof and kept overriding the
+    /// cell's displayed state back to `running` no matter how many times the
+    /// override was retried.
+    #[test]
+    fn set_status_done_on_cell_with_pending_own_proof_reports_done_not_running() {
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\ncommand=\"check\"\n";
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        d.lock()
+            .set_cell_state("squad-000000000001", 0, 0, NodeState::Failed)
+            .unwrap();
+
+        let status_body = serde_json::json!({
+            "kind": "cell",
+            "task_idx": 0,
+            "cell_idx": 0,
+            "state": "done",
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &status_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let squad: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(squad["tasks"][0]["cells"][0]["state"], "done");
+        assert_eq!(squad["tasks"][0]["cells"][0]["proof"][0]["state"], "done");
+        assert!(squad["tasks"][0]["cells"][0]["error"].is_null());
+
+        // A fresh GET must agree -- this is the exact repro of the reported
+        // bug: the override "swapping back to running" on every re-fetch.
+        let squad = route(&d, "GET", "/api/squads/squad-000000000001", "");
+        let squad: serde_json::Value = serde_json::from_str(&squad.body).unwrap();
+        assert_eq!(squad["tasks"][0]["cells"][0]["state"], "done");
     }
 
     /// RAL-271: the board's inline "Edit" button posts the same
