@@ -67,7 +67,7 @@ export function makeMailboxWidget({ currentUserName = "alice" } = {}) {
      var currentUserName = ${JSON.stringify(currentUserName)};
      ${sliceRegion()}
      return {
-       pollMailbox, toggleMailboxWidget, toggleMailboxShowRead, dismissMailboxMessage,
+       pollMailbox, toggleMailboxWidget, toggleMailboxShowRead, dismissMailboxMessage, undrainMailboxMessage,
        mailboxSorted, mailboxMsgHtml, renderMailboxWidget,
        state: () => ({ mailboxMessages, mailboxExpanded, mailboxShowRead }),
        setMessages: (msgs) => { mailboxMessages = msgs; },

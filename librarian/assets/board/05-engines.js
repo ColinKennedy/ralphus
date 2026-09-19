@@ -247,7 +247,9 @@
       CLICK_HANDLERS.overrideInheritedKey = (e, ds) => overrideInheritedKey(ds.scope || "", ds.branchId || "", ds.key || "", ds.value || "");
       CLICK_HANDLERS.autofixDefaultBranch = (e, ds) => autofixDefaultBranch(ds.project || "", ds.squadId || "", Number(ds.taskIdx));
       CLICK_HANDLERS.dismissMailboxMessage = (e, ds) => dismissMailboxMessage(ds.id || "");
+      CLICK_HANDLERS.undrainMailboxMessage = (e, ds) => undrainMailboxMessage(ds.id || "");
       CLICK_HANDLERS.dismissNotification = (e, ds) => dismissNotification(ds.id || "");
+      CLICK_HANDLERS.undismissNotification = (e, ds) => undismissNotification(ds.id || "");
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;
