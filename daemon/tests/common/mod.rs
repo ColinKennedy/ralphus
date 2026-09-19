@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
+#[allow(dead_code)]
 pub fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
@@ -25,6 +26,7 @@ pub fn git(root: &Path, args: &[&str]) -> String {
 // identity and line-ending behavior. Sharing this immutable template is safe
 // because `git init` copies its config into each test's independently created
 // `.git`; repositories, object stores, refs, and linked worktrees are not shared.
+#[allow(dead_code)]
 pub fn init_repo(root: &Path) {
     let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/git-template");
     let template_arg = format!("--template={}", template.display());
