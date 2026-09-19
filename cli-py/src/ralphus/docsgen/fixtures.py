@@ -756,6 +756,7 @@ TASKS_SQUADS: tuple[Json, ...] = (
 TASKS_ROUTES: Routes = {
     "/api/tasks": {"daemon": _daemon_status(running=1), "squads": list(TASKS_SQUADS)},
     "/api/guardians": [],
+    "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
 }
