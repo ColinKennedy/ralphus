@@ -193,60 +193,36 @@ pub fn with_uri(mut payload: Value, uri: String) -> Value {
     payload
 }
 
-/// Appended to a resumed agent's context in `--mode readonly` (mirrors
-/// Python's `_READONLY_RESUME_INSTRUCTIONS`).
-const READONLY_RESUME_INSTRUCTIONS: &str = "You are in read-only mode. You may only read files. Do NOT write, \
-edit, delete, commit, or push anything.";
-
-/// Builds the local CLI command that resumes `agent_session_id`, ported from
-/// Python's `_agent_resume_command` (itself a hand-mirrored duplicate of
-/// `daemon/src/server.rs::open_agent_terminal`'s dispatch -- see that
-/// function's docstring for why there is no single shared implementation).
+/// Builds the local CLI command that resumes `agent_session_id`, delegating
+/// to [`ralphus_core::agent_resume::agent_resume_argv`] (shared with
+/// `cli/src/commands/review.rs` and, for the daemon's own spawn path,
+/// `daemon/src/server.rs::open_agent_terminal`) so this printed command
+/// matches what "Open Agent" itself would actually run.
+///
+/// `claude_program`/`codex_program`/`pi_program` are resolved from the
+/// `RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`/`RALPHUS_PI_COMMAND` env
+/// overrides here, falling back to the bare agent name -- RAL-468: this used
+/// to hardcode the literal names, silently ignoring the same override the
+/// daemon's real spawn already respected.
+#[must_use]
 pub fn agent_resume_command(
     agent: Option<&str>,
     agent_session_id: &str,
     mode: &str,
 ) -> Vec<String> {
-    let mut cmd: Vec<String>;
-    if matches!(agent, Some("codex") | Some("codex-cli")) {
-        // The top-level interactive `codex resume`, not `codex exec resume`
-        // (Codex's non-interactive headless mode, which requires a prompt
-        // argument or piped stdin and fails immediately with "No prompt
-        // provided" otherwise -- exactly the reported symptom of resuming
-        // this way into an interactive terminal with nothing to pipe in).
-        cmd = vec!["codex".to_string()];
-        if mode == "readonly" {
-            cmd.push("-c".to_string());
-            cmd.push(format!(
-                "developer_instructions={READONLY_RESUME_INSTRUCTIONS}"
-            ));
-        }
-        cmd.push("resume".to_string());
-        cmd.push(agent_session_id.to_string());
-    } else if matches!(agent, Some("pi")) {
-        cmd = vec![
-            "pi".to_string(),
-            "--session".to_string(),
-            agent_session_id.to_string(),
-            "--approve".to_string(),
-        ];
-        if mode == "readonly" {
-            cmd.push("--append-system-prompt".to_string());
-            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
-        }
-    } else {
-        cmd = vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            agent_session_id.to_string(),
-        ];
-        if mode == "readonly" {
-            cmd.push("--dangerously-skip-permissions".to_string());
-            cmd.push("--append-system-prompt".to_string());
-            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
-        }
-    }
-    cmd
+    let claude_program =
+        std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+    let codex_program =
+        std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
+    let pi_program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
+    ralphus_core::agent_resume::agent_resume_argv(
+        agent,
+        agent_session_id,
+        mode,
+        &claude_program,
+        &codex_program,
+        &pi_program,
+    )
 }
 
 #[must_use]

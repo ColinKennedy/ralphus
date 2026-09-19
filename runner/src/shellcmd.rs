@@ -19,7 +19,6 @@ use crate::hostos::is_windows;
 pub const SHELL_AUTO: &str = "auto";
 
 const REAL_SHELLS: &[&str] = &["powershell", "pwsh", "cmd", "bash", "sh", "zsh", "fish"];
-const POWERSHELLS: &[&str] = &["powershell", "pwsh"];
 const ANCESTRY_MAX_DEPTH: u32 = 12;
 
 /// The argv prefix that makes each shell run one command line as a single
@@ -253,66 +252,13 @@ fn is_executable_posix(_path: &str) -> bool {
     false
 }
 
-/// Quotes `value` as exactly one literal token for `shell`.
-#[must_use]
-pub fn quote_for_shell(shell: &str, value: &str) -> String {
-    if POWERSHELLS.contains(&shell) {
-        return format!("'{}'", value.replace('\'', "''"));
-    }
-    if shell == "cmd" {
-        if value.is_empty() || value.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
-            return format!("\"{}\"", value.replace('"', "\"\""));
-        }
-        return value.to_string();
-    }
-    if shell == "fish" {
-        return format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
-    }
-    posix_quote(value)
-}
-
-/// Equivalent to Python's `shlex.quote`: wraps in single quotes unless the
-/// value contains only shell-safe characters, splicing embedded single
-/// quotes as `'\''`.
-fn posix_quote(value: &str) -> String {
-    let is_safe = !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "@%_+=:,./-".contains(c));
-    if is_safe {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// A `shell` command line that runs `program` with `args`, all quoted.
-/// PowerShell needs the `&` call operator -- a quoted string in command
-/// position is just a string literal to it, not something to execute.
-#[must_use]
-pub fn build_program_command_line(shell: &str, program: &str, args: &[String]) -> String {
-    let mut tokens = vec![quote_for_shell(shell, program)];
-    tokens.extend(args.iter().map(|a| quote_for_shell(shell, a)));
-    let line = tokens.join(" ");
-    if POWERSHELLS.contains(&shell) {
-        format!("& {line}")
-    } else {
-        line
-    }
-}
-
-/// Appends `args` (quoted for `shell`) to an opaque `raw_command` shell line.
-#[must_use]
-pub fn build_compound_command_line(shell: &str, raw_command: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        return raw_command.to_string();
-    }
-    let tail = args
-        .iter()
-        .map(|a| quote_for_shell(shell, a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{raw_command} {tail}")
-}
+/// Quoting/compound-command-line-building is shared with [`crate::agent_resume`]'s
+/// resume path in `ralphus-core` (RAL-468) so a compound `RALPHUS_CLAUDE_COMMAND`
+/// launches and resumes through the identical quoting logic instead of two
+/// hand-duplicated copies drifting apart.
+pub use ralphus_core::shellcmd::{
+    build_compound_command_line, build_program_command_line, quote_for_shell,
+};
 
 /// The `(args, use_shell)` pair to hand a process spawn for `command_line`.
 /// Everything gets an explicit argv except cmd.exe on Windows, which needs
@@ -415,35 +361,6 @@ pub fn cmd_raw_shell_command(line: &str) -> std::process::Command {
 mod tests {
     use super::*;
 
-    #[test]
-    fn quote_for_shell_powershell_doubles_single_quotes() {
-        assert_eq!(quote_for_shell("powershell", "it's"), "'it''s'");
-    }
-
-    #[test]
-    fn quote_for_shell_cmd_wraps_on_space() {
-        assert_eq!(quote_for_shell("cmd", "hello world"), "\"hello world\"");
-        assert_eq!(quote_for_shell("cmd", "noSpace"), "noSpace");
-    }
-
-    #[test]
-    fn quote_for_shell_posix_passes_through_safe_tokens() {
-        assert_eq!(quote_for_shell("bash", "safe-token_1"), "safe-token_1");
-        assert_eq!(quote_for_shell("bash", "needs quoting"), "'needs quoting'");
-    }
-
-    #[test]
-    fn build_program_command_line_adds_call_operator_for_powershell() {
-        let line = build_program_command_line("powershell", "claude", &["--foo".to_string()]);
-        assert!(line.starts_with("& "));
-    }
-
-    #[test]
-    fn build_program_command_line_no_call_operator_for_bash() {
-        let line = build_program_command_line("bash", "claude", &["--foo".to_string()]);
-        assert!(!line.starts_with('&'));
-    }
-
     /// RAL-385: cmd.exe cannot carry a newline, and silently truncating the
     /// command line there is what made the original failure so hard to read.
     #[test]
@@ -468,12 +385,6 @@ mod tests {
         let args = vec!["a\nb".to_string()];
         let spawn_args = SpawnArgs::Argv(vec!["bash".to_string(), "-c".to_string()]);
         assert!(command_for_spawn_args(spawn_args, &args).is_ok());
-    }
-
-    #[test]
-    fn build_compound_command_line_appends_quoted_args() {
-        let line = build_compound_command_line("bash", "cd /foo && claude", &["a b".to_string()]);
-        assert_eq!(line, "cd /foo && claude 'a b'");
     }
 
     #[test]
