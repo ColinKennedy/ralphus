@@ -18,9 +18,9 @@ rem
 rem By default this also builds the vendored psmux (RAL-347, vendor/psmux git
 rem submodule) and links it into ralphus-daemon.exe via the `embedded-tmux`
 rem feature, so a release build works out of the box without a separate tmux
-rem install. Set RALPHUS_SKIP_VENDORED_TMUX=1 to skip this (e.g. no network
-rem access to build the submodule, or you intentionally always point
-rem RALPHUS_TMUX_CMD at your own binary) and build without embedded-tmux.
+rem install. Pass --skip-tmux to skip this (e.g. no network access to build
+rem the submodule, or you intentionally always point RALPHUS_TMUX_CMD at your
+rem own binary) and build without embedded-tmux.
 
 set "root=%~dp0.."
 for %%I in ("%root%") do set "root=%%~fI"
@@ -39,8 +39,8 @@ for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh-
 )
 
 set "daemon_features="
-if "%RALPHUS_SKIP_VENDORED_TMUX%"=="1" (
-  echo == RALPHUS_SKIP_VENDORED_TMUX=1: skipping vendored psmux build ==
+if /I "%~1"=="--skip-tmux" (
+  echo == --skip-tmux: skipping vendored psmux build ==
 ) else (
   echo == building vendored psmux ^(vendor/psmux submodule^) ==
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build-vendored-tmux.ps1"

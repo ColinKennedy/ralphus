@@ -76,6 +76,13 @@ This applies to code comments and docstrings project-wide. Architecture
 narrative in `AGENTS.md` files is a separate case — those documents are meant
 to record where things came from.
 
+## Keep shell and batch scripts in parity
+
+When changing a script with both `scripts/*.sh` and `scripts/*.cmd` entry
+points, make the corresponding behavior available in both. Platform-specific
+implementation details may differ, but their user-facing options and intent
+must remain aligned.
+
 ## External CLI calls use long flags
 
 Every invocation this repo makes of another command-line tool -- `git`, `gh`,

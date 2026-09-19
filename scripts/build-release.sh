@@ -15,6 +15,11 @@
 # screenshots, dev-only, never shipped) -- see AGENTS.md.
 set -euo pipefail
 
+skip_tmux=false
+if [[ "${1:-}" == "--skip-tmux" ]]; then
+  skip_tmux=true
+fi
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 dist="$root/dist"
 mkdir -p "$dist"
@@ -31,8 +36,25 @@ for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh
   done
 done
 
+daemon_feature=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [[ "$skip_tmux" == true ]]; then
+      echo "== --skip-tmux: skipping vendored psmux build =="
+    else
+      echo "== building vendored psmux (vendor/psmux submodule) =="
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$root/scripts/build-vendored-tmux.ps1"
+      daemon_feature="--features ralphus-daemon/embedded-tmux"
+    fi
+    ;;
+esac
+
 echo "== building Rust executables (release) =="
-cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml"
+if [[ -n "$daemon_feature" ]]; then
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml" "$daemon_feature"
+else
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml"
+fi
 for bin in ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider; do
   for ext in "" ".exe"; do
     src="$root/target/release/${bin}${ext}"

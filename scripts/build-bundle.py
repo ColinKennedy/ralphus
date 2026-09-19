@@ -299,7 +299,8 @@ def assemble_bundle(
             raise FileNotFoundError(
                 f"required tmux asset missing: {required} -- run "
                 "scripts/build-vendored-tmux.ps1 (scripts/build-release.cmd does this by "
-                "default unless RALPHUS_SKIP_VENDORED_TMUX=1) before assembling a bundle"
+                "default) "
+                "before assembling a bundle"
             )
     actual_hash = sha256_file(tmux_exe)
     version_text = read_version(tmux_exe)

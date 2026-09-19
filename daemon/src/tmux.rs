@@ -1649,7 +1649,7 @@ pub fn watch_for_exit(pid: u32) -> std::sync::mpsc::Receiver<ProcessExit> {
 /// populates `daemon/assets/tmux/windows/tmux.exe` (see
 /// `daemon/assets/tmux/windows/README.md` and `docs/tmux-embedding.md`), and
 /// rebuilding. `scripts/build-release.cmd` does both by default (opt out via
-/// `RALPHUS_SKIP_VENDORED_TMUX=1`), which is how release/GitHub-release
+/// `--skip-tmux`), which is how release/GitHub-release
 /// bundles ship it out of the box. Without the feature (or on a platform with
 /// no embedded asset yet), [`extract`] returns a clear error rather than
 /// panicking or silently no-opping, and [`super::resolve_tmux_program`] falls

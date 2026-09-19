@@ -7,8 +7,8 @@
 # on its own -- so a plain `cargo build`/`cargo test` never needs the
 # submodule checked out or psmux's own dependency tree fetched. Run this
 # first, then `cargo build --release --features ralphus-daemon/embedded-tmux`
-# (scripts/build-release.cmd does both by default; opt out with
-# RALPHUS_SKIP_VENDORED_TMUX=1).
+# (the Windows paths in scripts/build-release.cmd and build-release.sh do both
+# by default; opt out with --skip-tmux).
 [CmdletBinding()]
 param()
 
