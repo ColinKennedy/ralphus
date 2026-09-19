@@ -36,7 +36,7 @@ for stale in ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh
   done
 done
 
-daemon_features=()
+daemon_feature=""
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     if [[ "$skip_tmux" == true ]]; then
@@ -44,13 +44,17 @@ case "$(uname -s)" in
     else
       echo "== building vendored psmux (vendor/psmux submodule) =="
       powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$root/scripts/build-vendored-tmux.ps1"
-      daemon_features=(--features ralphus-daemon/embedded-tmux)
+      daemon_feature="--features ralphus-daemon/embedded-tmux"
     fi
     ;;
 esac
 
 echo "== building Rust executables (release) =="
-cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml" "${daemon_features[@]}"
+if [[ -n "$daemon_feature" ]]; then
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml" "$daemon_feature"
+else
+  cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "$root/Cargo.toml"
+fi
 for bin in ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider; do
   for ext in "" ".exe"; do
     src="$root/target/release/${bin}${ext}"
