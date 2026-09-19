@@ -1184,8 +1184,8 @@ fn route_for_user(
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
         // RAL-416: catalog-driven health administration -- read-only, admin
-        // gated like the other machine/health board surfaces above.
-        // ralphus[ignore-endpoint-cli]: board admin Catalog tab; `ralphus check catalog` reads ralphus_core::health_catalog directly instead of this route
+        // gated like the other machine/health board surfaces above. Mapped to
+        // `check catalog` in check_endpoint_cli_parity.py's manifest.
         ("GET", ["api", "health", "catalog"]) => {
             admin_gated(daemon, user_header, health_catalog_reply)
         }
