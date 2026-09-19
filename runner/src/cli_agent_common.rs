@@ -33,14 +33,10 @@ pub fn shell_command_line(shell: &str, program: &str, args: &[String]) -> String
     shellcmd::build_compound_command_line(shell, program, args)
 }
 
-#[must_use]
-pub fn is_compound_command(value: &str) -> bool {
-    let trimmed = value.trim();
-    if !trimmed.contains(' ') {
-        return false;
-    }
-    !is_quote_wrapped(trimmed)
-}
+/// Shared with [`ralphus_core::agent_resume`]'s resume path (RAL-468) so a
+/// compound `RALPHUS_CLAUDE_COMMAND` launches and resumes through the
+/// identical "is this a shell line" test.
+pub use ralphus_core::shellcmd::is_compound_command;
 
 /// Whether a launcher must be passed through a shell instead of directly to
 /// `Command::new`. Windows batch wrappers need `cmd /C` even when their path
@@ -85,13 +81,6 @@ pub fn preflight_default_program(
     shellcmd::find_program(program)
         .ok_or_else(|| BackendError(format!("program {program:?} is not resolvable on PATH")))?;
     Ok(())
-}
-
-fn is_quote_wrapped(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
 }
 
 fn task_prompts_dir() -> PathBuf {
