@@ -462,8 +462,13 @@ test("ntCancelActiveGenerations posts a cancel request per active job id and cle
 // user changes it, not linger until the next submit attempt.
 
 test("the Agent and Project selects clear their own field error on change", () => {
-  assert.match(boardSource, /onchange="ntSimple\.agent=this\.value;ntSimple\.model='';ntClearFieldError\('agent'\);renderNewTaskModal\(\)"/, "Agent's onchange must clear its field error");
-  assert.match(boardSource, /onchange="ntSimple\.project=this\.value;ntClearFieldError\('project'\);renderNewTaskModal\(\)"/, "Project's onchange must clear its field error");
+  assert.match(boardSource, /renderAgentSelectHtml\("nt-agent",\s*agentCwd,\s*ntSimple\.agent,\s*"onNtAgentChange"/, "Agent must render through the shared agent-select component, wired to onNtAgentChange");
+  const body = boardSource.slice(boardSource.indexOf("function onNtAgentChange("));
+  const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
+  assert.match(fn, /ntSimple\.agent\s*=\s*value/, "onNtAgentChange must update the agent field");
+  assert.match(fn, /ntSimple\.model\s*=\s*""/, "onNtAgentChange must clear the model field, since suggestions are agent-specific");
+  assert.match(fn, /ntClearFieldError\("agent"\)/, "onNtAgentChange must clear agent's field error");
+  assert.match(boardSource, /onchange="ntSimple\.project=this\.value;ntClearFieldError\('project'\);ntPreloadNewTaskAgentDefault\(ntSimpleAgentCwd\(\)\);renderNewTaskModal\(\)"/, "Project's onchange must clear its field error and warm the agent cache for the newly selected project");
 });
 
 test("the prompt textarea and a template field clear their error inline (no full re-render) on input", () => {
@@ -488,7 +493,7 @@ test("ntClearFieldErrorInline removes both the .err class and the field's error 
 // widgets stay level regardless of which column has an error.
 
 test("the Agent/Model and Project/Upstream rows override align-items to flex-start", () => {
-  const agentRowAt = boardSource.indexOf('data-tip="Which agent backend runs the work cell.');
+  const agentRowAt = boardSource.indexOf('renderAgentSelectHtml("nt-agent"');
   const agentRowStart = boardSource.lastIndexOf('<div class="row"', agentRowAt);
   assert.match(boardSource.slice(agentRowStart, agentRowAt), /align-items:flex-start/, "the Agent/Model row must top-align its columns");
 

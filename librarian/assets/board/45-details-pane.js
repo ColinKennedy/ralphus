@@ -1260,10 +1260,25 @@
       }
 
       /**
-       * Switches the details pane into edit mode.
+       * Switches the details pane into edit mode. For a cell, also eagerly
+       * warms the agent-select combo box's option list (RAL-466) so it
+       * doesn't render as a single placeholder until clicked; the delayed
+       * re-render this may trigger goes through `preserveUserState` so it
+       * can't clobber in-progress typing elsewhere in the form.
        * @returns {void}
        */
-      function startEdit() { editing = true; preserveUserState(document.getElementById("details"), renderDetails); }
+      function startEdit() {
+        editing = true;
+        preserveUserState(document.getElementById("details"), renderDetails);
+        if (sel.kind === "cell") {
+          const r = findSquad(selectedSquadId);
+          const s = r && r.tasks[sel.taskIdx] && r.tasks[sel.taskIdx].cells[sel.cellIdx];
+          if (s) {
+            const cwd = s.cwd || "";
+            preloadAgentSelect(cwd, () => editing && sel.kind === "cell", () => preserveUserState(document.getElementById("details"), renderDetails));
+          }
+        }
+      }
       /**
        * Exits edit mode without saving.
        * @returns {void}
@@ -1281,6 +1296,18 @@
         byId("agent-fields").classList.toggle("hidden", !agent);
         byId("command-fields").classList.toggle("hidden", agent);
       }
+      /**
+       * `onchange` handler for the cell edit form's agent `<select>`
+       * (required by `renderAgentSelectHtml`'s shared markup). A no-op:
+       * unlike the Reviews/Project-Settings draft objects, `saveEdit()`
+       * reads this field's live DOM value directly, so there's nothing to
+       * stage here.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onCellEditAgentChange(value) { /* no-op -- see saveEdit() */ }
+      // Knip reference: used as an onchange callback string in renderAgentSelectHtml
+      void onCellEditAgentChange;
       /**
        * Renders the edit form for the current selection (squad label, task fields, or cell fields).
        * @param {SquadView} r
@@ -1307,18 +1334,13 @@
         } else {
           const s = r.tasks[sel.taskIdx].cells[sel.cellIdx];
           const isCmd = !!s.command;
-          // Known agents in this codebase (core/src/schema.rs default is "claude";
-          // the runner dispatches "claude"/"anthropic", "claude-code"/"claude-cli",
-          // "codex"/"codex-cli", and "ollama"). Backed by a datalist so the input stays free-text.
-          const agents = ["claude", "claude-code", "codex", "codex-cli", "ollama"];
           fields = `<label>mode<select id="e-mode" onchange="onModeChange()">
               <option value="agent"${isCmd ? "" : " selected"}>Agent</option>
               <option value="command"${isCmd ? " selected" : ""}>Command</option>
             </select></label>
             <label>cwd<input id="e-cwd" value="${esc(s.cwd || "")}"></label>
             <div id="agent-fields"${isCmd ? ' class="hidden"' : ""}>
-              <label>agent<input id="e-agent" list="e-agent-list" value="${esc(s.agent || "")}">
-                <datalist id="e-agent-list">${agents.map((a) => `<option value="${a}">`).join("")}</datalist></label>
+              <label>agent${renderAgentSelectHtml("e-agent", s.cwd || "", s.agent || "", "onCellEditAgentChange")}</label>
               <label>model<input id="e-model" value="${esc(s.model || "")}"></label>
               <label>prompt<textarea id="e-prompt" rows="5"${s.prompt == null ? " disabled" : ""}>${esc(s.prompt || "")}</textarea></label>${s.prompt == null ? `<div class="warn" style="margin:2px 0 6px" data-tip="The prompt text is fetched separately from the squad list and has not arrived yet.
 It is held back rather than shown blank, so saving cannot overwrite it with an empty value.">prompt still loading — it will not be modified by this save</div>` : ""}

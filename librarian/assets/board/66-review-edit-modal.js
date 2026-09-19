@@ -178,8 +178,11 @@
           g = guardians.find((x) => x.id === gid);
           if (!g || !g.branches) { notify("error", "Failed to load review details."); return; }
         }
-        reviewEditDraft = buildReviewEditDraft(g);
+        const draft = buildReviewEditDraft(g);
+        reviewEditDraft = draft;
         renderReviewEditModal();
+        const cwd = g.git_root || (g.projects && g.projects[0]) || "";
+        preloadAgentSelect(cwd, () => reviewEditDraft === draft, renderReviewEditModal);
       }
 
       /**
@@ -448,7 +451,7 @@
         return frozen
           ? `<div class="kv-row"><span class="k">resolver agent</span><span class="v mono">${esc(resolverAgent || "agent default")}</span></div>
              <div class="kv-row"><span class="k">resolver model</span><span class="v mono">${esc(resolverModel || "agent default")}</span></div>`
-          : `<div class="kv-row"><span class="k">resolver agent</span><select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onAgentChange}(this.value)" onmousedown="onResolverSelectMouseDown(event,this,${JSON.stringify(cwd)})" data-tip="Conflict-resolver backend used when the AI agent resolves merge conflicts. Applies on Save.">${resolverOptionHtml(cwd, resolverAgent)}</select></div>
+          : `<div class="kv-row"><span class="k">resolver agent</span>${renderAgentSelectHtml("", cwd, resolverAgent, onAgentChange, REVIEW_EDIT_INPUT_STYLE, "Conflict-resolver backend used when the AI agent resolves merge conflicts. Applies on Save.")}</div>
              <div class="kv-row"><span class="k">resolver model</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(resolverModel)}" placeholder="agent default" oninput="${onModelChange}(this.value)" data-tip="Exact model passed to the selected resolver agent. Clear to use the agent's default. Applies on Save."></div>`;
       }
       /**
