@@ -163,28 +163,12 @@
        * @property {NtTemplateField[]} fields
        * @property {string} [prompt_template]
        */
-      /**
-       * @typedef {object} NtCatalogAgent
-       * @property {string} id
-       * @property {string} kind
-       * @property {string} backend
-       * @property {string[]} models
-       */
-      /** @type {NtCatalogAgent[]} */
-      const NT_FALLBACK_AGENTS = [
-        { id: "claude", kind: "builtin", backend: "claude", models: [] },
-        { id: "claude-code", kind: "builtin", backend: "claude-code", models: ["sonnet", "opus", "haiku", "fable"] },
-        { id: "ollama", kind: "builtin", backend: "ollama", models: [] },
-      ];
       /** @type {NtTemplate[]} loaded from GET /api/config/templates */
       let ntTemplates = [];
       /** whether `ntTemplates` is just the built-in fallback (zero valid [[templates]] configured) */
       let ntTemplatesFallback = true;
       /** the `.ralphus.toml [ui] new_task_default_tab` value, applied the next time the modal opens */
       let ntConfigDefaultTab = "simple";
-      /** @type {NtCatalogAgent[]} loaded from GET /api/agents/catalog */
-      let ntAgentCatalog = [];
-      let ntAgentCatalogDefault = "claude";
       /**
        * @typedef {object} NtListItem
        * @property {string} label
@@ -252,7 +236,7 @@
         return {
           templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
           label: "",
-          prompt: "", fieldValues: {}, agent: ntAgentCatalogDefault, model: "",
+          prompt: "", fieldValues: {}, agent: "", model: "",
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
           skipAutoBuild: true, generateAutoBuild: true,
           proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
@@ -290,16 +274,19 @@
         }
       }
       /**
-       * Loads the Simple tab's template list and agent catalog, then
-       * re-renders if the modal is still open on the Simple tab. Never
-       * throws — a network failure just leaves the hardcoded fallbacks in
-       * place, the same graceful-degradation pattern `fetchAgentOptionsEntry`
-       * uses for the review-resolver dropdown.
+       * Loads the Simple tab's template list, then re-renders if the modal
+       * is still open on the Simple tab. Never throws — a network failure
+       * just leaves the hardcoded template fallback in place, the same
+       * graceful-degradation pattern `fetchAgentOptionsEntry` uses for the
+       * review-resolver dropdown. The agent field's default is resolved
+       * separately by `ntPreloadNewTaskAgentDefault`, RAL-466: it shares
+       * `65-reviews.js`'s cwd-scoped `/api/agents` machinery instead of the
+       * cwd-independent `/api/agents/catalog` this used to call.
        * @returns {Promise<void>}
        */
       async function loadNtSimpleConfig() {
         try {
-          const [tplResp, catResp] = await Promise.all([fetch("/api/config/templates"), fetch("/api/agents/catalog")]);
+          const tplResp = await fetch("/api/config/templates");
           if (tplResp.ok) {
             const tpl = await tplResp.json();
             ntTemplates = tpl.templates || [];
@@ -309,15 +296,63 @@
               ntSimple.templateName = ntTemplates[0].name;
             }
           }
-          if (catResp.ok) {
-            const cat = await catResp.json();
-            ntAgentCatalog = cat.agents || [];
-            ntAgentCatalogDefault = cat.default_agent || "claude";
-            if (!ntSimple.agent) ntSimple.agent = ntAgentCatalogDefault;
-          }
-        } catch (e) { /* keep the hardcoded fallbacks; the form stays usable */ }
+        } catch (e) { /* keep the hardcoded fallback; the form stays usable */ }
         if (ntTab === "simple") renderNewTaskModal();
+        ntPreloadNewTaskAgentDefault(ntSimpleAgentCwd());
       }
+      /**
+       * The cwd the Simple tab's agent field should resolve options
+       * against: the currently-selected project's path, or `""` when no
+       * project is picked yet (matches the "no cwd known yet" convention
+       * `ensureAgentOptionsLoaded`/`agentSelectOptionHtml` already use for
+       * the review-resolver and Squad edit-agent fields).
+       * @returns {string}
+       */
+      function ntSimpleAgentCwd() {
+        const project = projects.find((p) => p.name === ntSimple.project);
+        return project ? project.path : "";
+      }
+      /**
+       * Warms the shared agent-select cache for `cwd` and, unlike
+       * `preloadAgentSelect`, also fills in a concrete default agent id
+       * once resolved, RAL-466: the Simple tab's `agent` field must hold a
+       * real value at submit time (the built TOML always writes an
+       * explicit `agent = ...` line and `ntValidateSimpleFields` requires
+       * it), so leaving it blank until the user opens the dropdown isn't
+       * an option here the way it is for the review-resolver field's
+       * "blank means inherit" convention. No-ops once the user has picked
+       * an agent, or once a prior call already filled one in. Guards
+       * against a closed/reset modal the same way `preloadAgentSelect`
+       * guards against a closed/replaced review-edit draft.
+       * @param {string} cwd
+       * @returns {void}
+       */
+      function ntPreloadNewTaskAgentDefault(cwd) {
+        const state = ntSimple;
+        ensureAgentOptionsLoaded(cwd).then((entry) => {
+          if (ntSimple !== state || state.agent) return;
+          state.agent = entry.defaultAgent;
+          if (ntModalOpen && ntTab === "simple") renderNewTaskModal();
+        });
+      }
+      /**
+       * `onchange` handler for the Simple tab's shared agent `<select>`
+       * (`renderAgentSelectHtml`'s `onChangeFnName` must be a literal
+       * global function name, not a closure) -- mirrors the field's old
+       * inline handler: picking a new agent clears the model field (its
+       * suggestions/validity are agent-specific) and any stale "Agent is
+       * required" error.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onNtAgentChange(value) {
+        ntSimple.agent = value;
+        ntSimple.model = "";
+        ntClearFieldError("agent");
+        renderNewTaskModal();
+      }
+      // Knip reference: used as an onchange callback string in renderAgentSelectHtml
+      void onNtAgentChange;
       // RALPHUS-SIMPLE-TAB:BEGIN
       // Pure decision logic for the Simple tab (RAL-297): template
       // resolution/fallback, field validation, the generic editable-list-
@@ -996,11 +1031,8 @@
             ${esc(f.label || f.name)}${f.required ? " *" : ""}
             <input class="${ntFieldErrorText(`field:${f.name}`) ? "err" : ""}" style="${NT_INPUT_STYLE}" value="${esc(ntSimple.fieldValues[f.name] || "")}" oninput="ntSimple.fieldValues[${JSON.stringify(f.name)}]=this.value;ntClearFieldErrorInline(${JSON.stringify(`field:${f.name}`)}, this)">
           </label>${ntFieldErrorHtml(`field:${f.name}`)}`).join("");
-        const catalog = ntAgentCatalog.length ? ntAgentCatalog : NT_FALLBACK_AGENTS;
-        const sortedCatalog = [...catalog].sort((a, b) => a.id.localeCompare(b.id));
-        const agentOptions = sortedCatalog.map((a) => `<option value="${esc(a.id)}" ${a.id === ntSimple.agent ? "selected" : ""}>${esc(a.id)}${a.id === ntAgentCatalogDefault ? " (default)" : ""}</option>`).join("");
-        const selectedAgent = catalog.find((a) => a.id === ntSimple.agent);
-        const modelDatalist = ((selectedAgent && selectedAgent.models) || []).map((m) => `<option value="${esc(m)}">`).join("");
+        const agentCwd = ntSimpleAgentCwd();
+        const agentStyle = NT_INPUT_STYLE + (ntFieldErrorText("agent") ? ";border-color:var(--failed)" : "");
         const projectOptions = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === ntSimple.project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
         const selectedProject = projects.find((p) => p.name === ntSimple.project);
         const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
@@ -1021,21 +1053,20 @@
           </label>
           ${ntFieldErrorHtml("prompt")}
           <div class="row" style="gap:8px;margin-top:8px;align-items:flex-start">
-            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which agent backend runs the work cell. Independent of the chosen project — not scoped to any particular worktree.">
+            <label style="flex:1;font-size:12px;color:var(--muted)">
               Agent
-              <select class="${ntFieldErrorText("agent") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.agent=this.value;ntSimple.model='';ntClearFieldError('agent');renderNewTaskModal()">${agentOptions}</select>
+              ${renderAgentSelectHtml("nt-agent", agentCwd, ntSimple.agent, "onNtAgentChange", agentStyle, "Which agent backend runs the work cell. Scoped to the selected project's worktree, if any, so any custom agent profiles registered for it show up here too.")}
               ${ntFieldErrorHtml("agent")}
             </label>
-            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The model to use. Choices are scoped to the selected agent when known, but you can type any model name — an unsupported value fails at submit time, not as you type.">
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The model to use. You can type any model name — an unsupported value fails at submit time, not as you type.">
               Model
-              <input list="nt-model-list" style="${NT_INPUT_STYLE}" value="${esc(ntSimple.model)}" oninput="ntSimple.model=this.value" placeholder="(agent default)">
-              <datalist id="nt-model-list">${modelDatalist}</datalist>
+              <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.model)}" oninput="ntSimple.model=this.value" placeholder="(agent default)">
             </label>
           </div>
           <div class="row" style="gap:8px;margin-top:8px;align-items:flex-start">
             <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which registered project the work runs against. The task always runs in a fresh worktree branch for this project — never the project's raw checkout directly.">
               Project
-              <select class="${ntFieldErrorText("project") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;ntClearFieldError('project');renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
+              <select class="${ntFieldErrorText("project") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;ntClearFieldError('project');ntPreloadNewTaskAgentDefault(ntSimpleAgentCwd());renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
               ${ntFieldErrorHtml("project")}
             </label>
             ${showUpstream ? `

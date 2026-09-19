@@ -143,6 +143,8 @@
           projectReviewSettingsDraft = buildProjectReviewSettingsDraft(project, {});
         }
         renderProjectReviewSettingsModal();
+        const draft = projectReviewSettingsDraft;
+        preloadAgentSelect(draft.cwd, () => projectReviewSettingsDraft === draft, renderProjectReviewSettingsModal);
       }
 
       /**
