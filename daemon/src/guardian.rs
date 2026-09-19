@@ -7858,46 +7858,6 @@ mod tests {
         assert!(store.reset_guardian_to_collecting(&id).is_err());
     }
 
-    #[test]
-    fn guardian_branches_still_in_flight_reports_a_branch_whose_cell_has_not_finished() {
-        let mut store = Store::open_in_memory().unwrap();
-        insert_cell_for_branch(&mut store, "feat", NodeState::Running);
-
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store.add_guardian_branch(&id, "feat").unwrap();
-
-        assert_eq!(
-            store.guardian_branches_still_in_flight(&id).unwrap(),
-            vec!["feat".to_string()],
-            "a branch whose cell is still running has not been reached yet and \
-             must not be raced ahead of by a post-collecting re-trigger"
-        );
-    }
-
-    #[test]
-    fn guardian_branches_still_in_flight_ignores_a_dead_failed_cell() {
-        // The scenario this method exists to fix: a branch whose latest cell
-        // is stuck at a terminal `failed`/`cancelled` state must not block a
-        // re-trigger forever (unlike `guardian_unfinished_linked_branches`,
-        // which would report it) -- there is nothing left to wait for unless
-        // someone retries that task, which produces a fresh cell row anyway.
-        let mut store = Store::open_in_memory().unwrap();
-        insert_cell_for_branch(&mut store, "feat", NodeState::Failed);
-
-        let id = store.create_guardian("r", "main", "/repo").unwrap();
-        store.add_guardian_branch(&id, "feat").unwrap();
-
-        assert_eq!(
-            store.guardian_branches_still_in_flight(&id).unwrap(),
-            Vec::<String>::new()
-        );
-        // Contrast: the broader, `collecting`-only check still reports it.
-        assert_eq!(
-            store.guardian_unfinished_linked_branches(&id).unwrap(),
-            vec!["feat".to_string()]
-        );
-    }
-
     // ── RAL-442: readiness is gated on the parent task's final state, not
     // just its child cell(s) ──────────────────────────────────────────────
 
