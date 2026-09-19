@@ -504,6 +504,14 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (b.pr_submission_pending) return `<span class="badge live" data-tip="Auto-submitting this branch's pull request is in progress on its own background worker.\nWho/when: you enabled auto-submit for this review's PR stack and this branch just reached a terminal state.\nClears automatically once the attempt completes (success clears it silently; failure leaves the ⚠ auto-submit failed badge instead).">⏳ submitting PR</span>`;
         if (b.auto_submit_error) return `<span class="badge bad" data-tip="Auto-submitting this branch's pull request failed: ${esc(b.auto_submit_error)}\nWho/when: you enabled auto-submit for this review's PR stack and this branch's PR wasn't opened/updated as a result.\nCheck forge credentials/connectivity, then resubmit manually (review pr submit) or wait for the next auto-submit attempt.">⚠ auto-submit failed</span>`;
         if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
+        // RAL-<pending>: before the rebase itself starts, a manual "Merge /
+        // rebase" click (or the periodic background re-check) first fetches
+        // this branch's own PR and, if a reviewer pushed directly to it,
+        // pulls those commits through the full conflict-aware path — which
+        // can take as long as a real rebase. Runs synchronously ahead of the
+        // rebase worker, so without this badge the branch would keep showing
+        // its previous terminal status with no sign anything is happening.
+        if (b.merge_status === "syncing_pr") return `<span class="badge live" data-tip="Checking this branch's PR for commits a reviewer pushed directly, before rebasing — pulling them in first if found.\nWho/when: you clicked Merge / rebase (or the periodic re-check fired) and this branch's PR needed a fresh remote check.\nClears automatically once the check (and pull, if needed) finishes — the rebase itself starts right after.">⏳ syncing PR</span>`;
         if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
         // RAL-149: all conflict markers for this branch are resolved and committed,
         // but the dedicated final-proof agent call (a separate LLM call from

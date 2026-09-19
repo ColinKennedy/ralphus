@@ -190,7 +190,7 @@
        * @property {boolean} [enabled]
        * @property {string} [name]
        * @property {string} [project]
-       * @property {string} [merge_status] - "pending" | "in_progress" | "done" | "proof_pending" | "conflict_resolved" | "failed" | ...
+       * @property {string} [merge_status] - "pending" | "syncing_pr" | "in_progress" | "done" | "proof_pending" | "conflict_resolved" | "failed" | ...
        * @property {string} [moved_from_guardian_id]
        * @property {string} [source_squad_id]
        * @property {number} [source_task_idx]

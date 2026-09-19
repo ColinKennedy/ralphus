@@ -220,6 +220,17 @@ pub enum MergeStatus {
     Pending,
     /// All linked task cells are done; branch is waiting for the rebase to start.
     Ready,
+    /// Checking (and, if the PR is ahead, pulling) this branch's remote PR
+    /// commits before the rebase itself starts. Transient -- set right before
+    /// `sync_remote_pr_commits` touches this specific branch's PR and cleared
+    /// to `Self::InProgress` (via the reset every `run_merge_cancellable`/
+    /// `staged_merge_pass` attempt performs) once that check clears, or to
+    /// `Self::Failed` if the pull itself fails. Exists so a manual "Merge /
+    /// rebase" click -- which runs this check synchronously before the
+    /// background rebase worker ever starts -- has something to show besides
+    /// a stale terminal status while it may be waiting on a real forge fetch
+    /// and agent-driven conflict resolution.
+    SyncingPr,
     /// Being rebased onto the stack.
     InProgress,
     /// The review rebase was explicitly stopped while this branch was active.
@@ -254,6 +265,7 @@ impl MergeStatus {
         match self {
             Self::Pending => "pending",
             Self::Ready => "ready",
+            Self::SyncingPr => "syncing_pr",
             Self::InProgress => "in_progress",
             Self::Stopped => "stopped",
             Self::Actioning => "actioning",
@@ -5045,6 +5057,62 @@ mod tests {
         assert_eq!(mp.total, 0);
         assert_eq!(mp.done, 0);
         assert_eq!(mp.pct, 0.0);
+    }
+
+    #[test]
+    fn merge_progress_does_not_count_syncing_pr_as_done_or_failed() {
+        // A branch mid-remote-PR-check contributes to `total` (the board's
+        // progress bar must still know about it) but is neither done nor
+        // failed -- it hasn't even started its rebase yet.
+        let branches = vec![
+            branch_view_with_status("a", "done"),
+            branch_view_with_status("b", "syncing_pr"),
+        ];
+        let mp = MergeProgress::compute(&branches);
+        assert_eq!(mp.total, 2);
+        assert_eq!(mp.done, 1);
+        assert_eq!(mp.failed, 0);
+    }
+
+    #[test]
+    fn syncing_pr_status_round_trips_through_the_store() {
+        // RAL-<pending>: a manual "Merge / rebase" click's mandatory
+        // remote-PR check runs synchronously before the rebase worker even
+        // starts, so this status is set from `pr::sync_remote_pr_commits`
+        // rather than the merge worker's own per-branch loop -- this pins
+        // the store-level contract that call relies on: the string it's
+        // stored/read back as, and that it survives a normal read.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let bid = store.get_guardian(&id).unwrap().branches[0].id.clone();
+
+        assert_eq!(MergeStatus::SyncingPr.as_str(), "syncing_pr");
+
+        store
+            .set_branch_status(&id, &bid, MergeStatus::SyncingPr, None)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.branches[0].merge_status, "syncing_pr");
+
+        // And a subsequent failure (e.g. the pull itself errors) must not
+        // leave it stuck showing "syncing_pr" forever -- it moves to a real
+        // terminal status with the failure recorded as `detail`, the same
+        // way every other merge-status failure is surfaced.
+        store
+            .set_branch_status(
+                &id,
+                &bid,
+                MergeStatus::Failed,
+                Some("could not pull remote commits for PR pr-1: network error"),
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.branches[0].merge_status, "failed");
+        assert_eq!(
+            g.branches[0].detail.as_deref(),
+            Some("could not pull remote commits for PR pr-1: network error")
+        );
     }
 
     fn branch_view_with_status(branch: &str, merge_status: &str) -> BranchView {

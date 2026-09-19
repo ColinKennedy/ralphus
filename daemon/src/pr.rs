@@ -47,7 +47,7 @@ use opentelemetry::trace::{SpanKind, Status};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::guardian::{BranchView, GuardianView};
+use crate::guardian::{BranchView, GuardianView, MergeStatus};
 use crate::guardian_merge::{self, git};
 use crate::runner::{Runner, RunnerSpec};
 use crate::server::Reply;
@@ -6670,9 +6670,33 @@ pub fn sync_remote_pr_commits(
         if !pr_ahead {
             continue;
         }
-        if pull_pr_commits(store, runner, &pr.id)
-            .map_err(|e| format!("could not pull remote commits for PR {}: {e}", pr.id))?
-        {
+        // RAL-<pending>: this pull (fetch already done above, but the pull
+        // itself resolves conflicts through the full agent-driven path and
+        // pushes) can take as long as a real rebase, and runs synchronously
+        // inside `kickoff_merge` -- before a manual "Merge / rebase" click's
+        // HTTP response even returns, let alone the background rebase worker
+        // that would otherwise be the first thing to update this branch's
+        // status. Mark it so the board has something live to show instead of
+        // a stale terminal pill for however long this takes.
+        if let Some(bid) = &pr.branch_id {
+            let _ = store
+                .lock()
+                .set_branch_status(id, bid, MergeStatus::SyncingPr, None);
+        }
+        let result = pull_pr_commits(store, runner, &pr.id)
+            .map_err(|e| format!("could not pull remote commits for PR {}: {e}", pr.id));
+        let did_pull = match result {
+            Ok(did_pull) => did_pull,
+            Err(e) => {
+                if let Some(bid) = &pr.branch_id {
+                    let _ = store
+                        .lock()
+                        .set_branch_status(id, bid, MergeStatus::Failed, Some(&e));
+                }
+                return Err(e);
+            }
+        };
+        if did_pull {
             pulled += 1;
         }
     }
