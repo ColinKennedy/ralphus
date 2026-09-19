@@ -247,7 +247,17 @@
         try {
           const before = document.getElementById(preId);
           if (!before) return;
-          const atBottom = forceBottom || before.scrollTop + before.clientHeight >= before.scrollHeight - 4;
+          // A fresh content load (never fetched this session, or just
+          // reopened after an explicit close, which clears peekContent) means
+          // `before` is the transient "Loading…" placeholder, not real
+          // content — its live scrollTop/scrollHeight say nothing meaningful
+          // about where the reader actually was, so trust the persisted
+          // atBottom flag from before the box closed instead (RAL-471).
+          const freshLoad = peekContent[key] === undefined;
+          const saved = peekScrollState[key];
+          const atBottom = forceBottom || (freshLoad && saved
+            ? saved.atBottom
+            : before.scrollTop + before.clientHeight >= before.scrollHeight - 4);
 
           // Liveness + fallback content: poll `/pane` for its authoritative
           // `active` flag (RAL-397 Phase 2G-A) and its rendered snapshot. The
@@ -337,7 +347,17 @@
           // A just-revived (or just-ended) box gets pinned to the bottom
           // regardless of where it was scrolled: its content is a different
           // log now, so the old offset means nothing.
-          if (atBottom || next.headerChanged) pre.scrollTop = pre.scrollHeight;
+          if (atBottom || next.headerChanged) {
+            pre.scrollTop = pre.scrollHeight;
+          } else if (freshLoad) {
+            // Not bottom-pinned, but this is the first render into a rebuilt
+            // or just-reopened `<pre>` (RAL-471) — its scrollTop otherwise
+            // defaults to 0 and would silently strand the reader at the top
+            // instead of their saved mid-log position.
+            const target = peekScrollRestoreTarget(saved, pre.scrollHeight);
+            if (target !== null) pre.scrollTop = target;
+          }
+          savePeekScrollState(key, pre);
           updatePeekJumpVisibility(key);
           updatePeekActivityLabel(key);
         } catch (_) {
@@ -437,7 +457,10 @@
           peekTape[key] = tapePrepend(cur, { start: chunk.start, content: chunk.content, total: cur.total });
           renderPeekTape(key);
           const preAfter = document.getElementById(`peek-pre-${cssKey}`);
-          if (preAfter) preAfter.scrollTop = prevTop + (preAfter.scrollHeight - prevHeight);
+          if (preAfter) {
+            preAfter.scrollTop = prevTop + (preAfter.scrollHeight - prevHeight);
+            savePeekScrollState(key, preAfter);
+          }
         } finally {
           peekLoadingOlder.delete(key);
         }
@@ -471,11 +494,55 @@
       function onPeekScroll(key) {
         updatePeekJumpVisibility(key);
         const pre = document.getElementById(`peek-pre-${peekCssKey(key)}`);
+        if (!pre) return;
+        savePeekScrollState(key, pre);
         const w = peekTape[key];
-        if (!pre || !w) return;
+        if (!w) return;
         if (pre.scrollTop <= TAPE_TOP_TRIGGER_PX && w.loadedStart > 0 && !peekLoadingOlder.has(key)) {
           void loadOlderPeekTape(key);
         }
+      }
+      /**
+       * Persists a peek box's current scroll offset and whether it's pinned to
+       * the bottom (RAL-471), so it can be restored later if the box's `<pre>`
+       * gets torn down and rebuilt — navigating to a different cell/squad and
+       * back, or an explicit collapse/reopen of the same box. `atBottom` is
+       * saved as its own boolean rather than left to be re-derived from `top`
+       * against a possibly-changed `scrollHeight` at restore time — see
+       * {@link peekScrollRestoreTarget}.
+       * @param {string} key
+       * @param {HTMLElement} pre
+       * @returns {void}
+       */
+      function savePeekScrollState(key, pre) {
+        peekScrollState[key] = {
+          top: pre.scrollTop,
+          atBottom: pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4,
+        };
+      }
+      /**
+       * Restores every currently-rendered peek box's saved scroll position
+       * (RAL-471). Call after any DOM write that may have (re)created peek
+       * `<pre>` panes — a fresh node always starts scrolled to the top
+       * regardless of what was showing for that key before, whether from
+       * navigating to a different cell/squad and back or an explicit
+       * collapse/reopen of the same one. A key with no saved state (never
+       * opened this session) is left alone; a genuinely fresh open is instead
+       * pinned to the bottom by `togglePeek`'s own `fetchPeek(key, true)`.
+       * Scoped to `[data-key]` so it never touches the System Prompt tab's
+       * `<pre>` (no `data-key`, its own tab state) or the attempt-history
+       * viewer's `<pre>` (a different, unrelated box).
+       * @returns {void}
+       */
+      function restorePeekScrollPositions() {
+        document.querySelectorAll(".peek-pre[data-key]").forEach((el) => {
+          const pre = /** @type {HTMLElement} */ (el);
+          const key = pre.dataset.key;
+          if (!key) return;
+          const target = peekScrollRestoreTarget(peekScrollState[key], pre.scrollHeight);
+          if (target !== null) pre.scrollTop = target;
+          updatePeekJumpVisibility(key);
+        });
       }
       /**
        * Scrolls a peek box's terminal pane to the latest (bottom-most) output.
@@ -486,6 +553,7 @@
         const pre = document.getElementById(`peek-pre-${peekCssKey(key)}`);
         if (!pre) return;
         pre.scrollTop = pre.scrollHeight;
+        savePeekScrollState(key, pre);
         updatePeekJumpVisibility(key);
       }
       /**
@@ -497,6 +565,7 @@
         const pre = document.getElementById(`peek-pre-${peekCssKey(key)}`);
         if (!pre) return;
         pre.scrollTop = 0;
+        savePeekScrollState(key, pre);
         updatePeekJumpVisibility(key);
       }
       /**

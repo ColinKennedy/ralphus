@@ -344,6 +344,30 @@
           headerChanged: !prev.ended,
         };
       }
+      /**
+       * Resolves the scrollTop to apply to a peek box's terminal `<pre>` from
+       * its saved scroll state (RAL-471), once fresh content has just loaded
+       * into it -- either the node itself was just (re)created (navigating to
+       * a different cell/squad and back, or an explicit collapse/reopen of the
+       * same box) or its content had been cleared and just reloaded.
+       *
+       * A bottom-anchored save ignores its own saved numeric offset and
+       * targets the *current* `scrollHeight` instead, so a box the user had
+       * pinned to "the latest output" shows the true latest output even if the
+       * tape grew while the box was elsewhere or closed -- an explicit
+       * boolean, not re-derived later from the saved offset against a
+       * `scrollHeight` that may have changed since. Anything else targets its
+       * saved offset verbatim; the browser clamps it once assigned to a real
+       * `scrollTop`, so a saved offset past a shorter reloaded log just
+       * settles at that log's own bottom.
+       * @param {{top: number, atBottom: boolean}|undefined} saved
+       * @param {number} scrollHeight
+       * @returns {number|null} the scrollTop to apply, or null when nothing was saved for this key
+       */
+      function peekScrollRestoreTarget(saved, scrollHeight) {
+        if (!saved) return null;
+        return saved.atBottom ? scrollHeight : saved.top;
+      }
       // RALPHUS-PEEK-STATE-MACHINE:END
 
       // ---- RAL-397 Phase 2G-A: single-tape seamless scroll ----
@@ -803,14 +827,18 @@
           delete peekMissingStrikes[key];
           delete peekLastActivity[key];
           delete peekSystemPrompt[key]; // RAL-428: refetch the System Prompt tab on the next open
+          // peekScrollState is deliberately kept (RAL-471): scroll position
+          // should survive an explicit collapse/reopen of the same box, not
+          // just navigating away and back.
         }
         terminalMenuOpen[key] = false; // pressing the primary button should collapse the actions dropdown too
         rerenderOwningPane();
         // Fetch immediately on open (rather than waiting up to 2s for the next
-        // poll tick) and force it to the bottom — a freshly opened box has no
-        // prior scroll position to preserve, and the most recent output is what
-        // the user opened it to see.
-        if (peekOpen[key]) fetchPeek(key, true);
+        // poll tick). Force it to the bottom only when there's no saved scroll
+        // state (RAL-471) — a freshly opened box has no prior position to
+        // preserve, and the most recent output is what the user opened it to
+        // see; a reopened one restores its saved position/bottom-pin instead.
+        if (peekOpen[key]) fetchPeek(key, !peekScrollState[key]);
       }
       /**
        * Whether Live View pane `key` currently shows ralphus's own

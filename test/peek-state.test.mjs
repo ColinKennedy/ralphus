@@ -23,7 +23,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { peek } from "./board-peek-state.mjs";
 
-const { PEEK_MISSING_STRIKE_LIMIT, peekCssKey, peekUrlFor, peekTranscriptUrlFor, systemPromptUrlFor, peekPromptDisplay, peekPromptText, nextPeekPaneState } = peek;
+const { PEEK_MISSING_STRIKE_LIMIT, peekCssKey, peekUrlFor, peekTranscriptUrlFor, systemPromptUrlFor, peekPromptDisplay, peekPromptText, nextPeekPaneState, peekScrollRestoreTarget } = peek;
 
 const NOW = 1_700_000_000_000;
 
@@ -233,4 +233,28 @@ test("peekPromptDisplay renders the three System Prompt tab states", () => {
   assert.equal(peekPromptDisplay({ error: "no such step" }), "no such step", "reason shown verbatim");
   assert.equal(peekPromptDisplay({ text: "the prompt" }), "the prompt");
   assert.equal(peekPromptDisplay({}), "(no system prompt)", "a state with neither text nor error falls back");
+});
+
+// ---- RAL-471: per-cell Live View scroll-position persistence ----
+
+test("peekScrollRestoreTarget: nothing saved for this key leaves the box untouched", () => {
+  assert.equal(peekScrollRestoreTarget(undefined, 5000), null);
+});
+
+test("peekScrollRestoreTarget: a bottom-anchored save targets the current scrollHeight, not its stale offset", () => {
+  // The saved numeric top (900) is from before new output arrived; a
+  // bottom-pinned box must show the *true* bottom of the now-taller log
+  // (5000), not the old offset that would land mid-log.
+  assert.equal(peekScrollRestoreTarget({ top: 900, atBottom: true }, 5000), 5000);
+});
+
+test("peekScrollRestoreTarget: a mid-log save targets its exact saved offset, ignoring scrollHeight", () => {
+  assert.equal(peekScrollRestoreTarget({ top: 1234, atBottom: false }, 5000), 1234);
+});
+
+test("peekScrollRestoreTarget: a mid-log save past a shorter reloaded log is left for the browser to clamp", () => {
+  // The caller assigns this straight to a real scrollTop, which the browser
+  // clamps to the max legal offset -- passing the raw saved value through
+  // unmodified is correct, not a bug.
+  assert.equal(peekScrollRestoreTarget({ top: 9999, atBottom: false }, 500), 9999);
 });

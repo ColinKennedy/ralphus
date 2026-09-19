@@ -242,6 +242,7 @@
         else html = tabs + cellView(squad, squad.tasks[sel.taskIdx], squad.tasks[sel.taskIdx].cells[sel.cellIdx]);
         if (!setDetailsHtml(el, html)) return;
         attachPeekResizeHandlers();
+        restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
         // The markup above carries a stale duration for anything still
         // running; fill in the live values immediately rather than leaving
         // them wrong until the next one-second tick.

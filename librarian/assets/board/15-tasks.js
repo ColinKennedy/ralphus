@@ -1494,6 +1494,8 @@
       let peekTab = {};
       /** @type {{[key: string]: (PromptTabState|"loading")|undefined}} peek key -> System Prompt tab state (RAL-428): a `PromptTabState` once fetched (the loaded text, or why there is none), the literal "loading" while a fetch is in flight, undefined until the tab is first opened. Deleted on close (see `togglePeek`) so the next open refetches. */
       let peekSystemPrompt = {};
+      /** @type {{[key: string]: {top: number, atBottom: boolean}}} peek key -> last-known scroll offset of its terminal `<pre>`, and whether it was pinned to the bottom (RAL-471). `atBottom` is tracked as its own boolean rather than re-derived from `top` against a possibly-changed `scrollHeight` later -- see `peekScrollRestoreTarget`. Survives navigating away and back (the `<pre>` node gets destroyed/recreated but this doesn't) and, deliberately, an explicit close via `togglePeek` too, so collapsing and reopening the same box doesn't lose the reader's place. Session-only, like every other peek* map -- not persisted. */
+      let peekScrollState = {};
       /** @type {{[key: string]: string|null}} gid -> branch name, the currently selected branch in the review pane */
       let selectedBranch = {};
       /** @type {{[key: string]: BranchConflicts}} "gid:branch_id" -> last-fetched live conflicting-files list (RAL-148) */
