@@ -24,6 +24,8 @@
        * @property {{[key: string]: string}} [env_overrides] - RAL-191: environment-variable overrides set on this individual proof step — the narrowest layer, merged on top of the owning scope's `proof_env_overrides` and its ancestors. Absent for the vast majority of steps.
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this step's own `env_overrides` (or its owning scope's `proof_env_overrides`) has been edited since the step last ran/retried or had its status explicitly set. No behavioral effect.
        * @property {number} [maximum_tool_output_tokens] - RAL-333: resolved tool-output token cap, or absent for no cap. Resolved against this step's real parent (owning cell for a cell-scope step, owning task for a task-scope step) -- see `agent_supports_maximum_tool_output_tokens`.
+       * @property {number|null} [started_at_ms] - When this step first entered `running`, or `null` until it starts. Mirrors `CellView.started_at_ms`.
+       * @property {number|null} [finished_at_ms] - When this step last reached a terminal state, or `null` while pending/running. Mirrors `CellView.finished_at_ms`.
        */
       /**
        * @typedef {object} CellView

@@ -2658,8 +2658,8 @@ keeps the default newest-first order).
           "env_out_of_date": false,
           "started_at_ms": 1783120107300,
           "finished_at_ms": null,
-          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "maximum_tool_output_tokens": 40000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false } ] } ],
-          "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null, "env_out_of_date": false } ]
+          "cells": [ { "id": "cell-0", "cwd": "/repo", "agent": "claude", "model": null, "state": "done", "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "maximum_budget_usd": 5.0, "maximum_context": null, "auto_compact_threshold": 80000, "maximum_tool_output_tokens": 40000, "started_at_ms": 1783120107300, "finished_at_ms": 1783120115900, "env_out_of_date": false, "proof": [ { "id": "fmt", "kind": "command", "state": "done", "output": null, "spec": "cargo fmt --check", "model": null, "env_out_of_date": false, "started_at_ms": 1783120107400, "finished_at_ms": 1783120108100 } ] } ],
+          "proof":   [ { "id": "tests", "kind": "command", "state": "pending", "output": null, "spec": "cargo test", "model": null, "env_out_of_date": false, "started_at_ms": null, "finished_at_ms": null } ]
         }
       ]
     }
@@ -2771,6 +2771,11 @@ are exposed here, each in task/cell declaration order. A proof entry carries:
   Omitted for `command` / `brain` / `approval` kinds, and may also be absent on
   historical rows created before August 15, 2026.
 - `model` — model override for `prompt`-kind steps; `null` when unset.
+- `started_at_ms` / `finished_at_ms` — same semantics as the squad/task/cell
+  fields described above (first entered `running`; last reached a terminal
+  state), scoped to this individual proof step. Back the Live View's
+  "started ..." / "ended ..." header once the step's own box becomes a
+  read-only historical record.
 
 `command` and `prompt` proof steps actually run (`pending` → `running` →
 `done`/`failed`); `brain`/`approval` steps are accepted but deferred and stay

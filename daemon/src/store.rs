@@ -288,6 +288,14 @@ pub struct ProofView {
     /// set. No behavioral effect; see [`Store::set_proof_step_env_overrides`].
     #[serde(default)]
     pub env_out_of_date: bool,
+    /// When this step first entered `running` (Unix epoch milliseconds).
+    /// `None` until it starts. Lets the Live View show "started ..."
+    /// alongside "ended ..." once the step is a historical record, the same
+    /// way `CellView::started_at_ms` does.
+    pub started_at_ms: Option<i64>,
+    /// When this step last reached a terminal state (Unix epoch
+    /// milliseconds). `None` while pending/running.
+    pub finished_at_ms: Option<i64>,
 }
 
 /// A cell as shown in the board.
@@ -4592,7 +4600,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, started_at_ms, finished_at_ms FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -4622,6 +4630,8 @@ impl Store {
                         maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
                         compaction_input_tokens: r.get::<_, i64>(21)?,
                         compaction_count: r.get::<_, i64>(22)?,
+                        started_at_ms: r.get::<_, Option<i64>>(23)?,
+                        finished_at_ms: r.get::<_, Option<i64>>(24)?,
                     },
                 ))
             })?
@@ -4641,7 +4651,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, started_at_ms, finished_at_ms FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -4667,6 +4677,8 @@ impl Store {
                     maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
                     compaction_input_tokens: r.get::<_, i64>(18)?,
                     compaction_count: r.get::<_, i64>(19)?,
+                    started_at_ms: r.get::<_, Option<i64>>(20)?,
+                    finished_at_ms: r.get::<_, Option<i64>>(21)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12563,6 +12575,21 @@ command = "y"
         let (started_after, finished) = read_stamps(&store);
         assert_eq!(started_after, Some(started));
         assert!(finished.is_some());
+
+        // The board-facing `ProofView` (what the Live View's "started ..."/
+        // "ended ..." header reads) must carry the same stamps as the raw
+        // row -- this is what the frontend actually sees, not just the DB.
+        // Both query paths that build a `ProofView` (the single-scope
+        // `proofs_for` and the whole-squad `proofs_by_scope` behind
+        // `get_squad`) must agree.
+        let view_steps = store.proofs_for(&squad, 0, "cell", 0).unwrap();
+        assert_eq!(view_steps[0].started_at_ms, Some(started));
+        assert_eq!(view_steps[0].finished_at_ms, finished);
+
+        let squad_view = store.get_squad(&squad).unwrap();
+        let proof = &squad_view.tasks[0].cells[0].proof[0];
+        assert_eq!(proof.started_at_ms, Some(started));
+        assert_eq!(proof.finished_at_ms, finished);
     }
 
     #[test]
