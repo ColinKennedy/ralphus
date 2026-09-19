@@ -9495,23 +9495,75 @@ use ralphus_core::agent_resume::{
 /// detached from a live cell) -- both ultimately run the exact same real
 /// CLI resume command, just handed to a different spawn mechanism.
 fn resume_shell_invocation(agent: Option<&str>, agent_session_id: &str) -> (String, Vec<String>) {
-    let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
+    resume_shell_invocation_with_overrides(
+        agent,
+        agent_session_id,
+        &ResumeCommandOverrides::from_env(),
+    )
+}
+
+/// The `RALPHUS_SHELL_CMD`/`RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`/
+/// `RALPHUS_PI_COMMAND` overrides [`resume_shell_invocation`] reads, threaded
+/// explicitly (rather than read from `std::env` inline) so a test can exercise
+/// a compound override end-to-end without mutating real process environment --
+/// `std::env::set_var`/`remove_var` are `unsafe fn`s and this workspace
+/// forbids `unsafe_code` outright.
+#[derive(Debug, Clone, Default)]
+struct ResumeCommandOverrides {
+    shell_cmd: Option<String>,
+    claude_command: Option<String>,
+    codex_command: Option<String>,
+    pi_command: Option<String>,
+}
+
+impl ResumeCommandOverrides {
+    fn from_env() -> Self {
+        Self {
+            shell_cmd: std::env::var("RALPHUS_SHELL_CMD").ok(),
+            claude_command: std::env::var("RALPHUS_CLAUDE_COMMAND").ok(),
+            codex_command: std::env::var("RALPHUS_CODEX_COMMAND").ok(),
+            pi_command: std::env::var("RALPHUS_PI_COMMAND").ok(),
+        }
+    }
+}
+
+/// Pure core of [`resume_shell_invocation`] -- see that function's docstring.
+/// Split out so a RAL-468 regression test can pass a compound
+/// `RALPHUS_CLAUDE_COMMAND`-equivalent override (e.g. `foo bar -- claude`)
+/// directly and assert the resulting command line is shell-routed, without
+/// touching real process environment.
+fn resume_shell_invocation_with_overrides(
+    agent: Option<&str>,
+    agent_session_id: &str,
+    overrides: &ResumeCommandOverrides,
+) -> (String, Vec<String>) {
+    let shell_cmd = overrides
+        .shell_cmd
+        .clone()
+        .unwrap_or_else(|| "pwsh".to_string());
     let command = if is_codex_agent(agent) {
         // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
         // override point resolves both the headless squad and this resumed
         // one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
+        let program = overrides
+            .codex_command
+            .clone()
+            .unwrap_or_else(|| "codex".to_string());
         resume_codex_agent_command(&program, agent_session_id)
     } else if is_pi_agent(agent) {
-        let program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
+        let program = overrides
+            .pi_command
+            .clone()
+            .unwrap_or_else(|| "pi".to_string());
         resume_pi_agent_command(&program, agent_session_id)
     } else {
         // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
         // same override point resolves both the headless squad and this
         // resumed one to the same binary.
-        let program =
-            std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+        let program = overrides
+            .claude_command
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
         resume_agent_command(&program, agent_session_id)
     };
     let shell_args = vec![
@@ -14724,6 +14776,44 @@ mod tests {
 
     fn daemon() -> Daemon {
         Daemon::new(Store::open_in_memory().unwrap(), 12)
+    }
+
+    /// RAL-468: a `RALPHUS_CLAUDE_COMMAND` wrapper like `foo bar -- claude`
+    /// (e.g. `rez-env`, a launcher that execs into the real agent binary) is
+    /// a compound shell line, not a single executable. "Open Agent" must
+    /// shell-route it end-to-end -- program name, resume flags, and all --
+    /// rather than quoting the whole compound string as one literal program
+    /// name (which would try to exec a file literally named `foo bar --
+    /// claude`).
+    #[test]
+    fn resume_shell_invocation_shell_routes_a_compound_claude_override() {
+        let overrides = ResumeCommandOverrides {
+            claude_command: Some("foo bar -- claude".to_string()),
+            ..ResumeCommandOverrides::default()
+        };
+        let (shell_cmd, shell_args) =
+            resume_shell_invocation_with_overrides(None, "abc-123", &overrides);
+        assert_eq!(shell_cmd, "pwsh");
+        let command = shell_args.last().expect("command is the last -Command arg");
+        assert_eq!(
+            command,
+            "foo bar -- claude '--resume' 'abc-123' '--dangerously-skip-permissions'"
+        );
+        assert!(!command.starts_with("& '"));
+    }
+
+    /// A plain (non-compound) override keeps the exact quoting this path
+    /// always used, unaffected by the RAL-468 compound-routing branch.
+    #[test]
+    fn resume_shell_invocation_keeps_plain_override_unaffected() {
+        let overrides = ResumeCommandOverrides {
+            codex_command: Some("codex".to_string()),
+            ..ResumeCommandOverrides::default()
+        };
+        let (_, shell_args) =
+            resume_shell_invocation_with_overrides(Some("codex"), "thread-1", &overrides);
+        let command = shell_args.last().expect("command is the last -Command arg");
+        assert!(command.starts_with("& 'codex'"));
     }
 
     fn submit_body(toml: &str) -> String {

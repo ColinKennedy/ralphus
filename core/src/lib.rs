@@ -12,6 +12,7 @@ pub mod license;
 pub mod process;
 pub mod redact;
 pub mod schema;
+pub mod shellcmd;
 pub mod thrash;
 pub mod uri;
 pub mod validate;

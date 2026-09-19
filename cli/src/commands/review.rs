@@ -1043,62 +1043,30 @@ pub fn parse_environment_flags(
     Ok(result)
 }
 
-/// Appended to a resumed agent's context in `--mode readonly` (mirrors
-/// Python's `_READONLY_RESUME_INSTRUCTIONS`, duplicated here the same way
-/// `cell.rs` duplicates it -- see that module's `agent_resume_command`
-/// doc comment for why there is no single shared implementation).
-const READONLY_RESUME_INSTRUCTIONS: &str = "You are in read-only mode. You may only read files. Do NOT write, \
-edit, delete, commit, or push anything.";
-
-/// Builds the local CLI command that resumes `agent_session_id`; see
-/// `cell.rs::agent_resume_command` (identical logic, kept as its own copy
-/// per-module -- Python's own `_agent_resume_command` is likewise a
-/// hand-mirrored duplicate with no shared boundary to call into).
+/// Builds the local CLI command that resumes `agent_session_id`; delegates to
+/// [`ralphus_core::agent_resume::agent_resume_argv`], the same shared logic
+/// `cell.rs::agent_resume_command` delegates to -- see that module's doc
+/// comment (RAL-468: these two used to be hand-duplicated copies that both
+/// silently ignored the `RALPHUS_*_COMMAND` overrides).
+#[must_use]
 pub fn agent_resume_command(
     agent: Option<&str>,
     agent_session_id: &str,
     mode: &str,
 ) -> Vec<String> {
-    let mut cmd: Vec<String>;
-    if matches!(agent, Some("codex") | Some("codex-cli")) {
-        // The top-level interactive `codex resume`, not `codex exec resume`
-        // (Codex's non-interactive headless mode, which requires a prompt
-        // argument or piped stdin and fails immediately with "No prompt
-        // provided" otherwise -- exactly the reported symptom of resuming
-        // this way into an interactive terminal with nothing to pipe in).
-        cmd = vec!["codex".to_string()];
-        if mode == "readonly" {
-            cmd.push("-c".to_string());
-            cmd.push(format!(
-                "developer_instructions={READONLY_RESUME_INSTRUCTIONS}"
-            ));
-        }
-        cmd.push("resume".to_string());
-        cmd.push(agent_session_id.to_string());
-    } else if matches!(agent, Some("pi")) {
-        cmd = vec![
-            "pi".to_string(),
-            "--session".to_string(),
-            agent_session_id.to_string(),
-            "--approve".to_string(),
-        ];
-        if mode == "readonly" {
-            cmd.push("--append-system-prompt".to_string());
-            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
-        }
-    } else {
-        cmd = vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            agent_session_id.to_string(),
-        ];
-        if mode == "readonly" {
-            cmd.push("--dangerously-skip-permissions".to_string());
-            cmd.push("--append-system-prompt".to_string());
-            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
-        }
-    }
-    cmd
+    let claude_program =
+        std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| "claude".to_string());
+    let codex_program =
+        std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| "codex".to_string());
+    let pi_program = std::env::var("RALPHUS_PI_COMMAND").unwrap_or_else(|_| "pi".to_string());
+    ralphus_core::agent_resume::agent_resume_argv(
+        agent,
+        agent_session_id,
+        mode,
+        &claude_program,
+        &codex_program,
+        &pi_program,
+    )
 }
 
 /// Prints a resolved check/action command's `cwd`/`command`, and (if

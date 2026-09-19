@@ -12,8 +12,28 @@
 /// prompts pre-approved -- "Open Agent" always resumes non-interactively,
 /// so it must never immediately stall on a prompt a human has to notice and
 /// click through.
+///
+/// `program` may be a compound shell line (RAL-468: a `RALPHUS_CLAUDE_COMMAND`
+/// wrapper like `rez-env foo -- claude`, not a single executable) -- see
+/// [`crate::shellcmd::is_compound_command`]. That case is shell-routed:
+/// `program` runs through the shell verbatim (it is already a valid command
+/// line) with the resume flags appended as quoted tokens, the same way the
+/// runner's headless launch path already routes a compound override rather
+/// than exec'ing it directly. A plain program name keeps the exact quoting
+/// this function always used, unchanged.
 #[must_use]
 pub fn resume_agent_command(program: &str, session_id: &str) -> String {
+    if crate::shellcmd::is_compound_command(program) {
+        return crate::shellcmd::build_compound_command_line(
+            "powershell",
+            program,
+            &[
+                "--resume".to_string(),
+                session_id.to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
+        );
+    }
     let safe_program = program.replace('\'', "''");
     let safe_session = session_id.replace('\'', "''");
     format!("& '{safe_program}' --resume '{safe_session}' --dangerously-skip-permissions")
@@ -34,6 +54,17 @@ pub fn resume_agent_command(program: &str, session_id: &str) -> String {
 /// a different code path from this one.
 #[must_use]
 pub fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
+    if crate::shellcmd::is_compound_command(program) {
+        return crate::shellcmd::build_compound_command_line(
+            "powershell",
+            program,
+            &[
+                "resume".to_string(),
+                session_id.to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            ],
+        );
+    }
     let safe_program = program.replace('\'', "''");
     let safe_session = session_id.replace('\'', "''");
     format!("& '{safe_program}' resume '{safe_session}' --dangerously-bypass-approvals-and-sandbox")
@@ -43,6 +74,17 @@ pub fn resume_codex_agent_command(program: &str, session_id: &str) -> String {
 /// to trust project-local files for the resumed run.
 #[must_use]
 pub fn resume_pi_agent_command(program: &str, session_id: &str) -> String {
+    if crate::shellcmd::is_compound_command(program) {
+        return crate::shellcmd::build_compound_command_line(
+            "powershell",
+            program,
+            &[
+                "--session".to_string(),
+                session_id.to_string(),
+                "--approve".to_string(),
+            ],
+        );
+    }
     let safe_program = program.replace('\'', "''");
     let safe_session = session_id.replace('\'', "''");
     format!("& '{safe_program}' --session '{safe_session}' --approve")
@@ -59,6 +101,17 @@ pub fn resume_pi_agent_command(program: &str, session_id: &str) -> String {
 /// rather than guessing at it).
 #[must_use]
 pub fn resume_agent_command_posix(program: &str, session_id: &str) -> String {
+    if crate::shellcmd::is_compound_command(program) {
+        return crate::shellcmd::build_compound_command_line(
+            "bash",
+            program,
+            &[
+                "--resume".to_string(),
+                session_id.to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
+        );
+    }
     format!(
         "{} --resume {} --dangerously-skip-permissions",
         posix_quote_single(program),
@@ -98,6 +151,72 @@ pub fn is_pi_agent(agent: Option<&str>) -> bool {
     matches!(agent, Some("pi"))
 }
 
+/// Appended to a resumed agent's context in `--mode readonly`.
+pub const READONLY_RESUME_INSTRUCTIONS: &str = "You are in read-only mode. You may only read files. Do NOT write, \
+edit, delete, commit, or push anything.";
+
+/// Builds the resume argv (unquoted tokens) printed by `ralphus cell
+/// terminal` / `ralphus review branch terminal` / `ralphus review checks
+/// terminal` for a human to copy into their own shell, rather than the
+/// quoted PowerShell command line [`resume_agent_command`] and friends build
+/// for the daemon to spawn directly. Token quoting is deliberately left to
+/// the reader's own shell here -- unlike the spawn path, there is no shell
+/// this crate controls to quote for.
+///
+/// `claude_program`/`codex_program`/`pi_program` are each caller-resolved
+/// (normally the `RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`/
+/// `RALPHUS_PI_COMMAND` env var override, falling back to the bare agent
+/// name) so this crate never reads the environment itself -- RAL-468: this
+/// used to be duplicated per-caller with the agent name hardcoded, silently
+/// ignoring that same override the daemon's real "Open Agent" spawn already
+/// respected.
+#[must_use]
+pub fn agent_resume_argv(
+    agent: Option<&str>,
+    agent_session_id: &str,
+    mode: &str,
+    claude_program: &str,
+    codex_program: &str,
+    pi_program: &str,
+) -> Vec<String> {
+    if is_codex_agent(agent) {
+        let mut cmd = vec![codex_program.to_string()];
+        if mode == "readonly" {
+            cmd.push("-c".to_string());
+            cmd.push(format!(
+                "developer_instructions={READONLY_RESUME_INSTRUCTIONS}"
+            ));
+        }
+        cmd.push("resume".to_string());
+        cmd.push(agent_session_id.to_string());
+        cmd
+    } else if is_pi_agent(agent) {
+        let mut cmd = vec![
+            pi_program.to_string(),
+            "--session".to_string(),
+            agent_session_id.to_string(),
+            "--approve".to_string(),
+        ];
+        if mode == "readonly" {
+            cmd.push("--append-system-prompt".to_string());
+            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
+        }
+        cmd
+    } else {
+        let mut cmd = vec![
+            claude_program.to_string(),
+            "--resume".to_string(),
+            agent_session_id.to_string(),
+        ];
+        if mode == "readonly" {
+            cmd.push("--dangerously-skip-permissions".to_string());
+            cmd.push("--append-system-prompt".to_string());
+            cmd.push(READONLY_RESUME_INSTRUCTIONS.to_string());
+        }
+        cmd
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +227,21 @@ mod tests {
         assert!(cmd.contains("--dangerously-skip-permissions"));
         assert!(cmd.contains("--resume 'abc-123'"));
         assert!(cmd.contains("& 'claude'"));
+    }
+
+    /// RAL-468: a `RALPHUS_CLAUDE_COMMAND` wrapper like `foo bar -- claude`
+    /// is a compound shell line, not a single executable -- it must run
+    /// through the shell verbatim, not get quoted as one literal program
+    /// name (which is what made `& 'foo bar -- claude' --resume ...` try to
+    /// exec a file literally named `foo bar -- claude`).
+    #[test]
+    fn resume_agent_command_shell_routes_a_compound_program() {
+        let cmd = resume_agent_command("foo bar -- claude", "abc-123");
+        assert_eq!(
+            cmd,
+            "foo bar -- claude '--resume' 'abc-123' '--dangerously-skip-permissions'"
+        );
+        assert!(!cmd.starts_with("& '"));
     }
 
     #[test]
@@ -145,6 +279,15 @@ mod tests {
     }
 
     #[test]
+    fn resume_codex_agent_command_shell_routes_a_compound_program() {
+        let cmd = resume_codex_agent_command("foo bar -- codex", "thread-abc-123");
+        assert_eq!(
+            cmd,
+            "foo bar -- codex 'resume' 'thread-abc-123' '--dangerously-bypass-approvals-and-sandbox'"
+        );
+    }
+
+    #[test]
     fn resume_codex_agent_command_escapes_single_quotes() {
         let cmd = resume_codex_agent_command("my'codex", "sess'123");
         assert!(cmd.contains("my''codex"));
@@ -157,6 +300,56 @@ mod tests {
         assert!(cmd.contains("--session 'session-123'"));
         assert!(cmd.contains("--approve"));
         assert!(cmd.contains("& 'pi'"));
+    }
+
+    #[test]
+    fn resume_pi_agent_command_shell_routes_a_compound_program() {
+        let cmd = resume_pi_agent_command("foo bar -- pi", "session-123");
+        assert_eq!(cmd, "foo bar -- pi '--session' 'session-123' '--approve'");
+    }
+
+    #[test]
+    fn resume_agent_command_posix_shell_routes_a_compound_program() {
+        let cmd = resume_agent_command_posix("foo bar -- claude", "abc-123");
+        assert_eq!(
+            cmd,
+            "foo bar -- claude --resume abc-123 --dangerously-skip-permissions"
+        );
+    }
+
+    #[test]
+    fn agent_resume_argv_uses_caller_supplied_program_override() {
+        let cmd = agent_resume_argv(
+            Some("claude"),
+            "sess-1",
+            "open",
+            "foo bar -- claude",
+            "codex",
+            "pi",
+        );
+        assert_eq!(cmd, vec!["foo bar -- claude", "--resume", "sess-1"]);
+    }
+
+    #[test]
+    fn agent_resume_argv_dispatches_per_agent_and_mode() {
+        assert_eq!(
+            agent_resume_argv(Some("codex"), "sess-1", "open", "claude", "codex", "pi"),
+            vec!["codex", "resume", "sess-1"]
+        );
+        assert_eq!(
+            agent_resume_argv(Some("pi"), "sess-1", "open", "claude", "codex", "pi"),
+            vec!["pi", "--session", "sess-1", "--approve"]
+        );
+        let readonly = agent_resume_argv(
+            Some("claude"),
+            "sess-1",
+            "readonly",
+            "claude",
+            "codex",
+            "pi",
+        );
+        assert!(readonly.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(readonly.contains(&READONLY_RESUME_INSTRUCTIONS.to_string()));
     }
 
     #[test]
