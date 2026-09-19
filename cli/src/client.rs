@@ -786,6 +786,19 @@ impl DaemonClient {
         self.post(&format!("/api/mailbox/{client_id}/drain"), Some(body))
     }
 
+    /// `POST /api/mailbox/{client_id}/undrain` (RAL-465) -- reverts a drain,
+    /// marking messages unread again. `message_ids: None` undrains every
+    /// drained message; `Some(ids)` undrains exactly those.
+    pub fn mailbox_undrain(
+        &self,
+        client_id: &str,
+        message_ids: Option<&[String]>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({});
+        set_if_some(&mut body, "message_ids", message_ids.map(|ids| json!(ids)));
+        self.post(&format!("/api/mailbox/{client_id}/undrain"), Some(body))
+    }
+
     // ---- personal mailbox / watches / preferences (RAL-320) ------------
 
     /// `GET /api/mailbox/personal/messages` -- the acting user's personal
@@ -819,16 +832,30 @@ impl DaemonClient {
         self.post(&format!("/api/mailbox/personal/drain{qs}"), Some(body))
     }
 
-    /// `GET /api/watches` -- every watch the acting user owns.
-    pub fn list_watches(&self, user: Option<&str>) -> Result<Value, DaemonError> {
+    /// `POST /api/mailbox/personal/undrain` (RAL-465) -- reverts a drain,
+    /// marking messages unread again. `message_ids: None` undrains every
+    /// drained message; `Some(ids)` undrains exactly those.
+    pub fn personal_mailbox_undrain(
+        &self,
+        message_ids: Option<&[String]>,
+        user: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({});
+        set_if_some(&mut body, "message_ids", message_ids.map(|ids| json!(ids)));
+        let qs = query_string(&[("user", user.map(str::to_string))]);
+        self.post(&format!("/api/mailbox/personal/undrain{qs}"), Some(body))
+    }
+
+    /// `GET /api/watches` -- every follow the acting user owns.
+    pub fn list_follows(&self, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
         self.get(&format!("/api/watches{qs}"))
     }
 
-    /// `POST /api/watches` -- watch (or update the watch's tiers in place)
+    /// `POST /api/watches` -- follow (or update the follow's tiers in place)
     /// an entity URI on the acting user's behalf. `notify_tiers` omitted or
     /// empty defaults to the acting user's `default_notify_tiers` preference.
-    pub fn create_watch(
+    pub fn create_follow(
         &self,
         entity_uri: &str,
         notify_tiers: Option<&[String]>,
@@ -843,7 +870,7 @@ impl DaemonClient {
     /// `DELETE /api/watches/{entity_uri}` -- `entity_uri` is interpolated raw
     /// (not urlencoded): the daemon's route matcher expects the literal
     /// colon-delimited URI as the path segment.
-    pub fn delete_watch(&self, entity_uri: &str, user: Option<&str>) -> Result<Value, DaemonError> {
+    pub fn delete_follow(&self, entity_uri: &str, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
         self.delete(&format!("/api/watches/{entity_uri}{qs}"))
     }

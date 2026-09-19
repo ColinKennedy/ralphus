@@ -14,11 +14,6 @@ use crate::flags::Scanner;
 pub enum MailboxCommand {
     Check {
         priority: Option<String>,
-        /// RAL-375: restrict to one category (e.g. `"review"`). `None`
-        /// drains everything, regardless of category -- QuickStart Watcher's
-        /// default. QuickStart Reviewer's system prompt instead runs `check
-        /// --category review`.
-        category: Option<String>,
     },
     Personal {
         unread_only: bool,
@@ -29,16 +24,20 @@ pub enum MailboxCommand {
         message_ids: Option<Vec<String>>,
         user: Option<String>,
     },
-    Watch {
+    PersonalUndrain {
+        message_ids: Option<Vec<String>>,
+        user: Option<String>,
+    },
+    Follow {
         entity_uri: String,
         tiers: Vec<String>,
         user: Option<String>,
     },
-    Unwatch {
+    Unfollow {
         entity_uri: String,
         user: Option<String>,
     },
-    Watches {
+    Follows {
         user: Option<String>,
     },
     Preferences {
@@ -46,8 +45,11 @@ pub enum MailboxCommand {
     },
     SetPreferences {
         user: String,
-        auto_watch: bool,
+        auto_follow: bool,
         tiers: Vec<String>,
+    },
+    Undrain {
+        message_ids: Option<Vec<String>>,
     },
     UsageError(String),
 }
@@ -58,8 +60,7 @@ pub fn parse(args: &[String]) -> MailboxCommand {
     match args.first().map(String::as_str) {
         None | Some("check") => {
             let priority = scanner.take_value("--priority").ok().flatten();
-            let category = scanner.take_value("--category").ok().flatten();
-            MailboxCommand::Check { priority, category }
+            MailboxCommand::Check { priority }
         }
         Some("personal") => {
             let unread_only = scanner.take_bool("--unread");
@@ -91,7 +92,30 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 user,
             }
         }
-        Some("watch") => {
+        Some("personal-undrain") => {
+            let ids = match scanner.take_repeated("--id") {
+                Ok(v) => v,
+                Err(e) => return MailboxCommand::UsageError(e.0),
+            };
+            let user = match scanner.take_value("--user") {
+                Ok(v) => v,
+                Err(e) => return MailboxCommand::UsageError(e.0),
+            };
+            MailboxCommand::PersonalUndrain {
+                message_ids: if ids.is_empty() { None } else { Some(ids) },
+                user,
+            }
+        }
+        Some("undrain") => {
+            let ids = match scanner.take_repeated("--id") {
+                Ok(v) => v,
+                Err(e) => return MailboxCommand::UsageError(e.0),
+            };
+            MailboxCommand::Undrain {
+                message_ids: if ids.is_empty() { None } else { Some(ids) },
+            }
+        }
+        Some("follow") => {
             let tiers = match scanner.take_repeated("--tier") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
@@ -101,30 +125,30 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
             match scanner.remaining().into_iter().next() {
-                Some(entity_uri) => MailboxCommand::Watch {
+                Some(entity_uri) => MailboxCommand::Follow {
                     entity_uri,
                     tiers,
                     user,
                 },
-                None => MailboxCommand::UsageError("watch requires <entity-uri>".to_string()),
+                None => MailboxCommand::UsageError("follow requires <entity-uri>".to_string()),
             }
         }
-        Some("unwatch") => {
+        Some("unfollow") => {
             let user = match scanner.take_value("--user") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
             match scanner.remaining().into_iter().next() {
-                Some(entity_uri) => MailboxCommand::Unwatch { entity_uri, user },
-                None => MailboxCommand::UsageError("unwatch requires <entity-uri>".to_string()),
+                Some(entity_uri) => MailboxCommand::Unfollow { entity_uri, user },
+                None => MailboxCommand::UsageError("unfollow requires <entity-uri>".to_string()),
             }
         }
-        Some("watches") => {
+        Some("follows") => {
             let user = match scanner.take_value("--user") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            MailboxCommand::Watches { user }
+            MailboxCommand::Follows { user }
         }
         Some("preferences") => {
             let user = match scanner.take_value("--user") {
@@ -143,28 +167,28 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_watch_on = scanner.take_bool("--auto-watch");
-            let auto_watch_off = scanner.take_bool("--no-auto-watch");
+            let auto_follow_on = scanner.take_bool("--auto-follow");
+            let auto_follow_off = scanner.take_bool("--no-auto-follow");
             let tiers = match scanner.take_repeated("--tier") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_watch = match (auto_watch_on, auto_watch_off) {
+            let auto_follow = match (auto_follow_on, auto_follow_off) {
                 (true, false) => Some(true),
                 (false, true) => Some(false),
                 _ => None,
             };
-            match (user, auto_watch) {
-                (Some(user), Some(auto_watch)) => MailboxCommand::SetPreferences {
+            match (user, auto_follow) {
+                (Some(user), Some(auto_follow)) => MailboxCommand::SetPreferences {
                     user,
-                    auto_watch,
+                    auto_follow,
                     tiers,
                 },
                 (None, _) => {
                     MailboxCommand::UsageError("set-preferences requires --user <name>".to_string())
                 }
                 (_, None) => MailboxCommand::UsageError(
-                    "set-preferences requires exactly one of --auto-watch/--no-auto-watch"
+                    "set-preferences requires exactly one of --auto-follow/--no-auto-follow"
                         .to_string(),
                 ),
             }
@@ -181,14 +205,9 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             println!("usage error: {m}");
             2
         }
-        MailboxCommand::Check { priority, category } => run_and_report(opts, None, || {
+        MailboxCommand::Check { priority } => run_and_report(opts, None, || {
             let client_id = ensure_client_id(&client)?;
-            let messages = client.mailbox_messages_filtered(
-                &client_id,
-                true,
-                priority.as_deref(),
-                category.as_deref(),
-            )?;
+            let messages = client.mailbox_messages(&client_id, true, priority.as_deref())?;
             let ids = message_ids(&messages);
             let drained = if ids.is_empty() {
                 0
@@ -223,31 +242,38 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
-        MailboxCommand::Watch {
+        MailboxCommand::PersonalUndrain { message_ids, user } => run_and_report(opts, None, || {
+            let result = client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?;
+            emit(opts, &result, |v| {
+                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+            });
+            Ok(())
+        }),
+        MailboxCommand::Follow {
             entity_uri,
             tiers,
             user,
         } => run_and_report(opts, None, || {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            let result = client.create_watch(&entity_uri, tiers_opt, user.as_deref())?;
+            let result = client.create_follow(&entity_uri, tiers_opt, user.as_deref())?;
             emit(opts, &result, |v| {
                 println!(
-                    "watching {}",
+                    "followed {}",
                     v["entity_uri"].as_str().unwrap_or(&entity_uri)
                 );
             });
             Ok(())
         }),
-        MailboxCommand::Unwatch { entity_uri, user } => {
-            run_and_report(opts, Some("ralphus mailbox watches"), || {
-                let result = client.delete_watch(&entity_uri, user.as_deref())?;
-                emit(opts, &result, |_| println!("stopped watching {entity_uri}"));
+        MailboxCommand::Unfollow { entity_uri, user } => {
+            run_and_report(opts, Some("ralphus mailbox follows"), || {
+                let result = client.delete_follow(&entity_uri, user.as_deref())?;
+                emit(opts, &result, |_| println!("unfollowed {entity_uri}"));
                 Ok(())
             })
         }
-        MailboxCommand::Watches { user } => run_and_report(opts, None, || {
-            let result = client.list_watches(user.as_deref())?;
-            emit(opts, &result, render_watches);
+        MailboxCommand::Follows { user } => run_and_report(opts, None, || {
+            let result = client.list_follows(user.as_deref())?;
+            emit(opts, &result, render_follows);
             Ok(())
         }),
         MailboxCommand::Preferences { user } => run_and_report(opts, None, || {
@@ -257,12 +283,20 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
         }),
         MailboxCommand::SetPreferences {
             user,
-            auto_watch,
+            auto_follow,
             tiers,
         } => run_and_report(opts, None, || {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            let result = client.set_user_preferences(&user, auto_watch, tiers_opt)?;
+            let result = client.set_user_preferences(&user, auto_follow, tiers_opt)?;
             emit(opts, &result, render_preferences);
+            Ok(())
+        }),
+        MailboxCommand::Undrain { message_ids } => run_and_report(opts, None, || {
+            let client_id = ensure_client_id(&client)?;
+            let result = client.mailbox_undrain(&client_id, message_ids.as_deref())?;
+            emit(opts, &result, |v| {
+                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+            });
             Ok(())
         }),
     }
@@ -321,13 +355,13 @@ fn render_messages(messages: &Value) {
     }
 }
 
-fn render_watches(result: &Value) {
-    let watches = result["watches"].as_array().cloned().unwrap_or_default();
-    if watches.is_empty() {
-        println!("no watches");
+fn render_follows(result: &Value) {
+    let follows = result["follows"].as_array().cloned().unwrap_or_default();
+    if follows.is_empty() {
+        println!("no follows");
         return;
     }
-    for f in &watches {
+    for f in &follows {
         let tiers = f["notify_tiers"]
             .as_array()
             .map(|a| {
@@ -357,9 +391,9 @@ fn render_preferences(u: &Value) {
         })
         .unwrap_or_default();
     println!(
-        "{}: auto_watch={} default_notify_tiers=[{}]",
+        "{}: auto_follow={} default_notify_tiers=[{}]",
         u["name"].as_str().unwrap_or_default(),
-        u["auto_watch"].as_bool().unwrap_or(false),
+        u["auto_follow"].as_bool().unwrap_or(false),
         tiers
     );
 }
@@ -377,8 +411,7 @@ mod tests {
         matches!(
             parse(&[]),
             MailboxCommand::Check {
-                priority: None,
-                category: None
+                priority: None
             }
         );
     }
@@ -386,20 +419,8 @@ mod tests {
     #[test]
     fn parses_check_with_priority_filter() {
         match parse(&v(&["check", "--priority", "urgent"])) {
-            MailboxCommand::Check { priority, category } => {
+            MailboxCommand::Check { priority } => {
                 assert_eq!(priority.as_deref(), Some("urgent"));
-                assert_eq!(category, None);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_check_with_category_filter() {
-        match parse(&v(&["check", "--category", "review"])) {
-            MailboxCommand::Check { priority, category } => {
-                assert_eq!(priority, None);
-                assert_eq!(category.as_deref(), Some("review"));
             }
             other => panic!("unexpected: {other:?}"),
         }

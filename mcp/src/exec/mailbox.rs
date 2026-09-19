@@ -9,14 +9,9 @@ use super::{ExecResult, usage};
 pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
     match cmd {
         MailboxCommand::UsageError(_) => Err(usage("no such tool")),
-        MailboxCommand::Check { priority, category } => {
+        MailboxCommand::Check { priority } => {
             let client_id = mailbox::ensure_client_id(client)?;
-            let messages = client.mailbox_messages_filtered(
-                &client_id,
-                true,
-                priority.as_deref(),
-                category.as_deref(),
-            )?;
+            let messages = client.mailbox_messages(&client_id, true, priority.as_deref())?;
             let ids = mailbox::message_ids(&messages);
             let drained = if ids.is_empty() {
                 0
@@ -38,26 +33,33 @@ pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
         MailboxCommand::PersonalDrain { message_ids, user } => {
             Ok(client.personal_mailbox_drain(message_ids.as_deref(), user.as_deref())?)
         }
-        MailboxCommand::Watch {
+        MailboxCommand::PersonalUndrain { message_ids, user } => {
+            Ok(client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?)
+        }
+        MailboxCommand::Follow {
             entity_uri,
             tiers,
             user,
         } => {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            Ok(client.create_watch(&entity_uri, tiers_opt, user.as_deref())?)
+            Ok(client.create_follow(&entity_uri, tiers_opt, user.as_deref())?)
         }
-        MailboxCommand::Unwatch { entity_uri, user } => {
-            Ok(client.delete_watch(&entity_uri, user.as_deref())?)
+        MailboxCommand::Unfollow { entity_uri, user } => {
+            Ok(client.delete_follow(&entity_uri, user.as_deref())?)
         }
-        MailboxCommand::Watches { user } => Ok(client.list_watches(user.as_deref())?),
+        MailboxCommand::Follows { user } => Ok(client.list_follows(user.as_deref())?),
         MailboxCommand::Preferences { user } => Ok(client.get_user_preferences(&user)?),
         MailboxCommand::SetPreferences {
             user,
-            auto_watch,
+            auto_follow,
             tiers,
         } => {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            Ok(client.set_user_preferences(&user, auto_watch, tiers_opt)?)
+            Ok(client.set_user_preferences(&user, auto_follow, tiers_opt)?)
+        }
+        MailboxCommand::Undrain { message_ids } => {
+            let client_id = mailbox::ensure_client_id(client)?;
+            Ok(client.mailbox_undrain(&client_id, message_ids.as_deref())?)
         }
     }
 }

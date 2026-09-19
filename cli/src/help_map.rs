@@ -1047,9 +1047,8 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
     node(
         "check",
         &[],
-        &["--priority [urgent|high|normal]", "--category [name]"],
-        "Drain unread escalation mailbox messages and print them (RAL-241). \
-         --category restricts to one message category, e.g. \"review\" (RAL-375).",
+        &["--priority [urgent|high|normal]"],
+        "Drain unread escalation mailbox messages and print them (RAL-241).",
         false,
         false, // drains (marks read) as a side effect -- not read-only
         &[],
@@ -1062,7 +1061,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
             "--unread",
             "--user [name]",
         ],
-        "List the acting user's personal mailbox messages, filtered through their watches \
+        "List the acting user's personal mailbox messages, filtered through their follows \
          (RAL-320).",
         false,
         true, // read-only: lists messages, never marks them read.
@@ -1078,29 +1077,38 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "watch",
+        "personal-undrain",
+        &[],
+        &["--id [id...]", "--user [name]"],
+        "Mark personal mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).",
+        false,
+        false, // mutates read state.
+        &[],
+    ),
+    node(
+        "follow",
         &["entity_uri [str]"],
         &["--tier [urgent|high|normal...]", "--user [name]"],
-        "Watch an entity so its notifications reach the personal mailbox; re-watching updates \
-         the notification tiers in place (RAL-343).",
+        "Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
+         reach the mailbox; re-following updates the notification tiers in place (RAL-320).",
         false,
-        false, // creates/updates a watch.
+        false, // creates/updates a follow.
         &[],
     ),
     node(
-        "unwatch",
+        "unfollow",
         &["entity_uri [str]"],
         &["--user [name]"],
-        "Stop watching an entity (RAL-343).",
+        "Stop following an entity (RAL-320).",
         false,
-        false, // deletes a watch.
+        false, // deletes a follow.
         &[],
     ),
     node(
-        "watches",
+        "follows",
         &[],
         &["--user [name]"],
-        "List the acting user's watches (RAL-343).",
+        "List the acting user's follows (RAL-320).",
         false,
         true, // read-only listing.
         &[],
@@ -1109,7 +1117,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         "preferences",
         &[],
         &["--user [name]"],
-        "Show a user's notification preferences: automatic creator watches and default notify tiers.",
+        "Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).",
         false,
         true, // read-only.
         &[],
@@ -1119,14 +1127,23 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         &[],
         &[
             "--user [name]",
-            "--auto-watch",
-            "--no-auto-watch",
+            "--auto-follow",
+            "--no-auto-follow",
             "--tier [urgent|high|normal...]",
         ],
-        "Set a user's automatic-watch and default notification-tier preferences; requires exactly \
-         one of --auto-watch/--no-auto-watch (RAL-320).",
+        "Set a user's auto-follow and default notification-tier preferences; requires exactly \
+         one of --auto-follow/--no-auto-follow (RAL-320).",
         false,
         false, // mutates stored preferences.
+        &[],
+    ),
+    node(
+        "undrain",
+        &[],
+        &["--id [id...]"],
+        "Mark escalation mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).",
+        false,
+        false, // mutates read state.
         &[],
     ),
 ];
