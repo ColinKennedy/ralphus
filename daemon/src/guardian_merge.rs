@@ -7349,12 +7349,20 @@ fn project_already_in_base(
                 root.git(&["merge-base", "--is-ancestor", rev, base_sha])
                     .is_ok()
             });
-        let worktree_is_in_upstream = b.worktree.as_deref().is_some_and(|worktree| {
-            crate::reviews::workspace_head_is_ancestor_of_upstream(
-                &root.at(PathBuf::from(worktree)),
-            )
+        // RAL-300 bug fix: this must check the worktree's HEAD against
+        // `base_sha` (the guardian's actual base branch), not against the
+        // worktree's own `@{upstream}` -- for a review/PR worktree that
+        // tracking ref is the PR's own head branch on the fork (ralphus
+        // pushes HEAD there on every push), so it is trivially an ancestor
+        // of itself the moment anything is pushed, regardless of whether the
+        // PR ever merged into the base. That false signal caused guardians
+        // to auto-approve with open, unmerged PRs (RAL-460).
+        let worktree_head_is_in_base = b.worktree.as_deref().is_some_and(|worktree| {
+            root.at(PathBuf::from(worktree))
+                .git(&["merge-base", "--is-ancestor", "HEAD", base_sha])
+                .is_ok()
         });
-        review_ref_is_in_base || worktree_is_in_upstream
+        review_ref_is_in_base || worktree_head_is_in_base
     })
 }
 
