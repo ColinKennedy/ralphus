@@ -245,15 +245,15 @@ fn session_id_args(options: &RunOptions<'_>) -> Vec<String> {
     }
 }
 
-/// RAL-336: `--setting-sources ""` disables loading settings from the
-/// user/project/local sources, independent of where `CLAUDE_CONFIG_DIR`
-/// points -- the settings-specific isolation lever. Empty when personal
-/// settings are allowed.
+/// RAL-336: limit settings to the project source, independently of where
+/// `CLAUDE_CONFIG_DIR` points. This admits the workspace's `CLAUDE.md` while
+/// excluding user and local settings. Empty when personal settings are
+/// allowed.
 fn setting_sources_args(options: &RunOptions<'_>) -> Vec<String> {
     if options.allow_personal_settings {
         Vec::new()
     } else {
-        vec!["--setting-sources".to_string(), String::new()]
+        vec!["--setting-sources".to_string(), "project".to_string()]
     }
 }
 
@@ -344,8 +344,8 @@ fn apply_claude_config_dir_env(cmd: &mut Command, claude_config_dir: Option<&std
 /// (RAL-336): `None` when personal memory is allowed (today's behavior --
 /// whatever the child inherits is used unmodified), else a per-worktree
 /// isolated directory that the operator's real global `CLAUDE.md` is never
-/// read from. Claude Code's `--setting-sources ""` flag (added separately in
-/// `run()`) already gates settings independent of this directory, so
+/// read from. Claude Code's `--setting-sources project` flag (added separately
+/// in `run()`) gates settings independently of this directory, so
 /// `settings.json` is only worth preserving into the isolated dir when
 /// personal settings are still allowed -- otherwise that flag already blocks
 /// it regardless of where `CLAUDE_CONFIG_DIR` points. A stored
@@ -1906,11 +1906,11 @@ mod tests {
     // ── RAL-336 agent isolation ────────────────────────────────────────────
 
     #[test]
-    fn setting_sources_args_disables_settings_by_default() {
+    fn setting_sources_args_loads_project_settings_only_by_default() {
         // `RunOptions::default()` -- `allow_personal_settings` is `false`.
         assert_eq!(
             setting_sources_args(&RunOptions::default()),
-            vec!["--setting-sources".to_string(), String::new()]
+            vec!["--setting-sources".to_string(), "project".to_string()]
         );
     }
 
