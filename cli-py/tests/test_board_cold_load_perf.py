@@ -120,6 +120,7 @@ def _empty_board() -> fixtures.Json:
 SQUADS_ROUTES: fixtures.Routes = {
     "/api/tasks": {"daemon": _daemon_status(), "squads": list(_HEAVY_SQUADS)},
     "/api/guardians": [],
+    "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
 }
@@ -133,6 +134,7 @@ TASKS_ROUTES: fixtures.Routes = {
     "/api/pull-requests/index": [],
     "/api/projects": {"projects": []},
     "/api/guardians": [],
+    "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
 }
@@ -143,6 +145,7 @@ WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
     "/api/task-index": {"daemon": _daemon_status(), "squads": []},
     "/api/pull-requests/index": [],
     "/api/guardians": [],
+    "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
     "/api/worktree-retirements": {"entries": list(_RETIREMENT_ROWS)},
@@ -155,6 +158,7 @@ WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
 PROJECTS_ROUTES: fixtures.Routes = {
     "/api/tasks": _empty_board(),
     "/api/guardians": [],
+    "/api/guardian-index": [],
     "/api/resources": {"resources": []},
     "/api/queue": {"items": []},
     "/api/projects": {"projects": list(_HEAVY_PROJECTS)},
