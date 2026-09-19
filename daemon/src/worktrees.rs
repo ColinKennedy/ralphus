@@ -4061,6 +4061,8 @@ mod tests {
     fn env_ctx<'a>(
         cwd: Option<&'a str>,
         targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+        prefetched_upstreams: &'a HashMap<(String, String), String>,
+        on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
     ) -> PlaceholderContext<'a> {
         PlaceholderContext {
             squad_id: "squad-1",
@@ -4070,6 +4072,8 @@ mod tests {
             cell_id: "s0",
             machine: None,
             targets,
+            prefetched_upstreams,
+            on_disk_worktrees,
             cwd,
         }
     }
@@ -4078,10 +4082,20 @@ mod tests {
     fn materialize_env_overrides_resolves_link_to_cwd() {
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([("WT".to_string(), "<<ralphus:link/cwd>>".to_string())]);
-        let resolved =
-            materialize_env_overrides(&store, env_ctx(Some("/resolved/wt"), &targets), &env)
-                .expect("resolve link to cwd");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to cwd");
         assert_eq!(resolved.get("WT").map(String::as_str), Some("/resolved/wt"));
     }
 
@@ -4089,13 +4103,23 @@ mod tests {
     fn materialize_env_overrides_resolves_link_to_cwd_with_suffix() {
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([(
             "LOGS".to_string(),
             "<<ralphus:link/cwd?suffix=./logs>>".to_string(),
         )]);
-        let resolved =
-            materialize_env_overrides(&store, env_ctx(Some("/resolved/wt"), &targets), &env)
-                .expect("resolve link to cwd with suffix");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to cwd with suffix");
         assert_eq!(
             resolved.get("LOGS").map(String::as_str),
             Some(
@@ -4115,6 +4139,8 @@ mod tests {
         // test the reverse-name case below to rule out lucky ordering).
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([
             ("BASE".to_string(), "<<ralphus:link/cwd>>".to_string()),
             (
@@ -4122,9 +4148,17 @@ mod tests {
                 "<<ralphus:link/environment.BASE?suffix=./sub>>".to_string(),
             ),
         ]);
-        let resolved =
-            materialize_env_overrides(&store, env_ctx(Some("/resolved/wt"), &targets), &env)
-                .expect("resolve chained link");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve chained link");
         assert_eq!(
             resolved.get("BASE").map(String::as_str),
             Some("/resolved/wt")
@@ -4147,6 +4181,8 @@ mod tests {
         // proving the resolver doesn't just get lucky with BTreeMap order.
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([
             (
                 "AAA_LINKS_TO_ZZZ".to_string(),
@@ -4154,9 +4190,17 @@ mod tests {
             ),
             ("ZZZ_BASE".to_string(), "<<ralphus:link/cwd>>".to_string()),
         ]);
-        let resolved =
-            materialize_env_overrides(&store, env_ctx(Some("/resolved/wt"), &targets), &env)
-                .expect("resolve chained link");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve chained link");
         assert_eq!(
             resolved.get("AAA_LINKS_TO_ZZZ").map(String::as_str),
             Some("/resolved/wt")
@@ -4171,10 +4215,20 @@ mod tests {
         // materialization.
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([("WT".to_string(), "<<ralphus:link/cwd>>".to_string())]);
-        let resolved =
-            materialize_env_overrides(&store, env_ctx(Some("/plain/checkout"), &targets), &env)
-                .expect("resolve link to a plain literal");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/plain/checkout"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link to a plain literal");
         assert_eq!(
             resolved.get("WT").map(String::as_str),
             Some("/plain/checkout")
@@ -4188,9 +4242,15 @@ mod tests {
         // fields existed.
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([("PLAIN".to_string(), "just-a-literal".to_string())]);
-        let resolved = materialize_env_overrides(&store, env_ctx(None, &targets), &env)
-            .expect("resolve plain literal");
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(None, &targets, &prefetched_upstreams, &on_disk_worktrees),
+            &env,
+        )
+        .expect("resolve plain literal");
         assert_eq!(
             resolved.get("PLAIN").map(String::as_str),
             Some("just-a-literal")
@@ -4201,6 +4261,8 @@ mod tests {
     fn materialize_env_overrides_errors_on_a_two_key_link_cycle() {
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([
             (
                 "A".to_string(),
@@ -4211,8 +4273,17 @@ mod tests {
                 "<<ralphus:link/environment.A>>".to_string(),
             ),
         ]);
-        let err = materialize_env_overrides(&store, env_ctx(Some("/wt"), &targets), &env)
-            .expect_err("a circular link chain must fail resolution");
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/wt"),
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect_err("a circular link chain must fail resolution");
         assert!(err.contains("circular"), "{err}");
     }
 
@@ -4220,9 +4291,15 @@ mod tests {
     fn materialize_env_overrides_errors_when_cwd_link_has_no_cwd_in_scope() {
         let store = Store::open_in_memory().unwrap();
         let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
         let env = BTreeMap::from([("WT".to_string(), "<<ralphus:link/cwd>>".to_string())]);
-        let err = materialize_env_overrides(&store, env_ctx(None, &targets), &env)
-            .expect_err("linking to cwd with no cwd in scope must fail");
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(None, &targets, &prefetched_upstreams, &on_disk_worktrees),
+            &env,
+        )
+        .expect_err("linking to cwd with no cwd in scope must fail");
         assert!(err.contains("cwd"), "{err}");
     }
 }
