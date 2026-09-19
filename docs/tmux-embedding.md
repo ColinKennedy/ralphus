@@ -63,8 +63,8 @@ installed, non-vendored tmux/psmux is discouraged.
    Rust project), and copies the resulting `tmux.exe` to
    `daemon/assets/tmux/windows/tmux.exe`.
 2. Rebuild with `cargo build --release --features ralphus-daemon/embedded-tmux`.
-   `scripts/build-release.cmd` does both steps by default — set
-   `RALPHUS_SKIP_VENDORED_TMUX=1` to opt out and build without it (e.g. no
+   The Windows paths in `scripts/build-release.cmd` and `build-release.sh` do
+   both steps by default — pass `--skip-tmux` to opt out and build without it (e.g. no
    network access to fetch the submodule's own crate dependencies, or you
    always point `RALPHUS_TMUX_CMD` at your own binary anyway). Vendorization
    is optional, never mandatory: a plain `cargo build`/`cargo test` with no

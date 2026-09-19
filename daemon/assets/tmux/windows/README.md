@@ -16,7 +16,7 @@ cargo build --release --features ralphus-daemon/embedded-tmux
 ```
 
 `scripts\build-release.cmd` runs both steps by default (opt out with
-`RALPHUS_SKIP_VENDORED_TMUX=1`), which is how release/GitHub-release bundles
+`--skip-tmux`), which is how release/GitHub-release bundles
 ship the embedded build out of the box.
 
 ## Why this used to require a manual checklist (RAL-102), and doesn't anymore
