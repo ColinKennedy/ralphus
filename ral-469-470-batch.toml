@@ -33,14 +33,14 @@ auto_fix_pr_errors   = true
 name    = "ral-470-build-release-skip-tmux-flag"
 project = "ralphus"
 agent   = "codex"
-model   = "terra"
+model   = "gpt-5.6-terra"
 
 [[task.cell]]
 id                         = "work"
 cwd                        = "<<ralphus:new-worktree/RAL-470-build-release-skip-tmux-flag?upstream=staging>>"
 review                     = "<<ralphus:new-review/ral-469-470>>"
 agent                      = "codex"
-model                      = "terra"
+model                      = "gpt-5.6-terra"
 maximum_context            = 120000
 auto_compact_threshold     = 86000
 maximum_tool_output_tokens = 12000
@@ -163,14 +163,14 @@ command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code
 name    = "ral-469-restore-claude-md-agents-md-loading"
 project = "ralphus"
 agent   = "codex"
-model   = "terra"
+model   = "gpt-5.6-terra"
 
 [[task.cell]]
 id                         = "work"
 cwd                        = "<<ralphus:new-worktree/RAL-469-restore-claude-md-agents-md-loading?upstream=staging>>"
 review                     = "<<ralphus:new-review/ral-469-470>>"
 agent                      = "codex"
-model                      = "terra"
+model                      = "gpt-5.6-terra"
 maximum_context            = 200000
 auto_compact_threshold     = 150000
 maximum_tool_output_tokens = 15000
