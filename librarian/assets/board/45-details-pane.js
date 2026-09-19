@@ -1158,7 +1158,8 @@
       function showTextPopup(title, text) {
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
-            <h2>${esc(title)}</h2>
+            <h2 style="padding-right:26px">${esc(title)}</h2>
+            <span class="corner">${copyBtn(text)}</span>
             <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px">${esc(text)}</pre>
             <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
           </div></div>`;
@@ -1253,7 +1254,8 @@
         const text = /** @type {HTMLElement} */ (e.currentTarget).dataset.full || "";
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
-            <h2 style="color:var(--failed)">Failure log</h2>
+            <h2 style="color:var(--failed);padding-right:26px">Failure log</h2>
+            <span class="corner">${copyBtn(text)}</span>
             <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--failed);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px;color:var(--failed)">${esc(text)}</pre>
             <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
           </div></div>`;
