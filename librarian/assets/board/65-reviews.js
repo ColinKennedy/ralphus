@@ -1169,6 +1169,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               ${manualChecksPeekBox(g)}`;
           })()}`;
         attachPeekResizeHandlers();
+        restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
       }
       // CCTL-135: per-branch merge detail is collapsed by default; toggle open.
       /**
