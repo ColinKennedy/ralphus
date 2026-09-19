@@ -1226,16 +1226,21 @@ pub struct LiveViewConfig {
     /// falls back to 200.
     #[serde(default)]
     pub tool_arg_truncate_chars: Option<u32>,
-    /// RAL-434: whether the pi backend collapses each thinking/reasoning
-    /// block it streams into a compact marker instead of printing it
-    /// verbatim. Pi's own `hideThinkingBlock` setting only governs its
-    /// interactive TUI's renderer -- its `--mode json`/print-mode event
-    /// stream (what the pi backend actually consumes) always tags thinking
-    /// content with its own distinct event type regardless of that setting,
-    /// so this is ralphus's own control, not a passthrough of Pi's. `None`
-    /// means unset; resolved callers use
+    /// RAL-434: whether a newly-opened Live View pane starts with the model's
+    /// thinking/reasoning content folded away.
+    ///
+    /// This is a *rendering* default only, exactly like
+    /// [`show_debug_messages_default`](Self::show_debug_messages_default) --
+    /// the runner always tags thinking into the transcript
+    /// (`runner/src/pi_backend.rs`'s `THINKING_MARKER`), so the per-pane "Show
+    /// Thinking" checkbox can fold and unfold it freely and nothing is ever
+    /// discarded at capture time. Backends that do not distinguish thinking
+    /// from ordinary output (everything but pi today) have nothing to tag, so
+    /// their panes are unaffected whatever this is set to.
+    ///
+    /// `None` means unset; resolved callers use
     /// [`hide_thinking`](Self::hide_thinking), which falls back to `false`
-    /// (thinking streams like any other text).
+    /// (thinking shown, today's behavior).
     #[serde(default)]
     pub hide_thinking: Option<bool>,
 }
@@ -1257,9 +1262,8 @@ impl LiveViewConfig {
             .unwrap_or(DEFAULT_TOOL_ARG_TRUNCATE_CHARS)
     }
 
-    /// Whether the pi backend should collapse each thinking block into a
-    /// compact marker. Defaults to `false` (thinking streams like any other
-    /// text) when unset.
+    /// Whether a newly-opened Live View pane starts with thinking folded
+    /// away. Defaults to `false` (thinking shown) when unset.
     #[must_use]
     pub fn hide_thinking(&self) -> bool {
         self.hide_thinking.unwrap_or(false)
@@ -3427,26 +3431,25 @@ mod tests {
         assert_eq!(effective.tool_arg_truncate_chars(), 500);
     }
 
-    // ── hide_thinking (RAL-434) ────────────────────────────────────────────
+    // -- hide_thinking (RAL-434) ------------------------------------------
 
     #[test]
     fn hide_thinking_defaults_to_false_when_absent() {
-        let c = live_view_from_toml_str("");
-        assert!(!c.hide_thinking());
+        assert!(!live_view_from_toml_str("").hide_thinking());
     }
 
     #[test]
     fn hide_thinking_parses_explicit_true() {
-        let c = live_view_from_toml_str("[live_view]\nhide_thinking = true\n");
-        assert!(c.hide_thinking());
+        assert!(live_view_from_toml_str("[live_view]\nhide_thinking = true\n").hide_thinking());
     }
 
     #[test]
     fn hide_thinking_parses_explicit_false() {
-        let c = live_view_from_toml_str("[live_view]\nhide_thinking = false\n");
-        assert!(!c.hide_thinking());
+        assert!(!live_view_from_toml_str("[live_view]\nhide_thinking = false\n").hide_thinking());
     }
 
+    /// A project's `.ralphus.toml` overrides the global file, the same way
+    /// every other `[live_view]` key layers.
     #[test]
     fn hide_thinking_project_wins_over_global() {
         let global = live_view_from_toml_str("[live_view]\nhide_thinking = false\n");

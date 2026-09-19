@@ -720,6 +720,7 @@ const CHECK_CHILDREN: &[HelpNode] = &[
         true, // ("check", "health")
         &[],
     ),
+    // Mapped to GET /api/health/catalog in check_endpoint_cli_parity.py's manifest.
     node(
         "catalog",
         &[],

@@ -481,6 +481,12 @@
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
+      /** Model thinking/reasoning marker, trailing space included; tags one line of reasoning (RAL-434). Matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER. */
+      const RALPHUS_TAPE_THINKING_PREFIX = "RALPHUS_THINKING: ";
+      /** Private sentinel classifyTapeLine returns for a thinking line that is folded away, so renderTapeLines can collapse a whole run of them into one placeholder. Carries a NUL byte so it can never collide with a real rendered line. */
+      const THINKING_FOLDED = "\u0000thinking-folded";
+      /** What a folded run of thinking lines renders as, following the ⟨debug⟩ convention formatInlineTapeEvent uses. */
+      const THINKING_FOLDED_TEXT = "\u27e8thinking\u2026\u27e9";
       /** The mid-run, per-turn usage snapshot's message name. Matches runner/src/cartographer.rs::LIVE_USAGE_MESSAGE — the one usage event whose numbers are a live estimate, superseded by the cell's own "llm done"/"proof-llm done" event once the run finishes. */
       const LIVE_USAGE_MESSAGE = "live usage";
       /** Max chars scanned for a CSI sequence's final byte before giving up. Matches daemon/src/terminal_log.rs::MAX_CSI_SEQUENCE_LEN. */
@@ -630,35 +636,80 @@
        * Classify + render one already-ANSI-stripped line, or return null to
        * drop it: `RALPHUS_TMUX_DONE` lines are always dropped (internal
        * sentinel); `RALPHUS_EVENT` lines are dropped when Debug is off and
-       * rendered inline when on; everything else is agent output, kept verbatim
-       * (a trailing `\r` from `\r\n` is trimmed for tidy display).
+       * rendered inline when on; `RALPHUS_THINKING` lines (RAL-434) are
+       * un-prefixed when Thinking is on and returned as the `THINKING_FOLDED`
+       * sentinel when off, for renderTapeLines to collapse; everything else is
+       * agent output, kept verbatim (a trailing `\r` from `\r\n` is trimmed
+       * for tidy display).
        * @param {string} line
        * @param {boolean} showDebug
+       * @param {boolean} showThinking
        * @returns {string|null}
        */
-      function classifyTapeLine(line, showDebug) {
+      function classifyTapeLine(line, showDebug, showThinking) {
         const clean = line.replace(/\r$/, "");
         if (clean.startsWith(RALPHUS_TAPE_DONE_PREFIX)) return null;
         if (clean.startsWith(RALPHUS_TAPE_EVENT_PREFIX)) {
           if (!showDebug) return null;
           return formatInlineTapeEvent(clean.slice(RALPHUS_TAPE_EVENT_PREFIX.length));
         }
+        if (clean.startsWith(RALPHUS_TAPE_THINKING_PREFIX)) {
+          if (!showThinking) return THINKING_FOLDED;
+          return clean.slice(RALPHUS_TAPE_THINKING_PREFIX.length);
+        }
         return clean;
       }
       /**
        * Run the full pipeline over a tape's complete lines — ANSI-strip,
        * classify, drop nulls, join — to the single text the Live View renders.
+       *
+       * A folded thinking block is many tagged lines but should read as one
+       * `⟨thinking…⟩` line, so a run of consecutive `THINKING_FOLDED`
+       * sentinels collapses to a single placeholder. The run is broken by any
+       * other line, so two thinking blocks either side of real output stay
+       * visibly separate.
        * @param {string[]} lines
        * @param {boolean} showDebug
+       * @param {boolean} showThinking
        * @returns {string}
        */
-      function renderTapeLines(lines, showDebug) {
+      function renderTapeLines(lines, showDebug, showThinking) {
         const out = [];
+        let folding = false;
         for (const raw of lines) {
-          const rendered = classifyTapeLine(renderPaneLine(raw), showDebug);
-          if (rendered !== null) out.push(rendered);
+          const rendered = classifyTapeLine(renderPaneLine(raw), showDebug, showThinking);
+          if (rendered === null) continue;
+          if (rendered === THINKING_FOLDED) {
+            if (folding) continue;
+            folding = true;
+            out.push(THINKING_FOLDED_TEXT);
+            continue;
+          }
+          folding = false;
+          out.push(rendered);
         }
         return out.join("\n");
+      }
+      /**
+       * Strips the `RALPHUS_THINKING` tag off every line of a whole block of
+       * already-fetched text, leaving the reasoning itself (RAL-434).
+       *
+       * Used by the views that show a terminal log as-is rather than through
+       * the classify pipeline — the attempt-history viewer's older attempts —
+       * so a tagged line reads as plain reasoning there instead of leaking the
+       * marker. Those views have no Show Thinking checkbox of their own.
+       * @param {string} text
+       * @returns {string}
+       */
+      function stripThinkingPrefixes(text) {
+        return text
+          .split("\n")
+          .map((line) =>
+            line.startsWith(RALPHUS_TAPE_THINKING_PREFIX)
+              ? line.slice(RALPHUS_TAPE_THINKING_PREFIX.length)
+              : line,
+          )
+          .join("\n");
       }
       // RALPHUS-TAPE-LINES:END
 
@@ -840,6 +891,33 @@
         renderPeekTape(key);
       }
       /**
+       * Whether Live View pane `key` currently expands the model's
+       * thinking/reasoning lines (RAL-434) rather than folding each block to a
+       * single `⟨thinking…⟩` placeholder — the per-pane override in
+       * `peekShowThinking` if this pane's checkbox has been toggled this
+       * session, else the inverse of the config-driven `hideThinkingDefault`.
+       * @param {string} key
+       * @returns {boolean}
+       */
+      function peekShowsThinking(key) {
+        return key in peekShowThinking ? peekShowThinking[key] : !hideThinkingDefault;
+      }
+      /**
+       * Toggles Live View pane `key`'s "Show Thinking" checkbox (RAL-434).
+       * Thinking is tagged into the transcript by the runner rather than
+       * dropped, so — exactly like "Show Debug Messages" — this only flips the
+       * flag and re-renders the already-loaded tape window: no fetch, no
+       * flash, and folding is freely reversible.
+       * @param {string} key
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function toggleShowThinking(key, checked) {
+        peekShowThinking[key] = checked;
+        if (peekTape[key] === undefined) return;
+        renderPeekTape(key);
+      }
+      /**
        * Switches which tab a peek box shows — "terminal" (the default,
        * transcript-tape live view, RAL-397 Phase 2G-A) or "prompt" (the
        * step's exact system prompt, RAL-428). Only admins ever get the tab
@@ -900,10 +978,11 @@
         setPeekPreText(`peek-prompt-${peekCssKey(key)}`, peekPromptDisplay(peekSystemPrompt[key]));
       }
       /**
-       * Fetches the operator-configured default for the "Show Debug
-       * Messages" checkbox (RAL-232, `[live_view]` in `.ralphus.toml`) once
-       * at page load. Best-effort: a failed/unreachable fetch just leaves
-       * the built-in `false` (unchecked, agent-only) default in place.
+       * Fetches the operator-configured defaults for the Live View's
+       * checkboxes — "Show Debug Messages" (RAL-232) and "Show Thinking"
+       * (RAL-434), both `[live_view]` in `.ralphus.toml` — once at page load.
+       * Best-effort: a failed/unreachable fetch just leaves the built-in
+       * defaults in place (debug unchecked/agent-only, thinking expanded).
        * @returns {Promise<void>}
        */
       async function fetchLiveViewConfigDefault() {
@@ -912,7 +991,8 @@
           if (!resp.ok) return;
           const data = await resp.json();
           showDebugMessagesDefault = !!data.show_debug_messages_default;
+          hideThinkingDefault = !!data.hide_thinking;
         } catch (_) {
-          // keep the built-in false default
+          // keep the built-in defaults
         }
       }

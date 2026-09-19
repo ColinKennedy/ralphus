@@ -161,19 +161,6 @@ pub struct RunOptions<'a> {
     /// separate settings from memory -- those backends isolate whenever
     /// either this or [`Self::allow_personal_settings`] is `false`.
     pub allow_personal_memory: bool,
-    /// RAL-434: whether a backend that streams thinking/reasoning content as
-    /// its own distinct event type should collapse each thinking block into
-    /// a compact marker instead of printing it verbatim. Pi's `--mode json`
-    /// stream tags every `message_update` with an `assistantMessageEvent`
-    /// `type` (`thinking_start`/`thinking_delta`/`thinking_end` vs.
-    /// `text_start`/`text_delta`/`text_end`) regardless of its own
-    /// interactive-only `hideThinkingBlock` setting (that setting is read
-    /// only by the TUI's renderer, never by JSON/print mode), so this is
-    /// ralphus's own control rather than a passthrough of Pi's. Defaults to
-    /// `false` (thinking streams like any other text, today's behavior)
-    /// mirroring `allow_personal_settings`'s "hand-rolled backends accept
-    /// and ignore it" precedent -- only the pi backend reads this today.
-    pub hide_thinking: bool,
 }
 
 /// RAL-292: the sole turn content sent by [`ModelBackend::nudge`]'s default

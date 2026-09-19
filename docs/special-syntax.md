@@ -142,7 +142,7 @@ prefer a standalone exact-form line over a substring scan.
 
 ### Process-side sentinels (agent authors, not cell authors)
 
-Two sentinels exist for code that *hosts* a ralphus runner, not for task
+Three sentinels exist for code that *hosts* a ralphus runner, not for task
 files or cell replies:
 
 - **`RALPHUS_EVENT: {"level":"info",…}`** — stderr marker lines the runner
@@ -156,6 +156,23 @@ files or cell replies:
   daemon polls pane content for a **standalone line of that exact form** —
   deliberately not a substring scan, which false-positives whenever the
   cell's own work echoes the literal marker.
+- **`RALPHUS_THINKING: <one line of reasoning>`** — a stdout marker the
+  runner prints before each line of model thinking/reasoning content, for
+  backends that report thinking as its own distinct event stream (RAL-434;
+  pi today, via its `--mode json` `thinking_start`/`thinking_delta`/
+  `thinking_end` events). Unlike the two above, this tags the *model's*
+  output rather than ralphus's own telemetry, and it exists so thinking
+  visibility is a **render-time** choice: the board's per-pane "Show
+  Thinking" checkbox strips the tag when on and folds the run of lines
+  carrying it into one `⟨thinking…⟩` placeholder when off. Nothing is
+  discarded at capture time, so folding is freely reversible; `[live_view]
+  hide_thinking` only sets which way a newly-opened pane starts.
+
+  Matched as a **line prefix** (after any leading whitespace), never as a
+  substring, so agent output that merely echoes the literal marker
+  mid-line is left alone. The `/pane` fallback view has no checkbox of its
+  own, so the daemon strips the tag there and shows the reasoning plainly
+  (`server.rs::unprefix_thinking_line`).
 
 ---
 

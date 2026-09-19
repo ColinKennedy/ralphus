@@ -143,6 +143,11 @@
         // lines are rendered in place or dropped -- no separate stream, no
         // prepended block (that richer Cartographer stream returns in 2G-B).
         const showDebug = peekShowsDebug(key);
+        // RAL-434: the thinking counterpart. The runner tags each reasoning
+        // line into the tape rather than dropping it, so this folds and
+        // unfolds the same loaded window -- nothing is refetched, and nothing
+        // was discarded at capture time to begin with.
+        const showThinking = peekShowsThinking(key);
         const shown = cached;
         // RAL-428: admins get a two-tab live viewer — the transcript-tape
         // terminal (default; the Show Debug Messages toggle, jump button and
@@ -154,6 +159,7 @@
         // terminal tab.
         const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
         const debugToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const thinkingToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show the model's own thinking/reasoning, expanded inline where it happened. Off folds each thinking block to a single &lt;thinking…&gt; line so routine monitoring shows what the agent did rather than how it talked itself there.\nFolding is purely a display choice and is freely reversible -- the reasoning is always captured in the transcript, so toggling this re-renders the text already loaded without refetching anything.\nThe starting state can be changed globally via the ralphus config file's [live_view] table (hide_thinking).\nOnly agent backends that report thinking as its own distinct stream have anything to fold here; a backend that does not (or a plain command cell) shows nothing either way."><input type="checkbox" ${showThinking ? "checked" : ""} onchange="toggleShowThinking('${esc(key)}',this.checked)"> Show Thinking</label>`;
         const copyTip = promptTab
           ? "Copy this step's system prompt to clipboard.\nCopies the exact text shown on this tab — the full effective prompt the agent received (ralphus's hidden instructions plus the step's authored system prompt).\nA command cell or an agent step never yet dispatched has no text to copy."
           : "Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after.";
@@ -370,7 +376,9 @@
       function renderPeekTape(key) {
         const w = peekTape[key];
         const ended = !!peekEnded[key];
-        let text = w ? renderTapeLines(tapeCompleteLines(w, ended), peekShowsDebug(key)) : "";
+        let text = w
+          ? renderTapeLines(tapeCompleteLines(w, ended), peekShowsDebug(key), peekShowsThinking(key))
+          : "";
         text = scrubSecrets(text);
         if (ended) {
           text = text.trim()
@@ -609,7 +617,15 @@
             };
           } else {
             const data = await resp.json();
-            historyViewing[key] = { attempt, content: scrubSecrets(data.content || "(empty)"), merged };
+            // RAL-434: this view shows a stored attempt's log as-is rather
+            // than through the tape classify pipeline, and has no Show
+            // Thinking checkbox, so un-tag thinking lines here -- otherwise
+            // the raw marker would show through.
+            historyViewing[key] = {
+              attempt,
+              content: scrubSecrets(stripThinkingPrefixes(data.content || "(empty)")),
+              merged,
+            };
           }
         } catch (_) {
           historyViewing[key] = { attempt, content: "Could not load this attempt's log (network error).", merged };
