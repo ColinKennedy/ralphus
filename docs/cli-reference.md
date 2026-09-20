@@ -677,14 +677,16 @@ use; see `READ_ONLY_NOTE`.
         - register --arg [value...] --channel --description [text] --program [path] --scheme [name]  {Register a provider program a task's 'machine' field can reference.}
         - remove scheme [str]  {Remove a registered machine provider.}
     - mailbox  {Drain the escalation mailbox (RAL-241): failed/stalled work the daemon flagged for attention. Also personal watches and notification preferences layered over the same mailbox (RAL-320).}
-        - check --category [name] --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241). --category restricts to one message category, e.g. "review" (RAL-375).}
+        - check --priority [urgent|high|normal]  {Drain unread escalation mailbox messages and print them (RAL-241).}
         - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their watches (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
-        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: automatic creator watches and default notify tiers.}
-        - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's automatic-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
-        - unwatch entity_uri [uri] --user [name]  {Stop watching an entity (RAL-343).}
-        - watch entity_uri [uri] --tier [urgent|high|normal...] --user [name]  {Watch an entity so its notifications reach the personal mailbox; re-watching updates the notification tiers in place (RAL-343).}
-        - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-343).}
+        - personal-undrain --id [id...] --user [name]  {Mark personal mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
+        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).}
+        - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's auto-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
+        - undrain --id [id...]  {Mark escalation mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
+        - unwatch entity_uri [uri] --user [name]  {Stop watching an entity (RAL-320).}
+        - watch entity_uri [uri] --tier [urgent|high|normal...] --user [name]  {Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-watching updates the notification tiers in place (RAL-320).}
+        - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
     - project  {Register and inspect projects known to the daemon.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}

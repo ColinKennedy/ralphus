@@ -115,7 +115,7 @@ fn dummy_json(chip: &ralphus_mcp::chip::Chip) -> serde_json::Value {
 /// no chip-level "required" signal to derive from.
 const BUSINESS_RULE_ONLY_EXTRA_BOOL: &[(&[&str], &str)] = &[
     (&["review", "squash"], "on"),
-    (&["mailbox", "set-preferences"], "auto_follow"),
+    (&["mailbox", "set-preferences"], "auto_watch"),
 ];
 
 #[test]

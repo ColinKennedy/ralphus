@@ -131,11 +131,11 @@ user-facing actions and relations use **watch** / **watcher**.
 | Term | Meaning |
 |---|---|
 | **Monitor** | The internal subsystem that records watches and emits the bounded set of typed squad/review events eligible for watcher notification. |
-| **watch** | One relation binding a **user** to a whole squad or review plus selected notify tiers. Re-watching updates tiers in place. A squad watch cascades to its tasks, cells, and proof steps through `EntityUri::covers`. The legacy SQLite table and user-preference column retain their `follows` / `auto_follow` names for database compatibility. |
+| **watch** | One relation binding a **user** to a whole squad or review plus selected notify tiers. Re-watching updates tiers in place. A squad watch cascades to its tasks, cells, and proof steps through `EntityUri::covers`. |
 | **watcher** | A user who has a watch on the named squad or review. |
 | **notify tiers** (on a watch) | The subset of the mailbox's existing `urgent`/`high`/`normal` priority tiers a watch accepts. Distinct from **default notify tiers** (a user-level default). |
 | **personal mailbox** | The per-user *view* over the same broadcast mailbox rows, filtered to events covered by that user's watches and tiers. Because both views use the same event-tagged row, being an owner and watcher cannot create duplicate messages. |
-| **watch everything I create** | The default-on per-user preference persisted in the compatibility column `users.auto_follow`. It creates watches for future squads and reviews; disabling it does not remove existing watches. |
+| **watch everything I create** | The default-on per-user preference persisted in `users.auto_watch`. It creates watches for future squads and reviews; disabling it does not remove existing watches. |
 | **default notify tiers** (user preference) | A per-user preference used when a watch does not specify its own tiers, including automatic creator watches. |
 
 ## Scheduling
