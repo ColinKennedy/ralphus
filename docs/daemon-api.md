@@ -3797,7 +3797,7 @@ event. No `?category` filter here (RAL-375) — a watched entity's messages
 always surface through a personal watch regardless of category, so a client
 polling this endpoint sees them no matter which mode it's operating in.
 
-### `POST /api/forge/webhook/{provider}` (Track E, E2-E6)
+### `POST /api/forge/webhook/{provider}` (Track E, E2-E7)
 Receives a forge-delivered webhook event. `{provider}` is `github` or
 `gitlab`; any other value is `404 not_found`.
 
@@ -3846,8 +3846,15 @@ when a PR resolved) naming the provider, matched project, and resolved
 secret matches) gets `401 unauthorized` — the same error envelope as a
 missing bearer token elsewhere in the API.
 
-**Scope note.** The acknowledge-within-10s budget is a separate,
-not-yet-implemented step (E7).
+**Acknowledge within 10s always (E7).** This route is answered on its own
+freshly spawned thread rather than `write_pool`'s single-worker queue every
+other mutating route goes through (`run_http_loop` in `server.rs`) — a
+webhook delivery must never be stuck waiting behind an unrelated slow
+mutation (e.g. a squad-creation git fetch) past a forge's own webhook ack
+budget (GitHub marks a delivery failed and retries it if no response arrives
+within 10s). Safe because the handler only touches `Store` through its own
+internal locking, the same guarantee `read_pool`'s concurrent GET workers
+already rely on.
 
 ## Notes on future evolution
 

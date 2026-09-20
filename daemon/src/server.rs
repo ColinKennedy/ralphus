@@ -15544,6 +15544,11 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         // time that poll runs -- true when the accept loop itself just ran
         // the handler, not guaranteed if a `write_pool` worker is still
         // mid-flight on a separate thread.
+        //
+        // `POST /api/forge/webhook/{provider}` is the other exception (Track
+        // E, E7): answered on its own freshly spawned thread rather than
+        // queued on `write_pool`, so it can never be stuck behind an
+        // unrelated slow mutation past a forge's webhook ack budget.
         if pending.method == "GET" {
             // `dispatch` only hands the request back if every worker thread
             // is gone (they all panicked); answering it inline then is
@@ -15555,6 +15560,20 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
         {
             answer_request(daemon, pending);
+        } else if pending.method == "POST" && webhook_provider_from_path(&pending.url).is_some() {
+            // Track E, E7: acknowledge within 10s always. `write_pool` has
+            // exactly one worker (see its doc comment) and can be mid-flight
+            // on an unrelated slow mutation -- a squad-creation git fetch, a
+            // Guardian merge -- for far longer than a forge's webhook ack
+            // budget (GitHub marks a delivery failed and retries it if no
+            // response arrives within 10s). A verified webhook delivery must
+            // never queue behind that, so it's answered on its own thread
+            // instead, independent of `write_pool`'s ordering. Safe because
+            // `route_webhook` only touches `Store` through its own internal
+            // locking (RAL-393) -- the same guarantee `read_pool` workers
+            // already rely on to run concurrently with mutating requests.
+            let daemon = Arc::clone(daemon);
+            std::thread::spawn(move || answer_request(&daemon, pending));
         } else if let Some(returned) = write_pool.dispatch(pending) {
             answer_request(daemon, returned);
         }
