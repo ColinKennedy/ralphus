@@ -503,30 +503,57 @@ pub fn run_loop(
     }
     loop {
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
-        if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
+        // Track A / A9: `tick` above already skips claiming new Pending
+        // squads during a configured `[daemon].downtime` window (RAL-122),
+        // but every sub-sweep below still ran on schedule regardless --
+        // configured quiet hours silenced almost none of the daemon's
+        // background activity, outbound forge traffic included. Checked
+        // once per outer iteration, fresh (matching `tick`'s own "checked
+        // fresh every tick" reasoning), and gates every sub-sweep below
+        // uniformly, so "downtime" has one simple meaning: the scheduler
+        // starts nothing new and touches nothing background-automatic,
+        // while any cell/task already running keeps running untouched
+        // (`tick`'s own doc explains why that part is safe to leave alone).
+        //
+        // One deliberate tradeoff: `cpu_stall_tracker.sweep` below also
+        // pauses, so a cell that wedges during a downtime window will not
+        // be flagged until the window ends. Accepted because the window is
+        // self-configured and typically short, and because a stalled cell
+        // is otherwise inert (it costs nothing extra by sitting unflagged)
+        // -- but worth knowing if downtime windows are ever configured to
+        // span a much longer period than "quiet hours".
+        //
+        // A sub-sweep skipped this way leaves its own `last_x` timer
+        // untouched, so it is due again (and runs) on the very next
+        // iteration once downtime ends, the same "catch up immediately,
+        // never backlog forever" behavior a paused cron tick would have.
+        let in_downtime = crate::config::scheduler_in_downtime();
+        if !in_downtime && last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
             last_maintenance = std::time::Instant::now();
         }
-        if last_base_branch_freshness_poll.elapsed() >= BASE_BRANCH_FRESHNESS_POLL_INTERVAL {
+        if !in_downtime
+            && last_base_branch_freshness_poll.elapsed() >= BASE_BRANCH_FRESHNESS_POLL_INTERVAL
+        {
             crate::guardian_merge::poll_base_branch_freshness_once(&store);
             last_base_branch_freshness_poll = std::time::Instant::now();
         }
-        if last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
+        if !in_downtime && last_summary_sweep.elapsed() >= SUMMARY_SWEEP_INTERVAL {
             crate::guardian_merge::sweep_pending_summaries(&store, &sem);
             // RAL-389 uses the same cheap debounce-sweep cadence while doing
             // the actual push and forge work on background threads.
             crate::pr::sweep_pending_pr_auto_submits_once(&store);
             last_summary_sweep = std::time::Instant::now();
         }
-        if last_ark_check.elapsed() >= Duration::from_secs(3600) {
+        if !in_downtime && last_ark_check.elapsed() >= Duration::from_secs(3600) {
             crate::ark::periodic_sweep(&store, &cancellations, &sem);
             last_ark_check = std::time::Instant::now();
         }
-        if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
+        if !in_downtime && last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
             last_worktree_retirement = std::time::Instant::now();
         }
-        if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
+        if !in_downtime && last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();
             let guard = store.lock();
             match guard.cartographer_prune(cfg.retention_days(), cfg.max_rows()) {
@@ -550,7 +577,7 @@ pub fn run_loop(
             drop(guard);
             last_prune = std::time::Instant::now();
         }
-        if last_terminal_log_prune.elapsed() >= TERMINAL_LOG_PRUNE_INTERVAL {
+        if !in_downtime && last_terminal_log_prune.elapsed() >= TERMINAL_LOG_PRUNE_INTERVAL {
             let cfg = crate::config::load_terminal_log_config();
             // Filesystem walk, deliberately done without holding the store
             // lock (unlike `cartographer_prune`, which is itself the DB
@@ -571,15 +598,15 @@ pub fn run_loop(
             }
             last_terminal_log_prune = std::time::Instant::now();
         }
-        if last_forge_reorder_poll.elapsed() >= FORGE_REORDER_POLL_INTERVAL {
+        if !in_downtime && last_forge_reorder_poll.elapsed() >= FORGE_REORDER_POLL_INTERVAL {
             crate::pr::poll_forge_reorders(&store, &sem, &cancellations);
             last_forge_reorder_poll = std::time::Instant::now();
         }
-        if last_triage_schedule_check.elapsed() >= TRIAGE_SCHEDULE_INTERVAL {
+        if !in_downtime && last_triage_schedule_check.elapsed() >= TRIAGE_SCHEDULE_INTERVAL {
             crate::triage::run_schedule_tick(&store);
             last_triage_schedule_check = std::time::Instant::now();
         }
-        if last_cpu_stall_sweep.elapsed() >= CPU_STALL_SWEEP_INTERVAL {
+        if !in_downtime && last_cpu_stall_sweep.elapsed() >= CPU_STALL_SWEEP_INTERVAL {
             cpu_stall_tracker.sweep(&store, &procs);
             last_cpu_stall_sweep = std::time::Instant::now();
         }
