@@ -3884,8 +3884,20 @@ unregistered project name. On success, `201` with the created hook:
 { "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true }
 ```
 
-Manual/explicit only — no automatic lifecycle management (secret rotation,
-address change, project removal) yet; that is a later ticket (E9).
+Manual/explicit for install itself; secret rotation and address change are
+`POST .../webhook/update` below (E9), and project-removal cleanup is
+automatic (E9, see `DELETE /api/projects/{name}` below).
+
+**GitLab "url is blocked" (E10).** GitLab's SSRF protection rejects a
+webhook URL pointing to the local network with a `422` whose raw body
+doesn't say where the fix lives. Both `install` and `update` translate that
+specific error into guidance naming the fix: a GitLab *instance admin* must
+enable "Allow requests to the local network from webhooks and integrations"
+under Admin Area > Settings > Network > Outbound requests — a setting the
+project maintainer calling this route cannot change themselves. This is the
+most likely first-run failure when `--daemon-url` points at a
+local/tunneled address (`http://127.0.0.1:...`, an ngrok/tailscale
+hostname the GitLab instance treats as local) against a self-hosted GitLab.
 
 ### `GET /api/projects/{name}/webhook/status` (Track E, E8)
 Lists every webhook currently registered on the project's forge repo — not

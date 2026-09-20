@@ -2446,8 +2446,9 @@ impl ForgeClient {
                     "merge_requests_events": true,
                     "push_events": false,
                 });
-                let body =
-                    self.send_structured(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                let body = self
+                    .send_structured(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)
+                    .map_err(translate_gitlab_url_blocked)?;
                 parse_gitlab_webhook(&body)
             }
         }
@@ -2497,8 +2498,9 @@ impl ForgeClient {
                     "merge_requests_events": true,
                     "push_events": false,
                 });
-                let body =
-                    self.send_structured(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                let body = self
+                    .send_structured(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)
+                    .map_err(translate_gitlab_url_blocked)?;
                 parse_gitlab_webhook(&body)
             }
         }
@@ -2748,6 +2750,35 @@ fn describe_error(e: ureq::Error) -> ForgeError {
             }
         }
         other => ForgeError::other(format!("forge API: {other}")),
+    }
+}
+
+/// Detect GitLab's SSRF-protection rejection (Track E, E10) -- a `422
+/// Unprocessable Entity` with a body like `{"message":{"url":["is blocked:
+/// Requests to the local network are not allowed"]}}` -- and translate it
+/// into actionable admin guidance. This is overwhelmingly the first-run
+/// failure for a self-hosted GitLab instance, or a `--daemon-url` pointing
+/// at a local/tunneled address, and GitLab's raw error alone doesn't say
+/// where the fix lives: it's an *instance-admin-only* setting ("Allow
+/// requests to the local network from webhooks and integrations" under
+/// Admin Area > Settings > Network > Outbound requests), invisible to
+/// whoever is running `webhook install`/`update` as a project maintainer.
+/// A non-matching error passes through unchanged.
+fn translate_gitlab_url_blocked(e: ForgeError) -> ForgeError {
+    if e.status != Some(422) || !e.message.to_lowercase().contains("is blocked") {
+        return e;
+    }
+    ForgeError {
+        status: e.status,
+        retry_after: e.retry_after,
+        message: format!(
+            "GitLab rejected this webhook URL as pointing to the local network (SSRF \
+             protection). A GitLab instance admin must enable \"Allow requests to the local \
+             network from webhooks and integrations\" under Admin Area > Settings > Network > \
+             Outbound requests before this will succeed -- a project maintainer running this \
+             command cannot change that setting themselves. Original error: {}",
+            e.message
+        ),
     }
 }
 
@@ -6657,6 +6688,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hook.id, "7");
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E10: GitLab "url is blocked" (SSRF protection) translation ──
+
+    #[test]
+    fn translate_gitlab_url_blocked_rewrites_the_message_and_keeps_the_status() {
+        let raw = ForgeError {
+            status: Some(422),
+            retry_after: None,
+            message: r#"forge API 422: {"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#.to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw);
+        assert_eq!(translated.status, Some(422));
+        assert!(
+            String::from(translated.clone()).contains("instance admin"),
+            "{}",
+            String::from(translated)
+        );
+    }
+
+    #[test]
+    fn translate_gitlab_url_blocked_passes_through_unrelated_errors() {
+        let raw = ForgeError {
+            status: Some(404),
+            retry_after: None,
+            message: "forge API 404: not found".to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw.clone());
+        assert_eq!(String::from(translated), String::from(raw));
+    }
+
+    #[test]
+    fn translate_gitlab_url_blocked_ignores_a_422_with_unrelated_text() {
+        // Same status, different reason -- must not be misidentified as the
+        // SSRF-protection case.
+        let raw = ForgeError {
+            status: Some(422),
+            retry_after: None,
+            message: r#"forge API 422: {"message":{"url":["is invalid"]}}"#.to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw.clone());
+        assert_eq!(String::from(translated), String::from(raw));
+    }
+
+    #[test]
+    fn create_webhook_translates_gitlabs_blocked_url_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#,
+                )
+                .with_status_code(422),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client
+            .create_webhook("http://127.0.0.1:9999/api/forge/webhook/gitlab", "shh")
+            .unwrap_err();
+        assert_eq!(err.status, Some(422));
+        assert!(
+            String::from(err).contains("instance admin"),
+            "GitLab's blocked-url error should be translated into admin guidance"
+        );
         handle.join().unwrap();
     }
 }
