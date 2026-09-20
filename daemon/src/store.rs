@@ -1690,6 +1690,13 @@ impl Store {
                 local_sha          TEXT,
                 etag_conversation  TEXT,
                 etag_review        TEXT,
+                -- The merge check's own `GET /pulls/{n}` ETag. Owned by
+                -- `check_pr_merges`, not by either poll half below: that
+                -- check asks the single hottest forge question ralphus has
+                -- (has this PR merged yet?), and sending `If-None-Match`
+                -- makes the overwhelmingly common no answer a 304, which
+                -- GitHub does not charge against the primary rate limit.
+                etag_pr_state      TEXT,
                 -- Per-half freshness. `last_checked_at_ms`/`status`/
                 -- `last_error` above are the rolled-up most-recent-of-either;
                 -- these describe each half on its own, because a pass
@@ -2815,6 +2822,12 @@ impl Store {
             // column can still be NULL for guardians created before this
             // migration.
             "ALTER TABLE guardians ADD COLUMN owner TEXT",
+            // The merge check's own `GET /pulls/{n}` ETag -- see this
+            // column's comment on `guardian_pr_forge_cache`'s CREATE TABLE
+            // above. NULL on an existing row means "never asked
+            // conditionally"; the first merge check after this migration
+            // fetches unconditionally and records the ETag it gets back.
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN etag_pr_state TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

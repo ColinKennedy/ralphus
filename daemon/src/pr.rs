@@ -1087,6 +1087,40 @@ impl Store {
             .unwrap_or((None, None)))
     }
 
+    /// Read the ETag [`check_pr_merges`] last recorded for this PR's
+    /// `GET /pulls/{n}`, if any -- so the next merge check can send
+    /// `If-None-Match` and cost no forge quota when the PR has not changed.
+    pub(crate) fn pr_state_etag(&self, pr_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT etag_pr_state FROM guardian_pr_forge_cache WHERE pr_id=?",
+                params![pr_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the ETag a merge-state fetch returned for this PR.
+    ///
+    /// Only `etag_pr_state` is ever updated on an existing row: the rolled-up
+    /// `last_checked_at_ms`/`status` columns describe the RAL-366 poller's
+    /// two halves (drift and comments), and the merge check is neither of
+    /// them, so it must not move them. They are seeded on insert purely
+    /// because `last_checked_at_ms` is `NOT NULL` -- with `ok`, since
+    /// reaching this call at all means a forge fetch just succeeded, and both
+    /// half-columns left NULL to say "never attempted".
+    pub(crate) fn set_pr_state_etag(&self, pr_id: &str, etag: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(pr_id, last_checked_at_ms, status, etag_pr_state)
+             VALUES(?,?,'ok',?)
+             ON CONFLICT(pr_id) DO UPDATE SET etag_pr_state = excluded.etag_pr_state",
+            params![pr_id, now_ms(), etag],
+        )?;
+        Ok(())
+    }
+
     /// Wholesale-replace the comment/note ids the RAL-366 poller last fetched
     /// for `(pr_id, endpoint)` -- called only after a fresh (non-304)
     /// conditional fetch, so a comment deleted on the forge between polls
@@ -2579,13 +2613,17 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return settle_pr_merge_states(store, id, &[]);
     }
 
-    // Resolve each open PR's forge client up front (cheap, local config/DB
-    // reads); the actual forge call is the only genuinely slow part here,
-    // and is fired off concurrently below since one PR's merge state has no
-    // bearing on any other's.
+    // Resolve each open PR's forge client and last-seen ETag up front
+    // (cheap, local config/DB reads); the actual forge call is the only
+    // genuinely slow part here, and is fired off concurrently below since
+    // one PR's merge state has no bearing on any other's.
     struct MergeCheckJob<'a> {
         pr: &'a PullRequestView,
         client: crate::forge::ForgeClient,
+        /// The ETag the last merge check recorded for this PR, sent as
+        /// `If-None-Match` so an unchanged PR answers `304` and costs no
+        /// GitHub rate-limit quota. `None` until the first check records one.
+        etag: Option<String>,
     }
     let mut jobs = Vec::new();
     for pr in prs
@@ -2613,9 +2651,11 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
         match routing.client_for(&pr.repo) {
             Some(client) if client.kind().as_str() == pr.forge => {
+                let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
                 jobs.push(MergeCheckJob {
                     pr,
                     client: client.clone(),
+                    etag,
                 });
             }
             Some(client) => {
@@ -2646,20 +2686,23 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         }
     }
 
-    let fetched: Vec<Option<std::result::Result<String, String>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .iter()
-            .map(|job| scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
-            })
-            .collect()
-    });
+    let fetched: Vec<Option<std::result::Result<crate::forge::PrStatePoll, String>>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .iter()
+                .map(|job| {
+                    scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client, job.etag.as_deref()))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
+                })
+                .collect()
+        });
 
     let mut freshly_merged = Vec::new();
     for (job, result) in jobs.iter().zip(fetched) {
@@ -2937,7 +2980,8 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     for pr in prs.iter().filter(|p| p.state == "open") {
-        let fetched = fetch_pr_merge_state(pr, client);
+        let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
+        let fetched = fetch_pr_merge_state(pr, client, etag.as_deref());
         apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
 
@@ -2951,9 +2995,14 @@ fn apply_pr_merge_check(
 fn fetch_pr_merge_state(
     pr: &PullRequestView,
     client: &crate::forge::ForgeClient,
-) -> Option<std::result::Result<String, String>> {
+    etag: Option<&str>,
+) -> Option<std::result::Result<crate::forge::PrStatePoll, String>> {
     let number = pr.pr_number?;
-    Some(client.get_pull_request_state(number))
+    Some(
+        client
+            .get_pull_request_state_conditional(number, etag)
+            .map_err(String::from),
+    )
 }
 
 /// The store-writing half of a single PR's merge-state check: apply an
@@ -2964,55 +3013,65 @@ fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
-    fetched: Option<std::result::Result<String, String>>,
+    fetched: Option<std::result::Result<crate::forge::PrStatePoll, String>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
     let Some(result) = fetched else {
         return;
     };
-    match result {
-        Ok(state) if state != "open" => {
-            let _ = store.lock().update_pull_request_ex(
-                &pr.id,
-                None,
-                None,
-                None,
-                Some(&state),
-                None,
-                None,
-                None,
-            );
-            if state == "merged" {
-                freshly_merged.push(pr.clone());
-            } else {
-                // RAL-<new>: a PR closed without merging (state == "closed")
-                // was previously written with zero logging, unlike the
-                // sibling forge-error arm below -- a review can never satisfy
-                // "every linked PR merged" after this and would sit in
-                // `in_review` forever with no record of why.
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [pr] review {id} pr {} observed closed (not merged) on the forge",
-                    pr.id
-                );
-                let guard = store.lock();
-                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::WARNING,
-                    source: "pr",
-                    message: "linked pr closed without merging",
-                    scope: Some("guardian"),
-                    squad_id: None,
-                    guardian_id: Some(id),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({"pr_id": pr.id}),
-                    admin_only: false,
-                });
-            }
+    let (state, etag) = match result {
+        // The stored ETag still matched, so nothing about this PR has
+        // changed since the last check -- including its state. Keep the
+        // recorded one and spend no further work on it.
+        Ok(crate::forge::PrStatePoll::NotModified) => return,
+        Ok(crate::forge::PrStatePoll::Modified { state, etag }) => (state, etag),
+        Err(error) => {
+            log_pr_merge_check_failure(store, id, pr, &error);
+            return;
         }
-        Ok(_) => {}
-        Err(error) => log_pr_merge_check_failure(store, id, pr, &error),
+    };
+    // Record the new ETag even when the state itself is unchanged: this
+    // response is the one the *next* poll wants to ask "still this?" against.
+    let _ = store.lock().set_pr_state_etag(&pr.id, etag.as_deref());
+    if state != "open" {
+        let _ = store.lock().update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            Some(&state),
+            None,
+            None,
+            None,
+        );
+        if state == "merged" {
+            freshly_merged.push(pr.clone());
+        } else {
+            // RAL-<new>: a PR closed without merging (state == "closed")
+            // was previously written with zero logging, unlike the
+            // sibling forge-error arm below -- a review can never satisfy
+            // "every linked PR merged" after this and would sit in
+            // `in_review` forever with no record of why.
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr {} observed closed (not merged) on the forge",
+                pr.id
+            );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "linked pr closed without merging",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"pr_id": pr.id}),
+                admin_only: false,
+            });
+        }
     }
 }
 
@@ -10775,6 +10834,122 @@ mod tests {
         assert_eq!(pr_a_row.state, "merged");
 
         handle.join().unwrap();
+    }
+
+    fn req_header(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    }
+
+    /// An `in_review` guardian with one open, forge-numbered PR.
+    fn guardian_with_one_open_pr(store: &crate::store_lock::StoreHandle) -> (String, String) {
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        (gid, pr_id)
+    }
+
+    #[test]
+    fn merge_check_records_the_returned_etag_and_sends_it_on_the_next_pass() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // First pass: nothing stored yet, so no conditional header.
+            let first = server.recv().unwrap();
+            assert_eq!(req_header(&first, "If-None-Match"), None);
+            first
+                .respond(
+                    tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"s1\""[..]).unwrap(),
+                        )
+                        .with_status_code(200),
+                )
+                .unwrap();
+            // Second pass: the recorded ETag must come back out as
+            // `If-None-Match`, and a 304 must leave the PR exactly as it was.
+            let second = server.recv().unwrap();
+            assert_eq!(
+                req_header(&second, "If-None-Match").as_deref(),
+                Some("\"s1\"")
+            );
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, pr_id) = guardian_with_one_open_pr(&store);
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(
+            store.lock().pr_state_etag(&pr_id).unwrap().as_deref(),
+            Some("\"s1\""),
+            "a fresh response's etag must be recorded for the next pass"
+        );
+
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(
+            store.lock().get_pull_request(&pr_id).unwrap().state,
+            "open",
+            "a 304 means nothing changed, including the recorded state"
+        );
+        assert_eq!(
+            store.lock().pr_state_etag(&pr_id).unwrap().as_deref(),
+            Some("\"s1\""),
+            "a 304 must not clear the etag it was validated against"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn merge_check_etag_write_does_not_disturb_the_poller_half_columns() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (_gid, pr_id) = guardian_with_one_open_pr(&store);
+
+        store
+            .lock()
+            .set_pr_state_etag(&pr_id, Some("\"s1\""))
+            .unwrap();
+
+        let cached = store.lock().get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(
+            cached.drift_checked_at_ms, None,
+            "the merge check is not the drift half and must not claim to have run it"
+        );
+        assert_eq!(
+            cached.comments_checked_at_ms, None,
+            "the merge check is not the comments half and must not claim to have run it"
+        );
     }
 
     #[test]

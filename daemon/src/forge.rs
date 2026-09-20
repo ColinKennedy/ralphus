@@ -167,6 +167,21 @@ pub enum CommentsPoll {
     },
 }
 
+/// Result of [`ForgeClient::get_pull_request_state_conditional`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrStatePoll {
+    /// The stored ETag still matched -- the PR's state is whatever the
+    /// caller already has recorded. On GitHub a `304` does not count against
+    /// the primary rate limit at all, which is the point of asking this way.
+    NotModified,
+    /// A fresh state (`"open"`/`"closed"`/`"merged"`, normalized across both
+    /// forges exactly as [`ForgeClient::get_pull_request_state`] reports it),
+    /// plus the new ETag to store for next time (`None` if this
+    /// forge/response didn't send one, in which case the next poll falls back
+    /// to an unconditional fetch).
+    Modified { state: String, etag: Option<String> },
+}
+
 /// Live base-ref metadata used to reconcile forge-authored base edits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestBaseState {
@@ -785,30 +800,66 @@ impl ForgeClient {
     }
 
     fn get_pull_request_state_inner(&self, number: i64) -> Result<String, String> {
-        let token = self.require_token()?;
-        match self.kind {
+        match self.get_pull_request_state_conditional(number, None)? {
+            PrStatePoll::Modified { state, .. } => Ok(state),
+            // Unreachable with `etag: None` -- no `If-None-Match` is sent, so
+            // the forge has nothing to match and cannot answer `304`.
+            PrStatePoll::NotModified => Err(
+                "forge returned 304 for an unconditional pull request state request".to_string(),
+            ),
+        }
+    }
+
+    /// [`Self::get_pull_request_state`] as a conditional request: sends
+    /// `If-None-Match` when `etag` is given, so a PR whose state has not
+    /// changed since the last poll costs no forge rate-limit quota on GitHub.
+    ///
+    /// This is the merge check's hot path -- `check_pr_merges` asks it once
+    /// per open PR per poll pass, and the answer is "still open" almost every
+    /// time -- so it is the single call where a conditional request pays for
+    /// itself most.
+    ///
+    /// Returns the raw [`ForgeError`] rather than a `String` so a scheduled
+    /// caller can inspect `status`/`retry_after` and back off on a rate limit
+    /// instead of retrying next cycle as if nothing happened.
+    pub fn get_pull_request_state_conditional(
+        &self,
+        number: i64,
+        etag: Option<&str>,
+    ) -> Result<PrStatePoll, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        let req = match self.kind {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
-                if resp["merged"].as_bool().unwrap_or(false) {
-                    return Ok("merged".to_string());
-                }
-                Ok(resp["state"].as_str().unwrap_or("open").to_string())
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
             }
             ForgeKind::GitLab => {
                 let url = format!(
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(match resp["state"].as_str().unwrap_or("opened") {
-                    "opened" => "open".to_string(),
-                    other => other.to_string(),
-                })
+                ureq::get(&url).set("PRIVATE-TOKEN", token)
+            }
+        };
+        match self.get_conditional(req, etag)? {
+            ConditionalGet::NotModified => Ok(PrStatePoll::NotModified),
+            ConditionalGet::Modified { value, etag } => {
+                let state = match self.kind {
+                    ForgeKind::GitHub => {
+                        if value["merged"].as_bool().unwrap_or(false) {
+                            "merged".to_string()
+                        } else {
+                            value["state"].as_str().unwrap_or("open").to_string()
+                        }
+                    }
+                    ForgeKind::GitLab => match value["state"].as_str().unwrap_or("opened") {
+                        "opened" => "open".to_string(),
+                        other => other.to_string(),
+                    },
+                };
+                Ok(PrStatePoll::Modified { state, etag })
             }
         }
     }
@@ -5346,6 +5397,98 @@ mod tests {
         let req = ureq::get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_github_sends_if_none_match_and_returns_the_fresh_etag() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"p1\""));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"p2\""[..]).unwrap(),
+                    )
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client
+                .get_pull_request_state_conditional(7, Some("\"p1\""))
+                .unwrap(),
+            PrStatePoll::Modified {
+                state: "merged".to_string(),
+                etag: Some("\"p2\"".to_string()),
+            }
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_reports_not_modified_on_304() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"p1\""));
+            req.respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client
+                .get_pull_request_state_conditional(7, Some("\"p1\""))
+                .unwrap(),
+            PrStatePoll::NotModified
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_gitlab_normalizes_opened_and_sends_no_etag_when_it_has_none() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/3");
+            assert_eq!(req_header(&req, "If-None-Match"), None);
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state":"opened"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client.get_pull_request_state_conditional(3, None).unwrap(),
+            PrStatePoll::Modified {
+                state: "open".to_string(),
+                etag: None,
+            }
+        );
         handle.join().unwrap();
     }
 
