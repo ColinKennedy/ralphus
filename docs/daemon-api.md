@@ -2440,9 +2440,10 @@ per-project, since one poll cycle spans every project's repos):
 | `poll_interval_secs` | Seconds between poll passes. Values under 5s are treated as unset (a misconfigured `0` would otherwise busy-loop the poller against every open PR's forge). | `300` (RAL-279's original base-drift-poll cadence) |
 
 The poller never consumes a scheduler concurrency permit, skips entirely
-during a configured `[daemon].downtime` window (RAL-122), and batches one
-`git fetch` per guardian's git root covering every one of that guardian's
-open PRs' branches — never one `git fetch` per PR.
+during a configured `[daemon].downtime` window (RAL-122 — as does every other
+scheduler sub-sweep and the hourly health sweep, Track A / A9), and batches
+one `git fetch` per guardian's git root covering every one of that
+guardian's open PRs' branches — never one `git fetch` per PR.
 
 Each pass runs in two ordered stages, and the ordering matters in **both**
 directions:
@@ -2478,6 +2479,32 @@ read `drift_checked_at_ms`/`drift_status` or
 `comments_checked_at_ms`/`comments_status`: a pass that refreshed only
 comments still moves the rolled-up timestamp, so it can read as seconds old
 while the drift columns are hours stale.
+
+#### The linked-PR merge check (`[merge_check]`, Track A / A1)
+
+Separately from the cache above, `review_maintenance` (the scheduler's own
+5s-cadence pass) asks the forge on every linked PR/MR whether it has merged
+yet, so an `in_review` guardian is approved the moment its whole stack lands
+without waiting for a human to notice. Left unthrottled, this was the single
+largest consumer of forge rate-limit budget in the daemon (one `GET
+/pulls/{n}` per open PR, every 5s — roughly 720 requests/hour/PR). It is now
+throttled per guardian by a daemon-singleton `[merge_check]` table in the
+global config file only (same "global-only, no per-project layering"
+rationale as `[pr_cache]` — one sweep spans every project's reviews):
+
+| `.ralphus.toml [merge_check]` key | Meaning | Unset resolves to |
+|---|---|---|
+| `enabled` | Whether the **polled** merge check runs at all. `false` means a review only settles when a manual "Merge / rebase" trigger asks (never throttled — a person who just clicked it gets a live answer). | `true` |
+| `poll_interval_secs` | Minimum seconds between polled merge checks for the same guardian. Values under 5s are treated as unset. | `60` |
+
+The check is also a conditional (`If-None-Match`/`ETag`) request (Track A /
+A2), so a PR whose state hasn't changed since the last poll costs no forge
+quota on GitHub. Like every other forge poller in the daemon, it consults the
+shared per-forge-client rate-limit backoff table (Track A / A6) — skipped
+entirely for a client already cooling down from a `429`/`403` — and that
+backoff can now also be entered proactively, from a successful response's own
+`X-RateLimit-Remaining`/`X-RateLimit-Reset` headers, before the forge ever
+returns a hard rate-limit error (Track A / A7).
 
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
