@@ -843,22 +843,33 @@
         const openPrs = (pullRequests[g.id] || []).filter((p) => p.state === "open");
         return prsMatchStatusFilter(openPrs, reviewFilters.prStatus);
       }
+      // RALPHUS-REVIEW-PR-STATUS-FILTER:BEGIN
       /**
-       * Renders the Reviews sidebar's PR-status filter (RAL-463): a
-       * single-select dropdown mirroring the Tasks tab's, off ("any") by
-       * default.
+       * Builds the Reviews sidebar's PR-status dropdown config (RAL-474): a
+       * single-select menu mirroring the Tasks tab's (`ttPrStatusDropdownConfig`),
+       * sharing the project dropdown's presentation/dismissal model (RAL-475)
+       * instead of a native `<select>`. Off ("any") by default.
+       * @returns {StatusDropdownConfig}
+       */
+      function reviewPrStatusDropdownConfig() {
+        return {
+          id: "reviews-pr",
+          label: "PR Status",
+          mode: "single",
+          options: Object.keys(TT_PR_CI_COLORS).map((s) => ({ value: s, label: statusDropdownLabel(s), color: TT_PR_CI_COLORS[s] })),
+          selectedValue: reviewFilters.prStatus === "any" ? null : reviewFilters.prStatus,
+          optionTip: (s) => `Show only reviews where every one of their PRs are ${s}.`,
+          onSelect: (v) => setReviewPrStatusFilter(v == null ? "any" : /** @type {"passing"|"failing"|"pending"} */ (v)),
+        };
+      }
+      /**
+       * Renders the Reviews sidebar's PR-status filter (RAL-463, RAL-474): the
+       * shared single-select Status dropdown (RAL-475) mirroring the Tasks
+       * tab's, off ("any") by default.
        * @returns {void}
        */
       function renderReviewPrStatusFilter() {
-        const el = byId("review-pr-filter");
-        const opt = (/** @type {string} */ value, /** @type {string} */ label) =>
-          `<option value="${value}" ${reviewFilters.prStatus === value ? "selected" : ""}>${label}</option>`;
-        el.innerHTML = `<select onchange="setReviewPrStatusFilter(this.value)" data-tip="Show only reviews where every one of their PRs share this status.\nWho/when: use this to find fully-passing or fully-failing reviews at a glance, or PRs still waiting on CI.\nOff (any) by default. A review with no PRs never matches a status here.">`
-          + opt("any", "PR status: any")
-          + opt("passing", "PR status: passing")
-          + opt("failing", "PR status: failing")
-          + opt("pending", "PR status: pending")
-          + `</select>`;
+        renderStatusDropdown("review-pr-filter", reviewPrStatusDropdownConfig());
       }
       /**
        * Sets the Reviews sidebar's PR-status filter and re-renders (RAL-463).
@@ -870,6 +881,7 @@
         renderReviews();
         syncHash();
       }
+      // RALPHUS-REVIEW-PR-STATUS-FILTER:END
       /**
        * Computes the Reviews sidebar list after guardian-status/text filtering.
        * @returns {GuardianView[]}

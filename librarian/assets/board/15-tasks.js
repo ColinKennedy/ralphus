@@ -827,23 +827,35 @@
         // undermining the "stays open across individual clicks" design above.
         return names.map((name) => `<div class="ctx-check ${taskTabFilters.projects.has(name) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${taskTabFilters.projects.has(name) ? "checked" : ""} onchange="ttToggleProjectFilter('${esc(name)}',this.checked)">${esc(name)}</label></div>`).join("");
       }
+      // RALPHUS-TT-PR-STATUS-FILTER:BEGIN
       /**
-       * Renders the Tasks toolbar's PR-status filter (RAL-463): a
-       * single-select dropdown over the three PR CI statuses, off ("any")
-       * by default -- left there, `ttRowMatchesPrFilter` never even looks at
-       * a row's PRs, so the filter is genuinely deferred rather than merely
-       * hidden.
+       * Builds the Tasks toolbar's PR-status dropdown config (RAL-474): a
+       * single-select menu over the three PR CI statuses, sharing the
+       * project dropdown's presentation/dismissal model (RAL-475) instead
+       * of a native `<select>`. Off ("any") by default -- left there,
+       * `ttRowMatchesPrFilter` never even looks at a row's PRs, so the
+       * filter is genuinely deferred rather than merely hidden.
+       * @returns {StatusDropdownConfig}
+       */
+      function ttPrStatusDropdownConfig() {
+        return {
+          id: "tasks-pr",
+          label: "PR Status",
+          mode: "single",
+          options: Object.keys(TT_PR_CI_COLORS).map((s) => ({ value: s, label: statusDropdownLabel(s), color: TT_PR_CI_COLORS[s] })),
+          selectedValue: taskTabFilters.prStatus === "any" ? null : taskTabFilters.prStatus,
+          optionTip: (s) => `Show only tasks where every one of their currently-open PRs are ${s}.`,
+          onSelect: (v) => ttSetPrStatusFilter(v == null ? "any" : /** @type {"passing"|"failing"|"pending"} */ (v)),
+        };
+      }
+      /**
+       * Renders the Tasks toolbar's PR-status filter (RAL-463, RAL-474): the
+       * shared single-select Status dropdown (RAL-475) over the three PR CI
+       * statuses.
        * @returns {void}
        */
       function renderTtPrStatusFilter() {
-        const opt = (/** @type {string} */ value, /** @type {string} */ label) =>
-          `<option value="${value}" ${taskTabFilters.prStatus === value ? "selected" : ""}>${label}</option>`;
-        byId("tt-pr-filter").innerHTML = `<select onchange="ttSetPrStatusFilter(this.value)" data-tip="Show only tasks where every one of their currently-open PRs share this status.\nWho/when: use this to find fully-passing or fully-failing work at a glance, or PRs still waiting on CI.\nOff (any) by default. A task with no open PRs never matches a status here.">`
-          + opt("any", "PR status: any")
-          + opt("passing", "PR status: passing")
-          + opt("failing", "PR status: failing")
-          + opt("pending", "PR status: pending")
-          + `</select>`;
+        renderStatusDropdown("tt-pr-filter", ttPrStatusDropdownConfig());
       }
       /**
        * Sets the Tasks toolbar's PR-status filter and re-renders (RAL-463).
@@ -856,6 +868,7 @@
         ttScrollSelectionIntoView();
         syncHash();
       }
+      // RALPHUS-TT-PR-STATUS-FILTER:END
       /**
        * Opens the Tasks toolbar's project-filter dropdown (RAL-345), a `.ctx-menu` popup of project checkboxes -- stays open across individual checkbox clicks since picking several projects in a row is the common case.
        * @param {MouseEvent} e
