@@ -844,14 +844,20 @@
        */
       function visibleGuardians() {
         syncReviewResolverDefault();
-        return guardians.filter((g) => reviewFilters.status.has(g.status)
-          && reviewFilters.resolver.has(resolverOf(g))
-          && reviewFilters.origin.has(originOf(g))
-          && (g.id.toLowerCase().includes(reviewFilters.q) || g.name.toLowerCase().includes(reviewFilters.q))
-          && reviewMatchesPrStatusFilter(g)
-          // RAL-331: a hidden review is a personal view preference, excluded
-          // by default -- except the one just navigated to directly (§reveal).
-          && (reviewFilters.showHidden || !hiddenGuardianIds.has(g.id) || g.id === revealedGuardianId));
+        // RAL-461 follow-up: the one review just navigated to directly
+        // (§reveal) is always shown, bypassing every sidebar filter below --
+        // not just the "hidden" one -- so a "go to review" link can never
+        // land on a review the current status/resolver/origin/PR-status/
+        // search filter would otherwise exclude. Scoped to this single id;
+        // it does not relax the filter for anything else.
+        return guardians.filter((g) => g.id === revealedGuardianId
+          || (reviewFilters.status.has(g.status)
+            && reviewFilters.resolver.has(resolverOf(g))
+            && reviewFilters.origin.has(originOf(g))
+            && (g.id.toLowerCase().includes(reviewFilters.q) || g.name.toLowerCase().includes(reviewFilters.q))
+            && reviewMatchesPrStatusFilter(g)
+            // RAL-331: a hidden review is a personal view preference, excluded by default.
+            && (reviewFilters.showHidden || !hiddenGuardianIds.has(g.id))));
       }
       /**
        * Changes the sidebar's squad sort key.
@@ -877,16 +883,22 @@
        * @returns {SquadView[]}
        */
       function visibleSquads() {
-        let list = squads.filter((r) => filters.status.has(r.state)
-          && (r.id.toLowerCase().includes(filters.q) || (r.label || "").toLowerCase().includes(filters.q))
-          // RAL-331: a hidden squad is a personal view preference, excluded
-          // by default -- except the one just navigated to directly (§reveal).
-          && (filters.showHidden || !hiddenSquadIds.has(r.id) || r.id === revealedSquadId)
-          // RAL-345: a squad matches the project filter if any of its own
-          // tasks' projects is in the selected set; empty set means no filter.
-          // Reads the squad-level `projects` union rather than walking the
-          // task tree, so the sidebar needs no per-task data at all.
-          && (!filters.projects.size || (r.projects || []).some((project) => filters.projects.has(project))));
+        // RAL-461 follow-up: the one squad just navigated to directly
+        // (§reveal) is always shown, bypassing every sidebar filter below --
+        // not just the "hidden" one -- so a "go to squad" link can never
+        // land on a squad the current status/project/search filter would
+        // otherwise exclude. Scoped to this single id; it does not relax
+        // the filter for anything else.
+        let list = squads.filter((r) => r.id === revealedSquadId
+          || (filters.status.has(r.state)
+            && (r.id.toLowerCase().includes(filters.q) || (r.label || "").toLowerCase().includes(filters.q))
+            // RAL-331: a hidden squad is a personal view preference, excluded by default.
+            && (filters.showHidden || !hiddenSquadIds.has(r.id))
+            // RAL-345: a squad matches the project filter if any of its own
+            // tasks' projects is in the selected set; empty set means no filter.
+            // Reads the squad-level `projects` union rather than walking the
+            // task tree, so the sidebar needs no per-task data at all.
+            && (!filters.projects.size || (r.projects || []).some((project) => filters.projects.has(project)))));
         list.sort((a, b) => filters.sort === "name"
           ? filters.dir * (a.label || a.id).localeCompare(b.label || b.id)
           : filters.dir * (a.created_at_ms - b.created_at_ms));
