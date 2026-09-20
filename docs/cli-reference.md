@@ -683,8 +683,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) personal --priority [urgent|high|normal] --unread --user [name]  {List the acting user's personal mailbox messages, filtered through their follows (RAL-320).}
         - personal-drain --id [id...] --user [name]  {Mark personal mailbox messages read; omit --id to drain every unread message (RAL-320).}
         - personal-undrain --id [id...] --user [name]  {Mark personal mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
-        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-follow and default notify tiers (RAL-320).}
-        - set-preferences --auto-follow --no-auto-follow --tier [urgent|high|normal...] --user [name]  {Set a user's auto-follow and default notification-tier preferences; requires exactly one of --auto-follow/--no-auto-follow (RAL-320).}
+        - (read-only-safe) preferences --user [name]  {Show a user's notification preferences: auto-watch and default notify tiers (RAL-320).}
+        - set-preferences --auto-watch --no-auto-watch --tier [urgent|high|normal...] --user [name]  {Set a user's auto-watch and default notification-tier preferences; requires exactly one of --auto-watch/--no-auto-watch (RAL-320).}
         - undrain --id [id...]  {Mark escalation mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
         - unfollow entity_uri [uri] --user [name]  {Stop following an entity (RAL-320).}
     - project  {Register and inspect projects known to the daemon.}

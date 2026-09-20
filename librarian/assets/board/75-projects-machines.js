@@ -1304,7 +1304,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       async function setAutoWatch(enabled) {
         const name = prefsUserName();
         if (!name) return;
-        const r = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_follow: enabled, default_notify_tiers: defaultWatchTiers }) });
+        const r = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_watch: enabled, default_notify_tiers: defaultWatchTiers }) });
         if (r.ok) autoWatch = enabled;
         renderPrefs();
       }
@@ -1327,7 +1327,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             const p = await fetch(`/api/users/${encodeURIComponent(name)}/preferences`);
             if (p.ok) {
               const preferences = await p.json();
-              autoWatch = !!preferences.auto_follow;
+              autoWatch = !!preferences.auto_watch;
               defaultWatchTiers = preferences.default_notify_tiers || defaultWatchTiers;
             }
           }
@@ -2411,4 +2411,3 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const scrollId = kind === "task" ? `tk-${taskIdx}` : `n-${taskIdx}-${cellIdx}`;
         setTimeout(() => document.getElementById(scrollId)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
       }
-

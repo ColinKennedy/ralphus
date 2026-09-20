@@ -45,7 +45,7 @@ pub enum MailboxCommand {
     },
     SetPreferences {
         user: String,
-        auto_follow: bool,
+        auto_watch: bool,
         tiers: Vec<String>,
     },
     Undrain {
@@ -167,28 +167,28 @@ pub fn parse(args: &[String]) -> MailboxCommand {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_follow_on = scanner.take_bool("--auto-follow");
-            let auto_follow_off = scanner.take_bool("--no-auto-follow");
+            let auto_watch_on = scanner.take_bool("--auto-watch");
+            let auto_watch_off = scanner.take_bool("--no-auto-watch");
             let tiers = match scanner.take_repeated("--tier") {
                 Ok(v) => v,
                 Err(e) => return MailboxCommand::UsageError(e.0),
             };
-            let auto_follow = match (auto_follow_on, auto_follow_off) {
+            let auto_watch = match (auto_watch_on, auto_watch_off) {
                 (true, false) => Some(true),
                 (false, true) => Some(false),
                 _ => None,
             };
-            match (user, auto_follow) {
-                (Some(user), Some(auto_follow)) => MailboxCommand::SetPreferences {
+            match (user, auto_watch) {
+                (Some(user), Some(auto_watch)) => MailboxCommand::SetPreferences {
                     user,
-                    auto_follow,
+                    auto_watch,
                     tiers,
                 },
                 (None, _) => {
                     MailboxCommand::UsageError("set-preferences requires --user <name>".to_string())
                 }
                 (_, None) => MailboxCommand::UsageError(
-                    "set-preferences requires exactly one of --auto-follow/--no-auto-follow"
+                    "set-preferences requires exactly one of --auto-watch/--no-auto-watch"
                         .to_string(),
                 ),
             }
@@ -287,11 +287,11 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
         }),
         MailboxCommand::SetPreferences {
             user,
-            auto_follow,
+            auto_watch,
             tiers,
         } => run_and_report(opts, None, || {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            let result = client.set_user_preferences(&user, auto_follow, tiers_opt)?;
+            let result = client.set_user_preferences(&user, auto_watch, tiers_opt)?;
             emit(opts, &result, render_preferences);
             Ok(())
         }),
@@ -398,9 +398,9 @@ fn render_preferences(u: &Value) {
         })
         .unwrap_or_default();
     println!(
-        "{}: auto_follow={} default_notify_tiers=[{}]",
+        "{}: auto_watch={} default_notify_tiers=[{}]",
         u["name"].as_str().unwrap_or_default(),
-        u["auto_follow"].as_bool().unwrap_or(false),
+        u["auto_watch"].as_bool().unwrap_or(false),
         tiers
     );
 }
@@ -544,30 +544,30 @@ mod tests {
     }
 
     #[test]
-    fn set_preferences_requires_user_and_auto_follow_choice() {
+    fn set_preferences_requires_user_and_auto_watch_choice() {
         assert!(matches!(
             parse(&v(&["set-preferences", "--user", "colin"])),
             MailboxCommand::UsageError(_)
         ));
         assert!(matches!(
-            parse(&v(&["set-preferences", "--auto-follow"])),
+            parse(&v(&["set-preferences", "--auto-watch"])),
             MailboxCommand::UsageError(_)
         ));
         match parse(&v(&[
             "set-preferences",
             "--user",
             "colin",
-            "--auto-follow",
+            "--auto-watch",
             "--tier",
             "urgent",
         ])) {
             MailboxCommand::SetPreferences {
                 user,
-                auto_follow,
+                auto_watch,
                 tiers,
             } => {
                 assert_eq!(user, "colin");
-                assert!(auto_follow);
+                assert!(auto_watch);
                 assert_eq!(tiers, v(&["urgent"]));
             }
             other => panic!("unexpected: {other:?}"),
@@ -576,9 +576,9 @@ mod tests {
             "set-preferences",
             "--user",
             "colin",
-            "--no-auto-follow",
+            "--no-auto-watch",
         ])) {
-            MailboxCommand::SetPreferences { auto_follow, .. } => assert!(!auto_follow),
+            MailboxCommand::SetPreferences { auto_watch, .. } => assert!(!auto_watch),
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -51,11 +51,11 @@ pub fn execute(cmd: MailboxCommand, client: &DaemonClient) -> ExecResult {
         MailboxCommand::Preferences { user } => Ok(client.get_user_preferences(&user)?),
         MailboxCommand::SetPreferences {
             user,
-            auto_follow,
+            auto_watch,
             tiers,
         } => {
             let tiers_opt = (!tiers.is_empty()).then_some(tiers.as_slice());
-            Ok(client.set_user_preferences(&user, auto_follow, tiers_opt)?)
+            Ok(client.set_user_preferences(&user, auto_watch, tiers_opt)?)
         }
         MailboxCommand::Undrain { message_ids } => {
             let client_id = mailbox::ensure_client_id(client)?;
