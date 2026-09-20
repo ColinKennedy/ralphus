@@ -62,6 +62,10 @@ sha2 = "0.10"
 # HMAC-SHA256 over the raw request body, keyed by the configured webhook
 # secret. Pairs with `sha2` above, already a workspace dependency.
 hmac = "0.12"
+# Constant-time compare for GitLab's X-Gitlab-Token webhook header (Track E,
+# E4) -- a plain shared-secret comparison must not leak timing information
+# about how many leading bytes matched.
+subtle = "2"
 # CSPRNG source for the daemon's bearer-token generation (RAL-219) — a small,
 # dependency-light crate (already resolved transitively via the TLS stack)
 # rather than pulling in the full `rand` ecosystem for one `getrandom()` call.

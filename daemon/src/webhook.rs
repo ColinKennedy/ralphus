@@ -7,6 +7,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -43,6 +44,30 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+/// Verify a GitLab webhook delivery's `X-Gitlab-Token` header against the
+/// configured secret. Unlike GitHub's HMAC signature, GitLab's token is a
+/// plain shared secret sent verbatim, so this is a direct equality check --
+/// but it must run in constant time, since a byte-at-a-time timing leak
+/// would let an attacker recover the secret through repeated requests.
+pub fn verify_gitlab_token(secret: &str, header_token: &str) -> bool {
+    if secret.is_empty() {
+        // An unset/empty configured secret must never authenticate a
+        // request, even one sent with no token header at all -- otherwise
+        // a misconfigured hook (secret never set) silently accepts every
+        // delivery instead of failing closed.
+        return false;
+    }
+    let secret = secret.as_bytes();
+    let header_token = header_token.as_bytes();
+    if secret.len() != header_token.len() {
+        // `ConstantTimeEq` requires equal-length slices; a length mismatch
+        // is not itself sensitive (it's observable from the request size
+        // regardless), so a fast-path early return here leaks nothing new.
+        return false;
+    }
+    secret.ct_eq(header_token).into()
 }
 
 #[cfg(test)]
@@ -105,5 +130,34 @@ mod tests {
 
     fn encode_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn gitlab_token_accepts_matching_secret() {
+        assert!(verify_gitlab_token("my-shared-secret", "my-shared-secret"));
+    }
+
+    #[test]
+    fn gitlab_token_rejects_wrong_secret() {
+        assert!(!verify_gitlab_token("my-shared-secret", "guessed-secret"));
+    }
+
+    #[test]
+    fn gitlab_token_rejects_different_length() {
+        assert!(!verify_gitlab_token("short", "a-much-longer-guess"));
+    }
+
+    #[test]
+    fn gitlab_token_rejects_empty_against_configured() {
+        assert!(!verify_gitlab_token("my-shared-secret", ""));
+    }
+
+    #[test]
+    fn gitlab_token_two_empty_strings_do_not_match_by_accident() {
+        // Not a real deployment state (an empty configured secret means
+        // webhooks were never set up), but the function must not treat
+        // "both empty" as a match -- that would let an attacker send no
+        // token at all and pass verification against a misconfigured hook.
+        assert!(!verify_gitlab_token("", ""));
     }
 }
