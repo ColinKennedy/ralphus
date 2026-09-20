@@ -11116,6 +11116,47 @@ fn capture_and_stop_node(store: &Store, squad_id: &str, req: &SetStatusBody) {
     capture_and_stop_nodes(store, squad_id, std::slice::from_ref(req));
 }
 
+/// Preserve an operator's explicit acceptance of a failed proof in the ghost
+/// read by downstream cells. The original proof-outcome note remains the
+/// ground truth; this supplement explains why scheduling may proceed anyway.
+fn note_manual_failed_proof_acceptance(store: &Store, squad_id: &str, req: &SetStatusBody) {
+    let cell_idx = if req.proof_scope == "cell" {
+        Some(req.cell_idx)
+    } else {
+        store
+            .cells_of(squad_id)
+            .ok()
+            .and_then(|cells| {
+                cells
+                    .into_iter()
+                    .find(|cell| cell.task_idx == req.task_idx)
+                    .map(|cell| cell.idx)
+            })
+    };
+    let Some(cell_idx) = cell_idx else {
+        return;
+    };
+    let scope = if req.proof_scope == "cell" {
+        "cell"
+    } else {
+        "task"
+    };
+    let note = format!(
+        "Daemon note: an operator manually changed failed {scope}-scoped proof step {} to done. \
+         This explicitly accepts the failed check result; it does not mean the proof passed.",
+        req.proof_idx
+    );
+    let uri = crate::ghost::cell_uri(squad_id, req.task_idx, cell_idx);
+    let _ = store.upsert_ghost(
+        &uri,
+        crate::ghost::KIND_CELL,
+        Some(squad_id),
+        None,
+        &note,
+        None,
+    );
+}
+
 /// Manually override the state of a squad, task, cell, or proof step (RAL-74).
 ///
 /// Routes through the same store setters used by natural transitions so that
@@ -11136,6 +11177,22 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
     let store = daemon.lock();
+    let accepted_failed_proof = if req.kind == "proof" && req.state == "done" {
+        store
+            .proof_state(
+                id,
+                req.task_idx,
+                &req.proof_scope,
+                req.cell_idx,
+                req.proof_idx,
+            )
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("failed")
+    } else {
+        false
+    };
     let stop_plan =
         if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
             match stop_cascade_plan(&store, id, &req) {
@@ -11290,6 +11347,9 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     };
     if let Err(e) = result {
         return store_error(&e);
+    }
+    if accepted_failed_proof {
+        note_manual_failed_proof_acceptance(&store, id, &req);
     }
     // RAL-315: a task cancelled here (directly, or via `apply_stop_cascade`
     // cancelling its owning task from a cell/proof-level stop) is invisible
@@ -22619,6 +22679,51 @@ command = "true"
         assert_eq!(r.status, 200);
         let squad: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], false);
+    }
+
+    #[test]
+    fn set_status_done_on_failed_proof_records_operator_acceptance_for_dependents() {
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\nid=\"check\"\ncommand=\"check\"\n";
+        let d = daemon();
+        let squad_id = "squad-000000000001";
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        d.lock()
+            .set_proof_state(squad_id, 0, "cell", 0, 0, NodeState::Failed)
+            .unwrap();
+        let uri = crate::ghost::cell_uri(squad_id, 0, 0);
+        d.lock()
+            .upsert_ghost(
+                &uri,
+                crate::ghost::KIND_CELL,
+                Some(squad_id),
+                None,
+                "Daemon note: the proof failed.",
+                None,
+            )
+            .unwrap();
+
+        let status_body = serde_json::json!({
+            "kind": "proof",
+            "task_idx": 0,
+            "proof_scope": "cell",
+            "cell_idx": 0,
+            "proof_idx": 0,
+            "state": "done",
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &status_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let ghost = d.lock().get_ghost(&uri).unwrap().unwrap();
+        assert!(ghost.content.contains("the proof failed"));
+        assert!(ghost.content.contains("operator manually changed"));
+        assert!(ghost.content.contains("does not mean the proof passed"));
     }
 
     /// A cell whose own proof never ran (e.g. it was previously blocked by a
