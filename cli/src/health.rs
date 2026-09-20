@@ -161,102 +161,83 @@ impl CheckResult {
 /// one matching pair of quotes (a Windows path with spaces).
 #[must_use]
 pub fn is_compound_shell_command(value: &str) -> bool {
-    let stripped = value.trim();
-    if !stripped.contains(' ') {
-        return false;
-    }
-    let bytes = stripped.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if first == last && (first == b'\'' || first == b'"') {
-            let inner = &stripped[1..stripped.len() - 1];
-            if !inner.contains(first as char) {
-                return false;
-            }
-        }
-    }
-    true
+    ralphus_core::process::is_compound_shell_command(value)
 }
 
 /// Strips one layer of wrapping quotes from a bare (non-compound) path.
 #[must_use]
 pub fn unquote_path(value: &str) -> String {
-    let stripped = value.trim();
-    let bytes = stripped.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if first == last && (first == b'\'' || first == b'"') {
-            return stripped[1..stripped.len() - 1].to_string();
-        }
-    }
-    stripped.to_string()
+    ralphus_core::process::unquote_path(value)
 }
 
 fn check_agent_command(name: &str, env_var: &str, default_program: &str) -> CheckResult {
-    let Ok(raw) = std::env::var(env_var) else {
-        return CheckResult::harness(
-            name,
-            PASS,
-            format!("not set (defaults to '{default_program}' on PATH)"),
-            format!("Tasks using this backend run '{default_program}' resolved from PATH."),
-            "No action needed.",
-        );
+    check_agent_command_for(name, env_var, default_program, std::env::var(env_var).ok())
+}
+
+fn check_agent_command_for(
+    name: &str,
+    env_var: &str,
+    default_program: &str,
+    override_command: Option<String>,
+) -> CheckResult {
+    let (raw, source) = match override_command {
+        Some(command) => (command, format!("${env_var}")),
+        None => (default_program.to_string(), "default".to_string()),
     };
     if is_compound_shell_command(&raw) {
         return CheckResult::harness(
             name,
             PASS,
-            format!("compound shell command, not path-checked: {raw}"),
+            format!("compound shell command, not executable-checked: {raw}"),
             "The command is a shell pipeline/multi-word invocation, so only a live run can confirm it actually works.",
             "No action needed; verify by running a task with this backend.",
-        );
+        )
+        .with_provenance(source);
     }
     let path = unquote_path(&raw);
-    let p = Path::new(&path);
-    if !p.is_file() {
+    let explicit_path = Path::new(&path);
+    let resolved = if explicit_path.components().count() > 1 {
+        path.clone()
+    } else {
+        which(&path).unwrap_or(path.clone())
+    };
+    let resolved_path = Path::new(&resolved);
+    if !resolved_path.is_file() {
         return CheckResult::harness(
             name,
             FAIL,
-            format!("{path} does not exist or is not a file"),
+            format!("{path} does not resolve to an executable file"),
             format!(
-                "Tasks using this backend cannot start; ${env_var} points at a nonexistent file."
+                "Tasks using this backend cannot start; {source} command '{path}' is unavailable."
             ),
-            format!("Fix or unset ${env_var} so it points at a real executable."),
-        );
+            format!("Install {path}, put it on PATH, or set ${env_var} to a real executable."),
+        )
+        .with_provenance(source);
     }
-    if !is_executable(p) {
+    if !is_executable(resolved_path) {
         return CheckResult::harness(
             name,
             FAIL,
-            format!("{path} is not executable"),
+            format!("{resolved} is not executable"),
             format!(
-                "Tasks using this backend cannot start; ${env_var} points at a non-executable file."
+                "Tasks using this backend cannot start; {source} command '{path}' is not executable."
             ),
-            format!("Make {path} executable, or point ${env_var} at a real executable."),
-        );
+            format!("Make {resolved} executable, or set ${env_var} to a real executable."),
+        )
+        .with_provenance(source);
     }
     CheckResult::harness(
         name,
         PASS,
-        path,
+        resolved,
         "Tasks using this backend can start.",
         "No action needed.",
     )
+    .with_provenance(source)
 }
 
-#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
-    true
+    ralphus_core::process::is_executable(path)
 }
 
 /// `shutil.which` equivalent: PATH search only (no cwd-first search, unlike
@@ -278,7 +259,7 @@ fn which(program: &str) -> Option<String> {
     for dir in std::env::split_paths(&path_var) {
         for suffix in &suffixes {
             let candidate = dir.join(format!("{program}{suffix}"));
-            if candidate.is_file() {
+            if is_executable(&candidate) {
                 return Some(candidate.to_string_lossy().into_owned());
             }
         }
@@ -1686,19 +1667,24 @@ mod tests {
     }
 
     #[test]
-    fn check_agent_command_passes_when_unset() {
-        // Use a var name guaranteed not to be set in any real environment.
-        let result = check_agent_command("x-command", "RALPHUS_TEST_UNSET_AGENT_VAR_XYZ", "claude");
-        assert_eq!(result.status, PASS);
-        assert!(result.detail.contains("not set"));
+    fn check_agent_command_fails_when_default_is_unavailable() {
+        let result = check_agent_command_for(
+            "x-command",
+            "RALPHUS_TEST_UNSET_AGENT_VAR_XYZ",
+            "definitely-not-a-real-agent-program-ral484",
+            None,
+        );
+        assert_eq!(result.status, FAIL);
+        assert!(result.detail.contains("does not resolve"));
     }
 
     #[test]
     fn check_agent_command_is_harness_section() {
-        let result = check_agent_command(
+        let result = check_agent_command_for(
             "x-command",
             "RALPHUS_TEST_UNSET_AGENT_VAR_HARNESS",
-            "claude",
+            "definitely-not-a-real-agent-program-ral484",
+            None,
         );
         assert_eq!(result.section, HARNESS);
     }
