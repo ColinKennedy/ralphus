@@ -687,6 +687,8 @@ use; see `READ_ONLY_NOTE`.
         - unwatch entity_uri [uri] --user [name]  {Stop watching an entity (RAL-320).}
         - watch entity_uri [uri] --tier [urgent|high|normal...] --user [name]  {Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications reach the mailbox; re-watching updates the notification tiers in place (RAL-320).}
         - (read-only-safe) watches --user [name]  {List the acting user's watches (RAL-320).}
+    - mcp  {Configure agent hosts to use the ralphus MCP server.}
+        - initialize host [claude|codex|pi] --dry-run --profile-file [path] --yes  {Preview and apply the local MCP setup required by an agent host.}
     - project  {Register and inspect projects known to the daemon.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}

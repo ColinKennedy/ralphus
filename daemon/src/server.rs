@@ -11123,15 +11123,12 @@ fn note_manual_failed_proof_acceptance(store: &Store, squad_id: &str, req: &SetS
     let cell_idx = if req.proof_scope == "cell" {
         Some(req.cell_idx)
     } else {
-        store
-            .cells_of(squad_id)
-            .ok()
-            .and_then(|cells| {
-                cells
-                    .into_iter()
-                    .find(|cell| cell.task_idx == req.task_idx)
-                    .map(|cell| cell.idx)
-            })
+        store.cells_of(squad_id).ok().and_then(|cells| {
+            cells
+                .into_iter()
+                .find(|cell| cell.task_idx == req.task_idx)
+                .map(|cell| cell.idx)
+        })
     };
     let Some(cell_idx) = cell_idx else {
         return;

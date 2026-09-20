@@ -743,6 +743,7 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[node(
     &[],
 )];
 
+// ralphus[ignore-endpoint-cli]: local MCP-host setup (edits local config files); no daemon round trip
 const MCP_CHILDREN: &[HelpNode] = &[node(
     "initialize",
     &["host [claude|codex|pi]"],

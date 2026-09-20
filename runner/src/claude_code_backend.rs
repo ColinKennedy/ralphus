@@ -15,9 +15,7 @@ use crate::backend::{
     BACKGROUND_JOB_NUDGE_PROMPT, BackendError, BackendOutcome, ModelBackend, RunOptions,
 };
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
-use crate::mcp_init::{
-    self, McpInitializationPlan, McpInitializer, McpSetupCommand,
-};
+use crate::mcp_init::{self, McpInitializationPlan, McpInitializer, McpSetupCommand};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -58,8 +56,8 @@ impl McpInitializer for ClaudeCodeBackend {
     ) -> Result<McpInitializationPlan, String> {
         let mcp_program = mcp_init::find_mcp_program()?;
         let program = self.program();
-        let configured = run_claude_command(&program, &["mcp", "get", "ralphus"])
-            .is_ok_and(|output| {
+        let configured =
+            run_claude_command(&program, &["mcp", "get", "ralphus"]).is_ok_and(|output| {
                 output.status.success()
                     && String::from_utf8_lossy(&output.stdout).contains("Scope: User config")
             });
@@ -103,7 +101,10 @@ impl McpInitializer for ClaudeCodeBackend {
         for command in &plan.commands {
             let output = run_claude_command(&command.program, &command.args)?;
             if !output.status.success() {
-                return Err(format!("{} failed with {}", command.description, output.status));
+                return Err(format!(
+                    "{} failed with {}",
+                    command.description, output.status
+                ));
             }
         }
         mcp_init::apply_file_edits(&plan.edits)

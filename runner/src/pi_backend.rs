@@ -12,8 +12,7 @@ use serde_json::Value;
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::cli_agent_common::{live_session_path, write_live_session_id};
 use crate::mcp_init::{
-    self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer,
-    McpThirdPartyInstall,
+    self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer, McpThirdPartyInstall,
 };
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
@@ -80,7 +79,10 @@ impl McpInitializer for PiBackend {
             .entry("mcpServers".to_string())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         let Some(servers) = servers.as_object_mut() else {
-            return Err(format!("{}: mcpServers must be a JSON object", config_path.display()));
+            return Err(format!(
+                "{}: mcpServers must be a JSON object",
+                config_path.display()
+            ));
         };
         if !servers.contains_key("ralphus") {
             servers.insert(
@@ -150,9 +152,11 @@ fn contains_mcp_adapter_package(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(contains_mcp_adapter_package),
         Value::String(source) => source.contains("pi-mcp-adapter"),
-        Value::Object(object) => object
-            .get("source")
-            .is_some_and(|source| source.as_str().is_some_and(|text| text.contains("pi-mcp-adapter"))),
+        Value::Object(object) => object.get("source").is_some_and(|source| {
+            source
+                .as_str()
+                .is_some_and(|text| text.contains("pi-mcp-adapter"))
+        }),
         _ => false,
     }
 }

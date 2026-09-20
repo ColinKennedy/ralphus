@@ -46,7 +46,9 @@ pub fn parse(args: &[String]) -> McpCommand {
 pub fn dispatch(command: McpCommand) -> i32 {
     match command {
         McpCommand::Help => {
-            println!("usage: ralphus mcp initialize <claude|codex|pi> [--profile-file <path>] [--dry-run] [--yes]");
+            println!(
+                "usage: ralphus mcp initialize <claude|codex|pi> [--profile-file <path>] [--dry-run] [--yes]"
+            );
             0
         }
         McpCommand::UsageError(message) => {
@@ -64,9 +66,7 @@ pub fn dispatch(command: McpCommand) -> i32 {
 
 fn initialize(host: &str, profile_file: Option<String>, dry_run: bool, yes: bool) -> i32 {
     if !matches!(host, "claude" | "codex" | "pi") {
-        println!(
-            "error: unknown MCP host {host:?}; expected claude, codex, or pi"
-        );
+        println!("error: unknown MCP host {host:?}; expected claude, codex, or pi");
         return 2;
     }
     let default_profile = default_profile_path();
@@ -111,7 +111,12 @@ fn initialize(host: &str, profile_file: Option<String>, dry_run: bool, yes: bool
         println!("    source: {}", install.url);
     }
     for command in &plan.commands {
-        println!("  run {}: {} {}", command.description, command.program, command.args.join(" "));
+        println!(
+            "  run {}: {} {}",
+            command.description,
+            command.program,
+            command.args.join(" ")
+        );
     }
     if plan.third_party_installs.is_empty() && plan.commands.is_empty() && plan.edits.is_empty() {
         println!("  no changes needed");
@@ -131,7 +136,9 @@ fn initialize(host: &str, profile_file: Option<String>, dry_run: bool, yes: bool
             return 2;
         }
         if !plan.third_party_installs.is_empty() {
-            println!("WARNING: this will install the third-party Pi MCP Adapter before writing the listed files.");
+            println!(
+                "WARNING: this will install the third-party Pi MCP Adapter before writing the listed files."
+            );
         }
         print!("Apply this plan? [Y/n] ");
         let _ = std::io::stdout().flush();
@@ -144,7 +151,10 @@ fn initialize(host: &str, profile_file: Option<String>, dry_run: bool, yes: bool
     }
     match backend.apply_mcp_initialization(&plan) {
         Ok(()) => {
-            println!("{} will load ralphus MCP the next time it starts. Restart your shell to use the updated PATH.", plan.host);
+            println!(
+                "{} will load ralphus MCP the next time it starts. Restart your shell to use the updated PATH.",
+                plan.host
+            );
             0
         }
         Err(error) => {
