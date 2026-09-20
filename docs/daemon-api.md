@@ -4050,6 +4050,44 @@ with no shadow-mode history yet.
   daemon parses, so this is a proxy (arrival-order regression) rather than
   a comparison against a true forge-side event sequence.
 
+**Exit criterion for leaving shadow mode (Track F, F4).** F1-F3 build the
+tooling; graduating a project's `[webhook]` mode from `"shadow"` to
+`"active"` is an operational decision made against real traffic over real
+calendar time, not something this codebase can complete on its own — there
+is no code left to write here, only a criterion to state and a way to
+evaluate it, both already available once a project has run in `"shadow"`
+mode long enough to accumulate a meaningful `shadow-scorecard`.
+
+A project is ready to graduate once, over a sustained observation window
+(e.g. two weeks of real PR/MR activity — a `total_deliveries` count in at
+least the low tens per project is a reasonable floor before trusting the
+percentages at all):
+
+- `missed_count` stays at or near zero — the webhook is reliably arriving
+  ahead of (or is the *only* signal for) what the poll would otherwise have
+  caught, not silently failing to fire on real changes.
+- `spurious_count` is low and, more importantly, *understood* — a nonzero
+  count from event types this daemon doesn't yet parse a PR from (E5) is
+  expected and harmless; a nonzero count from deliveries that *should* have
+  resolved a PR but didn't is a signal something upstream (project
+  registration, forge repo naming) is misconfigured and needs fixing before
+  trusting delivery-driven behavior.
+- `avg_lag_ms`/`max_lag_ms` are consistent with the poll interval this
+  project would otherwise rely on (Track A) — a webhook arriving *after*
+  the poll would have caught the same change anyway isn't adding value, and
+  a wildly inconsistent `max_lag_ms` may indicate delivery retries or
+  network instability worth investigating before depending on timeliness.
+- `out_of_order_count` is zero or explained — a nonzero count doesn't by
+  itself block graduation (delivery reordering is a real possibility this
+  daemon must already tolerate, since nothing here assumes in-order
+  arrival), but an unexplained *pattern* of it is worth understanding first.
+
+Evaluating this is a `GET .../webhook/shadow-scorecard` call (repeated
+periodically, by a human or a script, against each project still in
+`"shadow"` mode) — nothing in this codebase runs that evaluation
+automatically or flips a project's mode on its own; `mode` remains a value
+someone edits in `.ralphus.toml` once satisfied.
+
 ## Notes on future evolution
 
 - Single-secret bearer-token auth landed in RAL-219 (see
