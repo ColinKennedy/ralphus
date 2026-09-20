@@ -1035,16 +1035,51 @@
         finally { prSyncStatusInFlight.delete(prId); }
       }
       /**
+       * Fetches every PR's cached drift state in one flat query (Track B /
+       * B2) and merges it into `prSyncStatus`, keyed by `pr_id` -- what
+       * `pollPullRequests` used to build by calling `GET
+       * /api/pull-requests/{id}/sync-status` once per open PR of the
+       * selected review, each of which does a real git fetch server-side.
+       * `GET /api/pull-requests/forge-cache-index` instead reads what the
+       * RAL-366 background poller already knows, at the cost of the drift
+       * banner reflecting that poller's own cadence (a few minutes) rather
+       * than a check made at render time -- the same push-plus-slow-
+       * reconciliation tradeoff this whole track makes elsewhere. An
+       * explicit live check remains available: `ttRunPrCheck`'s "Check PR"
+       * action (Tasks tab) still calls `fetchPrSyncStatus` directly.
+       *
+       * A PR the background poller has never reached yet (just submitted,
+       * no poll pass since) is simply absent from the response -- its
+       * `in_sync`/`pr_ahead`/`worktree_ahead` fields stay `null`, which maps
+       * to "no drift banner" (the safe default) rather than a stale or
+       * fabricated reading.
+       * @returns {Promise<void>}
+       */
+      async function applyPrForgeCacheIndex() {
+        try {
+          const res = await fetch("/api/pull-requests/forge-cache-index");
+          if (!res.ok) return;
+          /** @type {PrForgeCacheView[]} */
+          const rows = await res.json();
+          rows.forEach((r) => {
+            prSyncStatus[r.pr_id] = {
+              remote_sha: r.remote_sha,
+              local_sha: r.local_sha,
+              in_sync: !!r.in_sync,
+              pr_ahead: !!r.pr_ahead,
+              worktree_ahead: !!r.worktree_ahead,
+            };
+          });
+        } catch (e) { /* transient -- the next poll retries */ }
+      }
+      /**
        * Fetches the PRs submitted for a review and caches them, so the PR
        * badge/link (which only needs pr_url/pr_number/ci_status, all present
-       * on this response) can render immediately. Also kicks off a live
-       * drift check (RAL-190) for each still-open one that has a recorded
-       * forge number, but does NOT wait on it -- `fetchPrSyncStatus` does its
-       * own `git fetch` per PR, serialized per repo on the daemon side, which
-       * can take many seconds per PR and has nothing to do with whether the
-       * badge itself is ready to show. It writes into `prSyncStatus`
-       * independently and the next poll tick picks it up whenever it lands.
-       * Only polled for the open review, mirroring `pollBranchConflicts`.
+       * on this response) can render immediately. Drift state for each
+       * (RAL-190) comes from `applyPrForgeCacheIndex`, fetched once per
+       * `pollReviews` cycle rather than once per open PR here -- see its doc
+       * for why. Only polled for the open review, mirroring
+       * `pollBranchConflicts`.
        * @param {string} gid
        * @returns {Promise<void>}
        */
@@ -1055,8 +1090,6 @@
           /** @type {PullRequestView[]} */
           const prs = await res.json();
           pullRequests[gid] = prs;
-          const open = prs.filter((p) => p.state === "open" && p.pr_number != null);
-          open.forEach((p) => { fetchPrSyncStatus(p.id); });
         } catch (e) { /* transient -- the next poll retries */ }
       }
       /** @type {{[id: string]: Promise<void>}} in-flight per-guardian full-detail fetches, keyed by guardian id -- a selection-triggered fetch (`ensureGuardianDetailLoaded`) and a concurrently-running `pollReviews` cycle for the same id share one request instead of firing two. */
@@ -1206,6 +1239,7 @@
               pollBranchConflicts(gid),
               pollPullRequests(gid),
               pollPrErrors(gid),
+              applyPrForgeCacheIndex(),
             ]);
             // The awaited refreshes may have been overtaken by a newer poll
             // (or re-selection) — a stale render now would show old data.

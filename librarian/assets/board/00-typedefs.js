@@ -443,6 +443,34 @@
        * @property {boolean} worktree_ahead
        */
       /**
+       * One PR/MR's cached forge state (RAL-366, Track B / B2) -- see `GET
+       * /api/pull-requests/forge-cache-index`, `daemon::pr::PrForgeCacheView`.
+       * Populated only by the background poller, plus write-throughs from
+       * the on-demand sync-status/comments routes; `in_sync`/`pr_ahead`/
+       * `worktree_ahead` are `null` (not yet `false`) for a PR the poller
+       * has never reached.
+       * @typedef {object} PrForgeCacheView
+       * @property {string} pr_id
+       * @property {number} last_checked_at_ms
+       * @property {string} status
+       * @property {string|null} last_error
+       * @property {boolean|null} in_sync
+       * @property {boolean|null} pr_ahead
+       * @property {boolean|null} worktree_ahead
+       * @property {string|null} remote_sha
+       * @property {string|null} local_sha
+       * @property {number} comment_count
+       * @property {number} unactioned_count
+       * @property {string|null} latest_comment_author
+       * @property {string|null} latest_comment_at
+       * @property {number|null} drift_checked_at_ms
+       * @property {string|null} drift_status
+       * @property {string|null} drift_error
+       * @property {number|null} comments_checked_at_ms
+       * @property {string|null} comments_status
+       * @property {string|null} comments_error
+       */
+      /**
        * One PR review comment/note (RAL-117) -- see `GET /api/pull-requests/{id}/comments`.
        * @typedef {object} PrCommentItem
        * @property {boolean} actioned
