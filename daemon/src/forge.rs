@@ -128,6 +128,15 @@ pub struct PrComment {
 /// count silently under-reported.
 const PER_PAGE: u32 = 100;
 
+/// Remaining-quota threshold (Track A / A7) below which
+/// [`ForgeClient::note_rate_limit_headers`] proactively starts a backoff
+/// window, read off GitHub's own `X-RateLimit-Remaining` header on an
+/// otherwise-successful response. Conservative on purpose: low enough that
+/// ordinary traffic against a 5,000/hour budget never trips it, high enough
+/// to leave a safety margin before the budget would actually run out and
+/// start failing every call outright.
+const RATE_LIMIT_LOW_WATER_MARK: i64 = 50;
+
 /// Which comment endpoint [`ForgeClient::list_pr_comments_conditional`]
 /// polls (RAL-366). GitHub splits PR feedback across two REST resources --
 /// general conversation (`/issues/{n}/comments`) and inline review comments
@@ -2270,6 +2279,7 @@ impl ForgeClient {
             .set("Content-Type", "application/json")
             .send_string(&payload.to_string())
             .map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
         parse_body(resp)
     }
 
@@ -2277,6 +2287,7 @@ impl ForgeClient {
     /// why every read call in this file routes through this.
     fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
         let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
         parse_body(resp)
     }
 
@@ -2286,7 +2297,53 @@ impl ForgeClient {
     /// limit instead of retrying next cycle as if nothing happened.
     fn get_structured(&self, req: ureq::Request) -> Result<serde_json::Value, ForgeError> {
         let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
         parse_body(resp).map_err(ForgeError::other)
+    }
+
+    /// Read GitHub's `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers off
+    /// a *successful* response and start a backoff window proactively when
+    /// remaining quota is low (Track A / A7) -- before the forge ever
+    /// answers an actual 429/403. The reactive path (A6: back off once a
+    /// rate-limit response actually happens) still exists and still matters
+    /// -- GitLab sends no equivalent headers this codebase knows how to
+    /// parse, and a proactive check can itself race a burst of concurrent
+    /// requests past the threshold -- but this catches the common case
+    /// (steady drain toward exhaustion) before it becomes a hard failure.
+    ///
+    /// Calls [`crate::pr::start_backoff`] directly rather than returning a
+    /// signal for each caller to act on: every read path in this file
+    /// (`get`/`get_structured`/`get_conditional`) shares this one check, and
+    /// [`crate::pr::PR_CACHE_BACKOFF`] is already the single, shared backoff
+    /// table every poller in the daemon consults (A6) -- adding a second
+    /// path for the same table would only invite the two to disagree.
+    fn note_rate_limit_headers(&self, resp: &ureq::Response) {
+        if self.kind != ForgeKind::GitHub {
+            // GitLab's default limit (2,000 req/min) is generous enough
+            // that proactive backoff has not been needed there, and GitLab
+            // does not send `X-RateLimit-*` under these names.
+            return;
+        }
+        let Some(remaining) = resp
+            .header("X-RateLimit-Remaining")
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            return;
+        };
+        if remaining > RATE_LIMIT_LOW_WATER_MARK {
+            return;
+        }
+        let retry_after = resp
+            .header("X-RateLimit-Reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|reset_epoch_secs| {
+                let now_epoch_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Duration::from_secs((reset_epoch_secs - now_epoch_secs).max(1) as u64)
+            });
+        crate::pr::start_backoff(self, retry_after);
     }
 
     /// `GET` with conditional-request support (RAL-366): sets `If-None-Match`
@@ -2311,6 +2368,7 @@ impl ForgeClient {
         match req.call() {
             Ok(resp) if resp.status() == 304 => Ok(ConditionalGet::NotModified),
             Ok(resp) => {
+                self.note_rate_limit_headers(&resp);
                 let etag = resp.header("ETag").map(str::to_string);
                 let body = resp
                     .into_string()
@@ -5580,6 +5638,118 @@ mod tests {
         assert_eq!(err.status, Some(429));
         assert_eq!(err.retry_after, Some(Duration::from_secs(30)));
         assert!(err.is_rate_limited());
+        handle.join().unwrap();
+    }
+
+    fn unix_epoch_secs_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn low_remaining_quota_on_a_successful_github_response_starts_a_proactive_backoff() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let reset_at = unix_epoch_secs_now() + 120;
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"base": {"ref": "main"}, "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"5"[..])
+                        .unwrap(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"X-RateLimit-Reset"[..],
+                        reset_at.to_string().as_bytes(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget-a7-low".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(!crate::pr::is_backed_off(&client));
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(
+            crate::pr::is_backed_off(&client),
+            "a near-exhausted quota must trigger a proactive backoff"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn healthy_remaining_quota_does_not_trigger_a_backoff() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"base": {"ref": "main"}, "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"4999"[..])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget-a7-healthy".to_string(),
+            Some("tok".to_string()),
+        );
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(!crate::pr::is_backed_off(&client));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn gitlab_rate_limit_headers_are_never_consulted() {
+        // GitLab sends no `X-RateLimit-*` header under these names -- a
+        // GitLab client reusing this repo path from a hypothetical GitHub
+        // low-quota response must not be affected by it (and in practice
+        // never would be, since responses are per-client anyway); this pins
+        // that the GitHub-only header check is a deliberate `self.kind`
+        // branch, not an oversight.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"target_branch": "main", "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"1"[..])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme/widget-a7-gitlab".to_string(),
+            Some("tok".to_string()),
+        );
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(!crate::pr::is_backed_off(&client));
         handle.join().unwrap();
     }
 
