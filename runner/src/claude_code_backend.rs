@@ -3,7 +3,8 @@
 //! headlessly, parsing its `stream-json` event stream on stdout.
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +15,9 @@ use crate::backend::{
     BACKGROUND_JOB_NUDGE_PROMPT, BackendError, BackendOutcome, ModelBackend, RunOptions,
 };
 use crate::cli_agent_common::{live_session_path, write_live_session_id, write_prompt_file};
+use crate::mcp_init::{
+    self, McpInitializationPlan, McpInitializer, McpSetupCommand,
+};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -45,6 +49,87 @@ impl ClaudeCodeBackend {
             std::env::var("RALPHUS_CLAUDE_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
     }
+}
+
+impl McpInitializer for ClaudeCodeBackend {
+    fn mcp_initialization_plan(
+        &self,
+        profile_path: PathBuf,
+    ) -> Result<McpInitializationPlan, String> {
+        let mcp_program = mcp_init::find_mcp_program()?;
+        let program = self.program();
+        let configured = run_claude_command(&program, &["mcp", "get", "ralphus"])
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("Scope: User config")
+            });
+        let commands = if configured {
+            Vec::new()
+        } else {
+            vec![McpSetupCommand {
+                description: "register the ralphus stdio MCP server in Claude Code's user scope"
+                    .to_string(),
+                program,
+                args: vec![
+                    "mcp".to_string(),
+                    "add".to_string(),
+                    "--scope".to_string(),
+                    "user".to_string(),
+                    "ralphus".to_string(),
+                    "--".to_string(),
+                    mcp_program.display().to_string(),
+                ],
+            }]
+        };
+        let profile_text = std::fs::read_to_string(&profile_path).unwrap_or_default();
+        let edits = if profile_text.contains("# Added by ralphus mcp initialize") {
+            Vec::new()
+        } else {
+            vec![mcp_init::profile_path_edit(
+                profile_path,
+                mcp_program.parent().unwrap_or(Path::new(".")),
+            )]
+        };
+        Ok(McpInitializationPlan {
+            host: "claude",
+            mcp_program,
+            third_party_installs: Vec::new(),
+            commands,
+            edits,
+        })
+    }
+
+    fn apply_mcp_initialization(&self, plan: &McpInitializationPlan) -> Result<(), String> {
+        for command in &plan.commands {
+            let output = run_claude_command(&command.program, &command.args)?;
+            if !output.status.success() {
+                return Err(format!("{} failed with {}", command.description, output.status));
+            }
+        }
+        mcp_init::apply_file_edits(&plan.edits)
+    }
+}
+
+fn run_claude_command(program: &str, args: &[impl AsRef<str>]) -> Result<Output, String> {
+    let args: Vec<String> = args.iter().map(|arg| arg.as_ref().to_string()).collect();
+    let compound = crate::cli_agent_common::launcher_requires_shell(program);
+    let mut command = if compound {
+        let shell = if crate::cli_agent_common::is_windows_batch_launcher(program) {
+            "cmd".to_string()
+        } else {
+            shellcmd::resolve_shell(None)
+        };
+        let line = crate::cli_agent_common::shell_command_line(&shell, program, &args);
+        shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), &args)
+            .map_err(|error| format!("could not prepare Claude Code MCP command: {error}"))?
+    } else {
+        let mut command = Command::new(program);
+        command.args(&args);
+        command
+    };
+    command
+        .output()
+        .map_err(|error| format!("could not run {program}: {error}"))
 }
 
 impl ModelBackend for ClaudeCodeBackend {
