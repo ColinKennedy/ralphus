@@ -2548,6 +2548,49 @@ candidate) and, once a delivery verifies, what happens next:
 - **`"active"`**: no recording; reserved for a future ticket that acts on a
   delivery directly.
 
+**Auto-reconciliation (`[daemon].public_url`).** `webhook install`/`update`
+(E8/E9 above) are otherwise entirely manual — `--daemon-url` has to be
+supplied on every call, since this daemon's own bind address
+(`127.0.0.1:PORT`) is not the address GitHub/GitLab can reach it at through
+NAT, a reverse proxy, or a tunnel, and that can never be *derived*, only set
+once. `[daemon].public_url` is that one-time setting (daemon-singleton, not
+per-project, same global/`$RALPHUS_CONFIGURATION_PATH`/project-local
+layering every other `[daemon]` scalar gets — see `DaemonConfig::public_url`
+in `daemon/src/config.rs`). Once set, every daemon startup spawns a one-shot
+background pass (`server::spawn_webhook_reconciliation`, never blocking
+request serving) that walks every registered project and, for each one
+whose effective `[webhook]` mode isn't `"disabled"`:
+
+- installs a webhook for the first time if none is recorded yet;
+- **repoints** an already-recorded webhook **in place** (`webhook update`'s
+  own PATCH-by-id call, not a fresh `install`) if its last-recorded URL no
+  longer matches the configured `public_url` — i.e. this daemon's address
+  changed since it was installed;
+- leaves it alone if the recorded URL already matches;
+- skips the project with a warning (both `rlog!` and Cartographer) if
+  `[webhook].secret_env` names a variable unset in this daemon's own process
+  environment — installing anyway would create a hook that can never verify
+  a delivery.
+
+Unset (the default), this whole pass is a no-op and every project's webhook
+stays exactly as manually installed. Repointing in place instead of
+deleting and reinstalling matters because neither forge cleans up an
+orphaned hook promptly: **GitHub never automatically disables a failing
+webhook at all** — a hook left pointed at a dead address just accumulates
+failed "Recent Deliveries" forever, with zero self-healing (source:
+[GitHub Docs, "Handling failed webhook
+deliveries"](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries)).
+**GitLab** is more forgiving but still leaves cruft: a webhook is
+temporarily disabled after 4 consecutive failures (starting at a 1-minute
+cooldown, doubling on each further failure up to a 24-hour cap, and
+auto-re-enabling itself each cycle to retry), and permanently disabled
+after 40 consecutive failures — which then needs a manual/API test call
+returning `2xx` to reactivate (source: [GitLab Docs,
+"Webhooks"](https://docs.gitlab.com/user/project/integrations/webhooks/)).
+Blindly calling `install` again on every address change would leave exactly
+that silently-failing, orphaned hook sitting alongside the new one; this
+auto-reconciliation pass exists specifically so that never happens.
+
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
 change):
