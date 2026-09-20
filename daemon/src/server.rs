@@ -5431,6 +5431,14 @@ struct WebhookInfoResponse {
     id: String,
     url: String,
     active: bool,
+    /// Track E, E12: GitLab only -- `true` when GitLab has auto-disabled
+    /// this hook after repeated delivery failures. Always `false` for
+    /// GitHub (no equivalent concept); see
+    /// [`crate::forge::ForgeWebhook::disabled`]'s doc comment. Re-enable by
+    /// firing `POST .../webhook/check` (E11) -- GitLab's own mechanism for
+    /// clearing this state is a successful test request, not a separate
+    /// "re-enable" call.
+    disabled: bool,
 }
 
 impl From<crate::forge::ForgeWebhook> for WebhookInfoResponse {
@@ -5439,6 +5447,7 @@ impl From<crate::forge::ForgeWebhook> for WebhookInfoResponse {
             id: h.id,
             url: h.url,
             active: h.active,
+            disabled: h.disabled,
         }
     }
 }

@@ -214,7 +214,7 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
 | POST | `/api/forge/webhook/{provider}` | [Receive a forge webhook delivery](#post-apiforgewebhookprovider-track-e-e2-e7) (`github`\|`gitlab`) -- the daemon's one unauthenticated route; self-authenticates via HMAC/token instead |
 | POST | `/api/projects/{name}/webhook/install` | [Register a live webhook](#post-apiprojectsnamewebhookinstall-track-e-e8) on the project's forge repo, pointed at this daemon's receive route |
-| GET | `/api/projects/{name}/webhook/status` | [List webhooks](#get-apiprojectsnamewebhookstatus-track-e-e8) currently registered on the project's forge repo |
+| GET | `/api/projects/{name}/webhook/status` | [List webhooks](#get-apiprojectsnamewebhookstatus-track-e-e8e12) currently registered on the project's forge repo |
 | POST | `/api/projects/{name}/webhook/uninstall` | [Delete a webhook](#post-apiprojectsnamewebhookuninstall-track-e-e8) from the project's forge repo by id |
 | POST | `/api/projects/{name}/webhook/update` | [Rotate the secret/URL](#post-apiprojectsnamewebhookupdate-track-e-e9) on an already-installed webhook, keeping its id |
 | POST | `/api/projects/{name}/webhook/check` | [Fire a reachability test](#post-apiprojectsnamewebhookcheck-track-e-e11) against the installed webhook |
@@ -3882,7 +3882,7 @@ verify (E3/E4) once deliveries start arriving. `404 not_found` for an
 unregistered project name. On success, `201` with the created hook:
 
 ```json
-{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true }
+{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true, "disabled": false }
 ```
 
 Manual/explicit for install itself; secret rotation and address change are
@@ -3900,17 +3900,27 @@ most likely first-run failure when `--daemon-url` points at a
 local/tunneled address (`http://127.0.0.1:...`, an ngrok/tailscale
 hostname the GitLab instance treats as local) against a self-hosted GitLab.
 
-### `GET /api/projects/{name}/webhook/status` (Track E, E8)
+### `GET /api/projects/{name}/webhook/status` (Track E, E8/E12)
 Lists every webhook currently registered on the project's forge repo — not
 filtered to ones this daemon installed (a forge has no ownership concept for
 a hook), so the caller matches by `url`:
 
 ```json
-{ "hooks": [{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true }] }
+{ "hooks": [{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true, "disabled": false }] }
 ```
 
 Read-only; not admin-gated (matches `GET /api/projects` being open to every
 caller above). `404 not_found` for an unregistered project name.
+
+**`disabled` (E12, GitLab only).** `true` when GitLab has auto-disabled the
+hook after repeated delivery failures (its `alert_status` is `disabled` or
+`temporarily_disabled`, gated by the instance's `auto_disabling_web_hooks`
+setting) — a disabled hook silently drops every delivery. Always `false`
+for GitHub, which has no equivalent per-hook disabled state. There is no
+separate "re-enable" endpoint: GitLab's own mechanism for clearing this
+state is a successful test request, so `POST .../webhook/check` (E11) *is*
+the re-enable action — fire it, then re-check `status` to confirm
+`disabled` cleared.
 
 ### `POST /api/projects/{name}/webhook/uninstall` (Track E, E8)
 Deletes one webhook from the project's forge repo by its forge-assigned id

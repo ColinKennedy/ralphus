@@ -393,10 +393,21 @@ pub struct ForgeWebhook {
     pub url: String,
     /// `true` for a GitHub hook with `active: true`. GitLab has no
     /// equivalent boolean on hook creation/listing -- a GitLab hook is
-    /// always reported `true` here; its richer `alert_status`
-    /// (`executable`/`disabled`/`temporarily_disabled`) is a later ticket's
-    /// concern (E12), not read by this type.
+    /// always reported `true` here; see [`Self::disabled`] for GitLab's own
+    /// (different) failure-state concept.
     pub active: bool,
+    /// GitLab only (Track E, E12): `true` when the hook's `alert_status` is
+    /// `"disabled"` or `"temporarily_disabled"` -- GitLab auto-disables a
+    /// webhook after repeated delivery failures (when
+    /// `auto_disabling_web_hooks` is on for the instance), silently
+    /// dropping every delivery until it's re-enabled. GitLab's own
+    /// mechanism to re-enable a disabled hook *is* firing a test request
+    /// (`POST .../webhook/check`, E11) -- there is no separate "re-enable"
+    /// endpoint, so this field's only job is to tell a caller reading
+    /// `GET .../webhook/status` that `check` is worth trying. Always
+    /// `false` for GitHub, which has no equivalent disabled-state concept
+    /// on a hook (only a per-delivery `last_response`, not surfaced here).
+    pub disabled: bool,
 }
 
 /// The outcome of firing a forge's webhook test/ping mechanism (Track E,
@@ -2883,13 +2894,18 @@ fn parse_github_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeErro
         id: id.to_string(),
         url,
         active,
+        disabled: false,
     })
 }
 
-/// Parse one GitLab webhook-management row (`{"id", "url"}`) into a
-/// [`ForgeWebhook`] (Track E, E8). GitLab has no boolean `active` field on
-/// this endpoint, so a present row is always reported `active: true` here --
-/// see [`ForgeWebhook::active`]'s doc comment.
+/// Parse one GitLab webhook-management row (`{"id", "url", "alert_status"}`)
+/// into a [`ForgeWebhook`] (Track E, E8/E12). GitLab has no boolean `active`
+/// field on this endpoint, so a present row is always reported
+/// `active: true` here -- see [`ForgeWebhook::active`]'s doc comment.
+/// `alert_status` absent or unrecognized is treated as not-disabled: an
+/// older GitLab version without this field, or a value this code doesn't
+/// know about, should never *hide* a working hook's status by defaulting
+/// the other way.
 fn parse_gitlab_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeError> {
     let id = v
         .get("id")
@@ -2900,10 +2916,15 @@ fn parse_gitlab_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeErro
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let disabled = matches!(
+        v.get("alert_status").and_then(serde_json::Value::as_str),
+        Some("disabled" | "temporarily_disabled")
+    );
     Ok(ForgeWebhook {
         id: id.to_string(),
         url,
         active: true,
+        disabled,
     })
 }
 
@@ -6551,6 +6572,46 @@ mod tests {
             "https://ralphus.example.com/api/forge/webhook/gitlab"
         );
         assert!(hook.active);
+        assert!(!hook.disabled);
+    }
+
+    // ── Track E, E12: read back hook disabled-state ─────────────────────
+
+    #[test]
+    fn parse_gitlab_webhook_reports_disabled_for_disabled_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "disabled"});
+        assert!(parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_disabled_for_temporarily_disabled_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "temporarily_disabled"});
+        assert!(parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_not_disabled_for_executable_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "executable"});
+        assert!(!parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_not_disabled_when_alert_status_is_absent() {
+        // An older GitLab without this field, or a value this code doesn't
+        // know about, must never hide a hook's status by defaulting the
+        // other way.
+        let row = serde_json::json!({"id": 7, "url": "https://x"});
+        assert!(!parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_github_webhook_is_never_disabled() {
+        let row = serde_json::json!({
+            "id": 42,
+            "config": {"url": "https://x"},
+            "active": true,
+        });
+        assert!(!parse_github_webhook(&row).unwrap().disabled);
     }
 
     #[test]
