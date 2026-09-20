@@ -40,6 +40,12 @@ pub struct TaskFile {
     /// `[[default]]` blocks. Only the first is significant.
     #[serde(default, rename = "default")]
     pub defaults: Vec<DefaultBlock>,
+    /// RAL-476: the registered user submitting this task file, if named
+    /// explicitly. When absent, the daemon infers the submitter from the
+    /// request/CLI/MCP context instead (see `daemon::server::current_user`
+    /// and the submitter-resolution order documented on RAL-476).
+    #[serde(default)]
+    pub submitter: Option<String>,
     /// The tasks in this submission.
     #[serde(default)]
     pub task: Vec<TaskDef>,

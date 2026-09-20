@@ -87,6 +87,12 @@ fn spawn_sse_reader(
 fn events_stream_pushes_a_squad_event_on_submit() {
     let base = spawn_server();
 
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    ureq::post(&format!("{base}/api/users"))
+        .set("Content-Type", "application/json")
+        .send_string(&user_body)
+        .expect("user registration");
+
     let resp = ureq::get(&format!("{base}/api/events"))
         .call()
         .expect("SSE connection opens");
@@ -102,6 +108,7 @@ fn events_stream_pushes_a_squad_event_on_submit() {
     let submit_body = serde_json::json!({ "toml": GOOD, "label": "sse test" }).to_string();
     let submitted = ureq::post(&format!("{base}/api/squads"))
         .set("Content-Type", "application/json")
+        .set("X-Ralphus-User", "test-user")
         .send_string(&submit_body);
     assert!(submitted.is_ok(), "submit failed: {:?}", submitted.err());
 
@@ -130,6 +137,12 @@ fn events_stream_pushes_a_squad_event_on_submit() {
 fn events_stream_supports_multiple_concurrent_subscribers() {
     let base = spawn_server();
 
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    ureq::post(&format!("{base}/api/users"))
+        .set("Content-Type", "application/json")
+        .send_string(&user_body)
+        .expect("user registration");
+
     let resp_a = ureq::get(&format!("{base}/api/events")).call().unwrap();
     let rx_a = spawn_sse_reader(resp_a.into_reader());
     let resp_b = ureq::get(&format!("{base}/api/events")).call().unwrap();
@@ -140,6 +153,7 @@ fn events_stream_supports_multiple_concurrent_subscribers() {
     let submit_body = serde_json::json!({ "toml": GOOD, "label": "sse test 2" }).to_string();
     ureq::post(&format!("{base}/api/squads"))
         .set("Content-Type", "application/json")
+        .set("X-Ralphus-User", "test-user")
         .send_string(&submit_body)
         .expect("submit ok");
 

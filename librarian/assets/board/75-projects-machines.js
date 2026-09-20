@@ -1024,7 +1024,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
             <td style="color:var(--muted)">${fmtProjCreated(u.created_at_ms)}</td>
             <td data-tip="RAL-332: a UI-level convenience gate, not a real security boundary -- see the disclaimer above.">${u.is_admin ? "✓ Admin" : "—"}</td>
             <td class="row" style="gap:6px;flex-wrap:nowrap">
-              <button class="btn" data-click="removeUser" data-name="${esc(u.name)}" data-tip="Remove this placeholder user.\nGrants/revokes nothing by itself — it just stops the name from being selectable as a default_user or explicit identity.\nThis cannot be undone — you would have to add it again.">Remove</button>
+              <button class="btn" data-click="removeUser" data-name="${esc(u.name)}" data-tip="Remove this placeholder user.\nGrants/revokes nothing by itself — it just stops the name from being selectable as a default_user or explicit identity. Fork rows and historical review ownership referencing this name are preserved, not cascade-deleted; any project affected (default PR user, review owner, or registered fork) is named in the confirmation before you commit.\nThis cannot be undone — you would have to add it again.">Remove</button>
               <button class="btn squadbtn" data-click="openUserMenu" data-name="${esc(u.name)}" data-tip="More actions — edit this user's profile as admin, or grant/revoke their admin flag.">⋯</button>
             </td>
           </tr>`;
@@ -1133,12 +1133,30 @@ Work submitted against it will fail — fix the machine or deregister the provid
         await pollUsers();
       }
       /**
-       * Removes a registered user.
+       * Removes a registered user. Fetches the RAL-476 pre-deletion impact
+       * check first, so the confirmation names every affected project
+       * instead of asking blind -- deletion never cascades (fork rows and
+       * historical review ownership are preserved as durable strings), but
+       * a project left without its default PR user, or a review left
+       * without its owner, only surfaces afterward unless named up front.
        * @param {string} name
        * @returns {Promise<void>}
        */
       async function removeUser(name) {
-        if (!confirm(`Remove user "${name}"?`)) return;
+        let message = `Remove user "${name}"?`;
+        try {
+          const r = await fetch(`/api/users/${encodeURIComponent(name)}/deletion-impact`);
+          if (r.ok) {
+            const d = await r.json();
+            /** @type {{project: string, reasons: {kind: string, detail: string}[]}[]} */
+            const affected = d.affected || [];
+            if (affected.length) {
+              const lines = affected.map((a) => `- ${a.project}: ${a.reasons.map((x) => x.detail).join(", ")}`);
+              message = `Deleting "${name}" affects ${affected.length} project${affected.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nThis does not delete or reassign any of it -- the project(s) above will be left without a resolved identity for future PRs/reviews until reconfigured.\n\nDelete "${name}" anyway?`;
+            }
+          }
+        } catch (e) { /* impact check failed; fall back to the generic prompt below */ }
+        if (!confirm(message)) return;
         try {
           const r = await fetch(`/api/users/${encodeURIComponent(name)}`, { method: "DELETE" });
           userError = r.ok ? "" : await responseError(r, "remove failed");

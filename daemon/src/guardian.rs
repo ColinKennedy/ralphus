@@ -583,6 +583,14 @@ pub struct GuardianView {
     pub detail: Option<String>,
     /// The squad this review was derived from, if any (manual reviews have none).
     pub squad_id: Option<String>,
+    /// RAL-476: the registered user this review is submitted/routed as --
+    /// stamped at creation time from (in priority order) the squad's own
+    /// `submitter`, the project's configured `default_pr_user`, or the
+    /// daemon's `default_user`. `None` when none of those resolved (a
+    /// review is expected to always resolve one going forward, but a
+    /// pre-RAL-476 row, or one created with no submitter/fallback available,
+    /// can still be `None`).
+    pub owner: Option<String>,
     /// The stable, read-only combined review worktree (head of the last branch).
     pub combined_worktree: Option<String>,
     /// Total conflict marker blocks detected across all files when last resolving.
@@ -1122,10 +1130,36 @@ impl Store {
             .or(separate_pr_branch_stamp)
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
+        // RAL-476: every review must resolve to exactly one owning user --
+        // the squad's own recorded submitter first (explicit TOML
+        // `submitter`, or whoever's request context it was inferred from at
+        // submit time), else this project's configured default PR user,
+        // else the daemon's own configured default user. `None` only when
+        // none of the three resolve (no submitter, no project default, no
+        // daemon default_user configured at all).
+        let owner = squad_id
+            .and_then(|sid| self.get_squad_submitter(sid).ok().flatten())
+            .or_else(|| db_settings.default_pr_user.clone())
+            .or_else(|| crate::config::load_daemon_config().default_user);
+        // RAL-476 (interview Q6): a project can require every review it hosts
+        // to route through a registered fork -- reject the submission
+        // outright with a clear reason instead of silently falling back to a
+        // direct-origin push once `pr.rs`'s routing later finds no fork.
+        if db_settings.forks_only == Some(true) {
+            let has_fork = match (project, owner.as_deref()) {
+                (Some(proj), Some(user)) => self.resolve_fork(proj, user)?.is_some(),
+                _ => false,
+            };
+            if !has_fork {
+                return Err(StoreError::InvalidTransition(format!(
+                    "project {project:?} requires a registered fork ('forks_only' policy) but no fork resolves for owner {owner:?}"
+                )));
+            }
+        }
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch)
-             VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1)",
-            params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch)],
+            "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch, owner)
+             VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?)",
+            params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner],
         )?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
@@ -4024,7 +4058,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4043,7 +4077,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4161,6 +4195,7 @@ impl Store {
             post_merge_detail: r.get(57)?,
             post_merge_started_at_ms: r.get(58)?,
             post_merge_finished_at_ms: r.get(59)?,
+            owner: r.get(60)?,
         })
     }
 
@@ -4525,6 +4560,7 @@ impl Store {
             status: row.status,
             detail: row.detail,
             squad_id: row.squad_id,
+            owner: row.owner,
             combined_worktree: row.combined_worktree,
             conflicts_found: row.conflicts_found,
             conflicts_fixed: row.conflicts_fixed,
@@ -4977,6 +5013,9 @@ struct GuardianRow {
     post_merge_detail: Option<String>,
     post_merge_started_at_ms: Option<i64>,
     post_merge_finished_at_ms: Option<i64>,
+    /// RAL-476: the registered user this review is submitted/routed as --
+    /// see [`GuardianView::owner`].
+    owner: Option<String>,
     /// RAL-273: see [`GuardianView::notice_kind`].
     notice_kind: Option<String>,
     notice_message: Option<String>,

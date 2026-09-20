@@ -607,6 +607,12 @@ pub struct SquadView {
     /// `server::submit`'s doc comment) errored. Mirrors [`TaskView::error`]'s
     /// shape and lifecycle. `None` for every squad that never failed this way.
     pub error: Option<String>,
+    /// The user who submitted this squad (RAL-476) -- explicit TOML
+    /// `submitter`, else the acting request's resolved identity at submit
+    /// time, else `None` if neither resolved (tasks/cells don't require an
+    /// owning user). See `server::resolve_submitter`.
+    #[serde(default)]
+    pub submitter: Option<String>,
 }
 
 /// A node in the cross-squad `[[default]] depends_on` gating graph
@@ -705,6 +711,22 @@ pub struct ProjectReviewSettings {
     pub auto_fix_pr_errors: Option<bool>,
     #[serde(default)]
     pub auto_fix_prompt_template: Option<String>,
+    /// RAL-476: fallback owning user for a review whose squad has no
+    /// `submitter` of its own (e.g. an auto-review triggered with no
+    /// explicit submission) -- see `Store::create_guardian_keyed`'s owner
+    /// resolution chain. Not a `ReviewConfig`/Arbiter field, so it is
+    /// deliberately absent from [`Self::into_review_config`].
+    #[serde(default)]
+    pub default_pr_user: Option<String>,
+    /// RAL-476 (interview Q6): when `Some(true)`, every review created for
+    /// this project must resolve to a registered fork for its owning user --
+    /// `Store::create_guardian_keyed` rejects the submission outright rather
+    /// than silently falling back to a direct-origin push. `None`/`Some(false)`
+    /// both mean "no such requirement" (unset is not a footgun default).
+    /// Also absent from [`Self::into_review_config`] for the same reason as
+    /// `default_pr_user`.
+    #[serde(default)]
+    pub forks_only: Option<bool>,
 }
 
 impl ProjectReviewSettings {
@@ -2781,6 +2803,18 @@ impl Store {
             // exhausted attempt, mirroring `auto_fix_attempted_at_ms`'s own
             // single-attempt cap, and cleared by the same paths that clear it.
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_exhausted_notified_at_ms INTEGER",
+            // RAL-476: the user who submitted this squad, resolved once at
+            // submit time (explicit TOML `submitter`, else the acting
+            // request's identity) -- see `server::resolve_submitter`.
+            "ALTER TABLE squads ADD COLUMN submitter TEXT",
+            // RAL-476: the resolved owning user for this review, stamped at
+            // guardian-creation time in `Store::create_guardian_keyed` from
+            // (in priority order) the squad's `submitter`, the project's
+            // `default_pr_user`, then the daemon's configured default user.
+            // Every review must resolve to exactly one owner, but this
+            // column can still be NULL for guardians created before this
+            // migration.
+            "ALTER TABLE guardians ADD COLUMN owner TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3122,7 +3156,7 @@ impl Store {
         let default_env = default_block.map(|d| &d.environment);
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO squads(id, label, state, depends_on, env_overrides, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO squads(id, label, state, depends_on, env_overrides, created_at_ms, updated_at_ms, submitter) VALUES(?,?,?,?,?,?,?,?)",
             params![
                 squad_id,
                 label,
@@ -3130,7 +3164,8 @@ impl Store {
                 to_json(squad_deps),
                 default_env.map(to_json_map).unwrap_or_else(|| "{}".to_string()),
                 now,
-                now
+                now,
+                file.submitter.as_deref()
             ],
         )?;
 
@@ -4082,12 +4117,29 @@ impl Store {
         Ok(count > 0)
     }
 
+    /// The submitter recorded on `squad_id` (RAL-476), if any -- used by
+    /// [`Self::create_guardian_keyed`] as the first link in a review's owner
+    /// resolution chain. `Ok(None)` both when the squad has no submitter and
+    /// when `squad_id` names no squad at all (a guardian's `squad_id` can be
+    /// `None`, or point at a squad since deleted).
+    pub(crate) fn get_squad_submitter(&self, squad_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT submitter FROM squads WHERE id=?",
+                params![squad_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Fetch a single squad's full board view.
     pub fn get_squad(&self, id: &str) -> Result<SquadView> {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error FROM squads WHERE id=?",
+                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -4099,6 +4151,7 @@ impl Store {
                         r.get::<_, Option<i64>>(5)?,
                         r.get::<_, String>(6)?,
                         r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -4114,6 +4167,7 @@ impl Store {
             row.5,
             from_json_map(&row.6),
             row.7,
+            row.8,
         )
     }
 
@@ -4154,7 +4208,7 @@ impl Store {
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let mut stmt = conn.prepare(
-            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error FROM squads ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads ORDER BY created_at_ms DESC, id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -4167,23 +4221,27 @@ impl Store {
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(id, label, state, ts, started, finished, env, error)| {
-                Self::build_squad_view(
-                    conn,
-                    id,
-                    label,
-                    state,
-                    ts,
-                    started,
-                    finished,
-                    from_json_map(&env),
-                    error,
-                )
-            })
+            .map(
+                |(id, label, state, ts, started, finished, env, error, submitter)| {
+                    Self::build_squad_view(
+                        conn,
+                        id,
+                        label,
+                        state,
+                        ts,
+                        started,
+                        finished,
+                        from_json_map(&env),
+                        error,
+                        submitter,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -4241,6 +4299,7 @@ impl Store {
         finished_at_ms: Option<i64>,
         env_overrides: BTreeMap<String, String>,
         error: Option<String>,
+        submitter: Option<String>,
     ) -> Result<SquadView> {
         let mut tstmt = conn.prepare(
             "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
@@ -4352,6 +4411,7 @@ impl Store {
             reviews,
             env_overrides,
             error,
+            submitter,
         })
     }
 
@@ -14813,6 +14873,8 @@ command = "e"
             auto_submit_pr_stack: Some(true),
             auto_fix_pr_errors: Some(true),
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
+            default_pr_user: Some("alice".to_string()),
+            forks_only: Some(true),
         };
         store
             .set_project_review_settings("proj", &settings)

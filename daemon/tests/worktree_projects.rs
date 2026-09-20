@@ -192,6 +192,10 @@ fn placeholder_cwd_with_registered_project_submits_successfully() {
     let repo = init_repo(&base);
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
 
+    let user_body = serde_json::json!({"name": "Colin Kennedy"}).to_string();
+    let reply = route(&daemon, "POST", "/api/users", &user_body);
+    assert_eq!(reply.status, 200, "user: {}", reply.body);
+
     let reg_body =
         serde_json::json!({"name": "proj", "description": "d", "path": repo, "vcs": "git"})
             .to_string();
@@ -210,6 +214,10 @@ fn placeholder_cwd_with_registered_project_submits_successfully() {
 #[test]
 fn placeholder_cwd_with_unregistered_project_is_rejected_at_submit() {
     let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
+
+    let user_body = serde_json::json!({"name": "Colin Kennedy"}).to_string();
+    let reply = route(&daemon, "POST", "/api/users", &user_body);
+    assert_eq!(reply.status, 200, "user: {}", reply.body);
 
     let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n\
                 [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"do work\"\n";
