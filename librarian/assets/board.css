@@ -171,6 +171,12 @@
       .kv-row .k { color: var(--muted); min-width: 96px; }
       .kv-row .v { word-break: break-word; }
       .kv-row .v.inherited-value { font-style: italic; }
+      /* RAL-477: shared single-line, ellipsis-truncated status/detail summary
+         (see `detailSummary()` in board/20-util.js) -- caps at 420px so one
+         long value can't blow out a card's layout, but still shrinks to fit
+         a narrower container (a flex item beside a badge, a kv-row value). */
+      .detail-summary { display: inline-block; max-width: min(420px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; cursor: pointer; }
+      .detail-summary:hover { text-decoration: underline; }
       /* Read-only field indicator (see docs/colors.md) — a small muted lock badge
          appended to a kv-row's key label for a field derived/computed, never editable. */
       .ro-badge { color: var(--muted); font-size: 10px; cursor: default; margin-left: 2px; }

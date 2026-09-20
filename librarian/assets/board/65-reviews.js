@@ -504,7 +504,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (b.pr_submission_pending) return `<span class="badge live" data-tip="Auto-submitting this branch's pull request is in progress on its own background worker.\nWho/when: you enabled auto-submit for this review's PR stack and this branch just reached a terminal state.\nClears automatically once the attempt completes (success clears it silently; failure leaves the ⚠ auto-submit failed badge instead).">⏳ submitting PR</span>`;
         if (b.auto_submit_error) return `<span class="badge bad" data-full="${esc(b.auto_submit_error)}" onclick="event.stopPropagation();openErrPopup(event)" data-tip="Auto-submitting this branch's pull request failed: ${esc(b.auto_submit_error)}\nWho/when: you enabled auto-submit for this review's PR stack and this branch's PR wasn't opened/updated as a result.\nCheck forge credentials/connectivity, then resubmit manually (review pr submit) or wait for the next auto-submit attempt.\nClick to open the full failure text in a copyable popup.">⚠ auto-submit failed</span>`;
         if (b.merge_status === "ready") return `<span class="badge ready" data-tip="All tasks are done — this branch is queued for the automatic rebase.\nThe scheduler will start rebasing it into the review stack shortly.">⚡ ready</span>`;
-        if (b.merge_status === "failed") return `<span class="badge bad" data-tip="Merge failed — ${esc(b.detail || "conflict during rebase")}">⚠ conflict</span>`;
+        if (b.merge_status === "failed") {
+          const failDetail = b.detail || "conflict during rebase";
+          return `<span class="badge bad" data-tip="Merge failed — ${esc(failDetail)}">⚠ conflict</span> ${detailSummary(failDetail, "Failure log", "fail")}`;
+        }
         // RAL-149: all conflict markers for this branch are resolved and committed,
         // but the dedicated final-proof agent call (a separate LLM call from
         // the fix pass) hasn't finished yet. Clears automatically once that call
@@ -912,7 +915,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ? `<span class="br-toggle" data-tip="Expand or collapse merge detail for this branch." data-click="toggleBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}">${open ? "▾" : "▸"}</span>`
             : `<span class="br-toggle placeholder">▸</span>`;
           const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
-              ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${esc(b.detail)}</span></div>` : ""}
+              ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${detailSummary(b.detail, "Branch detail")}</span></div>` : ""}
               ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span></div>` : ""}
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
@@ -1029,7 +1032,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           <h3 class="section">check gates</h3>${checks}${skipInfo}
           <div class="kv-row">${envViewerBtn(`/api/guardians/${g.id}/tests-env`, "this review's check gates (tests)")}</div>
           <h3 class="section" data-tip="Squash controls how each task branch's commits appear in the review worktree.\nScope is per git project — set it independently for each project in the review.">squash</h3>${squashSummary}
-          ${g.detail && !autoBuiltCmd ? `<div class="warn">${esc(g.detail)}</div>` : ""}
+          ${g.detail && !autoBuiltCmd ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           <h3 class="section">branches${canReorder ? ' <span class="k" style="text-transform:none;letter-spacing:0">— drag to reorder · toggle ⊙/⊘ to enable/disable</span>' : ""}${hasPending ? ' <span class="badge warn2" data-tip="Unsaved order or enable/disable changes — click Save to apply, or Discard to revert.">● unsaved changes</span>' : ""}</h3>
           ${allDisabled ? `<div class="warn" style="margin:4px 0 8px">All branches are disabled — saving will make this review a no-op (no rebase runs). Re-enable at least one branch before saving, or click Discard.</div>` : ""}
           ${isMultiProject ? `<div class="row" style="margin-bottom:8px;gap:4px">${(g.projects||[]).map((p) => {
