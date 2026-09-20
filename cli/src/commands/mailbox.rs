@@ -243,9 +243,13 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             Ok(())
         }),
         MailboxCommand::PersonalUndrain { message_ids, user } => run_and_report(opts, None, || {
-            let result = client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?;
+            let result =
+                client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?;
             emit(opts, &result, |v| {
-                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+                println!(
+                    "undrained {} message(s)",
+                    v["undrained"].as_u64().unwrap_or(0)
+                );
             });
             Ok(())
         }),
@@ -295,7 +299,10 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             let client_id = ensure_client_id(&client)?;
             let result = client.mailbox_undrain(&client_id, message_ids.as_deref())?;
             emit(opts, &result, |v| {
-                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+                println!(
+                    "undrained {} message(s)",
+                    v["undrained"].as_u64().unwrap_or(0)
+                );
             });
             Ok(())
         }),
@@ -408,12 +415,7 @@ mod tests {
 
     #[test]
     fn bare_mailbox_behaves_like_check() {
-        matches!(
-            parse(&[]),
-            MailboxCommand::Check {
-                priority: None
-            }
-        );
+        matches!(parse(&[]), MailboxCommand::Check { priority: None });
     }
 
     #[test]
@@ -478,9 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_watch_with_entity_uri_and_tiers() {
+    fn parses_follow_with_entity_uri_and_tiers() {
         match parse(&v(&[
-            "watch",
+            "follow",
             "--tier",
             "urgent",
             "--tier",
@@ -489,7 +491,7 @@ mod tests {
             "colin",
             "squad:squad-1",
         ])) {
-            MailboxCommand::Watch {
+            MailboxCommand::Follow {
                 entity_uri,
                 tiers,
                 user,
@@ -503,17 +505,17 @@ mod tests {
     }
 
     #[test]
-    fn watch_without_entity_uri_is_usage_error() {
+    fn follow_without_entity_uri_is_usage_error() {
         assert!(matches!(
-            parse(&v(&["watch"])),
+            parse(&v(&["follow"])),
             MailboxCommand::UsageError(_)
         ));
     }
 
     #[test]
-    fn parses_unwatch() {
-        match parse(&v(&["unwatch", "squad:squad-1"])) {
-            MailboxCommand::Unwatch { entity_uri, user } => {
+    fn parses_unfollow() {
+        match parse(&v(&["unfollow", "squad:squad-1"])) {
+            MailboxCommand::Unfollow { entity_uri, user } => {
                 assert_eq!(entity_uri, "squad:squad-1");
                 assert_eq!(user, None);
             }
@@ -522,9 +524,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_watches_listing() {
-        match parse(&v(&["watches", "--user", "colin"])) {
-            MailboxCommand::Watches { user } => assert_eq!(user.as_deref(), Some("colin")),
+    fn parses_follows_listing() {
+        match parse(&v(&["follows", "--user", "colin"])) {
+            MailboxCommand::Follows { user } => assert_eq!(user.as_deref(), Some("colin")),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -539,30 +541,30 @@ mod tests {
     }
 
     #[test]
-    fn set_preferences_requires_user_and_auto_watch_choice() {
+    fn set_preferences_requires_user_and_auto_follow_choice() {
         matches!(
             parse(&v(&["set-preferences", "--user", "colin"])),
             MailboxCommand::UsageError(_)
         );
         matches!(
-            parse(&v(&["set-preferences", "--auto-watch"])),
+            parse(&v(&["set-preferences", "--auto-follow"])),
             MailboxCommand::UsageError(_)
         );
         match parse(&v(&[
             "set-preferences",
             "--user",
             "colin",
-            "--auto-watch",
+            "--auto-follow",
             "--tier",
             "urgent",
         ])) {
             MailboxCommand::SetPreferences {
                 user,
-                auto_watch,
+                auto_follow,
                 tiers,
             } => {
                 assert_eq!(user, "colin");
-                assert!(auto_watch);
+                assert!(auto_follow);
                 assert_eq!(tiers, v(&["urgent"]));
             }
             other => panic!("unexpected: {other:?}"),
@@ -571,9 +573,9 @@ mod tests {
             "set-preferences",
             "--user",
             "colin",
-            "--no-auto-watch",
+            "--no-auto-follow",
         ])) {
-            MailboxCommand::SetPreferences { auto_watch, .. } => assert!(!auto_watch),
+            MailboxCommand::SetPreferences { auto_follow, .. } => assert!(!auto_follow),
             other => panic!("unexpected: {other:?}"),
         }
     }

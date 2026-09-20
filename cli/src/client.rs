@@ -870,7 +870,11 @@ impl DaemonClient {
     /// `DELETE /api/watches/{entity_uri}` -- `entity_uri` is interpolated raw
     /// (not urlencoded): the daemon's route matcher expects the literal
     /// colon-delimited URI as the path segment.
-    pub fn delete_follow(&self, entity_uri: &str, user: Option<&str>) -> Result<Value, DaemonError> {
+    pub fn delete_follow(
+        &self,
+        entity_uri: &str,
+        user: Option<&str>,
+    ) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
         self.delete(&format!("/api/watches/{entity_uri}{qs}"))
     }
