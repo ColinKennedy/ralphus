@@ -15534,7 +15534,7 @@ fn route_webhook(
 
             // Track F, F1: while this project's webhook mode is "shadow",
             // record the delivery purely for later comparison against what
-            // the poll independently found (F2) -- never acted on, never
+            // the poll independently found -- never acted on, never
             // changes what this route returns. The mode is re-resolved
             // here rather than threaded through `candidates` above: only
             // the winning project's mode is ever relevant, so resolving
@@ -15545,15 +15545,28 @@ fn route_webhook(
                 .iter()
                 .find(|p| p.name == project_name)
                 .map(|p| crate::config::resolve_webhook(std::path::Path::new(&p.path)).mode());
-            if shadow_project_mode == Some(Ok(crate::config::WebhookMode::Shadow)) {
-                let _ = daemon.lock().record_webhook_shadow_delivery(
-                    kind.as_str(),
-                    delivery_id,
-                    project_name,
-                    resolved_pr_id,
-                );
-            }
+            let shadow_delivery =
+                if shadow_project_mode == Some(Ok(crate::config::WebhookMode::Shadow)) {
+                    daemon
+                        .lock()
+                        .record_webhook_shadow_delivery(
+                            kind.as_str(),
+                            delivery_id,
+                            project_name,
+                            resolved_pr_id,
+                        )
+                        .ok()
+                } else {
+                    None
+                };
 
+            // Track F, F2: the delta between what the webhook just told us
+            // and what the poll's own most recent look already knew --
+            // computed once, at record time (`poll_lag_ms` above), and
+            // folded into the same Cartographer row rather than a second
+            // log call, so a shadow-mode delivery's comparison data lives
+            // alongside its receipt event instead of as a separate,
+            // independently-timestamped row that could drift apart from it.
             let _ = daemon
                 .lock()
                 .cartographer_log(crate::cartographer::CartographerEntry {
@@ -15570,6 +15583,10 @@ fn route_webhook(
                         "provider": kind.as_str(),
                         "project": project_name,
                         "pr_id": resolved_pr_id,
+                        "shadow": shadow_delivery.as_ref().map(|d| serde_json::json!({
+                            "poll_last_checked_at_ms": d.poll_last_checked_at_ms,
+                            "poll_lag_ms": d.poll_lag_ms,
+                        })),
                     }),
                     admin_only: false,
                 });

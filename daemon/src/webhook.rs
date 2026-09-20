@@ -210,13 +210,25 @@ pub struct ShadowDeliveryRecord {
     pub project_name: String,
     pub pr_id: Option<String>,
     pub arrived_at_ms: i64,
+    /// Snapshot of `guardian_pr_forge_cache.last_checked_at_ms` for the
+    /// resolved PR, taken at record time (Track F, F2). `None` means the
+    /// poll had never checked this PR as of the delivery's arrival -- the
+    /// clearest "the poll would have missed this entirely" signal.
+    pub poll_last_checked_at_ms: Option<i64>,
+    /// `arrived_at_ms - poll_last_checked_at_ms`: positive means the poll's
+    /// last look predates this delivery by that many milliseconds. `None`
+    /// under the same condition as `poll_last_checked_at_ms`.
+    pub poll_lag_ms: Option<i64>,
 }
 
 impl Store {
     /// Record one verified webhook delivery while a project's `[webhook]`
     /// mode is `"shadow"` (Track F, F1) -- purely observational, never
-    /// acted on. Comparing this record against what the poll independently
-    /// found is a separate step (F2), not done here.
+    /// acted on. Snapshots the poll's current knowledge of the resolved PR
+    /// at the same time (F2), so the delta between "the webhook just told
+    /// us this" and "the poll's last actual look" is captured once, at the
+    /// moment it's most meaningful, rather than reconstructed later from
+    /// two independently-drifting timestamps.
     pub fn record_webhook_shadow_delivery(
         &self,
         provider: &str,
@@ -225,11 +237,32 @@ impl Store {
         pr_id: Option<&str>,
     ) -> Result<ShadowDeliveryRecord> {
         let arrived_at_ms = now_ms();
+        let poll_last_checked_at_ms = match pr_id {
+            Some(pr_id) => self
+                .conn
+                .query_row(
+                    "SELECT last_checked_at_ms FROM guardian_pr_forge_cache WHERE pr_id=?1",
+                    rusqlite::params![pr_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let poll_lag_ms = poll_last_checked_at_ms.map(|checked| arrived_at_ms - checked);
         self.conn.execute(
             "INSERT INTO webhook_shadow_deliveries(
-                 provider, delivery_id, project_name, pr_id, arrived_at_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![provider, delivery_id, project_name, pr_id, arrived_at_ms],
+                 provider, delivery_id, project_name, pr_id, arrived_at_ms,
+                 poll_last_checked_at_ms, poll_lag_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                provider,
+                delivery_id,
+                project_name,
+                pr_id,
+                arrived_at_ms,
+                poll_last_checked_at_ms,
+                poll_lag_ms
+            ],
         )?;
         Ok(ShadowDeliveryRecord {
             provider: provider.to_string(),
@@ -237,6 +270,8 @@ impl Store {
             project_name: project_name.to_string(),
             pr_id: pr_id.map(str::to_string),
             arrived_at_ms,
+            poll_last_checked_at_ms,
+            poll_lag_ms,
         })
     }
 }
@@ -459,5 +494,64 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    // ── Track F, F2: compare against poll-discovered truth ──────────────
+
+    #[test]
+    fn shadow_delivery_with_no_pr_has_no_poll_comparison() {
+        let s = Store::open_in_memory().unwrap();
+        let record = s
+            .record_webhook_shadow_delivery("github", Some("d1"), "proj", None)
+            .unwrap();
+        assert_eq!(record.poll_last_checked_at_ms, None);
+        assert_eq!(record.poll_lag_ms, None);
+    }
+
+    #[test]
+    fn shadow_delivery_with_a_pr_the_poll_never_checked_has_no_poll_comparison() {
+        let s = Store::open_in_memory().unwrap();
+        let record = s
+            .record_webhook_shadow_delivery("github", Some("d1"), "proj", Some("pr-1"))
+            .unwrap();
+        assert_eq!(record.pr_id, Some("pr-1".to_string()));
+        assert_eq!(record.poll_last_checked_at_ms, None);
+        assert_eq!(record.poll_lag_ms, None);
+    }
+
+    #[test]
+    fn shadow_delivery_captures_the_polls_last_known_check_and_lag() {
+        let s = Store::open_in_memory().unwrap();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let pr_id = s
+            .create_pull_request(
+                &gid,
+                None,
+                "github",
+                "acme/widget",
+                "review/demo",
+                "main",
+                "Demo",
+                "",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO guardian_pr_forge_cache(pr_id, last_checked_at_ms) VALUES(?1, ?2)",
+                rusqlite::params![pr_id, 1_000_i64],
+            )
+            .unwrap();
+        let record = s
+            .record_webhook_shadow_delivery("github", Some("d1"), "proj", Some(&pr_id))
+            .unwrap();
+        assert_eq!(record.poll_last_checked_at_ms, Some(1_000));
+        let lag = record.poll_lag_ms.expect("lag must be computed");
+        // arrived_at_ms is real wall-clock time (now_ms()), so it's far
+        // ahead of the fixed 1_000 fixture -- just assert the lag is
+        // positive and consistent with arrived_at_ms - 1_000.
+        assert!(lag > 0);
+        assert_eq!(lag, record.arrived_at_ms - 1_000);
     }
 }

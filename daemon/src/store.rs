@@ -1768,19 +1768,29 @@ impl Store {
                 daemon_url      TEXT NOT NULL,
                 installed_at_ms INTEGER NOT NULL
             );
-            -- Track F, F1: one row per verified webhook delivery while a
+            -- Track F, F1/F2: one row per verified webhook delivery while a
             -- project's [webhook] mode is \"shadow\" -- recorded, never
             -- acted on, purely to build confidence the delivery stream can
             -- be trusted before flipping a project to \"active\". `pr_id`
             -- NULL means E5 couldn't resolve a PR for this delivery (a
             -- spurious delivery for scorecard purposes, F3).
+            -- `poll_last_checked_at_ms` is a snapshot of
+            -- `guardian_pr_forge_cache.last_checked_at_ms` for the resolved
+            -- PR taken at record time (F2) -- NULL means the poll had never
+            -- checked this PR as of the delivery's arrival, the clearest
+            -- \"the poll would have missed this entirely\" signal.
+            -- `poll_lag_ms` is the derived
+            -- `arrived_at_ms - poll_last_checked_at_ms` delta, NULL under
+            -- the same condition.
             CREATE TABLE IF NOT EXISTS webhook_shadow_deliveries (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider      TEXT NOT NULL,
-                delivery_id   TEXT,
-                project_name  TEXT NOT NULL,
-                pr_id         TEXT,
-                arrived_at_ms INTEGER NOT NULL
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider                TEXT NOT NULL,
+                delivery_id             TEXT,
+                project_name            TEXT NOT NULL,
+                pr_id                   TEXT,
+                arrived_at_ms           INTEGER NOT NULL,
+                poll_last_checked_at_ms INTEGER,
+                poll_lag_ms             INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_webhook_shadow_deliveries_project
                 ON webhook_shadow_deliveries(project_name);

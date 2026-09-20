@@ -2528,15 +2528,22 @@ below treats a project as a webhook delivery target at all:
 (`"disabled"` is skipped outright, never counted as a verification
 candidate) and, once a delivery verifies, what happens next:
 
-- **`"shadow"`** (Track F, F1): the delivery is recorded (provider,
+- **`"shadow"`** (Track F, F1/F2): the delivery is recorded (provider,
   delivery id, resolved PR, arrival time) purely for later comparison
   against what the poll independently found -- never acted on, and this
-  route's response is unaffected either way. Nothing currently *acts* on a
-  webhook delivery regardless of mode (no state transition is driven by
-  receiving one yet), so `"shadow"` vs `"active"` doesn't yet change this
-  route's behavior beyond whether the recording happens -- the distinction
-  exists to build the delivery-vs-poll comparison history (F2/F3) before any
-  future ticket makes a webhook delivery actually trigger something.
+  route's response is unaffected either way. At record time, the poll's
+  current knowledge of the resolved PR (`guardian_pr_forge_cache.last_checked_at_ms`)
+  is snapshotted and the delta folded into the same `"verified webhook
+  delivery received"` Cartographer row (F2) under a `shadow` key:
+  `poll_last_checked_at_ms` (`null` if the poll had never checked this PR
+  as of the delivery's arrival -- the clearest "the poll would have missed
+  this" signal) and `poll_lag_ms` (`arrived_at_ms - poll_last_checked_at_ms`).
+  Nothing currently *acts* on a webhook delivery regardless of mode (no
+  state transition is driven by receiving one yet), so `"shadow"` vs
+  `"active"` doesn't yet change this route's behavior beyond whether the
+  recording happens -- the distinction exists to build the delivery-vs-poll
+  comparison history (surfaced as a scorecard, F3) before any future ticket
+  makes a webhook delivery actually trigger something.
 - **`"active"`**: no recording; reserved for a future ticket that acts on a
   delivery directly.
 
