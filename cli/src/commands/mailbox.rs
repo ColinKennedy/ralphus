@@ -243,9 +243,13 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             Ok(())
         }),
         MailboxCommand::PersonalUndrain { message_ids, user } => run_and_report(opts, None, || {
-            let result = client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?;
+            let result =
+                client.personal_mailbox_undrain(message_ids.as_deref(), user.as_deref())?;
             emit(opts, &result, |v| {
-                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+                println!(
+                    "undrained {} message(s)",
+                    v["undrained"].as_u64().unwrap_or(0)
+                );
             });
             Ok(())
         }),
@@ -295,7 +299,10 @@ pub fn dispatch(cmd: MailboxCommand, opts: &GlobalOpts) -> i32 {
             let client_id = ensure_client_id(&client)?;
             let result = client.mailbox_undrain(&client_id, message_ids.as_deref())?;
             emit(opts, &result, |v| {
-                println!("undrained {} message(s)", v["undrained"].as_u64().unwrap_or(0));
+                println!(
+                    "undrained {} message(s)",
+                    v["undrained"].as_u64().unwrap_or(0)
+                );
             });
             Ok(())
         }),
@@ -408,12 +415,7 @@ mod tests {
 
     #[test]
     fn bare_mailbox_behaves_like_check() {
-        matches!(
-            parse(&[]),
-            MailboxCommand::Check {
-                priority: None
-            }
-        );
+        matches!(parse(&[]), MailboxCommand::Check { priority: None });
     }
 
     #[test]
