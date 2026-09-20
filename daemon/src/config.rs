@@ -2340,16 +2340,27 @@ fn configuration_path_entries(configuration_path_env: Option<&str>) -> Vec<PathB
 /// Load the effective daemon config, lowest to highest precedence:
 /// `$RALPHUS_CONFIG_HOME/config.toml` (or its `~/.config/ralphus/` default),
 /// then `$RALPHUS_CONFIGURATION_PATH` entries in order, then the
-/// project-local `.ralphus.toml` found by walking up from `cwd` --
-/// matching the precedence `agent_profiles::load_profiles_for_path_with`
-/// and `machine_targets`'s equivalent already use. `load_daemon_config`
-/// used to skip the `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a
-/// field (e.g. `default_user`) set only via that established convention
-/// silently never loaded.
+/// project-local `.ralphus.toml` found by walking up from `cwd`, then
+/// `$RALPHUS_DAEMON_PUBLIC_URL` overriding just `public_url` above all of
+/// that -- matching the precedence `agent_profiles::load_profiles_for_path_with`
+/// and `machine_targets`'s equivalent already use for everything up through
+/// project-local. `load_daemon_config` used to skip the
+/// `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a field (e.g.
+/// `default_user`) set only via that established convention silently never
+/// loaded.
+///
+/// `$RALPHUS_DAEMON_PUBLIC_URL` exists so a launch script (`build-debug.sh`/
+/// `.cmd`'s `--webhook-tunnel`) can hand the daemon a value it can only know
+/// at the moment it starts a tunnel (ngrok's public URL changes on every
+/// restart on its free tier) without editing `.ralphus.toml` on every run --
+/// the file stays the sticky fallback for a stable address (a paid tunnel, a
+/// real reverse proxy), the env var is the "this run's actual address" live
+/// override on top of it.
 #[must_use]
 fn load_daemon_config_with(
     cwd: Option<&Path>,
     configuration_path_env: Option<&str>,
+    public_url_env: Option<&str>,
 ) -> DaemonConfig {
     let mut merged = global_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2365,14 +2376,19 @@ fn load_daemon_config_with(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
-    merge_daemon_config(merged, local)
+    let mut cfg = merge_daemon_config(merged, local);
+    if let Some(url) = public_url_env.map(str::trim).filter(|u| !u.is_empty()) {
+        cfg.public_url = Some(url.to_string());
+    }
+    cfg
 }
 
 #[must_use]
 pub fn load_daemon_config() -> DaemonConfig {
     let cwd = std::env::current_dir().ok();
     let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    load_daemon_config_with(cwd.as_deref(), raw.as_deref())
+    let public_url_env = std::env::var("RALPHUS_DAEMON_PUBLIC_URL").ok();
+    load_daemon_config_with(cwd.as_deref(), raw.as_deref(), public_url_env.as_deref())
 }
 
 /// Parse a `CartographerConfig` from the given TOML text; the default (30
@@ -3513,7 +3529,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let cfg = load_daemon_config_with(Some(&cwd), Some(config_file.to_str().unwrap()));
+        let cfg = load_daemon_config_with(Some(&cwd), Some(config_file.to_str().unwrap()), None);
         assert_eq!(cfg.default_user.as_deref(), Some("from-configuration-path"));
 
         let _ = std::fs::remove_dir_all(&config_dir);
@@ -3549,10 +3565,67 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_daemon_config_with(Some(&project_root), Some(config_file.to_str().unwrap()));
+        let cfg = load_daemon_config_with(
+            Some(&project_root),
+            Some(config_file.to_str().unwrap()),
+            None,
+        );
         assert_eq!(cfg.default_user.as_deref(), Some("from-project-local"));
 
         let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn load_daemon_config_with_public_url_env_overrides_everything_else() {
+        let project_root = std::env::temp_dir().join(format!(
+            "ralphus-cfg-public-url-env-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".ralphus.toml"),
+            "[daemon]\npublic_url = \"https://from-file.example.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_daemon_config_with(
+            Some(&project_root),
+            None,
+            Some("https://from-ngrok-this-run.example.com"),
+        );
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://from-ngrok-this-run.example.com")
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn load_daemon_config_with_blank_public_url_env_is_ignored() {
+        let project_root = std::env::temp_dir().join(format!(
+            "ralphus-cfg-public-url-env-blank-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".ralphus.toml"),
+            "[daemon]\npublic_url = \"https://from-file.example.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_daemon_config_with(Some(&project_root), None, Some("   "));
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://from-file.example.com"),
+            "a blank env var must not clobber a real configured value"
+        );
+
         let _ = std::fs::remove_dir_all(&project_root);
     }
 
