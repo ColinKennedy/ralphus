@@ -1556,6 +1556,159 @@ impl ForgeConfig {
     }
 }
 
+/// Webhook receiving mode (Track E / E1) -- a closed set, deliberately not a
+/// free-form string. An unrecognized `[webhook] mode` value is rejected
+/// loudly (see [`WebhookConfig::mode`]) rather than silently treated as
+/// `disabled` -- the same "a silently-wrong value is worse than a loud one"
+/// call this file already made once, for `pull_request_branch_convention`
+/// (RAL-244): security-adjacent config (a receiving secret, signature
+/// verification) is exactly the case where a user believing webhooks are on
+/// when they are not is the worse failure mode.
+///
+/// `Shadow` and `Active` are laid out now, even though only `Shadow` is
+/// reachable by anything this track (E/F) builds -- `Active` is Track G
+/// territory, cutover, out of scope here -- so `mode` has its full, stable
+/// vocabulary from the start instead of growing a third value later as a
+/// breaking change to what's already shipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookMode {
+    /// Webhooks are off. Polling is the daemon's only source of truth. The
+    /// default -- an unconfigured `[webhook]` table changes nothing.
+    Disabled,
+    /// Deliveries are received, verified, deduped, and recorded against what
+    /// polling independently discovers (Track F) -- but never acted on.
+    /// Polling still drives every outcome.
+    Shadow,
+    /// Deliveries drive refresh; polling relaxes to a slow reconciliation
+    /// sweep (Track G). Not reachable by any code this track ships.
+    Active,
+}
+
+impl WebhookMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Shadow => "shadow",
+            Self::Active => "active",
+        }
+    }
+}
+
+impl std::str::FromStr for WebhookMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "disabled" => Ok(Self::Disabled),
+            "shadow" => Ok(Self::Shadow),
+            "active" => Ok(Self::Active),
+            other => Err(format!(
+                "unknown [webhook] mode {other:?} -- expected one of \"disabled\", \"shadow\", \"active\""
+            )),
+        }
+    }
+}
+
+/// Fallback [`WebhookConfig::secret_env`] environment variable name when
+/// unset.
+pub const DEFAULT_WEBHOOK_SECRET_ENV: &str = "RALPHUS_WEBHOOK_SECRET";
+
+/// Per-project webhook receiving config (Track E / E1), `[webhook]` table.
+/// Layered per-project over the global default like [`ForgeConfig`]/
+/// [`ReviewConfig`] (unlike [`PrCacheConfig`]/[`MergeCheckConfig`]/
+/// [`HealthSweepConfig`], which are daemon-singleton) -- a webhook is
+/// registered against one specific project's forge repository, so its
+/// config is inherently per-project, the same reasoning [`ForgeConfig`]
+/// itself already documents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WebhookConfig {
+    /// Raw mode string. Deliberately *not* validated at deserialization
+    /// time -- every other malformed field in this file falls back to a
+    /// default rather than failing the whole config load (`toml::from_str`
+    /// parses the entire `ConfigFile` in one shot; a hard `enum` rejection
+    /// here would silently revert every *other* table -- `[forge]`,
+    /// `[review]`, everything -- to defaults too, exactly the failure mode
+    /// this field exists to avoid). [`Self::mode`] validates it explicitly
+    /// instead, so a bad value surfaces as its own clear error without
+    /// corrupting unrelated config.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Name of the environment variable holding the webhook's shared
+    /// secret -- the HMAC key GitHub's `X-Hub-Signature-256` is verified
+    /// against (Track E / E3), or the shared token GitLab's
+    /// `X-Gitlab-Token` is compared to (Track E / E4). Mirrors
+    /// [`ForgeConfig::token_env`]'s own "name of an env var, not the value
+    /// itself" convention -- a secret never belongs in a checked-in
+    /// `.ralphus.toml`. `None` falls back to [`DEFAULT_WEBHOOK_SECRET_ENV`].
+    #[serde(default)]
+    pub secret_env: Option<String>,
+}
+
+impl WebhookConfig {
+    /// Layer `self` (global) under `over` (per-project). Per-project scalars
+    /// win when present, same semantics as [`ForgeConfig::merge`].
+    #[must_use]
+    pub fn merge(self, over: WebhookConfig) -> WebhookConfig {
+        WebhookConfig {
+            mode: over.mode.or(self.mode),
+            secret_env: over.secret_env.or(self.secret_env),
+        }
+    }
+
+    /// The validated mode: [`WebhookMode::Disabled`] when unset, or the
+    /// parsed value -- `Err` names the specific unrecognized string rather
+    /// than silently falling back, so a typo (`"shado"`) is loud rather than
+    /// indistinguishable from a deliberately-disabled project. Callers that
+    /// need a mode to act on (the receive route, `webhook install`/`status`)
+    /// should surface this error directly rather than defaulting past it.
+    pub fn mode(&self) -> std::result::Result<WebhookMode, String> {
+        match &self.mode {
+            None => Ok(WebhookMode::Disabled),
+            Some(s) => s.parse(),
+        }
+    }
+
+    /// The effective secret env var name: the configured value, or
+    /// [`DEFAULT_WEBHOOK_SECRET_ENV`] when unset.
+    #[must_use]
+    pub fn resolved_secret_env(&self) -> &str {
+        self.secret_env
+            .as_deref()
+            .unwrap_or(DEFAULT_WEBHOOK_SECRET_ENV)
+    }
+}
+
+/// Parse a `WebhookConfig` from the given TOML text; the default (unset
+/// mode, unset secret env) when the `[webhook]` table is absent.
+#[must_use]
+pub fn webhook_from_toml_str(s: &str) -> WebhookConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .webhook
+        .unwrap_or_default()
+}
+
+fn load_webhook_file(path: &Path) -> WebhookConfig {
+    std::fs::read_to_string(path)
+        .map(|s| webhook_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
+/// Resolve the effective webhook config for a project rooted at `cwd`: the
+/// global config layered under the nearest per-project `.ralphus.toml`
+/// (per-project scalars win), same layering as [`resolve_forge`].
+#[must_use]
+pub fn resolve_webhook(cwd: &Path) -> WebhookConfig {
+    let global = global_config_path()
+        .map(|p| load_webhook_file(&p))
+        .unwrap_or_default();
+    let project = find_project_config(cwd)
+        .map(|p| load_webhook_file(&p))
+        .unwrap_or_default();
+    global.merge(project)
+}
+
 /// Provider-specific PR/MR submission defaults (`[github]`/`[gitlab]` tables,
 /// RAL-196). Each provider's table holds the same knobs, so both parse into
 /// this one struct — the fields on [`ConfigFile`] choose the table. Today
@@ -2021,6 +2174,8 @@ struct ConfigFile {
     thrash: Option<ThrashConfig>,
     #[serde(default)]
     forge: Option<ForgeConfig>,
+    #[serde(default)]
+    webhook: Option<WebhookConfig>,
     /// `[github]` provider-specific defaults table (RAL-196), see
     /// [`ForgeProviderConfig`].
     #[serde(default)]
@@ -2875,6 +3030,92 @@ mod tests {
         let c = health_sweep_from_toml_str("[health]\npoll_interval_secs = 1\n");
         assert_eq!(c.poll_interval(), Duration::from_secs(3600));
     }
+
+    // ── webhook config (Track E / E1) ───────────────────────────────────────
+
+    #[test]
+    fn webhook_config_unset_resolves_to_disabled_mode_and_default_secret_env() {
+        let c = WebhookConfig::default();
+        assert_eq!(c.mode().unwrap(), WebhookMode::Disabled);
+        assert_eq!(c.resolved_secret_env(), "RALPHUS_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn webhook_config_absent_table_is_default() {
+        assert_eq!(
+            webhook_from_toml_str("[review]\nskip_worktrees = true\n"),
+            WebhookConfig::default()
+        );
+    }
+
+    #[test]
+    fn parse_webhook_config_overrides() {
+        let c = webhook_from_toml_str(
+            "[webhook]\nmode = \"shadow\"\nsecret_env = \"MY_WEBHOOK_SECRET\"\n",
+        );
+        assert_eq!(c.mode().unwrap(), WebhookMode::Shadow);
+        assert_eq!(c.resolved_secret_env(), "MY_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn webhook_mode_parses_every_documented_value() {
+        assert_eq!(
+            "disabled".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Disabled
+        );
+        assert_eq!(
+            "shadow".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Shadow
+        );
+        assert_eq!(
+            "active".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Active
+        );
+    }
+
+    #[test]
+    fn webhook_mode_rejects_an_unrecognized_value_loudly() {
+        // Track E / E1: unlike every other malformed field in this file, an
+        // invalid mode must not silently resolve to Disabled -- it must
+        // surface as its own explicit error.
+        let c = webhook_from_toml_str("[webhook]\nmode = \"shado\"\n");
+        let err = c.mode().unwrap_err();
+        assert!(err.contains("shado"), "{err}");
+        assert!(err.contains("disabled"), "{err}");
+        assert!(err.contains("shadow"), "{err}");
+        assert!(err.contains("active"), "{err}");
+    }
+
+    #[test]
+    fn webhook_mode_as_str_round_trips_through_from_str() {
+        for mode in [
+            WebhookMode::Disabled,
+            WebhookMode::Shadow,
+            WebhookMode::Active,
+        ] {
+            assert_eq!(mode.as_str().parse::<WebhookMode>().unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn webhook_config_merge_prefers_project_scalars_over_global() {
+        let global =
+            webhook_from_toml_str("[webhook]\nmode = \"shadow\"\nsecret_env = \"GLOBAL\"\n");
+        let project = webhook_from_toml_str("[webhook]\nsecret_env = \"PROJECT\"\n");
+        let merged = global.merge(project);
+        // Project left `mode` unset -- global's value survives.
+        assert_eq!(merged.mode().unwrap(), WebhookMode::Shadow);
+        // Project set `secret_env` -- it wins over global's.
+        assert_eq!(merged.resolved_secret_env(), "PROJECT");
+    }
+
+    // `resolve_webhook` itself (the env-var/filesystem-dependent wrapper
+    // around `merge`) is deliberately not separately tested here -- no
+    // `resolve_*` function in this file is, since `unsafe_code = "forbid"`
+    // (workspace-wide) rules out the `std::env::set_var` an isolated test
+    // would need to point it at a fixture directory. `merge` above is the
+    // pure, directly-testable half; `resolve_webhook` is `resolve_forge`'s
+    // same thin "read two files, merge" wrapper, trusted the same way.
 
     // ── merge check throttle ────────────────────────────────────────────────
 
