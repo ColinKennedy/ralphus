@@ -276,6 +276,101 @@ impl Store {
     }
 }
 
+/// Aggregated shadow-mode delivery history for one project (Track F, F3) --
+/// see `Store::webhook_shadow_scorecard`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowScorecard {
+    pub total_deliveries: i64,
+    /// Deliveries that resolved to a real PR the poll had never checked as
+    /// of arrival (`pr_id` present, `poll_last_checked_at_ms` was `None`)
+    /// -- the poll would have missed this entirely without the webhook.
+    /// Deliberately excludes [`Self::spurious_count`]'s rows: a delivery
+    /// with no resolved PR trivially has no poll data either, but that's a
+    /// different failure mode ("this delivery wasn't about anything ralphus
+    /// tracks") from "the poll hadn't caught up yet", and conflating them
+    /// would double-count every spurious delivery as also missed.
+    pub missed_count: i64,
+    /// Deliveries that verified but resolved to no PR at all (an event
+    /// type `extract_pr_hint`, E5, doesn't parse a PR/MR from, or a PR
+    /// ralphus never submitted).
+    pub spurious_count: i64,
+    /// Mean `poll_lag_ms` across deliveries where it was computed (i.e.
+    /// excluding `missed_count`'s rows, which have no lag to average).
+    /// `None` when there is nothing to average.
+    pub avg_lag_ms: Option<f64>,
+    pub max_lag_ms: Option<i64>,
+    /// Deliveries for a PR whose `arrived_at_ms` is earlier than an
+    /// already-recorded delivery for the *same* PR -- a sign either forge
+    /// delivered its events out of send order, or two concurrent
+    /// connections raced. Computed by walking recorded rows in insertion
+    /// order per PR, not by comparing forge-side event sequence numbers
+    /// (neither forge's webhook payload carries one this daemon parses).
+    pub out_of_order_count: i64,
+}
+
+impl Store {
+    /// Aggregate a project's `webhook_shadow_deliveries` history into a
+    /// scorecard (Track F, F3) -- the actual "should this project's
+    /// `[webhook]` mode graduate from `\"shadow\"` to `\"active\"`?"
+    /// evidence F1/F2 exist to build.
+    pub fn webhook_shadow_scorecard(&self, project_name: &str) -> Result<ShadowScorecard> {
+        let (total_deliveries, missed_count, spurious_count, avg_lag_ms, max_lag_ms) = self
+            .conn
+            .query_row(
+                "SELECT
+                     COUNT(*),
+                     SUM(CASE WHEN pr_id IS NOT NULL AND poll_last_checked_at_ms IS NULL THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN pr_id IS NULL THEN 1 ELSE 0 END),
+                     AVG(poll_lag_ms),
+                     MAX(poll_lag_ms)
+                 FROM webhook_shadow_deliveries WHERE project_name=?1",
+                rusqlite::params![project_name],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        r.get::<_, Option<f64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?;
+
+        // Out-of-order detection needs per-PR ordering, which the
+        // aggregate query above can't express -- walked separately here
+        // rather than forced into one SQL statement.
+        let mut stmt = self.conn.prepare(
+            "SELECT pr_id, arrived_at_ms FROM webhook_shadow_deliveries
+             WHERE project_name=?1 AND pr_id IS NOT NULL ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![project_name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut last_seen: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        let mut out_of_order_count = 0i64;
+        for (pr_id, arrived_at_ms) in rows {
+            if let Some(&previous) = last_seen.get(&pr_id) {
+                if arrived_at_ms < previous {
+                    out_of_order_count += 1;
+                }
+            }
+            last_seen.insert(pr_id, arrived_at_ms);
+        }
+
+        Ok(ShadowScorecard {
+            total_deliveries,
+            missed_count,
+            spurious_count,
+            avg_lag_ms,
+            max_lag_ms,
+            out_of_order_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +648,125 @@ mod tests {
         // positive and consistent with arrived_at_ms - 1_000.
         assert!(lag > 0);
         assert_eq!(lag, record.arrived_at_ms - 1_000);
+    }
+
+    // ── Track F, F3: shadow-mode scorecard ───────────────────────────────
+
+    #[test]
+    fn scorecard_of_an_empty_project_is_all_zero() {
+        let s = Store::open_in_memory().unwrap();
+        let card = s.webhook_shadow_scorecard("proj").unwrap();
+        assert_eq!(card.total_deliveries, 0);
+        assert_eq!(card.missed_count, 0);
+        assert_eq!(card.spurious_count, 0);
+        assert_eq!(card.avg_lag_ms, None);
+        assert_eq!(card.max_lag_ms, None);
+        assert_eq!(card.out_of_order_count, 0);
+    }
+
+    #[test]
+    fn scorecard_counts_missed_and_spurious_deliveries() {
+        let s = Store::open_in_memory().unwrap();
+        // Missed: a resolved PR the poll never checked.
+        s.record_webhook_shadow_delivery("github", Some("d1"), "proj", Some("pr-1"))
+            .unwrap();
+        // Spurious: verified, but no PR resolved at all.
+        s.record_webhook_shadow_delivery("github", Some("d2"), "proj", None)
+            .unwrap();
+        let card = s.webhook_shadow_scorecard("proj").unwrap();
+        assert_eq!(card.total_deliveries, 2);
+        assert_eq!(card.missed_count, 1);
+        assert_eq!(card.spurious_count, 1);
+    }
+
+    #[test]
+    fn scorecard_only_counts_the_named_project() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d1"), "proj-a", None)
+            .unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d2"), "proj-b", None)
+            .unwrap();
+        assert_eq!(
+            s.webhook_shadow_scorecard("proj-a")
+                .unwrap()
+                .total_deliveries,
+            1
+        );
+        assert_eq!(
+            s.webhook_shadow_scorecard("proj-b")
+                .unwrap()
+                .total_deliveries,
+            1
+        );
+    }
+
+    #[test]
+    fn scorecard_averages_lag_across_deliveries_that_have_one() {
+        let s = Store::open_in_memory().unwrap();
+        let gid = s.create_guardian("demo", "main", "/repo").unwrap();
+        let pr_id = s
+            .create_pull_request(
+                &gid,
+                None,
+                "github",
+                "acme/widget",
+                "review/demo",
+                "main",
+                "Demo",
+                "",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO guardian_pr_forge_cache(pr_id, last_checked_at_ms) VALUES(?1, ?2)",
+                rusqlite::params![pr_id, 100_i64],
+            )
+            .unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d1"), "proj", Some(&pr_id))
+            .unwrap();
+        // A missed delivery has no lag and must not pull the average down
+        // to zero -- AVG() over the lag column should skip its NULL.
+        s.record_webhook_shadow_delivery("github", Some("d2"), "proj", Some("pr-never-checked"))
+            .unwrap();
+        let card = s.webhook_shadow_scorecard("proj").unwrap();
+        assert_eq!(card.total_deliveries, 2);
+        assert_eq!(card.missed_count, 1);
+        assert!(card.avg_lag_ms.expect("one delivery has a lag") > 0.0);
+    }
+
+    #[test]
+    fn scorecard_detects_an_out_of_order_arrival_for_the_same_pr() {
+        let s = Store::open_in_memory().unwrap();
+        // Two deliveries for the same PR, inserted in order, but the
+        // second's arrived_at_ms is BEFORE the first's -- simulated
+        // directly via SQL, since real arrived_at_ms is wall-clock time
+        // and can't be controlled from the public recording API.
+        s.conn
+            .execute(
+                "INSERT INTO webhook_shadow_deliveries(provider, delivery_id, project_name, pr_id, arrived_at_ms) VALUES('github','d1','proj','pr-1',2000)",
+                [],
+            )
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO webhook_shadow_deliveries(provider, delivery_id, project_name, pr_id, arrived_at_ms) VALUES('github','d2','proj','pr-1',1000)",
+                [],
+            )
+            .unwrap();
+        let card = s.webhook_shadow_scorecard("proj").unwrap();
+        assert_eq!(card.out_of_order_count, 1);
+    }
+
+    #[test]
+    fn scorecard_does_not_flag_in_order_arrivals_across_different_prs() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d1"), "proj", Some("pr-1"))
+            .unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d2"), "proj", Some("pr-2"))
+            .unwrap();
+        let card = s.webhook_shadow_scorecard("proj").unwrap();
+        assert_eq!(card.out_of_order_count, 0);
     }
 }

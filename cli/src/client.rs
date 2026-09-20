@@ -602,6 +602,13 @@ impl DaemonClient {
         self.post(&format!("/api/projects/{project}/webhook/check"), None)
     }
 
+    /// `GET /api/projects/{name}/webhook/shadow-scorecard` (Track F, F3):
+    /// aggregates the project's shadow-mode delivery history into a
+    /// scorecard.
+    pub fn project_webhook_shadow_scorecard(&self, project: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{project}/webhook/shadow-scorecard"))
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see

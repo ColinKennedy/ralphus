@@ -1098,6 +1098,13 @@ fn route_for_user(
         ("POST", ["api", "projects", name, "webhook", "check"]) => {
             admin_gated(daemon, user_header, || project_webhook_check(daemon, name))
         }
+        // Track F, F3: aggregate the project's shadow-mode delivery history
+        // (F1/F2) into a scorecard. Read-only, not admin-gated (matches
+        // `GET .../webhook/status` above) -- no forge call, purely a local
+        // Store aggregate.
+        ("GET", ["api", "projects", name, "webhook", "shadow-scorecard"]) => {
+            project_webhook_shadow_scorecard(daemon, name)
+        }
         // RAL-338: fork registration. Reads open to every caller (matches the
         // `projects` pattern above). `GET /api/project-forks` is the
         // unscoped list across every project. A trailing user segment
@@ -5791,6 +5798,56 @@ fn project_webhook_check(daemon: &Daemon, name: &str) -> Reply {
     match client.test_webhook(&record.hook_id) {
         Ok(result) => json(200, &WebhookCheckResponse::from(result)),
         Err(e) => error(502, "forge_call_failed", &String::from(e), vec![]),
+    }
+}
+
+#[derive(Serialize)]
+struct ShadowScorecardResponse {
+    total_deliveries: i64,
+    missed_count: i64,
+    spurious_count: i64,
+    avg_lag_ms: Option<f64>,
+    max_lag_ms: Option<i64>,
+    out_of_order_count: i64,
+}
+
+impl From<crate::webhook::ShadowScorecard> for ShadowScorecardResponse {
+    fn from(c: crate::webhook::ShadowScorecard) -> Self {
+        Self {
+            total_deliveries: c.total_deliveries,
+            missed_count: c.missed_count,
+            spurious_count: c.spurious_count,
+            avg_lag_ms: c.avg_lag_ms,
+            max_lag_ms: c.max_lag_ms,
+            out_of_order_count: c.out_of_order_count,
+        }
+    }
+}
+
+/// `GET /api/projects/{name}/webhook/shadow-scorecard` (Track F, F3):
+/// aggregates the project's `webhook_shadow_deliveries` history (F1/F2)
+/// into a scorecard -- the evidence for whether a project's `[webhook]`
+/// mode is ready to graduate from `"shadow"` to `"active"`. Read-only, no
+/// forge call (unlike every other route under `.../webhook/`), so it isn't
+/// admin-gated. `404 not_found` for an unregistered project name; an
+/// all-zero scorecard for a registered project with no shadow-mode history
+/// yet (never in `"shadow"` mode, or no deliveries received since).
+fn project_webhook_shadow_scorecard(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_project(name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("project \"{name}\" is not registered"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    match daemon.lock().webhook_shadow_scorecard(name) {
+        Ok(card) => json(200, &ShadowScorecardResponse::from(card)),
+        Err(e) => store_error(&e),
     }
 }
 
@@ -27935,5 +27992,78 @@ command=\"cargo test\"
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["fired"], true);
         handle.join().unwrap();
+    }
+
+    // ── Track F, F3: shadow-mode scorecard route ─────────────────────────
+
+    #[test]
+    fn project_webhook_shadow_scorecard_route_unregistered_project_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "GET",
+            "/api/projects/does-not-exist/webhook/shadow-scorecard",
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn project_webhook_shadow_scorecard_route_is_all_zero_with_no_history() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-scorecard-empty");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-scorecard-proj-1", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "GET",
+            "/api/projects/webhook-scorecard-proj-1/webhook/shadow-scorecard",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["total_deliveries"], 0);
+        assert_eq!(v["missed_count"], 0);
+        assert_eq!(v["spurious_count"], 0);
+        assert!(v["avg_lag_ms"].is_null());
+    }
+
+    #[test]
+    fn project_webhook_shadow_scorecard_route_reflects_recorded_deliveries() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-scorecard-with-history");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-scorecard-proj-2", &repo.to_string_lossy(), ""),
+        );
+        d.lock()
+            .record_webhook_shadow_delivery("github", Some("d1"), "webhook-scorecard-proj-2", None)
+            .unwrap();
+        d.lock()
+            .record_webhook_shadow_delivery(
+                "github",
+                Some("d2"),
+                "webhook-scorecard-proj-2",
+                Some("pr-1"),
+            )
+            .unwrap();
+
+        let r = route(
+            &d,
+            "GET",
+            "/api/projects/webhook-scorecard-proj-2/webhook/shadow-scorecard",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["total_deliveries"], 2);
+        assert_eq!(v["spurious_count"], 1);
+        assert_eq!(v["missed_count"], 1);
     }
 }

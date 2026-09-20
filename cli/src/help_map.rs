@@ -1173,6 +1173,19 @@ installed for this project.",
         false,
         &[],
     ),
+    node(
+        "shadow-scorecard",
+        &["project [str]"],
+        &[],
+        "Show the project's shadow-mode webhook delivery scorecard: total deliveries, \
+missed-change count (a resolved PR the poll had never checked as of the delivery), spurious \
+deliveries (verified but resolved to no PR), average/max poll lag, and out-of-order arrivals -- \
+the evidence for whether [webhook] mode is ready to move from \"shadow\" to \"active\". \
+Read-only, no forge call.",
+        false,
+        true, // ("project", "webhook", "shadow-scorecard")
+        &[],
+    ),
 ];
 
 const PROJECT_CHILDREN: &[HelpNode] = &[

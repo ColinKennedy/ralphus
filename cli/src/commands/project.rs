@@ -66,6 +66,7 @@ pub enum ProjectWebhookCommand {
     Uninstall { project: String, hook_id: String },
     Update { project: String, daemon_url: String },
     Check { project: String },
+    ShadowScorecard { project: String },
     UsageError(String),
 }
 
@@ -191,6 +192,12 @@ fn parse_webhook(args: &[String]) -> ProjectWebhookCommand {
             Some(project) => ProjectWebhookCommand::Check { project },
             None => ProjectWebhookCommand::UsageError(
                 "project webhook check requires a <project> argument".to_string(),
+            ),
+        },
+        Some("shadow-scorecard") => match scanner.clone().remaining().into_iter().next() {
+            Some(project) => ProjectWebhookCommand::ShadowScorecard { project },
+            None => ProjectWebhookCommand::UsageError(
+                "project webhook shadow-scorecard requires a <project> argument".to_string(),
             ),
         },
         Some(other) => ProjectWebhookCommand::UsageError(format!(
@@ -633,6 +640,21 @@ fn dispatch_webhook(cmd: ProjectWebhookCommand, opts: &GlobalOpts) -> i32 {
                 1
             }
         },
+        ProjectWebhookCommand::ShadowScorecard { project } => {
+            match client.project_webhook_shadow_scorecard(&project) {
+                Ok(card) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&card).unwrap_or_default()
+                    );
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    2
+                }
+            }
+        }
     }
 }
 
@@ -1620,6 +1642,24 @@ mod tests {
     fn webhook_check_requires_a_project_argument() {
         assert!(matches!(
             parse(&v(&["webhook", "check"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_shadow_scorecard() {
+        match parse(&v(&["webhook", "shadow-scorecard", "proj"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::ShadowScorecard { project }) => {
+                assert_eq!(project, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_shadow_scorecard_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&["webhook", "shadow-scorecard"])),
             ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
         ));
     }

@@ -218,6 +218,7 @@ produced no pane output.
 | POST | `/api/projects/{name}/webhook/uninstall` | [Delete a webhook](#post-apiprojectsnamewebhookuninstall-track-e-e8) from the project's forge repo by id |
 | POST | `/api/projects/{name}/webhook/update` | [Rotate the secret/URL](#post-apiprojectsnamewebhookupdate-track-e-e9) on an already-installed webhook, keeping its id |
 | POST | `/api/projects/{name}/webhook/check` | [Fire a reachability test](#post-apiprojectsnamewebhookcheck-track-e-e11) against the installed webhook |
+| GET | `/api/projects/{name}/webhook/shadow-scorecard` | [Shadow-mode delivery scorecard](#get-apiprojectsnamewebhookshadow-scorecard-track-f-f3) -- missed/spurious counts, poll lag, out-of-order arrivals |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
@@ -4010,6 +4011,44 @@ in a way this response deliberately does not paper over:
 
 A GitLab call through this route also benefits from E10's blocked-url
 translation, same as `install`/`update`.
+
+### `GET /api/projects/{name}/webhook/shadow-scorecard` (Track F, F3)
+Aggregates the project's `webhook_shadow_deliveries` history (F1/F2) into a
+scorecard — the evidence for whether `[webhook]` mode is ready to graduate
+from `"shadow"` to `"active"`. Read-only, no forge call, not admin-gated
+(matches `GET .../webhook/status` above). `404 not_found` for an
+unregistered project name; an all-zero scorecard for a registered project
+with no shadow-mode history yet.
+
+```json
+{
+  "total_deliveries": 42,
+  "missed_count": 3,
+  "spurious_count": 5,
+  "avg_lag_ms": 812.4,
+  "max_lag_ms": 4500,
+  "out_of_order_count": 0
+}
+```
+
+- `missed_count` — deliveries that resolved to a real PR the poll had never
+  checked as of arrival. The poll would have missed this entirely without
+  the webhook. Deliberately excludes `spurious_count`'s rows: a delivery
+  with no resolved PR trivially has no poll data either, but that's a
+  different failure mode (not one the poll could ever have caught) from
+  "the poll hadn't caught up yet" — counting both under `missed_count` would
+  double-count every spurious delivery.
+- `spurious_count` — deliveries that verified but resolved to no PR at all
+  (an event type E5 doesn't parse a PR/MR from, or a PR ralphus never
+  submitted).
+- `avg_lag_ms`/`max_lag_ms` — mean/max `poll_lag_ms` across deliveries where
+  it was computed (i.e. excluding `missed_count`'s rows, which have no lag
+  to average). `null` when there's nothing to average.
+- `out_of_order_count` — deliveries for a PR whose arrival is earlier than
+  an already-recorded delivery for the *same* PR, walked in recording
+  order. Neither forge's webhook payload carries a sequence number this
+  daemon parses, so this is a proxy (arrival-order regression) rather than
+  a comparison against a true forge-side event sequence.
 
 ## Notes on future evolution
 
