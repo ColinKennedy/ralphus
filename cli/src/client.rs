@@ -74,14 +74,21 @@ impl DaemonClient {
         &self.base_url
     }
 
-    fn url(&self, path: &str) -> String {
+    /// `pub(crate)` (Track C / C2) so `sse::EventStream::connect` can build
+    /// the `/api/events?ticket=...` URL itself -- that request is a
+    /// long-lived streaming `GET` the shared `get`/`post`/... helpers below
+    /// can't serve (they read the whole body into one `String`), so it is
+    /// built and issued directly in `sse.rs` rather than through them.
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
     /// Attach `Authorization: Bearer <token>` when a token is available, so
     /// the daemon's RAL-219 auth gate doesn't reject every request. Mirrors
     /// `librarian/src/server.rs::daemon_token()`/`proxy()`.
-    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+    /// `pub(crate)` (Track C / C2) -- see [`Self::url`]'s doc for why
+    /// `sse::EventStream::connect` needs this directly.
+    pub(crate) fn authorize(&self, req: ureq::Request) -> ureq::Request {
         match daemon_token() {
             Some(token) => req.set("Authorization", &format!("Bearer {token}")),
             None => req,
@@ -98,7 +105,10 @@ impl DaemonClient {
         self.finish(path, req.call())
     }
 
-    fn post(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
+    /// `pub(crate)` (Track C / C2) so `sse::EventStream::connect` can mint
+    /// its `/api/events` ticket via `POST /api/events/ticket` through the
+    /// same tested path every other daemon write uses.
+    pub(crate) fn post(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
         let req = self.authorize(
             ureq::post(&self.url(path))
                 .timeout(self.timeout)
