@@ -3758,5 +3758,3 @@ polling this endpoint sees them no matter which mode it's operating in.
   attribution are still **not** in this draft; when multi-user hardening
   begins, a `submitted_by` field on squads (keyed off something richer than one
   shared token) is the expected addition (see `FOLLOW.local.md` #3).
-- Live updates are poll-based for now (librarian polls `GET /api/tasks`); an SSE
-  or WebSocket channel is a later optimization.
