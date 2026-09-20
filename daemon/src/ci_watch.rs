@@ -283,7 +283,15 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
             );
             return;
         }
-        match client.check_pr_ci_status(number) {
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked -- this loop's
+        // own fast-then-backoff escalation (5s -> 20s -> 60s) governs when it
+        // retries either way.
+        if crate::pr::is_backed_off(&client) {
+            std::thread::sleep(next_poll_delay(elapsed));
+            continue;
+        }
+        match client.check_pr_ci_status_ex(number) {
             Ok(PrCiState::Passing) => {
                 if elapsed < SUCCESS_SETTLE_DURATION {
                     log_ci_watch(
@@ -349,6 +357,12 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     .set_pr_ci_status(&pr.id, PrCiState::Pending.as_str(), None);
             }
             Err(e) => {
+                // Track A / A6: hold off the *next* iteration's call for
+                // this client on a rate limit, instead of retrying on the
+                // very next poll tick as if nothing happened.
+                if e.is_rate_limited() {
+                    crate::pr::start_backoff(&client, e.retry_after);
+                }
                 log_ci_watch(
                     store,
                     guardian_id,
@@ -358,7 +372,7 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                         "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
                          poll error (will retry): {e}"
                     ),
-                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
+                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e.to_string()}),
                 );
             }
         }
@@ -638,9 +652,19 @@ pub fn poll_open_pr_ci_status(
     let mut polled: Vec<(PullRequestView, PrCiState)> = Vec::with_capacity(open.len());
     for pr in open {
         let number = pr.pr_number.expect("filtered above");
-        let probe = match client.check_pr_ci_status_probe(number) {
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked -- the
+        // remaining PRs in this guardian still get their turn, matching this
+        // loop's existing fail-safe-per-PR shape.
+        if crate::pr::is_backed_off(&client) {
+            continue;
+        }
+        let probe = match client.check_pr_ci_status_probe_ex(number) {
             Ok(p) => p,
             Err(e) => {
+                if e.is_rate_limited() {
+                    crate::pr::start_backoff(&client, e.retry_after);
+                }
                 log_ci_watch(
                     store,
                     guardian_id,
@@ -649,7 +673,7 @@ pub fn poll_open_pr_ci_status(
                     format!(
                         "ralphus [ci-watch] review {guardian_id} pr #{number} standing poll error (will retry next pass): {e}"
                     ),
-                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e}),
+                    serde_json::json!({"pr_number": number, "outcome": "poll_error", "error": e.to_string()}),
                 );
                 continue;
             }

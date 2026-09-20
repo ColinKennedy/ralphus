@@ -2651,6 +2651,14 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
         match routing.client_for(&pr.repo) {
             Some(client) if client.kind().as_str() == pr.forge => {
+                // Track A / A6: a client already cooling down from a prior
+                // rate-limit response is skipped rather than re-asked --
+                // this is the hottest poller in the daemon (every open PR,
+                // every throttle interval), so it is also the one most able
+                // to push a rate limit past exhaustion if it never backs off.
+                if is_backed_off(client) {
+                    continue;
+                }
                 let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
                 jobs.push(MergeCheckJob {
                     pr,
@@ -2689,29 +2697,27 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let fetched: Vec<
         Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
     > = std::thread::scope(|scope| {
-            let handles: Vec<_> = jobs
-                .iter()
-                .map(|job| {
-                    scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client, job.etag.as_deref()))
+        let handles: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client, job.etag.as_deref()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Some(Err(crate::forge::ForgeError::other(
+                        "forge merge check panicked",
+                    )))
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| {
-                            Some(Err(crate::forge::ForgeError::other(
-                                "forge merge check panicked",
-                            )))
-                        })
-                })
-                .collect()
-        });
+            })
+            .collect()
+    });
 
     let mut freshly_merged = Vec::new();
     for (job, result) in jobs.iter().zip(fetched) {
-        apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
+        apply_pr_merge_state(store, id, job.pr, &job.client, result, &mut freshly_merged);
     }
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
@@ -2987,7 +2993,7 @@ fn apply_pr_merge_check(
     for pr in prs.iter().filter(|p| p.state == "open") {
         let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
         let fetched = fetch_pr_merge_state(pr, client, etag.as_deref());
-        apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
+        apply_pr_merge_state(store, id, pr, client, fetched, &mut freshly_merged);
     }
 
     settle_pr_merge_states(store, id, &freshly_merged)
@@ -3014,6 +3020,7 @@ fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
+    client: &crate::forge::ForgeClient,
     fetched: Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
@@ -3027,6 +3034,12 @@ fn apply_pr_merge_state(
         Ok(crate::forge::PrStatePoll::NotModified) => return,
         Ok(crate::forge::PrStatePoll::Modified { state, etag }) => (state, etag),
         Err(error) => {
+            // Track A / A6: a rate limit here must hold off the *next*
+            // pass's job for this client, not just get logged and retried
+            // on the very next throttle interval as if nothing happened.
+            if error.is_rate_limited() {
+                start_backoff(client, error.retry_after);
+            }
             log_pr_merge_check_failure(store, id, pr, &error.to_string());
             return;
         }
@@ -3599,7 +3612,23 @@ pub fn detect_forge_reorder(
                 pr.forge, pr.repo
             ));
         };
-        let state = client.get_pull_request_base_state(num)?;
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked.
+        if is_backed_off(client) {
+            return Err(format!(
+                "forge rate-limited; backing off ({}/{})",
+                pr.forge, pr.repo
+            ));
+        }
+        let state = match client.get_pull_request_base_state_ex(num) {
+            Ok(state) => state,
+            Err(e) => {
+                if e.is_rate_limited() {
+                    start_backoff(client, e.retry_after);
+                }
+                return Err(e.to_string());
+            }
+        };
         live_state.insert((*branch_id).to_string(), state);
     }
     let Some((forge_base, base_changed_at_ms, order)) =
@@ -4061,8 +4090,19 @@ pub fn poll_pr_base_drift(
         let Some(client) = routing.client_for(&pr.repo) else {
             continue;
         };
-        let Ok(forge_base) = client.get_pull_request_base(number) else {
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked.
+        if is_backed_off(client) {
             continue;
+        }
+        let forge_base = match client.get_pull_request_base_ex(number) {
+            Ok(base) => base,
+            Err(e) => {
+                if e.is_rate_limited() {
+                    start_backoff(client, e.retry_after);
+                }
+                continue;
+            }
         };
         match classify_base_drift(
             &pr.base_ref,
@@ -4145,17 +4185,20 @@ const DEFAULT_RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::fro
 /// -- shared across every guardian's poll pass in this process, so a
 /// 429/403 observed while polling one guardian's PRs also holds off comment
 /// fetches for another guardian on the same repo within the same cycle,
-/// rather than each rediscovering the rate limit independently.
+/// rather than each rediscovering the rate limit independently. Also shared
+/// with `ci_watch.rs` (Track A / A6) -- one backoff table per forge client,
+/// regardless of which poller tripped it or which poller checks it next.
 static PR_CACHE_BACKOFF: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn forge_client_backoff_key(client: &crate::forge::ForgeClient) -> String {
+pub(crate) fn forge_client_backoff_key(client: &crate::forge::ForgeClient) -> String {
     format!("{}:{}", client.kind().as_str(), client.repo_label())
 }
 
 /// Whether `client` is still cooling down from a prior rate-limit response
-/// this process has already seen.
-fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
+/// this process has already seen. `pub(crate)` (Track A / A6): every forge
+/// poller in the daemon consults this, not only the ones in this module.
+pub(crate) fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
     let key = forge_client_backoff_key(client);
     PR_CACHE_BACKOFF
         .lock()
@@ -4166,7 +4209,11 @@ fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
 
 /// Start (or extend) a rate-limit backoff window for `client`, honoring the
 /// forge's own `Retry-After` when it sent one instead of guessing.
-fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::time::Duration>) {
+/// `pub(crate)` (Track A / A6): see [`is_backed_off`].
+pub(crate) fn start_backoff(
+    client: &crate::forge::ForgeClient,
+    retry_after: Option<std::time::Duration>,
+) {
     let key = forge_client_backoff_key(client);
     let resume_at = std::time::Instant::now() + retry_after.unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF);
     PR_CACHE_BACKOFF
@@ -10276,6 +10323,106 @@ mod tests {
         assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
     }
 
+    /// A real, minimal git repo + registered project + guardian with one
+    /// open, forge-numbered PR -- `detect_forge_reorder`/`poll_pr_base_drift`
+    /// need to resolve an actual `ForgeClient` to exercise their Track A / A6
+    /// backoff check, unlike their `"/repo"`-fixture tests above, which rely
+    /// on that resolution failing before any client is ever built.
+    fn guardian_with_resolvable_client_and_one_open_pr(
+        store: &crate::store_lock::StoreHandle,
+        tag: &str,
+        repo_label: &str,
+    ) -> (String, String) {
+        let root_dir = tmp_dir(tag);
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{repo_label}.git"),
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            "[forge]\nkind = \"github\"\napi_base = \"http://127.0.0.1:1\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n",
+        )
+        .unwrap();
+        store
+            .lock()
+            .register_project(tag, "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian(tag, "main", root_dir.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                repo_label,
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        (gid, pr_id)
+    }
+
+    #[test]
+    fn detect_forge_reorder_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, _pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-reorder",
+            "acme/widget-a6-reorder",
+        );
+        // Port 1 is never listening -- if the backoff check is skipped, this
+        // reaches a real connection attempt and fails with a *connection*
+        // error, not the "rate-limited" message asserted below.
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-reorder".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        let err = detect_forge_reorder(&store, &gid).unwrap_err();
+        assert!(err.contains("rate-limited"), "{err}");
+    }
+
+    #[test]
+    fn poll_pr_base_drift_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, _pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-drift",
+            "acme/widget-a6-drift",
+        );
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-drift".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        // Fail-safe-per-PR, like the rest of this poller: a backed-off
+        // client is skipped (0 pulled), not an error.
+        assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
+    }
+
     #[test]
     fn auto_fix_retry_gate_resets_on_a_new_push_even_with_no_intervening_non_failing_status() {
         // Regression test for guardian-000000000119 / GitHub PR #235: the
@@ -11182,6 +11329,33 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&gid),
             "a terminal review's throttle entry must not accumulate"
+        );
+    }
+
+    #[test]
+    fn check_pr_merges_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-merge",
+            "acme/widget-a6-merge",
+        );
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-merge".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        // A skipped job changes nothing, so this reads as "no merges
+        // observed" rather than an error -- matching the rest of this
+        // function's fail-safe-per-PR shape.
+        assert!(!check_pr_merges(&store, &gid));
+        assert_eq!(
+            store.lock().get_pull_request(&pr_id).unwrap().state,
+            "open",
+            "a skipped job must not touch the pr row"
         );
     }
 
