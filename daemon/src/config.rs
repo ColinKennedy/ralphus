@@ -996,6 +996,22 @@ pub struct DaemonConfig {
     /// from creating an exporter.
     #[serde(default)]
     pub opentelemetry: Option<bool>,
+    /// This daemon's own externally-reachable base URL -- what GitHub/GitLab
+    /// can actually reach it at (through NAT, a reverse proxy, a tunnel),
+    /// which is not derivable from the bind address `ralphus-daemon serve`
+    /// listens on. `None` (the default) means webhook auto-reconciliation
+    /// (`webhook_reconcile::spawn_webhook_reconciliation`) does nothing --
+    /// every project's `[webhook]` stays exactly as manually installed via
+    /// `ralphus project webhook install`/`update`, matching this field's
+    /// absence in every config written before it existed. Set once here
+    /// instead of re-passed as `--daemon-url` on every manual call: on
+    /// every daemon startup, this value is compared against each webhook-
+    /// enabled project's last-recorded `daemon_url`, and any mismatch is
+    /// repointed in place (never deleted and recreated, which would leave
+    /// the stale hook behind pointed at nothing -- neither forge cleans
+    /// that up promptly, see `webhook_reconcile`'s module doc).
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl DaemonConfig {
@@ -2304,6 +2320,7 @@ fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
         default_user_is_admin: over.default_user_is_admin.or(base.default_user_is_admin),
         max_concurrent: over.max_concurrent.or(base.max_concurrent),
         opentelemetry: over.opentelemetry.or(base.opentelemetry),
+        public_url: over.public_url.or(base.public_url),
     }
 }
 
@@ -3955,6 +3972,33 @@ mod tests {
     fn opentelemetry_defaults_to_enabled_and_can_be_disabled() {
         assert!(daemon_from_toml_str("").opentelemetry_enabled());
         assert!(!daemon_from_toml_str("[daemon]\nopentelemetry = false\n").opentelemetry_enabled());
+    }
+
+    #[test]
+    fn public_url_defaults_to_unset() {
+        assert_eq!(daemon_from_toml_str("").public_url, None);
+    }
+
+    #[test]
+    fn public_url_parses_from_the_daemon_table() {
+        let cfg = daemon_from_toml_str("[daemon]\npublic_url = \"https://ralphus.example.com\"\n");
+        assert_eq!(cfg.public_url.as_deref(), Some("https://ralphus.example.com"));
+    }
+
+    #[test]
+    fn public_url_project_local_wins_over_global_on_merge() {
+        let global = daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let project = daemon_from_toml_str("[daemon]\npublic_url = \"https://project.example.com\"\n");
+        let merged = merge_daemon_config(global, project);
+        assert_eq!(merged.public_url.as_deref(), Some("https://project.example.com"));
+    }
+
+    #[test]
+    fn public_url_unset_locally_falls_back_to_global_on_merge() {
+        let global = daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let project = daemon_from_toml_str("");
+        let merged = merge_daemon_config(global, project);
+        assert_eq!(merged.public_url.as_deref(), Some("https://global.example.com"));
     }
 
     #[test]
