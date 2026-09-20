@@ -145,5 +145,6 @@ fn exec_webhook(cmd: ProjectWebhookCommand, client: &DaemonClient) -> ExecResult
             project,
             daemon_url,
         } => Ok(client.update_project_webhook(&project, &daemon_url)?),
+        ProjectWebhookCommand::Check { project } => Ok(client.check_project_webhook(&project)?),
     }
 }

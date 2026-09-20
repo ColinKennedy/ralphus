@@ -399,6 +399,17 @@ pub struct ForgeWebhook {
     pub active: bool,
 }
 
+/// The outcome of firing a forge's webhook test/ping mechanism (Track E,
+/// E11). `fired` is whether the forge *accepted* the test-fire request --
+/// not proof this daemon actually received the resulting delivery; see
+/// [`ForgeClient::test_webhook`]'s doc comment for why that distinction
+/// can't be collapsed into one boolean uniformly across both forges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookTestResult {
+    pub fired: bool,
+    pub message: String,
+}
+
 /// A resolved connection to one forge repository: enough to create PRs, list
 /// comments, and fetch a PR template. Built by [`resolve_remote`].
 #[derive(Clone)]
@@ -2554,6 +2565,68 @@ impl ForgeClient {
                 self.delete_structured(ureq::delete(&url).set("PRIVATE-TOKEN", token))
             }
         }
+    }
+
+    /// Fire the forge's own webhook test/ping mechanism against an
+    /// installed hook (Track E, E11) -- a reachability check: does a real
+    /// delivery from the forge actually reach this daemon's receive route?
+    ///
+    /// The two forges' test endpoints are not equivalent, and this method
+    /// deliberately does not paper over that: GitHub's ping endpoint is
+    /// fire-and-forget (a bare `204` means the forge *accepted* the
+    /// request, not that this daemon received it -- GitHub reports the
+    /// actual delivery outcome only via its own "Recent Deliveries" UI, not
+    /// synchronously here). GitLab's test endpoint is closer to
+    /// synchronous: it attempts the delivery itself and returns a response
+    /// body describing the outcome, surfaced verbatim in
+    /// [`WebhookTestResult::message`] rather than parsed into a guessed
+    /// shape this code isn't confident is stable across GitLab versions.
+    pub fn test_webhook(&self, hook_id: &str) -> Result<WebhookTestResult, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!(
+                    "{}/repos/{}/hooks/{hook_id}/pings",
+                    self.api_base, self.repo_path
+                );
+                self.post_no_body_structured(
+                    ureq::post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(WebhookTestResult {
+                    fired: true,
+                    message: "ping sent -- GitHub does not report delivery success \
+                              synchronously; check the hook's \"Recent Deliveries\" page on \
+                              GitHub to confirm this daemon received it."
+                        .to_string(),
+                })
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}/test/merge_requests_events",
+                    self.api_base, self.repo_path
+                );
+                let message = self
+                    .post_no_body_structured(ureq::post(&url).set("PRIVATE-TOKEN", token))
+                    .map_err(translate_gitlab_url_blocked)?;
+                Ok(WebhookTestResult {
+                    fired: true,
+                    message,
+                })
+            }
+        }
+    }
+
+    /// `POST` with no request body, returning the response body as raw text
+    /// rather than parsed JSON (Track E, E11) -- both forges' webhook
+    /// test-fire endpoints return diagnostic text worth surfacing verbatim
+    /// (see [`Self::test_webhook`]'s doc comment) rather than a structured
+    /// shape this code would need to guess at.
+    fn post_no_body_structured(&self, req: ureq::Request) -> Result<String, ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        Ok(resp.into_string().unwrap_or_default())
     }
 
     /// Read GitHub's `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers off
@@ -6761,6 +6834,81 @@ mod tests {
             String::from(err).contains("instance admin"),
             "GitLab's blocked-url error should be translated into admin guidance"
         );
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E11: webhook reachability (test-fire) ──────────────────
+
+    #[test]
+    fn test_webhook_github_pings_the_right_url_and_reports_fired() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/42/pings");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client.test_webhook("42").unwrap();
+        assert!(result.fired);
+        assert!(result.message.contains("Recent Deliveries"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_webhook_gitlab_hits_the_right_trigger_url_and_surfaces_the_body() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(
+                req.url(),
+                "/projects/acme%2Fwidget/hooks/7/test/merge_requests_events"
+            );
+            req.respond(tiny_http::Response::from_string(r#"{"message":"ok"}"#))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client.test_webhook("7").unwrap();
+        assert!(result.fired);
+        assert_eq!(result.message, r#"{"message":"ok"}"#);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_webhook_gitlab_translates_a_blocked_url_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#,
+                )
+                .with_status_code(422),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client.test_webhook("7").unwrap_err();
+        assert!(String::from(err).contains("instance admin"));
         handle.join().unwrap();
     }
 }

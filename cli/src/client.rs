@@ -595,6 +595,13 @@ impl DaemonClient {
         )
     }
 
+    /// `POST /api/projects/{name}/webhook/check` (Track E, E11): fire the
+    /// forge's own webhook test/ping mechanism against the hook recorded
+    /// installed for the project -- a reachability check.
+    pub fn check_project_webhook(&self, project: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/projects/{project}/webhook/check"), None)
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see

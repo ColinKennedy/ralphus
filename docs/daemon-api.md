@@ -217,6 +217,7 @@ produced no pane output.
 | GET | `/api/projects/{name}/webhook/status` | [List webhooks](#get-apiprojectsnamewebhookstatus-track-e-e8) currently registered on the project's forge repo |
 | POST | `/api/projects/{name}/webhook/uninstall` | [Delete a webhook](#post-apiprojectsnamewebhookuninstall-track-e-e8) from the project's forge repo by id |
 | POST | `/api/projects/{name}/webhook/update` | [Rotate the secret/URL](#post-apiprojectsnamewebhookupdate-track-e-e9) on an already-installed webhook, keeping its id |
+| POST | `/api/projects/{name}/webhook/check` | [Fire a reachability test](#post-apiprojectsnamewebhookcheck-track-e-e11) against the installed webhook |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
@@ -3954,6 +3955,34 @@ the forge call succeeded. Never blocks or fails project removal — a forge
 outage, a revoked token, or the repo having moved only produces a warning
 log line, since a project must never end up stuck registered just because
 its webhook couldn't be cleanly torn down.
+
+### `POST /api/projects/{name}/webhook/check` (Track E, E11)
+Fires the forge's own webhook test/ping mechanism against the hook recorded
+installed for the project — a reachability check for whether a real
+delivery from the forge actually reaches this daemon's receive route.
+Admin-gated, same rationale as `install`/`update`/`uninstall` (a real
+outbound call to the forge). `404 not_found` if no webhook was ever recorded
+installed for this project (run `install` first) or the project name is
+unregistered.
+
+```json
+{ "fired": true, "message": "..." }
+```
+
+`fired` is whether the forge *accepted* the test-fire request — not proof
+this daemon received the resulting delivery, and the two forges differ here
+in a way this response deliberately does not paper over:
+
+- **GitHub**'s ping endpoint is fire-and-forget: a successful `fired: true`
+  only means GitHub queued the ping. `message` points at GitHub's own
+  "Recent Deliveries" page on the hook, which is the only place delivery
+  success is actually reported.
+- **GitLab**'s test endpoint attempts the delivery synchronously and
+  returns a body describing the outcome; `message` carries that body
+  verbatim rather than a parsed/guessed shape.
+
+A GitLab call through this route also benefits from E10's blocked-url
+translation, same as `install`/`update`.
 
 ## Notes on future evolution
 

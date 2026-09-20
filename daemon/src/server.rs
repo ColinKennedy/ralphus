@@ -1091,6 +1091,13 @@ fn route_for_user(
                 project_webhook_update(daemon, name, body)
             })
         }
+        // Track E, E11: fire the forge's own webhook test/ping mechanism
+        // against the recorded hook -- a reachability check. Admin-gated
+        // for the same reason as install/update/uninstall above (a real
+        // outbound call to the forge).
+        ("POST", ["api", "projects", name, "webhook", "check"]) => {
+            admin_gated(daemon, user_header, || project_webhook_check(daemon, name))
+        }
         // RAL-338: fork registration. Reads open to every caller (matches the
         // `projects` pattern above). `GET /api/project-forks` is the
         // unscoped list across every project. A trailing user segment
@@ -5714,6 +5721,68 @@ fn update_webhook_for_project(
         .update_webhook(hook_id, &callback_url, secret)
         .map_err(String::from)?;
     Ok((client.kind(), hook))
+}
+
+#[derive(Serialize)]
+struct WebhookCheckResponse {
+    fired: bool,
+    message: String,
+}
+
+impl From<crate::forge::WebhookTestResult> for WebhookCheckResponse {
+    fn from(r: crate::forge::WebhookTestResult) -> Self {
+        Self {
+            fired: r.fired,
+            message: r.message,
+        }
+    }
+}
+
+/// `POST /api/projects/{name}/webhook/check` (Track E, E11): fire the
+/// forge's own webhook test/ping mechanism against the hook this daemon
+/// recorded installing for the project -- a reachability check for whether
+/// a real delivery from the forge actually reaches this daemon's receive
+/// route. `404 not_found` if no webhook was ever recorded installed for
+/// this project (run `install` first). See
+/// [`crate::forge::ForgeClient::test_webhook`]'s doc comment for why
+/// `fired: true` in the response is not, by itself, proof of end-to-end
+/// reachability for every forge.
+fn project_webhook_check(daemon: &Daemon, name: &str) -> Reply {
+    let project = match daemon.lock().get_project(name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("project \"{name}\" is not registered"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let record = match daemon.lock().get_project_webhook(name) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                "no webhook is recorded as installed for this project -- run \
+                 POST .../webhook/install first",
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let root = std::path::Path::new(&project.path);
+    let forge_cfg = crate::config::resolve_forge(root);
+    let client = match crate::forge::resolve_remote(root, "", &forge_cfg) {
+        Ok(c) => c,
+        Err(e) => return error(400, "forge_resolve_failed", &e, vec![]),
+    };
+    match client.test_webhook(&record.hook_id) {
+        Ok(result) => json(200, &WebhookCheckResponse::from(result)),
+        Err(e) => error(502, "forge_call_failed", &String::from(e), vec![]),
+    }
 }
 
 #[derive(Serialize)]
@@ -27744,5 +27813,78 @@ command=\"cargo test\"
 
         let r = route(&d, "DELETE", "/api/projects/webhook-removal-proj-2", "");
         assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    // ── Track E, E11: webhook reachability check ─────────────────────────
+
+    #[test]
+    fn project_webhook_check_route_rejects_when_nothing_was_ever_installed() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-check-none");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-check-proj-1", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/webhook-check-proj-1/webhook/check",
+            "",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn project_webhook_check_route_unregistered_project_is_404() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/projects/does-not-exist/webhook/check", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn project_webhook_check_route_fires_a_github_ping_and_reports_success() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-check-github");
+        add_origin_remote(&repo);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/9/pings");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!("[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\n"),
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-check-proj-2", &repo.to_string_lossy(), ""),
+        );
+        d.lock()
+            .record_project_webhook(
+                "webhook-check-proj-2",
+                "github",
+                "9",
+                "https://ralphus.example.com",
+            )
+            .unwrap();
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/webhook-check-proj-2/webhook/check",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["fired"], true);
+        handle.join().unwrap();
     }
 }

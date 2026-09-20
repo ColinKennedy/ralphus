@@ -65,6 +65,7 @@ pub enum ProjectWebhookCommand {
     Status { project: String },
     Uninstall { project: String, hook_id: String },
     Update { project: String, daemon_url: String },
+    Check { project: String },
     UsageError(String),
 }
 
@@ -185,6 +186,12 @@ fn parse_webhook(args: &[String]) -> ProjectWebhookCommand {
         Some("update") => match parse_webhook_update(&mut scanner) {
             Ok(cmd) => cmd,
             Err(e) => ProjectWebhookCommand::UsageError(e.0),
+        },
+        Some("check") => match scanner.clone().remaining().into_iter().next() {
+            Some(project) => ProjectWebhookCommand::Check { project },
+            None => ProjectWebhookCommand::UsageError(
+                "project webhook check requires a <project> argument".to_string(),
+            ),
         },
         Some(other) => ProjectWebhookCommand::UsageError(format!(
             "unknown project webhook subcommand: {other}"
@@ -605,6 +612,19 @@ fn dispatch_webhook(cmd: ProjectWebhookCommand, opts: &GlobalOpts) -> i32 {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&hook).unwrap_or_default()
+                );
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectWebhookCommand::Check { project } => match client.check_project_webhook(&project) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
                 );
                 0
             }
@@ -1582,6 +1602,24 @@ mod tests {
                 "--daemon-url",
                 "https://new.example.com"
             ])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_check() {
+        match parse(&v(&["webhook", "check", "proj"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Check { project }) => {
+                assert_eq!(project, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_check_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&["webhook", "check"])),
             ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
         ));
     }

@@ -1159,6 +1159,20 @@ id. Fails with 404 if no webhook was ever recorded installed for this project --
         false,
         &[],
     ),
+    node(
+        "check",
+        &["project [str]"],
+        &[],
+        "Fire the forge's own webhook test/ping mechanism against the hook recorded installed \
+for the project -- a reachability check for whether a real delivery from the forge actually \
+reaches this daemon's receive route. GitHub's ping is fire-and-forget (check the hook's \
+\"Recent Deliveries\" page on GitHub to confirm receipt); GitLab's test endpoint reports its \
+outcome synchronously in the response. Fails with 404 if no webhook was ever recorded \
+installed for this project.",
+        false,
+        false,
+        &[],
+    ),
 ];
 
 const PROJECT_CHILDREN: &[HelpNode] = &[
