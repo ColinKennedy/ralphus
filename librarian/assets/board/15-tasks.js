@@ -733,13 +733,29 @@
       function ttAllStatus(on) { taskTabFilters.status = on ? new Set(STATES) : new Set(); renderTtStatusFilters(); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
       // RALPHUS-TT-FILTER-SELECTION-SCROLL:END
       /**
-       * Renders the toolbar's per-state checkboxes and syncs the filter input/checkboxes to `taskTabFilters` -- called on load and whenever filters are reset wholesale, never on every poll (which would fight the user's typing/checking).
+       * Builds the Tasks toolbar's Status dropdown config (RAL-475), from
+       * `STATES` and `taskTabFilters.status`.
+       * @returns {StatusDropdownConfig}
+       */
+      function ttStatusDropdownConfig() {
+        return {
+          id: "tasks",
+          label: "Status",
+          mode: "multi",
+          options: STATES.map((s) => ({ value: s, label: statusDropdownLabel(s), color: "--" + s })),
+          selected: taskTabFilters.status,
+          optionTip: (s) => `Show or hide ${s} tasks.`,
+          onToggle: ttToggleStatus,
+          onAll: () => ttAllStatus(true),
+          onNone: () => ttAllStatus(false),
+        };
+      }
+      /**
+       * Renders the toolbar's Status dropdown and syncs the filter input/checkboxes to `taskTabFilters` -- called on load and whenever filters are reset wholesale, never on every poll (which would fight the user's typing/checking).
        * @returns {void}
        */
       function renderTtStatusFilters() {
-        const el = byId("tt-status-filters");
-        el.innerHTML = STATES.map((s) => `<label data-tip="Show or hide ${s} tasks.">${sdot(s)}<input type="checkbox" ${taskTabFilters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="ttToggleStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
-          + `<span class="chip" onclick="ttAllStatus(true)" data-tip="Show tasks of every status.">all</span><span class="chip" onclick="ttAllStatus(false)" data-tip="Hide all tasks — clear the status filter entirely.">none</span>`;
+        renderStatusDropdown("tt-status-filters", ttStatusDropdownConfig());
         /** @type {HTMLInputElement} */ (byId("tt-filter")).value = taskTabFilters.q;
         /** @type {HTMLInputElement} */ (byId("tt-show-hidden")).checked = taskTabFilters.showHidden;
         /** @type {HTMLInputElement} */ (byId("tt-needs-me")).checked = taskTabFilters.needsMe;
