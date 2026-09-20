@@ -664,6 +664,47 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           : (PR_STATE_COLORS[p.state] || "--muted");
         return `var(${role})`;
       }
+      // RALPHUS-PR-VISIBLE-STATES:BEGIN
+      /**
+       * RAL-478: PR/MR states a review's branch link/card still shows once no
+       * longer open -- a PR closed without merging stays visible alongside a
+       * merged one, distinct from the flat "gone" behavior before this ticket
+       * (both were filtered out with `open`-only checks). Excludes `dropped`
+       * (RAL-302's soft-delete marker for a row that was never a real,
+       * currently-relevant PR).
+       * @type {Set<string>}
+       */
+      const BRANCH_PR_VISIBLE_STATES = new Set(["open", "merged", "closed"]);
+      /**
+       * Whether a branch's PR row still belongs on the review detail view
+       * (RAL-478): its state must be one a reviewer still cares about
+       * (`BRANCH_PR_VISIBLE_STATES`), and it must not have been superseded by
+       * a fresher replacement row (RAL-338's fork-promotion reconcile-first) --
+       * the replacement is the current one to show, not this one.
+       * @param {{state: string, superseded_by?: string|null}} p
+       * @returns {boolean}
+       */
+      function isVisibleBranchPr(p) {
+        return BRANCH_PR_VISIBLE_STATES.has(p.state) && !p.superseded_by;
+      }
+      /** Lower ranks first -- an open PR outranks a merged one, which outranks a closed one, when a branch has more than one visible row to pick a single link from. */
+      /** @type {{[state: string]: number}} */
+      const BRANCH_PR_STATE_RANK = { open: 0, merged: 1, closed: 2 };
+      /**
+       * Picks the single most relevant visible PR for a branch's compact link
+       * (RAL-478): prefers a still-open PR, falling back to merged then
+       * closed, so a stale closed/merged link never shadows a genuinely
+       * active one when a branch somehow carries more than one visible row.
+       * @param {PullRequestView[]} prs
+       * @returns {PullRequestView|null}
+       */
+      function pickBranchPr(prs) {
+        const visible = prs.filter(isVisibleBranchPr);
+        if (!visible.length) return null;
+        return visible.reduce((best, p) =>
+          (BRANCH_PR_STATE_RANK[p.state] ?? 99) < (BRANCH_PR_STATE_RANK[best.state] ?? 99) ? p : best);
+      }
+      // RALPHUS-PR-VISIBLE-STATES:END
       /**
        * Renders one existing PR's status row: forge/number/state, and a drift
        * banner (RAL-190) offering "pull PR commits" when the PR branch has
@@ -702,7 +743,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           </div>`;
       }
       /**
-       * Renders a compact clickable link to this branch's open PR/MR, if one
+       * Renders a compact clickable link to this branch's most relevant PR/MR
+       * (RAL-478: open, or -- once no longer open -- merged/closed), if one
        * exists, directly in the branch row (RAL-190) -- so a branch that
        * already has a PR stays one click away from GitHub/GitLab without
        * expanding its detail. `branchPrSection` below shows the fuller card
@@ -713,16 +755,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {string}
        */
       function branchPrLink(g, b) {
-        const pr = (pullRequests[g.id] || []).find((p) => p.branch_id === b.id && p.state === "open");
+        const pr = pickBranchPr((pullRequests[g.id] || []).filter((p) => p.branch_id === b.id));
         if (!pr || !pr.pr_url) return "";
         const color = prColorVar(pr);
-        const ciNote = pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
-        const canQueryForge = pr.pr_number != null;
+        const ciNote = pr.state === "open" && pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
+        const canQueryForge = pr.state === "open" && pr.pr_number != null;
         return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote} Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
       }
       /**
-       * Renders the PR status section for one stacked branch (RAL-190+):
-       * its existing open PR(s), if any. Submission itself is triggered once,
+       * Renders the PR status section for one stacked branch (RAL-190+): its
+       * existing PR(s), if any -- open, or (RAL-478) merged/closed once no
+       * longer open, so a PR abandoned without merging stays visible here
+       * instead of silently vanishing. Submission itself is triggered once,
        * for the whole stack, via `combinedPrSection`'s button -- not per
        * branch (a stray manual "submit PR" per branch made it too easy to
        * submit branches out of order and break the base chain).
@@ -732,7 +776,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        */
       function branchPrSection(g, b) {
         if (!b.worktree) return "";
-        const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id && p.state === "open");
+        const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id).filter(isVisibleBranchPr);
         if (!prs.length) return "";
         return `<div class="pr-section" style="margin-top:6px" onclick="event.stopPropagation()">${prs.map(prCard).join("")}</div>`;
       }

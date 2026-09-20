@@ -391,6 +391,7 @@
        * @property {string|null} [last_pushed_sha]
        * @property {string|null} [stack_id]
        * @property {string|null} [dropped_reason]
+       * @property {string|null} [superseded_by] - RAL-338: the id of the PR row that replaced this one (fork-promotion reconcile-first). Non-null means a fresher row is the current one to show, not this one.
        * @property {string|null} [ci_status] - RAL-395: "pending" | "passing" | "failing", from the last standing CI/CD poll. null if never polled.
        * @property {string|null} [ci_failure_job_url] - RAL-395: the failing job's forge URL, when `ci_status === "failing"` and the forge gave one.
        * @property {boolean|null} [draft] - RAL-353: whether the forge reports this PR/MR as a draft (WIP). null only for rows recorded before the column existed and never polled since; the board treats null as not-draft.
