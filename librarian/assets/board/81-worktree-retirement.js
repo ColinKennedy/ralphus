@@ -21,8 +21,8 @@
       const RETIREMENT_STATE_COLORS = { scheduled:"--pending", eligible:"--queued", claimed:"--ignored", failed:"--failed", deferred:"--waiting", opted_out:"--muted", retired:"--cancelled" };
       /** @type {WorktreeRetirementEntry[]} rows from the last poll */
       let retirementEntries = [];
-      /** @type {string[]} active state filter chips (empty = every state) */
-      let retirementStateFilters = [];
+      /** @type {Set<string>} visible states (RAL-475: all-selected-by-default, like every other view's status filter -- an empty set hides every row) */
+      let retirementStateFilters = new Set(RETIREMENT_STATES);
       /**
        * Polls `/api/worktree-retirements` for the Worktree retirement tab
        * and re-renders it. Same connection-dot/timestamp convention as
@@ -51,15 +51,41 @@
         return `<span class="dot" style="background:${cvar(color)}"></span> ${esc(s)}`;
       }
       /**
-       * Toggles one state filter chip on the Worktree retirement tab and re-renders.
+       * Toggles one state in/out of the Worktree retirement tab's visibility filter and re-renders.
        * @param {string} s
+       * @param {boolean} on
        * @returns {void}
        */
-      function toggleRetirementState(s) {
-        retirementStateFilters = retirementStateFilters.includes(s)
-          ? retirementStateFilters.filter((f) => f !== s)
-          : [...retirementStateFilters, s];
+      function toggleRetirementState(s, on) {
+        on ? retirementStateFilters.add(s) : retirementStateFilters.delete(s);
         renderWorktreeRetirementPage();
+      }
+      /**
+       * Shows or hides every retirement state at once (the Status dropdown's All/None actions).
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function retirementAllStates(on) {
+        retirementStateFilters = on ? new Set(RETIREMENT_STATES) : new Set();
+        renderWorktreeRetirementPage();
+      }
+      /**
+       * Builds the Worktree retirement tab's Status dropdown config (RAL-475), from
+       * `RETIREMENT_STATES` and `retirementStateFilters`.
+       * @returns {StatusDropdownConfig}
+       */
+      function retirementStatusDropdownConfig() {
+        return {
+          id: "retirement",
+          label: "Status",
+          mode: "multi",
+          options: RETIREMENT_STATES.map((s) => ({ value: s, label: statusDropdownLabel(s), color: Object.prototype.hasOwnProperty.call(RETIREMENT_STATE_COLORS, s) ? RETIREMENT_STATE_COLORS[s] : "--muted" })),
+          selected: retirementStateFilters,
+          optionTip: (s) => `Show or hide worktrees in the '${s}' state.`,
+          onToggle: toggleRetirementState,
+          onAll: () => retirementAllStates(true),
+          onNone: () => retirementAllStates(false),
+        };
       }
       /**
        * Renders the Worktree retirement tab: filter chips over
@@ -72,15 +98,9 @@
        */
       function renderWorktreeRetirementPage() {
         const rows = retirementEntries
-          .filter((e) => retirementStateFilters.length === 0 || retirementStateFilters.includes(e.state))
+          .filter((e) => retirementStateFilters.has(e.state))
           .slice()
           .sort((a, b) => a.eligible_at_ms - b.eligible_at_ms || a.path.localeCompare(b.path));
-        const chips = RETIREMENT_STATES.map((s) => {
-          const active = retirementStateFilters.includes(s);
-          return `<label data-tip="Filter the list to worktrees in the '${esc(s)}' state. Click again to include it in every-state view.">
-              <input type="checkbox" ${active ? "checked" : ""} onchange="toggleRetirementState('${esc(s)}')"> ${retirementStateBadge(s)}
-            </label>`;
-        }).join("");
         const rowsHtml = rows.length
           ? rows.map((e) => {
               const when = e.last_attempt_ms ?? e.eligible_at_ms;
@@ -112,13 +132,14 @@
                   <td>${detail}</td>
                 </tr>`;
             }).join("")
-          : `<tr><td colspan="4" class="empty">No review worktrees${retirementStateFilters.length ? " in the selected states" : ""}.</td></tr>`;
+          : `<tr><td colspan="4" class="empty">No review worktrees${retirementStateFilters.size !== RETIREMENT_STATES.length ? " in the selected states" : ""}.</td></tr>`;
         byId("worktree-retirement").innerHTML = `
-          <div class="status-filters row" id="retirement-state-filters">${chips}</div>
+          <div class="status-filters row" id="retirement-state-filters"></div>
           <table class="proj-table"><thead><tr>
             <th data-tip="The worktree's retirement state.">State</th>
             <th data-tip="The review the worktree belongs to.">Review</th>
             <th data-tip="The worktree path on disk (or the removed path, for retired rows).">Path</th>
             <th data-tip="scheduled/eligible: when the worktree becomes (or became) eligible. claimed: the claim holding it. failed: why the attempt failed. deferred: a machine provider's reason for trying again later. opted_out: why it is never retired automatically. retired: when it was removed.">Detail</th>
           </tr></thead><tbody>${rowsHtml}</tbody></table>`;
+        renderStatusDropdown("retirement-state-filters", retirementStatusDropdownConfig());
       }

@@ -542,14 +542,30 @@
 
       // ---------- filters ----------
       /**
-       * Renders the sidebar's per-state show/hide checkboxes.
+       * Builds the Squads sidebar's Status dropdown config (RAL-475), from
+       * `SQUAD_STATES` and `filters.status`.
+       * @returns {StatusDropdownConfig}
+       */
+      function squadStatusDropdownConfig() {
+        return {
+          id: "squads",
+          label: "Status",
+          mode: "multi",
+          options: SQUAD_STATES.map((s) => ({ value: s, label: statusDropdownLabel(s), color: "--" + s })),
+          selected: filters.status,
+          optionTip: (s) => `Show or hide ${s} squads.`,
+          onToggle: toggleStatus,
+          onAll: () => allStatus(true),
+          onNone: () => allStatus(false),
+        };
+      }
+      /**
+       * Renders the sidebar's Status dropdown and syncs the text filter input.
        * @returns {void}
        */
       function renderStatusFilters() {
-        const el = byId("status-filters");
         /** @type {HTMLInputElement} */ (byId("filter")).value = filters.q;
-        el.innerHTML = SQUAD_STATES.map((s) => `<label data-tip="Show or hide ${s} squads.">${sdot(s)}<input type="checkbox" ${filters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="toggleStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
-          + `<span class="chip" onclick="allStatus(true)" data-tip="Show squads of every status.">all</span><span class="chip" onclick="allStatus(false)" data-tip="Hide all squads — clear the status filter entirely.">none</span>`;
+        renderStatusDropdown("status-filters", squadStatusDropdownConfig());
         /** @type {HTMLInputElement} */ (byId("show-hidden-squads")).checked = filters.showHidden;
       }
       /**
@@ -670,14 +686,30 @@
       document.addEventListener("click", closeProjectFilterMenu);
       // RALPHUS-PROJECT-FILTER-MENU:END
       /**
-       * Renders the Reviews sidebar's guardian-status checkboxes and syncs its text filter input.
+       * Builds the Reviews sidebar's Status dropdown config (RAL-475), from
+       * `GUARDIAN_STATES` and `reviewFilters.status`.
+       * @returns {StatusDropdownConfig}
+       */
+      function reviewStatusDropdownConfig() {
+        return {
+          id: "reviews",
+          label: "Status",
+          mode: "multi",
+          options: GUARDIAN_STATES.map((s) => ({ value: s, label: statusDropdownLabel(s), color: Object.prototype.hasOwnProperty.call(G_COLORS, s) ? G_COLORS[s] : "--muted" })),
+          selected: reviewFilters.status,
+          optionTip: (s) => `Show or hide ${s} reviews.`,
+          onToggle: toggleReviewStatus,
+          onAll: () => allReviewStatus(true),
+          onNone: () => allReviewStatus(false),
+        };
+      }
+      /**
+       * Renders the Reviews sidebar's Status dropdown and syncs its text filter input.
        * @returns {void}
        */
       function renderReviewStatusFilters() {
-        const el = byId("review-status-filters");
         /** @type {HTMLInputElement} */ (byId("review-filter")).value = reviewFilters.q;
-        el.innerHTML = GUARDIAN_STATES.map((s) => `<label data-tip="Show or hide ${s} reviews.">${gdot(s)}<input type="checkbox" ${reviewFilters.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="toggleReviewStatus(this.dataset.state,this.checked)">${s}</label>`).join("")
-          + `<span class="chip" onclick="allReviewStatus(true)" data-tip="Show reviews of every status.">all</span><span class="chip" onclick="allReviewStatus(false)" data-tip="Hide all reviews — clear the status filter entirely.">none</span>`;
+        renderStatusDropdown("review-status-filters", reviewStatusDropdownConfig());
         /** @type {HTMLInputElement} */ (byId("show-hidden-reviews")).checked = reviewFilters.showHidden;
       }
       /**
