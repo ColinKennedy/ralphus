@@ -41,9 +41,10 @@ const BUSINESS_RULE_ONLY_EXTRA_ARGS: &[(&[&str], &[&str])] = &[
 /// trips a type-conversion error unrelated to the path-routing this test
 /// actually checks; a literal-choice chip (`forge [github|gitlab]`) instead
 /// gets its first listed literal, since some commands validate an enum-shaped
-/// value against its exact allowed set before returning a real command; a
-/// `key=value`-shaped chip (`--input [name=value...]`) gets a value that
-/// itself contains `=`, since some commands split on it eagerly.
+/// value against its exact allowed set before returning a real command; any
+/// `xxx=yyy`-shaped chip (`--input [name=value...]`, `--set [key=value...]`,
+/// `--link [key=target...]`) gets a value that itself contains `=`, since
+/// some commands split on it eagerly.
 fn dummy_value_for(chip: &str) -> String {
     let Some(inner) = chip
         .split('[')
@@ -55,7 +56,7 @@ fn dummy_value_for(chip: &str) -> String {
     if inner.contains('|') {
         return inner.split('|').next().unwrap_or("1").to_string();
     }
-    if inner.starts_with("name=value") {
+    if inner.contains('=') {
         return "x=1".to_string();
     }
     "1".to_string()

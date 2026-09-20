@@ -5,12 +5,14 @@ use ralphus_core::schema::TaskFile;
 use ralphus_core::validate::{ErrorKind, ValidationError};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_profile_env;
+use crate::agent_profile_store::AgentProfileView;
 use crate::config::{find_project_config, global_config_path};
 use crate::store::Store;
 
 pub const RAW_BACKEND: &str = "raw";
 
-const PROFILE_BACKENDS: &[&str] = &[
+pub(crate) const PROFILE_BACKENDS: &[&str] = &[
     "claude",
     "claude-code",
     "codex",
@@ -238,18 +240,134 @@ pub fn normalize_builtin_agent(agent: &str) -> Option<&'static str> {
     }
 }
 
+/// A DB-side snapshot of everything [`resolve_agent_for_path_with`] needs to
+/// consider RAL-473 database-backed agent profiles/backend-command overrides
+/// during resolution, fetched once under a short store lock so the
+/// resolution function itself never needs a `Store`/`StoreHandle` (and so it
+/// never performs config-file I/O while a lock is held -- see
+/// `scheduler.rs::resolve_shared_session_id`'s doc comment for why that
+/// ordering matters).
+#[derive(Debug, Clone, Default)]
+pub struct AgentDbSnapshot {
+    /// The stored DB profile named exactly `agent`, if one exists. A DB
+    /// profile wins over a same-named legacy TOML profile (with a logged
+    /// collision warning) -- see [`resolve_agent_for_path_with`].
+    pub profile: Option<AgentProfileView>,
+    /// Every stored built-in-backend command override, keyed by backend name
+    /// (`claude-code`, `codex`, `pi`). Applies to a resolution that ends up
+    /// on one of these backends via *either* a DB profile, a legacy TOML
+    /// profile that didn't set its own `executable`, or a bare builtin agent
+    /// name -- see [`resolve_agent_for_path_with`].
+    pub backend_commands: BTreeMap<String, String>,
+}
+
+impl AgentDbSnapshot {
+    /// Builds a snapshot for resolving `agent`. Only ever reads (never
+    /// mutates) the store; safe to call while holding a store lock, and
+    /// cheap enough (two indexed/small-table SQLite reads) to call once per
+    /// resolution.
+    #[must_use]
+    pub fn load(store: &Store, agent: &str) -> Self {
+        let profile = store.get_agent_profile(agent).unwrap_or(None);
+        let backend_commands = store
+            .list_agent_backend_commands()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.backend, c.command))
+            .collect();
+        Self {
+            profile,
+            backend_commands,
+        }
+    }
+}
+
 pub fn resolve_agent_for_path(agent: &str, cwd: &Path) -> Result<ResolvedAgentSelection, String> {
     let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    resolve_agent_for_path_with(agent, cwd, raw.as_deref())
+    resolve_agent_for_path_with(agent, cwd, raw.as_deref(), None)
+}
+
+/// [`resolve_agent_for_path`] with a database snapshot consulted first (RAL-473).
+/// The one-short-lock-then-release pattern [`AgentDbSnapshot::load`] enables
+/// is the intended way to call this from a context that only holds a
+/// `StoreHandle` (see `scheduler.rs::resolve_agent_selection`).
+pub fn resolve_agent_for_path_with_snapshot(
+    agent: &str,
+    cwd: &Path,
+    db: Option<&AgentDbSnapshot>,
+) -> Result<ResolvedAgentSelection, String> {
+    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
+    resolve_agent_for_path_with(agent, cwd, raw.as_deref(), db)
+}
+
+/// [`resolve_agent_for_path_with_snapshot`] for a caller that already holds a
+/// bare `&Store` (no locking of its own required) -- builds the snapshot and
+/// resolves in one call.
+pub fn resolve_agent_for_path_db(
+    agent: &str,
+    cwd: &Path,
+    store: &Store,
+) -> Result<ResolvedAgentSelection, String> {
+    let db = AgentDbSnapshot::load(store, agent);
+    resolve_agent_for_path_with_snapshot(agent, cwd, Some(&db))
+}
+
+/// Backends whose invoked command is a *global* override (interview Q4) --
+/// editing `agent_backend_commands` for one of these affects every profile
+/// (DB or legacy TOML) that selects it, plus any bare use of the builtin
+/// name itself. `raw` is excluded: it has no default command to override,
+/// so it keeps a per-profile executable instead (`raw` is also otherwise
+/// excluded from [`PROFILE_BACKENDS`] here since it's the one backend that
+/// mandates its own executable).
+pub(crate) fn command_overridable_backend(backend: &str) -> bool {
+    matches!(backend, "claude-code" | "codex" | "pi")
 }
 
 /// [`resolve_agent_for_path`] with `$RALPHUS_CONFIGURATION_PATH` passed in
-/// explicitly -- see [`configuration_path_entries`] for why.
+/// explicitly -- see [`configuration_path_entries`] for why. `db`, when
+/// supplied, layers in RAL-473 database-backed profiles/backend-command
+/// overrides on top of the legacy TOML/builtin resolution below; see
+/// [`AgentDbSnapshot`]'s doc comment for the precedence rules.
 fn resolve_agent_for_path_with(
     agent: &str,
     cwd: &Path,
     configuration_path_env: Option<&str>,
+    db: Option<&AgentDbSnapshot>,
 ) -> Result<ResolvedAgentSelection, String> {
+    if let Some(db_profile) = db.and_then(|db| db.profile.as_ref()) {
+        let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
+        if profiles.contains_key(agent) {
+            // ralphus[ignore-rlog-pair]: operator advisory about profile collision; caller logs task outcome if relevant
+            crate::rlog!(
+                WARNING,
+                "ralphus [agent-profiles] agent \"{agent}\" is defined both as a database \
+                 profile and a legacy TOML profile; the database profile wins. Remove the \
+                 TOML definition (or rename one of the two) to resolve the collision."
+            );
+        }
+        let resolved_env =
+            agent_profile_env::resolve_agent_env(&db_profile.env, |name| std::env::var(name).ok());
+        let secret_values: BTreeSet<String> =
+            agent_profile_env::secret_values(&db_profile.env, |name| std::env::var(name).ok())
+                .into_iter()
+                .collect();
+        // RAL-264: mirror the TOML `from_env` registration below -- a DB
+        // profile's `Link`-resolved values are exactly as secret-shaped.
+        crate::redact::register_all(secret_values.iter().cloned());
+        let executable = if db_profile.backend == RAW_BACKEND {
+            db_profile.executable.clone()
+        } else {
+            db.and_then(|db| db.backend_commands.get(&db_profile.backend).cloned())
+        };
+        return Ok(ResolvedAgentSelection {
+            backend: db_profile.backend.clone(),
+            executable,
+            model: db_profile.model.clone(),
+            env: resolved_env,
+            custom_profile: true,
+            secret_values,
+        });
+    }
     let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
     if let Some(profile) = profiles.get(agent) {
         // RAL-264: this profile is about to be used to run a cell, so its
@@ -258,9 +376,19 @@ fn resolve_agent_for_path_with(
         // registered from a prior resolution (idempotent), registering here
         // guarantees the values are in place before any tmux pane capture.
         crate::redact::register_all(profile.secret_values.iter().cloned());
+        // A legacy TOML profile that didn't author its own `executable` for
+        // an overridable backend still picks up the global DB command
+        // override (RAL-473); an explicit TOML `executable` keeps winning,
+        // preserving today's behavior unchanged for anyone still relying on
+        // it during the migration window (interview Q8).
+        let executable = profile.executable.clone().or_else(|| {
+            command_overridable_backend(&profile.backend)
+                .then(|| db.and_then(|db| db.backend_commands.get(&profile.backend).cloned()))
+                .flatten()
+        });
         return Ok(ResolvedAgentSelection {
             backend: profile.backend.clone(),
-            executable: profile.executable.clone(),
+            executable,
             model: profile.model.clone(),
             env: profile.env.clone(),
             custom_profile: true,
@@ -268,9 +396,12 @@ fn resolve_agent_for_path_with(
         });
     }
     if let Some(backend) = normalize_builtin_agent(agent) {
+        let executable = command_overridable_backend(backend)
+            .then(|| db.and_then(|db| db.backend_commands.get(backend).cloned()))
+            .flatten();
         return Ok(ResolvedAgentSelection {
             backend: backend.to_string(),
-            executable: None,
+            executable,
             model: None,
             env: BTreeMap::new(),
             custom_profile: false,
@@ -338,7 +469,8 @@ fn validate_task_file_profiles_with(
             let mut selections = Vec::with_capacity(names.len());
             let mut resolution_failed = false;
             for (candidate_idx, name) in names.iter().enumerate() {
-                match resolve_agent_for_path_with(name, &cwd, configuration_path_env) {
+                let db = AgentDbSnapshot::load(store, name);
+                match resolve_agent_for_path_with(name, &cwd, configuration_path_env, Some(&db)) {
                     Ok(s) => selections.push(s),
                     Err(message) => {
                         let path = if names.len() > 1 {
@@ -502,8 +634,9 @@ fn validate_task_file_profiles_with(
                 if !seen_cwds.insert(cwd.clone()) {
                     continue;
                 }
+                let db = AgentDbSnapshot::load(store, agent);
                 if let Err(message) =
-                    resolve_agent_for_path_with(agent, &cwd, configuration_path_env)
+                    resolve_agent_for_path_with(agent, &cwd, configuration_path_env, Some(&db))
                 {
                     errors.push(ValidationError {
                         path: format!("review[{review_idx}].agent"),
@@ -546,7 +679,7 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
             let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
-            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
+            if let Ok(selection) = resolve_agent_for_path_db(agent, &cwd, store) {
                 cell.model = selection.model;
             }
         }
@@ -571,7 +704,7 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
             })
         });
         if let Some(cwd) = matching_cwd {
-            if let Ok(selection) = resolve_agent_for_path(agent, &cwd) {
+            if let Ok(selection) = resolve_agent_for_path_db(agent, &cwd, store) {
                 review.model = selection.model;
             }
         }
@@ -636,7 +769,7 @@ pub fn resolve_agent_candidate_lists(
     for (task_idx, task) in file.task.iter_mut().enumerate() {
         if let Some(ralphus_core::schema::AgentSpec::Candidates(candidates)) = &task.agent {
             let cwd = task_level_cwd(store, task);
-            match pick_available_candidate(runner, candidates, &cwd) {
+            match pick_available_candidate(store, runner, candidates, &cwd) {
                 Some(winner) => {
                     task.model = winner.model.clone();
                     task.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
@@ -654,7 +787,7 @@ pub fn resolve_agent_candidate_lists(
             let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
                 continue;
             };
-            match pick_available_candidate(runner, candidates, &cwd) {
+            match pick_available_candidate(store, runner, candidates, &cwd) {
                 Some(winner) => {
                     cell.model = winner.model.clone();
                     cell.agent = Some(ralphus_core::schema::AgentSpec::Single(winner.agent));
@@ -672,6 +805,7 @@ pub fn resolve_agent_candidate_lists(
 /// First candidate (in list order) whose resolved backend passes the
 /// scheduler's own preflight check.
 fn pick_available_candidate(
+    store: &Store,
     runner: &dyn crate::runner::Runner,
     candidates: &[ralphus_core::schema::AgentCandidate],
     cwd: &Path,
@@ -679,7 +813,7 @@ fn pick_available_candidate(
     candidates
         .iter()
         .find(|c| {
-            resolve_agent_for_path(&c.agent, cwd).is_ok_and(|selection| {
+            resolve_agent_for_path_db(&c.agent, cwd, store).is_ok_and(|selection| {
                 runner
                     .preflight_agent(&selection.backend, selection.executable.as_deref(), None)
                     .is_ok()
@@ -821,11 +955,76 @@ fn check_profiles_for_root(root: &Path, suffix: &str) -> Vec<ProfileHealthResult
     results
 }
 
+/// Health-checks every RAL-473 database-backed agent profile and backend
+/// command override, independent of any project root (DB profiles are
+/// global-only, see [`AgentDbSnapshot`]'s doc comment). A backend-command
+/// override for `claude-code`/`codex`/`pi` is checked once per backend
+/// (never per-profile) since it's a shared, global setting -- matching how
+/// [`resolve_agent_for_path_with`] applies it.
+fn check_db_profiles_health(store: &Store) -> Vec<ProfileHealthResult> {
+    let mut results = Vec::new();
+    let commands = store.list_agent_backend_commands().unwrap_or_default();
+    for cmd in &commands {
+        let program = cmd.command.split_whitespace().next().unwrap_or("");
+        let check_name = format!("agent-backend-command:{}", cmd.backend);
+        match resolve_executable(program) {
+            Ok(resolved) => results.push(ProfileHealthResult {
+                name: check_name,
+                status: "pass",
+                detail: format!("command={:?} -> {resolved}", cmd.command),
+            }),
+            Err(reason) => results.push(ProfileHealthResult {
+                name: check_name,
+                status: "fail",
+                detail: format!(
+                    "command={:?} {reason} in the daemon process's PATH. Install it (or fix \
+                     the command) where `ralphus-daemon serve` runs -- no daemon restart is \
+                     needed once fixed.",
+                    cmd.command
+                ),
+            }),
+        }
+    }
+    let profiles = store.list_agent_profiles().unwrap_or_default();
+    for profile in &profiles {
+        let check_name = format!("agent-profile:{} (database)", profile.name);
+        let Some(executable) = profile.executable.as_deref() else {
+            results.push(ProfileHealthResult {
+                name: check_name,
+                status: "pass",
+                detail: format!("backend={}", profile.backend),
+            });
+            continue;
+        };
+        match resolve_executable(executable) {
+            Ok(resolved) => results.push(ProfileHealthResult {
+                name: check_name,
+                status: "pass",
+                detail: format!(
+                    "backend={} executable={executable} -> {resolved}",
+                    profile.backend
+                ),
+            }),
+            Err(reason) => results.push(ProfileHealthResult {
+                name: check_name,
+                status: "fail",
+                detail: format!(
+                    "backend={} {reason} in the daemon process's PATH. Install it (or fix the \
+                    path) where `ralphus-daemon serve` runs, then restart the daemon.",
+                    profile.backend
+                ),
+            }),
+        }
+    }
+    results
+}
+
 /// Health-checks every agent profile the daemon can see for `cwd` plus
-/// every registered project's `.ralphus.toml` (deduped by config path) --
-/// mirrors the root discovery `validate_task_file_profiles` uses at submit
-/// time, so `ralphus check health` and `ralphus submit` agree on which
-/// profiles are in scope.
+/// every registered project's `.ralphus.toml` (deduped by config path), plus
+/// every RAL-473 database-backed profile/backend-command override -- mirrors
+/// the root discovery `validate_task_file_profiles` uses at submit time, so
+/// `ralphus check health` and `ralphus submit` agree on which profiles are
+/// in scope.
 pub fn check_profiles_health(store: &Store, cwd: &Path) -> Vec<ProfileHealthResult> {
     let mut results = check_profiles_for_root(cwd, "");
     let mut seen_configs = BTreeSet::new();
@@ -844,6 +1043,7 @@ pub fn check_profiles_health(store: &Store, cwd: &Path) -> Vec<ProfileHealthResu
         let suffix = format!(" ({})", config_path.display());
         results.extend(check_profiles_for_root(&project_path, &suffix));
     }
+    results.extend(check_db_profiles_health(store));
     results
 }
 

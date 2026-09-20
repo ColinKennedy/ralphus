@@ -7,6 +7,8 @@
 
 pub mod agent_access;
 pub mod agent_catalog;
+pub mod agent_profile_env;
+pub mod agent_profile_store;
 pub mod agent_profiles;
 pub mod arbiter;
 pub mod ark;

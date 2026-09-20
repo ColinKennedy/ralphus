@@ -110,11 +110,22 @@ pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60
 /// blocking two-sample delta the way the Resources tab's own CPU% needs.
 pub const CPU_STALL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Resolves `agent` against RAL-473 database-backed profiles/backend-command
+/// overrides first, falling back to the legacy TOML/builtin resolution --
+/// see [`crate::agent_profiles::AgentDbSnapshot`]. The DB snapshot is
+/// fetched under a short-lived lock that is dropped *before* resolution runs
+/// (resolution does its own file I/O for legacy TOML profiles, which must
+/// never happen while the store mutex is held).
 fn resolve_agent_selection(
+    store: &crate::store_lock::StoreHandle,
     agent: &str,
     cwd: &str,
 ) -> Result<crate::agent_profiles::ResolvedAgentSelection, String> {
-    crate::agent_profiles::resolve_agent_for_path(agent, Path::new(cwd))
+    let db = {
+        let guard = store.lock();
+        crate::agent_profiles::AgentDbSnapshot::load(&guard, agent)
+    };
+    crate::agent_profiles::resolve_agent_for_path_with_snapshot(agent, Path::new(cwd), Some(&db))
 }
 
 /// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
@@ -232,9 +243,10 @@ fn resolve_shared_session_id(
     let mut blocked_reason: Option<String> = None;
     for (d, session_id) in dep_sessions {
         let dep = &cells[d];
-        let dep_backend = resolve_agent_selection(&dep.agent, dep.cwd.as_deref().unwrap_or("."))
-            .map(|s| s.backend)
-            .unwrap_or_else(|_| dep.agent.clone());
+        let dep_backend =
+            resolve_agent_selection(store, &dep.agent, dep.cwd.as_deref().unwrap_or("."))
+                .map(|s| s.backend)
+                .unwrap_or_else(|_| dep.agent.clone());
         if let Some(reason) = sharing_blocked_reason(
             current_backend,
             row.model.as_deref(),
@@ -2236,25 +2248,26 @@ fn run_cell_worker(
             .collect();
         crate::ghost::format_context_block(own.as_ref(), &parents)
     };
-    let selection = match resolve_agent_selection(&row.agent, row.cwd.as_deref().unwrap_or(".")) {
-        Ok(selection) => selection,
-        Err(message) => {
-            let outcome = crate::store::CellOutcome {
-                state: crate::store::NodeState::Failed,
-                usage: crate::store::RecordedUsage::default(),
-                error: Some(message.clone()),
-                agent_session_id: None,
-            };
-            {
-                let guard = store.lock();
-                let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+    let selection =
+        match resolve_agent_selection(store, &row.agent, row.cwd.as_deref().unwrap_or(".")) {
+            Ok(selection) => selection,
+            Err(message) => {
+                let outcome = crate::store::CellOutcome {
+                    state: crate::store::NodeState::Failed,
+                    usage: crate::store::RecordedUsage::default(),
+                    error: Some(message.clone()),
+                    agent_session_id: None,
+                };
+                {
+                    let guard = store.lock();
+                    let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+                }
+                let mut prog = progress.lock().expect("progress mutex poisoned");
+                prog.status[i] = CellState::Failed;
+                prog.failed.insert(row.task_idx);
+                return;
             }
-            let mut prog = progress.lock().expect("progress mutex poisoned");
-            prog.status[i] = CellState::Failed;
-            prog.failed.insert(row.task_idx);
-            return;
-        }
-    };
+        };
     let mut spec = RunnerSpec::from_row(squad_id, row);
     let proof_awareness = {
         let guard = store.lock();
@@ -3816,10 +3829,10 @@ fn run_proofs(
     trace_context: Option<&str>,
 ) -> ProofOutcome {
     let cx = otel::context_from_traceparent(trace_context);
-    let selection = match resolve_agent_selection(cell_agent, cwd) {
+    let selection = match resolve_agent_selection(store, cell_agent, cwd) {
         Ok(selection) => selection,
         Err(message) => {
-            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            // ralphus[ignore-rlog-pair]: this low-level helper's Store-owning caller records the structured workflow outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [scheduler] proof scope {squad_id}/t{task_idx}/{scope} cannot resolve agent {cell_agent:?}: {message}"

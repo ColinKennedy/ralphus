@@ -27,6 +27,7 @@
           <button id="tab-secrets" class="tab" style="display:none" onclick="showTab('secrets', true)" data-tip="Secrets — env-var names treated as secret (RAL-281).\nA cell/proof step's resolved env is checked by name against this list; a match scrubs that variable's value from durable pane text and terminal logs, in addition to the existing from_env-sourced agent-profile secrets.\nChanges apply immediately, no daemon restart needed.\nAdmin-only (RAL-332).">🔐 Secrets</button>
           <button id="tab-worktree-retirement" class="tab" style="display:none" onclick="showTab('worktree-retirement', true)" data-tip="Worktree retirement (RAL-385/386) — every review worktree across every review, by retirement state: scheduled, eligible, claimed, failed, deferred, opted_out, retired.\nA daily daemon sweep removes review worktrees idle 30+ days; anyone watching a review gets one mailbox heads-up before its worktree is actually removed.\nAdmin-only in this UI (RAL-332) -- the same data is queryable by any user via `ralphus review worktree-retirements`, admin or not.">⏳ Retirement</button>
           <button id="tab-health" class="tab" style="display:none" onclick="showTab('health', true)" data-tip="Health (RAL-416) — catalog-driven view of every daemon/remote check ralphus_core::health_catalog knows about.\nThis daemon's own row refreshes on an hourly Free-tier background sweep; remote [machine.targets.*] rows stay on-demand (RAL-355), same as the Machines tab.\nAdmin-only (RAL-332).">🩺 Health</button>
+          <button id="tab-agents" class="tab" style="display:none" onclick="showTab('agents', true)" data-tip="Agents (RAL-473) — manage agent profiles and built-in backend command overrides from the database, replacing config.toml/.ralphus.toml [agent.profiles.*] definitions.\nA profile picks a backend, optional default model, and an ordered Set/Link environment table; a backend-command override is a global setting shared by every profile selecting that backend.\nAdmin-only (RAL-332).">🤖 Agents</button>
           <!-- RAL-329: reached via the ⚙ button in the header, not the visible tab row -- kept as a real tab button (hidden) so it shares showTab's page show/hide bookkeeping. -->
           <button id="tab-prefs" class="tab" style="display:none" onclick="showTab('prefs', true)" data-tip="Preferences — your theme setting and your hidden squads/reviews/tasks.">⚙ Preferences</button>
         </nav>
@@ -221,6 +222,15 @@
       <div id="secrets"><div class="empty">Loading…</div></div>
     </main>
 
+    <main id="agents-page" style="display:none">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <b data-tip="Agent profiles (RAL-473) — database-backed agent definitions, replacing config.toml/.ralphus.toml [agent.profiles.*].\nA profile picks a backend, an optional default model, and an ordered Set/Link environment table. Nothing here is written to the daemon until you click Save Agent.">Agents</b>
+        <span style="color:var(--muted)" id="agent-profile-summary">—</span>
+      </div>
+      <div id="agent-backend-commands"><div class="empty">Loading…</div></div>
+      <div id="agents"><div class="empty">Loading…</div></div>
+    </main>
+
     <main id="prefs-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Preferences (RAL-329) — your personal view settings.\nThese only change what you see; they never change the underlying squad/review, and nobody else's view is affected.\nCurrent user is resolved from the X-Ralphus-User header, falling back to [daemon].default_user -- there is no sign-in yet (RAL-252).">Preferences</b>
@@ -336,6 +346,7 @@
     <script src="/board/75-projects-machines.js"></script>
     <script src="/board/76-project-review-settings-modal.js"></script>
     <script src="/board/77-mailbox.js"></script>
+    <script src="/board/78-agents.js"></script>
     <script src="/board/80-queue.js"></script>
     <script src="/board/81-worktree-retirement.js"></script>
     <script src="/board/85-health.js"></script>

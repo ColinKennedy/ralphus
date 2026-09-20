@@ -1179,6 +1179,49 @@ fn route_for_user(
         ("GET", ["api", "triage", "candidates"]) => {
             admin_gated(daemon, user_header, || list_triage_candidates(daemon))
         }
+        // RAL-473: admin-only DB-backed agent profile registry -- the
+        // "Agents" board tab reads/writes these, and `resolve_agent_for_path_db`
+        // (agent_profiles.rs) consults them at cell/proof run time with no
+        // daemon restart. Real CLI/MCP surfaces exist too (see
+        // check_endpoint_cli_parity.py's ENDPOINT_TO_CLI), so these are NOT
+        // board-only despite being admin-gated.
+        ("GET", ["api", "agent-profiles"]) => {
+            admin_gated(daemon, user_header, || list_agent_profiles(daemon))
+        }
+        ("POST", ["api", "agent-profiles"]) => admin_gated(daemon, user_header, || {
+            save_agent_profile(daemon, None, body)
+        }),
+        ("GET", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
+            get_agent_profile(daemon, &url_decode(name))
+        }),
+        ("PATCH", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
+            save_agent_profile(daemon, Some(&url_decode(name)), body)
+        }),
+        ("DELETE", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
+            delete_agent_profile(daemon, &url_decode(name), query)
+        }),
+        // Per Q4: a built-in backend's invoked command is a single global
+        // setting shared by every profile using that backend (not per-profile).
+        ("GET", ["api", "agent-backend-commands"]) => {
+            admin_gated(daemon, user_header, || list_agent_backend_commands(daemon))
+        }
+        ("POST", ["api", "agent-backend-commands", backend]) => {
+            admin_gated(daemon, user_header, || {
+                set_agent_backend_command(daemon, &url_decode(backend), body)
+            })
+        }
+        ("DELETE", ["api", "agent-backend-commands", backend]) => {
+            admin_gated(daemon, user_header, || {
+                reset_agent_backend_command(daemon, &url_decode(backend))
+            })
+        }
+        // Blast-radius listing (Q4): which profiles use this backend, shown
+        // before the UI lets an admin change/reset its command.
+        ("GET", ["api", "agent-backend-commands", backend, "profiles"]) => {
+            admin_gated(daemon, user_header, || {
+                list_agent_profiles_for_backend(daemon, &url_decode(backend))
+            })
+        }
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
@@ -3281,6 +3324,216 @@ fn deregister_triage_type(daemon: &Daemon, name: &str) -> Reply {
             ),
             vec![],
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/agent-profiles`: every DB-backed agent profile (RAL-473),
+/// alphabetical. Never includes resolved `Link` values -- see
+/// [`AgentProfileView`](crate::agent_profile_store::AgentProfileView)'s
+/// module doc comment (Q7: only stored `Set`/`Link` rows are returned, never
+/// a value resolved through a `Link`).
+#[derive(Serialize)]
+struct AgentProfilesResponse {
+    profiles: Vec<crate::agent_profile_store::AgentProfileView>,
+}
+
+fn list_agent_profiles(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_agent_profiles() {
+        Ok(profiles) => json(200, &AgentProfilesResponse { profiles }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/agent-profiles/{name}`.
+fn get_agent_profile(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().get_agent_profile(name) {
+        Ok(Some(profile)) => json(200, &profile),
+        Ok(None) => error(
+            404,
+            "not_found",
+            &format!("agent profile \"{name}\" does not exist"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/agent-profiles` (create) / `PATCH /api/agent-profiles/{name}`
+/// (update) body. `name` is required on create (`existing_name` is `None`)
+/// and is taken from the path on update; a body `name` on update is ignored
+/// in favor of the path segment, matching the triage-type registry's
+/// path-is-authoritative convention.
+#[derive(Deserialize)]
+struct SaveAgentProfileBody {
+    #[serde(default)]
+    name: String,
+    backend: String,
+    #[serde(default)]
+    executable: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    env: Vec<crate::agent_profile_env::AgentEnvEntry>,
+}
+
+fn agent_profile_save_error(err: crate::agent_profile_store::AgentProfileSaveError) -> Reply {
+    use crate::agent_profile_store::AgentProfileSaveError as E;
+    match err {
+        E::Cycle(cycle) => error(
+            400,
+            "link_cycle",
+            &format!("environment variable Link cycle detected: {cycle}"),
+            vec![],
+        ),
+        E::Store(e) => store_error(&e),
+        other => error(400, "invalid_value", &other.to_string(), vec![]),
+    }
+}
+
+/// `POST /api/agent-profiles` / `PATCH /api/agent-profiles/{name}`: create or
+/// update a DB-backed agent profile. Validates the Link graph for cycles
+/// before persisting anything (Q6) -- on a cycle, no partial write happens
+/// and the error names every key in the offending chain.
+fn save_agent_profile(daemon: &Daemon, existing_name: Option<&str>, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SaveAgentProfileBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"backend\" and, on create, \"name\"",
+            vec![],
+        );
+    };
+    let name = match existing_name {
+        Some(n) => n,
+        None => req.name.trim(),
+    };
+    if name.is_empty() {
+        return error(400, "invalid_value", "'name' must not be empty", vec![]);
+    }
+    match daemon.lock().upsert_agent_profile(
+        name,
+        req.backend.trim(),
+        req.executable.as_deref(),
+        req.model.as_deref(),
+        req.env,
+    ) {
+        Ok(()) => json(200, &serde_json::json!({"name": name})),
+        Err(e) => agent_profile_save_error(e),
+    }
+}
+
+/// `DELETE /api/agent-profiles/{name}`: Q9 -- refuses (409) if any stored
+/// cell/task/proof/review still references this profile by name, unless the
+/// caller passes `?force=true` after showing the operator that list. Running
+/// invocations already hold their own resolved agent selection in memory and
+/// are unaffected either way; only *future* starts consult the DB.
+fn delete_agent_profile(daemon: &Daemon, name: &str, query: &str) -> Reply {
+    let force = query_param(query, "force") == Some("true");
+    let guard = daemon.lock();
+    if !force {
+        match guard.agent_profile_references(name) {
+            Ok(refs) if !refs.is_empty() => {
+                return json(
+                    409,
+                    &serde_json::json!({
+                        "error": {
+                            "code": "in_use",
+                            "message": format!(
+                                "agent profile \"{name}\" is still referenced by stored squads/reviews; pass ?force=true to delete anyway"
+                            ),
+                        },
+                        "references": refs,
+                    }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return store_error(&e),
+        }
+    }
+    match guard.delete_agent_profile(name) {
+        Ok(true) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("agent profile \"{name}\" does not exist"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/agent-backend-commands`: every built-in backend's current
+/// command override (only backends with a row here have been overridden --
+/// an absent backend still runs its compiled-in default).
+#[derive(Serialize)]
+struct AgentBackendCommandsResponse {
+    commands: Vec<crate::agent_profile_store::AgentBackendCommandView>,
+}
+
+fn list_agent_backend_commands(daemon: &Daemon) -> Reply {
+    match daemon.lock().list_agent_backend_commands() {
+        Ok(commands) => json(200, &AgentBackendCommandsResponse { commands }),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetAgentBackendCommandBody {
+    command: String,
+}
+
+/// `POST /api/agent-backend-commands/{backend}`: overrides `backend`'s
+/// invoked command globally (Q4) -- every profile using this backend picks
+/// it up on its next cell/proof run, no daemon restart. Only
+/// `claude-code`/`codex`/`pi` are overridable this way; `raw` keeps a
+/// per-profile executable since it has no default to override.
+fn set_agent_backend_command(daemon: &Daemon, backend: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetAgentBackendCommandBody>(body) else {
+        return error(400, "bad_request", "body must include \"command\"", vec![]);
+    };
+    let command = req.command.trim();
+    if command.is_empty() {
+        return error(400, "invalid_value", "'command' must not be empty", vec![]);
+    }
+    if !crate::agent_profiles::command_overridable_backend(backend) {
+        return error(
+            400,
+            "invalid_value",
+            &format!("backend \"{backend}\" does not support a command override"),
+            vec![],
+        );
+    }
+    match daemon.lock().set_agent_backend_command(backend, command) {
+        Ok(()) => json(
+            200,
+            &serde_json::json!({"backend": backend, "command": command}),
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/agent-backend-commands/{backend}`: "Reset to default" --
+/// removes the override so `backend` goes back to its compiled-in command.
+fn reset_agent_backend_command(daemon: &Daemon, backend: &str) -> Reply {
+    match daemon.lock().reset_agent_backend_command(backend) {
+        Ok(true) => json(200, &serde_json::json!({"reset": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("backend \"{backend}\" has no command override to reset"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/agent-backend-commands/{backend}/profiles`: blast-radius list
+/// for the "Reset to default" / command-edit confirmation (Q4) -- every
+/// profile that would be affected by changing `backend`'s command.
+fn list_agent_profiles_for_backend(daemon: &Daemon, backend: &str) -> Reply {
+    match daemon.lock().list_agent_profiles_for_backend(backend) {
+        Ok(profiles) => json(200, &AgentProfilesResponse { profiles }),
         Err(e) => store_error(&e),
     }
 }
@@ -24955,6 +25208,200 @@ command=\"cargo test\"
         let r = route(&d, "POST", "/api/triage/types", r#"{"name":"  "}"#);
         assert_eq!(r.status, 400);
         assert!(r.body.contains("invalid_value"));
+    }
+
+    // ── DB-backed agent profile / backend command routes (RAL-473) ──────────
+
+    #[test]
+    fn agent_profile_routes_create_get_update_list_delete() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/agent-profiles", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"profiles\":[]"), "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"deepseek","backend":"claude-code","model":"deepseek-chat","env":[{"key":"A","kind":"set","value":"1"}]}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles/deepseek", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("deepseek-chat"), "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles/nope", "");
+        assert_eq!(r.status, 404);
+
+        let r = route(
+            &d,
+            "PATCH",
+            "/api/agent-profiles/deepseek",
+            r#"{"backend":"claude-code","model":"deepseek-reasoner","env":[]}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/agent-profiles/deepseek", "");
+        assert!(r.body.contains("deepseek-reasoner"), "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles", "");
+        assert!(r.body.contains("deepseek"), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/agent-profiles/deepseek", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/agent-profiles/deepseek", "");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn agent_profile_create_rejects_empty_name() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"  ","backend":"claude-code"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_create_rejects_unknown_backend() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"bad","backend":"not-a-backend"}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_profile_create_reports_a_link_cycle_naming_the_offending_keys() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"cyclic","backend":"claude-code","env":[
+                {"key":"A","kind":"link","value":"B"},
+                {"key":"B","kind":"link","value":"A"}
+            ]}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("link_cycle"), "{}", r.body);
+        assert!(r.body.contains('A') && r.body.contains('B'), "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-profiles/cyclic", "");
+        assert_eq!(
+            r.status, 404,
+            "a rejected cycle must not partially persist: {}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn agent_profile_delete_refuses_when_referenced_unless_forced() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"in-use","backend":"claude-code"}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        {
+            let guard = d.lock();
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO squads(id, label, state, depends_on, created_at_ms, updated_at_ms) \
+                     VALUES('sq-1', 'sq', 'Pending', '[]', 0, 0)",
+                    [],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO tasks(squad_id, idx, name, project, agent, state) \
+                     VALUES('sq-1', 0, 't', 'proj', 'in-use', 'Pending')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let r = route(&d, "DELETE", "/api/agent-profiles/in-use", "");
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert!(r.body.contains("sq-1"), "{}", r.body);
+        // The CLI's `extract_error_message` only ever looks at
+        // `body["error"]["message"]` (a nested object) -- confirm the 409
+        // stays in that shape, with "references" as a separate top-level
+        // field, rather than regressing to a flat `"error": "in_use"` string.
+        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(parsed["error"]["message"].as_str().is_some(), "{}", r.body);
+        assert_eq!(parsed["error"]["code"], "in_use", "{}", r.body);
+        assert!(parsed["references"]["squad_ids"].is_array(), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/agent-profiles/in-use?force=true", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn agent_backend_command_routes_set_list_reset_and_blast_radius() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/agent-backend-commands", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"commands\":[]"), "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-backend-commands/claude-code",
+            r#"{"command":"some-complex subcommand -- claude"}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/agent-backend-commands", "");
+        assert!(
+            r.body.contains("some-complex subcommand -- claude"),
+            "{}",
+            r.body
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-backend-commands/raw",
+            r#"{"command":"whatever"}"#,
+        );
+        assert_eq!(
+            r.status, 400,
+            "raw has no default command to override: {}",
+            r.body
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles",
+            r#"{"name":"uses-claude-code","backend":"claude-code"}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(
+            &d,
+            "GET",
+            "/api/agent-backend-commands/claude-code/profiles",
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("uses-claude-code"), "{}", r.body);
+
+        let r = route(&d, "DELETE", "/api/agent-backend-commands/claude-code", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "DELETE", "/api/agent-backend-commands/claude-code", "");
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 
     #[test]

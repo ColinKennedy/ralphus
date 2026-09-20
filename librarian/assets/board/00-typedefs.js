@@ -770,6 +770,46 @@
        * @property {number} created_at_ms
        */
       /**
+       * One row of a DB-backed agent profile's environment table (RAL-473).
+       * `kind` is `"Set"` (literal `value`) or `"Link"` (`value` names another
+       * env var to resolve at cell-run time -- first against this profile's
+       * own other entries, then the daemon process environment). The API
+       * never returns a resolved `Link` value, only this raw, unresolved
+       * shape -- see `GET /api/agent-profiles`.
+       * @typedef {object} AgentEnvEntry
+       * @property {string} key
+       * @property {string} kind - "set" | "link"
+       * @property {string} value
+       */
+      /**
+       * `GET /api/agent-profiles/{name}` / one entry of `GET /api/agent-profiles`'s `profiles` array (RAL-473).
+       * @typedef {object} AgentProfileView
+       * @property {string} name
+       * @property {string} backend
+       * @property {string|null} executable - only ever set for the "raw" backend; every other backend's command is a global AgentBackendCommandView override.
+       * @property {string|null} model
+       * @property {AgentEnvEntry[]} env
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+      /**
+       * `GET /api/agent-backend-commands`'s per-backend entry (RAL-473) -- a
+       * built-in backend's invoked command, overridden globally for every
+       * profile selecting that backend.
+       * @typedef {object} AgentBackendCommandView
+       * @property {string} backend
+       * @property {string} command
+       * @property {number} updated_at_ms
+       */
+      /**
+       * The 409 `in_use` body `DELETE /api/agent-profiles/{name}` returns when
+       * a delete is blocked (RAL-473) -- what's still referencing the profile,
+       * for the admin's own judgment call before retrying with `?force=true`.
+       * @typedef {object} AgentProfileReferences
+       * @property {string[]} squad_ids
+       * @property {string[]} guardian_ids
+       */
+      /**
        * @typedef {object} AvailableAgent
        * @property {string} id
        * @property {string} kind - "builtin" | "profile"

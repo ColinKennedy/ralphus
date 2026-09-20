@@ -517,6 +517,7 @@
         else if (tab === "triage") tabPoll = pollTriage();
         else if (tab === "users") tabPoll = pollUsers();
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();
+        else if (tab === "agents") tabPoll = Promise.all([pollAgentBackendCommands(), pollAgentProfiles()]).then(() => undefined);
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
         else if (tab === "health") tabPoll = pollHealth();
         else if (tab === "prefs") tabPoll = pollPrefs();
