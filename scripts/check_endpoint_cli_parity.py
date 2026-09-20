@@ -98,9 +98,9 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "POST /api/mailbox/personal/drain": ["mailbox personal-drain"],
     "POST /api/mailbox/personal/undrain": ["mailbox personal-undrain"],
     "GET /api/mailbox/personal/messages": ["mailbox personal"],
-    "GET /api/watches": ["mailbox follows"],
-    "POST /api/watches": ["mailbox follow"],
-    "DELETE /api/watches/{entity_uri}": ["mailbox unfollow"],
+    "GET /api/watches": ["mailbox watches"],
+    "POST /api/watches": ["mailbox watch"],
+    "DELETE /api/watches/{entity_uri}": ["mailbox unwatch"],
 
     "GET /api/mailbox/{client_id}/messages": ["mailbox check"],
     "POST /api/mailbox/{client_id}/drain": ["mailbox check"],
