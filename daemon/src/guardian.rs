@@ -1127,6 +1127,22 @@ impl Store {
              VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1)",
             params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch)],
         )?;
+        // RAL-<new>: a new review coming into existence is the single most
+        // consequential event in this file, and every route into it
+        // (`create_guardian_for_squad`/`_for_project`/`_keyed` directly) went
+        // through with zero logging until this -- the Triage/Arbiter-created
+        // path already logs its own creation via `Note::new("arbiter")`, this
+        // is the equivalent for every other creation route.
+        let note = crate::cartographer::Note::new("guardian").guardian(&id);
+        let note = match squad_id {
+            Some(sid) => note.squad(sid),
+            None => note,
+        };
+        note.emit(
+            self,
+            format!("review {id} ('{name}') created, base={base_branch}"),
+            serde_json::json!({"name": name, "base_branch": base_branch, "project": project}),
+        );
         Ok(id)
     }
 
@@ -3571,6 +3587,27 @@ impl Store {
                 id
             ],
         )?;
+        // RAL-<new>: the post-merge build/gate outcome -- including a real
+        // failure -- was previously recorded with zero logging anywhere in
+        // this call chain (most callers just `let _ =` it). A failing
+        // post-merge gate is exactly the "the system stopped and nothing
+        // says why" case this audit targets.
+        crate::cartographer::Note::new("guardian")
+            .level(if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            })
+            .guardian(id)
+            .emit(
+                self,
+                format!(
+                    "post-merge gate {}{}",
+                    if ok { "passed" } else { "failed" },
+                    detail.map_or_else(String::new, |d| format!(": {d}"))
+                ),
+                serde_json::json!({"ok": ok, "detail": detail}),
+            );
         Ok(())
     }
 
@@ -3686,6 +3723,25 @@ impl Store {
             .collect();
         for (branch, _) in &not_ready {
             self.set_branch_enabled_by_name(guardian_id, branch, false)?;
+        }
+        // RAL-<new>: force-start is a user-visible automated action -- it
+        // silently disabled every enabled branch not yet `done`, with zero
+        // record of which branches or why, until this. Its HTTP caller
+        // (`server::guardian_force_start`) only logs the `Err` case.
+        if !not_ready.is_empty() {
+            let branches: Vec<&str> = not_ready.iter().map(|(b, _)| b.as_str()).collect();
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .guardian(guardian_id)
+                .emit(
+                    self,
+                    format!(
+                        "force-start disabled {} branch(es) not yet done: {}",
+                        branches.len(),
+                        branches.join(", ")
+                    ),
+                    serde_json::json!({"branches": branches}),
+                );
         }
         Ok(not_ready)
     }
