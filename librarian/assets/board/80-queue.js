@@ -866,6 +866,12 @@
             showTab("users");
           } else if (h.tab === "secrets") {
             showTab("secrets");
+          } else if (h.tab === "worktree-retirement") {
+            showTab("worktree-retirement");
+          } else if (h.tab === "health") {
+            showTab("health");
+          } else if (h.tab === "agents") {
+            showTab("agents");
           } else if (h.tab === "prefs") {
             showTab("prefs");
           }
@@ -886,6 +892,9 @@
       else if (pendingHash && pendingHash.tab === "triage") { pendingHash = null; showTab("triage"); }
       else if (pendingHash && pendingHash.tab === "users") { pendingHash = null; showTab("users"); }
       else if (pendingHash && pendingHash.tab === "secrets") { pendingHash = null; showTab("secrets"); }
+      else if (pendingHash && pendingHash.tab === "worktree-retirement") { pendingHash = null; showTab("worktree-retirement"); }
+      else if (pendingHash && pendingHash.tab === "health") { pendingHash = null; showTab("health"); }
+      else if (pendingHash && pendingHash.tab === "agents") { pendingHash = null; showTab("agents"); }
       else if (pendingHash && pendingHash.tab === "prefs") { pendingHash = null; showTab("prefs"); }
       else { tick(); }
       // RAL-167: push (connectEventStream) is the primary live-update path;
