@@ -846,16 +846,16 @@ impl DaemonClient {
         self.post(&format!("/api/mailbox/personal/undrain{qs}"), Some(body))
     }
 
-    /// `GET /api/watches` -- every follow the acting user owns.
-    pub fn list_follows(&self, user: Option<&str>) -> Result<Value, DaemonError> {
+    /// `GET /api/watches` -- every watch the acting user owns.
+    pub fn list_watches(&self, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
         self.get(&format!("/api/watches{qs}"))
     }
 
-    /// `POST /api/watches` -- follow (or update the follow's tiers in place)
+    /// `POST /api/watches` -- create a watch or update its tiers in place.
     /// an entity URI on the acting user's behalf. `notify_tiers` omitted or
     /// empty defaults to the acting user's `default_notify_tiers` preference.
-    pub fn create_follow(
+    pub fn create_watch(
         &self,
         entity_uri: &str,
         notify_tiers: Option<&[String]>,
@@ -870,11 +870,7 @@ impl DaemonClient {
     /// `DELETE /api/watches/{entity_uri}` -- `entity_uri` is interpolated raw
     /// (not urlencoded): the daemon's route matcher expects the literal
     /// colon-delimited URI as the path segment.
-    pub fn delete_follow(
-        &self,
-        entity_uri: &str,
-        user: Option<&str>,
-    ) -> Result<Value, DaemonError> {
+    pub fn delete_watch(&self, entity_uri: &str, user: Option<&str>) -> Result<Value, DaemonError> {
         let qs = query_string(&[("user", user.map(str::to_string))]);
         self.delete(&format!("/api/watches/{entity_uri}{qs}"))
     }

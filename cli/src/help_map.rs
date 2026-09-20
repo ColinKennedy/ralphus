@@ -1061,7 +1061,7 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
             "--unread",
             "--user [name]",
         ],
-        "List the acting user's personal mailbox messages, filtered through their follows \
+        "List the acting user's personal mailbox messages, filtered through their watches \
          (RAL-320).",
         false,
         true, // read-only: lists messages, never marks them read.
@@ -1086,29 +1086,29 @@ const MAILBOX_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "follow",
+        "watch",
         &["entity_uri [str]"],
         &["--tier [urgent|high|normal...]", "--user [name]"],
-        "Follow an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
-         reach the mailbox; re-following updates the notification tiers in place (RAL-320).",
+        "Watch an entity (squad/task/cell/proof/review/review-worktree) so its notifications \
+         reach the mailbox; re-watching updates the notification tiers in place (RAL-320).",
         false,
-        false, // creates/updates a follow.
+        false, // creates or updates a watch.
         &[],
     ),
     node(
-        "unfollow",
+        "unwatch",
         &["entity_uri [str]"],
         &["--user [name]"],
-        "Stop following an entity (RAL-320).",
+        "Stop watching an entity (RAL-320).",
         false,
-        false, // deletes a follow.
+        false, // deletes a watch.
         &[],
     ),
     node(
-        "follows",
+        "watches",
         &[],
         &["--user [name]"],
-        "List the acting user's follows (RAL-320).",
+        "List the acting user's watches (RAL-320).",
         false,
         true, // read-only listing.
         &[],
