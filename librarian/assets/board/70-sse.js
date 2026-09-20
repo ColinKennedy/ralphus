@@ -272,8 +272,8 @@
       let promptCacheSquadId = null;
       /** @type {{[key: string]: {prompt?: string, system_prompt?: string|null}}} */
       let promptCache = {};
-      /** @type {string|null} squad id whose prompt fetch is in flight, so a poll burst issues one request rather than one each. */
-      let promptFetchInFlight = null;
+      /** @type {Map<string, Promise<boolean>>} squad id -> in-flight fetch promise, so a poll burst or a rapid reselect of the same squad shares one request instead of one each. */
+      let promptFetchesInFlight = new Map();
       /**
        * Cache key for a cell.
        * @param {number} ti
@@ -307,16 +307,28 @@
        * reconciliation tick.
        *
        * Cheap to call on every render: it returns immediately once the
-       * squad is cached or a fetch for it is already in flight, and the
-       * re-render it triggers on success cannot recurse, since by then the
-       * cache matches the selection.
+       * squad is cached or a fetch for it is already in flight. The
+       * callback re-checks the *current* selection rather than assuming
+       * `wanted` is still shown -- the selection can move to a different
+       * squad while this fetch is in flight, and retrying for whatever is
+       * selected now is what keeps the pane from getting stuck without a
+       * prompt until an unrelated future render happens to retry it.
        * @returns {void}
        */
       function syncPromptCache() {
         if (!selectedSquadId || promptCacheSquadId === selectedSquadId) return;
-        ensurePromptCache(selectedSquadId).then((loaded) => {
-          if (!loaded) return;
-          applyPromptCache();
+        if (!squads.some((r) => r.id === selectedSquadId)) return;
+        const wanted = selectedSquadId;
+        ensurePromptCache(wanted).then((loaded) => {
+          if (loaded) applyPromptCache();
+          // Only retry if the selection moved on to a different, not-yet-
+          // cached squad while this fetch was in flight -- a failed fetch
+          // for the squad still selected falls back to the next poll, same
+          // as before, rather than hammering the daemon in a tight loop.
+          if (selectedSquadId && selectedSquadId !== wanted && promptCacheSquadId !== selectedSquadId) {
+            syncPromptCache();
+            return;
+          }
           preserveUserState(document.getElementById("details"), renderDetails);
         });
       }
@@ -354,31 +366,36 @@
        * @returns {Promise<boolean>} whether fresh text was loaded
        */
       async function ensurePromptCache(id) {
-        if (!id || promptCacheSquadId === id || promptFetchInFlight === id) return false;
+        if (!id || promptCacheSquadId === id) return false;
+        const existing = promptFetchesInFlight.get(id);
+        if (existing) return existing;
         if (!squads.some((r) => r.id === id)) return false;
-        promptFetchInFlight = id;
-        try {
-          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
-          if (!res.ok) return false;
-          /** @type {SquadView} */
-          const detail = await res.json();
-          /** @type {{[key: string]: {prompt?: string, system_prompt?: string|null}}} */
-          const map = {};
-          (detail.tasks || []).forEach((t, ti) => {
-            (t.proof || []).forEach((v, vi) => { map[promptKeyTaskProof(ti, vi)] = { system_prompt: v.system_prompt }; });
-            (t.cells || []).forEach((c, si) => {
-              map[promptKeyCell(ti, si)] = { prompt: c.prompt, system_prompt: c.system_prompt };
-              (c.proof || []).forEach((v, vi) => { map[promptKeyCellProof(ti, si, vi)] = { system_prompt: v.system_prompt }; });
+        const promise = (async () => {
+          try {
+            const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+            if (!res.ok) return false;
+            /** @type {SquadView} */
+            const detail = await res.json();
+            /** @type {{[key: string]: {prompt?: string, system_prompt?: string|null}}} */
+            const map = {};
+            (detail.tasks || []).forEach((t, ti) => {
+              (t.proof || []).forEach((v, vi) => { map[promptKeyTaskProof(ti, vi)] = { system_prompt: v.system_prompt }; });
+              (t.cells || []).forEach((c, si) => {
+                map[promptKeyCell(ti, si)] = { prompt: c.prompt, system_prompt: c.system_prompt };
+                (c.proof || []).forEach((v, vi) => { map[promptKeyCellProof(ti, si, vi)] = { system_prompt: v.system_prompt }; });
+              });
             });
-          });
-          promptCache = map;
-          promptCacheSquadId = id;
-          return true;
-        } catch (e) {
-          return false; // transient -- the next poll retries
-        } finally {
-          promptFetchInFlight = null;
-        }
+            promptCache = map;
+            promptCacheSquadId = id;
+            return true;
+          } catch (e) {
+            return false; // transient -- the next poll retries
+          } finally {
+            promptFetchesInFlight.delete(id);
+          }
+        })();
+        promptFetchesInFlight.set(id, promise);
+        return promise;
       }
       // RALPHUS-TASKS-POLL-SEQ:END
       // ---- cross-squad task/cell index (on demand) ----
