@@ -593,7 +593,20 @@
       // Coalescing window: long enough to merge a burst of near-simultaneous
       // events into one refresh, short enough that push still feels instant
       // next to the old 2s poll.
-      const SSE_DEBOUNCE_MS = 150;
+      //
+      // Track B / B3: raised from the original 150ms now that a flush is
+      // usually cheap (B1's per-squad fetch, B2's flat forge-cache read)
+      // rather than a multi-MB `/api/tasks` refetch -- back when every flush
+      // cost that much, keeping the window short was what limited how often
+      // it fired. Now the window's only job is genuine event coalescing: a
+      // squad emitting Cartographer rows continuously (a whole cell
+      // finishing, several proof steps completing near-together) still
+      // easily produces more than one event inside 150ms, and each of those
+      // used to mean a separate flush. 500ms merges more of that burst into
+      // one flush while staying an order of magnitude faster than the 2s
+      // poll SSE replaced, and two orders of magnitude faster than the 60s
+      // reconciliation fallback underneath it.
+      const SSE_DEBOUNCE_MS = 500;
       /**
        * Replaces one squad's entry in `squads` with its fresh detail (Track
        * B / B1), or drops it if the squad no longer exists. Reuses
