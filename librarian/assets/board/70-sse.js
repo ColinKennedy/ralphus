@@ -75,6 +75,35 @@
         return !!(s && !s.isCollapsed && String(s).length && s.anchorNode && el.contains(s.anchorNode));
       }
       // RALPHUS-PRESERVE-USER-STATE:END
+      // RAL-481: a worktree/branch switch inside a review (selecting a
+      // different branch row, expanding/collapsing one, switching a
+      // multi-project tab) re-renders the whole review-detail pane via a
+      // direct call, which previously reset its scroll to the top --
+      // disruptive when a live-terminal peek box elsewhere in the pane is
+      // open and being watched. `preserveUserState` isn't the right tool
+      // here: it also snapshots every descendant `[id]` element's scrollTop
+      // (which would include an open peek box's `<pre>`) and force-restores
+      // that raw pixel offset after render, clobbering
+      // `restorePeekScrollPositions()`'s own atBottom-aware restore -- so a
+      // box pinned to "latest output" would snap back to a stale offset
+      // instead of following new output that arrived during the switch.
+      // This preserves only the pane's own outer scroll and leaves every
+      // peek box to its existing, more precise restore.
+      /**
+       * Re-renders `el` via `render()` while preserving only `el`'s own scroll
+       * position (RAL-481) -- deliberately not the descendant-scroll handling
+       * `preserveUserState` does, so an open live-terminal peek box's own
+       * atBottom-aware restore is left to win.
+       * @param {HTMLElement|null} el
+       * @param {() => void} render
+       * @returns {void}
+       */
+      function preservePaneScroll(el, render) {
+        if (!el) { render(); return; }
+        const top = el.scrollTop;
+        render();
+        if (top) el.scrollTop = top;
+      }
       // RALPHUS-RENDER-ALL:BEGIN
       /**
        * Re-renders the sidebar and graph unconditionally, and the details
