@@ -16,6 +16,33 @@ only a reachable daemon.
 > distributable bundle contains `ralphus-daemon`, `ralphus-librarian`,
 > `ralphus`, and `ralphus-runner` only. Build it yourself as below.
 
+## Setup shortcut: `ralphus mcp initialize`
+
+After `ralphus-mcp` has been built or installed, the CLI can configure a
+supported agent host for you:
+
+```bash
+ralphus mcp initialize <claude|codex|pi> [--profile-file <path>] [--dry-run] [--yes]
+```
+
+This is a shortcut for the host-specific registration and PATH setup below.
+It finds `ralphus-mcp`, registers it with the selected host, and adds the
+binary's directory to the selected shell profile when needed. It does **not**
+build `ralphus-mcp`; complete the build step first, or set
+`RALPHUS_MCP_PROGRAM` to the executable's absolute path.
+
+Start by previewing the exact changes:
+
+```bash
+ralphus mcp initialize codex --dry-run
+```
+
+Run the same command without `--dry-run` to confirm and apply the plan. Use
+`--yes` for a non-interactive apply, or `--profile-file <path>` to choose a
+profile instead of the shell-derived default. For Pi, the plan may also
+install the third-party Pi MCP Adapter; inspect its publisher and source in
+the dry-run output before applying it.
+
 ## Quickstart: Claude Code
 
 **1. Build the binary**

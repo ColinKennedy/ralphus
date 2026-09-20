@@ -3,7 +3,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -11,6 +11,9 @@ use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::cli_agent_common::{live_session_path, write_live_session_id};
+use crate::mcp_init::{
+    self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer, McpThirdPartyInstall,
+};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -47,6 +50,138 @@ impl PiBackend {
             return program;
         }
         shellcmd::find_program(&program).unwrap_or(program)
+    }
+}
+
+const MCP_ADAPTER_PACKAGE: &str = "npm:pi-mcp-adapter@2.34.0";
+const MCP_ADAPTER_REPOSITORY: &str = "https://github.com/nicobailon/pi-mcp-adapter";
+
+impl McpInitializer for PiBackend {
+    fn mcp_initialization_plan(
+        &self,
+        profile_path: PathBuf,
+    ) -> Result<McpInitializationPlan, String> {
+        let mcp_program = mcp_init::find_mcp_program()?;
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map_or_else(|| home.join(".pi").join("agent"), PathBuf::from);
+        let settings_path = agent_dir.join("settings.json");
+        let settings = read_mcp_json_object(&settings_path)?;
+        let needs_adapter = !settings
+            .get("packages")
+            .is_some_and(contains_mcp_adapter_package);
+        let config_path = home.join(".config").join("mcp").join("mcp.json");
+        let mut config = read_mcp_json_object(&config_path)?;
+        let mut edits = Vec::new();
+        let servers = config
+            .entry("mcpServers".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(servers) = servers.as_object_mut() else {
+            return Err(format!(
+                "{}: mcpServers must be a JSON object",
+                config_path.display()
+            ));
+        };
+        if !servers.contains_key("ralphus") {
+            servers.insert(
+                "ralphus".to_string(),
+                serde_json::json!({"command": mcp_program.display().to_string()}),
+            );
+            edits.push(McpFileEdit {
+                path: config_path,
+                description: "register the ralphus stdio MCP server for the Pi MCP adapter"
+                    .to_string(),
+                content: format_json(&config)?,
+                mode: McpFileEditMode::Replace,
+            });
+        }
+        let profile_text = std::fs::read_to_string(&profile_path).unwrap_or_default();
+        if !profile_text.contains("# Added by ralphus mcp initialize") {
+            edits.push(mcp_init::profile_path_edit(
+                profile_path,
+                mcp_program.parent().unwrap_or(Path::new(".")),
+            ));
+        }
+        Ok(McpInitializationPlan {
+            host: "pi",
+            mcp_program,
+            third_party_installs: if needs_adapter {
+                vec![McpThirdPartyInstall {
+                    description: format!("install Pi MCP Adapter ({MCP_ADAPTER_PACKAGE})"),
+                    publisher: "Nico Bailon (not Pi)".to_string(),
+                    url: MCP_ADAPTER_REPOSITORY.to_string(),
+                }]
+            } else {
+                Vec::new()
+            },
+            commands: Vec::new(),
+            edits,
+        })
+    }
+
+    fn apply_mcp_initialization(&self, plan: &McpInitializationPlan) -> Result<(), String> {
+        if !plan.third_party_installs.is_empty() {
+            run_pi_install(&self.launch_program())?;
+        }
+        mcp_init::apply_file_edits(&plan.edits)
+    }
+}
+
+fn read_mcp_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| format!("could not parse {}: {error}", path.display()))
+            .and_then(|value: Value| match value {
+                Value::Object(object) => Ok(object),
+                _ => Err(format!("{}: expected a JSON object", path.display())),
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
+
+fn format_json(value: &serde_json::Map<String, Value>) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map(|text| format!("{text}\n"))
+        .map_err(|error| format!("could not serialize Pi MCP config: {error}"))
+}
+
+fn contains_mcp_adapter_package(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_mcp_adapter_package),
+        Value::String(source) => source.contains("pi-mcp-adapter"),
+        Value::Object(object) => object.get("source").is_some_and(|source| {
+            source
+                .as_str()
+                .is_some_and(|text| text.contains("pi-mcp-adapter"))
+        }),
+        _ => false,
+    }
+}
+
+fn run_pi_install(program: &str) -> Result<(), String> {
+    let args = vec!["install".to_string(), MCP_ADAPTER_PACKAGE.to_string()];
+    let compound = crate::cli_agent_common::launcher_requires_shell(program);
+    let status = if compound {
+        let shell = if crate::cli_agent_common::is_windows_batch_launcher(program) {
+            "cmd".to_string()
+        } else {
+            shellcmd::resolve_shell(None)
+        };
+        let line = crate::cli_agent_common::shell_command_line(&shell, program, &args);
+        shellcmd::command_for_spawn_args(shellcmd::shell_spawn_args(&shell, &line), &args)
+            .map_err(|error| format!("could not prepare Pi MCP adapter install: {error}"))?
+            .status()
+    } else {
+        Command::new(program).args(&args).status()
+    }
+    .map_err(|error| format!("could not install Pi MCP adapter: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Pi MCP adapter installation failed with {status}"))
     }
 }
 

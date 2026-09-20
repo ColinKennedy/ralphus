@@ -11116,6 +11116,44 @@ fn capture_and_stop_node(store: &Store, squad_id: &str, req: &SetStatusBody) {
     capture_and_stop_nodes(store, squad_id, std::slice::from_ref(req));
 }
 
+/// Preserve an operator's explicit acceptance of a failed proof in the ghost
+/// read by downstream cells. The original proof-outcome note remains the
+/// ground truth; this supplement explains why scheduling may proceed anyway.
+fn note_manual_failed_proof_acceptance(store: &Store, squad_id: &str, req: &SetStatusBody) {
+    let cell_idx = if req.proof_scope == "cell" {
+        Some(req.cell_idx)
+    } else {
+        store.cells_of(squad_id).ok().and_then(|cells| {
+            cells
+                .into_iter()
+                .find(|cell| cell.task_idx == req.task_idx)
+                .map(|cell| cell.idx)
+        })
+    };
+    let Some(cell_idx) = cell_idx else {
+        return;
+    };
+    let scope = if req.proof_scope == "cell" {
+        "cell"
+    } else {
+        "task"
+    };
+    let note = format!(
+        "Daemon note: an operator manually changed failed {scope}-scoped proof step {} to done. \
+         This explicitly accepts the failed check result; it does not mean the proof passed.",
+        req.proof_idx
+    );
+    let uri = crate::ghost::cell_uri(squad_id, req.task_idx, cell_idx);
+    let _ = store.upsert_ghost(
+        &uri,
+        crate::ghost::KIND_CELL,
+        Some(squad_id),
+        None,
+        &note,
+        None,
+    );
+}
+
 /// Manually override the state of a squad, task, cell, or proof step (RAL-74).
 ///
 /// Routes through the same store setters used by natural transitions so that
@@ -11136,6 +11174,22 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
     let store = daemon.lock();
+    let accepted_failed_proof = if req.kind == "proof" && req.state == "done" {
+        store
+            .proof_state(
+                id,
+                req.task_idx,
+                &req.proof_scope,
+                req.cell_idx,
+                req.proof_idx,
+            )
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("failed")
+    } else {
+        false
+    };
     let stop_plan =
         if matches!(req.kind.as_str(), "task" | "cell" | "proof") && req.state == "cancelled" {
             match stop_cascade_plan(&store, id, &req) {
@@ -11290,6 +11344,9 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     };
     if let Err(e) = result {
         return store_error(&e);
+    }
+    if accepted_failed_proof {
+        note_manual_failed_proof_acceptance(&store, id, &req);
     }
     // RAL-315: a task cancelled here (directly, or via `apply_stop_cascade`
     // cancelling its owning task from a cell/proof-level stop) is invisible
@@ -12512,11 +12569,49 @@ fn guardian_list_prs(daemon: &Daemon, id: &str) -> Reply {
 /// auto-submitted stack went wrong. Dropped rows remain visible as history
 /// via `GET .../pull-request-stacks` (`PrStackView`/`group_into_stacks`);
 /// this never hard-deletes.
+///
+/// Dissolves any registered GitHub-native stack *before* clearing the local
+/// record of its number -- otherwise the stack object is left dangling on
+/// GitHub, still claiming every PR that was a member when this ran, and no
+/// later reconcile pass can ever free them into a fresh stack because
+/// ralphus has forgotten the number needed to unstack it (confirmed live on
+/// guardian-000000000113: `review pr unlink` cleared the local record but
+/// left the GitHub stack open with a since-closed PR still "in" it,
+/// orphaning its still-open sibling from ever showing as stacked again).
+/// Best-effort: unstack failures are logged, not fatal -- the local rows
+/// still get dropped and the number still gets cleared, matching the
+/// already-best-effort `NotFound` handling below.
 fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
-    let store = daemon.lock();
-    if let Err(e) = store.get_guardian(id) {
-        return store_error(&e);
+    let (guardian, stack_number) = {
+        let store = daemon.lock();
+        let guardian = match store.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        let stack_number = store.get_guardian_forge_stack_number(id).ok().flatten();
+        (guardian, stack_number)
+    };
+    if let Some(stack_number) = stack_number {
+        let root = Path::new(&guardian.git_root);
+        let forge_cfg = crate::config::resolve_forge(root);
+        match crate::forge::resolve_remote(root, &guardian.base_branch, &forge_cfg) {
+            Ok(client) => {
+                if let Err(e) = client.unstack(stack_number) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} could not dissolve github pr stack {stack_number} during unlink: {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not resolve a forge client to dissolve github pr stack {stack_number} during unlink: {e}"
+                );
+            }
+        }
     }
+    let store = daemon.lock();
     let dropped = match store.bulk_drop_open_pull_requests(id, "unlinked") {
         Ok(n) => n,
         Err(e) => return store_error(&e),
@@ -22583,6 +22678,51 @@ command = "true"
         assert_eq!(squad["tasks"][0]["cells"][0]["env_out_of_date"], false);
     }
 
+    #[test]
+    fn set_status_done_on_failed_proof_records_operator_acceptance_for_dependents() {
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
+            [[task.cell.proof]]\nid=\"check\"\ncommand=\"check\"\n";
+        let d = daemon();
+        let squad_id = "squad-000000000001";
+        route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
+        d.lock()
+            .set_proof_state(squad_id, 0, "cell", 0, 0, NodeState::Failed)
+            .unwrap();
+        let uri = crate::ghost::cell_uri(squad_id, 0, 0);
+        d.lock()
+            .upsert_ghost(
+                &uri,
+                crate::ghost::KIND_CELL,
+                Some(squad_id),
+                None,
+                "Daemon note: the proof failed.",
+                None,
+            )
+            .unwrap();
+
+        let status_body = serde_json::json!({
+            "kind": "proof",
+            "task_idx": 0,
+            "proof_scope": "cell",
+            "cell_idx": 0,
+            "proof_idx": 0,
+            "state": "done",
+        })
+        .to_string();
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/set-status",
+            &status_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let ghost = d.lock().get_ghost(&uri).unwrap().unwrap();
+        assert!(ghost.content.contains("the proof failed"));
+        assert!(ghost.content.contains("operator manually changed"));
+        assert!(ghost.content.contains("does not mean the proof passed"));
+    }
+
     /// A cell whose own proof never ran (e.g. it was previously blocked by a
     /// failed dependency, so it went straight to `failed` without its proof
     /// ever leaving `pending`) must actually report `done` -- not silently
@@ -23899,6 +24039,90 @@ command=\"c\"
         );
         assert_eq!(r2.status, 200);
         assert_eq!(r2.body, "{\"dropped\":0}");
+    }
+
+    #[test]
+    fn unlink_prs_dissolves_a_registered_github_stack_before_clearing_it() {
+        // Regression for the guardian-000000000113 incident: `review pr
+        // unlink` used to clear the local `forge_stack_number` without ever
+        // telling GitHub to dissolve the stack object it named. The object
+        // was left dangling on the forge, still claiming whichever PRs were
+        // members at unlink time, so no later reconcile pass could ever free
+        // them into a fresh stack -- a still-open PR stayed permanently
+        // grouped (on GitHub's side) with a since-closed sibling that ralphus
+        // itself had long forgotten about.
+        let repo = tmp_git_repo("unlink-stack");
+        let status = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/stacks/42/unstack");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let d = daemon();
+        let body = serde_json::json!({
+            "name": "r",
+            "base_branch": "main",
+            "git_root": repo.to_str().unwrap(),
+        })
+        .to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001".to_string();
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        d.lock().set_guardian_forge_stack_number(&gid, 42).unwrap();
+
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/pull-requests/unlink"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.body, "{\"dropped\":1}");
+
+        handle
+            .join()
+            .expect("unstack request never reached the mock forge server");
+        assert_eq!(d.lock().get_pull_request(&pr_id).unwrap().state, "dropped");
+        assert_eq!(
+            d.lock().get_guardian_forge_stack_number(&gid).unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -12,6 +12,12 @@
 /// unimplemented tool is.
 pub const EXCLUDED: &[(&[&str], &str)] = &[
     (
+        &["mcp", "initialize"],
+        "Chooses and writes a shell profile after an interactive path prompt, then presents a\
+         confirmation before modifying the host configuration; those user-controlled local-file\
+         edits do not have a single-request/response MCP shape.",
+    ),
+    (
         &["cell", "open-agent"],
         "Opens the real interactive agent in a new terminal for a human to drive directly \
          (RAL-288) -- it hands control to a live, attached TTY session, not a value it could \

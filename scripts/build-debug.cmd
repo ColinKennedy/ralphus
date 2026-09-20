@@ -89,6 +89,24 @@ rem    librarian exiting) tears the daemon down too. The daemon is launched via
 rem    PowerShell's Start-Process -PassThru so we capture its exact PID -- the
 rem    cleanup below kills only THAT process, not every ralphus-daemon.exe on
 rem    the box, so a second side-by-side instance (different ports) survives.
+rem    -NoNewWindow (not -WindowStyle Hidden) is required here: a hidden
+rem    window still gets its own console, which puts the daemon in a separate
+rem    console process group that never sees a Ctrl-C typed into this window --
+rem    only the foreground librarian.exe would die, and the taskkill below
+rem    never runs because Ctrl-C also triggers cmd's own "Terminate batch job
+rem    (Y/N)?" prompt, which aborts the rest of this script if answered Y.
+rem    -NoNewWindow keeps the daemon in this window's console/process group so
+rem    Ctrl-C kills it directly, independent of that prompt.
+rem
+rem    The PID comes back through a temp FILE, never through `for /f`. `for /f`
+rem    reads its child command's stdout over a pipe and keeps reading until
+rem    that pipe reports EOF -- and -NoNewWindow hands the daemon that very
+rem    same stdout handle, so the daemon holds the write end open for its
+rem    entire (unbounded) lifetime. The `for /f` would then never return, the
+rem    librarian below would never start, and the board would never come up.
+rem    -RedirectStandardOutput/-RedirectStandardError are absent for the same
+rem    reason; the daemon already writes everything to its configured log_path
+rem    (see ~/.config/ralphus/config.toml [daemon].log_path).
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 echo == starting stack ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
@@ -100,17 +118,19 @@ if "%db_path%"=="" (
     echo    db        -^> %db_path%
 )
 echo    librarian -^> http://127.0.0.1:%librarian_port%
+echo    board dev mode -^> reading librarian\assets from disk (RALPHUS_BOARD_ASSETS_DIR); edits are live on browser refresh
 set "ps_arglist=serve','--port','%daemon_port%"
 if not "%db_path%"=="" set "ps_arglist=%ps_arglist%','--db','%db_path%"
-rem NOTE: do NOT add -RedirectStandardError/-RedirectStandardOutput to this
-rem Start-Process. With a redirect, PowerShell holds the redirect pipe open for
-rem the whole lifetime of the (long-running) daemon, so the `for /f` capturing
-rem its .Id never sees the pipe close and this line HANGS forever -- the script
-rem then never reaches the librarian below and the board never comes up. The
-rem daemon already writes everything to its configured log_path (see
-rem ~/.config/ralphus/config.toml [daemon].log_path), so file capture here is
-rem redundant anyway.
-for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
+set "daemon_pid_file=%TEMP%\ralphus-debug-daemon-%daemon_port%.pid"
+del "%daemon_pid_file%" >nul 2>&1
+powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -NoNewWindow).Id | Set-Content -Encoding ascii -Path '%daemon_pid_file%'"
+set "daemon_pid="
+if exist "%daemon_pid_file%" set /p daemon_pid=<"%daemon_pid_file%"
+del "%daemon_pid_file%" >nul 2>&1
+if not defined daemon_pid (
+    echo failed to start the daemon: no pid captured 1>&2
+    exit /b 1
+)
 
 set "RALPHUS_BOARD_ASSETS_DIR=%root%\librarian\assets"
 "%root%\target\debug\ralphus-librarian.exe" serve --port %librarian_port%

@@ -16,6 +16,7 @@ pub mod execute;
 pub mod harness_backend;
 pub mod hostos;
 pub mod llm_client;
+pub mod mcp_init;
 pub mod otel;
 pub mod pi_backend;
 pub mod providers;

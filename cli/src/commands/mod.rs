@@ -16,6 +16,7 @@ pub mod cell;
 pub mod env;
 pub mod machine;
 pub mod mailbox;
+pub mod mcp;
 pub mod misc;
 pub mod project;
 pub mod proof;
@@ -182,6 +183,7 @@ pub enum Command {
     Proof(proof::ProofCommand),
     Review(review::ReviewCommand),
     Queue(queue::QueueCommand),
+    Mcp(mcp::McpCommand),
     /// `ralphus initialize git [--path P]`: enables git rerere+autoupdate in
     /// the target repository (defaults to cwd). No other `initialize`
     /// subcommand exists in the source today.
@@ -263,6 +265,7 @@ pub fn parse_args(args: &[String]) -> Command {
                 _ => Command::UsageError("initialize: expected 'git' subcommand".to_string()),
             }
         }
+        Some("mcp") => Command::Mcp(mcp::parse(&scanner.remaining())),
         Some("task") => Command::Task(task::parse(&scanner.remaining())),
         Some("cell") => Command::Cell(cell::parse(&scanner.remaining())),
         Some("proof") => Command::Proof(proof::parse(&scanner.remaining())),
@@ -338,6 +341,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Proof(c) => proof::dispatch(c, opts),
         Command::Review(c) => review::dispatch(c, opts),
         Command::Queue(c) => queue::dispatch(c, opts),
+        Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
