@@ -337,6 +337,7 @@ fn resolve_agent_for_path_with(
     if let Some(db_profile) = db.and_then(|db| db.profile.as_ref()) {
         let profiles = load_profiles_for_path_with(cwd, configuration_path_env)?;
         if profiles.contains_key(agent) {
+            // ralphus[ignore-rlog-pair]: operator advisory about profile collision; caller logs task outcome if relevant
             crate::rlog!(
                 WARNING,
                 "ralphus [agent-profiles] agent \"{agent}\" is defined both as a database \

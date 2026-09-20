@@ -642,7 +642,18 @@ use; see `READ_ONLY_NOTE`.
 ```
 - ralphus --daemon-url [url] --json --version  {Submit and manage autonomous agent tasks against the ralphus daemon.}
     - agent  {Inspect agent backends ralphus can run.}
+        - backend-command  {Administrative (RAL-473): override the invoked command for a built-in agent backend (claude-code/codex/pi). Affects every profile using that backend globally.}
+            - (read-only-safe) list  {Administrative (RAL-473): list every built-in backend's command override, if any.}
+            - (read-only-safe) profiles backend [str]  {Administrative (RAL-473): list agent profiles using a built-in backend (blast-radius check before changing its command).}
+            - reset backend [str]  {Administrative (RAL-473): reset a built-in backend to its compiled-in default command.}
+            - set backend [str] --command [argv]  {Administrative (RAL-473): set the global invoked command for a built-in backend (claude-code/codex/pi), e.g. a wrapper/compound command. Takes effect on the next cell/proof run, no daemon restart needed.}
         - (read-only-safe) list  {List supported agent backends and the models each is allowed to run.}
+        - profile  {Administrative (RAL-473): manage DB-backed agent profiles. Most users only need `ralphus agent list`.}
+            - create name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...]  {Administrative (RAL-473): create a new DB-backed agent profile. --set adds a literal env value, --link chains to another key in the same profile's env table (validated for cycles on save).}
+            - delete name [str] --force  {Administrative (RAL-473): delete an agent profile. Fails if it is still referenced by a stored squad/review unless --force is given.}
+            - (read-only-safe) get name [str]  {Administrative (RAL-473): show one agent profile's stored backend/model/env rows.}
+            - (read-only-safe) list  {Administrative (RAL-473): list all DB-backed agent profiles (built-in and custom).}
+            - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...]  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
         - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text]  {Edit a cell's fields.}
