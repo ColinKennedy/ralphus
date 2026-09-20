@@ -4,6 +4,7 @@
 //! `ThreadEvent` stream on stdout.
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
 use crate::cli_agent_common::{live_session_path, write_live_session_id};
+use crate::mcp_init::{self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer};
 use crate::shellcmd::{self, Env};
 use crate::tools::Workspace;
 
@@ -26,6 +28,49 @@ impl CodexBackend {
         self.program_override.clone().unwrap_or_else(|| {
             std::env::var("RALPHUS_CODEX_COMMAND").unwrap_or_else(|_| DEFAULT_PROGRAM.to_string())
         })
+    }
+}
+
+impl McpInitializer for CodexBackend {
+    fn mcp_initialization_plan(
+        &self,
+        profile_path: PathBuf,
+    ) -> Result<McpInitializationPlan, String> {
+        let mcp_program = mcp_init::find_mcp_program()?;
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        let config_path = home.join(".codex").join("config.toml");
+        let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let mut edits = Vec::new();
+        if !config_text.contains("[mcp_servers.ralphus]") {
+            let command = toml::Value::String(mcp_program.display().to_string()).to_string();
+            edits.push(McpFileEdit {
+                path: config_path,
+                description: "register the ralphus stdio MCP server for Codex".to_string(),
+                content: format!("\n[mcp_servers.ralphus]\ncommand = {command}\n"),
+                mode: McpFileEditMode::Append,
+            });
+        }
+        let profile_text = std::fs::read_to_string(&profile_path).unwrap_or_default();
+        let marker = "# Added by ralphus mcp initialize";
+        if !profile_text.contains(marker) {
+            edits.push(mcp_init::profile_path_edit(
+                profile_path,
+                mcp_program.parent().unwrap_or(Path::new(".")),
+            ));
+        }
+        Ok(McpInitializationPlan {
+            host: "codex",
+            mcp_program,
+            third_party_installs: Vec::new(),
+            commands: Vec::new(),
+            edits,
+        })
+    }
+
+    fn apply_mcp_initialization(&self, plan: &McpInitializationPlan) -> Result<(), String> {
+        mcp_init::apply_file_edits(&plan.edits)
     }
 }
 

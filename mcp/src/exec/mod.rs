@@ -87,6 +87,9 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Proof(c) => proof::execute(c, client),
         Command::Review(c) => review::execute(c, client),
         Command::Queue(c) => queue::execute(c, client),
+        Command::Mcp(_) => Err(usage(
+            "mcp initialize is excluded from the MCP tool surface",
+        )),
         Command::InitializeGit { path } => exec_initialize_git(path),
         Command::Project(c) => project::execute(c, client),
         Command::Machine(c) => machine::execute(c, client),

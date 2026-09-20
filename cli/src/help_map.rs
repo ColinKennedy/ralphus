@@ -743,6 +743,16 @@ const INITIALIZE_CHILDREN: &[HelpNode] = &[node(
     &[],
 )];
 
+const MCP_CHILDREN: &[HelpNode] = &[node(
+    "initialize",
+    &["host [claude|codex|pi]"],
+    &["--dry-run", "--profile-file [path]", "--yes"],
+    "Preview and apply the local MCP setup required by an agent host.",
+    false,
+    false,
+    &[],
+)];
+
 const TRIAGE_TYPE_CHILDREN: &[HelpNode] = &[
     node(
         "deregister",
@@ -1772,6 +1782,15 @@ tailing and --wait-until-valid are not yet ported).",
             false,
             true, // ("history",)
             &[],
+        ),
+        node(
+            "mcp",
+            &[],
+            &[],
+            "Configure agent hosts to use the ralphus MCP server.",
+            false,
+            false,
+            MCP_CHILDREN,
         ),
         node(
             "initialize",
