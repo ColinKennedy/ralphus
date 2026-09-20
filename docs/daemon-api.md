@@ -212,6 +212,7 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}/action-feedback` | [Pull un-actioned feedback](#post-apipull-requestspr_idaction-feedback) into the worktree |
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
+| POST | `/api/forge/webhook/{provider}` | [Receive a forge webhook delivery](#post-apiforgewebhookprovider-track-e-e2-e4) (`github`\|`gitlab`) -- the daemon's one unauthenticated route; self-authenticates via HMAC/token instead |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
@@ -2506,6 +2507,24 @@ backoff can now also be entered proactively, from a successful response's own
 `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers, before the forge ever
 returns a hard rate-limit error (Track A / A7).
 
+#### Webhook receiving (`[webhook]`, Track E / E1-E4)
+
+Per-project config (global + `.ralphus.toml` override, same layering as
+`[forge]`/`[review]`) controlling whether [`POST
+/api/forge/webhook/{provider}`](#post-apiforgewebhookprovider-track-e-e2-e4)
+below treats a project as a webhook delivery target at all:
+
+| `.ralphus.toml [webhook]` key | Meaning | Unset resolves to |
+|---|---|---|
+| `mode` | `"disabled"`, `"shadow"`, or `"active"`. An unrecognized value fails config load loudly (not silently treated as `"disabled"`) — security-adjacent config should fail closed and visibly, not leave webhooks off while the operator believes they're on. | `"disabled"` |
+| `secret_env` | Name of the environment variable (read from the daemon process's own environment, not stored in config) holding this project's webhook shared secret. | `RALPHUS_WEBHOOK_SECRET` |
+
+`mode` only gates whether a project is *considered* by the receive route
+(`"disabled"` is skipped outright, never counted as a verification
+candidate); `"shadow"` vs `"active"` distinguishes recording a delivery
+without acting on it from acting on it, both not yet implemented (Track E's
+later items).
+
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones
 change):
@@ -3777,6 +3796,41 @@ event. No `?category` filter here (RAL-375) — a watched entity's messages
 (e.g. a `review`-category PR/CI-watch notice, see the Mailbox row above)
 always surface through a personal watch regardless of category, so a client
 polling this endpoint sees them no matter which mode it's operating in.
+
+### `POST /api/forge/webhook/{provider}` (Track E, E2-E4)
+Receives a forge-delivered webhook event. `{provider}` is `github` or
+`gitlab`; any other value is `404 not_found`.
+
+**Auth.** This is the daemon's one unauthenticated route — a forge cannot
+send this daemon's bearer token, so `run_http_loop`'s HTTP boundary
+special-cases this exact path ahead of the ordinary `Daemon::authorized`
+check (see `answer_request` in `server.rs`) and dispatches to a dedicated
+handler instead. In its place, the delivery authenticates itself:
+
+- **GitHub**: `X-Hub-Signature-256` — HMAC-SHA256 over the raw request body,
+  keyed by the project's configured webhook secret (`sha256=<hex digest>`).
+- **GitLab**: `X-Gitlab-Token` — the shared secret sent verbatim, checked
+  with a constant-time compare.
+
+The URL carries no project name, since a forge delivers to one fixed
+endpoint per provider, not per project. Which project a delivery belongs to
+is discovered by whose configured secret it verifies against, not asserted
+by the caller: every registered project's effective `[webhook]` config
+(global + `.ralphus.toml`, see `[webhook]` below) is tried in turn, skipping
+any project whose resolved `mode` is `"disabled"` or whose configured secret
+env var isn't set in this process's environment. The first project whose
+secret verifies the delivery is the match.
+
+A verified delivery gets `200 {"status": "accepted"}` and a Cartographer row
+(`source: "webhook"`) naming the provider and matched project. An
+unverifiable delivery (wrong/missing signature, or no project's secret
+matches) gets `401 unauthorized` — the same error envelope as a missing
+bearer token elsewhere in the API.
+
+**Scope note.** This wires up receipt and verification only. Resolving a
+verified delivery to the PR/review it concerns, deduping retried deliveries
+(both forges retry undelivered webhooks), and the acknowledge-within-10s
+budget are separate, not-yet-implemented steps.
 
 ## Notes on future evolution
 

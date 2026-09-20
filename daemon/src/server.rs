@@ -14926,6 +14926,120 @@ pub fn serve_with_token(
 /// indefinitely.
 const EVENTS_PATH: &str = "/api/events";
 
+/// Match `POST /api/forge/webhook/{provider}` (Track E, E2) and return the
+/// raw `{provider}` path segment, unvalidated -- [`route_webhook`] is what
+/// rejects an unrecognized provider name, this only recognizes the shape.
+fn webhook_provider_from_path(url: &str) -> Option<String> {
+    let path_only = url.split('?').next().unwrap_or(url);
+    let segs: Vec<&str> = path_only.trim_matches('/').split('/').collect();
+    match segs.as_slice() {
+        ["api", "forge", "webhook", provider] => Some((*provider).to_string()),
+        _ => None,
+    }
+}
+
+/// Pure candidate-matching step for [`route_webhook`]: given each
+/// registered project's already-resolved webhook secret (`None` for a
+/// project with no live secret -- `[webhook].mode` is `Disabled`, its mode
+/// failed to parse, or its configured secret env var isn't set), find the
+/// first one the delivery verifies against.
+///
+/// Takes resolved secrets as a parameter rather than reading config/env
+/// itself, so it is directly testable without touching this process's real
+/// environment (`std::env::set_var` is `unsafe` and this workspace forbids
+/// `unsafe_code` outright) -- see `configuration_path_entries` in
+/// `config.rs` for the same testability pattern applied to another
+/// env-dependent config field.
+fn find_verified_webhook_project<'a>(
+    kind: crate::forge::ForgeKind,
+    body: &str,
+    github_signature: Option<&str>,
+    gitlab_token: Option<&str>,
+    candidates: &'a [(String, Option<String>)],
+) -> Option<&'a str> {
+    candidates.iter().find_map(|(name, secret)| {
+        let secret = secret.as_deref()?;
+        let verified = match kind {
+            crate::forge::ForgeKind::GitHub => github_signature.is_some_and(|sig| {
+                crate::webhook::verify_github_signature(secret.as_bytes(), body.as_bytes(), sig)
+            }),
+            crate::forge::ForgeKind::GitLab => {
+                gitlab_token.is_some_and(|token| crate::webhook::verify_gitlab_token(secret, token))
+            }
+        };
+        verified.then_some(name.as_str())
+    })
+}
+
+/// Handle a verified (or not) forge webhook delivery (Track E, E2-E4).
+///
+/// Unlike every other route, the URL carries no project name -- a forge
+/// delivers to one fixed endpoint per provider, not per project -- so which
+/// project a delivery belongs to is discovered by whose configured secret
+/// verifies it, not asserted by the caller. Each registered project's
+/// `[webhook]` config (`crate::config::resolve_webhook`) is resolved to a
+/// candidate secret (or `None`, see [`find_verified_webhook_project`]'s doc
+/// comment for the skip conditions), and the actual matching is delegated
+/// to that pure function.
+///
+/// Scope note: this wires up receipt and verification only. Resolving a
+/// verified delivery to the PR/review it concerns, deduping retried
+/// deliveries, and the acknowledge-within-10s budget are Track E's later
+/// items (E5-E7), not implemented here.
+fn route_webhook(
+    daemon: &Daemon,
+    provider: &str,
+    body: &str,
+    github_signature: Option<&str>,
+    gitlab_token: Option<&str>,
+) -> Reply {
+    let Some(kind) = crate::forge::ForgeKind::parse(provider) else {
+        return error(404, "not_found", "unknown webhook provider", vec![]);
+    };
+
+    let projects = match daemon.lock().list_projects() {
+        Ok(projects) => projects,
+        Err(e) => return store_error(&e),
+    };
+
+    let candidates: Vec<(String, Option<String>)> = projects
+        .iter()
+        .map(|project| {
+            let config = crate::config::resolve_webhook(std::path::Path::new(&project.path));
+            let secret = match config.mode() {
+                Ok(crate::config::WebhookMode::Disabled) | Err(_) => None,
+                Ok(_) => std::env::var(config.resolved_secret_env()).ok(),
+            };
+            (project.name.clone(), secret)
+        })
+        .collect();
+
+    match find_verified_webhook_project(kind, body, github_signature, gitlab_token, &candidates) {
+        Some(project_name) => {
+            let _ = daemon.lock().cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "webhook",
+                message: "verified webhook delivery received",
+                scope: Some("webhook"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"provider": kind.as_str(), "project": project_name}),
+                admin_only: false,
+            });
+            json(200, &serde_json::json!({"status": "accepted"}))
+        }
+        None => error(
+            401,
+            "unauthorized",
+            "webhook signature verification failed",
+            vec![],
+        ),
+    }
+}
+
 /// Case-insensitive header lookup (`tiny_http::Header::field` compares
 /// case-insensitively via `.equiv`).
 fn header_value(request: &tiny_http::Request, name: &'static str) -> Option<String> {
@@ -15029,6 +15143,12 @@ struct PendingRequest {
     traceparent: Option<String>,
     auth_header: Option<String>,
     user_header: Option<String>,
+    /// GitHub's `X-Hub-Signature-256` (E3) / GitLab's `X-Gitlab-Token` (E4)
+    /// webhook delivery headers -- captured unconditionally, like the other
+    /// headers above, but only ever read by [`route_webhook`] for
+    /// `POST /api/forge/webhook/{provider}`.
+    webhook_github_signature: Option<String>,
+    webhook_gitlab_token: Option<String>,
     cors: ralphus_core::cors::CorsDecision,
     /// When the accept loop finished reading this request, so the time it
     /// then spent waiting for a worker is reportable separately from the
@@ -15107,6 +15227,8 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         traceparent,
         auth_header,
         user_header,
+        webhook_github_signature,
+        webhook_gitlab_token,
         cors,
         accepted_at,
     } = pending;
@@ -15121,7 +15243,27 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     // HTTP boundary rather than inside `route()` so its ~100 in-process
     // unit tests stay auth-agnostic. `/api/events` never reaches this
     // point (handled in the accept loop); RAL-222 owns its auth separately.
-    let reply = if daemon.authorized(auth_header.as_deref()) {
+    //
+    // Track E, E2: `POST /api/forge/webhook/{provider}` is the one other
+    // exception -- a forge delivering a webhook cannot send this daemon's
+    // bearer token, so it authenticates itself instead (HMAC-SHA256 or a
+    // constant-time shared-secret compare, see `route_webhook`). Checked
+    // ahead of `daemon.authorized` rather than folded into it, so every
+    // other route's bearer-token requirement is untouched by this one path.
+    let webhook_provider = if method == "POST" {
+        webhook_provider_from_path(&url)
+    } else {
+        None
+    };
+    let reply = if let Some(provider) = webhook_provider {
+        route_webhook(
+            daemon,
+            &provider,
+            &body,
+            webhook_github_signature.as_deref(),
+            webhook_gitlab_token.as_deref(),
+        )
+    } else if daemon.authorized(auth_header.as_deref()) {
         route_with_trace_for_user(
             daemon,
             &method,
@@ -15293,6 +15435,8 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let traceparent = header_value(&request, "traceparent");
         let auth_header = header_value(&request, "Authorization");
         let user_header = header_value(&request, "X-Ralphus-User");
+        let webhook_github_signature = header_value(&request, "X-Hub-Signature-256");
+        let webhook_gitlab_token = header_value(&request, "X-Gitlab-Token");
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -15305,6 +15449,8 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             traceparent,
             auth_header,
             user_header,
+            webhook_github_signature,
+            webhook_gitlab_token,
             cors,
             accepted_at: Instant::now(),
         };
@@ -26683,5 +26829,119 @@ command=\"cargo test\"
              (samples: {all_samples:?})",
             all_samples.len(),
         );
+    }
+
+    // ── Track E, E2: forge webhook receive route ────────────────────────
+
+    #[test]
+    fn webhook_provider_from_path_matches_the_expected_shape() {
+        assert_eq!(
+            webhook_provider_from_path("/api/forge/webhook/github"),
+            Some("github".to_string())
+        );
+        assert_eq!(
+            webhook_provider_from_path("/api/forge/webhook/gitlab?x=1"),
+            Some("gitlab".to_string())
+        );
+    }
+
+    #[test]
+    fn webhook_provider_from_path_rejects_other_shapes() {
+        assert_eq!(webhook_provider_from_path("/api/forge/webhook"), None);
+        assert_eq!(
+            webhook_provider_from_path("/api/forge/webhook/github/extra"),
+            None
+        );
+        assert_eq!(webhook_provider_from_path("/api/projects"), None);
+        assert_eq!(webhook_provider_from_path("/"), None);
+    }
+
+    fn github_signed_header(secret: &str, body: &str) -> String {
+        use hmac::Mac;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256={hex}")
+    }
+
+    #[test]
+    fn find_verified_webhook_project_matches_github_signature_against_the_right_candidate() {
+        let body = r#"{"action":"opened"}"#;
+        let header = github_signed_header("secret-b", body);
+        let candidates = vec![
+            ("project-a".to_string(), Some("secret-a".to_string())),
+            ("project-b".to_string(), Some("secret-b".to_string())),
+        ];
+        let matched = find_verified_webhook_project(
+            crate::forge::ForgeKind::GitHub,
+            body,
+            Some(&header),
+            None,
+            &candidates,
+        );
+        assert_eq!(matched, Some("project-b"));
+    }
+
+    #[test]
+    fn find_verified_webhook_project_matches_gitlab_token_against_the_right_candidate() {
+        let candidates = vec![
+            ("project-a".to_string(), Some("secret-a".to_string())),
+            ("project-b".to_string(), Some("secret-b".to_string())),
+        ];
+        let matched = find_verified_webhook_project(
+            crate::forge::ForgeKind::GitLab,
+            "{}",
+            None,
+            Some("secret-b"),
+            &candidates,
+        );
+        assert_eq!(matched, Some("project-b"));
+    }
+
+    #[test]
+    fn find_verified_webhook_project_skips_candidates_with_no_resolved_secret() {
+        // `None` models a project whose `[webhook].mode` is `Disabled`, its
+        // mode failed to parse, or its secret env var isn't set -- none of
+        // these should ever be treated as a match, even by coincidence.
+        let candidates = vec![("project-a".to_string(), None)];
+        let matched = find_verified_webhook_project(
+            crate::forge::ForgeKind::GitLab,
+            "{}",
+            None,
+            Some(""),
+            &candidates,
+        );
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn find_verified_webhook_project_returns_none_when_nothing_verifies() {
+        let candidates = vec![("project-a".to_string(), Some("secret-a".to_string()))];
+        let matched = find_verified_webhook_project(
+            crate::forge::ForgeKind::GitLab,
+            "{}",
+            None,
+            Some("wrong-guess"),
+            &candidates,
+        );
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn route_webhook_rejects_unknown_provider() {
+        let d = daemon();
+        let reply = route_webhook(&d, "bitbucket", "{}", None, None);
+        assert_eq!(reply.status, 404);
+    }
+
+    #[test]
+    fn route_webhook_rejects_when_no_project_verifies() {
+        // No projects are registered in this in-memory store, so there are
+        // no candidates at all -- the delivery must still be rejected
+        // (401), not accepted by default.
+        let d = daemon();
+        let reply = route_webhook(&d, "github", "{}", Some("sha256=deadbeef"), None);
+        assert_eq!(reply.status, 401);
     }
 }
