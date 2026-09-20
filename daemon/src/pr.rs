@@ -125,8 +125,24 @@ pub struct PullRequestView {
     /// RAL-395: when auto-fix was last dispatched for the *current* failing
     /// CI state on this PR -- caps auto-fix at a single attempt per failure.
     /// `None` if never attempted for the current failure (or the PR isn't
-    /// currently failing).
+    /// currently failing). Cleared two ways: [`Store::set_pr_ci_status`] when
+    /// `ci_status` moves off `"failing"`, and (RAL-<new>) [`Store::update_pull_request_ex`]
+    /// whenever `last_pushed_sha` actually advances -- the latter exists
+    /// because a fresh commit can be observed `Failing` on its very first
+    /// poll with no intervening non-failing tick, which would otherwise leave
+    /// this marker latched from a prior, already-superseded failure.
     pub auto_fix_attempted_at_ms: Option<i64>,
+    /// RAL-<new>: when a mailbox notice was last sent telling a human that
+    /// this PR's single auto-fix attempt is used up and CI is still failing
+    /// -- caps that notice at one per exhausted attempt, the same way
+    /// `auto_fix_attempted_at_ms` caps the attempt itself, so a PR stuck
+    /// failing for hours doesn't re-notify on every 2-minute standing poll.
+    /// Cleared alongside `auto_fix_attempted_at_ms` by the same three paths
+    /// (a fresh non-failing `ci_status`, an advancing `last_pushed_sha`, or
+    /// an explicit reset), so the next genuine exhaustion notifies again.
+    /// `None` if never sent (including: never exhausted, or exhausted but not
+    /// yet noticed by a poll pass).
+    pub auto_fix_exhausted_notified_at_ms: Option<i64>,
     /// RAL-353: whether the forge currently reports this PR/MR as a draft
     /// (WIP). Written at create/adopt time from the forge's own `draft`
     /// field, then kept fresh by every CI probe
@@ -238,6 +254,7 @@ struct PrRow {
     ci_status: Option<String>,
     ci_failure_job_url: Option<String>,
     auto_fix_attempted_at_ms: Option<i64>,
+    auto_fix_exhausted_notified_at_ms: Option<i64>,
     draft: Option<bool>,
 }
 
@@ -266,12 +283,13 @@ impl From<PrRow> for PullRequestView {
             ci_status: r.ci_status,
             ci_failure_job_url: r.ci_failure_job_url,
             auto_fix_attempted_at_ms: r.auto_fix_attempted_at_ms,
+            auto_fix_exhausted_notified_at_ms: r.auto_fix_exhausted_notified_at_ms,
             draft: r.draft,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft, auto_fix_exhausted_notified_at_ms";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -298,6 +316,7 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         ci_failure_job_url: r.get(20)?,
         auto_fix_attempted_at_ms: r.get(21)?,
         draft: r.get(22)?,
+        auto_fix_exhausted_notified_at_ms: r.get(23)?,
     })
 }
 
@@ -542,19 +561,35 @@ impl Store {
         let new_pr_number = pr_number.unwrap_or(existing.pr_number);
         let new_pr_url = pr_url
             .map(|o| o.map(str::to_string))
-            .unwrap_or(existing.pr_url);
+            .unwrap_or_else(|| existing.pr_url.clone());
         let new_alias = branch_alias.unwrap_or(&existing.branch_alias);
         let new_state = state.unwrap_or(&existing.state);
         let new_base_ref = base_ref.unwrap_or(&existing.base_ref);
         let new_last_pushed_sha = last_pushed_sha
             .map(|o| o.map(str::to_string))
-            .unwrap_or(existing.last_pushed_sha);
+            .unwrap_or_else(|| existing.last_pushed_sha.clone());
         let new_last_pushed_base_ref = last_pushed_base_ref
             .map(|o| o.map(str::to_string))
             .unwrap_or(existing.last_pushed_base_ref);
+        // RAL-<new>: a genuinely new commit landing on this PR's branch always
+        // deserves a fresh auto-fix attempt, regardless of what `ci_status`
+        // does in between -- fixes guardian-000000000119 / PR #235, where the
+        // forge's very first post-push poll already came back `Failing` with
+        // no intervening `Pending`/`Passing` tick ever observed. That left
+        // `set_pr_ci_status`'s status-transition-based clear never firing, so
+        // the single-attempt cap stayed latched from the *previous* commit's
+        // failure and silently blocked every future auto-fix retry on this
+        // PR. Keying the reset off the sha actually advancing is authoritative
+        // where a status string is not.
+        let sha_advanced =
+            new_last_pushed_sha.is_some() && new_last_pushed_sha != existing.last_pushed_sha;
+        let had_attempt = existing.auto_fix_attempted_at_ms.is_some();
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
-             SET pr_number=?, pr_url=?, branch_alias=?, state=?, base_ref=?, last_pushed_sha=?, last_pushed_base_ref=?, updated_at_ms=?
+             SET pr_number=?, pr_url=?, branch_alias=?, state=?, base_ref=?, last_pushed_sha=?, last_pushed_base_ref=?,
+                 auto_fix_attempted_at_ms = CASE WHEN ? THEN NULL ELSE auto_fix_attempted_at_ms END,
+                 auto_fix_exhausted_notified_at_ms = CASE WHEN ? THEN NULL ELSE auto_fix_exhausted_notified_at_ms END,
+                 updated_at_ms=?
              WHERE id=?",
             params![
                 new_pr_number,
@@ -564,15 +599,45 @@ impl Store {
                 new_base_ref,
                 new_last_pushed_sha,
                 new_last_pushed_base_ref,
+                sha_advanced,
+                sha_advanced,
                 now_ms(),
                 id
             ],
         )?;
         if n == 0 {
-            Err(StoreError::NotFound)
-        } else {
-            Ok(())
+            return Err(StoreError::NotFound);
         }
+        // RAL-<new>: only worth a log when it actually undoes a live
+        // single-attempt cap -- every ordinary push (the common case) leaves
+        // `had_attempt` false and stays silent.
+        if sha_advanced && had_attempt {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] pr={id} auto-fix retry window reset: new commit {} pushed over previously-attempted {}",
+                new_last_pushed_sha.as_deref().unwrap_or("?"),
+                existing.last_pushed_sha.as_deref().unwrap_or("?")
+            );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "pr",
+                message: "auto-fix retry window reset: a new commit was pushed after the prior auto-fix attempt",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(&existing.guardian_id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "pr_id": id,
+                    "branch_id": existing.branch_id,
+                    "previous_sha": existing.last_pushed_sha,
+                    "new_sha": new_last_pushed_sha,
+                }),
+                admin_only: false,
+            });
+        }
+        Ok(())
     }
 
     /// Soft-delete a recorded PR mapping (RAL-300, soft-deleted since
@@ -792,20 +857,52 @@ impl Store {
     /// otherwise. Clears `auto_fix_attempted_at_ms` whenever the status is
     /// anything other than `"failing"`, so a *new* failure (after a passing
     /// or pending interval) gets a fresh auto-fix attempt rather than being
-    /// permanently capped by a stale marker from a prior failure.
+    /// permanently capped by a stale marker from a prior failure. This is a
+    /// secondary safety net, not the primary reset path -- see
+    /// `PullRequestView::auto_fix_attempted_at_ms`'s doc comment for why
+    /// [`Store::update_pull_request_ex`]'s sha-advance clear (RAL-<new>) is
+    /// the one that actually fires on a real post-push failure: that failure
+    /// can appear on the very first poll with no `Pending`/`Passing` tick for
+    /// this function to key off of.
     pub fn set_pr_ci_status(&self, id: &str, status: &str, job_url: Option<&str>) -> Result<()> {
+        let existing = self.get_pull_request(id).ok();
+        let had_attempt = existing
+            .as_ref()
+            .is_some_and(|pr| pr.auto_fix_attempted_at_ms.is_some());
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
              SET ci_status=?, ci_failure_job_url=?, updated_at_ms=?,
-                 auto_fix_attempted_at_ms = CASE WHEN ?='failing' THEN auto_fix_attempted_at_ms ELSE NULL END
+                 auto_fix_attempted_at_ms = CASE WHEN ?='failing' THEN auto_fix_attempted_at_ms ELSE NULL END,
+                 auto_fix_exhausted_notified_at_ms = CASE WHEN ?='failing' THEN auto_fix_exhausted_notified_at_ms ELSE NULL END
              WHERE id=?",
-            params![status, job_url, now_ms(), status, id],
+            params![status, job_url, now_ms(), status, status, id],
         )?;
         if n == 0 {
-            Err(StoreError::NotFound)
-        } else {
-            Ok(())
+            return Err(StoreError::NotFound);
         }
+        // RAL-<new>: only worth a log when this actually undoes a live
+        // single-attempt cap (the common case -- status staying the same, or
+        // a PR that was never auto-fixed -- stays silent).
+        if had_attempt && status != "failing" {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] pr={id} auto-fix retry window reset: ci status recovered to {status}"
+            );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "pr",
+                message: "auto-fix retry window reset: ci status moved off failing",
+                scope: Some("branch"),
+                squad_id: None,
+                guardian_id: existing.as_ref().map(|pr| pr.guardian_id.as_str()),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"pr_id": id, "new_status": status}),
+                admin_only: false,
+            });
+        }
+        Ok(())
     }
 
     /// RAL-353: record a PR/MR's current draft (WIP) state as observed from
@@ -833,6 +930,23 @@ impl Store {
     pub fn mark_pr_auto_fix_attempted(&self, id: &str) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=?, updated_at_ms=? WHERE id=?",
+            params![now_ms(), now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Mark that a human was just notified (mailbox) that this PR's single
+    /// auto-fix attempt is exhausted and CI is still failing (RAL-<new>) --
+    /// caps that notice at one per exhausted attempt, the same way
+    /// [`Self::mark_pr_auto_fix_attempted`] caps the attempt itself. Cleared
+    /// by the same paths that clear `auto_fix_attempted_at_ms`.
+    pub fn mark_pr_auto_fix_exhausted_notified(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET auto_fix_exhausted_notified_at_ms=?, updated_at_ms=? WHERE id=?",
             params![now_ms(), now_ms(), id],
         )?;
         if n == 0 {
@@ -1165,7 +1279,7 @@ impl Store {
     /// keeps reporting the same `"failing"` status forever.
     pub fn clear_pr_auto_fix_attempted(&self, id: &str) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=NULL, updated_at_ms=? WHERE id=?",
+            "UPDATE guardian_pull_requests SET auto_fix_attempted_at_ms=NULL, auto_fix_exhausted_notified_at_ms=NULL, updated_at_ms=? WHERE id=?",
             params![now_ms(), id],
         )?;
         if n == 0 {
@@ -1185,7 +1299,7 @@ impl Store {
     pub fn reset_open_pr_auto_fix_attempts(&self, guardian_id: &str) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE guardian_pull_requests
-             SET auto_fix_attempted_at_ms=NULL, updated_at_ms=?
+             SET auto_fix_attempted_at_ms=NULL, auto_fix_exhausted_notified_at_ms=NULL, updated_at_ms=?
              WHERE guardian_id=? AND state='open' AND auto_fix_attempted_at_ms IS NOT NULL",
             params![now_ms(), guardian_id],
         )?)
@@ -2786,6 +2900,31 @@ fn apply_pr_merge_state(
             );
             if state == "merged" {
                 freshly_merged.push(pr.clone());
+            } else {
+                // RAL-<new>: a PR closed without merging (state == "closed")
+                // was previously written with zero logging, unlike the
+                // sibling forge-error arm below -- a review can never satisfy
+                // "every linked PR merged" after this and would sit in
+                // `in_review` forever with no record of why.
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} pr {} observed closed (not merged) on the forge",
+                    pr.id
+                );
+                let guard = store.lock();
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "pr",
+                    message: "linked pr closed without merging",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"pr_id": pr.id}),
+                    admin_only: false,
+                });
             }
         }
         Ok(_) => {}
@@ -3705,6 +3844,30 @@ pub fn poll_pr_base_drift(
     let alias_by_branch = open_alias_by_branch(&prs);
 
     if routing.parent_client.is_none() && routing.fork_client.is_none() {
+        // RAL-<new>: this guardian has open, forge-numbered PRs (checked
+        // above), so a forge client having resolved at submission time but
+        // not now means something changed (token revoked, remote removed) --
+        // base-drift detection for this guardian's entire PR stack silently
+        // stops every poll from here on without this.
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {id} base drift poll skipped: no forge client could be resolved \
+             for either parent or fork"
+        );
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "pr",
+            message: "base drift poll skipped: no forge client resolved",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({}),
+            admin_only: false,
+        });
         return Ok(0);
     }
 
@@ -5631,7 +5794,32 @@ fn auto_submit_terminal_branches(
 pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, id: &str) {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
-        Err(_) => return,
+        Err(e) => {
+            // RAL-<new>: a branch's terminal transition already logged
+            // "auto-submit-pr-stack queued" (schedule_auto_submit_branch) to
+            // get this pass dispatched -- if the guardian lookup then fails
+            // here, that queued request just vanishes with nothing closing
+            // the loop on it.
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} auto-submit pass aborted: guardian lookup failed: {e}"
+            );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "auto-submit pass aborted: guardian lookup failed",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"error": e.to_string()}),
+                admin_only: false,
+            });
+            return;
+        }
     };
     if !guardian.effective_auto_submit_pr_stack {
         return;
@@ -7559,6 +7747,7 @@ mod tests {
             ci_status: None,
             ci_failure_job_url: None,
             auto_fix_attempted_at_ms: None,
+            auto_fix_exhausted_notified_at_ms: None,
             draft: None,
         }
     }
@@ -9880,6 +10069,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
+    }
+
+    #[test]
+    fn auto_fix_retry_gate_resets_on_a_new_push_even_with_no_intervening_non_failing_status() {
+        // Regression test for guardian-000000000119 / GitHub PR #235: the
+        // background auto-fix poller pushed a fix, then its very first
+        // post-push CI poll already came back `Failing` again with no
+        // `Pending`/`Passing` tick ever observed in between. Before RAL-<new>,
+        // `auto_fix_attempted_at_ms` (the single-attempt-per-failure cap) only
+        // cleared when `ci_status` moved off `"failing"` -- since it never
+        // did here, the marker stayed latched from the *first* failure and
+        // every subsequent auto-fix attempt was silently skipped forever.
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                "acme/w",
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+
+        // First failure observed; auto-fix dispatches and claims its single
+        // attempt for it.
+        store
+            .lock()
+            .set_pr_ci_status(&pr_id, "failing", None)
+            .unwrap();
+        store.lock().mark_pr_auto_fix_attempted(&pr_id).unwrap();
+        store
+            .lock()
+            .mark_pr_auto_fix_exhausted_notified(&pr_id)
+            .unwrap();
+
+        // Still the same commit, still failing (e.g. a routine repeat poll
+        // before any push happened) -- the cap must stay latched.
+        store
+            .lock()
+            .set_pr_ci_status(&pr_id, "failing", None)
+            .unwrap();
+        let mid = store.lock().get_pull_request(&pr_id).unwrap();
+        assert!(
+            mid.auto_fix_attempted_at_ms.is_some(),
+            "cap must stay latched while nothing has actually changed"
+        );
+        assert!(mid.auto_fix_exhausted_notified_at_ms.is_some());
+
+        // The auto-fix agent commits and pushes a real new commit.
+        store
+            .lock()
+            .update_pull_request_ex(
+                &pr_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some("newsha")),
+                None,
+            )
+            .unwrap();
+        let after_push = store.lock().get_pull_request(&pr_id).unwrap();
+        assert!(
+            after_push.auto_fix_attempted_at_ms.is_none(),
+            "a genuinely new commit must reset the retry cap immediately, \
+             before any CI poll even runs"
+        );
+        assert!(
+            after_push.auto_fix_exhausted_notified_at_ms.is_none(),
+            "the exhaustion notice must also reset so a real new exhaustion can notify again"
+        );
+
+        // The very first post-push poll already reports Failing -- no
+        // Pending/Passing tick in between, exactly the observed sequence in
+        // the reported bug.
+        store
+            .lock()
+            .set_pr_ci_status(&pr_id, "failing", None)
+            .unwrap();
+        let after_second_failure = store.lock().get_pull_request(&pr_id).unwrap();
+        assert!(
+            after_second_failure.auto_fix_attempted_at_ms.is_none(),
+            "the new failure must be eligible for its own fresh auto-fix attempt"
+        );
     }
 
     #[test]

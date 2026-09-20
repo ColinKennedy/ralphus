@@ -2761,6 +2761,12 @@ impl Store {
             // first real run under this column's existence.
             "ALTER TABLE proofs ADD COLUMN started_at_ms INTEGER",
             "ALTER TABLE proofs ADD COLUMN finished_at_ms INTEGER",
+            // RAL-<new>: a one-shot marker recording that a human was already
+            // notified (mailbox) that this PR's single auto-fix attempt is
+            // used up and CI is still failing -- caps that notice at one per
+            // exhausted attempt, mirroring `auto_fix_attempted_at_ms`'s own
+            // single-attempt cap, and cleared by the same paths that clear it.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_exhausted_notified_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

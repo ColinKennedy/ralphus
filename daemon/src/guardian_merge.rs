@@ -4665,7 +4665,21 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
 ) {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
-        Err(_) => return,
+        Err(e) => {
+            // RAL-<new>: every branch finished rebasing and this is the
+            // finalize step (combined worktree, manual commands, final
+            // checks, InReview transition) -- a silent return here can leave
+            // the review stuck in `Merging` forever with nothing recorded.
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::ERROR)
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    format!("finalize aborted: guardian record not found: {e}"),
+                    serde_json::json!({"error": e.to_string()}),
+                );
+            return;
+        }
     };
     if cancel.is_cancelled() {
         return;
@@ -5837,8 +5851,27 @@ pub fn run_feedback(
     // RAL-380: mark the reviewer message this call was invoked for as
     // `Failed` -- used on every early-exit path below that bails out before
     // the resolver agent (and therefore the main completion block further
-    // down) ever runs.
+    // down) ever runs. RAL-<new>: also log it -- `Store::set_message_action_status`
+    // itself has no logging of its own, so without this every one of this
+    // function's seven early-exit paths (guardian/branch not found, cancelled
+    // while waiting for the worktree lease, ...) previously vanished with
+    // zero trace, the closest direct analog in this file to the
+    // guardian-000000000119/PR#235 bug that motivated this audit.
     let fail_message = || {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} branch {branch_id} feedback request rejected before \
+             the resolver ran (message_seq={message_seq:?})"
+        );
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .guardian(id)
+            .scope("branch")
+            .emit(
+                &store.lock(),
+                "feedback request rejected before the resolver ran",
+                serde_json::json!({"branch_id": branch_id, "message_seq": message_seq}),
+            );
         if let Some(seq) = message_seq {
             let _ = store
                 .lock()
@@ -5896,6 +5929,12 @@ pub fn run_feedback(
             break;
         }
         if cancel.is_cancelled() {
+            // RAL-<new>: every other checkpoint that bails out on
+            // `cancel.is_cancelled()` calls `log_merge_cancelled` (see its
+            // own doc comment) -- this one, waiting to acquire the branch
+            // worktree lease, didn't, so a feedback round cancelled here left
+            // no trace distinguishing it from any other silent bail-out.
+            log_merge_cancelled(store, id);
             let _ = store.lock().clear_branch_pending_feedback(id, branch_id);
             fail_message();
             return FeedbackOutcome::default();
@@ -7166,7 +7205,22 @@ pub(crate) fn restack_stack_from(
 ) -> bool {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
-        Err(_) => return false,
+        Err(e) => {
+            // RAL-<new>: this is the shared entry point for both a detected
+            // manual push (`rebase_on_manual_push`) and pr.rs's stack-
+            // ancestry repair (a detected broken stack) -- a real,
+            // already-detected problem can be dropped here with nothing
+            // recording why the restack it prompted never happened.
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    format!("restack from position {from_position} aborted: guardian record not found: {e}"),
+                    serde_json::json!({"from_position": from_position, "detail": detail, "error": e.to_string()}),
+                );
+            return false;
+        }
     };
     let claimed = {
         let g = store.lock();
@@ -7175,6 +7229,17 @@ pub(crate) fn restack_stack_from(
                 .is_ok()
     };
     if !claimed {
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .guardian(id)
+            .emit(
+                &store.lock(),
+                format!(
+                    "restack from position {from_position} deferred: guardian not claimable \
+                     (not idle, or already claimed by another operation)"
+                ),
+                serde_json::json!({"from_position": from_position, "detail": detail}),
+            );
         return false;
     }
     let git_root = Workspace::for_guardian(store, id, PathBuf::from(&guardian.git_root));
