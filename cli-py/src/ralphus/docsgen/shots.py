@@ -162,7 +162,7 @@ def _cartographer_overview(page: Page) -> None:
         fixture_server(fixtures.CARTOGRAPHER_ROUTES) as daemon_url,
         librarian_server(daemon_url) as base_url,
     ):
-        _goto(page, base_url, "#/cartographer")
+        _goto(page, base_url, "#/logs")
         page.wait_for_selector("#cartographer-body table")
         _shoot(page, "cartographer-overview")
 

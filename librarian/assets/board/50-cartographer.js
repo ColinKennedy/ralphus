@@ -311,7 +311,7 @@
        * @param {number} id
        * @returns {string}
        */
-      function cartoRowUrl(id) { return `${location.origin}${location.pathname}#/cartographer?id=${id}`; }
+      function cartoRowUrl(id) { return `${location.origin}${location.pathname}#/logs?id=${id}`; }
       /**
        * Renders a copy-link button for one Cartographer row.
        * @param {number} id
@@ -562,4 +562,3 @@
         render();
         loadPrStackModal(gid).then(render);
       }
-
