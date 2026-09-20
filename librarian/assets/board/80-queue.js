@@ -49,12 +49,6 @@
       const Q_READINESS = ["ready", "blocked", "excluded", "running"];
       /** @type {{[key: string]: string}} */
       const qDotColor = { ready: "--done", blocked: "--queued", excluded: "--failed", running: "--running" };
-      /**
-       * Renders a colored status dot for a queue readiness value.
-       * @param {string} s
-       * @returns {string}
-       */
-      const qDot = (s) => `<span class="dot" style="background:${cvar(qDotColor[s] || "--muted")}"></span>`;
       // Roll a squad/task block's member readinesses up into one badge: fully
       // ready only if every member is; otherwise the worst case (excluded beats
       // blocked) so a header never claims "ready" while something under it isn't.
@@ -141,15 +135,31 @@
       }
 
       /**
-       * Renders the Queue tab's per-readiness filter checkboxes.
+       * Builds the Queue tab's Status dropdown config (RAL-475), from
+       * `Q_READINESS` and `queueUI.status`.
+       * @returns {StatusDropdownConfig}
+       */
+      function queueStatusDropdownConfig() {
+        return {
+          id: "queue",
+          label: "Status",
+          mode: "multi",
+          options: Q_READINESS.map((s) => ({ value: s, label: statusDropdownLabel(s), color: qDotColor[s] || "--muted" })),
+          selected: queueUI.status,
+          optionTip: (s) => `Show or hide ${s} items (only applies when 'ready-only' is off).`,
+          onToggle: queueToggleStatus,
+          onAll: () => queueAllStatus(true),
+          onNone: () => queueAllStatus(false),
+        };
+      }
+      /**
+       * Renders the Queue tab's Status dropdown.
        * @returns {void}
        */
       function renderQueueFilters() {
         const el = document.getElementById("queue-status-filters");
         if (!el) return;
-        el.innerHTML = Q_READINESS.map((s) =>
-          `<label data-tip="Show or hide ${s} items (only applies when 'ready-only' is off).">${qDot(s)}<input type="checkbox" ${queueUI.status.has(s) ? "checked" : ""} data-state="${esc(s)}" onchange="queueToggleStatus(this.dataset.state,this.checked)">${s}</label>`
-        ).join("");
+        renderStatusDropdown("queue-status-filters", queueStatusDropdownConfig());
       }
       /**
        * Toggles one readiness value in/out of the Queue tab's visibility filter.
@@ -158,6 +168,12 @@
        * @returns {void}
        */
       function queueToggleStatus(s, on) { on ? queueUI.status.add(s) : queueUI.status.delete(s); renderQueue(); queueEnsureSelectionVisible(); }
+      /**
+       * Shows or hides every readiness value at once (the Status dropdown's All/None actions).
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function queueAllStatus(on) { queueUI.status = on ? new Set(Q_READINESS) : new Set(); renderQueueFilters(); renderQueue(); queueEnsureSelectionVisible(); }
       /**
        * Toggles the Queue tab's "ready only" filter.
        * @param {boolean} on
