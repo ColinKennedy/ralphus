@@ -3670,7 +3670,6 @@ fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, R
             .unwrap_or_default();
         return Ok(user_name);
     }
-    eprintln!("DEBUG: Admin exists, requiring current user");
     let user_name = require_current_user(daemon, user_header)?;
     match daemon.lock().is_admin(&user_name) {
         Ok(true) => Ok(user_name),
