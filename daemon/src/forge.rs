@@ -380,6 +380,25 @@ pub struct CreatedStack {
     pub number: i64,
 }
 
+/// One row from a forge's webhook-*management* API (Track E, E8) --
+/// creating/listing/deleting a hook registered on the repo itself. Distinct
+/// from `crate::webhook`, which is the *receiving* side (verifying a
+/// delivery this endpoint's counterpart sends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeWebhook {
+    /// Forge-assigned id, as a string regardless of the forge's own numeric
+    /// type -- kept opaque since nothing here does arithmetic on it, only
+    /// round-trips it back into a `DELETE .../hooks/{id}` URL.
+    pub id: String,
+    pub url: String,
+    /// `true` for a GitHub hook with `active: true`. GitLab has no
+    /// equivalent boolean on hook creation/listing -- a GitLab hook is
+    /// always reported `true` here; its richer `alert_status`
+    /// (`executable`/`disabled`/`temporarily_disabled`) is a later ticket's
+    /// concern (E12), not read by this type.
+    pub active: bool,
+}
+
 /// A resolved connection to one forge repository: enough to create PRs, list
 /// comments, and fetch a PR template. Built by [`resolve_remote`].
 #[derive(Clone)]
@@ -2340,6 +2359,22 @@ impl ForgeClient {
         parse_body(resp)
     }
 
+    /// [`Self::send`], but keeping the structured [`ForgeError`] (Track E,
+    /// E8) -- same rationale as [`Self::get_structured`] alongside
+    /// [`Self::get`].
+    fn send_structured(
+        &self,
+        req: ureq::Request,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, ForgeError> {
+        let resp = req
+            .set("Content-Type", "application/json")
+            .send_string(&payload.to_string())
+            .map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        parse_body(resp).map_err(ForgeError::other)
+    }
+
     /// `GET`, parsing the JSON response body. See [`Self::send`]'s doc for
     /// why every read call in this file routes through this.
     fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
@@ -2356,6 +2391,116 @@ impl ForgeClient {
         let resp = req.call().map_err(|e| self.describe_evicting(e))?;
         self.note_rate_limit_headers(&resp);
         parse_body(resp).map_err(ForgeError::other)
+    }
+
+    /// `DELETE`, discarding the response body -- both forges return an empty
+    /// 204 for a successful webhook-hook deletion (Track E, E8), so there is
+    /// nothing here for [`parse_body`] to parse. `req.call()` already treats
+    /// a non-2xx status as `Err`, so success is exactly "no error".
+    fn delete_structured(&self, req: ureq::Request) -> Result<(), ForgeError> {
+        req.call().map_err(|e| self.describe_evicting(e))?;
+        Ok(())
+    }
+
+    /// Create a webhook on this repo pointed at `callback_url` (Track E,
+    /// E8) -- expected to already be the full `.../api/forge/webhook/
+    /// {provider}` address, since this daemon has no way to know its own
+    /// externally-reachable URL. Subscribed only to pull/merge-request
+    /// lifecycle events, the only event type
+    /// [`crate::webhook::extract_pr_hint`] (E5) parses a PR/MR out of --
+    /// subscribing to anything broader would just be unread noise on the
+    /// receiving end.
+    pub fn create_webhook(
+        &self,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<ForgeWebhook, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "name": "web",
+                    "config": {
+                        "url": callback_url,
+                        "content_type": "json",
+                        "secret": secret,
+                        "insecure_ssl": "0",
+                    },
+                    "events": ["pull_request"],
+                    "active": true,
+                });
+                let body = self.send_structured(
+                    ureq::post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                parse_github_webhook(&body)
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/hooks", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "url": callback_url,
+                    "token": secret,
+                    "merge_requests_events": true,
+                    "push_events": false,
+                });
+                let body =
+                    self.send_structured(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                parse_gitlab_webhook(&body)
+            }
+        }
+    }
+
+    /// List every webhook registered on this repo (Track E, E8) -- not
+    /// filtered to ones this daemon created; a caller matches by URL to
+    /// find its own.
+    pub fn list_webhooks(&self) -> Result<Vec<ForgeWebhook>, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        let req = match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks", self.api_base, self.repo_path);
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/hooks", self.api_base, self.repo_path);
+                ureq::get(&url).set("PRIVATE-TOKEN", token)
+            }
+        };
+        let body = self.get_structured(req)?;
+        let rows = body.as_array().cloned().unwrap_or_default();
+        rows.iter()
+            .map(|row| match self.kind {
+                ForgeKind::GitHub => parse_github_webhook(row),
+                ForgeKind::GitLab => parse_gitlab_webhook(row),
+            })
+            .collect()
+    }
+
+    /// Delete a webhook by its forge-assigned id (Track E, E8) -- the same
+    /// `id` [`Self::create_webhook`]/[`Self::list_webhooks`] return.
+    pub fn delete_webhook(&self, hook_id: &str) -> Result<(), ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks/{hook_id}", self.api_base, self.repo_path);
+                self.delete_structured(
+                    ureq::delete(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}",
+                    self.api_base, self.repo_path
+                );
+                self.delete_structured(ureq::delete(&url).set("PRIVATE-TOKEN", token))
+            }
+        }
     }
 
     /// Read GitHub's `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers off
@@ -2560,6 +2705,51 @@ fn parse_body(resp: ureq::Response) -> Result<serde_json::Value, String> {
         .into_string()
         .map_err(|e| format!("forge API read: {e}"))?;
     serde_json::from_str(&body).map_err(|e| format!("forge API JSON parse: {e}"))
+}
+
+/// Parse one GitHub webhook-management row (`{"id", "config": {"url"},
+/// "active"}`) into a [`ForgeWebhook`] (Track E, E8).
+fn parse_github_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeError> {
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ForgeError::other("missing hook id in GitHub response"))?;
+    let url = v
+        .get("config")
+        .and_then(|c| c.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let active = v
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(ForgeWebhook {
+        id: id.to_string(),
+        url,
+        active,
+    })
+}
+
+/// Parse one GitLab webhook-management row (`{"id", "url"}`) into a
+/// [`ForgeWebhook`] (Track E, E8). GitLab has no boolean `active` field on
+/// this endpoint, so a present row is always reported `active: true` here --
+/// see [`ForgeWebhook::active`]'s doc comment.
+fn parse_gitlab_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeError> {
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ForgeError::other("missing hook id in GitLab response"))?;
+    let url = v
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(ForgeWebhook {
+        id: id.to_string(),
+        url,
+        active: true,
+    })
 }
 
 /// Parse a git remote URL into `(host, path)`, where `path` has no leading
@@ -6165,6 +6355,177 @@ mod tests {
             panic!("expected a fresh body");
         };
         assert_eq!(comments[0].author, "carol");
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E8: webhook management (install/list/uninstall) ───────
+
+    #[test]
+    fn parse_github_webhook_reads_id_url_and_active() {
+        let row = serde_json::json!({
+            "id": 42,
+            "config": {"url": "https://ralphus.example.com/api/forge/webhook/github"},
+            "active": true,
+        });
+        let hook = parse_github_webhook(&row).unwrap();
+        assert_eq!(hook.id, "42");
+        assert_eq!(
+            hook.url,
+            "https://ralphus.example.com/api/forge/webhook/github"
+        );
+        assert!(hook.active);
+    }
+
+    #[test]
+    fn parse_github_webhook_rejects_a_missing_id() {
+        let row = serde_json::json!({"config": {"url": "https://x"}, "active": true});
+        assert!(parse_github_webhook(&row).is_err());
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reads_id_and_url_and_is_always_active() {
+        let row = serde_json::json!({
+            "id": 7,
+            "url": "https://ralphus.example.com/api/forge/webhook/gitlab",
+            "merge_requests_events": true,
+        });
+        let hook = parse_gitlab_webhook(&row).unwrap();
+        assert_eq!(hook.id, "7");
+        assert_eq!(
+            hook.url,
+            "https://ralphus.example.com/api/forge/webhook/gitlab"
+        );
+        assert!(hook.active);
+    }
+
+    #[test]
+    fn create_webhook_posts_the_expected_github_shape() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["config"]["url"],
+                "https://ralphus.example.com/api/forge/webhook/github"
+            );
+            assert_eq!(v["config"]["secret"], "shh");
+            assert_eq!(v["events"], serde_json::json!(["pull_request"]));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":42,"config":{"url":"https://ralphus.example.com/api/forge/webhook/github"},"active":true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .create_webhook(
+                "https://ralphus.example.com/api/forge/webhook/github",
+                "shh",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "42");
+        assert!(hook.active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_webhook_posts_the_expected_gitlab_shape() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["url"],
+                "https://ralphus.example.com/api/forge/webhook/gitlab"
+            );
+            assert_eq!(v["token"], "shh");
+            assert_eq!(v["merge_requests_events"], true);
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":7,"url":"https://ralphus.example.com/api/forge/webhook/gitlab"}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .create_webhook(
+                "https://ralphus.example.com/api/forge/webhook/gitlab",
+                "shh",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "7");
+        assert!(hook.active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_webhooks_parses_a_github_array() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks");
+            req.respond(tiny_http::Response::from_string(
+                r#"[{"id":1,"config":{"url":"https://a"},"active":true},{"id":2,"config":{"url":"https://b"},"active":false}]"#,
+            ))
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hooks = client.list_webhooks().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].id, "1");
+        assert!(hooks[0].active);
+        assert!(!hooks[1].active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_webhook_sends_a_delete_to_the_right_url() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Delete);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks/7");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.delete_webhook("7").unwrap();
         handle.join().unwrap();
     }
 }

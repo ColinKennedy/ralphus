@@ -549,6 +549,38 @@ impl DaemonClient {
         self.delete(&path)
     }
 
+    /// `POST /api/projects/{name}/webhook/install` (Track E, E8).
+    /// `daemon_url` is this daemon's own externally-reachable base URL --
+    /// there is no way for the daemon process to determine that itself
+    /// (NAT, a reverse proxy, a tunnel), so the caller supplies it.
+    pub fn install_project_webhook(
+        &self,
+        project: &str,
+        daemon_url: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/install"),
+            Some(json!({"daemon_url": daemon_url})),
+        )
+    }
+
+    /// `GET /api/projects/{name}/webhook/status` (Track E, E8).
+    pub fn project_webhook_status(&self, project: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{project}/webhook/status"))
+    }
+
+    /// `POST /api/projects/{name}/webhook/uninstall` (Track E, E8).
+    pub fn uninstall_project_webhook(
+        &self,
+        project: &str,
+        hook_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/uninstall"),
+            Some(json!({"hook_id": hook_id})),
+        )
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see

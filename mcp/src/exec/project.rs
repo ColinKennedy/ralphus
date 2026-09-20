@@ -2,7 +2,7 @@
 
 use ralphus_cli::client::{DaemonClient, ProjectReviewSettingsPatch};
 use ralphus_cli::commands::project::{
-    ProjectCommand, ProjectForkCommand, ProjectReviewSettingsCommand,
+    ProjectCommand, ProjectForkCommand, ProjectReviewSettingsCommand, ProjectWebhookCommand,
 };
 
 use super::{ExecResult, usage};
@@ -37,6 +37,7 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
         ProjectCommand::Remove { name } => Ok(client.remove_project(&name)?),
         ProjectCommand::Fork(cmd) => exec_fork(cmd, client),
         ProjectCommand::ReviewSettings(cmd) => exec_review_settings(cmd, client),
+        ProjectCommand::Webhook(cmd) => exec_webhook(cmd, client),
     }
 }
 
@@ -123,6 +124,22 @@ fn exec_fork(cmd: ProjectForkCommand, client: &DaemonClient) -> ExecResult {
         )?),
         ProjectForkCommand::Remove { project, user } => {
             Ok(client.remove_project_fork(&project, user.as_deref().unwrap_or(""))?)
+        }
+    }
+}
+
+fn exec_webhook(cmd: ProjectWebhookCommand, client: &DaemonClient) -> ExecResult {
+    match cmd {
+        ProjectWebhookCommand::Help | ProjectWebhookCommand::UsageError(_) => {
+            Err(usage("no such tool"))
+        }
+        ProjectWebhookCommand::Install {
+            project,
+            daemon_url,
+        } => Ok(client.install_project_webhook(&project, &daemon_url)?),
+        ProjectWebhookCommand::Status { project } => Ok(client.project_webhook_status(&project)?),
+        ProjectWebhookCommand::Uninstall { project, hook_id } => {
+            Ok(client.uninstall_project_webhook(&project, &hook_id)?)
         }
     }
 }

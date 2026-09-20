@@ -1112,6 +1112,43 @@ unset) -- existing reviews are unaffected.",
     ),
 ];
 
+// Track E, E8: explicit, manually-triggered forge webhook
+// install/status/uninstall -- see `crate::commands::project::ProjectWebhookCommand`.
+const PROJECT_WEBHOOK_CHILDREN: &[HelpNode] = &[
+    node(
+        "install",
+        &["project [str]"],
+        &["--daemon-url [url]"],
+        "Register a live webhook on the project's forge repo, pointed at this daemon's own \
+POST /api/forge/webhook/{provider} receive route. --daemon-url is this daemon's own \
+externally-reachable base URL (it cannot determine that itself). Requires the project's \
+[webhook] secret_env variable to already be set in the daemon's own process environment.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "status",
+        &["project [str]"],
+        &[],
+        "List every webhook currently registered on the project's forge repo (not filtered \
+to ones ralphus installed -- match by url).",
+        false,
+        true, // ("project", "webhook", "status")
+        &[],
+    ),
+    node(
+        "uninstall",
+        &["project [str]"],
+        &["--hook-id [id]"],
+        "Delete one webhook from the project's forge repo by its forge-assigned id (see \
+`project webhook status` for the id).",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const PROJECT_CHILDREN: &[HelpNode] = &[
     node(
         "fork",
@@ -1178,6 +1215,16 @@ agent/model, machine, budget, proof scope, and the project-level equivalents of 
         false,
         false,
         PROJECT_REVIEW_SETTINGS_CHILDREN,
+    ),
+    node(
+        "webhook",
+        &[],
+        &[],
+        "Manage a live forge webhook for a project (Track E, E8): explicit install/status/\
+uninstall only -- no automatic lifecycle management (secret rotation, address change) yet.",
+        false,
+        false,
+        PROJECT_WEBHOOK_CHILDREN,
     ),
 ];
 

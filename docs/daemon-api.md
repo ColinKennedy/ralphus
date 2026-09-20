@@ -212,7 +212,10 @@ produced no pane output.
 | POST | `/api/pull-requests/{pr_id}/action-feedback` | [Pull un-actioned feedback](#post-apipull-requestspr_idaction-feedback) into the worktree |
 | GET | `/api/pull-requests/{pr_id}/sync-status` | [Drift check](#get-apipull-requestspr_idsync-status) between the PR branch and the review worktree (RAL-190) |
 | POST | `/api/pull-requests/{pr_id}/pull-from-pr` | [Pull PR-branch commits](#post-apipull-requestspr_idpull-from-pr) into the review worktree (RAL-190) |
-| POST | `/api/forge/webhook/{provider}` | [Receive a forge webhook delivery](#post-apiforgewebhookprovider-track-e-e2-e4) (`github`\|`gitlab`) -- the daemon's one unauthenticated route; self-authenticates via HMAC/token instead |
+| POST | `/api/forge/webhook/{provider}` | [Receive a forge webhook delivery](#post-apiforgewebhookprovider-track-e-e2-e7) (`github`\|`gitlab`) -- the daemon's one unauthenticated route; self-authenticates via HMAC/token instead |
+| POST | `/api/projects/{name}/webhook/install` | [Register a live webhook](#post-apiprojectsnamewebhookinstall-track-e-e8) on the project's forge repo, pointed at this daemon's receive route |
+| GET | `/api/projects/{name}/webhook/status` | [List webhooks](#get-apiprojectsnamewebhookstatus-track-e-e8) currently registered on the project's forge repo |
+| POST | `/api/projects/{name}/webhook/uninstall` | [Delete a webhook](#post-apiprojectsnamewebhookuninstall-track-e-e8) from the project's forge repo by id |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
@@ -3855,6 +3858,58 @@ budget (GitHub marks a delivery failed and retries it if no response arrives
 within 10s). Safe because the handler only touches `Store` through its own
 internal locking, the same guarantee `read_pool`'s concurrent GET workers
 already rely on.
+
+### `POST /api/projects/{name}/webhook/install` (Track E, E8)
+Registers a live webhook on the project's forge repo, pointed at [`POST
+/api/forge/webhook/{provider}`](#post-apiforgewebhookprovider-track-e-e2-e7)
+above. Admin-gated (a wrong caller could point a repo's webhook at an
+attacker-controlled URL).
+
+```json
+{ "daemon_url": "https://ralphus.example.com" }
+```
+
+`daemon_url` is this daemon's own externally-reachable base URL — there is no
+way for the daemon process to determine that itself (NAT, a reverse proxy, a
+tunnel), so the caller supplies it; `/api/forge/webhook/{provider}` is
+appended automatically. Requires the project's effective `[webhook]`
+`secret_env` variable (see below) to already be set in this daemon's own
+process environment — `400 bad_request` naming the unset variable
+otherwise, since an installed hook with no matching secret would never
+verify (E3/E4) once deliveries start arriving. `404 not_found` for an
+unregistered project name. On success, `201` with the created hook:
+
+```json
+{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true }
+```
+
+Manual/explicit only — no automatic lifecycle management (secret rotation,
+address change, project removal) yet; that is a later ticket (E9).
+
+### `GET /api/projects/{name}/webhook/status` (Track E, E8)
+Lists every webhook currently registered on the project's forge repo — not
+filtered to ones this daemon installed (a forge has no ownership concept for
+a hook), so the caller matches by `url`:
+
+```json
+{ "hooks": [{ "id": "42", "url": "https://ralphus.example.com/api/forge/webhook/github", "active": true }] }
+```
+
+Read-only; not admin-gated (matches `GET /api/projects` being open to every
+caller above). `404 not_found` for an unregistered project name.
+
+### `POST /api/projects/{name}/webhook/uninstall` (Track E, E8)
+Deletes one webhook from the project's forge repo by its forge-assigned id
+(from `GET .../webhook/status`). Admin-gated, same rationale as `install`.
+
+```json
+{ "hook_id": "42" }
+```
+
+`hook_id` is required rather than inferred — a repo can carry other,
+unrelated webhooks, and guessing which one to delete risks removing someone
+else's hook. `200 {"deleted": true}` on success; `404 not_found` for an
+unregistered project name.
 
 ## Notes on future evolution
 
