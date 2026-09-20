@@ -628,6 +628,30 @@
           if (idx === -1) squads.push(detail); else squads[idx] = detail;
         } catch (e) { /* transient -- leave the cached row as-is */ }
       }
+      // Track B / B4: the gain B1 + B3 claim, recorded rather than assumed
+      // (computed from documented/measured figures already in this file and
+      // the audit that drove this track, not a live-traffic capture -- this
+      // environment has no running board with real users to sample):
+      //
+      //   Before (no targeted refresh, 150ms debounce): every flush repaints
+      //   the whole board from `GET /api/tasks`, which the audit measured at
+      //   6.2MB against a real squad history. A squad emitting Cartographer
+      //   rows continuously produced roughly 7 flushes/sec at the old
+      //   debounce window -- about 43MB/sec of board traffic for that one
+      //   actively-running squad's tab.
+      //
+      //   After (B1 targeted refresh, B3's 500ms debounce): a flush instead
+      //   fetches just the changed squad via `GET /api/squads/{id}`, ~10KB
+      //   per `ensurePromptCache`'s own doc comment above -- and the wider
+      //   window caps flushes at roughly 2/sec even under continuous churn.
+      //   About 20KB/sec for the same scenario: a ~2000x reduction.
+      //
+      //   Not reduced by this track: a burst touching many *different*
+      //   squads at once now costs one small request per squad rather than
+      //   one large one for everything -- more requests, but each is small
+      //   enough (~10KB) that the total is still far below one 6.2MB fetch
+      //   unless several hundred squads change in the same debounce window,
+      //   a scenario this codebase has no evidence of occurring in practice.
       /**
        * SSE-driven targeted refresh for the Squads/Tasks tabs (Track B / B1):
        * fetches and merges just the squads named by `squadIds` in place of
