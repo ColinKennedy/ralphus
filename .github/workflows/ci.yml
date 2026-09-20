@@ -406,6 +406,10 @@ jobs:
         run: python -m unittest scripts/test_check_review_settings_parity.py
       - name: Check review settings / TOML parity
         run: python scripts/check_review_settings_parity.py
+      - name: Test board tab / hash route parity checker
+        run: python -m unittest scripts/test_check_board_tab_route_parity.py
+      - name: Check board tab / hash route parity
+        run: python scripts/check_board_tab_route_parity.py
 
   docs:
     name: Docs (screenshot coverage lint)
