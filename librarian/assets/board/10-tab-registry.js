@@ -215,6 +215,36 @@
       let secretEnvNames = [];
       /** Message from the last failed add/rename/remove, shown inline above the table. */
       let secretEnvNameError = "";
+      // ---- Agents tab (RAL-473: DB-backed agent profiles + built-in backend command overrides) ----
+      /** @type {AgentProfileView[]} */
+      let agentProfiles = [];
+      /** Message from the last failed profile list load, shown inline above the table. */
+      let agentProfilesError = "";
+      /** @type {AgentBackendCommandView[]} */
+      let agentBackendCommands = [];
+      /** Message from the last failed backend-command load/save/reset, shown inline above the backend-command table. */
+      let agentBackendCommandsError = "";
+      /** The backend whose command-override row is mid-edit, or null. */
+      let agentBackendCommandEditing = /** @type {string|null} */ (null);
+      /** @type {AgentProfileView[]|null} profiles that would be affected by the in-flight backend-command edit's blast radius, or null when not showing one. */
+      let agentBackendCommandBlastRadius = null;
+      /**
+       * Staged edits for the profile currently open in the create/edit form,
+       * or null when the form is closed. Nothing here reaches the daemon
+       * until "Save Agent" is clicked -- the env table in particular is
+       * client-side-only until then, including any `Link` entry (RAL-473
+       * interview: the API never returns a resolved Link value, so there is
+       * nothing to stage from the server beyond the raw key/kind/value rows
+       * already in `AgentProfileView.env`).
+       * @type {{editingName: string|null, name: string, backend: string, executable: string, model: string, env: AgentEnvEntry[]}|null}
+       */
+      let agentProfileForm = null;
+      /** Message from the last failed profile save, shown inside the create/edit form. */
+      let agentProfileFormError = "";
+      /** @type {AgentProfileReferences|null} references reported by the last blocked (409) delete attempt, keyed by the profile name pending a forced re-delete. */
+      let agentProfileDeleteBlocked = null;
+      /** The profile name a blocked delete's confirmation is pending for, or null. */
+      let agentProfileDeletePendingName = /** @type {string|null} */ (null);
       // ---- Preferences tab (RAL-329: per-user hidden squads/reviews, built on RAL-328; RAL-365 adds tasks) ----
       /** The three `HiddenItem.kind` values. */
       const HIDDEN_KINDS = ["squad", "review", "task"];
@@ -260,7 +290,7 @@
       // must not misfire just because the very first fetch hasn't landed.
       let whoAmIResolved = false;
       /** Tab names only ever shown to an admin (client-side hide -- the daemon enforces this server-side too). */
-      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets", "worktree-retirement", "health"];
+      const ADMIN_ONLY_TABS = ["machines", "triage", "projects", "users", "secrets", "worktree-retirement", "health", "agents"];
       // RAL-332 "Edit Profile": the target user name an admin is viewing
       // RAL-329's Preferences page as, or null for "viewing your own". Set by
       // `editUserProfile`, cleared the moment the admin navigates off the

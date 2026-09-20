@@ -1207,6 +1207,20 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_profiles (
+                name          TEXT PRIMARY KEY,
+                backend       TEXT NOT NULL,
+                executable    TEXT,
+                model         TEXT,
+                env_json      TEXT NOT NULL DEFAULT '[]',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_backend_commands (
+                backend       TEXT PRIMARY KEY,
+                command       TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS squads (
                 id            TEXT PRIMARY KEY,
                 label         TEXT,

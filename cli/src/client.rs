@@ -239,6 +239,17 @@ fn redact_env_map(value: &mut Value, preserve_null_tombstones: bool) {
 }
 
 /// Builds a query string from `(key, value)` pairs, skipping `None` values.
+/// Builds the `env` array a `create_agent_profile`/`update_agent_profile`
+/// request body expects, from `(key, kind, value)` triples where `kind` is
+/// `"set"` or `"link"`.
+fn agent_env_json(env: &[(String, String, String)]) -> Value {
+    Value::Array(
+        env.iter()
+            .map(|(key, kind, value)| json!({"key": key, "kind": kind, "value": value}))
+            .collect(),
+    )
+}
+
 fn query_string(pairs: &[(&str, Option<String>)]) -> String {
     let parts: Vec<String> = pairs
         .iter()
@@ -593,6 +604,98 @@ impl DaemonClient {
 
     pub fn deregister_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
         self.delete(&format!("/api/machines/{scheme}"))
+    }
+
+    /// `GET /api/agent-profiles` (RAL-473): every DB-backed agent profile,
+    /// administrative -- most users should read `ralphus agent list` instead.
+    pub fn list_agent_profiles(&self) -> Result<Value, DaemonError> {
+        self.get("/api/agent-profiles")
+    }
+
+    /// `GET /api/agent-profiles/{name}`.
+    pub fn get_agent_profile(&self, name: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/agent-profiles/{name}"))
+    }
+
+    /// `POST /api/agent-profiles`: create a new DB-backed agent profile.
+    /// `env` is `(key, kind, value)` triples, `kind` one of `"set"`/`"link"`.
+    pub fn create_agent_profile(
+        &self,
+        name: &str,
+        backend: &str,
+        executable: Option<&str>,
+        model: Option<&str>,
+        env: &[(String, String, String)],
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/agent-profiles",
+            Some(json!({
+                "name": name,
+                "backend": backend,
+                "executable": executable,
+                "model": model,
+                "env": agent_env_json(env),
+            })),
+        )
+    }
+
+    /// `PATCH /api/agent-profiles/{name}`: update an existing profile.
+    pub fn update_agent_profile(
+        &self,
+        name: &str,
+        backend: &str,
+        executable: Option<&str>,
+        model: Option<&str>,
+        env: &[(String, String, String)],
+    ) -> Result<Value, DaemonError> {
+        self.patch(
+            &format!("/api/agent-profiles/{name}"),
+            Some(json!({
+                "backend": backend,
+                "executable": executable,
+                "model": model,
+                "env": agent_env_json(env),
+            })),
+        )
+    }
+
+    /// `DELETE /api/agent-profiles/{name}` (Q9): refuses with 409 if the
+    /// profile is still referenced by a stored squad/review, unless `force`.
+    pub fn delete_agent_profile(&self, name: &str, force: bool) -> Result<Value, DaemonError> {
+        let query = query_string(&[("force", force.then(|| "true".to_string()))]);
+        self.delete(&format!("/api/agent-profiles/{name}{query}"))
+    }
+
+    /// `GET /api/agent-backend-commands` (Q4): every built-in backend's
+    /// current command override (an absent backend still runs its
+    /// compiled-in default).
+    pub fn list_agent_backend_commands(&self) -> Result<Value, DaemonError> {
+        self.get("/api/agent-backend-commands")
+    }
+
+    /// `POST /api/agent-backend-commands/{backend}`: overrides `backend`'s
+    /// invoked command globally -- every profile using this backend picks it
+    /// up on its next cell/proof run, no daemon restart.
+    pub fn set_agent_backend_command(
+        &self,
+        backend: &str,
+        command: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/agent-backend-commands/{backend}"),
+            Some(json!({"command": command})),
+        )
+    }
+
+    /// `DELETE /api/agent-backend-commands/{backend}`: "Reset to default".
+    pub fn reset_agent_backend_command(&self, backend: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/agent-backend-commands/{backend}"))
+    }
+
+    /// `GET /api/agent-backend-commands/{backend}/profiles`: blast-radius
+    /// list for the command-edit/reset confirmation (Q4).
+    pub fn list_agent_profiles_for_backend(&self, backend: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/agent-backend-commands/{backend}/profiles"))
     }
 
     /// Register (or update) a Triage type (RAL-318).

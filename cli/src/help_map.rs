@@ -694,16 +694,143 @@ the review worktree.",
 
 // ---- other top-level groups' children -------------------------------------
 
-// ralphus[ignore-endpoint-cli]: reads built-in agent names + configured [agent.profiles.*] from the local .ralphus.toml; GET /api/agents is a board picker for unsubmitted forms
-const AGENT_CHILDREN: &[HelpNode] = &[node(
-    "list",
-    &[],
-    &[],
-    "List supported agent backends and the models each is allowed to run.",
-    false,
-    true, // ("agent", "list")
-    &[],
-)];
+const AGENT_CHILDREN: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: reads built-in agent names + configured [agent.profiles.*] from the local .ralphus.toml; GET /api/agents is a board picker for unsubmitted forms
+    node(
+        "list",
+        &[],
+        &[],
+        "List supported agent backends and the models each is allowed to run.",
+        false,
+        true, // ("agent", "list")
+        &[],
+    ),
+    node(
+        "profile",
+        &[],
+        &[],
+        "Administrative (RAL-473): manage DB-backed agent profiles. Most users only need \
+`ralphus agent list`.",
+        false,
+        false,
+        AGENT_PROFILE_CHILDREN,
+    ),
+    node(
+        "backend-command",
+        &[],
+        &[],
+        "Administrative (RAL-473): override the invoked command for a built-in agent backend \
+(claude-code/codex/pi). Affects every profile using that backend globally.",
+        false,
+        false,
+        AGENT_BACKEND_COMMAND_CHILDREN,
+    ),
+];
+
+const AGENT_PROFILE_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "Administrative (RAL-473): list all DB-backed agent profiles (built-in and custom).",
+        false,
+        true, // ("agent", "profile", "list")
+        &[],
+    ),
+    node(
+        "get",
+        &["name [str]"],
+        &[],
+        "Administrative (RAL-473): show one agent profile's stored backend/model/env rows.",
+        false,
+        true, // ("agent", "profile", "get")
+        &[],
+    ),
+    node(
+        "create",
+        &["name [str]"],
+        &[
+            "--backend [name]",
+            "--executable [cmd]",
+            "--model [name]",
+            "--set [key=value...]",
+            "--link [key=target...]",
+        ],
+        "Administrative (RAL-473): create a new DB-backed agent profile. --set adds a literal \
+env value, --link chains to another key in the same profile's env table (validated for cycles \
+on save).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "update",
+        &["name [str]"],
+        &[
+            "--backend [name]",
+            "--executable [cmd]",
+            "--model [name]",
+            "--set [key=value...]",
+            "--link [key=target...]",
+        ],
+        "Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "delete",
+        &["name [str]"],
+        &["--force"],
+        "Administrative (RAL-473): delete an agent profile. Fails if it is still referenced by \
+a stored squad/review unless --force is given.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const AGENT_BACKEND_COMMAND_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "Administrative (RAL-473): list every built-in backend's command override, if any.",
+        false,
+        true, // ("agent", "backend-command", "list")
+        &[],
+    ),
+    node(
+        "set",
+        &["backend [str]"],
+        &["--command [argv]"],
+        "Administrative (RAL-473): set the global invoked command for a built-in backend \
+(claude-code/codex/pi), e.g. a wrapper/compound command. Takes effect on the next cell/proof \
+run, no daemon restart needed.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "reset",
+        &["backend [str]"],
+        &[],
+        "Administrative (RAL-473): reset a built-in backend to its compiled-in default command.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "profiles",
+        &["backend [str]"],
+        &[],
+        "Administrative (RAL-473): list agent profiles using a built-in backend (blast-radius \
+check before changing its command).",
+        false,
+        true, // ("agent", "backend-command", "profiles")
+        &[],
+    ),
+];
 
 const CHECK_CHILDREN: &[HelpNode] = &[
     node(

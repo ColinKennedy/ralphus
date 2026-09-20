@@ -483,9 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_watch_with_entity_uri_and_tiers() {
+    fn parses_follow_with_entity_uri_and_tiers() {
         match parse(&v(&[
-            "watch",
+            "follow",
             "--tier",
             "urgent",
             "--tier",
@@ -494,7 +494,7 @@ mod tests {
             "colin",
             "squad:squad-1",
         ])) {
-            MailboxCommand::Watch {
+            MailboxCommand::Follow {
                 entity_uri,
                 tiers,
                 user,
@@ -508,17 +508,17 @@ mod tests {
     }
 
     #[test]
-    fn watch_without_entity_uri_is_usage_error() {
+    fn follow_without_entity_uri_is_usage_error() {
         assert!(matches!(
-            parse(&v(&["watch"])),
+            parse(&v(&["follow"])),
             MailboxCommand::UsageError(_)
         ));
     }
 
     #[test]
-    fn parses_unwatch() {
-        match parse(&v(&["unwatch", "squad:squad-1"])) {
-            MailboxCommand::Unwatch { entity_uri, user } => {
+    fn parses_unfollow() {
+        match parse(&v(&["unfollow", "squad:squad-1"])) {
+            MailboxCommand::Unfollow { entity_uri, user } => {
                 assert_eq!(entity_uri, "squad:squad-1");
                 assert_eq!(user, None);
             }
@@ -527,9 +527,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_watches_listing() {
-        match parse(&v(&["watches", "--user", "colin"])) {
-            MailboxCommand::Watches { user } => assert_eq!(user.as_deref(), Some("colin")),
+    fn parses_follows_listing() {
+        match parse(&v(&["follows", "--user", "colin"])) {
+            MailboxCommand::Follows { user } => assert_eq!(user.as_deref(), Some("colin")),
             other => panic!("unexpected: {other:?}"),
         }
     }

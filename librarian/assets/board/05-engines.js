@@ -250,6 +250,10 @@
       CLICK_HANDLERS.undrainMailboxMessage = (e, ds) => undrainMailboxMessage(ds.id || "");
       CLICK_HANDLERS.dismissNotification = (e, ds) => dismissNotification(ds.id || "");
       CLICK_HANDLERS.undismissNotification = (e, ds) => undismissNotification(ds.id || "");
+      CLICK_HANDLERS.editAgentProfile = (e, ds) => editAgentProfile(ds.name || "");
+      CLICK_HANDLERS.deleteAgentProfile = (e, ds) => deleteAgentProfile(ds.name || "");
+      CLICK_HANDLERS.forceDeleteAgentProfile = (e, ds) => forceDeleteAgentProfile(ds.name || "");
+      CLICK_HANDLERS.removeAgentProfileEnvRow = (e, ds) => removeAgentProfileEnvRow(Number(ds.i));
       document.addEventListener("click", (/** @type {MouseEvent} */ e) => {
         const el = /** @type {HTMLElement|null} */ (/** @type {HTMLElement} */ (e.target).closest("[data-click]"));
         if (!el || !el.dataset.click) return;

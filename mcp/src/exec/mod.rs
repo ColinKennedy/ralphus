@@ -93,7 +93,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::InitializeGit { path } => exec_initialize_git(path),
         Command::Project(c) => project::execute(c, client),
         Command::Machine(c) => machine::execute(c, client),
-        Command::Agent(c) => agent::execute(c),
+        Command::Agent(c) => agent::execute(c, client),
         Command::Show(c) => show::execute(c),
         Command::Squad(c) => squad::execute(c, client),
         Command::Mailbox(c) => mailbox::execute(c, client),
