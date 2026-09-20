@@ -16,6 +16,7 @@
 use serde::Serialize;
 
 use crate::agent_access::AgentAccess;
+use crate::store::Store;
 
 /// One agent the Simple tab's agent dropdown can offer.
 #[derive(Debug, Clone, Serialize)]
@@ -53,17 +54,17 @@ fn models_for_backend(backend: &str) -> Vec<String> {
 }
 
 /// The cwd-independent agent catalog: built-in backends plus any
-/// globally-discoverable `[agent.profiles.*]` entries, each with its known
-/// model list. Never fails -- an error loading profiles (e.g. a malformed
-/// `.ralphus.toml`) degrades to the builtin-only list, matching this
-/// codebase's "malformed config never blocks" rule (see `crate::config`'s
-/// module doc comment).
+/// globally-discoverable `[agent.profiles.*]` entries and RAL-473
+/// database-backed profiles, each with its known model list. Never fails --
+/// an error loading profiles (e.g. a malformed `.ralphus.toml`) degrades to
+/// the builtin-only list, matching this codebase's "malformed config never
+/// blocks" rule (see `crate::config`'s module doc comment).
 #[must_use]
-pub fn agent_catalog() -> Vec<CatalogAgent> {
+pub fn agent_catalog(store: &Store) -> Vec<CatalogAgent> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let user = crate::agent_access::UserContext::default();
     let agents = crate::agent_access::DefaultAgentAccess
-        .available_agents(&user, &cwd)
+        .available_agents(&user, &cwd, store)
         .unwrap_or_default();
     agents
         .into_iter()
@@ -82,7 +83,8 @@ mod tests {
 
     #[test]
     fn agent_catalog_includes_claude_code_with_its_restricted_models() {
-        let agents = agent_catalog();
+        let store = Store::open_in_memory().expect("open store");
+        let agents = agent_catalog(&store);
         let claude_code = agents
             .iter()
             .find(|a| a.id == "claude-code")
@@ -93,7 +95,8 @@ mod tests {
 
     #[test]
     fn agent_catalog_backend_with_no_known_models_is_empty_not_missing() {
-        let agents = agent_catalog();
+        let store = Store::open_in_memory().expect("open store");
+        let agents = agent_catalog(&store);
         let ollama = agents
             .iter()
             .find(|a| a.id == "ollama")

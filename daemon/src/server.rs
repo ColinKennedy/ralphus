@@ -1259,7 +1259,7 @@ fn route_for_user(
         // RAL-297: cwd-independent agent+model catalog for the Simple task
         // form's agent picker -- see `crate::agent_catalog`.
         // ralphus[ignore-endpoint-cli]: board 'Simple' form agent catalog (id/URL/label hints)
-        ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(),
+        ("GET", ["api", "agents", "catalog"]) => agent_catalog_reply(daemon),
         // RAL-332: the current caller's resolved identity and admin flag --
         // lets the board decide whether to show its admin-only tabs without
         // it ever needing to know its own claimed name (it deliberately
@@ -4298,9 +4298,10 @@ fn visit_user_profile(daemon: &Daemon, user_header: Option<&str>, name: &str) ->
 }
 
 /// Lists the agents a user may select for `cwd` -- built-in backends plus
-/// whatever `.ralphus.toml` custom profiles apply there. The caller-presented
-/// identity is currently inert in `AgentAccess`, but shares the same header
-/// and configured-default resolution as other user-scoped endpoints.
+/// whatever `.ralphus.toml` custom profiles and RAL-473 database-backed
+/// profiles apply. The caller-presented identity is currently inert in
+/// `AgentAccess`, but shares the same header and configured-default
+/// resolution as other user-scoped endpoints.
 fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply {
     let Some(cwd) = query_param(query, "cwd").map(url_decode) else {
         return error(
@@ -4314,7 +4315,13 @@ fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply
         Ok(id) => crate::agent_access::UserContext { id },
         Err(reply) => return reply,
     };
-    match daemon.agent_access.available_agents(&user, Path::new(&cwd)) {
+    let result = {
+        let store = daemon.lock();
+        daemon
+            .agent_access
+            .available_agents(&user, Path::new(&cwd), &store)
+    };
+    match result {
         Ok(agents) => {
             let default_agent = crate::config::resolve(Path::new(&cwd))
                 .default_resolver_agent()
@@ -8722,11 +8729,12 @@ struct AgentCatalogResponse {
     default_agent: String,
 }
 
-fn agent_catalog_reply() -> Reply {
+fn agent_catalog_reply(daemon: &Daemon) -> Reply {
+    let agents = crate::agent_catalog::agent_catalog(&daemon.lock());
     json(
         200,
         &AgentCatalogResponse {
-            agents: crate::agent_catalog::agent_catalog(),
+            agents,
             default_agent: ralphus_core::schema::DEFAULT_AGENT.to_string(),
         },
     )
