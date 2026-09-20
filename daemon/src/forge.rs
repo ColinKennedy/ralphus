@@ -154,10 +154,13 @@ enum ConditionalGet {
     /// The forge returned `304`: `etag` still matches, nothing to re-parse.
     NotModified,
     /// A fresh body, plus this response's own `ETag` (`None` if the forge
-    /// didn't send one) to store for the next poll's `If-None-Match`.
+    /// didn't send one) to store for the next poll's `If-None-Match`, and
+    /// (Track A / A8) the next-page URL parsed from this response's `Link`
+    /// header, when the forge paginated it (`None` on a last/only page).
     Modified {
         value: serde_json::Value,
         etag: Option<String>,
+        link_next: Option<String>,
     },
 }
 
@@ -854,7 +857,11 @@ impl ForgeClient {
         };
         match self.get_conditional(req, etag)? {
             ConditionalGet::NotModified => Ok(PrStatePoll::NotModified),
-            ConditionalGet::Modified { value, etag } => {
+            ConditionalGet::Modified {
+                value,
+                etag,
+                link_next: _,
+            } => {
                 let state = match self.kind {
                     ForgeKind::GitHub => {
                         if value["merged"].as_bool().unwrap_or(false) {
@@ -2112,19 +2119,69 @@ impl ForgeClient {
                 ureq::get(&url).set("PRIVATE-TOKEN", token)
             }
         };
-        match self.get_conditional(req, etag)? {
-            ConditionalGet::NotModified => Ok(CommentsPoll::NotModified),
-            ConditionalGet::Modified { value, etag } => {
-                let items = value.as_array().ok_or_else(|| {
+        let (mut items, etag, mut link_next) = match self.get_conditional(req, etag)? {
+            ConditionalGet::NotModified => return Ok(CommentsPoll::NotModified),
+            ConditionalGet::Modified {
+                value,
+                etag,
+                link_next,
+            } => {
+                let items = value.as_array().cloned().ok_or_else(|| {
                     ForgeError::other(format!("unexpected comments response shape: {value}"))
                 })?;
-                let comments = match self.kind {
-                    ForgeKind::GitHub => parse_github_comments(items),
-                    ForgeKind::GitLab => parse_gitlab_notes(items),
-                };
-                Ok(CommentsPoll::Modified { comments, etag })
+                (items, etag, link_next)
             }
+        };
+        // Track A / A8: follow the forge's own pagination rather than
+        // silently truncating past the first `PER_PAGE` items -- a PR/MR
+        // with more than 100 comments previously lost every comment past
+        // the 100th with no error or warning, exactly on the long-running
+        // PRs where un-actioned feedback matters most. Each follow-up page
+        // is fetched unconditionally (no `If-None-Match`): the caller's
+        // stored etag only ever describes page 1, which is the only page a
+        // future poll can short-circuit via `NotModified` anyway.
+        while let Some(next_url) = link_next.take() {
+            let follow_req = self.authed_get(&next_url, token);
+            let (page_value, page_link_next) = self.get_with_link(follow_req)?;
+            let page_items = page_value.as_array().ok_or_else(|| {
+                ForgeError::other(format!("unexpected comments response shape: {page_value}"))
+            })?;
+            items.extend(page_items.iter().cloned());
+            link_next = page_link_next;
         }
+        let comments = match self.kind {
+            ForgeKind::GitHub => parse_github_comments(&items),
+            ForgeKind::GitLab => parse_gitlab_notes(&items),
+        };
+        Ok(CommentsPoll::Modified { comments, etag })
+    }
+
+    /// Build an authenticated `GET` for an absolute URL the forge itself
+    /// handed back (a pagination `Link` header's `rel="next"` target) --
+    /// unlike every other request builder in this file, which builds its own
+    /// URL from `self.api_base`/`self.repo_path`, this one has no path/query
+    /// of its own to construct; only the auth header depends on `self.kind`.
+    fn authed_get(&self, url: &str, token: &str) -> ureq::Request {
+        match self.kind {
+            ForgeKind::GitHub => ureq::get(url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            ForgeKind::GitLab => ureq::get(url).set("PRIVATE-TOKEN", token),
+        }
+    }
+
+    /// [`Self::get_structured`], but also returning the next-page URL parsed
+    /// from this response's `Link` header (Track A / A8), for a caller
+    /// following pagination itself.
+    fn get_with_link(
+        &self,
+        req: ureq::Request,
+    ) -> Result<(serde_json::Value, Option<String>), ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        let link_next = resp.header("Link").and_then(parse_link_next);
+        let value = parse_body(resp).map_err(ForgeError::other)?;
+        Ok((value, link_next))
     }
 
     /// Best-effort fetch of the repo's PR/MR template, so generated PR bodies
@@ -2370,12 +2427,17 @@ impl ForgeClient {
             Ok(resp) => {
                 self.note_rate_limit_headers(&resp);
                 let etag = resp.header("ETag").map(str::to_string);
+                let link_next = resp.header("Link").and_then(parse_link_next);
                 let body = resp
                     .into_string()
                     .map_err(|e| ForgeError::other(format!("forge API read: {e}")))?;
                 let value = serde_json::from_str(&body)
                     .map_err(|e| ForgeError::other(format!("forge API JSON parse: {e}")))?;
-                Ok(ConditionalGet::Modified { value, etag })
+                Ok(ConditionalGet::Modified {
+                    value,
+                    etag,
+                    link_next,
+                })
             }
             // Defensive: not observed with this ureq version's redirect
             // handling (a 304 without `Location` comes back `Ok` above), but
@@ -2458,6 +2520,24 @@ impl From<ForgeError> for String {
 /// pulling in a date-parsing dependency for a case that doesn't occur.
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Parse the `rel="next"` URL out of a GitHub/GitLab pagination `Link`
+/// header (Track A / A8), RFC 5988 form:
+/// `<https://api.github.com/...&page=2>; rel="next", <...&page=5>; rel="last"`.
+/// `None` when there is no `next` entry -- either this is the only/last
+/// page, or the forge sent no `Link` header at all (a page under
+/// [`PER_PAGE`], the overwhelmingly common case, gets no `Link` header from
+/// either forge).
+fn parse_link_next(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url_part, rel_part) = part.split_once(';')?;
+        if rel_part.trim() != r#"rel="next""# {
+            return None;
+        }
+        let url = url_part.trim().strip_prefix('<')?.strip_suffix('>')?;
+        Some(url.to_string())
+    })
 }
 
 fn describe_error(e: ureq::Error) -> ForgeError {
@@ -5864,6 +5944,97 @@ mod tests {
                 etag: None,
             }
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn parse_link_next_finds_next_among_multiple_rels() {
+        let header = concat!(
+            r#"<https://api.github.com/x?page=2>; rel="next", "#,
+            r#"<https://api.github.com/x?page=5>; rel="last""#
+        );
+        assert_eq!(
+            parse_link_next(header).as_deref(),
+            Some("https://api.github.com/x?page=2")
+        );
+    }
+
+    #[test]
+    fn parse_link_next_is_none_without_a_next_rel() {
+        let header = r#"<https://api.github.com/x?page=1>; rel="prev""#;
+        assert_eq!(parse_link_next(header), None);
+    }
+
+    #[test]
+    fn list_pr_comments_conditional_follows_a_paginated_link_header() {
+        // Track A / A8: a PR with more than one page of comments must not
+        // silently lose everything past page 1.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let addr_for_thread = addr.clone();
+        let handle = std::thread::spawn(move || {
+            let addr = addr_for_thread;
+            let page1 = server.recv().unwrap();
+            assert_eq!(
+                page1.url(),
+                "/repos/acme/widget/issues/7/comments?per_page=100"
+            );
+            let next_url =
+                format!("http://{addr}/repos/acme/widget/issues/7/comments?per_page=100&page=2");
+            page1
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"id":1,"user":{"login":"alice"},"body":"p1","created_at":"2024-01-01T00:00:00Z"}]"#,
+                    )
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"c1\""[..]).unwrap(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Link"[..],
+                            format!(r#"<{next_url}>; rel="next""#).as_bytes(),
+                        )
+                        .unwrap(),
+                    ),
+            )
+            .unwrap();
+            let page2 = server.recv().unwrap();
+            // The followed request must carry the same auth header a normal
+            // request would, and must not resend the page-1 `If-None-Match`
+            // -- page 2 was never conditionally fetched before.
+            assert_eq!(
+                req_header(&page2, "Authorization").as_deref(),
+                Some("Bearer tok")
+            );
+            assert_eq!(req_header(&page2, "If-None-Match"), None);
+            page2
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"id":2,"user":{"login":"bob"},"body":"p2","created_at":"2024-01-02T00:00:00Z"}]"#,
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client
+            .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, None)
+            .unwrap();
+        let CommentsPoll::Modified { comments, etag } = result else {
+            panic!("expected Modified, got {result:?}");
+        };
+        assert_eq!(comments.len(), 2, "both pages' comments must be present");
+        assert_eq!(comments[0].author, "alice");
+        assert_eq!(comments[1].author, "bob");
+        // The etag returned must be page 1's -- the only page a future call
+        // can validate against via `If-None-Match`.
+        assert_eq!(etag.as_deref(), Some("\"c1\""));
         handle.join().unwrap();
     }
 
