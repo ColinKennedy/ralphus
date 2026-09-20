@@ -2463,7 +2463,7 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
 /// freshly observed merged, the *whole set* is re-read to decide what "all
 /// linked PRs merged" means for this guardian right now:
 ///
-/// - `in_review` and every linked PR merged: approve outright via
+/// - `in_review` and every linked PR merged: mark merged outright via
 ///   [`crate::guardian::Store::approve_guardian`] -- the same transition the
 ///   "Approve" button drives -- so a review whose stack landed on the forge
 ///   never sits stale waiting for a human to notice.
@@ -2481,7 +2481,7 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
 /// token, forge down, ...) is left exactly as it was -- an unreachable forge
 /// must never be mistaken for "confirmed merged", mirroring
 /// [`refresh_open_prs`]'s "assume still open" fallback. Returns whether
-/// anything changed (approved, or a PR was dropped) -- callers use this to
+/// anything changed (marked merged, or a PR was dropped) -- callers use this to
 /// know the guardian's status may no longer be what they last read.
 pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
     let Ok(guardian) = store.lock().get_guardian(id) else {
@@ -3007,17 +3007,17 @@ fn settle_pr_merge_states(
         if !all_merged {
             return false;
         }
-        let approved = store.lock().approve_guardian(id).is_ok();
-        if approved {
+        let merged = store.lock().approve_guardian(id).is_ok();
+        if merged {
             crate::rlog!(
                 INFO,
-                "ralphus [pr] review {id} approved: every linked pr has merged"
+                "ralphus [pr] review {id} merged: every linked pr has merged"
             );
             let guard = store.lock();
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
-                message: "review approved: every linked pr has merged",
+                message: "review merged: every linked pr has merged",
                 scope: Some("guardian"),
                 squad_id: None,
                 guardian_id: Some(id),
@@ -3030,7 +3030,7 @@ fn settle_pr_merge_states(
                 admin_only: false,
             });
         }
-        return approved;
+        return merged;
     }
 
     if freshly_merged.is_empty() {
@@ -10480,7 +10480,7 @@ mod tests {
         assert!(changed, "every linked pr merging must report a change");
 
         let updated_guardian = store.lock().get_guardian(&gid).unwrap();
-        assert_eq!(updated_guardian.status.as_str(), "approved");
+        assert_eq!(updated_guardian.status.as_str(), "merged");
         let updated_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(updated_pr.state, "merged");
 
@@ -10488,7 +10488,7 @@ mod tests {
     }
 
     #[test]
-    fn check_pr_merges_approves_when_all_merges_were_already_recorded() {
+    fn check_pr_merges_marks_merged_when_all_merges_were_already_recorded() {
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
@@ -10527,7 +10527,7 @@ mod tests {
         let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
 
         assert!(apply_pr_merge_check(&store, &gid, &prs, &client));
-        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
     }
 
     #[test]
@@ -10584,7 +10584,7 @@ mod tests {
         assert_eq!(
             updated_guardian.status.as_str(),
             "merging",
-            "a mid-flight review must not be silently force-approved"
+            "a mid-flight review must not be silently force-merged"
         );
         let dropped_pr = store.lock().get_pull_request(&pr_id).unwrap();
         assert_eq!(
@@ -10841,7 +10841,7 @@ mod tests {
         );
 
         // The stack isn't fully merged yet (the promoted branch is still
-        // open) -- the review must stay `in_review`, not jump to `approved`.
+        // open) -- the review must stay `in_review`, not jump to `merged`.
         let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "in_review");
 
@@ -13469,7 +13469,7 @@ mod tests {
 
     #[test]
     fn auto_submit_does_not_create_or_reconcile_a_stack_after_approval() {
-        let root = setup_auto_submit_repo("auto-submit-approved-read-only");
+        let root = setup_auto_submit_repo("auto-submit-merged-read-only");
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let (id, branch_id, _tip) = setup_terminal_branch(&store, &root, true);
         store
@@ -13505,8 +13505,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_does_not_requeue_an_approved_review() {
-        let root = setup_auto_submit_repo("recovery-approved-read-only");
+    fn startup_recovery_does_not_requeue_a_merged_review() {
+        let root = setup_auto_submit_repo("recovery-merged-read-only");
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let (id, _branch_id, _tip) = setup_terminal_branch(&store, &root, true);
         store

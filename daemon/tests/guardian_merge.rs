@@ -652,14 +652,14 @@ fn reopen_cancelled_guardian_merge_stages_the_ready_prefix_while_a_branch_is_pen
 }
 
 #[test]
-fn reopen_guardian_merge_rejects_a_guardian_that_is_neither_cancelled_nor_approved() {
+fn reopen_guardian_merge_rejects_a_guardian_that_is_neither_cancelled_nor_merged() {
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (root, gid) = {
         let mut guard = store.lock();
         setup_review_with_pending_last_branch(&mut guard)
     };
 
-    // Still `collecting`, never cancelled or approved: reopen must be
+    // Still `collecting`, never cancelled or merged: reopen must be
     // rejected and the guardian state left untouched.
     let reply = reopen_guardian_merge(
         Arc::clone(&store),
@@ -3181,10 +3181,10 @@ fn base_shift_for_skip_worktrees_uses_cancellable_fallback() {
 
 // RAL-300: when the base branch's shift IS the review's own work landing (a
 // fast-forward merge that happened outside any tracked PR), the base
-// shift is not new upstream work to rebase onto -- it must approve the
-// review instead of wasting a rebuild against a base that already has it.
+// shift is not new upstream work to rebase onto -- it must mark the
+// review merged instead of wasting a rebuild against a base that already has it.
 #[test]
-fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() {
+fn base_shift_that_already_contains_the_review_merges_instead_of_rebuilding() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
     let before = store.lock().get_guardian(&id).unwrap();
@@ -3201,14 +3201,14 @@ fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() 
 
     let sem = Semaphore::new(4);
     // `rebuild_on_base_shift` reports `true` here too (it "handled" the base
-    // shift, just by approving instead of rebuilding) -- what actually
+    // shift, just by marking merged instead of rebuilding) -- what actually
     // matters is the guardian's status below, not this return value.
     rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
 
     let after = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
-        after.status, "approved",
-        "must approve instead of rebuilding: detail {:?}",
+        after.status, "merged",
+        "must mark merged instead of rebuilding: detail {:?}",
         after.detail
     );
 
@@ -3221,12 +3221,12 @@ fn base_shift_that_already_contains_the_review_approves_instead_of_rebuilding() 
 // whether or not the PR ever merged into the guardian's actual base. This
 // reproduces that shape (an arbitrary branch parked at the worktree's HEAD
 // and set as its upstream, same as a freshly-pushed PR branch would be) and
-// asserts it must NOT be enough to approve -- only the guardian's real base
-// branch landing the work should. See `manual_merge_approves_when_the_review_
+// asserts it must NOT be enough to mark merged -- only the guardian's real base
+// branch landing the work should. See `manual_merge_marks_merged_when_the_review_
 // worktree_is_already_in_the_base_branch` below for the case that legitimately
-// should approve.
+// should.
 #[test]
-fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
+fn manual_merge_does_not_mark_merged_from_worktree_upstream_alone() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
     let before = store.lock().get_guardian(&id).unwrap();
@@ -3262,7 +3262,7 @@ fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
     }
     assert_eq!(
         guardian.status, "in_review",
-        "must not auto-approve from the worktree's own upstream alone: detail {:?}",
+        "must not auto-mark-merged from the worktree's own upstream alone: detail {:?}",
         guardian.detail
     );
 
@@ -3272,9 +3272,9 @@ fn manual_merge_does_not_approve_from_worktree_upstream_alone() {
 // The legitimate counterpart to the regression test above: when the feature
 // has actually landed on the guardian's real base branch (e.g. a manual
 // `git merge --ff-only` + push outside of any tracked PR), the manual
-// "Merge / rebase" trigger must still recognize that and approve.
+// "Merge / rebase" trigger must still recognize that and mark it merged.
 #[test]
-fn manual_merge_approves_when_the_review_worktree_is_already_in_the_base_branch() {
+fn manual_merge_marks_merged_when_the_review_worktree_is_already_in_the_base_branch() {
     let (root, store, id) = single_feature_repo();
     run_merge(&store, &NoopRunner, &id);
     let before = store.lock().get_guardian(&id).unwrap();
@@ -3294,8 +3294,8 @@ fn manual_merge_approves_when_the_review_worktree_is_already_in_the_base_branch(
         Cancellations::new(),
     );
     assert_eq!(reply.status, 200, "body={}", reply.body);
-    assert!(reply.body.contains("\"status\":\"approved\""));
-    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "approved");
+    assert!(reply.body.contains("\"status\":\"merged\""));
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "merged");
 
     let _ = std::fs::remove_dir_all(&root);
 }

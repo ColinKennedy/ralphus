@@ -110,7 +110,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/runner.rs` — `Runner` trait + `SubprocessRunner` (spawns `RALPHUS_RUNNER_CMD`).
 - `daemon/src/proof.rs` — `command` proof execution.
 - `daemon/src/plan.rs` — dependency graph (Kahn topological sort).
-- `daemon/src/guardian.rs` — Guardian store + state machine (Collecting→Approved→Deployed).
+- `daemon/src/guardian.rs` — Guardian store + state machine (Collecting→Merged→Deployed).
 - `daemon/src/guardian_merge.rs` — stacked linear rebase in a worktree, agent conflict resolution.
 - `daemon/src/review_branch.rs` — RAL-378: readable review-branch naming (`<task branch>-review`, length cap, ref-validity repair, `-2`/`-3` collision walk). Pure; the git/SQL "is this taken" lookups live in `guardian_merge.rs`/`guardian.rs`.
 - `daemon/src/reviews.rs` — review derivation (per-guardian, per-branch merge status).

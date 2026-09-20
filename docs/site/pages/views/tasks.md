@@ -30,7 +30,7 @@ The toolbar above the table filters rows:
   Squads tab (hiding is squad-level only).
 - **needs me** shows only rows you're directly responsible for right now:
   watched or watched-squad tasks that are `failed`, awaiting your review
-  approval, or approved with no PR submitted yet.
+  approval, or merged with no PR submitted yet.
 - **status filters** toggle which task states are visible.
 
 ## Expanding a task

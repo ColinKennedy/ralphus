@@ -147,8 +147,8 @@ pub(crate) enum StartMergeOutcome {
     Merging,
     Deferred,
     AlreadyInProgress,
-    /// RAL-300: every linked PR had already merged, so this trigger approved
-    /// the review outright instead of starting a rebuild.
+    /// RAL-300: every linked PR had already merged, so this trigger marked
+    /// the review merged outright instead of starting a rebuild.
     AlreadyMerged,
 }
 
@@ -3390,7 +3390,7 @@ pub fn start_merge(
         ),
         Ok(StartMergeOutcome::AlreadyMerged) => reply(
             200,
-            "{\"status\":\"approved\",\"message\":\"this review's work was already merged\"}",
+            "{\"status\":\"merged\",\"message\":\"this review's work was already merged\"}",
         ),
         Err(StartMergeError::NotFound(message)) => reply(404, &error_body("not_found", &message)),
         Err(StartMergeError::Preflight(message)) => {
@@ -3468,16 +3468,16 @@ pub(crate) fn kickoff_merge(
     // RAL-300: a manual "Merge / rebase" trigger must not waste a rebuild
     // when every linked PR has already merged -- ask first, exactly like the
     // periodic sweep (`review_maintenance`) does. When this settles the
-    // review by approving it outright, report that instead of falling
+    // review by marking it merged outright, report that instead of falling
     // through to the ordinary claim/rebuild path below (which would just
     // find nothing left to claim and 409). A mid-flight PR drop (guardian
     // status unchanged) falls straight through to the normal path.
     if crate::pr::check_pr_merges(&store, id) {
-        let now_approved = matches!(
+        let now_merged = matches!(
             store.lock().get_guardian(id),
-            Ok(g) if g.status.as_str() == GuardianStatus::Approved.as_str()
+            Ok(g) if g.status.as_str() == GuardianStatus::Merged.as_str()
         );
-        if now_approved {
+        if now_merged {
             return Ok(StartMergeOutcome::AlreadyMerged);
         }
     }
@@ -3766,11 +3766,11 @@ pub fn restart_guardian_merge(
     start_merge(store, runner, id, sem, cancellations)
 }
 
-/// Reopen a `cancelled` or `approved` review (status → `collecting`) and
+/// Reopen a `cancelled` or `merged` review (status → `collecting`) and
 /// immediately try an incremental staged merge (RAL-265, [`run_merge_staged`])
 /// -- the same pass a task completion would have triggered via
 /// `start_reviews` (`daemon/src/scheduler.rs`) had this review not been
-/// cancelled/approved at the time. Deliberately *not* the all-or-nothing
+/// cancelled/merged at the time. Deliberately *not* the all-or-nothing
 /// [`start_merge`] that the manual "Merge / rebase" button uses: that path
 /// waits for every enabled branch's cell to finish before rebasing anything,
 /// so a review reopened while one branch is still pending would sit doing
@@ -3784,8 +3784,8 @@ pub fn restart_guardian_merge(
 /// has returned. Wait for that worker here, where a fresh merge could reuse
 /// the same worktrees; if it does not stop within the bounded budget, leave
 /// the review cancelled and ask the caller to retry instead of overlapping two
-/// workers. An approved review never has a worker to wait for -- it only
-/// ever arrives at `approved` from `in_review`, which has none either -- so
+/// workers. A merged review never has a worker to wait for -- it only
+/// ever arrives at `merged` from `in_review`, which has none either -- so
 /// this wait resolves immediately for that case.
 pub fn reopen_guardian_merge(
     store: crate::store_lock::StoreHandle,
@@ -7478,24 +7478,24 @@ fn guardian_base_already_has_every_branch(
     })
 }
 
-/// Approve `id` because [`guardian_base_already_has_every_branch`] (or the
+/// Mark `id` merged because [`guardian_base_already_has_every_branch`] (or the
 /// equivalent per-project check inline in [`rebuild_on_base_shift`]) found
 /// every enabled branch already landed on its base (RAL-300) -- shared so the
-/// periodic sweep and a manual "Merge / rebase" trigger log/approve
+/// periodic sweep and a manual "Merge / rebase" trigger log/mark-merged
 /// identically. Only valid from `in_review` (mirrors `approve_guardian`'s one
-/// legal transition); returns whether it approved.
+/// legal transition); returns whether it did.
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    let approved = store.lock().approve_guardian(id).is_ok();
-    if approved {
+    let merged = store.lock().approve_guardian(id).is_ok();
+    if merged {
         crate::rlog!(
             INFO,
-            "ralphus [guardian] review {id} approved: base branch already contains every branch's commits"
+            "ralphus [guardian] review {id} merged: base branch already contains every branch's commits"
         );
         let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "guardian",
-            message: "approved: base branch already contains every branch's commits",
+            message: "merged: base branch already contains every branch's commits",
             scope: Some("guardian"),
             squad_id: None,
             guardian_id: Some(id),
@@ -7506,7 +7506,7 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
             admin_only: false,
         });
     }
-    approved
+    merged
 }
 
 /// If the guardian's base branch has moved in ANY of its projects since the stack
@@ -7597,7 +7597,7 @@ pub fn rebuild_on_base_shift(
     // work to rebase onto -- if the shift itself is every project absorbing
     // this review's own branches (already-ancestor for all of them), then the
     // shift IS this review landing, not something to rebuild against.
-    // Approve outright instead of wasting a rebuild on a base that already
+    // Mark merged outright instead of wasting a rebuild on a base that already
     // has us; only from `in_review` -- `approve_guardian` has no other
     // transition, and a `merge_failed` review still needs a human regardless.
     if guardian.status.as_str() == "in_review"
@@ -10854,7 +10854,7 @@ mod tests {
         assert!(IDLE_MAINT_LAST.lock().expect("poisoned").contains_key(&id));
 
         // The guardian is no longer in the candidate set at all (e.g. it was
-        // approved/cancelled and dropped out of the maintained-status filter).
+        // merged/cancelled and dropped out of the maintained-status filter).
         filter_by_idle_cadence(&[]);
         assert!(
             !IDLE_MAINT_LAST.lock().expect("poisoned").contains_key(&id),
@@ -10930,7 +10930,7 @@ mod tests {
     fn collect_base_fetch_targets_excludes_every_non_maintained_status() {
         let guardians = vec![
             fetch_info("collecting", "origin/main", &["/repo/a"], None),
-            fetch_info("approved", "origin/main", &["/repo/a"], None),
+            fetch_info("merged", "origin/main", &["/repo/a"], None),
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());

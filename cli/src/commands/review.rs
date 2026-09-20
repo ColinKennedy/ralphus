@@ -933,7 +933,7 @@ fn with_selector_action(
 /// Whether `guardian` (a `GuardianView` from `GET /api/guardians`) is a
 /// plausible PR-submission candidate -- `--pr-ready`'s filter predicate.
 pub fn is_pr_ready(guardian: &Value) -> bool {
-    const PR_READY_STATUSES: [&str; 2] = ["in_review", "approved"];
+    const PR_READY_STATUSES: [&str; 2] = ["in_review", "merged"];
     let status = guardian["status"].as_str().unwrap_or_default();
     if !PR_READY_STATUSES.contains(&status) {
         return false;

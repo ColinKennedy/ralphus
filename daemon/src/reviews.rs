@@ -1625,7 +1625,7 @@ fn add_new_branches(
 /// check whether any of those pools' count thresholds has now fired (a cron
 /// schedule can also fire one independently -- see `crate::scheduler`'s
 /// Triage tick). A firing pool is drained and turned into a fresh review
-/// guardian through the same Collecting -> Approved -> Deployed pipeline
+/// guardian through the same Collecting -> Merged -> Deployed pipeline
 /// [`derive_reviews`] uses, flagged [`crate::guardian::GUARDIAN_ORIGIN_ARBITER`].
 /// Returns the created guardian ids (empty when no cell opts into Triage, or
 /// no pool fired).

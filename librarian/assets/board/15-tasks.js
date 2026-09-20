@@ -158,7 +158,7 @@
         name: "Task name. Click a row to select it; ctrl/cmd-click to toggle it into a multi-selection, shift-click to select a range -- a bulk action (the row meatball, ⋮) then applies to every task still selected and visible.\nThe chevron (when present) expands its cells.",
         squad: "The owning squad's OWN state -- not a roll-up of this row -- plus its label.\nClick to open the squad on the Squads tab; hover to highlight every other row from the same squad.\nUse this menu to group the whole table by squad.",
         cells: "Proportional breakdown of this task's cells by state, plus done/total count.",
-        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review approved/merging with no PR submitted yet.",
+        review: "Right-aligned Review/PR lane: the most-attention-needing review this task participates in (with a +N suffix for extra reviews), then its earliest-submitted PR, always last.\nA dashed placeholder means a review merged/merging with no PR submitted yet.",
         time: "Duration (live while running) or start time, per this menu's mode toggle. A dash means the task hasn't started.",
         tokens: "Input / output token totals, summed over this task's cells, cell proof steps, and task-scope proof steps.",
         cache: "Prompt-cache write / read token totals -- both are input-side figures, unlike Tokens' in/out split.",
@@ -501,7 +501,7 @@
           const ciNote = pr.state === "open" && pr.ci_status ? ` (CI: ${esc(pr.ci_status)})` : "";
           const canQueryForge = pr.state === "open" && pr.pr_number != null;
           parts.push(`<span class="tt-badge pr-badge" style="color:${color};border-color:${color}" onclick="event.stopPropagation();ttOpenPr('${esc(pr.pr_url || "")}')" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="PR ${esc(label)} — ${esc(pr.state)} on ${esc(pr.forge)}/${esc(pr.repo)}${ciNote}, earliest-submitted for this task.${prPick.count > 1 ? ` +${prPick.count - 1} more PR(s) on this task.` : ""}\nClick to open on the forge. Right-click to refresh its status or pull in feedback.">${esc(label)}${extra}</span>`);
-        } else if (reviewBadge && (reviewBadge.review.status === "approved" || reviewBadge.review.status === "merging")) {
+        } else if (reviewBadge && (reviewBadge.review.status === "merged" || reviewBadge.review.status === "merging")) {
           parts.push(`<span class="tt-badge pr-placeholder" data-tip="Review &quot;${esc(reviewBadge.review.name)}&quot; is ${esc(reviewBadge.review.status)} but has no PR submitted yet.">no PR</span>`);
         }
         return `<span class="tt-badges">${parts.join("")}</span>`;
@@ -1170,7 +1170,7 @@
             const pr = row.prs.find((p) => p.branch_alias === b);
             const badge = pr
               ? `<span class="tt-badge pr-badge" style="color:${cvar(ttPrColorVar(pr))};border-color:${cvar(ttPrColorVar(pr))}" onclick="ttOpenPr('${esc(pr.pr_url || "")}')" data-tip="Open PR on the forge.${pr.state === "open" && pr.ci_status ? ` CI: ${esc(pr.ci_status)}.` : ""}">${pr.pr_number ? "#" + pr.pr_number : esc(pr.state)}</span>`
-              : (r.status === "approved" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Approved/merging with no PR submitted yet.">no PR</span>` : "");
+              : (r.status === "merged" || r.status === "merging" ? `<span class="tt-badge pr-placeholder" data-tip="Merged/merging with no PR submitted yet.">no PR</span>` : "");
             return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0 3px 14px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" data-tip="${esc(b)}">${esc(b)}</span>${badge}</div>`;
           }).join("");
           return `<div style="margin-bottom:8px"><div style="display:flex;align-items:center;gap:6px">${sdot(r.status)}<b style="flex:1">${esc(r.name)}</b>${pill(r.status)}</div>${branchRows}</div>`;
@@ -1549,5 +1549,5 @@
       let historyViewing = {};
       /** @type {Set<string>} gid -> an Approve is in flight, so the button shows a pending/disabled state until it resolves (RAL-234) */
       let pendingGuardianActions = new Set();
-      /** @type {Set<string>} gid -> a Merge / rebase (or, once cancelled/approved, Reopen) kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
+      /** @type {Set<string>} gid -> a Merge / rebase (or, once cancelled/merged, Reopen) kickoff is in flight, so the button shows a pending/disabled state until the daemon has answered and the board has reloaded */
       let pendingMergeActions = new Set();
