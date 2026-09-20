@@ -70,6 +70,48 @@ pub fn verify_gitlab_token(secret: &str, header_token: &str) -> bool {
     secret.ct_eq(header_token).into()
 }
 
+/// Extract the `(repo, PR/MR number)` hint from a GitHub `pull_request` or
+/// GitLab `merge_request` webhook delivery body, if it carries one. `None`
+/// covers both a malformed body and any other webhook event type this
+/// daemon doesn't (yet) look for a PR/MR in (e.g. GitHub `push`, GitLab
+/// `Note Hook`).
+///
+/// This is a hint only (Track E, E5) -- `route_webhook` uses the returned
+/// pair solely to look up an already-recorded PR row via
+/// `Store::find_pull_request_by_number`, the same lookup `GET
+/// /api/pull-requests` already exposes. The parsed body is never stored;
+/// nothing here is treated as authoritative, since an unverified body could
+/// claim to be about any PR at all -- only the *matched project* (already
+/// established by signature verification before this runs) constrains
+/// which `repo` values are even meaningful to look up.
+///
+/// `repo` is returned in the same shape `Store`'s `repo` column already
+/// uses for each forge (see `PullRequestView::repo`'s doc comment): plain
+/// `owner/repo` for GitHub, percent-encoded `namespace%2Fproject` for
+/// GitLab (`crate::forge`'s own repo-path construction encodes the same
+/// way, so this mirrors an established convention rather than inventing a
+/// new one).
+pub fn extract_pr_hint(kind: crate::forge::ForgeKind, body: &str) -> Option<(String, i64)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    match kind {
+        crate::forge::ForgeKind::GitHub => {
+            let repo = value
+                .get("repository")?
+                .get("full_name")?
+                .as_str()?
+                .to_string();
+            let number = value.get("pull_request")?.get("number")?.as_i64()?;
+            Some((repo, number))
+        }
+        crate::forge::ForgeKind::GitLab => {
+            let path = value.get("project")?.get("path_with_namespace")?.as_str()?;
+            let repo = path.replace('/', "%2F");
+            let number = value.get("object_attributes")?.get("iid")?.as_i64()?;
+            Some((repo, number))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +201,42 @@ mod tests {
         // "both empty" as a match -- that would let an attacker send no
         // token at all and pass verification against a misconfigured hook.
         assert!(!verify_gitlab_token("", ""));
+    }
+
+    #[test]
+    fn extract_pr_hint_reads_a_github_pull_request_payload() {
+        let body = r#"{
+            "action": "synchronize",
+            "repository": {"full_name": "acme/widget"},
+            "pull_request": {"number": 42}
+        }"#;
+        let hint = extract_pr_hint(crate::forge::ForgeKind::GitHub, body);
+        assert_eq!(hint, Some(("acme/widget".to_string(), 42)));
+    }
+
+    #[test]
+    fn extract_pr_hint_reads_a_gitlab_merge_request_payload_and_percent_encodes_the_repo() {
+        let body = r#"{
+            "object_kind": "merge_request",
+            "project": {"path_with_namespace": "acme/widget"},
+            "object_attributes": {"iid": 7}
+        }"#;
+        let hint = extract_pr_hint(crate::forge::ForgeKind::GitLab, body);
+        assert_eq!(hint, Some(("acme%2Fwidget".to_string(), 7)));
+    }
+
+    #[test]
+    fn extract_pr_hint_returns_none_for_an_unrelated_github_event() {
+        // A GitHub `push` event has no `pull_request` key at all.
+        let body = r#"{"ref": "refs/heads/main", "repository": {"full_name": "acme/widget"}}"#;
+        assert_eq!(extract_pr_hint(crate::forge::ForgeKind::GitHub, body), None);
+    }
+
+    #[test]
+    fn extract_pr_hint_returns_none_for_malformed_json() {
+        assert_eq!(
+            extract_pr_hint(crate::forge::ForgeKind::GitHub, "not json at all"),
+            None
+        );
     }
 }

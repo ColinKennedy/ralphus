@@ -14982,10 +14982,14 @@ fn find_verified_webhook_project<'a>(
 /// comment for the skip conditions), and the actual matching is delegated
 /// to that pure function.
 ///
-/// Scope note: this wires up receipt and verification only. Resolving a
-/// verified delivery to the PR/review it concerns, deduping retried
-/// deliveries, and the acknowledge-within-10s budget are Track E's later
-/// items (E5-E7), not implemented here.
+/// Once verified, the delivery's body is used exactly once more: as a hint
+/// (`crate::webhook::extract_pr_hint`) to look up an already-recorded PR row
+/// via `Store::find_pull_request_by_number` (E5) -- the same lookup `GET
+/// /api/pull-requests` exposes. The body itself is discarded after that; no
+/// delivery is ever persisted.
+///
+/// Scope note: deduping retried deliveries and the acknowledge-within-10s
+/// budget are Track E's later items (E6/E7), not implemented here.
 fn route_webhook(
     daemon: &Daemon,
     provider: &str,
@@ -15016,20 +15020,46 @@ fn route_webhook(
 
     match find_verified_webhook_project(kind, body, github_signature, gitlab_token, &candidates) {
         Some(project_name) => {
-            let _ = daemon.lock().cartographer_log(crate::cartographer::CartographerEntry {
-                level: crate::logging::LogLevel::INFO,
-                source: "webhook",
-                message: "verified webhook delivery received",
-                scope: Some("webhook"),
-                squad_id: None,
-                guardian_id: None,
-                cell_id: None,
-                task: None,
-                log_path: None,
-                payload: serde_json::json!({"provider": kind.as_str(), "project": project_name}),
-                admin_only: false,
-            });
-            json(200, &serde_json::json!({"status": "accepted"}))
+            // E5: the payload is a hint only -- used to look up an already
+            // recorded PR row, never stored or trusted on its own. A
+            // GitHub/GitLab retry storm on an event type this daemon
+            // doesn't parse for a PR/MR (or a delivery for a PR ralphus
+            // never submitted) resolves to `None` here, which is expected
+            // and not an error: the delivery was still verified and still
+            // gets a `200`.
+            let resolved_pr =
+                crate::webhook::extract_pr_hint(kind, body).and_then(|(repo, pr_number)| {
+                    daemon
+                        .lock()
+                        .find_pull_request_by_number(kind.as_str(), &repo, pr_number)
+                        .ok()
+                        .flatten()
+                });
+            let resolved_pr_id = resolved_pr.as_ref().map(|pr| pr.id.as_str());
+            let resolved_guardian_id = resolved_pr.as_ref().map(|pr| pr.guardian_id.as_str());
+            let _ = daemon
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "webhook",
+                    message: "verified webhook delivery received",
+                    scope: Some("webhook"),
+                    squad_id: None,
+                    guardian_id: resolved_guardian_id,
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "provider": kind.as_str(),
+                        "project": project_name,
+                        "pr_id": resolved_pr_id,
+                    }),
+                    admin_only: false,
+                });
+            json(
+                200,
+                &serde_json::json!({"status": "accepted", "pr_id": resolved_pr_id}),
+            )
         }
         None => error(
             401,
