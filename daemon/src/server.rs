@@ -1065,15 +1065,22 @@ fn route_for_user(
             })
         }
         // RAL-338: fork registration. Reads open to every caller (matches the
-        // `projects` pattern above); mutations admin-gated like
-        // `register_project`. `GET /api/project-forks` is the unscoped list
-        // across every project. A trailing user segment targets one specific
-        // row (`.../forks/{user}`); PATCH/DELETE with *no* trailing segment
-        // target the project-wide default (`user=""`) row instead -- the
-        // literal empty segment form (`.../forks/`) is indistinguishable from
-        // the collection path once `path.trim_matches('/')` strips a trailing
-        // slash, so the no-segment form is this router's way of addressing
-        // the default row.
+        // `projects` pattern above). `GET /api/project-forks` is the
+        // unscoped list across every project. A trailing user segment
+        // targets one specific row (`.../forks/{user}`); PATCH/DELETE with
+        // *no* trailing segment target the project-wide default (`user=""`)
+        // row instead -- the literal empty segment form (`.../forks/`) is
+        // indistinguishable from the collection path once
+        // `path.trim_matches('/')` strips a trailing slash, so the
+        // no-segment form is this router's way of addressing the default
+        // row.
+        //
+        // RAL-476 (interview Q9): a row naming a real user is
+        // self-or-admin-gated -- that user may edit their own fork row from
+        // Preferences without being an admin. The project-wide default row
+        // (`user=""`, addressed by the no-segment PATCH/DELETE, and by POST
+        // when its body omits `user`) stays `admin_gated`, since no real
+        // caller is ever named `""`.
         ("GET", ["api", "project-forks"]) => list_all_project_forks(daemon),
         // RAL-385: read-only worktree-retirement view -- every review
         // worktree classified by retirement state plus the durable history
@@ -1083,9 +1090,14 @@ fn route_for_user(
         ("GET", ["api", "projects", name, "forks"]) => {
             list_project_forks(daemon, &url_decode(name))
         }
-        ("POST", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
-            create_project_fork(daemon, &url_decode(name), body)
-        }),
+        ("POST", ["api", "projects", name, "forks"]) => {
+            let target_user = serde_json::from_str::<CreateProjectForkBody>(body)
+                .map(|req| req.user)
+                .unwrap_or_default();
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                create_project_fork(daemon, &url_decode(name), body)
+            })
+        }
         ("PATCH", ["api", "projects", name, "forks"]) => admin_gated(daemon, user_header, || {
             patch_project_fork(daemon, &url_decode(name), "", body)
         }),
@@ -1093,13 +1105,15 @@ fn route_for_user(
             delete_project_fork(daemon, &url_decode(name), "")
         }),
         ("PATCH", ["api", "projects", name, "forks", user]) => {
-            admin_gated(daemon, user_header, || {
-                patch_project_fork(daemon, &url_decode(name), &url_decode(user), body)
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                patch_project_fork(daemon, &url_decode(name), &target_user, body)
             })
         }
         ("DELETE", ["api", "projects", name, "forks", user]) => {
-            admin_gated(daemon, user_header, || {
-                delete_project_fork(daemon, &url_decode(name), &url_decode(user))
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                delete_project_fork(daemon, &url_decode(name), &target_user)
             })
         }
         // RAL-408: this project's DEFAULT review settings -- the board's
@@ -1263,6 +1277,16 @@ fn route_for_user(
         ("POST", ["api", "users"]) => {
             admin_gated(daemon, user_header, || create_user(daemon, body))
         }
+        // RAL-476 (interview Q8): read-only pre-deletion impact check --
+        // the Users tab calls this before confirming a delete, so its
+        // `confirm()` dialog can name every affected project instead of
+        // deleting blind.
+        // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
+        ("GET", ["api", "users", name, "deletion-impact"]) => {
+            admin_gated(daemon, user_header, || {
+                user_deletion_impact(daemon, &url_decode(name))
+            })
+        }
         // ralphus[ignore-endpoint-cli]: board Users/Admin tab administration
         ("DELETE", ["api", "users", name]) => admin_gated(daemon, user_header, || {
             delete_user(daemon, &url_decode(name))
@@ -1388,7 +1412,7 @@ fn route_for_user(
             mailbox_undrain(daemon, client_id, body)
         }
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
-        ("POST", ["api", "squads"]) => submit(daemon, body, query),
+        ("POST", ["api", "squads"]) => submit(daemon, body, query, user_header),
         // RAL-297: Simple task form's opt-in "generation step" primitive.
         // ralphus[ignore-endpoint-cli]: board 'Simple' form sketch-to-task generator (RAL-374)
         ("POST", ["api", "generate"]) => generate_start(daemon, body),
@@ -2728,6 +2752,14 @@ struct ProjectReviewSettingsBody {
     auto_fix_pr_errors: Option<bool>,
     #[serde(default)]
     auto_fix_prompt_template: Option<String>,
+    /// RAL-476: fallback owning user for reviews whose squad has no
+    /// `submitter` of its own -- see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    default_pr_user: Option<String>,
+    /// RAL-476: require every review in this project to resolve to a
+    /// registered fork -- see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    forks_only: Option<bool>,
 }
 
 /// `POST /api/projects/{name}/review-settings`: apply a patch (see
@@ -2808,6 +2840,20 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
         }
         Err(e) => return store_error(&e),
     };
+    if let Some(user) = req.default_pr_user.as_deref().filter(|s| !s.is_empty()) {
+        match store.get_user(user) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return error(
+                    400,
+                    "unknown_user",
+                    &format!("'default_pr_user' {user:?} is not registered"),
+                    vec![],
+                );
+            }
+            Err(e) => return store_error(&e),
+        }
+    }
     let mut settings = store
         .get_project_review_settings(&project.name)
         .unwrap_or_default();
@@ -2855,6 +2901,12 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_fix_prompt_template {
         settings.auto_fix_prompt_template = clear_if_empty(v);
+    }
+    if let Some(v) = req.default_pr_user {
+        settings.default_pr_user = clear_if_empty(v);
+    }
+    if let Some(v) = req.forks_only {
+        settings.forks_only = Some(v);
     }
     match store.set_project_review_settings(&project.name, &settings) {
         Ok(()) => json(
@@ -3884,6 +3936,70 @@ fn current_user(daemon: &Daemon, user_header: Option<&str>) -> Result<Option<Str
     }
 }
 
+/// RAL-476: resolve the submitter to stamp on a newly submitted squad,
+/// following the priority order from the RAL-476 interview (Q3):
+///
+/// 1. An explicit top-level `submitter` in the task file.
+/// 2. Steps 2/3: the request's resolved identity (`current_user`, i.e. the
+///    `X-Ralphus-User` header) -- there is no verified-login distinction yet
+///    (RAL-252) between "an authenticated override" and "the submitting
+///    system's own OS username", so both interview steps collapse onto the
+///    same header value here: a CLI/MCP client that defaults its own header
+///    to its local OS username gets step 3's behavior for free once it does,
+///    with no separate daemon-side signal required.
+/// 3. Steps 4/5: neither resolves -- `None`. The project fallback PR user and
+///    any `forks_only` no-user policy (interview steps 4/5) apply at
+///    review-materialization time instead (`Store::create_guardian_keyed`'s
+///    owner chain), not here -- a squad's `submitter` column is allowed to
+///    stay `None` (see `Store::SquadView::submitter`'s doc comment).
+///
+/// When both an explicit `submitter` and a resolved header identity are
+/// present and disagree, the header identity must be a registered admin
+/// (Q5) -- an admin may explicitly submit as another user, but a non-admin
+/// mismatch is rejected.
+fn resolve_effective_submitter(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    explicit: Option<&str>,
+) -> Result<Option<String>, Reply> {
+    let header_user = current_user(daemon, user_header)?;
+    let Some(explicit) = explicit else {
+        return Ok(header_user);
+    };
+    if daemon
+        .lock()
+        .get_user(explicit)
+        .map_err(|e| store_error(&e))?
+        .is_none()
+    {
+        return Err(error(
+            400,
+            "unknown_user",
+            &format!("submitter {explicit:?} is not registered"),
+            vec![],
+        ));
+    }
+    if let Some(header_user) = &header_user {
+        if header_user != explicit {
+            let caller_is_admin = daemon
+                .lock()
+                .is_admin(header_user)
+                .map_err(|e| store_error(&e))?;
+            if !caller_is_admin {
+                return Err(error(
+                    400,
+                    "submitter_conflict",
+                    &format!(
+                        "submitter {explicit:?} does not match the requesting user {header_user:?}; only an admin may submit as another registered user"
+                    ),
+                    vec![],
+                ));
+            }
+        }
+    }
+    Ok(Some(explicit.to_string()))
+}
+
 fn require_current_user(daemon: &Daemon, user_header: Option<&str>) -> Result<String, Reply> {
     current_user(daemon, user_header)?.ok_or_else(|| {
         error(
@@ -3923,7 +4039,6 @@ fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, R
             .unwrap_or_default();
         return Ok(user_name);
     }
-    eprintln!("DEBUG: Admin exists, requiring current user");
     let user_name = require_current_user(daemon, user_header)?;
     match daemon.lock().is_admin(&user_name) {
         Ok(true) => Ok(user_name),
@@ -3943,6 +4058,63 @@ fn require_admin(daemon: &Daemon, user_header: Option<&str>) -> Result<String, R
 /// repeating the same `match require_admin(...) { ... }` at each handler.
 fn admin_gated(daemon: &Daemon, user_header: Option<&str>, reply: impl FnOnce() -> Reply) -> Reply {
     match require_admin(daemon, user_header) {
+        Ok(_) => reply(),
+        Err(r) => r,
+    }
+}
+
+/// Requires the resolved caller to either *be* `target_user` or be a
+/// registered admin (RAL-476, interview Q9) -- lets a user manage their own
+/// per-project fork row from the Preferences page without granting them
+/// [`require_admin`]'s full surface, while an admin keeps write access to
+/// every row, including another user's and the project-wide default
+/// (`user=""`, which never equals a real caller name so it always falls
+/// through to the admin check). Shares [`require_admin`]'s bootstrap
+/// exception (no admin registered anywhere yet) for the same reason: a fresh
+/// instance must be able to register its first fork row before any admin can
+/// exist to gate against.
+fn require_self_or_admin(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    target_user: &str,
+) -> Result<String, Reply> {
+    let any_admin_exists = match daemon.lock().list_users() {
+        Ok(users) => users.iter().any(|u| u.is_admin),
+        Err(e) => return Err(store_error(&e)),
+    };
+    if !any_admin_exists {
+        let user_name = current_user(daemon, user_header)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        return Ok(user_name);
+    }
+    let caller = require_current_user(daemon, user_header)?;
+    if caller == target_user {
+        return Ok(caller);
+    }
+    match daemon.lock().is_admin(&caller) {
+        Ok(true) => Ok(caller),
+        Ok(false) => Err(error(
+            403,
+            "admin_required",
+            &format!("user {caller:?} may only edit their own fork row"),
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Runs `reply` only if the current caller is `target_user` or a registered
+/// admin, else returns [`require_self_or_admin`]'s error `Reply` unchanged --
+/// the self-or-admin equivalent of [`admin_gated`].
+fn self_or_admin_gated(
+    daemon: &Daemon,
+    user_header: Option<&str>,
+    target_user: &str,
+    reply: impl FnOnce() -> Reply,
+) -> Reply {
+    match require_self_or_admin(daemon, user_header, target_user) {
         Ok(_) => reply(),
         Err(r) => r,
     }
@@ -4458,6 +4630,17 @@ fn user_rename(daemon: &Daemon, name: &str, body: &str) -> Reply {
     }
     match daemon.lock().rename_user(name, new_name) {
         Ok(()) => json(200, &serde_json::json!({"name": new_name})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// RAL-476 (interview Q8): every registered project that would be left with
+/// a dangling reference if `name` were deleted -- see
+/// `Store::user_deletion_impact`. Always `200`, even for an unregistered
+/// name (an empty list -- nothing references a user that never existed).
+fn user_deletion_impact(daemon: &Daemon, name: &str) -> Reply {
+    match daemon.lock().user_deletion_impact(name) {
+        Ok(affected) => json(200, &serde_json::json!({ "affected": affected })),
         Err(e) => store_error(&e),
     }
 }
@@ -5216,7 +5399,7 @@ fn generate_cancel(daemon: &Daemon, id: &str) -> Reply {
     json(202, &serde_json::json!({}))
 }
 
-fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
+fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
     let Ok(req) = serde_json::from_str::<SubmitBody>(body) else {
         return error(
             400,
@@ -5236,7 +5419,7 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
         );
     }
 
-    let mut file = match toml::from_str(&req.toml) {
+    let mut file: ralphus_core::schema::TaskFile = match toml::from_str(&req.toml) {
         Ok(f) => f,
         Err(e) => {
             return error(
@@ -5247,6 +5430,14 @@ fn submit(daemon: &Daemon, body: &str, query: &str) -> Reply {
             );
         }
     };
+    // RAL-476: resolve and stamp the squad's submitter before it's persisted
+    // -- explicit TOML `submitter` if present (subject to the admin-conflict
+    // check), else the resolved request identity, else `None`. See
+    // `resolve_effective_submitter`'s doc comment for the full order.
+    match resolve_effective_submitter(daemon, user_header, file.submitter.as_deref()) {
+        Ok(resolved) => file.submitter = resolved,
+        Err(reply) => return reply,
+    }
     let profile_errors =
         crate::agent_profiles::validate_task_file_profiles(&daemon.lock(), &req.toml, &file);
     if !profile_errors.is_empty() {
@@ -15229,6 +15420,18 @@ mod tests {
     const GOOD: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
 
     fn daemon() -> Daemon {
+        let d = Daemon::new(Store::open_in_memory().unwrap(), 12);
+        // Register the default user from the daemon config so tests don't fail
+        // with "unknown_user" when submitting without an explicit submitter
+        if let Some(default_user) = crate::config::load_daemon_config().default_user {
+            let _ = d.lock().create_user(&default_user);
+        }
+        d
+    }
+
+    /// Create a daemon without registering the default user. Useful for tests
+    /// that specifically want to verify behavior when no user is available.
+    fn daemon_without_default_user() -> Daemon {
         Daemon::new(Store::open_in_memory().unwrap(), 12)
     }
 
@@ -25894,7 +26097,7 @@ command=\"cargo test\"
 
     #[test]
     fn watches_require_an_acting_user() {
-        let d = daemon();
+        let d = daemon_without_default_user();
         let body =
             serde_json::to_string(&serde_json::json!({"entity_uri": "squad:squad-1"})).unwrap();
         assert_eq!(route(&d, "GET", "/api/watches", "").status, 400);

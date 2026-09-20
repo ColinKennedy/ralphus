@@ -43,6 +43,25 @@ pub struct UserView {
     pub is_admin: bool,
 }
 
+/// One reason a project would be left with a dangling reference if a given
+/// user were deleted (RAL-476, interview Q8). `kind` is a stable machine tag
+/// (`"default_pr_user"` | `"review_owner"` | `"registered_fork"`); `detail`
+/// is the human-readable sentence fragment the Users tab's confirmation
+/// dialog names the project with.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserDeletionImpactReason {
+    pub kind: String,
+    pub detail: String,
+}
+
+/// A registered project affected by deleting a user, and every reason it is
+/// affected -- see [`Store::user_deletion_impact`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UserDeletionImpact {
+    pub project: String,
+    pub reasons: Vec<UserDeletionImpactReason>,
+}
+
 /// Shared row-mapper for `users` queries that select
 /// `name, created_at_ms, auto_watch, default_notify_tiers, is_admin` in that order.
 fn row_to_user_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserView> {
@@ -230,6 +249,67 @@ impl Store {
         Ok(())
     }
 
+    /// RAL-476 (interview Q8): every registered project that would be left
+    /// with a dangling reference if `name` were deleted -- consulted by the
+    /// admin Users tab to build a specific pre-deletion confirmation ("This
+    /// user is the default PR user for project X...") instead of deleting
+    /// blind. Purely a read: deletion itself never cascades (fork rows and
+    /// historical review ownership are durable strings, kept on purpose --
+    /// see `project_forks.rs`'s module doc comment and [`GuardianView::owner`]).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn user_deletion_impact(&self, name: &str) -> StoreResult<Vec<UserDeletionImpact>> {
+        let mut by_project: std::collections::BTreeMap<String, Vec<UserDeletionImpactReason>> =
+            std::collections::BTreeMap::new();
+
+        for project in self.list_projects()? {
+            let settings = self.get_project_review_settings(&project.name)?;
+            if settings.default_pr_user.as_deref() == Some(name) {
+                by_project
+                    .entry(project.name)
+                    .or_default()
+                    .push(UserDeletionImpactReason {
+                        kind: "default_pr_user".to_string(),
+                        detail: "is the default PR user for this project".to_string(),
+                    });
+            }
+        }
+
+        let mut owned_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for guardian in self.list_guardians()? {
+            if guardian.owner.as_deref() == Some(name) {
+                let project = guardian.project.unwrap_or(guardian.git_root);
+                *owned_counts.entry(project).or_insert(0) += 1;
+            }
+        }
+        for (project, count) in owned_counts {
+            by_project
+                .entry(project)
+                .or_default()
+                .push(UserDeletionImpactReason {
+                    kind: "review_owner".to_string(),
+                    detail: format!("owns {count} review{}", if count == 1 { "" } else { "s" }),
+                });
+        }
+
+        for fork in self.list_project_forks_for_user(name)? {
+            by_project
+                .entry(fork.project)
+                .or_default()
+                .push(UserDeletionImpactReason {
+                    kind: "registered_fork".to_string(),
+                    detail: "has a registered fork remote for this user".to_string(),
+                });
+        }
+
+        Ok(by_project
+            .into_iter()
+            .map(|(project, reasons)| UserDeletionImpact { project, reasons })
+            .collect())
+    }
+
     /// Remove a registered user. Returns `false` if no such user existed.
     ///
     /// # Errors
@@ -260,7 +340,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use ralphus_core::schema::TaskFile;
+
     use super::*;
+    use crate::store::ProjectReviewSettings;
 
     #[test]
     fn a_newly_registered_user_is_not_admin() {
@@ -313,5 +396,129 @@ mod tests {
         store.set_user_admin("alice", true).unwrap();
         store.create_user("alice").unwrap();
         assert!(store.is_admin("alice").unwrap());
+    }
+
+    #[test]
+    fn user_deletion_impact_for_an_unregistered_name_is_empty() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.user_deletion_impact("nobody").unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_deletion_impact_for_an_unaffected_user_is_empty() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        assert!(store.user_deletion_impact("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn user_deletion_impact_flags_the_project_default_pr_user() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    default_pr_user: Some("alice".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let impact = store.user_deletion_impact("alice").unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(impact[0].project, "proj");
+        assert_eq!(impact[0].reasons.len(), 1);
+        assert_eq!(impact[0].reasons[0].kind, "default_pr_user");
+    }
+
+    #[test]
+    fn user_deletion_impact_flags_review_ownership_with_a_count() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        let file: TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='build'\n[[task.cell]]\ncwd='/repo'\nprompt='go'\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        store
+            .create_guardian_for_squad("review1", "main", "/repo", Some(&squad_id))
+            .unwrap();
+        store
+            .create_guardian_for_squad("review2", "main", "/repo", Some(&squad_id))
+            .unwrap();
+
+        let impact = store.user_deletion_impact("alice").unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(impact[0].project, "/repo");
+        assert_eq!(impact[0].reasons.len(), 1);
+        assert_eq!(impact[0].reasons[0].kind, "review_owner");
+        assert_eq!(impact[0].reasons[0].detail, "owns 2 reviews");
+    }
+
+    #[test]
+    fn user_deletion_impact_flags_a_registered_fork() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        store
+            .upsert_project_fork(
+                "proj",
+                "alice",
+                "https://example.com/alice/proj.git",
+                "fork-alice",
+                "alice",
+            )
+            .unwrap();
+
+        let impact = store.user_deletion_impact("alice").unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(impact[0].project, "proj");
+        assert_eq!(impact[0].reasons.len(), 1);
+        assert_eq!(impact[0].reasons[0].kind, "registered_fork");
+    }
+
+    #[test]
+    fn user_deletion_impact_combines_multiple_reasons_for_one_project() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_user("alice").unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    default_pr_user: Some("alice".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .upsert_project_fork(
+                "proj",
+                "alice",
+                "https://example.com/alice/proj.git",
+                "fork-alice",
+                "alice",
+            )
+            .unwrap();
+        store
+            .create_guardian_for_project("review1", "main", "proj")
+            .unwrap();
+
+        let impact = store.user_deletion_impact("alice").unwrap();
+        assert_eq!(impact.len(), 1);
+        assert_eq!(impact[0].project, "proj");
+        let kinds: std::collections::BTreeSet<&str> =
+            impact[0].reasons.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            std::collections::BTreeSet::from([
+                "default_pr_user",
+                "review_owner",
+                "registered_fork"
+            ])
+        );
     }
 }

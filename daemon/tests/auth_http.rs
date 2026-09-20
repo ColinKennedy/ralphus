@@ -81,10 +81,30 @@ fn a_post_route_without_a_token_is_rejected_before_reaching_the_store() {
 #[test]
 fn a_post_route_with_the_correct_token_succeeds() {
     let base = spawn_authenticated_server();
+
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body, Some(TOKEN));
+    assert_eq!(status, 200);
+
     const GOOD: &str = "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n";
     let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
-    let (status, body) = post(&base, "/api/squads", &submit_body, Some(TOKEN));
-    assert_eq!(status, 201, "body: {body}");
+    let request = ureq::post(&format!("{base}/api/squads"))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {TOKEN}"))
+        .set("X-Ralphus-User", "test-user");
+    let resp = match request.send_string(&submit_body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            panic!("unexpected {code}: {}", r.into_string().unwrap_or_default())
+        }
+        Err(e) => panic!("request error: {e}"),
+    };
+    assert_eq!(
+        resp.status(),
+        201,
+        "body: {}",
+        resp.into_string().unwrap_or_default()
+    );
 }
 
 /// The stated reason for RAL-219 is enabling a remote/non-browser caller --
@@ -93,14 +113,30 @@ fn a_post_route_with_the_correct_token_succeeds() {
 #[test]
 fn a_non_browser_client_can_complete_a_full_submit_and_read_cycle_with_a_valid_token() {
     let base = spawn_authenticated_server();
+
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body, Some(TOKEN));
+    assert_eq!(status, 200);
+
     const GOOD: &str = "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n";
 
     let (status, _) = get(&base, "/api/daemon", Some(TOKEN));
     assert_eq!(status, 200);
 
     let submit_body = serde_json::json!({ "toml": GOOD, "label": "auth test" }).to_string();
-    let (status, body) = post(&base, "/api/squads", &submit_body, Some(TOKEN));
-    assert_eq!(status, 201, "submit body: {body}");
+    let request = ureq::post(&format!("{base}/api/squads"))
+        .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {TOKEN}"))
+        .set("X-Ralphus-User", "test-user");
+    let resp = match request.send_string(&submit_body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            panic!("unexpected {code}: {}", r.into_string().unwrap_or_default())
+        }
+        Err(e) => panic!("request error: {e}"),
+    };
+    assert_eq!(resp.status(), 201);
+    let body = resp.into_string().unwrap_or_default();
     assert!(body.contains("squad-000000000001"));
 
     let (status, body) = get(&base, "/api/squads/squad-000000000001", Some(TOKEN));

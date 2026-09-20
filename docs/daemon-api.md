@@ -754,6 +754,7 @@ unclaimed rows.
 ### Admin flag and admin-only endpoints (RAL-332)
 
 `GET /api/users`, `POST /api/users`, `DELETE /api/users/{name}`,
+`GET /api/users/{name}/deletion-impact`,
 `POST /api/users/{name}/rename`, `POST /api/users/{name}/admin`,
 `POST /api/users/{name}/visit`, everything under `/api/machines`,
 everything under `/api/triage`, everything under `/api/secret-env-names`,
@@ -818,8 +819,35 @@ Request: `{ "name": "colin" }`. `400` if `name` is empty. Response `200`:
 { "name": "colin" }
 ```
 
+### `GET /api/users/{name}/deletion-impact`
+RAL-476: every registered project that would be left with a dangling
+reference if `name` were deleted -- the Users tab calls this before
+confirming a delete, so the confirmation dialog can name every affected
+project instead of deleting blind. Read-only; does not itself change
+anything. Admin-only (RAL-332). Always `200`, including for an unregistered
+name (an empty `affected` list).
+
+```json
+{
+  "affected": [
+    {
+      "project": "widget-api",
+      "reasons": [
+        { "kind": "default_pr_user", "detail": "is the default PR user for this project" },
+        { "kind": "review_owner", "detail": "owns 2 reviews" }
+      ]
+    }
+  ]
+}
+```
+`kind` is one of `default_pr_user`, `review_owner`, `registered_fork`.
+
 ### `DELETE /api/users/{name}`
-Remove a registered user by exact name. Admin-only (RAL-332).
+Remove a registered user by exact name. Admin-only (RAL-332). Never
+cascades: fork rows (`project_forks`) and historical review ownership
+(`GuardianView.owner`) keep naming the deleted user as a durable string --
+see `GET /api/users/{name}/deletion-impact` above to see what that leaves
+dangling before deleting.
 
 ```json
 { "deleted": true }

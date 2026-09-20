@@ -61,8 +61,12 @@ fn full_submit_and_read_cycle_over_http() {
     assert_eq!(status, 200, "health body: {body}");
     assert!(body.contains("ralphus-daemon"));
 
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body);
+    assert_eq!(status, 200, "create user body");
+
     let submit_body = serde_json::json!({ "toml": GOOD, "label": "wire test" }).to_string();
-    let (status, body) = post(&base, "/api/squads", &submit_body);
+    let (status, body) = request_as_user(&base, "POST", "/api/squads", "test-user", &submit_body);
     assert_eq!(status, 201, "submit body: {body}");
     assert!(body.contains("squad-000000000001"));
 
@@ -82,8 +86,13 @@ fn full_submit_and_read_cycle_over_http() {
 #[test]
 fn invalid_submission_is_rejected_over_http() {
     let base = spawn_server();
+
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body);
+    assert_eq!(status, 200);
+
     let body = serde_json::json!({ "toml": "garbage = true" }).to_string();
-    let (status, resp) = post(&base, "/api/squads", &body);
+    let (status, resp) = request_as_user(&base, "POST", "/api/squads", "test-user", &body);
     assert_eq!(status, 400);
     assert!(resp.contains("validation_failed"));
 }
@@ -97,7 +106,7 @@ fn hidden_squads_are_scoped_by_the_user_header() {
         assert_eq!(status, 200, "create user body: {response}");
     }
     let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
-    let (status, response) = post(&base, "/api/squads", &submit_body);
+    let (status, response) = request_as_user(&base, "POST", "/api/squads", "alice", &submit_body);
     assert_eq!(status, 201, "submit body: {response}");
     let review_body = serde_json::json!({
         "name": "wire review",
@@ -181,7 +190,8 @@ fn hidden_squads_batch_applies_in_one_request() {
 
     for _ in 0..2 {
         let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
-        let (status, response) = post(&base, "/api/squads", &submit_body);
+        let (status, response) =
+            request_as_user(&base, "POST", "/api/squads", "alice", &submit_body);
         assert_eq!(status, 201, "submit body: {response}");
     }
 
@@ -246,7 +256,7 @@ fn hidden_tasks_are_scoped_by_the_user_header_and_independent_of_their_squad() {
         assert_eq!(status, 200, "create user body: {response}");
     }
     let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
-    let (status, response) = post(&base, "/api/squads", &submit_body);
+    let (status, response) = request_as_user(&base, "POST", "/api/squads", "alice", &submit_body);
     assert_eq!(status, 201, "submit body: {response}");
 
     let path = "/api/hidden/tasks/squad-000000000001/0";
@@ -333,7 +343,7 @@ fn hidden_tasks_batch_applies_in_one_request() {
 
     let two_tasks = "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n[[task]]\nname=\"test\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"go\"\n";
     let submit_body = serde_json::json!({ "toml": two_tasks }).to_string();
-    let (status, response) = post(&base, "/api/squads", &submit_body);
+    let (status, response) = request_as_user(&base, "POST", "/api/squads", "alice", &submit_body);
     assert_eq!(status, 201, "submit body: {response}");
 
     // One request hides both real tasks plus an index that does not exist --
@@ -492,7 +502,7 @@ fn cartographer_admin_only_rows_are_hidden_from_non_admin_viewers() {
     promote(&base, "", "alice", true);
 
     let submit_body = serde_json::json!({ "toml": GOOD }).to_string();
-    let (status, response) = post(&base, "/api/squads", &submit_body);
+    let (status, response) = request_as_user(&base, "POST", "/api/squads", "alice", &submit_body);
     assert_eq!(status, 201, "submit body: {response}");
 
     // RAL-328's hide/unhide rows are marked admin-only (RAL-332 closes that
@@ -605,10 +615,16 @@ fn cross_origin_preflight_for_disallowed_origin_is_blocked() {
 #[test]
 fn same_origin_post_is_allowed_and_echoes_the_origin_header() {
     let base = spawn_server();
+
+    let user_body = serde_json::json!({ "name": "test-user" }).to_string();
+    let (status, _) = post(&base, "/api/users", &user_body);
+    assert_eq!(status, 200);
+
     let submit_body = serde_json::json!({ "toml": GOOD, "label": "same origin" }).to_string();
 
     let resp = ureq::post(&format!("{base}/api/squads"))
         .set("Content-Type", "application/json")
+        .set("X-Ralphus-User", "test-user")
         .set("Origin", &base)
         .send_string(&submit_body);
     let resp = match resp {

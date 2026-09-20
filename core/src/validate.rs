@@ -156,7 +156,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     };
 
     for key in table.keys() {
-        if key != "default" && key != "task" && key != "review" {
+        if key != "default" && key != "task" && key != "review" && key != "submitter" {
             let line = ctx.idx.find_toplevel_key(ctx.raw, key);
             ctx.error(
                 key,
@@ -168,10 +168,36 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     }
 
     validate_defaults(table.get("default"), &mut ctx);
+    validate_submitter(table.get("submitter"), &mut ctx);
     validate_tasks(table.get("task"), &mut ctx);
     validate_review_blocks(table.get("review"), &mut ctx);
 
     report
+}
+
+/// RAL-476: `submitter` is a plain top-level string naming the registered
+/// user submitting this task file. `core` doesn't own the user registry (the
+/// daemon does), so this only checks the TOML shape -- non-empty string when
+/// present. The daemon separately rejects a `submitter` that doesn't name a
+/// registered user.
+fn validate_submitter(value: Option<&toml::Value>, ctx: &mut Ctx<'_>) {
+    let Some(value) = value else { return };
+    let line = ctx.key_line(None, "submitter");
+    match value.as_str() {
+        Some(s) if !s.trim().is_empty() => {}
+        Some(_) => ctx.error(
+            "submitter",
+            ErrorKind::InvalidValue,
+            "'submitter' must not be empty",
+            line,
+        ),
+        None => ctx.error(
+            "submitter",
+            ErrorKind::WrongType,
+            "'submitter' must be a string",
+            line,
+        ),
+    }
 }
 
 // ── Allowed key sets (mirror old:src/tasks/validate.rs) ──────────────────────
@@ -5227,6 +5253,41 @@ project = "ralphus"
                 .iter()
                 .any(|e| e.kind == ErrorKind::UnknownKey && e.message.contains("upstream")),
             "upstream must not be reported as unknown: {:?}",
+            r.errors
+        );
+    }
+
+    // ── RAL-476: submitter ───────────────────────────────────────────────────
+
+    #[test]
+    fn submitter_accepted_as_top_level_string() {
+        let src = format!("submitter = \"alice\"\n{GOOD}");
+        let r = validate_toml(&src);
+        assert!(r.is_ok(), "expected ok, got {:?}", r.errors);
+    }
+
+    #[test]
+    fn submitter_empty_string_rejected() {
+        let src = format!("submitter = \"\"\n{GOOD}");
+        let r = validate_toml(&src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.path == "submitter"),
+            "expected an invalid-value error for empty submitter: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn submitter_wrong_type_rejected() {
+        let src = format!("submitter = 5\n{GOOD}");
+        let r = validate_toml(&src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.path == "submitter"),
+            "expected a wrong-type error for non-string submitter: {:?}",
             r.errors
         );
     }

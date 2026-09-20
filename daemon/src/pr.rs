@@ -2627,10 +2627,19 @@ fn maybe_promote_fork_root(
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    // Daemon-internal poller, no per-request acting-user context -- resolves
-    // the project-wide default fork row, matching every other poller-driven
-    // fork lookup (mirrors `auto_submit_terminal_branches`'s rationale).
-    let routing = match resolve_fork_routing(store, &root, guardian, &forge_cfg, "") {
+    // Daemon-internal poller, no per-request acting-user context -- RAL-476:
+    // uses this review's own resolved `owner` (stamped at guardian-creation
+    // time from the squad's submitter, the project's default PR user, or the
+    // daemon's default user, in that order), falling back to the
+    // project-wide default fork row for a pre-RAL-476 guardian with no
+    // `owner` recorded.
+    let routing = match resolve_fork_routing(
+        store,
+        &root,
+        guardian,
+        &forge_cfg,
+        guardian.owner.as_deref().unwrap_or(""),
+    ) {
         Ok(Some(routing)) => routing,
         Ok(None) => return, // not a fork-mode review
         Err(e) => {
@@ -5680,12 +5689,19 @@ fn auto_submit_terminal_branches(
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: this is a daemon-internal poller, not a per-request submit --
-    // no acting-user identity exists to resolve, so it uses
-    // `[daemon].default_user` (falling back to the project-wide default fork
-    // row when even that is unset), matching `current_user`'s own fallback.
-    let poller_user = crate::config::load_daemon_config()
-        .default_user
-        .unwrap_or_default();
+    // no acting-user identity exists to resolve. RAL-476 extends this to
+    // prefer the review's own resolved `owner` (the squad's submitter,
+    // project default PR user, or daemon default user, already resolved once
+    // at guardian-creation time) over recomputing the daemon-wide default
+    // here, so auto-submission routes through the same fork a manual
+    // submission by that same user would. Falls back to `[daemon].default_user`
+    // for a pre-RAL-476 guardian with no `owner` recorded, then to the
+    // project-wide default fork row when even that is unset.
+    let poller_user = guardian.owner.clone().unwrap_or_else(|| {
+        crate::config::load_daemon_config()
+            .default_user
+            .unwrap_or_default()
+    });
     let fork_routing = resolve_fork_routing(store, &root, &guardian, &forge_cfg, &poller_user)?;
     if fork_routing.is_some() && guardian.machine.is_some() {
         return Err(format!(
