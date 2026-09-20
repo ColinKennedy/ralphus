@@ -2455,6 +2455,67 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
     });
 }
 
+/// Last time [`check_pr_merges`] actually asked the forge about a guardian,
+/// keyed by guardian id -- mirrors `ci_watch::STANDING_POLL_LAST`'s shape,
+/// but keyed and intervaled independently since it throttles a different
+/// forge call. Entries are dropped once a review reaches a terminal status
+/// (see [`check_pr_merges`]), so this tracks live reviews only.
+static MERGE_CHECK_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The throttled entry point to [`check_pr_merges`], for the background
+/// `review_maintenance` sweep.
+///
+/// `review_maintenance` runs on a 5s cadence, and [`check_pr_merges`] fires
+/// one `GET /pulls/{n}` per open PR per call -- 720 forge requests per hour
+/// per open PR, which is the single largest consumer of the rate-limit
+/// budget and enough on its own to exhaust GitHub's authenticated hourly
+/// limit at roughly six open PRs. This asks at most once per
+/// [`crate::config::MergeCheckConfig::poll_interval`] per guardian instead.
+///
+/// Manual triggers (the "Merge / rebase" button's `kickoff_merge` path) call
+/// [`check_pr_merges`] directly and are deliberately never throttled: a user
+/// who just asked deserves a live answer. Those calls do refresh this
+/// throttle's window, so the sweep doesn't re-ask on top of one.
+///
+/// Returns whether anything changed, exactly as [`check_pr_merges`] does --
+/// a skipped (throttled or disabled) pass changed nothing, so returns
+/// `false`.
+pub fn check_pr_merges_polled(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let cfg = crate::config::load_merge_check_config();
+    if !cfg.enabled() {
+        return false;
+    }
+    {
+        let last = MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !merge_check_due(
+            last.get(id).copied(),
+            std::time::Instant::now(),
+            cfg.poll_interval(),
+        ) {
+            return false;
+        }
+    }
+    check_pr_merges(store, id)
+}
+
+/// Whether a guardian last checked at `last` is due for another merge check
+/// at `now`. A guardian never checked in this process's lifetime is always
+/// due. Split out from [`check_pr_merges_polled`] so the interval decision is
+/// testable without a monotonic clock that can be wound backwards.
+fn merge_check_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    // `saturating_duration_since` rather than `duration_since`: an entry
+    // stamped fractionally ahead of `now` (two threads reading the clock in
+    // the other order) must read as "no time has passed", not panic.
+    last.is_none_or(|prev| now.saturating_duration_since(prev) >= interval)
+}
+
 /// Poll every PR/MR linked to `id` for a live "merged" state and settle the
 /// review accordingly (RAL-300).
 ///
@@ -2488,8 +2549,22 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return false;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        // A terminal review is never polled again -- drop its throttle entry
+        // rather than leaving it to accumulate for the daemon's lifetime.
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
         return false;
     }
+    // Every caller that reaches this point is about to ask the forge, so
+    // record the attempt even on the unthrottled (manual) path: a manual
+    // "Merge / rebase" answers the same question the sweep would have, and
+    // the sweep should not immediately re-ask on top of it.
+    MERGE_CHECK_LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id.to_string(), std::time::Instant::now());
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -10783,6 +10858,155 @@ mod tests {
         assert!(messages[0].message.contains("dropped from the review"));
 
         handle.join().unwrap();
+    }
+
+    /// A guardian sitting in `in_review` whose one linked PR is already
+    /// recorded `merged` -- `check_pr_merges` settles it to `approved`
+    /// without any forge call, which makes "did the check actually run?"
+    /// observable as a status change rather than as wall-clock timing.
+    fn guardian_ready_to_settle(store: &crate::store_lock::StoreHandle) -> String {
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .update_pull_request(&pr_id, None, None, None, Some("merged"))
+            .unwrap();
+        gid
+    }
+
+    #[test]
+    fn check_pr_merges_polled_skips_a_guardian_inside_its_throttle_window() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+
+        assert!(
+            !check_pr_merges_polled(&store, &gid),
+            "a guardian checked a moment ago must not be re-checked"
+        );
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().status,
+            "in_review",
+            "the throttled pass must not have reached `check_pr_merges`"
+        );
+    }
+
+    #[test]
+    fn check_pr_merges_polled_runs_for_a_guardian_it_has_never_checked() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&gid);
+
+        assert!(check_pr_merges_polled(&store, &gid));
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
+    }
+
+    #[test]
+    fn merge_check_is_due_once_the_interval_has_elapsed() {
+        // Expressed as time moving *forward* from a real reading: a
+        // monotonic clock cannot reliably be wound back far enough to
+        // backdate an `Instant` by a whole interval.
+        let interval = std::time::Duration::from_secs(60);
+        let last = std::time::Instant::now();
+
+        assert!(
+            !merge_check_due(Some(last), last, interval),
+            "a guardian checked this instant is not due"
+        );
+        assert!(
+            !merge_check_due(
+                Some(last),
+                last + interval - std::time::Duration::from_millis(1),
+                interval
+            ),
+            "a guardian checked a moment inside the window is not due"
+        );
+        assert!(
+            merge_check_due(Some(last), last + interval, interval),
+            "a guardian checked exactly one interval ago is due"
+        );
+        assert!(
+            merge_check_due(None, last, interval),
+            "a guardian never checked is always due"
+        );
+    }
+
+    #[test]
+    fn merge_check_treats_a_last_stamp_from_the_future_as_not_due() {
+        // Two threads can read the clock in the opposite order to the order
+        // they store it; that must read as "no time has passed", not panic.
+        let interval = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        assert!(!merge_check_due(
+            Some(now + std::time::Duration::from_secs(5)),
+            now,
+            interval
+        ));
+    }
+
+    #[test]
+    fn check_pr_merges_is_never_throttled_for_a_manual_trigger() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        // The sweep polled a moment ago; the "Merge / rebase" button must
+        // still get a live answer rather than the sweep's cooldown.
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+
+        assert!(check_pr_merges(&store, &gid));
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
+    }
+
+    #[test]
+    fn check_pr_merges_drops_the_throttle_entry_for_a_terminal_guardian() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::Deployed, None)
+            .unwrap();
+
+        assert!(!check_pr_merges(&store, &gid));
+        assert!(
+            !MERGE_CHECK_LAST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&gid),
+            "a terminal review's throttle entry must not accumulate"
+        );
     }
 
     #[test]

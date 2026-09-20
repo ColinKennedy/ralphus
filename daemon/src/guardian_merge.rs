@@ -7019,13 +7019,17 @@ pub fn review_maintenance(
             // trigger a merge for this guardian id.
             let token = cancellations.register(&format!("guardian:{id}"));
             // RAL-300: ask "have the linked PRs merged?" before deciding to
-            // rebase at all. When this approves the review outright (every
-            // linked PR merged, review was idle in `in_review`) or drops a
-            // stale mid-flight PR, it already updated guardian/PR state --
+            // rebase at all. Self-throttled per guardian (see
+            // `pr::check_pr_merges_polled`), because this sweep's own 5s
+            // cadence would otherwise put one `GET /pulls/{n}` per open PR on
+            // the forge every five seconds. When this approves the review
+            // outright (every linked PR merged, review was idle in
+            // `in_review`) or drops a stale mid-flight PR, it already
+            // updated guardian/PR state --
             // the base-shift/manual-push calls below re-read guardian.status
             // themselves and naturally no-op once it's no longer
             // `in_review`/`merge_failed`, so no extra branching is needed here.
-            crate::pr::check_pr_merges(&store, &id);
+            crate::pr::check_pr_merges_polled(&store, &id);
             // RAL-395: standing CI-status poll (self-throttled per guardian,
             // see `ci_watch::STANDING_POLL_INTERVAL`) -- persists the result
             // for the board and dispatches auto-fix on a fresh failure when
