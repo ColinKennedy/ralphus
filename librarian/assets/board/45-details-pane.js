@@ -654,7 +654,12 @@
       function selectBranchRow(e, gid, branch) {
         // Toggle: clicking a selected branch deselects it; clicking another selects it.
         selectedBranch[gid] = selectedBranch[gid] === branch ? null : branch;
-        renderReviewDetail();
+        // RAL-481: preserve the pane's own scroll across a switch between
+        // worktrees/branches in the same review, instead of a bare
+        // renderReviewDetail() jumping back to the top. Any open
+        // live-terminal peek box keeps its own atBottom-aware restore --
+        // see preservePaneScroll's comment for why that's a separate helper.
+        preservePaneScroll(reviewDetailScrollEl(), renderReviewDetail);
       }
       /**
        * Navigates to the Squads tab and selects a squad.
