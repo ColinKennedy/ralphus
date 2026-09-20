@@ -566,9 +566,10 @@ fn regen_from_feature_worktree(
 /// 3. **Review branch missing** — `checkout -B` recreates it from `branch`.
 /// 4. **Stale git tracking entry** — `git worktree prune` removes it so
 ///    `worktree add` does not reject the path as already registered; every
-///    `add` call site retries once more after an extra prune
-///    ([`add_worktree_with_prune_retry`]) in case the entry only frees up
-///    (lock released, concurrent recovery finishes) after the first one.
+///    `add` call site retries once more after an extra unlock, force-remove,
+///    and prune ([`add_worktree_with_prune_retry`]) in case the entry only
+///    frees up (lock released, concurrent recovery finishes) after the first
+///    pass.
 /// 5. **Branch mismatch** — `checkout -f -B rev branch` corrects it.
 /// 6. **Detached HEAD** — `checkout` reattaches to a named branch.
 /// 7. **Worktree locked** — unlocked before removal.
@@ -602,8 +603,9 @@ struct NoRecoveryFaults;
 
 impl RecoveryFaults for NoRecoveryFaults {}
 
-/// `git worktree add -B rev wt_str branch`, retrying once after a fresh
-/// `git worktree prune` if the first attempt fails.
+/// `git worktree add -B rev wt_str branch`, retrying once after unlocking,
+/// force-removing, and pruning the tracking entry at `wt_str` if the first
+/// attempt fails.
 ///
 /// [State 4]: `add` rejects `rev` as "already used by worktree" whenever
 /// *any* tracking entry still claims that branch, even one whose directory
@@ -613,6 +615,18 @@ impl RecoveryFaults for NoRecoveryFaults {}
 /// dropped in the gap between that prune and this `add` is still possible --
 /// this retry (guardian-000000000087) catches it instead of surfacing git's
 /// raw error.
+///
+/// guardian-000000000119: a plain re-prune isn't always enough -- a daemon
+/// restart racing its own predecessor's still-tearing-down worktree claim can
+/// leave the entry genuinely *locked*, not merely stale, which `prune` alone
+/// skips by design. The retry now redoes the same unlock + force-remove +
+/// prune sequence the caller already ran before its own first `add`, so a
+/// lock that outlived that first pass still gets cleared before the second.
+/// Safe to force here: by the time either call site reaches this helper, `wt`
+/// is expected already empty/absent, and every other recovery path in this
+/// function already discards uncommitted content in these review worktrees
+/// (logged as a warning) rather than treating it as durable state -- see the
+/// "discarding uncommitted changes" call sites above.
 fn add_worktree_with_prune_retry<F: RecoveryFaults>(
     root: &Workspace,
     rev: &str,
@@ -626,6 +640,8 @@ fn add_worktree_with_prune_retry<F: RecoveryFaults>(
     );
     first
         .or_else(|_| {
+            let _ = root.git(&["worktree", "unlock", wt_str]);
+            let _ = root.git(&["worktree", "remove", "--force", wt_str]);
             let _ = root.git(&["worktree", "prune"]);
             root.git(&["worktree", "add", "-B", rev, wt_str, branch])
         })
@@ -12338,6 +12354,43 @@ mod tests {
             "only the first attempt is short-circuited; the retry always uses real git"
         );
         assert_on_branch(&wt_path, rev);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn add_worktree_with_prune_retry_recovers_a_dangling_locked_entry() {
+        // guardian-000000000119: a plain `prune` retry (the original
+        // guardian-000000000087 fix) does not help when the stale tracking
+        // entry is LOCKED, not merely dangling -- `git worktree prune` skips
+        // locked entries by design, so the first `add` and a prune-only
+        // retry both fail with the exact error seen live: "'rev' is already
+        // used by worktree at '<path>'", even though nothing is actually
+        // checked out there. This calls the retry helper directly (skipping
+        // any unlock/remove a caller may have already run before reaching
+        // it), proving the helper no longer depends on that -- it now
+        // unlocks and force-removes the stale entry itself before its
+        // second `add` attempt.
+        let (base, repo, _fwt) = make_repo("add-retry-locked");
+        let root = Workspace::local(&repo);
+        let rev = "guardian/g/wt-feature-a";
+        let rwt = base.join("rwt");
+        let wt_str = rwt.to_string_lossy().to_string();
+
+        worktree_add_or_reset(&root, rev, &Workspace::local(&rwt), "feature/a")
+            .expect("initial setup");
+        g(&repo, &["worktree", "lock", &wt_str]);
+        std::fs::remove_dir_all(&rwt).unwrap();
+        assert!(!rwt.exists(), "precondition: rwt must not exist");
+
+        let result =
+            add_worktree_with_prune_retry(&root, rev, &wt_str, "feature/a", &mut NoRecoveryFaults);
+
+        assert!(
+            result.is_ok(),
+            "retry must clear a locked, dangling tracking entry: {result:?}"
+        );
+        assert_on_branch(&rwt, rev);
 
         let _ = std::fs::remove_dir_all(&base);
     }
