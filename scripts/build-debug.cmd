@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 rem build-debug.cmd -- the FAST counterpart to build-release.cmd (mirrors build-debug.sh).
 rem Fast local dev loop -- NO dist\. Runs the whole stack from source so
-rem iterating on the GUI (librarian\assets's board) is quick:
+rem iterating on the GUI (librarian\assets\board.html) is quick:
 rem
 rem   * daemon + librarian + runner + cli   -> cargo debug builds (incremental;
 rem                                            seconds each; all four are Rust)
@@ -11,10 +11,7 @@ rem All four binaries are Rust -- there is no Python venv sync step. `cli-py\`
 rem still exists for `docsgen\` (Playwright screenshots, dev-only, never
 rem shipped).
 rem
-rem Loop: edit a board asset (librarian\assets\board\*.js, board.css,
-rem board.html) and refresh the browser -- the librarian reads board assets from
-rem disk in dev mode (RALPHUS_BOARD_ASSETS_DIR is set below), so no rebuild is
-rem needed. Re-run this script only when Rust code changes.
+rem Loop: edit board.html -> re-run this script -> refresh the browser.
 rem Ctrl-C stops both processes. For a distributable standalone build (slow),
 rem use build-release.cmd instead.
 rem
@@ -76,7 +73,7 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
 )
 
 rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
-rem    any CLI/runner/librarian source edit alike).
+rem    board.html and any CLI/runner source edit alike).
 echo == cargo build (debug) daemon + librarian + runner + cli ==
 cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
@@ -89,6 +86,14 @@ rem    librarian exiting) tears the daemon down too. The daemon is launched via
 rem    PowerShell's Start-Process -PassThru so we capture its exact PID -- the
 rem    cleanup below kills only THAT process, not every ralphus-daemon.exe on
 rem    the box, so a second side-by-side instance (different ports) survives.
+rem    -NoNewWindow (not -WindowStyle Hidden) is required here: a hidden
+rem    window still gets its own console, which puts the daemon in a separate
+rem    console process group that never sees a Ctrl-C typed into this window --
+rem    only the foreground librarian.exe would die, and the taskkill below
+rem    never runs because Ctrl-C also triggers cmd's own "Terminate batch job
+rem    (Y/N)?" prompt, which aborts the rest of this script if answered Y.
+rem    -NoNewWindow keeps the daemon in this window's console/process group so
+rem    Ctrl-C kills it directly, independent of that prompt.
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 echo == starting stack ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
@@ -102,22 +107,9 @@ if "%db_path%"=="" (
 echo    librarian -^> http://127.0.0.1:%librarian_port%
 set "ps_arglist=serve','--port','%daemon_port%"
 if not "%db_path%"=="" set "ps_arglist=%ps_arglist%','--db','%db_path%"
-rem NOTE: do NOT add -RedirectStandardError/-RedirectStandardOutput to this
-rem Start-Process. With a redirect, PowerShell holds the redirect pipe open for
-rem the whole lifetime of the (long-running) daemon, so the `for /f` capturing
-rem its .Id never sees the pipe close and this line HANGS forever -- the script
-rem then never reaches the librarian below and the board never comes up. The
-rem daemon already writes everything to its configured log_path (see
-rem ~/.config/ralphus/config.toml [daemon].log_path), so file capture here is
-rem redundant anyway.
-for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
+for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -NoNewWindow).Id"') do set "daemon_pid=%%P"
 
-set "RALPHUS_BOARD_ASSETS_DIR=%root%\librarian\assets"
 "%root%\target\debug\ralphus-librarian.exe" serve --port %librarian_port%
 
-rem Reaching here means the librarian exited -- the daemon is killed next, so
-rem say so out loud: a silent teardown here has previously masqueraded as
-rem "the daemon crashes after ~2 minutes".
-echo == librarian exited (code %errorlevel%); stopping daemon pid %daemon_pid% ==
 taskkill /f /pid %daemon_pid% >nul 2>&1
 endlocal
