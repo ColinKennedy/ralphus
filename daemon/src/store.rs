@@ -1768,6 +1768,22 @@ impl Store {
                 daemon_url      TEXT NOT NULL,
                 installed_at_ms INTEGER NOT NULL
             );
+            -- Track F, F1: one row per verified webhook delivery while a
+            -- project's [webhook] mode is \"shadow\" -- recorded, never
+            -- acted on, purely to build confidence the delivery stream can
+            -- be trusted before flipping a project to \"active\". `pr_id`
+            -- NULL means E5 couldn't resolve a PR for this delivery (a
+            -- spurious delivery for scorecard purposes, F3).
+            CREATE TABLE IF NOT EXISTS webhook_shadow_deliveries (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider      TEXT NOT NULL,
+                delivery_id   TEXT,
+                project_name  TEXT NOT NULL,
+                pr_id         TEXT,
+                arrived_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_shadow_deliveries_project
+                ON webhook_shadow_deliveries(project_name);
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)

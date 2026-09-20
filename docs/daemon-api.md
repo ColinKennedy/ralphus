@@ -2524,11 +2524,21 @@ below treats a project as a webhook delivery target at all:
 | `mode` | `"disabled"`, `"shadow"`, or `"active"`. An unrecognized value fails config load loudly (not silently treated as `"disabled"`) — security-adjacent config should fail closed and visibly, not leave webhooks off while the operator believes they're on. | `"disabled"` |
 | `secret_env` | Name of the environment variable (read from the daemon process's own environment, not stored in config) holding this project's webhook shared secret. | `RALPHUS_WEBHOOK_SECRET` |
 
-`mode` only gates whether a project is *considered* by the receive route
+`mode` gates whether a project is *considered* by the receive route
 (`"disabled"` is skipped outright, never counted as a verification
-candidate); `"shadow"` vs `"active"` distinguishes recording a delivery
-without acting on it from acting on it, both not yet implemented (Track E's
-later items).
+candidate) and, once a delivery verifies, what happens next:
+
+- **`"shadow"`** (Track F, F1): the delivery is recorded (provider,
+  delivery id, resolved PR, arrival time) purely for later comparison
+  against what the poll independently found -- never acted on, and this
+  route's response is unaffected either way. Nothing currently *acts* on a
+  webhook delivery regardless of mode (no state transition is driven by
+  receiving one yet), so `"shadow"` vs `"active"` doesn't yet change this
+  route's behavior beyond whether the recording happens -- the distinction
+  exists to build the delivery-vs-poll comparison history (F2/F3) before any
+  future ticket makes a webhook delivery actually trigger something.
+- **`"active"`**: no recording; reserved for a future ticket that acts on a
+  delivery directly.
 
 ### `POST /api/pull-requests/{pr_id}`
 Mutate the recorded PR mapping. Body (all fields optional; only present ones

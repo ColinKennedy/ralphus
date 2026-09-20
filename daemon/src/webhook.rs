@@ -4,7 +4,8 @@
 //! [`config::WebhookConfig`](crate::config::WebhookConfig) reads, so
 //! verification stays isolated from the config-loading and route-dispatch
 //! code paths it's used from. The exceptions are [`Store::record_webhook_delivery`]
-//! (E6) and the `project_webhooks` bookkeeping methods (E9), `Store`-touching
+//! (E6), the `project_webhooks` bookkeeping methods (E9), and
+//! [`Store::record_webhook_shadow_delivery`] (Track F, F1) -- `Store`-touching
 //! methods colocated here rather than in `store.rs` -- the same "each
 //! concern hosts its own `impl Store` methods" pattern already used by
 //! `cartographer.rs`/`mailbox.rs`/`pr.rs`.
@@ -200,6 +201,46 @@ pub struct ProjectWebhookRecord {
     pub installed_at_ms: i64,
 }
 
+/// One recorded shadow-mode webhook delivery (Track F, F1/F2) -- see
+/// `Store::record_webhook_shadow_delivery`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowDeliveryRecord {
+    pub provider: String,
+    pub delivery_id: Option<String>,
+    pub project_name: String,
+    pub pr_id: Option<String>,
+    pub arrived_at_ms: i64,
+}
+
+impl Store {
+    /// Record one verified webhook delivery while a project's `[webhook]`
+    /// mode is `"shadow"` (Track F, F1) -- purely observational, never
+    /// acted on. Comparing this record against what the poll independently
+    /// found is a separate step (F2), not done here.
+    pub fn record_webhook_shadow_delivery(
+        &self,
+        provider: &str,
+        delivery_id: Option<&str>,
+        project_name: &str,
+        pr_id: Option<&str>,
+    ) -> Result<ShadowDeliveryRecord> {
+        let arrived_at_ms = now_ms();
+        self.conn.execute(
+            "INSERT INTO webhook_shadow_deliveries(
+                 provider, delivery_id, project_name, pr_id, arrived_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![provider, delivery_id, project_name, pr_id, arrived_at_ms],
+        )?;
+        Ok(ShadowDeliveryRecord {
+            provider: provider.to_string(),
+            delivery_id: delivery_id.map(str::to_string),
+            project_name: project_name.to_string(),
+            pr_id: pr_id.map(str::to_string),
+            arrived_at_ms,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +412,52 @@ mod tests {
         let record = s.get_project_webhook("proj").unwrap().unwrap();
         assert_eq!(record.hook_id, "43");
         assert_eq!(record.daemon_url, "https://new.example.com");
+    }
+
+    // ── Track F, F1: shadow-mode delivery recording ──────────────────────
+
+    #[test]
+    fn shadow_delivery_round_trips_through_the_table() {
+        let s = Store::open_in_memory().unwrap();
+        let record = s
+            .record_webhook_shadow_delivery("gitlab", None, "proj", None)
+            .unwrap();
+        assert_eq!(record.provider, "gitlab");
+        assert_eq!(record.project_name, "proj");
+        assert_eq!(record.pr_id, None);
+        let count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM webhook_shadow_deliveries", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn shadow_delivery_records_a_resolved_pr_and_delivery_id() {
+        let s = Store::open_in_memory().unwrap();
+        let record = s
+            .record_webhook_shadow_delivery("github", Some("d1"), "proj", Some("pr-1"))
+            .unwrap();
+        assert_eq!(record.delivery_id, Some("d1".to_string()));
+        assert_eq!(record.pr_id, Some("pr-1".to_string()));
+        assert!(record.arrived_at_ms > 0);
+    }
+
+    #[test]
+    fn shadow_delivery_allows_multiple_rows_for_the_same_project() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d1"), "proj", None)
+            .unwrap();
+        s.record_webhook_shadow_delivery("github", Some("d2"), "proj", None)
+            .unwrap();
+        let count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM webhook_shadow_deliveries", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

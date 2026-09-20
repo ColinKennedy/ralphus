@@ -15531,6 +15531,29 @@ fn route_webhook(
                 });
             let resolved_pr_id = resolved_pr.as_ref().map(|pr| pr.id.as_str());
             let resolved_guardian_id = resolved_pr.as_ref().map(|pr| pr.guardian_id.as_str());
+
+            // Track F, F1: while this project's webhook mode is "shadow",
+            // record the delivery purely for later comparison against what
+            // the poll independently found (F2) -- never acted on, never
+            // changes what this route returns. The mode is re-resolved
+            // here rather than threaded through `candidates` above: only
+            // the winning project's mode is ever relevant, so resolving
+            // every candidate's mode a second time (the first was
+            // `.mode()` inside the map that built `candidates`) would be
+            // wasted work on every project that didn't verify.
+            let shadow_project_mode = projects
+                .iter()
+                .find(|p| p.name == project_name)
+                .map(|p| crate::config::resolve_webhook(std::path::Path::new(&p.path)).mode());
+            if shadow_project_mode == Some(Ok(crate::config::WebhookMode::Shadow)) {
+                let _ = daemon.lock().record_webhook_shadow_delivery(
+                    kind.as_str(),
+                    delivery_id,
+                    project_name,
+                    resolved_pr_id,
+                );
+            }
+
             let _ = daemon
                 .lock()
                 .cartographer_log(crate::cartographer::CartographerEntry {
