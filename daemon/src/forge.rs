@@ -864,6 +864,51 @@ impl ForgeClient {
         }
     }
 
+    /// `GET /repos/{o}/{r}/pulls/{n}` (GitHub) or
+    /// `GET /projects/{id}/merge_requests/{n}` (GitLab), always live.
+    ///
+    /// Track A / A3 investigated caching this for [`Self::get_pull_request_base_state`],
+    /// since `detect_forge_reorder` and `poll_pr_base_drift` both call it for
+    /// `base`/`updated_at` on the same nominal 300s cadence, for the same
+    /// guardian set, from two independently-phased background loops. A
+    /// short-TTL cache keyed by `(kind, api_base, repo, number)` was built
+    /// and then reverted: `detect_forge_reorder` is also called a second
+    /// time in immediate succession to re-verify a just-applied reorder (see
+    /// `check_and_apply_forge_reorder`'s doc, and the regression test this
+    /// caught it with,
+    /// `detect_forge_reorder_converges_after_one_apply_when_the_registered_fork_remote_matches_base_branchs_own_remote`),
+    /// and a blind cache served that re-check a stale pre-apply value --
+    /// indistinguishable, from inside the cache, from the cross-loop overlap
+    /// it was meant to catch. A correct fix needs either genuine
+    /// single-flight coalescing (only dedupe requests that are *concurrently*
+    /// in flight, never a later sequential one) or fusing the two loops'
+    /// scheduling outright -- both larger changes than this item's scope,
+    /// and the latter is exactly the tradeoff `run_pr_forge_poll_cycle`'s own
+    /// doc comment already declined for a similar pair (drift vs. comments):
+    /// "merging their call sites would add risk without saving a network
+    /// round-trip" was written about a different pair there, but the
+    /// reasoning transfers. Left as two separate, always-fresh fetches.
+    fn fetch_pr_object_for_base_state(&self, number: i64) -> Result<serde_json::Value, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                self.get_structured(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                self.get_structured(ureq::get(&url).set("PRIVATE-TOKEN", token))
+            }
+        }
+    }
+
     /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273,
     /// RAL-279), unprefixed (GitHub's `base.ref` / GitLab's `target_branch`
     /// are both already bare branch names, matching the convention
@@ -879,9 +924,26 @@ impl ForgeClient {
         self.get_pull_request_base_state(number).map(|s| s.base)
     }
 
+    /// [`Self::get_pull_request_base`], keeping the structured [`ForgeError`]
+    /// (Track A / A5) -- for a poller that needs to distinguish a rate limit
+    /// from any other failure (Track A / A6).
+    pub fn get_pull_request_base_ex(&self, number: i64) -> Result<String, ForgeError> {
+        self.get_pull_request_base_state_ex(number).map(|s| s.base)
+    }
+
     /// Fetch the live base and the forge timestamp of the edit. The timestamp
     /// is required for RAL-277's cross-system last-write-wins rule.
     pub fn get_pull_request_base_state(&self, number: i64) -> Result<PullRequestBaseState, String> {
+        self.get_pull_request_base_state_ex(number)
+            .map_err(String::from)
+    }
+
+    /// [`Self::get_pull_request_base_state`], keeping the structured
+    /// [`ForgeError`] (Track A / A5) -- see [`Self::get_pull_request_base_ex`].
+    pub fn get_pull_request_base_state_ex(
+        &self,
+        number: i64,
+    ) -> Result<PullRequestBaseState, ForgeError> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -914,45 +976,38 @@ impl ForgeClient {
     fn get_pull_request_base_state_inner(
         &self,
         number: i64,
-    ) -> Result<PullRequestBaseState, String> {
-        let token = self.require_token()?;
+    ) -> Result<PullRequestBaseState, ForgeError> {
+        let resp = self.fetch_pr_object_for_base_state(number)?;
         let (base, updated_at) = match self.kind {
             ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
                 let base = resp["base"]["ref"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing base.ref".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing base.ref"))?;
                 let updated_at = resp["updated_at"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing updated_at"))?;
                 (base, updated_at)
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
                 let base = resp["target_branch"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing target_branch".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing target_branch"))?;
                 let updated_at = resp["updated_at"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing updated_at"))?;
                 (base, updated_at)
             }
         };
         let updated_at_ms = chrono::DateTime::parse_from_rfc3339(&updated_at)
-            .map_err(|e| format!("forge response has invalid updated_at {updated_at:?}: {e}"))?
+            .map_err(|e| {
+                ForgeError::other(format!(
+                    "forge response has invalid updated_at {updated_at:?}: {e}"
+                ))
+            })?
             .timestamp_millis();
         Ok(PullRequestBaseState {
             base,
@@ -966,6 +1021,13 @@ impl ForgeClient {
     /// merge conflict, both come back as [`PrCiState::Failing`]. Logs the
     /// outbound call (start/done/error) via `rlog!`.
     pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        self.check_pr_ci_status_ex(number).map_err(String::from)
+    }
+
+    /// [`Self::check_pr_ci_status`], keeping the structured [`ForgeError`]
+    /// (Track A / A5) -- for a poller that needs to distinguish a rate limit
+    /// from any other failure (Track A / A6).
+    pub fn check_pr_ci_status_ex(&self, number: i64) -> Result<PrCiState, ForgeError> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -993,37 +1055,70 @@ impl ForgeClient {
         result
     }
 
-    /// Poll CI and the forge's draft/WIP flag.
+    /// Poll CI and the draft/WIP flag from a single fetch of the PR/MR
+    /// object (Track A / A4): a prior version fetched it twice -- once
+    /// inside [`Self::check_pr_ci_status`] for `mergeable_state`/`head.sha`,
+    /// then again here purely to read `draft` -- doubling every standing CI
+    /// poll's cheapest call for no reason.
     pub fn check_pr_ci_status_probe(&self, number: i64) -> Result<PrCiProbe, String> {
-        let ci = self.check_pr_ci_status(number)?;
-        let token = self.require_token()?;
-        let object = match self.kind {
-            ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?
-            }
-            ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?
-            }
-        };
+        self.check_pr_ci_status_probe_ex(number)
+            .map_err(String::from)
+    }
+
+    /// [`Self::check_pr_ci_status_probe`], keeping the structured
+    /// [`ForgeError`] (Track A / A5) -- see [`Self::check_pr_ci_status_ex`].
+    pub fn check_pr_ci_status_probe_ex(&self, number: i64) -> Result<PrCiProbe, ForgeError> {
+        let object = self.fetch_pr_object(number)?;
+        let ci = self.check_pr_ci_status_from_object(&object)?;
         Ok(PrCiProbe {
             ci,
             draft: pr_object_draft(&object),
         })
     }
 
-    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, String> {
+    /// `GET /repos/{o}/{r}/pulls/{n}` (GitHub) or
+    /// `GET /projects/{id}/merge_requests/{n}` (GitLab), always live -- the
+    /// uncached twin of [`Self::get_pull_request_object_cached`]. Used where
+    /// a caller needs the object itself (not just one derived field) and,
+    /// like [`Self::check_pr_ci_status`], must never serve a stale one.
+    fn fetch_pr_object(&self, number: i64) -> Result<serde_json::Value, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         match self.kind {
-            ForgeKind::GitHub => self.check_github_pr_ci_status(number),
-            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(number),
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                self.get_structured(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                self.get_structured(ureq::get(&url).set("PRIVATE-TOKEN", token))
+            }
+        }
+    }
+
+    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, ForgeError> {
+        let object = self.fetch_pr_object(number)?;
+        self.check_pr_ci_status_from_object(&object)
+    }
+
+    /// Dispatch to the per-forge CI-status derivation, given an
+    /// already-fetched PR/MR object -- shared by [`Self::check_pr_ci_status`]
+    /// (which fetches the object itself) and
+    /// [`Self::check_pr_ci_status_probe`] (which reuses the one it fetched
+    /// for the draft flag).
+    fn check_pr_ci_status_from_object(
+        &self,
+        object: &serde_json::Value,
+    ) -> Result<PrCiState, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => self.check_github_pr_ci_status(object),
+            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(object),
         }
     }
 
@@ -1047,14 +1142,15 @@ impl ForgeClient {
     /// in-flight legacy status (`total_count > 0`) -- conflating them once
     /// made every such PR report `Pending` forever, no matter how green its
     /// check-runs were.
-    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
-        let token = self.require_token()?;
-        let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        let pr = self.get(
-            ureq::get(&pr_url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )?;
+    ///
+    /// `pr` must be a *fresh* fetch (Track A / A4: never
+    /// [`Self::get_pull_request_object_cached`]) -- this is exactly the
+    /// value `start_ci_watch`'s fast-then-backoff poll re-checks within
+    /// seconds of the last call to catch a rebase/force-push moving the head
+    /// sha, and a cached `mergeable_state`/`head.sha` would silently defeat
+    /// that escalation.
+    fn check_github_pr_ci_status(&self, pr: &serde_json::Value) -> Result<PrCiState, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         if pr["mergeable_state"].as_str() == Some("dirty") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the base branch".to_string(),
@@ -1071,7 +1167,7 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/check-runs",
             self.api_base, self.repo_path
         );
-        let checks = self.get(
+        let checks = self.get_structured(
             ureq::get(&checks_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1112,7 +1208,7 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/status",
             self.api_base, self.repo_path
         );
-        let status = self.get(
+        let status = self.get_structured(
             ureq::get(&status_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1184,13 +1280,10 @@ impl ForgeClient {
     /// same response, so no extra state to track) tells the two apart: a
     /// mismatch means the pipeline belongs to a commit that's no longer the
     /// head, so there's genuinely no verdict yet for the current one.
-    fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
-        let token = self.require_token()?;
-        let mr_url = format!(
-            "{}/projects/{}/merge_requests/{number}",
-            self.api_base, self.repo_path
-        );
-        let mr = self.get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+    /// `mr` must be a fresh fetch -- see [`Self::check_github_pr_ci_status`]'s
+    /// doc for why.
+    fn check_gitlab_pr_ci_status(&self, mr: &serde_json::Value) -> Result<PrCiState, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the target branch".to_string(),
@@ -2187,6 +2280,15 @@ impl ForgeClient {
         parse_body(resp)
     }
 
+    /// [`Self::get`], but keeping the structured [`ForgeError`] rather than
+    /// collapsing it to a `String` (Track A / A5) -- so a caller polling on
+    /// a schedule can inspect `status`/`retry_after` and back off on a rate
+    /// limit instead of retrying next cycle as if nothing happened.
+    fn get_structured(&self, req: ureq::Request) -> Result<serde_json::Value, ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        parse_body(resp).map_err(ForgeError::other)
+    }
+
     /// `GET` with conditional-request support (RAL-366): sets `If-None-Match`
     /// when `etag` is given, and reports a `304` as
     /// [`ConditionalGet::NotModified`] rather than an error. `304` has no
@@ -2258,7 +2360,7 @@ pub struct ForgeError {
 }
 
 impl ForgeError {
-    fn other(message: impl Into<String>) -> Self {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
         Self {
             status: None,
             retry_after: None,
@@ -3850,6 +3952,43 @@ mod tests {
     }
 
     #[test]
+    fn get_pull_request_base_state_always_reaches_the_network_even_for_repeated_calls() {
+        // Track A / A3: a cache here was built and reverted (see
+        // `ForgeClient::fetch_pr_object_for_base_state`'s doc) because a
+        // deliberate immediate re-check after applying a reorder must see a
+        // fresh answer, not a stale cached one -- lock that in.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            for forge_base in ["feature-a", "feature-b"] {
+                let req = server.recv().unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"base": {{"ref": "{forge_base}"}}, "updated_at": "2026-08-29T12:34:56.789Z"}}"#
+                    ))
+                    .with_status_code(200),
+                )
+                .unwrap();
+            }
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(
+            client.get_pull_request_base_state(9).unwrap().base,
+            "feature-a"
+        );
+        assert_eq!(
+            client.get_pull_request_base_state(9).unwrap().base,
+            "feature-b"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn get_pull_request_base_errors_when_the_forge_response_omits_it() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
@@ -5295,6 +5434,72 @@ mod tests {
             Some("tok".to_string()),
         );
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_probe_fetches_the_pr_object_exactly_once() {
+        // Track A / A4: a prior version fetched `/pulls/{n}` twice -- once
+        // for CI status, again purely for the draft flag.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"mergeable_state": "dirty", "draft": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // A second request here would mean the fetch was duplicated.
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let probe = client.check_pr_ci_status_probe(4).unwrap();
+        assert!(probe.draft);
+        assert!(matches!(probe.ci, PrCiState::Failing(_)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_probe_reads_gitlab_work_in_progress_from_the_same_fetch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "unchecked", "work_in_progress": true}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let probe = client.check_pr_ci_status_probe(9).unwrap();
+        assert!(probe.draft);
+        assert_eq!(probe.ci, PrCiState::Pending);
         handle.join().unwrap();
     }
 

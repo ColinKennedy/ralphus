@@ -2686,8 +2686,9 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         }
     }
 
-    let fetched: Vec<Option<std::result::Result<crate::forge::PrStatePoll, String>>> =
-        std::thread::scope(|scope| {
+    let fetched: Vec<
+        Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
+    > = std::thread::scope(|scope| {
             let handles: Vec<_> = jobs
                 .iter()
                 .map(|job| {
@@ -2699,7 +2700,11 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                 .map(|handle| {
                     handle
                         .join()
-                        .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
+                        .unwrap_or_else(|_| {
+                            Some(Err(crate::forge::ForgeError::other(
+                                "forge merge check panicked",
+                            )))
+                        })
                 })
                 .collect()
         });
@@ -2996,13 +3001,9 @@ fn fetch_pr_merge_state(
     pr: &PullRequestView,
     client: &crate::forge::ForgeClient,
     etag: Option<&str>,
-) -> Option<std::result::Result<crate::forge::PrStatePoll, String>> {
+) -> Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>> {
     let number = pr.pr_number?;
-    Some(
-        client
-            .get_pull_request_state_conditional(number, etag)
-            .map_err(String::from),
-    )
+    Some(client.get_pull_request_state_conditional(number, etag))
 }
 
 /// The store-writing half of a single PR's merge-state check: apply an
@@ -3013,7 +3014,7 @@ fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
-    fetched: Option<std::result::Result<crate::forge::PrStatePoll, String>>,
+    fetched: Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
     let Some(result) = fetched else {
@@ -3026,7 +3027,7 @@ fn apply_pr_merge_state(
         Ok(crate::forge::PrStatePoll::NotModified) => return,
         Ok(crate::forge::PrStatePoll::Modified { state, etag }) => (state, etag),
         Err(error) => {
-            log_pr_merge_check_failure(store, id, pr, &error);
+            log_pr_merge_check_failure(store, id, pr, &error.to_string());
             return;
         }
     };
