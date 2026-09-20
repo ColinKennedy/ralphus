@@ -127,6 +127,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
        ensurePromptCache,
        applyPromptCache,
        syncPromptCache,
+       setSelectedSquadId: (id) => { selectedSquadId = id; },
        state: () => ({ seq: tasksPollSeq, squads, sel, nodeMultiSel, squadSelCache, squadNodeCache, lastSquadId, daemonStatus: window._daemonStatus, promptCacheSquadId }),
      };`,
   );

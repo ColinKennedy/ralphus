@@ -193,6 +193,44 @@ test("selecting a squad fetches its prompt text immediately, not on the next pol
   assert.equal(poll.pendingFetches.length, warm, "a cached squad issues no further request");
 });
 
+test("reselecting a squad whose prompt fetch is already in flight shares that request, even if a different squad's fetch started in between", async () => {
+  // Regression: the in-flight tracker used to be a single shared squad id.
+  // Selecting squad B while squad A's fetch was still pending overwrote that
+  // id with B's, so reselecting A before its own fetch landed no longer
+  // matched the tracked id and fired a second, redundant fetch for A instead
+  // of sharing the one already in flight -- and because each of those
+  // redundant fetches raced to have the *last* one to settle decide which
+  // squad's text `promptCacheSquadId` ends up pointing at, the details pane
+  // could keep landing on stale or missing text until the user clicked away
+  // and back enough times for the right response to be the one that lands
+  // last. Tracking in-flight fetches per squad id removes the sharing bug
+  // and the race it created.
+  const poll = makeTasksPoll({ selectedSquadId: "s-1" });
+  const first = poll.pollTasks();
+  resolveJson(poll.pendingFetches[0], {
+    daemon: { running: 0, max_concurrent: 0 },
+    squads: [
+      { id: "s-1", tasks: [{ cells: [{ prompt: null, proof: [] }], proof: [] }] },
+      { id: "s-2", tasks: [{ cells: [{ prompt: null, proof: [] }], proof: [] }] },
+    ],
+  });
+  await first;
+
+  const s1Fetches = () => poll.pendingFetches.filter((f) => f.url === "/api/squads/s-1");
+
+  poll.syncPromptCache(); // selects s-1, starts its detail fetch
+  assert.equal(s1Fetches().length, 1, "selecting s-1 must fetch its detail");
+
+  poll.setSelectedSquadId("s-2");
+  poll.syncPromptCache(); // s-2 gets its own fetch, distinct from s-1's
+  assert.equal(poll.pendingFetches.filter((f) => f.url === "/api/squads/s-2").length, 1);
+
+  poll.setSelectedSquadId("s-1");
+  poll.syncPromptCache(); // s-1 reselected while its own fetch is still in flight
+  assert.equal(s1Fetches().length, 1,
+    "reselecting s-1 while its fetch is still pending must share it, not fire a duplicate");
+});
+
 test("invalidateTasksFetch drops the prompt cache, so an edited prompt is refetched", async () => {
   const poll = makeTasksPoll({ selectedSquadId: "s-1" });
   const first = poll.pollTasks();
