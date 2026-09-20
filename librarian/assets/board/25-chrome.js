@@ -328,7 +328,7 @@
             const p = new URLSearchParams();
             p.set("id", cartoSnapshotId);
             if (cartoExpanded.size) p.set("expanded", [...cartoExpanded].join(","));
-            url = `#/cartographer?${p.toString()}`;
+            url = `#/logs?${p.toString()}`;
           } else {
             const p = new URLSearchParams();
             for (const k of /** @type {(keyof CartoFilter)[]} */ (["q", "source", "scope", "level", "squad_id", "guardian_id", "cell_id"])) {
@@ -336,7 +336,7 @@
             }
             if (cartoExpanded.size) p.set("expanded", [...cartoExpanded].join(","));
             const qs = p.toString();
-            url = qs ? `#/cartographer?${qs}` : "#/cartographer";
+            url = qs ? `#/logs?${qs}` : "#/logs";
           }
         } else if (tab === "projects") {
           url = "#/projects";
@@ -348,6 +348,12 @@
           url = "#/users";
         } else if (tab === "secrets") {
           url = "#/secrets";
+        } else if (tab === "worktree-retirement") {
+          url = "#/retirement";
+        } else if (tab === "health") {
+          url = "#/health";
+        } else if (tab === "agents") {
+          url = "#/agents";
         } else if (tab === "prefs") {
           const p = new URLSearchParams();
           if (hiddenFilters.q) p.set("q", hiddenFilters.q);
@@ -438,7 +444,7 @@
         }
         if (raw.startsWith("resources")) return { tab: "resources" };
         if (raw.startsWith("queue")) return { tab: "queue" };
-        if (raw.startsWith("cartographer")) {
+        if (raw.startsWith("logs")) {
           const cartoQuery = Object.fromEntries(new URLSearchParams(raw.split("?")[1] || "").entries());
           return { tab: "cartographer", cartoQuery };
         }
@@ -447,6 +453,9 @@
         if (raw.startsWith("triage")) return { tab: "triage" };
         if (raw.startsWith("users")) return { tab: "users" };
         if (raw.startsWith("secrets")) return { tab: "secrets" };
+        if (raw.startsWith("retirement")) return { tab: "worktree-retirement" };
+        if (raw.startsWith("health")) return { tab: "health" };
+        if (raw.startsWith("agents")) return { tab: "agents" };
         if (raw.startsWith("prefs")) {
           const [, query] = raw.split("?");
           const p = new URLSearchParams(query || "");
