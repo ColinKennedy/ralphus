@@ -580,47 +580,118 @@
       let sseRefreshKinds = new Set();
       /** @type {Set<string>} guardian ids referenced by a pending event, since the last flush */
       let sseRefreshGuardianIds = new Set();
-      /** Whether a pending event carries a squad id, even if it is classified as a guardian event. */
-      let sseRefreshHasSquadChange = false;
+      /**
+       * Squad ids referenced by a pending event, since the last flush (Track
+       * B / B1) -- even one classified "guardian" can carry a `squad_id`
+       * (see `EventKind::for_row` in `daemon/src/events.rs`), so this is
+       * collected independently of `kinds`. Used to fetch and merge just the
+       * named squads instead of the whole `/api/tasks` response on every
+       * debounced batch -- see `applyTargetedSquadRefresh`.
+       * @type {Set<string>}
+       */
+      let sseRefreshSquadIds = new Set();
       // Coalescing window: long enough to merge a burst of near-simultaneous
       // events into one refresh, short enough that push still feels instant
       // next to the old 2s poll.
       const SSE_DEBOUNCE_MS = 150;
+      /**
+       * Replaces one squad's entry in `squads` with its fresh detail (Track
+       * B / B1), or drops it if the squad no longer exists. Reuses
+       * `GET /api/squads/{id}`, the same endpoint `ensurePromptCache`
+       * already fetches from -- its response carries full per-cell prompt
+       * text (unlike `/api/tasks`'s nulled-out fields), so no follow-up
+       * prompt-cache merge is needed for whichever squad this refreshes.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function refreshOneSquad(id) {
+        try {
+          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+          if (res.status === 404) { squads = squads.filter((r) => r.id !== id); return; }
+          if (!res.ok) return; // transient -- leave the cached row as-is
+          /** @type {SquadView} */
+          const detail = await res.json();
+          const idx = squads.findIndex((r) => r.id === id);
+          if (idx === -1) squads.push(detail); else squads[idx] = detail;
+        } catch (e) { /* transient -- leave the cached row as-is */ }
+      }
+      /**
+       * SSE-driven targeted refresh for the Squads/Tasks tabs (Track B / B1):
+       * fetches and merges just the squads named by `squadIds` in place of
+       * the whole `/api/tasks` response `pollTasks`/`pollTasksTab` would
+       * otherwise refetch on every debounced event batch -- while a squad is
+       * actively running and emitting Cartographer rows continuously, that
+       * repainted the entire board from a multi-MB response roughly seven
+       * times a second. Falls back to the full poll whenever there is a
+       * pending hash route to resolve (rare on this path -- that resolution
+       * logic belongs to the full poll functions, not duplicated here) or
+       * when a referenced squad is not yet in `squads` at all (a brand-new
+       * squad; the full poll already knows how to fold that in alongside its
+       * project/hidden-filter bookkeeping).
+       * @param {Set<string>} squadIds
+       * @param {() => Promise<void>} fullPoll
+       * @param {() => void} render
+       * @returns {Promise<void>}
+       */
+      async function applyTargetedSquadRefresh(squadIds, fullPoll, render) {
+        const isNew = [...squadIds].some((id) => !squads.some((r) => r.id === id));
+        if (pendingHash || isNew) { await fullPoll(); return; }
+        await Promise.all([...squadIds].map((id) => refreshOneSquad(id)));
+        applyPromptCache();
+        pruneSquadSelCache(squadSelCache, squadNodeCache, squads.map((r) => r.id));
+        reconcileLiveSelection();
+        // The "Running X / Y" counter normally comes from the same full-poll
+        // response this path is specifically avoiding -- refresh it from the
+        // lean, already-shared `/api/task-index` fetch instead, without
+        // letting that response's own (nulled-prompt-field) `squads` array
+        // overwrite the full detail just merged in above (`updateCounter`
+        // does exactly that, which is why this doesn't just call it).
+        try {
+          const d = await fetchTaskIndexShared();
+          /** @type {any} */ (window)._daemonStatus = d.daemon;
+          byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
+        } catch (e) { /* transient -- the next reconciliation tick retries */ }
+        byId("conn").className = "dot on";
+        markUpdated();
+        render();
+      }
       /**
        * Applies whatever the active tab needs in response to one coalesced
        * batch of pushed events -- mirrors `tick()`'s per-tab dispatch, plus a
        * feedback-thread refresh when the open review itself just changed.
        * @param {Set<string>} kinds
        * @param {Set<string>} guardianIds
-       * @param {boolean} hasSquadChange
+       * @param {Set<string>} squadIds
        * @returns {Promise<void>}
        */
-      async function applySseRefresh(kinds, guardianIds, hasSquadChange) {
+      async function applySseRefresh(kinds, guardianIds, squadIds) {
         if (tab === "tasks") {
           // RAL-345: an SSE-driven poll of this tab doesn't go through
           // `tick()`, so refresh the registered-project list here too --
           // keeps the project-filter dropdown current between full ticks.
           await refreshRegisteredProjectNames();
-          await pollTasksTab();
+          // A guardian-only batch (no `squad_id` at all) can still change
+          // what this tab renders (a cell's review badge via `taskTabPrIndex`),
+          // so it still needs `pollTasksTab`'s own PR-index fetch -- only a
+          // batch that named specific squads can take the targeted path.
+          if (squadIds.size) await applyTargetedSquadRefresh(squadIds, pollTasksTab, renderTasksTab);
+          else await pollTasksTab();
           await refreshBanner();
           return;
         }
-        // The Squads tab's own poll already refreshes the daemon-status
-        // counter and the `squads` cache from the very same `/api/tasks`
-        // response, so `updateCounter` here would be a second, redundant
-        // round-trip against an endpoint that takes seconds on a large squad
-        // history -- and, worse, a racing one (see `tasksPollSeq`). Going
-        // straight to `pollTasks` is both cheaper and the only path that
-        // actually repaints. It runs for every batch, not just one carrying
-        // a squad id: a guardian-only batch can still change what this tab
-        // renders (a cell's review badge), and the old `hasSquadChange` gate
-        // meant those batches refreshed the data without ever painting it.
         if (tab === "squads") {
           // RAL-345: same as the Tasks-tab path above -- the project-filter
           // dropdown binds to the live registered-project list, refreshed on
           // SSE-driven polls too (no full tick involved).
           await refreshRegisteredProjectNames();
-          await pollTasks();
+          // It runs for every batch, not just one carrying a squad id: a
+          // guardian-only batch can still change what this tab renders (a
+          // cell's review badge), and gating on `squadIds` alone would leave
+          // those batches refreshing nothing. `pollTasks` also refreshes the
+          // daemon-status counter/`squads` cache itself, so `updateCounter`
+          // is never called on this branch either way.
+          if (squadIds.size) await applyTargetedSquadRefresh(squadIds, pollTasks, renderAll);
+          else await pollTasks();
           await refreshBanner();
           return;
         }
@@ -636,8 +707,8 @@
           // manual click away and back.
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
-        } else if (tab === "queue" && (hasSquadChange || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
-          // `hasSquadChange` covers a row that carries a squad id but was
+        } else if (tab === "queue" && (squadIds.size || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
+          // `squadIds.size` covers a row that carries a squad id but was
           // classified "guardian" because it also carries a guardian id.
           await pollQueue();
         } else if (tab === "cartographer") {
@@ -656,14 +727,14 @@
       function scheduleSseRefresh(kind, row) {
         sseRefreshKinds.add(kind);
         if (row.guardian_id) sseRefreshGuardianIds.add(row.guardian_id);
-        if (row.squad_id) sseRefreshHasSquadChange = true;
+        if (row.squad_id) sseRefreshSquadIds.add(row.squad_id);
         if (sseRefreshTimer) return;
         sseRefreshTimer = setTimeout(() => {
           const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
           const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
-          const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
+          const squadIds = sseRefreshSquadIds; sseRefreshSquadIds = new Set();
           sseRefreshTimer = null;
-          applySseRefresh(kinds, guardianIds, hasSquadChange);
+          applySseRefresh(kinds, guardianIds, squadIds);
         }, SSE_DEBOUNCE_MS);
       }
       // How long to wait before minting a fresh ticket and reconnecting after
