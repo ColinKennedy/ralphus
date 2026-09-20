@@ -3797,7 +3797,7 @@ event. No `?category` filter here (RAL-375) — a watched entity's messages
 always surface through a personal watch regardless of category, so a client
 polling this endpoint sees them no matter which mode it's operating in.
 
-### `POST /api/forge/webhook/{provider}` (Track E, E2-E4)
+### `POST /api/forge/webhook/{provider}` (Track E, E2-E6)
 Receives a forge-delivered webhook event. `{provider}` is `github` or
 `gitlab`; any other value is `404 not_found`.
 
@@ -3821,16 +3821,33 @@ any project whose resolved `mode` is `"disabled"` or whose configured secret
 env var isn't set in this process's environment. The first project whose
 secret verifies the delivery is the match.
 
-A verified delivery gets `200 {"status": "accepted"}` and a Cartographer row
-(`source: "webhook"`) naming the provider and matched project. An
-unverifiable delivery (wrong/missing signature, or no project's secret
-matches) gets `401 unauthorized` — the same error envelope as a missing
-bearer token elsewhere in the API.
+**Dedup (E6).** GitHub's `X-GitHub-Delivery` / GitLab's `X-Gitlab-Event-UUID`
+identify one delivery; both forges retry an undelivered webhook under the
+same id. A retry of an already-processed id gets `200 {"status": "accepted",
+"duplicate": true}` immediately, skipping PR resolution and the Cartographer
+log entirely — a retry storm never double-counts one delivery. A delivery
+with no id header (an older forge/proxy that doesn't send one) is always
+treated as first-time.
 
-**Scope note.** This wires up receipt and verification only. Resolving a
-verified delivery to the PR/review it concerns, deduping retried deliveries
-(both forges retry undelivered webhooks), and the acknowledge-within-10s
-budget are separate, not-yet-implemented steps.
+**Resolution (E5).** A first-time verified delivery's body is read exactly
+once more, as a hint: GitHub's `pull_request.number` / GitLab's
+`object_attributes.iid`, paired with the repository (`repository.full_name`
+/ `project.path_with_namespace`, percent-encoded for GitLab to match the
+`repo` column's own shape). This is used solely to look up an
+already-recorded PR row (`GET /api/pull-requests`'s same
+forge+repo+pr_number lookup) — the parsed body is discarded immediately
+after, and an unresolved hint (an event type this daemon doesn't parse for a
+PR, or a PR ralphus never submitted) is expected, not an error.
+
+A verified, non-duplicate delivery gets `200 {"status": "accepted", "pr_id":
+"<id>"|null}` and a Cartographer row (`source: "webhook"`, `guardian_id` set
+when a PR resolved) naming the provider, matched project, and resolved
+`pr_id`. An unverifiable delivery (wrong/missing signature, or no project's
+secret matches) gets `401 unauthorized` — the same error envelope as a
+missing bearer token elsewhere in the API.
+
+**Scope note.** The acknowledge-within-10s budget is a separate,
+not-yet-implemented step (E7).
 
 ## Notes on future evolution
 

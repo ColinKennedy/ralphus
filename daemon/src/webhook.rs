@@ -1,10 +1,14 @@
-//! Webhook delivery verification (Track E). Pure, testable functions only --
-//! no HTTP route lives here (see `server.rs` for the receive route, E2)
-//! and no [`config::WebhookConfig`](crate::config::WebhookConfig) reads.
-//! Signature/token verification is checked before anything about a delivery
-//! is trusted, so it is kept isolated from both the config-loading and
-//! route-dispatch code paths it's used from.
+//! Webhook delivery verification (Track E). Signature/token verification and
+//! payload parsing are pure, testable functions -- no HTTP route lives here
+//! (see `server.rs` for the receive route, E2) and no
+//! [`config::WebhookConfig`](crate::config::WebhookConfig) reads, so
+//! verification stays isolated from the config-loading and route-dispatch
+//! code paths it's used from. The one exception is [`Store::record_webhook_delivery`]
+//! (E6), a `Store`-touching method colocated here rather than in
+//! `store.rs` -- the same "each concern hosts its own `impl Store` methods"
+//! pattern already used by `cartographer.rs`/`mailbox.rs`/`pr.rs`.
 
+use crate::store::{Result, Store, now_ms};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -109,6 +113,23 @@ pub fn extract_pr_hint(kind: crate::forge::ForgeKind, body: &str) -> Option<(Str
             let number = value.get("object_attributes")?.get("iid")?.as_i64()?;
             Some((repo, number))
         }
+    }
+}
+
+impl Store {
+    /// Atomically claim a webhook delivery id for `provider`, returning
+    /// `true` only the first time it's seen (Track E, E6). Both GitHub and
+    /// GitLab retry an undelivered webhook, and a retry must still be
+    /// acknowledged with a `200` but must not be re-processed -- see the
+    /// `webhook_deliveries` table's doc comment in `store.rs` for why. A
+    /// delivery with no id at all (the header wasn't sent) always returns
+    /// `true`: there's nothing to dedupe against, so it's processed as a
+    /// first-time delivery every time, same as before E6 existed.
+    pub fn record_webhook_delivery(&self, provider: &str, delivery_id: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO webhook_deliveries(provider, delivery_id, received_at_ms) VALUES(?1, ?2, ?3)",
+            rusqlite::params![provider, delivery_id, now_ms()],
+        )? == 1)
     }
 }
 
@@ -238,5 +259,22 @@ mod tests {
             extract_pr_hint(crate::forge::ForgeKind::GitHub, "not json at all"),
             None
         );
+    }
+
+    #[test]
+    fn record_webhook_delivery_claims_a_delivery_id_exactly_once() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.record_webhook_delivery("github", "delivery-1").unwrap());
+        // A retry under the same id must not be claimed a second time.
+        assert!(!s.record_webhook_delivery("github", "delivery-1").unwrap());
+    }
+
+    #[test]
+    fn record_webhook_delivery_keys_on_provider_too() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.record_webhook_delivery("github", "shared-id").unwrap());
+        // GitHub and GitLab mint ids from separate namespaces -- the same
+        // literal id under a different provider is not a collision.
+        assert!(s.record_webhook_delivery("gitlab", "shared-id").unwrap());
     }
 }

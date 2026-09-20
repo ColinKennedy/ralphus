@@ -14988,14 +14988,25 @@ fn find_verified_webhook_project<'a>(
 /// /api/pull-requests` exposes. The body itself is discarded after that; no
 /// delivery is ever persisted.
 ///
-/// Scope note: deduping retried deliveries and the acknowledge-within-10s
-/// budget are Track E's later items (E6/E7), not implemented here.
+/// Before that resolution runs, the delivery id (GitHub's `X-GitHub-Delivery`
+/// / GitLab's `X-Gitlab-Event-UUID`) is claimed via
+/// `Store::record_webhook_delivery` (E6): both forges retry an undelivered
+/// webhook under the same id, and a retry is acknowledged with the same
+/// `200` but skips PR resolution and the Cartographer log entirely, so a
+/// retry storm can't double-count one delivery. A delivery with no id header
+/// at all is always treated as first-time (there's nothing to dedupe
+/// against).
+///
+/// Scope note: the acknowledge-within-10s budget is Track E's next item
+/// (E7), not implemented here.
 fn route_webhook(
     daemon: &Daemon,
     provider: &str,
     body: &str,
     github_signature: Option<&str>,
     gitlab_token: Option<&str>,
+    github_delivery_id: Option<&str>,
+    gitlab_event_uuid: Option<&str>,
 ) -> Reply {
     let Some(kind) = crate::forge::ForgeKind::parse(provider) else {
         return error(404, "not_found", "unknown webhook provider", vec![]);
@@ -15020,6 +15031,29 @@ fn route_webhook(
 
     match find_verified_webhook_project(kind, body, github_signature, gitlab_token, &candidates) {
         Some(project_name) => {
+            let delivery_id = match kind {
+                crate::forge::ForgeKind::GitHub => github_delivery_id,
+                crate::forge::ForgeKind::GitLab => gitlab_event_uuid,
+            };
+            // E6: fail open on a DB error (treat as first-time) -- a
+            // transient store error dropping a legitimate delivery is worse
+            // than occasionally reprocessing one, and reprocessing here is
+            // just a lookup plus a log entry, not a side effect that
+            // compounds.
+            let first_time = delivery_id
+                .map(|id| {
+                    daemon
+                        .lock()
+                        .record_webhook_delivery(kind.as_str(), id)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if !first_time {
+                return json(
+                    200,
+                    &serde_json::json!({"status": "accepted", "duplicate": true}),
+                );
+            }
             // E5: the payload is a hint only -- used to look up an already
             // recorded PR row, never stored or trusted on its own. A
             // GitHub/GitLab retry storm on an event type this daemon
@@ -15179,6 +15213,11 @@ struct PendingRequest {
     /// `POST /api/forge/webhook/{provider}`.
     webhook_github_signature: Option<String>,
     webhook_gitlab_token: Option<String>,
+    /// GitHub's `X-GitHub-Delivery` / GitLab's `X-Gitlab-Event-UUID` (E6) --
+    /// both forges retry an undelivered webhook under the SAME delivery id,
+    /// so this is how `route_webhook` recognizes and skips reprocessing one.
+    webhook_github_delivery_id: Option<String>,
+    webhook_gitlab_event_uuid: Option<String>,
     cors: ralphus_core::cors::CorsDecision,
     /// When the accept loop finished reading this request, so the time it
     /// then spent waiting for a worker is reportable separately from the
@@ -15259,6 +15298,8 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         user_header,
         webhook_github_signature,
         webhook_gitlab_token,
+        webhook_github_delivery_id,
+        webhook_gitlab_event_uuid,
         cors,
         accepted_at,
     } = pending;
@@ -15292,6 +15333,8 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
             &body,
             webhook_github_signature.as_deref(),
             webhook_gitlab_token.as_deref(),
+            webhook_github_delivery_id.as_deref(),
+            webhook_gitlab_event_uuid.as_deref(),
         )
     } else if daemon.authorized(auth_header.as_deref()) {
         route_with_trace_for_user(
@@ -15467,6 +15510,8 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let user_header = header_value(&request, "X-Ralphus-User");
         let webhook_github_signature = header_value(&request, "X-Hub-Signature-256");
         let webhook_gitlab_token = header_value(&request, "X-Gitlab-Token");
+        let webhook_github_delivery_id = header_value(&request, "X-GitHub-Delivery");
+        let webhook_gitlab_event_uuid = header_value(&request, "X-Gitlab-Event-UUID");
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -15481,6 +15526,8 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             user_header,
             webhook_github_signature,
             webhook_gitlab_token,
+            webhook_github_delivery_id,
+            webhook_gitlab_event_uuid,
             cors,
             accepted_at: Instant::now(),
         };
@@ -26961,7 +27008,7 @@ command=\"cargo test\"
     #[test]
     fn route_webhook_rejects_unknown_provider() {
         let d = daemon();
-        let reply = route_webhook(&d, "bitbucket", "{}", None, None);
+        let reply = route_webhook(&d, "bitbucket", "{}", None, None, None, None);
         assert_eq!(reply.status, 404);
     }
 
@@ -26971,7 +27018,15 @@ command=\"cargo test\"
         // no candidates at all -- the delivery must still be rejected
         // (401), not accepted by default.
         let d = daemon();
-        let reply = route_webhook(&d, "github", "{}", Some("sha256=deadbeef"), None);
+        let reply = route_webhook(
+            &d,
+            "github",
+            "{}",
+            Some("sha256=deadbeef"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(reply.status, 401);
     }
 }

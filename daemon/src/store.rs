@@ -1735,6 +1735,22 @@ impl Store {
                 PRIMARY KEY (pr_id, endpoint, external_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_forge_comments_pr ON guardian_pr_forge_comments(pr_id);
+            -- Track E, E6: delivery-id dedup for the forge webhook receive
+            -- route (GitHub's `X-GitHub-Delivery` / GitLab's
+            -- `X-Gitlab-Event-UUID`). Both forges retry an undelivered
+            -- webhook, and a retry must still be acknowledged with a 200
+            -- but must not be re-processed -- re-resolving its PR and
+            -- re-emitting its Cartographer row would double-count it in
+            -- Track F's shadow-mode scorecard. Keyed on `(provider,
+            -- delivery_id)` rather than `delivery_id` alone since the two
+            -- forges mint IDs from separate namespaces with no uniqueness
+            -- guarantee across them.
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                provider       TEXT NOT NULL,
+                delivery_id    TEXT NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (provider, delivery_id)
+            );
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)
