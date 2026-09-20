@@ -3090,15 +3090,28 @@ impl Store {
             SquadState::Pending
         };
 
-        let squad_deps = file
-            .defaults
-            .first()
+        let default_block = file.defaults.first();
+        let squad_deps = default_block
             .map(|d| d.depends_on.as_slice())
             .unwrap_or(&[]);
+        // RAL-460 follow-up: `[[default]].environment` seeds the SAME
+        // hierarchical env-override store's squad layer a later
+        // `POST /api/squads/{id}/env` call would write to (RAL-150) -- from
+        // here on the two are indistinguishable, exactly like
+        // `TaskDef::environment` seeding a task's own layer below.
+        let default_env = default_block.map(|d| &d.environment);
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO squads(id, label, state, depends_on, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?)",
-            params![squad_id, label, state.as_str(), to_json(squad_deps), now, now],
+            "INSERT INTO squads(id, label, state, depends_on, env_overrides, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?,?)",
+            params![
+                squad_id,
+                label,
+                state.as_str(),
+                to_json(squad_deps),
+                default_env.map(to_json_map).unwrap_or_else(|| "{}".to_string()),
+                now,
+                now
+            ],
         )?;
 
         for (t_idx, task) in file.task.iter().enumerate() {
@@ -12034,6 +12047,38 @@ command = "y"
         );
         assert_eq!(resolved.get("TASK_ONLY").map(String::as_str), Some("1"));
         assert_eq!(resolved.get("CELL_ONLY").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn toml_default_environment_seeds_the_squad_env_overrides_layer() {
+        // RAL-460 follow-up: `[[default]].environment` seeds the same squad
+        // layer a later `POST /api/squads/{id}/env` call would write to
+        // (RAL-150), so it's inherited by every task/cell under it exactly
+        // like a squad-level override always has been -- a task/cell
+        // setting the same key still wins (see
+        // `toml_environment_seeds_task_and_cell_env_overrides` for that
+        // precedence).
+        let src = "[[default]]\nenvironment={SHARED=\"from-default\", DEFAULT_ONLY=\"1\"}\n\
+                   [[task]]\nname=\"t0\"\nenvironment={SHARED=\"from-task\"}\n\
+                   [[task.cell]]\nid=\"s0\"\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store.insert_squad(&parse(src), Some("r"), false).unwrap();
+
+        let squad_env = store.get_squad_env_overrides(&squad).unwrap();
+        assert_eq!(
+            squad_env.get("SHARED").map(String::as_str),
+            Some("from-default")
+        );
+        assert_eq!(squad_env.get("DEFAULT_ONLY").map(String::as_str), Some("1"));
+
+        // The task's own value wins over the default's for the shared key,
+        // same as any other layer in the hierarchy.
+        let resolved = store.resolve_cell_env_overrides(&squad, 0, 0).unwrap();
+        assert_eq!(
+            resolved.get("SHARED").map(String::as_str),
+            Some("from-task")
+        );
+        assert_eq!(resolved.get("DEFAULT_ONLY").map(String::as_str), Some("1"));
     }
 
     #[test]

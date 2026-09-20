@@ -231,7 +231,11 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         task-level field above. Values support the
                                         same embedded `<<ralphus:new-worktree/...>>`
                                         expansion as `cwd`; repeat the exact marker
-                                        to reuse that worktree's resolved path.
+                                        to reuse that worktree's resolved path. Also
+                                        supports `<<ralphus:linked-field/<path>>>` to
+                                        reference another field's resolved value
+                                        instead of retyping it (see "Linked fields"
+                                        below).
  budget_tokens           integer        Per-cell total-token cap (falls back to task)
  maximum_context         integer        Per-cell context-window token limit (falls back
                                         to task's `maximum_context`); see the
@@ -648,6 +652,55 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  validation, so always include a suffix (a sentinel or a literal name).
 
 ---------------------------------------------------------------
+ Linked fields (environment values that reference another field)
+---------------------------------------------------------------
+ An `environment` value can link to another field's resolved value instead
+ of retyping its placeholder text (or its eventual resolved value) verbatim:
+
+   "<<ralphus:linked-field/<path>>>"
+
+ <path> is relative-path-shaped. "." means the table this environment entry
+ is itself declared on (a cell, a task, or a proof step); ".." walks up one
+ level of TOML nesting per repetition -- a cell's ".." reaches its owning
+ task, a cell's proof step's ".." reaches that cell. The final segment names
+ the target field: "cwd", "id", or "environment.<key>" for a sibling entry in
+ the SAME table's own environment (an ancestor's environment.<key> can't be
+ crossed with ".." -- only "cwd"/"id" can).
+
+   [[task.cell]]
+   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+   environment = { WORKTREE = "<<ralphus:linked-field/./cwd>>" }
+
+ `WORKTREE` resolves to this cell's own `cwd` once the daemon has
+ materialized (or reused) that worktree -- the real on-disk path. A linked
+ field may itself link to another linked field ("chaining"); the daemon
+ resolves these in dependency order regardless of declaration order, and
+ rejects a chain that cycles back on itself.
+
+ Optional "?text=<function>({})" query: run a registered text-transform
+ function on the linked value before it's used. "{}" is the literal
+ placeholder for that resolved value -- the function's only argument. The
+ only registered function today is "basename", which returns the final path
+ component (like POSIX basename(1)):
+
+   [[task.cell]]
+   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+   environment = { WORKTREE_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
+
+ If that cwd resolves to ".../RAL-1234-add_payment_system", `WORKTREE_NAME`
+ resolves to just "RAL-1234-add_payment_system" -- the worktree's final path
+ component, not its full path. As with a worktree placeholder, trailing
+ literal text after the closing ">>" is appended to the resolved value; there
+ is no separate "?suffix=" query for that.
+
+ A malformed path (missing the leading "./"/"../", an invalid navigation
+ segment, no field name at the end), a target that doesn't exist at the level
+ reached, or an unrecognized "?text=" query (an unsupported query key, a
+ malformed "<function>({})" expression, or an unregistered function name)
+ all fail validation with a message naming the problem -- no silent
+ fallback.
+
+---------------------------------------------------------------
  depends_on formats
 ---------------------------------------------------------------
    "cell-id"                 another cell in the SAME task
@@ -930,7 +983,10 @@ project = "my-project"
   [[task.cell]]
   cwd    = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>"
   # Repeating the same marker in an environment value reuses this worktree.
-  environment = { WIDGET_WORKTREE = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>" }
+  # A linked field reaches the same resolved value without retyping the
+  # marker; "?text=basename({})" then trims it to just the worktree's final
+  # path component instead of the full path.
+  environment = { WIDGET_WORKTREE = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>", WIDGET_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
   prompt = "Add a widget module."
 
 Submit it:  ralphus submit tasks.toml
@@ -1046,12 +1102,27 @@ mod tests {
     #[test]
     fn tutor_shows_an_environment_value_reusing_the_cwd_worktree() {
         assert!(TASK_TUTOR.contains(
-            "environment = { WIDGET_WORKTREE = \"<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>\" }"
+            "environment = { WIDGET_WORKTREE = \"<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>\", \
+             WIDGET_NAME = \"<<ralphus:linked-field/./cwd?text=basename({})>>\" }"
         ));
         assert!(
             TASK_TUTOR.contains(
                 "Repeating the same marker in an environment value reuses this worktree."
             )
         );
+    }
+
+    #[test]
+    fn tutor_documents_linked_fields_and_the_text_query() {
+        assert!(TASK_TUTOR.contains("Linked fields"));
+        assert!(TASK_TUTOR.contains("\"<<ralphus:linked-field/<path>>>\""));
+        assert!(
+            TASK_TUTOR.contains("environment = { WORKTREE = \"<<ralphus:linked-field/./cwd>>\" }")
+        );
+        assert!(TASK_TUTOR.contains("\"?text=<function>({})\""));
+        assert!(TASK_TUTOR.contains(
+            "environment = { WORKTREE_NAME = \"<<ralphus:linked-field/./cwd?text=basename({})>>\" }"
+        ));
+        assert!(TASK_TUTOR.contains("\"basename\""));
     }
 }

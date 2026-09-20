@@ -21,6 +21,17 @@ pub struct DefaultBlock {
     /// this submission is allowed to start.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Environment variables applied to every cell/task/proof step in this
+    /// submission (RAL-460 follow-up), seeded into the squad's own layer of
+    /// the existing hierarchical env-override store (`squad < task < cell`,
+    /// RAL-150) -- see [`TaskDef::environment`]. A task/cell/proof step
+    /// setting the same key overrides it, same as any other layer. A
+    /// `"<<ralphus:linked-field/./cwd>>"`-style value resolves per the
+    /// specific cell/task/proof step it ends up applying to, exactly as if
+    /// it had been written directly there -- there is no single shared
+    /// "default's own" table for `.`/`..` to resolve against.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 /// A whole submitted task file.
@@ -550,6 +561,314 @@ pub fn first_worktree_placeholder_in_text(text: &str) -> Option<&str> {
             .into_iter()
             .find(|body| parse_worktree_placeholder(body).is_some())
     })
+}
+
+/// Scheme prefix for a "linked field" placeholder (RAL-460), e.g.
+/// `"ralphus:linked-field/./cwd"` or `"ralphus:linked-field/../id"`. Lets a
+/// TOML field -- today only `environment` values -- say "give me this OTHER
+/// field's resolved value" instead of re-embedding that field's placeholder
+/// text (or retyping its eventual resolved value) verbatim.
+///
+/// The text after the prefix is a relative-path-shaped address (see
+/// [`parse_linked_field_path`]): `.` means "the table this linked field is
+/// itself declared on" (a cell, a task, or a proof step); `..` walks up one
+/// level of TOML nesting from there (a cell's proof step's `..` reaches that
+/// cell; a cell's `..` reaches its owning task; a task-scoped proof step's
+/// `..` reaches that task). `../..` walks up two levels, and so on. The
+/// final path segment names the target field -- `cwd` or `id` (only some of
+/// which exist at any given level, see [`ScopeLevel`]), or
+/// `environment.<key>` for a sibling entry in this SAME table's own
+/// `environment` (never an ancestor's -- see the next paragraph) --
+/// interpreted by [`parse_link_target`].
+///
+/// A linked field embeds using the exact same `<<...>>` mechanism as a
+/// worktree placeholder ([`text_placeholders`], `daemon::worktrees`'s
+/// `expand_placeholder_text`), so trailing literal text after the closing
+/// `>>` (e.g. `"<<ralphus:linked-field/./cwd>>/logs"`) is just literal text
+/// appended to the resolved value -- the same as it already works for
+/// `ralphus:new-worktree/...`. There is deliberately no separate `?suffix=`
+/// query for this.
+///
+/// `environment.<key>` targets are restricted to `.` (`ups == 0`): the
+/// daemon resolves one scope's whole `environment` table as a single
+/// already-hierarchy-merged map (`squad < task < cell < proof`, RAL-150)
+/// before any placeholder in it is resolved, so an ancestor's `<key>` is
+/// already present in that same merged map under its own name (or shadowed
+/// by a same-named override closer in) -- there is no separate ancestor
+/// table left to address unambiguously by the time resolution runs. `cwd`
+/// and `id` don't have this problem (each level tracks its own literal
+/// value, never merged), so they alone may cross a `..`.
+///
+/// A linked field may itself be the target of another linked field
+/// ("chaining") -- e.g. one `environment` entry linking to a sibling entry
+/// that itself links to `./cwd`. Both `core::validate` and
+/// `daemon::worktrees` resolve these in dependency order rather than via a
+/// single hardcoded hop, and reject a chain that cycles back on itself or a
+/// path that doesn't resolve to a real field.
+///
+/// An optional `?text=<function>({})` query (RAL-460 follow-up) applies a
+/// registered [`TextFn`] to the linked value before it's used -- `{}` is the
+/// literal placeholder for that resolved value, the function's only
+/// argument. There is still deliberately no separate `?suffix=` query for
+/// appending literal text; that stays trailing text after the closing `>>`,
+/// exactly as it already works for `ralphus:new-worktree/...`. See
+/// [`parse_linked_field_query`].
+pub const LINKED_FIELD_PREFIX: &str = "ralphus:linked-field/";
+
+/// A parsed `ralphus:linked-field/<path>[?text=<function>({})]` sentinel body
+/// (already unwrapped from its `<<...>>` delimiters -- see
+/// [`text_placeholders`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedFieldRef<'a> {
+    /// The raw path after the prefix, e.g. `"./cwd"` or
+    /// `"../../environment.BASE"` -- not yet split into navigation vs.
+    /// field, see [`parse_linked_field_path`]. Never includes the `?...`
+    /// query suffix.
+    pub path: &'a str,
+    /// The raw query string, if any, with the leading `?` stripped (e.g.
+    /// `"text=basename({})"`). `None` when the sentinel has no `?` at all.
+    /// See [`parse_linked_field_query`].
+    pub query: Option<&'a str>,
+}
+
+/// Parse a `ralphus:linked-field/<path>[?query]` sentinel body. Returns
+/// `None` for text that isn't this scheme at all (a plain literal, a
+/// worktree placeholder, or some other placeholder kind), so callers fall
+/// through to their existing handling for those.
+#[must_use]
+pub fn parse_linked_field(body: &str) -> Option<LinkedFieldRef<'_>> {
+    let rest = body.strip_prefix(LINKED_FIELD_PREFIX)?;
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    Some(LinkedFieldRef { path, query })
+}
+
+/// Why a linked field's `<path>` failed to parse -- see
+/// [`parse_linked_field_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkedFieldPathError {
+    /// The path was empty (`"ralphus:linked-field/"` with nothing after it).
+    Empty,
+    /// The path had no navigation segment at all -- it must start with `.`
+    /// or `..` (e.g. a bare `"cwd"`, with no leading `./`, is rejected).
+    MissingNavigation,
+    /// A navigation segment (every segment before the last) was something
+    /// other than `.` or `..`.
+    InvalidNavigationSegment,
+    /// The final (field-name) segment was empty (e.g. a trailing `/`, or the
+    /// whole path being only navigation segments).
+    EmptyField,
+}
+
+/// A [`LinkedFieldRef::path`], split into how many levels to walk up
+/// (`ups`: the count of `..` segments; a lone `.` contributes zero) and the
+/// final field-name segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedLinkedFieldPath<'a> {
+    /// Levels to walk up from where this linked field is declared before
+    /// reading `field`. Zero means "this same table".
+    pub ups: usize,
+    /// The target field name -- see [`parse_link_target`].
+    pub field: &'a str,
+}
+
+/// Parse a linked field's `<path>` (e.g. `"./cwd"`, `"../id"`,
+/// `"../../environment.BASE"`) into navigation + target field. Every
+/// `/`-separated segment before the last must be exactly `.` or `..`; the
+/// last segment is the target field name.
+///
+/// # Errors
+/// See [`LinkedFieldPathError`].
+pub fn parse_linked_field_path(
+    path: &str,
+) -> Result<ParsedLinkedFieldPath<'_>, LinkedFieldPathError> {
+    if path.is_empty() {
+        return Err(LinkedFieldPathError::Empty);
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    let (field, nav) = segments
+        .split_last()
+        .expect("split('/') on a non-empty string yields at least one segment");
+    if nav.is_empty() {
+        return Err(LinkedFieldPathError::MissingNavigation);
+    }
+    let mut ups = 0usize;
+    for seg in nav {
+        match *seg {
+            "." => {}
+            ".." => ups += 1,
+            _ => return Err(LinkedFieldPathError::InvalidNavigationSegment),
+        }
+    }
+    if field.is_empty() {
+        return Err(LinkedFieldPathError::EmptyField);
+    }
+    Ok(ParsedLinkedFieldPath { ups, field })
+}
+
+/// A linked field's final path segment, interpreted as one of the field
+/// shapes a linked field may target (RAL-460). Which of these actually
+/// exists depends on the [`ScopeLevel`] reached after walking `ups` levels
+/// up -- see [`link_target_valid_for_scope`]; this function only recognizes
+/// the *shape* of the name, not whether it applies at a given level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkTarget<'a> {
+    /// A cell's own `cwd`.
+    Cwd,
+    /// A cell's or proof step's own `id`.
+    Id,
+    /// Another entry (`key`) in that level's own `environment` table.
+    Environment(&'a str),
+}
+
+/// Interpret a linked field's final path segment as a [`LinkTarget`].
+/// Returns `None` for any name that isn't one of the recognized shapes --
+/// callers report that as "does not point to a field".
+#[must_use]
+pub fn parse_link_target(field: &str) -> Option<LinkTarget<'_>> {
+    match field {
+        "cwd" => Some(LinkTarget::Cwd),
+        "id" => Some(LinkTarget::Id),
+        _ => field
+            .strip_prefix("environment.")
+            .filter(|key| !key.is_empty())
+            .map(LinkTarget::Environment),
+    }
+}
+
+/// The kind of TOML table a linked field can be declared on, or navigate to
+/// via `..` (RAL-460). Determines which [`LinkTarget`]s actually exist
+/// there -- see [`link_target_valid_for_scope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeLevel {
+    /// A `[[task]]` table: has only `environment.<key>` -- a task has
+    /// neither `cwd` nor its own `id`.
+    Task,
+    /// A `[[task.cell]]` table: has `cwd`, `id`, `environment.<key>`.
+    Cell,
+    /// A `[[task.proof]]` or `[[task.cell.proof]]` table: has `id`,
+    /// `environment.<key>`.
+    ProofStep,
+}
+
+/// Whether `target` is a field that actually exists on a table of kind
+/// `level`. `Environment(_)` is valid at every level (all three have their
+/// own `environment` table); the rest are level-specific.
+#[must_use]
+pub fn link_target_valid_for_scope(target: &LinkTarget<'_>, level: ScopeLevel) -> bool {
+    match target {
+        LinkTarget::Environment(_) => true,
+        LinkTarget::Cwd => level == ScopeLevel::Cell,
+        LinkTarget::Id => matches!(level, ScopeLevel::Cell | ScopeLevel::ProofStep),
+    }
+}
+
+/// The `<field>` name a [`LinkTarget`] was parsed from, for error messages.
+#[must_use]
+pub fn link_target_field_name(target: &LinkTarget<'_>) -> String {
+    match target {
+        LinkTarget::Cwd => "cwd".to_string(),
+        LinkTarget::Id => "id".to_string(),
+        LinkTarget::Environment(key) => format!("environment.{key}"),
+    }
+}
+
+/// A text-transform function invocable via a linked field's `?text=` query
+/// (RAL-460 follow-up), e.g.
+/// `"<<ralphus:linked-field/./cwd?text=basename({})>>"` resolves to the final
+/// path component of the cell's own `cwd`, not the full path. Registered by
+/// name -- see [`TextFn::by_name`] and [`parse_linked_field_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFn {
+    /// The final path component, mirroring POSIX `basename(1)`: trailing
+    /// `/`/`\` separators are stripped first, then everything up to and
+    /// including the last remaining separator is discarded. Both separators
+    /// are recognized regardless of the host platform, since the linked
+    /// value may have been produced on a different machine (RAL-185) than
+    /// the one resolving it.
+    Basename,
+}
+
+impl TextFn {
+    /// The registered `(name, function)` pairs a `?text=<name>({})` query
+    /// may name. Extend this list to register a new function.
+    const REGISTRY: &'static [(&'static str, TextFn)] = &[("basename", TextFn::Basename)];
+
+    /// Look up a registered text-transform function by its `?text=` name.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        Self::REGISTRY
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| *f)
+    }
+
+    /// Every registered function name, in registry order -- for error
+    /// messages that list what's available.
+    pub fn registered_names() -> impl Iterator<Item = &'static str> {
+        Self::REGISTRY.iter().map(|(name, _)| *name)
+    }
+
+    /// Apply this transform to a linked field's already-resolved value.
+    #[must_use]
+    pub fn apply(self, value: &str) -> String {
+        match self {
+            TextFn::Basename => {
+                let trimmed = value.trim_end_matches(['/', '\\']);
+                if trimmed.is_empty() {
+                    // The whole value was separators (e.g. "/" or "\\"), or
+                    // it was already empty -- nothing to strip further.
+                    return value.to_string();
+                }
+                match trimmed.rfind(['/', '\\']) {
+                    Some(i) => trimmed[i + 1..].to_string(),
+                    None => trimmed.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Why a linked field's optional `?text=<name>({})` query failed to parse --
+/// see [`parse_linked_field_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkedFieldQueryError<'a> {
+    /// The query wasn't `text=...` at all (e.g. a stray `?upstream=main` --
+    /// that query belongs to a worktree placeholder, not a linked field).
+    UnknownParam,
+    /// `?text=` with nothing after the `=`.
+    EmptyExpression,
+    /// The expression after `text=` wasn't exactly `<name>({})` -- e.g. a
+    /// missing or malformed `{}` placeholder, extra arguments, or trailing
+    /// text after the closing `)`.
+    MalformedExpression,
+    /// `<name>` parsed but isn't a [`TextFn`] registered under that name.
+    UnknownFunction(&'a str),
+}
+
+/// Parse a linked field's optional `?text=<name>({})` query (RAL-460
+/// follow-up) into the [`TextFn`] it names. `{}` is the literal placeholder
+/// for the linked field's own resolved value -- the only argument shape
+/// supported today, so `<name>` takes no other arguments.
+///
+/// # Errors
+/// See [`LinkedFieldQueryError`].
+pub fn parse_linked_field_query(query: &str) -> Result<TextFn, LinkedFieldQueryError<'_>> {
+    let expr = query
+        .strip_prefix("text=")
+        .ok_or(LinkedFieldQueryError::UnknownParam)?;
+    if expr.is_empty() {
+        return Err(LinkedFieldQueryError::EmptyExpression);
+    }
+    let Some(name) = expr.strip_suffix("({})") else {
+        return Err(LinkedFieldQueryError::MalformedExpression);
+    };
+    if name.is_empty() {
+        return Err(LinkedFieldQueryError::MalformedExpression);
+    }
+    TextFn::by_name(name).ok_or(LinkedFieldQueryError::UnknownFunction(name))
 }
 
 /// Reserved `?upstream=` sentinel value meaning "the repository's default
@@ -2517,5 +2836,233 @@ mod tests {
         let sess = &parsed.task[0].cell[0];
         assert!(sess.prompt.is_none());
         assert_eq!(sess.command.as_deref(), Some("cargo build"));
+    }
+
+    #[test]
+    fn parse_linked_field_reads_the_path() {
+        let link = parse_linked_field("ralphus:linked-field/./cwd").expect("is a linked field");
+        assert_eq!(link.path, "./cwd");
+        assert_eq!(link.query, None);
+    }
+
+    #[test]
+    fn parse_linked_field_splits_off_the_query() {
+        let link = parse_linked_field("ralphus:linked-field/./cwd?text=basename({})")
+            .expect("is a linked field");
+        assert_eq!(link.path, "./cwd");
+        assert_eq!(link.query, Some("text=basename({})"));
+    }
+
+    #[test]
+    fn parse_linked_field_ignores_non_matching_scheme() {
+        assert_eq!(
+            parse_linked_field("ralphus:new-worktree/foo?upstream=main"),
+            None
+        );
+        assert_eq!(parse_linked_field("plain text"), None);
+    }
+
+    #[test]
+    fn parse_linked_field_query_reads_a_registered_function() {
+        assert_eq!(
+            parse_linked_field_query("text=basename({})"),
+            Ok(TextFn::Basename)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_unknown_param() {
+        assert_eq!(
+            parse_linked_field_query("upstream=main"),
+            Err(LinkedFieldQueryError::UnknownParam)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_empty_expression() {
+        assert_eq!(
+            parse_linked_field_query("text="),
+            Err(LinkedFieldQueryError::EmptyExpression)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_a_malformed_expression() {
+        // Missing the "({})" call entirely.
+        assert_eq!(
+            parse_linked_field_query("text=basename"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // Real arguments instead of the literal "{}" placeholder.
+        assert_eq!(
+            parse_linked_field_query("text=basename(cwd)"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // Trailing text after the call.
+        assert_eq!(
+            parse_linked_field_query("text=basename({})extra"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // No function name before the call.
+        assert_eq!(
+            parse_linked_field_query("text=({})"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_unregistered_function() {
+        assert_eq!(
+            parse_linked_field_query("text=dirname({})"),
+            Err(LinkedFieldQueryError::UnknownFunction("dirname"))
+        );
+    }
+
+    #[test]
+    fn text_fn_basename_takes_the_final_path_component() {
+        assert_eq!(
+            TextFn::Basename.apply("/path/to/somewhere/RAL-1234-add_payment_system"),
+            "RAL-1234-add_payment_system"
+        );
+        assert_eq!(
+            TextFn::Basename.apply(r"C:\repos\somewhere\RAL-1234-add_payment_system"),
+            "RAL-1234-add_payment_system"
+        );
+    }
+
+    #[test]
+    fn text_fn_basename_strips_trailing_separators_first() {
+        assert_eq!(TextFn::Basename.apply("/path/to/dir/"), "dir");
+        assert_eq!(TextFn::Basename.apply(r"C:\path\to\dir\"), "dir");
+    }
+
+    #[test]
+    fn text_fn_basename_passes_through_a_bare_name() {
+        assert_eq!(TextFn::Basename.apply("standalone"), "standalone");
+    }
+
+    #[test]
+    fn text_fn_basename_handles_all_separators_and_empty_input() {
+        assert_eq!(TextFn::Basename.apply("/"), "/");
+        assert_eq!(TextFn::Basename.apply(""), "");
+    }
+
+    #[test]
+    fn parse_linked_field_path_reads_same_table_reference() {
+        let parsed = parse_linked_field_path("./cwd").expect("parse ok");
+        assert_eq!(parsed.ups, 0);
+        assert_eq!(parsed.field, "cwd");
+    }
+
+    #[test]
+    fn parse_linked_field_path_reads_parent_reference() {
+        let parsed = parse_linked_field_path("../id").expect("parse ok");
+        assert_eq!(parsed.ups, 1);
+        assert_eq!(parsed.field, "id");
+    }
+
+    #[test]
+    fn parse_linked_field_path_reads_multiple_levels_up() {
+        let parsed = parse_linked_field_path("../../environment.BASE").expect("parse ok");
+        assert_eq!(parsed.ups, 2);
+        assert_eq!(parsed.field, "environment.BASE");
+    }
+
+    #[test]
+    fn parse_linked_field_path_rejects_empty_path() {
+        assert_eq!(
+            parse_linked_field_path(""),
+            Err(LinkedFieldPathError::Empty)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_path_rejects_missing_navigation() {
+        // No leading "./" or "../" -- a bare field name is not a valid path,
+        // even though it's unambiguous, so that every linked field reads the
+        // same way at a glance.
+        assert_eq!(
+            parse_linked_field_path("cwd"),
+            Err(LinkedFieldPathError::MissingNavigation)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_path_rejects_invalid_navigation_segment() {
+        assert_eq!(
+            parse_linked_field_path(".../cwd"),
+            Err(LinkedFieldPathError::InvalidNavigationSegment)
+        );
+        assert_eq!(
+            parse_linked_field_path("sub/cwd"),
+            Err(LinkedFieldPathError::InvalidNavigationSegment)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_path_rejects_empty_field_segment() {
+        assert_eq!(
+            parse_linked_field_path("./"),
+            Err(LinkedFieldPathError::EmptyField)
+        );
+        assert_eq!(
+            parse_linked_field_path(".././"),
+            Err(LinkedFieldPathError::EmptyField)
+        );
+    }
+
+    #[test]
+    fn parse_link_target_recognizes_every_shape() {
+        assert_eq!(parse_link_target("cwd"), Some(LinkTarget::Cwd));
+        assert_eq!(parse_link_target("id"), Some(LinkTarget::Id));
+        assert_eq!(
+            parse_link_target("environment.BASE"),
+            Some(LinkTarget::Environment("BASE"))
+        );
+        assert_eq!(parse_link_target("environment."), None);
+        assert_eq!(parse_link_target("prompt"), None);
+        assert_eq!(parse_link_target("model"), None);
+        assert_eq!(parse_link_target("name"), None);
+        assert_eq!(parse_link_target("project"), None);
+    }
+
+    #[test]
+    fn link_target_valid_for_scope_matches_each_level() {
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Cwd,
+            ScopeLevel::Cell
+        ));
+        assert!(!link_target_valid_for_scope(
+            &LinkTarget::Cwd,
+            ScopeLevel::Task
+        ));
+        assert!(!link_target_valid_for_scope(
+            &LinkTarget::Cwd,
+            ScopeLevel::ProofStep
+        ));
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Id,
+            ScopeLevel::Cell
+        ));
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Id,
+            ScopeLevel::ProofStep
+        ));
+        assert!(!link_target_valid_for_scope(
+            &LinkTarget::Id,
+            ScopeLevel::Task
+        ));
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Environment("X"),
+            ScopeLevel::Task
+        ));
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Environment("X"),
+            ScopeLevel::Cell
+        ));
+        assert!(link_target_valid_for_scope(
+            &LinkTarget::Environment("X"),
+            ScopeLevel::ProofStep
+        ));
     }
 }

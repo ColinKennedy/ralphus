@@ -37,6 +37,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
 | `<<review:<id>>>` | `[[task.cell]].review` | an existing `[[review]]`'s id in the same submission (RAL-269) |
 | `<<ralphus:new-review/<key>>>` | `[[task.cell]].review` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269) |
+| `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
 
 Rules and risks:
 
@@ -51,7 +52,9 @@ Rules and risks:
   `project`, a wrapped new-worktree placeholder repeated there expands to
   the *same* materialized path as the `cwd` (memoized by the literal
   placeholder string, so the same value repeated across cells only
-  materializes once).
+  materializes once). An `environment` value may instead be a **linked
+  field** (RAL-460, below), which points back at another field on the same
+  cell instead of repeating that field's placeholder text.
 - **`?upstream=` is required** on a new-worktree placeholder cwd, so ralphus
   always knows what the created branch tracks instead of guessing from HEAD.
 - **`depends_on` is deliberately not a sentinel** — it is a bare-string
@@ -61,6 +64,147 @@ Rules and risks:
   `[[review]] upstream` declares the review's **base branch**; a cell
   placeholder's `?upstream=` sets *that cell's worktree's* git tracking
   upstream at creation time. See the glossary's Reviews section.
+
+### Linked field (`environment`, RAL-460)
+
+An `environment` value may link to another field instead of re-embedding
+that field's placeholder text (or its eventual resolved value). `.` in the
+path addresses the table this `environment` entry is itself declared on;
+`..` walks up one level of TOML nesting per repetition — a cell's proof
+step's `..` reaches that cell, a cell's `..` reaches its owning task, a
+task-scoped proof step's `..` reaches that task:
+
+```toml
+[[task.cell]]
+id = "worker"
+cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+environment.WORKTREE = "<<ralphus:linked-field/./cwd>>"
+environment.LOG_DIR = "<<ralphus:linked-field/./cwd>>/logs"
+
+[[task.cell.proof]]
+command = "cargo test"
+environment.CELL_ID = "<<ralphus:linked-field/../id>>"
+```
+
+`environment.WORKTREE` resolves to this cell's own `cwd`, once the daemon has
+materialized (or reused) that worktree — the real on-disk path, exactly the
+same value `cwd` itself ends up holding, and at the same point in
+materialization timing. `environment.LOG_DIR` resolves to that same path plus
+the literal `/logs` text after the sentinel. The proof step's
+`environment.CELL_ID` walks `..` up to its owning cell and reads that cell's
+`id` ("worker").
+
+Grammar:
+
+```
+"<<ralphus:linked-field/<path>>>"
+```
+
+`<path>` is `/`-separated: every segment before the last must be exactly `.`
+or `..`; the last segment names the target field.
+
+- **Embeds like a worktree placeholder.** A linked field is found by the same
+  `<<...>>` scan a worktree placeholder is (`core::schema::text_placeholders`)
+  — trailing literal text after the closing `>>` (as `LOG_DIR` above) is
+  literal text appended to the resolved value, not a separate `?suffix=`
+  query.
+- **Optional `?text=<function>({})` query** (RAL-460 follow-up) applies a
+  registered text-transform function to the linked value before it's used —
+  `{}` is the literal placeholder for that resolved value, the function's
+  only argument:
+
+  ```toml
+  [[task.cell]]
+  cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+  environment.WORKTREE_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>"
+  ```
+
+  If `cwd` resolves to `.../RAL-1234-add_payment_system`, `WORKTREE_NAME`
+  resolves to just `RAL-1234-add_payment_system` — the worktree's final path
+  component, not its full path. The only registered function today is
+  `basename` (`core::schema::TextFn`), which mirrors POSIX `basename(1)`:
+  trailing `/`/`\` separators are stripped first, then everything up to and
+  including the last remaining separator is discarded. Both separators are
+  recognized regardless of host platform, since the linked value may have
+  been produced on a different machine (RAL-185) than the one resolving it.
+  An unsupported query key, a malformed `<function>({})` expression (missing
+  the literal `{}`, extra arguments, trailing text after the `)`), or a
+  function name that isn't registered are all hard validation failures, the
+  same no-silent-fallback treatment a malformed `<path>` gets.
+- **The target field** is `cwd`, `id`, or `environment.<key>` for a sibling
+  entry in the SAME table's own `environment` (never an ancestor's — see the
+  cross-scope restriction below). Which of `cwd`/`id` actually exist depends
+  on what kind of table the path's navigation reaches: a cell has both, a
+  proof step has only `id`, a task has neither (only `environment.<key>`).
+  No other field names are recognized.
+- **`environment.<key>` targets are same-table only (`.`, not `..`).** The
+  daemon resolves one scope's whole `environment` table as a single
+  already-hierarchy-merged map (`squad < task < cell < proof`, RAL-150)
+  before any placeholder in it is resolved, so an ancestor's `<key>` is
+  already present in that same merged map under its own name (or shadowed by
+  a same-named override closer in) — there is no separate ancestor table left
+  to address unambiguously by the time resolution runs. `cwd` and `id` don't
+  have this problem (each level tracks its own literal value, never merged),
+  so only they may cross a `..`.
+- **Resolution timing.** A linked field resolves once its target field has a
+  real value: linking to `cwd` resolves once that cell's own worktree
+  placeholder (if it had one) has been materialized — the same point at
+  which any other `cwd`-embedding `environment` value already resolves.
+  Linking to a target that was never a placeholder (a cell `cwd` that's
+  already a plain literal path, or a static `id`) resolves directly to that
+  literal — there's no placeholder-resolution pass to run, just a value to
+  read.
+- **Chaining.** A linked field may itself be the target of another linked
+  field, as long as `environment.<key>` targets stay same-table:
+
+  ```toml
+  [[task.cell]]
+  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+  environment.BASE = "<<ralphus:linked-field/./cwd>>"
+  environment.LOG_DIR = "<<ralphus:linked-field/./environment.BASE>>/logs"
+  ```
+
+  Here `LOG_DIR` links to `BASE`, which itself links to `cwd`. The daemon
+  resolves these in dependency order — `cwd`, then `BASE`, then `LOG_DIR` —
+  regardless of which order the `environment` keys happen to be declared or
+  iterated in. A chain that cycles back on itself (`A` links to `B`, `B`
+  links to `A`) is rejected: at submit time when the cycle is fully declared
+  in one `environment` table, and defensively at run time either way.
+- **Validation.** The linked-to field must actually exist at the level the
+  path's navigation reaches, or submission fails validation — typo
+  protection, no silent fallback. Walking `..` past the top of the
+  submission, linking `cwd`/`id` to a level that doesn't have one (a task has
+  neither; a proof step's own `id` must actually be set in the TOML, unlike a
+  cell's, which falls back to an auto-generated one), or a same-table
+  `environment.<key>` that doesn't exist there, are all hard validation
+  failures. A malformed path (missing the leading `./`/`../`, an invalid
+  navigation segment, no field name at the end) fails validation with a
+  message naming the problem.
+- **`[[default]].environment`** (RAL-460 follow-up) sets a linked field once
+  and has it apply to every task/cell/proof step in the submission — it seeds
+  the same squad layer of the hierarchical env-override store (RAL-150) a
+  task's or cell's own `environment` seeds its own layer of, so `.`/`..`
+  resolve against whichever task/cell/proof step it ends up applying to, not
+  a single fixed table:
+
+  ```toml
+  [[default]]
+  environment.WORKTREE = "<<ralphus:linked-field/./cwd>>"
+
+  [[task]]
+  name = "t"
+  [[task.cell]]
+  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+  ```
+
+  Here every cell in the submission gets its own `WORKTREE` env var pointing
+  at its own `cwd` — resolved per cell, not once. Because a default's
+  `environment` entry is polymorphic like this, its linked-field syntax is
+  only checked at submit time (a well-formed `./cwd`-shaped path); a target
+  that doesn't apply at some particular cell/task/proof step surfaces as a
+  runtime resolution error there instead, the same way an unresolvable
+  placeholder anywhere else does. A task's own `environment` (inherited by
+  every cell under that task) is validated the same leniently.
 
 ### `restart_on` grammar (proof steps)
 
