@@ -89,6 +89,14 @@ rem    librarian exiting) tears the daemon down too. The daemon is launched via
 rem    PowerShell's Start-Process -PassThru so we capture its exact PID -- the
 rem    cleanup below kills only THAT process, not every ralphus-daemon.exe on
 rem    the box, so a second side-by-side instance (different ports) survives.
+rem    -NoNewWindow (not -WindowStyle Hidden) is required here: a hidden
+rem    window still gets its own console, which puts the daemon in a separate
+rem    console process group that never sees a Ctrl-C typed into this window --
+rem    only the foreground librarian.exe would die, and the taskkill below
+rem    never runs because Ctrl-C also triggers cmd's own "Terminate batch job
+rem    (Y/N)?" prompt, which aborts the rest of this script if answered Y.
+rem    -NoNewWindow keeps the daemon in this window's console/process group so
+rem    Ctrl-C kills it directly, independent of that prompt.
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 echo == starting stack ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
@@ -110,7 +118,7 @@ rem then never reaches the librarian below and the board never comes up. The
 rem daemon already writes everything to its configured log_path (see
 rem ~/.config/ralphus/config.toml [daemon].log_path), so file capture here is
 rem redundant anyway.
-for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -WindowStyle Hidden).Id"') do set "daemon_pid=%%P"
+for /f "delims=" %%P in ('powershell -NoProfile -Command "(Start-Process -FilePath '%root%\target\debug\ralphus-daemon.exe' -ArgumentList '%ps_arglist%' -PassThru -NoNewWindow).Id"') do set "daemon_pid=%%P"
 
 set "RALPHUS_BOARD_ASSETS_DIR=%root%\librarian\assets"
 "%root%\target\debug\ralphus-librarian.exe" serve --port %librarian_port%
