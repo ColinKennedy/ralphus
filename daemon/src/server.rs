@@ -5739,6 +5739,302 @@ fn update_webhook_for_project(
     Ok((client.kind(), hook))
 }
 
+// ── Webhook auto-reconciliation (`[daemon].public_url`) ─────────────────
+//
+// The daemon's bind address (`127.0.0.1:PORT`) is not the address GitHub/
+// GitLab can reach it at through NAT/a reverse proxy/a tunnel, so that
+// externally-reachable address can never be *derived* -- it's set once, as
+// `[daemon].public_url` (see that field's own doc comment in `config.rs`).
+// What this section automates instead is everything downstream of having
+// that value: on every daemon startup, each webhook-enabled project's
+// last-recorded hook is compared against the configured `public_url`, and
+// any mismatch is repointed *in place* via `update_webhook_for_project`
+// rather than a fresh `install_webhook_for_project` call.
+//
+// Repointing in place (never delete-then-recreate) matters because neither
+// forge cleans up a hook left pointed at a dead address promptly: GitHub
+// never automatically disables a failing webhook at all (a dead hook just
+// accumulates failed "Recent Deliveries" forever); GitLab only starts
+// temporarily disabling one after 4 consecutive failures (1-minute
+// backoff, doubling to a 24-hour cap) and needs 40 consecutive failures to
+// permanently disable it. Blindly calling `install` again after every
+// address change would leave exactly that orphaned, silently-failing hook
+// behind on top of the new one -- see docs/daemon-api.md's `[daemon]`
+// config table for the citations this reasoning is based on.
+
+/// One decision for how to reconcile a single project's webhook against
+/// this daemon's configured `[daemon].public_url`. Pure -- every input is a
+/// parameter rather than a live config/env/DB read, so every branch here is
+/// directly unit-testable without a mock forge server. See
+/// `run_webhook_reconciliation_pass` for what executes each variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WebhookReconcileAction {
+    /// `[webhook].mode` resolves to `disabled` (the default, and also what
+    /// an unrecognized mode string falls back to here -- a config typo is
+    /// already reported loudly elsewhere, the receive route and `webhook
+    /// install`; this pass just skips what it can't classify rather than
+    /// failing the whole reconciliation over one project). Nothing to do.
+    Disabled,
+    /// `[webhook].secret_env` names an environment variable that is unset
+    /// (or empty) in this daemon's own process. Installing anyway would
+    /// create a hook that can never verify a delivery, so this project is
+    /// skipped with a warning instead of silently shipping a broken hook.
+    MissingSecret,
+    /// A webhook is already recorded for this project and already points
+    /// at the configured `public_url`. Nothing to do.
+    UpToDate,
+    /// No webhook is recorded for this project yet -- first-time install.
+    Install,
+    /// A webhook is recorded, but its URL no longer matches the configured
+    /// `public_url` (this daemon's address changed since it was installed)
+    /// -- repoint the existing hook in place by its recorded id.
+    Update { hook_id: String },
+}
+
+/// Decide [`WebhookReconcileAction`] for one project.
+fn plan_webhook_reconcile(
+    mode: std::result::Result<crate::config::WebhookMode, String>,
+    existing: Option<&crate::webhook::ProjectWebhookRecord>,
+    public_url: &str,
+    secret_present: bool,
+) -> WebhookReconcileAction {
+    if mode.unwrap_or(crate::config::WebhookMode::Disabled) == crate::config::WebhookMode::Disabled
+    {
+        return WebhookReconcileAction::Disabled;
+    }
+    if !secret_present {
+        return WebhookReconcileAction::MissingSecret;
+    }
+    match existing {
+        None => WebhookReconcileAction::Install,
+        Some(record)
+            if record.daemon_url.trim_end_matches('/') == public_url.trim_end_matches('/') =>
+        {
+            WebhookReconcileAction::UpToDate
+        }
+        Some(record) => WebhookReconcileAction::Update {
+            hook_id: record.hook_id.clone(),
+        },
+    }
+}
+
+fn log_webhook_reconcile_missing_secret(
+    store: &crate::store_lock::StoreHandle,
+    project_name: &str,
+    secret_env: &str,
+) {
+    crate::rlog!(
+        WARNING,
+        "ralphus [webhook] {project_name} wants shadow/active mode but ${secret_env} is unset in this daemon's environment -- skipping auto-reconcile"
+    );
+    let _ = store
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "webhook",
+            message: "webhook auto-reconcile skipped: secret env var unset",
+            scope: Some("project"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"project": project_name, "secret_env": secret_env}),
+            admin_only: false,
+        });
+}
+
+fn log_webhook_reconcile_applied(
+    store: &crate::store_lock::StoreHandle,
+    project_name: &str,
+    public_url: &str,
+    verb: &str,
+) {
+    crate::rlog!(
+        INFO,
+        "ralphus [webhook] auto-{verb} {project_name}'s webhook at {public_url}"
+    );
+    let _ = store.lock().cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::INFO,
+        source: "webhook",
+        message: "webhook auto-reconciled",
+        scope: Some("project"),
+        squad_id: None,
+        guardian_id: None,
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({"project": project_name, "public_url": public_url, "action": verb}),
+        admin_only: false,
+    });
+}
+
+fn log_webhook_reconcile_failed(
+    store: &crate::store_lock::StoreHandle,
+    project_name: &str,
+    verb: &str,
+    error: &str,
+) {
+    crate::rlog!(
+        WARNING,
+        "ralphus [webhook] auto-{verb} failed for {project_name}: {error}"
+    );
+    let _ = store
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "webhook",
+            message: "webhook auto-reconcile forge call failed",
+            scope: Some("project"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({"project": project_name, "action": verb, "error": error}),
+            admin_only: false,
+        });
+}
+
+/// Run one reconciliation pass across every registered project against an
+/// already-resolved `public_url` -- takes it as a parameter rather than
+/// calling `crate::config::load_daemon_config()` itself, so this whole pass
+/// is directly testable against an in-memory store without touching real
+/// filesystem/cwd-anchored global config state (same reasoning
+/// `configuration_path_entries` in `config.rs` documents for its own env
+/// parameter). [`spawn_webhook_reconciliation`] is the one caller that
+/// resolves the real config and decides whether to call this at all -- an
+/// unset `[daemon].public_url` there means this function never runs, so
+/// every project's webhook stays exactly as manually installed via
+/// `ralphus project webhook install`/`update`. One project's forge-call
+/// failure is logged and skipped here, never aborting the rest of the pass.
+fn run_webhook_reconciliation_pass(store: &crate::store_lock::StoreHandle, public_url: &str) {
+    let projects = match store.lock().list_projects() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [webhook] reconciliation pass could not list projects: {e}"
+            );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::ERROR,
+                    source: "webhook",
+                    message: "webhook auto-reconcile pass could not list projects",
+                    scope: None,
+                    squad_id: None,
+                    guardian_id: None,
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"error": e.to_string()}),
+                    admin_only: false,
+                });
+            return;
+        }
+    };
+    for project in projects {
+        let root = std::path::Path::new(&project.path);
+        let webhook_cfg = crate::config::resolve_webhook(root);
+        let secret_env = webhook_cfg.resolved_secret_env().to_string();
+        let secret = std::env::var(&secret_env).ok().filter(|s| !s.is_empty());
+        let existing = match store.lock().get_project_webhook(&project.name) {
+            Ok(r) => r,
+            Err(e) => {
+                log_webhook_reconcile_failed(store, &project.name, "reconcile", &e.to_string());
+                continue;
+            }
+        };
+        let action = plan_webhook_reconcile(
+            webhook_cfg.mode(),
+            existing.as_ref(),
+            public_url,
+            secret.is_some(),
+        );
+        match action {
+            WebhookReconcileAction::Disabled | WebhookReconcileAction::UpToDate => {}
+            WebhookReconcileAction::MissingSecret => {
+                log_webhook_reconcile_missing_secret(store, &project.name, &secret_env);
+            }
+            WebhookReconcileAction::Install => {
+                // `secret` is guaranteed `Some` here: `plan_webhook_reconcile`
+                // only returns `Install` when `secret_present` was true.
+                let Some(secret) = secret else { continue };
+                match install_webhook_for_project(root, &secret, public_url) {
+                    Ok((kind, hook)) => {
+                        let _ = store.lock().record_project_webhook(
+                            &project.name,
+                            kind.as_str(),
+                            &hook.id,
+                            public_url,
+                        );
+                        log_webhook_reconcile_applied(
+                            store,
+                            &project.name,
+                            public_url,
+                            "installed",
+                        );
+                    }
+                    Err(e) => log_webhook_reconcile_failed(store, &project.name, "install", &e),
+                }
+            }
+            WebhookReconcileAction::Update { hook_id } => {
+                let Some(secret) = secret else { continue };
+                match update_webhook_for_project(root, &hook_id, &secret, public_url) {
+                    Ok((kind, hook)) => {
+                        let _ = store.lock().record_project_webhook(
+                            &project.name,
+                            kind.as_str(),
+                            &hook.id,
+                            public_url,
+                        );
+                        log_webhook_reconcile_applied(
+                            store,
+                            &project.name,
+                            public_url,
+                            "repointed",
+                        );
+                    }
+                    Err(e) => log_webhook_reconcile_failed(store, &project.name, "update", &e),
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the one-shot background pass ([`run_webhook_reconciliation_pass`])
+/// that reconciles every registered project's webhook against
+/// `[daemon].public_url` once at startup. Runs on its own thread so a slow
+/// or unreachable forge never delays `run_http_loop` accepting requests --
+/// same reasoning as `pr::spawn_pr_base_drift_poller`/
+/// `health_sweep::spawn_health_sweep`, though unlike those two this is a
+/// single pass, not a loop: an address change only needs to be noticed
+/// once per restart, and there's no periodic drift to watch for between
+/// restarts (the daemon isn't the one whose address moves on its own).
+/// Panic-isolated so one project's reconciliation blowing up doesn't take
+/// the thread down before the rest of the projects are reconciled.
+pub fn spawn_webhook_reconciliation(store: crate::store_lock::StoreHandle) {
+    std::thread::spawn(move || {
+        let daemon_cfg = crate::config::load_daemon_config();
+        let Some(public_url) = daemon_cfg
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_webhook_reconciliation_pass(&store, &public_url);
+        }));
+        if pass.is_err() {
+            crate::rlog!(ERROR, "ralphus [webhook] auto-reconciliation pass panicked");
+        }
+    });
+}
+
 #[derive(Serialize)]
 struct WebhookCheckResponse {
     fired: bool,
@@ -15327,6 +15623,11 @@ pub fn serve<A: ToSocketAddrs>(
     // health check -- see `crate::health_sweep`'s module doc comment for
     // why it's scoped to a subset of the catalog.
     crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle());
+    // Webhook auto-reconciliation: a no-op unless `[daemon].public_url` is
+    // configured -- see that section's own doc comment above
+    // `spawn_webhook_reconciliation` for why this is a one-shot pass, not a
+    // recurring poller like the two spawns just above.
+    spawn_webhook_reconciliation(daemon.store_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,
@@ -27844,6 +28145,207 @@ command=\"cargo test\"
         assert_eq!(kind, crate::forge::ForgeKind::GitHub);
         assert_eq!(hook.url, "https://new.example.com/api/forge/webhook/github");
         handle.join().unwrap();
+    }
+
+    // ── webhook auto-reconciliation (`[daemon].public_url`) ─────────────
+
+    #[test]
+    fn plan_webhook_reconcile_disabled_mode_needs_nothing() {
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Disabled),
+                None,
+                "https://ralphus.example.com",
+                true,
+            ),
+            WebhookReconcileAction::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_unrecognized_mode_string_behaves_like_disabled() {
+        assert_eq!(
+            plan_webhook_reconcile(
+                Err("unknown [webhook] mode \"shado\"".to_string()),
+                None,
+                "https://ralphus.example.com",
+                true,
+            ),
+            WebhookReconcileAction::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_shadow_with_no_secret_is_skipped() {
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Shadow),
+                None,
+                "https://ralphus.example.com",
+                false,
+            ),
+            WebhookReconcileAction::MissingSecret
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_with_no_existing_record_installs() {
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Shadow),
+                None,
+                "https://ralphus.example.com",
+                true,
+            ),
+            WebhookReconcileAction::Install
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_matching_recorded_url_is_up_to_date() {
+        let record = crate::webhook::ProjectWebhookRecord {
+            provider: "github".to_string(),
+            hook_id: "9".to_string(),
+            daemon_url: "https://ralphus.example.com".to_string(),
+            installed_at_ms: 0,
+        };
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Active),
+                Some(&record),
+                "https://ralphus.example.com",
+                true,
+            ),
+            WebhookReconcileAction::UpToDate
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_matching_recorded_url_ignores_a_trailing_slash() {
+        let record = crate::webhook::ProjectWebhookRecord {
+            provider: "github".to_string(),
+            hook_id: "9".to_string(),
+            daemon_url: "https://ralphus.example.com/".to_string(),
+            installed_at_ms: 0,
+        };
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Shadow),
+                Some(&record),
+                "https://ralphus.example.com",
+                true,
+            ),
+            WebhookReconcileAction::UpToDate
+        );
+    }
+
+    #[test]
+    fn plan_webhook_reconcile_mismatched_recorded_url_repoints_by_hook_id() {
+        let record = crate::webhook::ProjectWebhookRecord {
+            provider: "github".to_string(),
+            hook_id: "9".to_string(),
+            daemon_url: "https://old.example.com".to_string(),
+            installed_at_ms: 0,
+        };
+        assert_eq!(
+            plan_webhook_reconcile(
+                Ok(crate::config::WebhookMode::Shadow),
+                Some(&record),
+                "https://new.example.com",
+                true,
+            ),
+            WebhookReconcileAction::Update {
+                hook_id: "9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn webhook_reconciliation_pass_skips_a_project_with_no_webhook_config_at_all() {
+        let d = daemon();
+        let repo = tmp_git_repo("reconcile-disabled");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("reconcile-disabled-proj", &repo.to_string_lossy(), ""),
+        );
+        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
+        assert_eq!(
+            d.lock()
+                .get_project_webhook("reconcile-disabled-proj")
+                .unwrap(),
+            None,
+            "disabled mode must never install a webhook"
+        );
+    }
+
+    #[test]
+    fn webhook_reconciliation_pass_skips_a_project_whose_secret_env_is_unset() {
+        let d = daemon();
+        let repo = tmp_git_repo("reconcile-missing-secret");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[webhook]\nmode = \"shadow\"\nsecret_env = \"RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET\"\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("reconcile-missing-secret-proj", &repo.to_string_lossy(), ""),
+        );
+        // No mock forge server is started -- if the pass tried to call out
+        // despite the missing secret, this would hang or error instead of
+        // returning, so the assertion below reaching at all is itself part
+        // of the proof, in addition to the recorded-webhook check.
+        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
+        assert_eq!(
+            d.lock()
+                .get_project_webhook("reconcile-missing-secret-proj")
+                .unwrap(),
+            None,
+            "a project whose secret env var is unset must never get an installed webhook"
+        );
+    }
+
+    #[test]
+    fn webhook_reconciliation_pass_never_clobbers_an_existing_record_it_cannot_act_on() {
+        let d = daemon();
+        let repo = tmp_git_repo("reconcile-up-to-date");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[webhook]\nmode = \"shadow\"\nsecret_env = \"RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET_2\"\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("reconcile-up-to-date-proj", &repo.to_string_lossy(), ""),
+        );
+        d.lock()
+            .record_project_webhook(
+                "reconcile-up-to-date-proj",
+                "github",
+                "9",
+                "https://ralphus.example.com",
+            )
+            .unwrap();
+        // The secret env var is unset, so this pass can only ever reach
+        // `MissingSecret` here (never a real `UpToDate`/`Update` decision --
+        // `plan_webhook_reconcile_matching_recorded_url_is_up_to_date` above
+        // covers `UpToDate` itself, without needing a real secret). What
+        // this proves instead: reading an existing record and being unable
+        // to act on it never clears or corrupts that record.
+        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
+        let record = d
+            .lock()
+            .get_project_webhook("reconcile-up-to-date-proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.hook_id, "9");
+        assert_eq!(record.daemon_url, "https://ralphus.example.com");
     }
 
     #[test]

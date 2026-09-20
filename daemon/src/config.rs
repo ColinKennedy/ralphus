@@ -3982,23 +3982,35 @@ mod tests {
     #[test]
     fn public_url_parses_from_the_daemon_table() {
         let cfg = daemon_from_toml_str("[daemon]\npublic_url = \"https://ralphus.example.com\"\n");
-        assert_eq!(cfg.public_url.as_deref(), Some("https://ralphus.example.com"));
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://ralphus.example.com")
+        );
     }
 
     #[test]
     fn public_url_project_local_wins_over_global_on_merge() {
-        let global = daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
-        let project = daemon_from_toml_str("[daemon]\npublic_url = \"https://project.example.com\"\n");
+        let global =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let project =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://project.example.com\"\n");
         let merged = merge_daemon_config(global, project);
-        assert_eq!(merged.public_url.as_deref(), Some("https://project.example.com"));
+        assert_eq!(
+            merged.public_url.as_deref(),
+            Some("https://project.example.com")
+        );
     }
 
     #[test]
     fn public_url_unset_locally_falls_back_to_global_on_merge() {
-        let global = daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let global =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
         let project = daemon_from_toml_str("");
         let merged = merge_daemon_config(global, project);
-        assert_eq!(merged.public_url.as_deref(), Some("https://global.example.com"));
+        assert_eq!(
+            merged.public_url.as_deref(),
+            Some("https://global.example.com")
+        );
     }
 
     #[test]
