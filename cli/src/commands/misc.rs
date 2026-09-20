@@ -948,7 +948,13 @@ const WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// the fallback path forever.
 ///
 /// `None` on timeout expiring before `check()` ever returned `Some(_)`.
-fn wait_for<T>(
+///
+/// `pub` (Track C / C4): `ralphus-mcp`'s own `exec_listen`/`wait_for_terminal`
+/// reuse this directly rather than re-implementing the same push-driven
+/// wait a second time -- the same "otherwise-private helper made `pub` for
+/// `mcp`'s one external call site" pattern `cli/AGENTS.md` already documents
+/// for `resolve_scoped`/`with_uri`/etc.
+pub fn wait_for<T>(
     client: &DaemonClient,
     timeout: Option<f64>,
     mut check: impl FnMut() -> Option<T>,
