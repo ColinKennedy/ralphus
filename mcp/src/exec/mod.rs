@@ -134,7 +134,7 @@ fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {
         }
         if args.wait {
             if let Some(id) = &squad_id {
-                return Ok(wait_for_terminal(client, id)?);
+                return wait_for_terminal(client, id);
             }
         }
         Ok(result)
@@ -156,15 +156,27 @@ fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {
     submit_one(&texts.join("\n\n"))
 }
 
+/// How long `wait_for_terminal` waits for a squad to reach a terminal state
+/// before giving up (Track C / C1). Was unbounded: an MCP tool call has no
+/// way to signal "still working" the way the CLI's own progress printing
+/// does, so a squad that never reaches `done`/`failed`/`cancelled` pinned
+/// the calling MCP tool call forever. Generous rather than tight --
+/// agent-run squads legitimately take tens of minutes, and the failure mode
+/// this guards against is "forever", not "slower than ideal": 30 minutes is
+/// a bound that only ever bites a squad that is genuinely stuck.
+const WAIT_FOR_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// A silent (no progress printing) version of `misc::wait_for_terminal` --
 /// polls until the squad reaches a terminal state and returns it, without
 /// `println!`ing each transition (MCP has no per-tool-call progress
 /// channel to print to; a caller that wants incremental status can call
 /// `status`/`listen` itself).
-fn wait_for_terminal(
-    client: &DaemonClient,
-    squad_id: &str,
-) -> Result<Value, ralphus_cli::client::DaemonError> {
+///
+/// Bounded by [`WAIT_FOR_TERMINAL_TIMEOUT`] (Track C / C1): past that, the
+/// caller gets an explicit error naming the squad id rather than the call
+/// hanging indefinitely, and can check on it via `status`/`listen` instead.
+fn wait_for_terminal(client: &DaemonClient, squad_id: &str) -> ExecResult {
+    let deadline = std::time::Instant::now() + WAIT_FOR_TERMINAL_TIMEOUT;
     loop {
         let squad = client.squad(squad_id)?;
         if matches!(
@@ -172,6 +184,13 @@ fn wait_for_terminal(
             Some("done" | "failed" | "cancelled")
         ) {
             return Ok(squad);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(usage(format!(
+                "squad {squad_id} did not reach a terminal state within {}s -- \
+                 it may still be running; check its status with `status`/`listen` instead of waiting further",
+                WAIT_FOR_TERMINAL_TIMEOUT.as_secs()
+            )));
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
