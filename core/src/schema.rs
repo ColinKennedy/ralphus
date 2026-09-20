@@ -605,26 +605,44 @@ pub fn first_worktree_placeholder_in_text(text: &str) -> Option<&str> {
 /// `daemon::worktrees` resolve these in dependency order rather than via a
 /// single hardcoded hop, and reject a chain that cycles back on itself or a
 /// path that doesn't resolve to a real field.
+///
+/// An optional `?text=<function>({})` query (RAL-460 follow-up) applies a
+/// registered [`TextFn`] to the linked value before it's used -- `{}` is the
+/// literal placeholder for that resolved value, the function's only
+/// argument. There is still deliberately no separate `?suffix=` query for
+/// appending literal text; that stays trailing text after the closing `>>`,
+/// exactly as it already works for `ralphus:new-worktree/...`. See
+/// [`parse_linked_field_query`].
 pub const LINKED_FIELD_PREFIX: &str = "ralphus:linked-field/";
 
-/// A parsed `ralphus:linked-field/<path>` sentinel body (already unwrapped
-/// from its `<<...>>` delimiters -- see [`text_placeholders`]).
+/// A parsed `ralphus:linked-field/<path>[?text=<function>({})]` sentinel body
+/// (already unwrapped from its `<<...>>` delimiters -- see
+/// [`text_placeholders`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkedFieldRef<'a> {
     /// The raw path after the prefix, e.g. `"./cwd"` or
     /// `"../../environment.BASE"` -- not yet split into navigation vs.
-    /// field, see [`parse_linked_field_path`].
+    /// field, see [`parse_linked_field_path`]. Never includes the `?...`
+    /// query suffix.
     pub path: &'a str,
+    /// The raw query string, if any, with the leading `?` stripped (e.g.
+    /// `"text=basename({})"`). `None` when the sentinel has no `?` at all.
+    /// See [`parse_linked_field_query`].
+    pub query: Option<&'a str>,
 }
 
-/// Parse a `ralphus:linked-field/<path>` sentinel body. Returns `None` for
-/// text that isn't this scheme at all (a plain literal, a worktree
-/// placeholder, or some other placeholder kind), so callers fall through to
-/// their existing handling for those.
+/// Parse a `ralphus:linked-field/<path>[?query]` sentinel body. Returns
+/// `None` for text that isn't this scheme at all (a plain literal, a
+/// worktree placeholder, or some other placeholder kind), so callers fall
+/// through to their existing handling for those.
 #[must_use]
 pub fn parse_linked_field(body: &str) -> Option<LinkedFieldRef<'_>> {
-    body.strip_prefix(LINKED_FIELD_PREFIX)
-        .map(|path| LinkedFieldRef { path })
+    let rest = body.strip_prefix(LINKED_FIELD_PREFIX)?;
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    Some(LinkedFieldRef { path, query })
 }
 
 /// Why a linked field's `<path>` failed to parse -- see
@@ -755,6 +773,102 @@ pub fn link_target_field_name(target: &LinkTarget<'_>) -> String {
         LinkTarget::Id => "id".to_string(),
         LinkTarget::Environment(key) => format!("environment.{key}"),
     }
+}
+
+/// A text-transform function invocable via a linked field's `?text=` query
+/// (RAL-460 follow-up), e.g.
+/// `"<<ralphus:linked-field/./cwd?text=basename({})>>"` resolves to the final
+/// path component of the cell's own `cwd`, not the full path. Registered by
+/// name -- see [`TextFn::by_name`] and [`parse_linked_field_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFn {
+    /// The final path component, mirroring POSIX `basename(1)`: trailing
+    /// `/`/`\` separators are stripped first, then everything up to and
+    /// including the last remaining separator is discarded. Both separators
+    /// are recognized regardless of the host platform, since the linked
+    /// value may have been produced on a different machine (RAL-185) than
+    /// the one resolving it.
+    Basename,
+}
+
+impl TextFn {
+    /// The registered `(name, function)` pairs a `?text=<name>({})` query
+    /// may name. Extend this list to register a new function.
+    const REGISTRY: &'static [(&'static str, TextFn)] = &[("basename", TextFn::Basename)];
+
+    /// Look up a registered text-transform function by its `?text=` name.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        Self::REGISTRY
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| *f)
+    }
+
+    /// Every registered function name, in registry order -- for error
+    /// messages that list what's available.
+    pub fn registered_names() -> impl Iterator<Item = &'static str> {
+        Self::REGISTRY.iter().map(|(name, _)| *name)
+    }
+
+    /// Apply this transform to a linked field's already-resolved value.
+    #[must_use]
+    pub fn apply(self, value: &str) -> String {
+        match self {
+            TextFn::Basename => {
+                let trimmed = value.trim_end_matches(['/', '\\']);
+                if trimmed.is_empty() {
+                    // The whole value was separators (e.g. "/" or "\\"), or
+                    // it was already empty -- nothing to strip further.
+                    return value.to_string();
+                }
+                match trimmed.rfind(['/', '\\']) {
+                    Some(i) => trimmed[i + 1..].to_string(),
+                    None => trimmed.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Why a linked field's optional `?text=<name>({})` query failed to parse --
+/// see [`parse_linked_field_query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkedFieldQueryError<'a> {
+    /// The query wasn't `text=...` at all (e.g. a stray `?upstream=main` --
+    /// that query belongs to a worktree placeholder, not a linked field).
+    UnknownParam,
+    /// `?text=` with nothing after the `=`.
+    EmptyExpression,
+    /// The expression after `text=` wasn't exactly `<name>({})` -- e.g. a
+    /// missing or malformed `{}` placeholder, extra arguments, or trailing
+    /// text after the closing `)`.
+    MalformedExpression,
+    /// `<name>` parsed but isn't a [`TextFn`] registered under that name.
+    UnknownFunction(&'a str),
+}
+
+/// Parse a linked field's optional `?text=<name>({})` query (RAL-460
+/// follow-up) into the [`TextFn`] it names. `{}` is the literal placeholder
+/// for the linked field's own resolved value -- the only argument shape
+/// supported today, so `<name>` takes no other arguments.
+///
+/// # Errors
+/// See [`LinkedFieldQueryError`].
+pub fn parse_linked_field_query(query: &str) -> Result<TextFn, LinkedFieldQueryError<'_>> {
+    let expr = query
+        .strip_prefix("text=")
+        .ok_or(LinkedFieldQueryError::UnknownParam)?;
+    if expr.is_empty() {
+        return Err(LinkedFieldQueryError::EmptyExpression);
+    }
+    let Some(name) = expr.strip_suffix("({})") else {
+        return Err(LinkedFieldQueryError::MalformedExpression);
+    };
+    if name.is_empty() {
+        return Err(LinkedFieldQueryError::MalformedExpression);
+    }
+    TextFn::by_name(name).ok_or(LinkedFieldQueryError::UnknownFunction(name))
 }
 
 /// Reserved `?upstream=` sentinel value meaning "the repository's default
@@ -2728,6 +2842,15 @@ mod tests {
     fn parse_linked_field_reads_the_path() {
         let link = parse_linked_field("ralphus:linked-field/./cwd").expect("is a linked field");
         assert_eq!(link.path, "./cwd");
+        assert_eq!(link.query, None);
+    }
+
+    #[test]
+    fn parse_linked_field_splits_off_the_query() {
+        let link = parse_linked_field("ralphus:linked-field/./cwd?text=basename({})")
+            .expect("is a linked field");
+        assert_eq!(link.path, "./cwd");
+        assert_eq!(link.query, Some("text=basename({})"));
     }
 
     #[test]
@@ -2737,6 +2860,91 @@ mod tests {
             None
         );
         assert_eq!(parse_linked_field("plain text"), None);
+    }
+
+    #[test]
+    fn parse_linked_field_query_reads_a_registered_function() {
+        assert_eq!(
+            parse_linked_field_query("text=basename({})"),
+            Ok(TextFn::Basename)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_unknown_param() {
+        assert_eq!(
+            parse_linked_field_query("upstream=main"),
+            Err(LinkedFieldQueryError::UnknownParam)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_empty_expression() {
+        assert_eq!(
+            parse_linked_field_query("text="),
+            Err(LinkedFieldQueryError::EmptyExpression)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_a_malformed_expression() {
+        // Missing the "({})" call entirely.
+        assert_eq!(
+            parse_linked_field_query("text=basename"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // Real arguments instead of the literal "{}" placeholder.
+        assert_eq!(
+            parse_linked_field_query("text=basename(cwd)"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // Trailing text after the call.
+        assert_eq!(
+            parse_linked_field_query("text=basename({})extra"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+        // No function name before the call.
+        assert_eq!(
+            parse_linked_field_query("text=({})"),
+            Err(LinkedFieldQueryError::MalformedExpression)
+        );
+    }
+
+    #[test]
+    fn parse_linked_field_query_rejects_an_unregistered_function() {
+        assert_eq!(
+            parse_linked_field_query("text=dirname({})"),
+            Err(LinkedFieldQueryError::UnknownFunction("dirname"))
+        );
+    }
+
+    #[test]
+    fn text_fn_basename_takes_the_final_path_component() {
+        assert_eq!(
+            TextFn::Basename.apply("/path/to/somewhere/RAL-1234-add_payment_system"),
+            "RAL-1234-add_payment_system"
+        );
+        assert_eq!(
+            TextFn::Basename.apply(r"C:\repos\somewhere\RAL-1234-add_payment_system"),
+            "RAL-1234-add_payment_system"
+        );
+    }
+
+    #[test]
+    fn text_fn_basename_strips_trailing_separators_first() {
+        assert_eq!(TextFn::Basename.apply("/path/to/dir/"), "dir");
+        assert_eq!(TextFn::Basename.apply(r"C:\path\to\dir\"), "dir");
+    }
+
+    #[test]
+    fn text_fn_basename_passes_through_a_bare_name() {
+        assert_eq!(TextFn::Basename.apply("standalone"), "standalone");
+    }
+
+    #[test]
+    fn text_fn_basename_handles_all_separators_and_empty_input() {
+        assert_eq!(TextFn::Basename.apply("/"), "/");
+        assert_eq!(TextFn::Basename.apply(""), "");
     }
 
     #[test]

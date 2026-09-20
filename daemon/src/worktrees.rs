@@ -1444,7 +1444,7 @@ fn resolve_env_entry(
                 project_name,
                 env,
                 key,
-                link.path,
+                link,
                 ctx,
                 cache,
                 resolved,
@@ -1475,31 +1475,34 @@ fn resolve_env_entry(
     Ok(value)
 }
 
-/// Resolve a single `<<ralphus:linked-field/<path>>>` sentinel body's
-/// `<path>` (already unwrapped by [`expand_placeholder_text`], so `path` is
-/// e.g. `"./cwd"` or `"../id"`) against `ctx`'s scope, recursing into a
+/// Resolve a single `<<ralphus:linked-field/<path>[?text=<name>({})]>>`
+/// sentinel (already unwrapped by [`expand_placeholder_text`], so `link.path`
+/// is e.g. `"./cwd"` or `"../id"`) against `ctx`'s scope, recursing into a
 /// same-table `environment.<key>` sibling (via [`resolve_env_entry`]) when
 /// the target is itself another linked field (RAL-460). Mirrors
 /// `core::validate`'s structural checks exactly -- see
 /// [`ralphus_core::schema::LINKED_FIELD_PREFIX`]'s doc comment for the
 /// grammar and the `cwd`/`id` vs. `environment.<key>` cross-scope
-/// restriction both this and validation enforce.
+/// restriction both this and validation enforce. `link.query`'s `?text=`
+/// function (RAL-460 follow-up), if present, is applied to the resolved
+/// value last, after any chaining -- see
+/// [`ralphus_core::schema::parse_linked_field_query`].
 #[allow(clippy::too_many_arguments)]
 fn resolve_linked_field(
     store: &Store,
     project_name: Option<&str>,
     env: &BTreeMap<String, String>,
     key: &str,
-    path: &str,
+    link: ralphus_core::schema::LinkedFieldRef<'_>,
     ctx: PlaceholderContext<'_>,
     cache: &mut HashMap<String, String>,
     resolved: &mut BTreeMap<String, String>,
     resolving: &mut HashSet<String>,
 ) -> Result<String, String> {
-    let parsed = ralphus_core::schema::parse_linked_field_path(path).map_err(|_| {
+    let parsed = ralphus_core::schema::parse_linked_field_path(link.path).map_err(|_| {
         format!(
-            "cell '{}': environment \"{key}\" is a malformed linked-field sentinel \"{path}\"",
-            ctx.cell_id
+            "cell '{}': environment \"{key}\" is a malformed linked-field sentinel \"{}\"",
+            ctx.cell_id, link.path
         )
     })?;
     let Some(target) = ralphus_core::schema::parse_link_target(parsed.field) else {
@@ -1508,7 +1511,7 @@ fn resolve_linked_field(
             ctx.cell_id, parsed.field
         ));
     };
-    match target {
+    let value = match target {
         ralphus_core::schema::LinkTarget::Cwd => resolve_linked_cwd(ctx, parsed.ups, key),
         ralphus_core::schema::LinkTarget::Id => resolve_linked_id(ctx, parsed.ups, key),
         ralphus_core::schema::LinkTarget::Environment(target_key) => {
@@ -1537,7 +1540,17 @@ fn resolve_linked_field(
                 resolving,
             )
         }
-    }
+    }?;
+    let Some(query) = link.query else {
+        return Ok(value);
+    };
+    let text_fn = ralphus_core::schema::parse_linked_field_query(query).map_err(|_| {
+        format!(
+            "cell '{}': environment \"{key}\" has a malformed linked-field query \"{query}\"",
+            ctx.cell_id
+        )
+    })?;
+    Ok(text_fn.apply(&value))
 }
 
 /// Resolve a linked field's `cwd` target `ups` levels up from `ctx`'s own
@@ -4262,6 +4275,63 @@ mod tests {
             resolved.get("LOGS").map(String::as_str),
             Some("/resolved/wt/logs")
         );
+    }
+
+    #[test]
+    fn materialize_env_overrides_applies_a_text_query_to_the_linked_value() {
+        // RAL-460 follow-up: "?text=basename({})" applies the registered
+        // "basename" function to the linked cwd's resolved value.
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "WT_NAME".to_string(),
+            "<<ralphus:linked-field/./cwd?text=basename({})>>".to_string(),
+        )]);
+        let resolved = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/path/to/somewhere/RAL-1234-add_payment_system"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect("resolve link with text query");
+        assert_eq!(
+            resolved.get("WT_NAME").map(String::as_str),
+            Some("RAL-1234-add_payment_system")
+        );
+    }
+
+    #[test]
+    fn materialize_env_overrides_rejects_an_unregistered_text_query_function() {
+        let store = Store::open_in_memory().unwrap();
+        let targets = std::collections::BTreeMap::new();
+        let prefetched_upstreams = HashMap::new();
+        let on_disk_worktrees = RefCell::new(HashMap::new());
+        let env = BTreeMap::from([(
+            "WT_NAME".to_string(),
+            "<<ralphus:linked-field/./cwd?text=dirname({})>>".to_string(),
+        )]);
+        let err = materialize_env_overrides(
+            &store,
+            env_ctx(
+                Some("/resolved/wt"),
+                false,
+                None,
+                &targets,
+                &prefetched_upstreams,
+                &on_disk_worktrees,
+            ),
+            &env,
+        )
+        .expect_err("an unregistered text function must fail resolution");
+        assert!(err.contains("malformed linked-field query"), "{err}");
     }
 
     #[test]

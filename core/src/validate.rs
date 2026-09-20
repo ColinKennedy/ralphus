@@ -643,6 +643,9 @@ fn check_environment_lenient(ctx: &mut Ctx, table: &toml::Table, path: &str, hea
                     line,
                 );
             }
+            if let Some(query) = link.query {
+                check_linked_field_query(ctx, path, header, key, query);
+            }
         }
     }
 }
@@ -1283,6 +1286,9 @@ fn check_environment_link(
                 continue;
             }
         };
+        if let Some(query) = link.query {
+            check_linked_field_query(ctx, path, header, key, query);
+        }
         if parsed.ups >= chain.len() {
             let line = ctx.key_line(header, "environment");
             ctx.error(
@@ -1415,6 +1421,48 @@ fn check_environment_link(
             }
         }
     }
+}
+
+/// Validate a linked field's optional `?text=<name>({})` query (RAL-460
+/// follow-up). No-op when `query` doesn't fail to parse. Reports a hard
+/// error through `ctx` for a query this crate doesn't recognize -- an
+/// unsupported query key, a malformed `<name>({})` expression, or a `<name>`
+/// that isn't a registered [`crate::schema::TextFn`] -- the same
+/// no-silent-fallback treatment [`check_environment_link`] gives a malformed
+/// path.
+fn check_linked_field_query(
+    ctx: &mut Ctx,
+    path: &str,
+    header: Option<u32>,
+    key: &str,
+    query: &str,
+) {
+    let Err(e) = crate::schema::parse_linked_field_query(query) else {
+        return;
+    };
+    use crate::schema::LinkedFieldQueryError as E;
+    let detail = match e {
+        E::UnknownParam => "the only supported query is \"?text=<function>({})\"".to_string(),
+        E::EmptyExpression => "\"?text=\" must not be empty".to_string(),
+        E::MalformedExpression => {
+            "the expression after \"text=\" must be exactly \"<function>({})\", e.g. \
+             \"basename({})\""
+                .to_string()
+        }
+        E::UnknownFunction(name) => format!(
+            "\"{name}\" is not a registered text function (known: {})",
+            crate::schema::TextFn::registered_names()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let line = ctx.key_line(header, "environment");
+    ctx.error(
+        &format!("{path}.environment.{key}"),
+        ErrorKind::InvalidValue,
+        format!("environment value for \"{key}\" has a malformed linked-field query: {detail}"),
+        line,
+    );
 }
 
 /// Does `edges` (each a same-table `(key, target_key)` linked-field
@@ -3554,6 +3602,76 @@ project = "ralphus"
             r.errors
                 .iter()
                 .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("malformed")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn linked_field_text_query_with_a_registered_function_is_valid() {
+        let src = r#"
+[[task]]
+name = "t"
+project = "ralphus"
+
+    [[task.cell]]
+    cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+    environment = { FOO = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
+    prompt = "hello"
+"#;
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn linked_field_text_query_with_an_unregistered_function_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={FOO=\"<<ralphus:linked-field/./cwd?text=dirname({})>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("dirname")
+                && e.message.contains("not a registered text function")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn linked_field_text_query_with_a_malformed_expression_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={FOO=\"<<ralphus:linked-field/./cwd?text=basename(cwd)>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("malformed linked-field query")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn linked_field_unsupported_query_key_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   environment={FOO=\"<<ralphus:linked-field/./cwd?suffix=x>>\"}\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message
+                    .contains("only supported query is \"?text=<function>({})\"")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn default_environment_text_query_with_an_unregistered_function_is_rejected() {
+        let src = "[[default]]\nenvironment={SOME_ENV_VAR=\"<<ralphus:linked-field/./cwd?text=dirname({})>>\"}\n\
+                   [[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("not a registered text function")),
             "{:?}",
             r.errors
         );

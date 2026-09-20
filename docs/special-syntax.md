@@ -108,6 +108,29 @@ or `..`; the last segment names the target field.
   — trailing literal text after the closing `>>` (as `LOG_DIR` above) is
   literal text appended to the resolved value, not a separate `?suffix=`
   query.
+- **Optional `?text=<function>({})` query** (RAL-460 follow-up) applies a
+  registered text-transform function to the linked value before it's used —
+  `{}` is the literal placeholder for that resolved value, the function's
+  only argument:
+
+  ```toml
+  [[task.cell]]
+  cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+  environment.WORKTREE_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>"
+  ```
+
+  If `cwd` resolves to `.../RAL-1234-add_payment_system`, `WORKTREE_NAME`
+  resolves to just `RAL-1234-add_payment_system` — the worktree's final path
+  component, not its full path. The only registered function today is
+  `basename` (`core::schema::TextFn`), which mirrors POSIX `basename(1)`:
+  trailing `/`/`\` separators are stripped first, then everything up to and
+  including the last remaining separator is discarded. Both separators are
+  recognized regardless of host platform, since the linked value may have
+  been produced on a different machine (RAL-185) than the one resolving it.
+  An unsupported query key, a malformed `<function>({})` expression (missing
+  the literal `{}`, extra arguments, trailing text after the `)`), or a
+  function name that isn't registered are all hard validation failures, the
+  same no-silent-fallback treatment a malformed `<path>` gets.
 - **The target field** is `cwd`, `id`, or `environment.<key>` for a sibling
   entry in the SAME table's own `environment` (never an ancestor's — see the
   cross-scope restriction below). Which of `cwd`/`id` actually exist depends
