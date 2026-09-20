@@ -23,6 +23,14 @@ bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~
 
 This is deliberately explicit, not auto-picked: if a script silently chose a port or DB path on `start`, a later `ralphus-daemon stop --port N` (a new shell, a different agent) would have no reliable way to know what to target. Passing a non-default `--daemon-port` without `--db-path` still gets automatic DB isolation (derived as `~/.ralphus/tasks-<port>.db`) — only the *default* port keeps using the plain `~/.ralphus/tasks.db` it always has, so existing setups are unaffected. Point the CLI or a browser at the second instance with `ralphus --daemon-url http://127.0.0.1:7891 ...` / `http://127.0.0.1:7475`, and stop it with `ralphus-daemon stop --port 7891` when done.
 
+**Receiving real webhook deliveries locally — `build-debug.sh`/`.cmd --webhook-tunnel`.** A registered project's `[webhook]` mode only matters if GitHub/GitLab can actually reach this daemon, and a dev machine's own address (`127.0.0.1:PORT`) can't be reached from the internet. `--webhook-tunnel` automates the standard fix — a tunnel tool (here, [ngrok](https://ngrok.com/download); dev-only, never a project dependency, not installed by either build script) that hands out a public HTTPS URL forwarding straight to your local port:
+
+```bash
+bash scripts/build-debug.sh --webhook-tunnel
+```
+
+Before starting the daemon, this starts `ngrok http <daemon_port>`, polls ngrok's own local status API (`127.0.0.1:4040`, no auth needed) for its public URL, and exports it as `RALPHUS_DAEMON_PUBLIC_URL` — which `daemon/src/config.rs`'s `load_daemon_config` reads as this run's live override of `[daemon].public_url`, taking precedence over whatever (or nothing) is in `.ralphus.toml`. On the next daemon startup, `server::spawn_webhook_reconciliation` picks that up and installs/repoints every webhook-enabled project's hook to point at it. Free-tier ngrok hands out a **new** URL on every run — that's the whole reason this is automated rather than a one-time `.ralphus.toml` edit: repeat runs never touch the config file, and the reconciliation pass repoints existing hooks in place rather than leaving a stale duplicate behind (see `docs/daemon-api.md`'s `[daemon].public_url` section for why that matters — cited GitHub/GitLab webhook-failure-handling behavior). The tunnel is torn down alongside the daemon on Ctrl-C / exit. Windows delegates the ngrok-start-and-poll logic to `scripts/webhook-tunnel.ps1` rather than inlining it in `build-debug.cmd`, since a retry loop against a REST API is unwieldy to express correctly in batch.
+
 Run the pieces directly:
 
 ```bash

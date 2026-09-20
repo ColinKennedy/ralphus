@@ -18,7 +18,7 @@ rem needed. Re-run this script only when Rust code changes.
 rem Ctrl-C stops both processes. For a distributable standalone build (slow),
 rem use build-release.cmd instead.
 rem
-rem Usage: build-debug.cmd [--daemon-port N] [--librarian-port N] [--db-path PATH]
+rem Usage: build-debug.cmd [--daemon-port N] [--librarian-port N] [--db-path PATH] [--webhook-tunnel]
 rem Defaults to 7890/7474. Pass different ports to run a second stack
 rem alongside the regular one. RAL-164: --daemon-port + --db-path together
 rem give FULL isolation (separate port AND separate SQLite DB) -- the right
@@ -31,8 +31,20 @@ rem setups are unaffected. Ports/paths are never silently invented beyond
 rem this per-port default -- write down whatever you pass so a later
 rem `ralphus-daemon stop --port N` targets the right instance.
 rem
+rem --webhook-tunnel starts an ngrok tunnel to --daemon-port (ngrok must
+rem already be on PATH -- https://ngrok.com/download; it's a dev-only tool,
+rem never a project dependency) and exports RALPHUS_DAEMON_PUBLIC_URL to
+rem whatever public HTTPS URL ngrok hands back *this run* before the daemon
+rem starts -- see scripts/webhook-tunnel.ps1 and config.rs's
+rem load_daemon_config_with. Solves the chicken-and-egg of "the daemon
+rem needs public_url at startup, but a free-tier ngrok URL is only known
+rem once ngrok itself starts, and changes every run" without ever touching
+rem .ralphus.toml by hand. The tunnel is torn down alongside the daemon when
+rem this script exits.
+rem
 rem Example (regular stack, defaults):      build-debug.cmd
 rem Example (second stack, fully isolated): build-debug.cmd --daemon-port 7891 --librarian-port 7475 --db-path %USERPROFILE%\.ralphus\tasks-worktree2.db
+rem Example (webhook dev, real deliveries):  build-debug.cmd --webhook-tunnel
 
 rem Root is whichever checkout this script lives in (main or a worktree).
 rem MUST be resolved before any `shift` below -- plain `shift` shifts %0 too,
@@ -43,6 +55,7 @@ for %%I in ("%root%") do set "root=%%~fI"
 set "daemon_port=7890"
 set "librarian_port=7474"
 set "db_path="
+set "webhook_tunnel=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -64,8 +77,13 @@ if /i "%~1"=="--db-path" (
     shift
     goto parse_args
 )
+if /i "%~1"=="--webhook-tunnel" (
+    set "webhook_tunnel=1"
+    shift
+    goto parse_args
+)
 echo unknown argument: %~1 1>&2
-echo usage: build-debug.cmd [--daemon-port N] [--librarian-port N] [--db-path PATH] 1>&2
+echo usage: build-debug.cmd [--daemon-port N] [--librarian-port N] [--db-path PATH] [--webhook-tunnel] 1>&2
 exit /b 1
 :args_done
 
@@ -107,6 +125,33 @@ rem    librarian below would never start, and the board would never come up.
 rem    -RedirectStandardOutput/-RedirectStandardError are absent for the same
 rem    reason; the daemon already writes everything to its configured log_path
 rem    (see ~/.config/ralphus/config.toml [daemon].log_path).
+rem --webhook-tunnel: start ngrok and capture its (fresh-every-run) public
+rem HTTPS URL into RALPHUS_DAEMON_PUBLIC_URL before the daemon starts, so
+rem config.rs's load_daemon_config picks it up as this run's [daemon]
+rem public_url override -- no .ralphus.toml edit, ever. Delegated to a real
+rem .ps1 (not inlined here) because it needs a retry loop against ngrok's
+rem local status API, which is unwieldy to express correctly in batch.
+set "ngrok_pid="
+if "%webhook_tunnel%"=="1" (
+    echo == starting ngrok tunnel to port %daemon_port% ==
+    set "ngrok_pid_file=%TEMP%\ralphus-debug-ngrok-%daemon_port%.pid"
+    set "ngrok_url_file=%TEMP%\ralphus-debug-ngrok-%daemon_port%.url"
+    del "!ngrok_pid_file!" >nul 2>&1
+    del "!ngrok_url_file!" >nul 2>&1
+    powershell -NoProfile -File "%root%\scripts\webhook-tunnel.ps1" -Port %daemon_port% -PidFile "!ngrok_pid_file!" -UrlFile "!ngrok_url_file!"
+    if errorlevel 1 exit /b 1
+    if exist "!ngrok_pid_file!" set /p ngrok_pid=<"!ngrok_pid_file!"
+    del "!ngrok_pid_file!" >nul 2>&1
+    set "RALPHUS_DAEMON_PUBLIC_URL="
+    if exist "!ngrok_url_file!" set /p RALPHUS_DAEMON_PUBLIC_URL=<"!ngrok_url_file!"
+    del "!ngrok_url_file!" >nul 2>&1
+    if not defined RALPHUS_DAEMON_PUBLIC_URL (
+        echo failed to establish an ngrok tunnel 1>&2
+        exit /b 1
+    )
+    echo    webhook tunnel -^> !RALPHUS_DAEMON_PUBLIC_URL! ^(ngrok pid !ngrok_pid!^)
+)
+
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 echo == starting stack ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
@@ -140,4 +185,8 @@ rem say so out loud: a silent teardown here has previously masqueraded as
 rem "the daemon crashes after ~2 minutes".
 echo == librarian exited (code %errorlevel%); stopping daemon pid %daemon_pid% ==
 taskkill /f /pid %daemon_pid% >nul 2>&1
+if defined ngrok_pid (
+    echo == stopping ngrok tunnel pid %ngrok_pid% ==
+    taskkill /f /pid %ngrok_pid% >nul 2>&1
+)
 endlocal
