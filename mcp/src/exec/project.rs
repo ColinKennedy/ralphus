@@ -141,5 +141,9 @@ fn exec_webhook(cmd: ProjectWebhookCommand, client: &DaemonClient) -> ExecResult
         ProjectWebhookCommand::Uninstall { project, hook_id } => {
             Ok(client.uninstall_project_webhook(&project, &hook_id)?)
         }
+        ProjectWebhookCommand::Update {
+            project,
+            daemon_url,
+        } => Ok(client.update_project_webhook(&project, &daemon_url)?),
     }
 }

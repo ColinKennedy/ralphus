@@ -216,6 +216,7 @@ produced no pane output.
 | POST | `/api/projects/{name}/webhook/install` | [Register a live webhook](#post-apiprojectsnamewebhookinstall-track-e-e8) on the project's forge repo, pointed at this daemon's receive route |
 | GET | `/api/projects/{name}/webhook/status` | [List webhooks](#get-apiprojectsnamewebhookstatus-track-e-e8) currently registered on the project's forge repo |
 | POST | `/api/projects/{name}/webhook/uninstall` | [Delete a webhook](#post-apiprojectsnamewebhookuninstall-track-e-e8) from the project's forge repo by id |
+| POST | `/api/projects/{name}/webhook/update` | [Rotate the secret/URL](#post-apiprojectsnamewebhookupdate-track-e-e9) on an already-installed webhook, keeping its id |
 | POST | `/api/pull-requests/{pr_id}/refresh-ci` | [Live-poll and persist CI status](#post-apipull-requestspr_idrefresh-ci) for one PR on demand (RAL-402) |
 
 **Fork registration (RAL-338)**
@@ -3909,7 +3910,38 @@ Deletes one webhook from the project's forge repo by its forge-assigned id
 `hook_id` is required rather than inferred — a repo can carry other,
 unrelated webhooks, and guessing which one to delete risks removing someone
 else's hook. `200 {"deleted": true}` on success; `404 not_found` for an
-unregistered project name.
+unregistered project name. Also forgets the `project_webhooks` bookkeeping
+row (E9) recorded by `install`, so a later `update` correctly reports "no
+webhook is recorded" rather than acting on a hook that's already gone.
+
+### `POST /api/projects/{name}/webhook/update` (Track E, E9)
+Rotates the secret and/or callback URL on the webhook this daemon previously
+recorded installing for the project (`POST .../webhook/install`), without
+changing the hook's forge-assigned id — a delete-and-recreate would silently
+break anything that recorded the old id, including this daemon's own
+bookkeeping if the caller forgot to also update it. Admin-gated, same
+rationale as `install`/`uninstall`.
+
+```json
+{ "daemon_url": "https://ralphus.example.com" }
+```
+
+Same body shape as `install`; the secret is always re-read fresh from this
+daemon's process environment (`[webhook].secret_env`), so a rotated secret
+takes effect on the next `update` with no separate flag needed. `404
+not_found` if no webhook was ever recorded installed for this project (run
+`install` first) or the project name is unregistered; `400 bad_request` if
+the secret env var is unset. On success, `200` with the updated hook — same
+shape as `install`'s response.
+
+**Project removal (E9).** `DELETE /api/projects/{name}` now does best-effort
+webhook cleanup before removing the project: if a webhook was recorded
+installed for it, this daemon attempts to delete it from the forge and
+always clears the `project_webhooks` bookkeeping row, regardless of whether
+the forge call succeeded. Never blocks or fails project removal — a forge
+outage, a revoked token, or the repo having moved only produces a warning
+log line, since a project must never end up stuck registered just because
+its webhook couldn't be cleanly torn down.
 
 ## Notes on future evolution
 

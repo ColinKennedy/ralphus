@@ -1147,6 +1147,18 @@ to ones ralphus installed -- match by url).",
         false,
         &[],
     ),
+    node(
+        "update",
+        &["project [str]"],
+        &["--daemon-url [url]"],
+        "Rotate the secret and/or callback URL on the webhook this daemon previously \
+recorded installing for the project (`webhook install`), without changing its forge-assigned \
+id. Fails with 404 if no webhook was ever recorded installed for this project -- run \
+`webhook install` first.",
+        false,
+        false,
+        &[],
+    ),
 ];
 
 const PROJECT_CHILDREN: &[HelpNode] = &[

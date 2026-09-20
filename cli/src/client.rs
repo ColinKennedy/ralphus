@@ -581,6 +581,20 @@ impl DaemonClient {
         )
     }
 
+    /// `POST /api/projects/{name}/webhook/update` (Track E, E9): rotate the
+    /// secret and/or callback URL on the webhook this daemon previously
+    /// recorded installing for the project, without changing its id.
+    pub fn update_project_webhook(
+        &self,
+        project: &str,
+        daemon_url: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/update"),
+            Some(json!({"daemon_url": daemon_url})),
+        )
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see

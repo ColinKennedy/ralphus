@@ -1083,6 +1083,14 @@ fn route_for_user(
                 project_webhook_uninstall(daemon, name, body)
             })
         }
+        // Track E, E9: rotate the secret and/or callback URL on an
+        // already-installed hook. Admin-gated for the same reason as
+        // install/uninstall above.
+        ("POST", ["api", "projects", name, "webhook", "update"]) => {
+            admin_gated(daemon, user_header, || {
+                project_webhook_update(daemon, name, body)
+            })
+        }
         // RAL-338: fork registration. Reads open to every caller (matches the
         // `projects` pattern above). `GET /api/project-forks` is the
         // unscoped list across every project. A trailing user segment
@@ -5075,12 +5083,60 @@ fn get_project(daemon: &Daemon, name: &str) -> Reply {
 /// keyed by name in other tables (fork registrations, Triage thresholds,
 /// review-settings defaults) are intentionally left in place as orphaned
 /// data rather than cascaded away -- the same state those tables already
-/// tolerate when a project's path stops resolving on its own.
+/// tolerate when a project's path stops resolving on its own. A recorded
+/// webhook (Track E, E9) is the one exception: unlike those purely local
+/// rows, it is a *live side effect on a third-party forge* -- leaving it
+/// installed means the forge keeps sending deliveries this daemon has no
+/// project left to route them to. See
+/// [`cleanup_project_webhook_on_removal`]'s doc comment for why that
+/// cleanup runs before the project row is gone rather than after.
 fn delete_project(daemon: &Daemon, name: &str) -> Reply {
+    cleanup_project_webhook_on_removal(daemon, name);
     match daemon.lock().delete_project(name) {
         Ok(()) => json(200, &serde_json::json!({"removed": true})),
         Err(e) => store_error(&e),
     }
+}
+
+/// Best-effort webhook removal for a project about to be unregistered
+/// (Track E, E9). Must run *before* `Store::delete_project` -- both the
+/// project's `path` (needed to resolve a `ForgeClient`) and the recorded
+/// `project_webhooks` row are read from the store, and there is nothing
+/// left to read either from once the project row is gone. Never blocks or
+/// fails the removal itself: a forge outage, a revoked token, or the repo
+/// having moved must not leave a project stuck registered just because its
+/// webhook couldn't be cleanly torn down -- the failure is logged instead,
+/// same as any other best-effort external side effect in this codebase.
+fn cleanup_project_webhook_on_removal(daemon: &Daemon, name: &str) {
+    let Ok(Some(record)) = daemon.lock().get_project_webhook(name) else {
+        return;
+    };
+    let Ok(Some(project)) = daemon.lock().get_project(name) else {
+        return;
+    };
+    let root = std::path::Path::new(&project.path);
+    let forge_cfg = crate::config::resolve_forge(root);
+    match crate::forge::resolve_remote(root, "", &forge_cfg) {
+        Ok(client) => {
+            if let Err(e) = client.delete_webhook(&record.hook_id) {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [webhook] project {name:?} removed with hook {} still installed \
+                     on the forge -- delete failed: {e}",
+                    record.hook_id
+                );
+            }
+        }
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [webhook] project {name:?} removed with hook {} still installed on \
+                 the forge -- could not resolve a forge client to delete it: {e}",
+                record.hook_id
+            );
+        }
+    }
+    let _ = daemon.lock().delete_project_webhook(name);
 }
 
 /// `GET /api/project-forks` (RAL-338): every registered fork row, across
@@ -5427,7 +5483,21 @@ fn project_webhook_install(daemon: &Daemon, name: &str, body: &str) -> Reply {
         }
     };
     match install_webhook_for_project(root, &secret, &req.daemon_url) {
-        Ok(hook) => json(201, &WebhookInfoResponse::from(hook)),
+        Ok((kind, hook)) => {
+            // Track E, E9: recorded so a later `update` (secret rotation /
+            // address change) or removal-cleanup knows which hook id to
+            // act on without the caller supplying it again. Best-effort --
+            // the hook is already live on the forge either way, and a
+            // failed bookkeeping write here isn't worth failing the whole
+            // install for.
+            let _ = daemon.lock().record_project_webhook(
+                name,
+                kind.as_str(),
+                &hook.id,
+                &req.daemon_url,
+            );
+            json(201, &WebhookInfoResponse::from(hook))
+        }
         Err(e) => error(502, "forge_call_failed", &e, vec![]),
     }
 }
@@ -5438,11 +5508,13 @@ fn project_webhook_install(daemon: &Daemon, name: &str, body: &str) -> Reply {
 /// without touching this process's real environment (`std::env::set_var` is
 /// `unsafe` and this workspace forbids `unsafe_code` outright; same
 /// testability pattern as `configuration_path_entries` in `config.rs`).
+/// Returns the resolved [`ForgeKind`](crate::forge::ForgeKind) alongside the
+/// hook so the caller can record it (E9) without re-resolving the client.
 fn install_webhook_for_project(
     root: &std::path::Path,
     secret: &str,
     daemon_url: &str,
-) -> Result<crate::forge::ForgeWebhook, String> {
+) -> Result<(crate::forge::ForgeKind, crate::forge::ForgeWebhook), String> {
     let forge_cfg = crate::config::resolve_forge(root);
     let client = crate::forge::resolve_remote(root, "", &forge_cfg)?;
     let callback_url = format!(
@@ -5450,9 +5522,10 @@ fn install_webhook_for_project(
         daemon_url.trim_end_matches('/'),
         client.kind().as_str()
     );
-    client
+    let hook = client
         .create_webhook(&callback_url, secret)
-        .map_err(String::from)
+        .map_err(String::from)?;
+    Ok((client.kind(), hook))
 }
 
 #[derive(Serialize)]
@@ -5536,9 +5609,111 @@ fn project_webhook_uninstall(daemon: &Daemon, name: &str, body: &str) -> Reply {
         Err(e) => return error(400, "forge_resolve_failed", &e, vec![]),
     };
     match client.delete_webhook(&req.hook_id) {
-        Ok(()) => json(200, &serde_json::json!({"deleted": true})),
+        Ok(()) => {
+            // Track E, E9: forget the recorded install so a stale
+            // `project_webhooks` row doesn't outlive the hook it describes.
+            let _ = daemon.lock().delete_project_webhook(name);
+            json(200, &serde_json::json!({"deleted": true}))
+        }
         Err(e) => error(502, "forge_call_failed", &String::from(e), vec![]),
     }
+}
+
+/// `POST /api/projects/{name}/webhook/update` (Track E, E9): rotate the
+/// secret and/or callback URL on the webhook this daemon previously
+/// recorded installing for the project (`POST .../webhook/install`, E8),
+/// without changing the hook's id -- a delete-and-recreate would silently
+/// break anything that recorded the old id (including this daemon's own
+/// `project_webhooks` row, if the caller didn't also update it). `404
+/// not_found` if no webhook was ever recorded installed for this project.
+fn project_webhook_update(daemon: &Daemon, name: &str, body: &str) -> Reply {
+    let req: WebhookInstallRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error(
+                400,
+                "bad_request",
+                &format!("invalid request body: {e}"),
+                vec![],
+            );
+        }
+    };
+    let project = match daemon.lock().get_project(name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("project \"{name}\" is not registered"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let record = match daemon.lock().get_project_webhook(name) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                "no webhook is recorded as installed for this project -- run \
+                 POST .../webhook/install first",
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let root = std::path::Path::new(&project.path);
+    let webhook_config = crate::config::resolve_webhook(root);
+    let secret = match std::env::var(webhook_config.resolved_secret_env()) {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "webhook secret env var \"{}\" is not set in this daemon's process \
+                     environment",
+                    webhook_config.resolved_secret_env()
+                ),
+                vec![],
+            );
+        }
+    };
+    match update_webhook_for_project(root, &record.hook_id, &secret, &req.daemon_url) {
+        Ok((kind, hook)) => {
+            let _ = daemon.lock().record_project_webhook(
+                name,
+                kind.as_str(),
+                &hook.id,
+                &req.daemon_url,
+            );
+            json(200, &WebhookInfoResponse::from(hook))
+        }
+        Err(e) => error(502, "forge_call_failed", &e, vec![]),
+    }
+}
+
+/// The actual forge call behind [`project_webhook_update`] -- same
+/// secret-as-parameter split as [`install_webhook_for_project`], for the
+/// same testability reason.
+fn update_webhook_for_project(
+    root: &std::path::Path,
+    hook_id: &str,
+    secret: &str,
+    daemon_url: &str,
+) -> Result<(crate::forge::ForgeKind, crate::forge::ForgeWebhook), String> {
+    let forge_cfg = crate::config::resolve_forge(root);
+    let client = crate::forge::resolve_remote(root, "", &forge_cfg)?;
+    let callback_url = format!(
+        "{}/api/forge/webhook/{}",
+        daemon_url.trim_end_matches('/'),
+        client.kind().as_str()
+    );
+    let hook = client
+        .update_webhook(hook_id, &callback_url, secret)
+        .map_err(String::from)?;
+    Ok((client.kind(), hook))
 }
 
 #[derive(Serialize)]
@@ -27306,8 +27481,9 @@ command=\"cargo test\"
         )
         .unwrap();
 
-        let hook =
+        let (kind, hook) =
             install_webhook_for_project(&repo, "topsecret", "https://ralphus.example.com").unwrap();
+        assert_eq!(kind, crate::forge::ForgeKind::GitHub);
         assert_eq!(hook.id, "9");
         assert!(hook.active);
         handle.join().unwrap();
@@ -27423,5 +27599,150 @@ command=\"cargo test\"
         );
         assert_eq!(r.status, 200, "{}", r.body);
         handle.join().unwrap();
+    }
+
+    // ── Track E, E9: hook lifecycle (rotation, removal cleanup) ─────────
+
+    #[test]
+    fn project_webhook_update_route_rejects_when_nothing_was_ever_installed() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-update-none");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-update-proj-1", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/webhook-update-proj-1/webhook/update",
+            &serde_json::json!({"daemon_url": "https://new.example.com"}).to_string(),
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn project_webhook_update_route_unregistered_project_is_404() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/does-not-exist/webhook/update",
+            &serde_json::json!({"daemon_url": "https://new.example.com"}).to_string(),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn update_webhook_for_project_puts_the_expected_shape() {
+        let repo = tmp_git_repo("webhook-update-core");
+        add_origin_remote(&repo);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/9");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["config"]["url"],
+                "https://new.example.com/api/forge/webhook/github"
+            );
+            assert_eq!(v["config"]["secret"], "rotated-secret");
+            req.respond(tiny_http::Response::from_string(
+                r#"{"id":9,"config":{"url":"https://new.example.com/api/forge/webhook/github"},"active":true}"#,
+            ))
+            .unwrap();
+        });
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!("[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\n"),
+        )
+        .unwrap();
+
+        let (kind, hook) =
+            update_webhook_for_project(&repo, "9", "rotated-secret", "https://new.example.com")
+                .unwrap();
+        assert_eq!(kind, crate::forge::ForgeKind::GitHub);
+        assert_eq!(hook.url, "https://new.example.com/api/forge/webhook/github");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_project_route_best_effort_removes_a_recorded_webhook() {
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-removal-cleanup");
+        add_origin_remote(&repo);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Delete);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/9");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!("[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\n"),
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-removal-proj", &repo.to_string_lossy(), ""),
+        );
+        d.lock()
+            .record_project_webhook(
+                "webhook-removal-proj",
+                "github",
+                "9",
+                "https://ralphus.example.com",
+            )
+            .unwrap();
+
+        let r = route(&d, "DELETE", "/api/projects/webhook-removal-proj", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        handle.join().unwrap();
+        assert_eq!(
+            d.lock()
+                .get_project_webhook("webhook-removal-proj")
+                .unwrap(),
+            None,
+            "the project_webhooks row must be cleared even though the project row is now gone"
+        );
+    }
+
+    #[test]
+    fn delete_project_route_succeeds_even_when_the_forge_call_fails() {
+        // A dead forge/unreachable api_base must never block project
+        // removal -- the failure is logged, not surfaced as an error here.
+        let d = daemon();
+        let repo = tmp_git_repo("webhook-removal-forge-down");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[forge]\nkind = \"github\"\napi_base = \"http://127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("webhook-removal-proj-2", &repo.to_string_lossy(), ""),
+        );
+        d.lock()
+            .record_project_webhook(
+                "webhook-removal-proj-2",
+                "github",
+                "9",
+                "https://ralphus.example.com",
+            )
+            .unwrap();
+
+        let r = route(&d, "DELETE", "/api/projects/webhook-removal-proj-2", "");
+        assert_eq!(r.status, 200, "{}", r.body);
     }
 }

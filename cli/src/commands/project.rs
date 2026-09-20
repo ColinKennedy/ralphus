@@ -51,18 +51,20 @@ pub enum ProjectCommand {
     UsageError(String),
 }
 
-/// `ralphus project webhook <subcommand>` (Track E, E8): explicit,
-/// manually-triggered install/status/uninstall of a live webhook on a
-/// project's forge repo, pointed at this daemon's own receive route
-/// (`POST /api/forge/webhook/{provider}`). No automatic lifecycle
-/// management (secret rotation, address change) yet -- that's a later
-/// ticket (E9).
+/// `ralphus project webhook <subcommand>` (Track E, E8/E9): explicit,
+/// manually-triggered install/status/uninstall/update of a live webhook on
+/// a project's forge repo, pointed at this daemon's own receive route
+/// (`POST /api/forge/webhook/{provider}`). `update` (E9) rotates the
+/// secret and/or callback URL on an already-installed hook without
+/// changing its id; project-removal cleanup is automatic (server-side,
+/// `DELETE /api/projects/{name}`), not a CLI action.
 #[derive(Debug, Clone)]
 pub enum ProjectWebhookCommand {
     Help,
     Install { project: String, daemon_url: String },
     Status { project: String },
     Uninstall { project: String, hook_id: String },
+    Update { project: String, daemon_url: String },
     UsageError(String),
 }
 
@@ -180,10 +182,32 @@ fn parse_webhook(args: &[String]) -> ProjectWebhookCommand {
             Ok(cmd) => cmd,
             Err(e) => ProjectWebhookCommand::UsageError(e.0),
         },
+        Some("update") => match parse_webhook_update(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectWebhookCommand::UsageError(e.0),
+        },
         Some(other) => ProjectWebhookCommand::UsageError(format!(
             "unknown project webhook subcommand: {other}"
         )),
     }
+}
+
+fn parse_webhook_update(scanner: &mut Scanner) -> Result<ProjectWebhookCommand, UsageError> {
+    let daemon_url = scanner.take_value("--daemon-url")?;
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project webhook update requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(daemon_url) = daemon_url else {
+        return Err(UsageError(
+            "project webhook update requires --daemon-url".to_string(),
+        ));
+    };
+    Ok(ProjectWebhookCommand::Update {
+        project,
+        daemon_url,
+    })
 }
 
 fn parse_webhook_install(scanner: &mut Scanner) -> Result<ProjectWebhookCommand, UsageError> {
@@ -572,6 +596,23 @@ fn dispatch_webhook(cmd: ProjectWebhookCommand, opts: &GlobalOpts) -> i32 {
                 }
             }
         }
+        ProjectWebhookCommand::Update {
+            project,
+            daemon_url,
+        } => match client.update_project_webhook(&project, &daemon_url) {
+            Ok(hook) => {
+                println!("updated webhook for project \"{project}\"");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&hook).unwrap_or_default()
+                );
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
     }
 }
 
@@ -1500,6 +1541,47 @@ mod tests {
     fn unknown_webhook_subcommand_is_a_usage_error() {
         assert!(matches!(
             parse(&v(&["webhook", "bogus"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_update_with_required_flags() {
+        match parse(&v(&[
+            "webhook",
+            "update",
+            "proj",
+            "--daemon-url",
+            "https://new.example.com",
+        ])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Update {
+                project,
+                daemon_url,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(daemon_url, "https://new.example.com");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_update_requires_daemon_url() {
+        assert!(matches!(
+            parse(&v(&["webhook", "update", "proj"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_update_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&[
+                "webhook",
+                "update",
+                "--daemon-url",
+                "https://new.example.com"
+            ])),
             ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
         ));
     }

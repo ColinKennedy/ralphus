@@ -3,13 +3,15 @@
 //! (see `server.rs` for the receive route, E2) and no
 //! [`config::WebhookConfig`](crate::config::WebhookConfig) reads, so
 //! verification stays isolated from the config-loading and route-dispatch
-//! code paths it's used from. The one exception is [`Store::record_webhook_delivery`]
-//! (E6), a `Store`-touching method colocated here rather than in
-//! `store.rs` -- the same "each concern hosts its own `impl Store` methods"
-//! pattern already used by `cartographer.rs`/`mailbox.rs`/`pr.rs`.
+//! code paths it's used from. The exceptions are [`Store::record_webhook_delivery`]
+//! (E6) and the `project_webhooks` bookkeeping methods (E9), `Store`-touching
+//! methods colocated here rather than in `store.rs` -- the same "each
+//! concern hosts its own `impl Store` methods" pattern already used by
+//! `cartographer.rs`/`mailbox.rs`/`pr.rs`.
 
 use crate::store::{Result, Store, now_ms};
 use hmac::{Hmac, Mac};
+use rusqlite::OptionalExtension;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -131,6 +133,71 @@ impl Store {
             rusqlite::params![provider, delivery_id, now_ms()],
         )? == 1)
     }
+
+    /// Record (or replace) which webhook this daemon installed for a
+    /// project (Track E, E9) -- called after a successful `install` or
+    /// `update`, so a later `update`/removal-cleanup knows which hook id to
+    /// act on without the caller supplying it again.
+    pub fn record_project_webhook(
+        &self,
+        project_name: &str,
+        provider: &str,
+        hook_id: &str,
+        daemon_url: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO project_webhooks(project_name, provider, hook_id, daemon_url, installed_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_name) DO UPDATE SET
+                 provider=excluded.provider,
+                 hook_id=excluded.hook_id,
+                 daemon_url=excluded.daemon_url,
+                 installed_at_ms=excluded.installed_at_ms",
+            rusqlite::params![project_name, provider, hook_id, daemon_url, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The webhook this daemon last recorded installing for a project, if
+    /// any (Track E, E9).
+    pub fn get_project_webhook(&self, project_name: &str) -> Result<Option<ProjectWebhookRecord>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT provider, hook_id, daemon_url, installed_at_ms FROM project_webhooks WHERE project_name=?1",
+                rusqlite::params![project_name],
+                |r| {
+                    Ok(ProjectWebhookRecord {
+                        provider: r.get(0)?,
+                        hook_id: r.get(1)?,
+                        daemon_url: r.get(2)?,
+                        installed_at_ms: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Forget the recorded webhook for a project (Track E, E9) -- called
+    /// after a successful `uninstall`, or as best-effort cleanup when the
+    /// project itself is removed.
+    pub fn delete_project_webhook(&self, project_name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM project_webhooks WHERE project_name=?1",
+            rusqlite::params![project_name],
+        )?;
+        Ok(())
+    }
+}
+
+/// A webhook this daemon previously recorded installing for a project
+/// (Track E, E9) -- see `Store::get_project_webhook`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectWebhookRecord {
+    pub provider: String,
+    pub hook_id: String,
+    pub daemon_url: String,
+    pub installed_at_ms: i64,
 }
 
 #[cfg(test)]
@@ -276,5 +343,33 @@ mod tests {
         // GitHub and GitLab mint ids from separate namespaces -- the same
         // literal id under a different provider is not a collision.
         assert!(s.record_webhook_delivery("gitlab", "shared-id").unwrap());
+    }
+
+    #[test]
+    fn project_webhook_round_trips_through_record_get_delete() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.get_project_webhook("proj").unwrap(), None);
+
+        s.record_project_webhook("proj", "github", "42", "https://old.example.com")
+            .unwrap();
+        let record = s.get_project_webhook("proj").unwrap().unwrap();
+        assert_eq!(record.provider, "github");
+        assert_eq!(record.hook_id, "42");
+        assert_eq!(record.daemon_url, "https://old.example.com");
+
+        s.delete_project_webhook("proj").unwrap();
+        assert_eq!(s.get_project_webhook("proj").unwrap(), None);
+    }
+
+    #[test]
+    fn record_project_webhook_replaces_the_prior_row_for_the_same_project() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_project_webhook("proj", "github", "42", "https://old.example.com")
+            .unwrap();
+        s.record_project_webhook("proj", "github", "43", "https://new.example.com")
+            .unwrap();
+        let record = s.get_project_webhook("proj").unwrap().unwrap();
+        assert_eq!(record.hook_id, "43");
+        assert_eq!(record.daemon_url, "https://new.example.com");
     }
 }

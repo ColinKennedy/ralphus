@@ -2453,6 +2453,57 @@ impl ForgeClient {
         }
     }
 
+    /// Update an existing webhook's callback URL and/or secret (Track E,
+    /// E9) -- covers both secret rotation and this daemon's own address
+    /// changing, since both cases are "the hook is still the right hook,
+    /// just some of its config is stale" rather than delete-and-recreate
+    /// (which would also change the hook's id, breaking anything that
+    /// recorded the old one). GitHub uses `PATCH .../hooks/{id}` with the
+    /// same body shape as create; GitLab uses `PUT .../hooks/{id}`.
+    pub fn update_webhook(
+        &self,
+        hook_id: &str,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<ForgeWebhook, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks/{hook_id}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "config": {
+                        "url": callback_url,
+                        "content_type": "json",
+                        "secret": secret,
+                        "insecure_ssl": "0",
+                    },
+                });
+                let body = self.send_structured(
+                    ureq::patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                parse_github_webhook(&body)
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({
+                    "url": callback_url,
+                    "token": secret,
+                    "merge_requests_events": true,
+                    "push_events": false,
+                });
+                let body =
+                    self.send_structured(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                parse_gitlab_webhook(&body)
+            }
+        }
+    }
+
     /// List every webhook registered on this repo (Track E, E8) -- not
     /// filtered to ones this daemon created; a caller matches by URL to
     /// find its own.
@@ -6526,6 +6577,86 @@ mod tests {
             Some("tok".to_string()),
         );
         client.delete_webhook("7").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_webhook_sends_a_github_patch_with_the_new_config() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/42");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["config"]["url"],
+                "https://new.example.com/api/forge/webhook/github"
+            );
+            assert_eq!(v["config"]["secret"], "new-secret");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":42,"config":{"url":"https://new.example.com/api/forge/webhook/github"},"active":true}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .update_webhook(
+                "42",
+                "https://new.example.com/api/forge/webhook/github",
+                "new-secret",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "42");
+        assert_eq!(hook.url, "https://new.example.com/api/forge/webhook/github");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_webhook_sends_a_gitlab_put_with_the_new_config() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Put);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks/7");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["url"], "https://new.example.com/api/forge/webhook/gitlab");
+            assert_eq!(v["token"], "new-secret");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":7,"url":"https://new.example.com/api/forge/webhook/gitlab"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .update_webhook(
+                "7",
+                "https://new.example.com/api/forge/webhook/gitlab",
+                "new-secret",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "7");
         handle.join().unwrap();
     }
 }

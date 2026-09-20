@@ -1751,6 +1751,23 @@ impl Store {
                 received_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (provider, delivery_id)
             );
+            -- Track E, E9: which forge webhook (if any) this daemon
+            -- installed for a project (E8), so hook lifecycle actions --
+            -- rotating the secret / updating the callback URL (`POST
+            -- .../webhook/update`), and best-effort cleanup when the
+            -- project itself is removed -- know which hook id to act on
+            -- without asking the caller to look it up and pass it back in.
+            -- One row per project; `project_name` is not a foreign key into
+            -- `projects` (a project can be re-registered under the same
+            -- name after removal, and this row should not silently vanish
+            -- with it if cleanup already ran).
+            CREATE TABLE IF NOT EXISTS project_webhooks (
+                project_name    TEXT PRIMARY KEY,
+                provider        TEXT NOT NULL,
+                hook_id         TEXT NOT NULL,
+                daemon_url      TEXT NOT NULL,
+                installed_at_ms INTEGER NOT NULL
+            );
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)
