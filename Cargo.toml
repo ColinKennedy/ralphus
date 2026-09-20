@@ -58,6 +58,10 @@ sysinfo = { version = "0.36.1", default-features = false, features = ["system"] 
 # transitive deps, not used for anything security-sensitive (just a stable
 # cache-key filename), but a well-tested crate beats hand-rolling a hash.
 sha2 = "0.10"
+# GitHub webhook delivery verification (Track E, E3): X-Hub-Signature-256 is
+# HMAC-SHA256 over the raw request body, keyed by the configured webhook
+# secret. Pairs with `sha2` above, already a workspace dependency.
+hmac = "0.12"
 # CSPRNG source for the daemon's bearer-token generation (RAL-219) — a small,
 # dependency-light crate (already resolved transitively via the TLS stack)
 # rather than pulling in the full `rand` ecosystem for one `getrandom()` call.

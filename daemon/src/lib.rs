@@ -69,6 +69,7 @@ pub mod triage;
 pub mod users;
 pub mod vcs;
 pub mod watches;
+pub mod webhook;
 pub mod workspace;
 pub(crate) mod worktree_claims;
 pub(crate) mod worktree_transcript_retirement;
