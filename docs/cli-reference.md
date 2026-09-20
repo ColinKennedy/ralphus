@@ -687,8 +687,6 @@ use; see `READ_ONLY_NOTE`.
         - set-preferences --auto-follow --no-auto-follow --tier [urgent|high|normal...] --user [name]  {Set a user's auto-follow and default notification-tier preferences; requires exactly one of --auto-follow/--no-auto-follow (RAL-320).}
         - undrain --id [id...]  {Mark escalation mailbox messages unread (reverting a drain); omit --id to undrain every drained message (RAL-465).}
         - unfollow entity_uri [uri] --user [name]  {Stop following an entity (RAL-320).}
-    - mcp  {Configure agent hosts to use the ralphus MCP server.}
-        - initialize host [claude|codex|pi] --dry-run --profile-file [path] --yes  {Preview and apply the local MCP setup required by an agent host.}
     - project  {Register and inspect projects known to the daemon.}
         - fork  {Manage per-project, per-user fork registrations for fork-based stacked PR routing.}
             - add project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Register a fork for a project, optionally scoped to one user (defaults to the project-wide fallback row when --user is omitted).}
