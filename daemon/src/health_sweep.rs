@@ -24,13 +24,16 @@
 //! own tests) -- never by filtering a dynamically-assembled list, so an
 //! `OnDemand` or `Remote` catalog entry can never accidentally end up here.
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
-    ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA, ID_RUNNER, ID_TMUX,
+    ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
+    ID_PI_COMMAND, ID_RUNNER, ID_TMUX,
 };
-use ralphus_core::process::which;
+use ralphus_core::process::{is_compound_shell_command, is_executable, unquote_path, which};
 
 const PASS: &str = "pass";
 const WARN: &str = "warn";
@@ -47,6 +50,9 @@ const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_GLAB,
     ID_NVIDIA_SMI,
     ID_OLLAMA,
+    ID_CLAUDE_COMMAND,
+    ID_CODEX_COMMAND,
+    ID_PI_COMMAND,
 ];
 
 /// One check's cached outcome. Deliberately smaller than
@@ -228,6 +234,128 @@ fn check_ollama() -> SweepCheck {
     }
 }
 
+fn resolved_agent_command(command: &str) -> Option<String> {
+    let path = unquote_path(command);
+    let resolved = if path.contains(['/', '\\']) {
+        path
+    } else {
+        which(&path)?
+    };
+    is_executable(Path::new(&resolved)).then_some(resolved)
+}
+
+fn check_agent_command(id: &'static str, env_var: &str, default_program: &str) -> SweepCheck {
+    let (command, source) = match std::env::var(env_var) {
+        Ok(command) => (command, format!("${env_var}")),
+        Err(_) => (default_program.to_string(), "default".to_string()),
+    };
+    if is_compound_shell_command(&command) {
+        return SweepCheck {
+            id,
+            status: PASS,
+            detail: format!("compound shell command, not executable-checked: {command}"),
+        };
+    }
+    match resolved_agent_command(&command) {
+        Some(path) => SweepCheck {
+            id,
+            status: PASS,
+            detail: format!("{path} ({source})"),
+        },
+        None => SweepCheck {
+            id,
+            status: FAIL,
+            detail: format!("{source} command '{command}' does not resolve to an executable file"),
+        },
+    }
+}
+
+fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
+    output
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find_map(|candidate| {
+            let mut components = candidate.split('.');
+            Some((
+                components.next()?.parse().ok()?,
+                components.next()?.parse().ok()?,
+                components.next()?.parse().ok()?,
+            ))
+        })
+}
+
+#[must_use]
+fn supported_pi_version(version: (u64, u64, u64)) -> bool {
+    version >= (0, 85, 1)
+}
+
+fn check_pi_command() -> SweepCheck {
+    let (command, source) = match std::env::var("RALPHUS_PI_COMMAND") {
+        Ok(command) => (command, "$RALPHUS_PI_COMMAND".to_string()),
+        Err(_) => ("pi".to_string(), "default".to_string()),
+    };
+    if is_compound_shell_command(&command) {
+        return SweepCheck {
+            id: ID_PI_COMMAND,
+            status: PASS,
+            detail: format!(
+                "compound shell command, not executable- or version-checked: {command}"
+            ),
+        };
+    }
+    let Some(path) = resolved_agent_command(&command) else {
+        return SweepCheck {
+            id: ID_PI_COMMAND,
+            status: FAIL,
+            detail: format!("{source} command '{command}' does not resolve to an executable file"),
+        };
+    };
+    match Command::new(&path).arg("--version").output() {
+        Err(error) => SweepCheck {
+            id: ID_PI_COMMAND,
+            status: FAIL,
+            detail: format!("could not run {path} --version: {error}"),
+        },
+        Ok(output) if !output.status.success() => SweepCheck {
+            id: ID_PI_COMMAND,
+            status: FAIL,
+            detail: format!("{path} --version exited with {}", output.status),
+        },
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match parse_version(&text) {
+                Some(version) if supported_pi_version(version) => SweepCheck {
+                    id: ID_PI_COMMAND,
+                    status: PASS,
+                    detail: format!(
+                        "{path} version {}.{}.{} ({source})",
+                        version.0, version.1, version.2
+                    ),
+                },
+                Some(version) => SweepCheck {
+                    id: ID_PI_COMMAND,
+                    status: FAIL,
+                    detail: format!(
+                        "{path} version {}.{}.{} is older than required 0.85.1",
+                        version.0, version.1, version.2
+                    ),
+                },
+                None => SweepCheck {
+                    id: ID_PI_COMMAND,
+                    status: FAIL,
+                    detail: format!(
+                        "could not parse a Pi version from {path} --version output: {}",
+                        text.trim()
+                    ),
+                },
+            }
+        }
+    }
+}
+
 /// Runs every check in [`SWEEP_CATALOG_IDS`] and returns the resulting
 /// report -- does not itself touch [`HealthSweepState`], so tests can call
 /// this without needing a state handle.
@@ -241,6 +369,9 @@ pub fn run_sweep() -> SweepReport {
         check_glab(),
         check_nvidia_smi(),
         check_ollama(),
+        check_agent_command(ID_CLAUDE_COMMAND, "RALPHUS_CLAUDE_COMMAND", "claude"),
+        check_agent_command(ID_CODEX_COMMAND, "RALPHUS_CODEX_COMMAND", "codex"),
+        check_pi_command(),
     ];
     debug_assert_eq!(
         checks.len(),
@@ -306,6 +437,33 @@ mod tests {
         for id in SWEEP_CATALOG_IDS {
             assert!(ids.contains(id), "missing check for {id}");
         }
+    }
+
+    #[test]
+    fn parse_version_accepts_surrounding_pi_output() {
+        assert_eq!(parse_version("pi coding agent v0.85.1\n"), Some((0, 85, 1)));
+        assert_eq!(parse_version("version 1.2.3-beta"), Some((1, 2, 3)));
+        assert_eq!(parse_version("no version here"), None);
+    }
+
+    #[test]
+    fn pi_version_comparison_requires_0851() {
+        assert!(supported_pi_version((0, 85, 1)));
+        assert!(supported_pi_version((0, 86, 0)));
+        assert!(supported_pi_version((1, 0, 0)));
+        assert!(!supported_pi_version((0, 85, 0)));
+        assert!(!supported_pi_version((0, 84, 9)));
+    }
+
+    #[test]
+    fn compound_agent_commands_are_reported_without_execution() {
+        let result = check_agent_command(
+            ID_CLAUDE_COMMAND,
+            "RALPHUS_TEST_MISSING_AGENT_COMMAND_RAL484",
+            "wrapper claude",
+        );
+        assert_eq!(result.status, PASS);
+        assert!(result.detail.contains("wrapper claude"));
     }
 
     #[test]
