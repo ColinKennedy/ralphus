@@ -1,0 +1,514 @@
+# RAL-477 / RAL-478 / RAL-479 / RAL-480 / RAL-481.
+#
+# Per request:
+#   - every agent is claude-code (work cells sonnet, proofs/finalize haiku)
+#   - every upstream points at "staging"
+#   - one squad/review; proof_scope = "nothing"; skip_auto_build = true
+#   - auto-submit PR stack + auto-fix PR errors enabled
+#
+# Dependencies: RAL-477, RAL-478, RAL-479, RAL-481 are independent and run in
+# parallel. RAL-480 depends on RAL-479 (rename must land first per RAL-480's
+# own "Dependencies" section) -- its work cell depends_on RAL-479's finalize.
+
+[[review]]
+id                  = "ralphus:new-review/ral-477-478-479-480-481"
+name                = "RAL-477, RAL-478, RAL-479, RAL-480, RAL-481"
+upstream            = "staging"
+agent               = "claude-code"
+model               = "haiku"
+proof_scope         = "nothing"
+skip_auto_build     = true
+auto_submit_pr_stack = true
+auto_fix_pr_errors   = true
+
+
+# ---------------------------------------------------------------------------
+# RAL-477 - one-line status + copyable error popup
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-477-status-copyable-popup"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+[[task.cell]]
+id                     = "work"
+cwd                    = "<<ralphus:new-worktree/ral-477-status-copyable-popup?upstream=staging>>"
+review                 = "<<ralphus:new-review/ral-477-478-479-480-481>>"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position = "append"
+prompt                 = """
+# RAL-477: Collapse review status detail into a one-line summary with a copyable popup
+
+## Summary
+
+On the review board, a cell's status/detail text (e.g. a "feedback failed" error) currently renders inline at full length -- for long failures this dumps the entire raw error, including multi-turn tool/usage noise and pane output, directly into the board layout. Replace this with a single-line, ellipsis-truncated summary in the board view. Clicking the truncated line opens a popup/modal showing the full detail text, with a "copy to clipboard" button so the user can quickly grab the whole error without manually selecting overflowing inline text.
+
+## Values
+
+Long inline error dumps make the review board visually unusable -- a single failing cell can push all other cards out of view and force excessive scrolling. A truncated summary keeps the board scannable, while the popup-with-copy preserves full access to the detail (which the user needs to paste into chat, a ticket, or search) without requiring painful manual text selection from a cramped inline block.
+
+## Risks
+
+- Truncation must pick a sensible cutoff (e.g. first line or first N characters) that still surfaces useful signal (e.g. "feedback failed: agent error: ...") rather than an uninformative fragment.
+- The detail text can contain terminal/ANSI control sequences or embedded JSON (`RALPHUS_EVENT:` lines, tool call dumps) -- the popup should render it as plain, selectable text, not attempt to interpret it.
+- Needs to work across all the places this status/detail text is rendered on the board (not just the review conflict/failed state shown in the example), so the fix should target the shared rendering path rather than one call site.
+- Copy-to-clipboard must have a clear success indicator (e.g. brief "Copied" feedback) so the user isn't left unsure whether the click worked.
+- Any color/styling used for the truncated line or popup must use documented CSS variables per `docs/colors.md`, per this repo's UI conventions.
+
+## Acceptance Criteria
+
+- [ ] Review board status/detail text is rendered as a single line, truncated with an ellipsis when it exceeds the available width.
+- [ ] Clicking the truncated status line opens a popup showing the full, untruncated detail text.
+- [ ] The popup includes a "copy to clipboard" button that copies the full detail text and gives visible confirmation on click.
+- [ ] Long detail text (e.g. a multi-KB error with embedded tool output) no longer distorts the board layout.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-477 - one-line status + copyable error popup
+
+Q. Where do review-branch errors currently appear?
+A. An expanded branch renders `detail` as a one-line status row. `branchBadge()` renders generic failure/conflict badges. Auto-submit failures already use the shared copyable failure popup, while ordinary merge failures do not. See `librarian/assets/board/65-reviews.js:505` and `librarian/assets/board/45-details-pane.js:1254`.
+
+Q. Is the intended scope ordinary failed review branches?
+A. Yes. Show a short `detail` alongside the `⚠ conflict` badge and make that failure path open the existing copyable failure popup.
+"""
+
+[[task.cell.proof]]
+id                     = "web"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix lint, type, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "From the repository root run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and `npm test`. Fix failures caused by this ticket and re-run the failing checks up to 3 times. If they still fail, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "acceptance"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position = "append"
+prompt                 = "Verify and report each item. 1) Review board status/detail text renders as a single ellipsis-truncated line when it exceeds available width. 2) Clicking the truncated line opens a popup showing the full, untruncated detail. 3) The popup has a copy-to-clipboard button with visible confirmation on click. 4) The fix targets the shared rendering path, not one call site, and covers the ordinary failed/conflict review-branch case. 5) Colors/styling use documented CSS variables per docs/colors.md. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/ral-477-status-copyable-popup?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-477, stage only the intended files, commit with an appropriate RAL-477 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
+
+
+# ---------------------------------------------------------------------------
+# RAL-478 - closed PR badge/status parity
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-478-closed-pr-status-parity"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+[[task.cell]]
+id                     = "work"
+cwd                    = "<<ralphus:new-worktree/ral-478-closed-pr-status-parity?upstream=staging>>"
+review                 = "<<ralphus:new-review/ral-477-478-479-480-481>>"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position = "append"
+prompt                 = """
+# RAL-478: Add explicit closed-PR status and surface it everywhere
+
+## Summary
+
+Add an explicit "closed" PR status (distinct from open/merged) for both GitHub and GitLab, and reflect it wherever ralphus currently displays PR badges/state -- including the review detail view (opened by clicking an individual review) and the tasks tab. Both surfaces should receive live updates when a linked PR/MR is closed without merging, not just when it merges.
+
+## Values
+
+Today the UI only distinguishes open vs. merged (or lacks a closed state at all), so a PR that was closed without merging is indistinguishable from one that's still open or was never checked, misleading anyone glancing at the review or task view. An explicit closed status lets users immediately see abandoned/rejected PRs without opening GitHub/GitLab directly.
+
+## Risks
+
+- GitHub and GitLab must stay at feature parity per repo convention -- the closed-state detection and badge must work identically on both providers, using their REST APIs directly (not the `gh`/`glab` CLIs).
+- Must distinguish "closed without merge" from "merged" (which typically also reports as closed in the underlying API) -- badge/status logic needs to check the merge flag, not just open/closed.
+- Multiple UI surfaces (reviews tab detail view, tasks tab) need to consume the same underlying status source so they don't drift out of sync with each other.
+- Badge styling must use documented CSS variables per `docs/colors.md`, not hardcoded colors.
+- Polling/refresh timing needs to actually pick up the closed transition promptly -- stale cached PR state would defeat the purpose.
+
+## Acceptance Criteria
+
+- [ ] PR/MR status model includes an explicit "closed" state distinct from "open" and "merged", for both GitHub and GitLab.
+- [ ] The review detail view's PR badge reflects "closed" when the linked PR/MR is closed without merging.
+- [ ] The tasks tab reflects the same "closed" state for any PR/MR it displays.
+- [ ] Closing a PR/MR out-of-band (e.g. directly on GitHub/GitLab) is picked up and reflected in both UI surfaces.
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-478 - closed PR badge/status parity
+
+Q. Does the board retain closed PRs?
+A. Yes. The API supports `open`, `merged`, `closed`, and `dropped`; `prCard()` can color all four. But compact branch links and expanded branch PR cards filter to `state === "open"`, so closed PRs disappear from the ordinary branch display. See `librarian/assets/board/00-typedefs.js:388` and `librarian/assets/board/65-reviews.js:644`.
+
+Q. Where should closed PRs appear?
+A. The recommended path was approved by non-response: show closed PRs alongside merged PRs both as compact branch badges and in expanded branch cards, retaining their gray lifecycle color and omitting CI status once no longer open.
+"""
+
+[[task.cell.proof]]
+id                     = "fmt-clippy"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix formatting and lint failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run `cargo fmt --all -- --check`; if it fails, run `cargo fmt --all` and re-run the check. Then run `cargo clippy --all-targets -- -D warnings` and fix only failures caused by this ticket, re-running up to 3 times. If failures remain, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "web"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix lint, type, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "From the repository root run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and `npm test`. Fix failures caused by this ticket and re-run the failing checks up to 3 times. If they still fail, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "tests"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run focused tests for this ticket: `cargo nextest run -p ralphus-daemon --lib`. Do NOT run `cargo test --all-targets` or `cargo nextest run --all-targets` - this is a dogfooding environment and all-targets locks the running daemon/librarian executables and can hang. Confirm coverage exists for GitHub and GitLab both reporting an explicit closed-without-merge status distinct from merged. Fix ticket-caused failures and re-run up to 3 times. If failures remain, report exactly what ran and fail."
+
+[[task.cell.proof]]
+id                     = "parity"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position = "append"
+prompt                 = "Verify and report each item. 1) The PR/MR status model has an explicit closed state distinct from open and merged, for both GitHub and GitLab, using each provider's REST API directly. 2) The review detail view's PR badge shows closed for a closed-without-merge PR/MR. 3) The tasks tab shows the same closed state. 4) Both surfaces pick up an out-of-band close promptly, not just on merge. 5) Badge styling uses documented CSS variables per docs/colors.md. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/ral-478-closed-pr-status-parity?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-478, stage only the intended files, commit with an appropriate RAL-478 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
+
+
+# ---------------------------------------------------------------------------
+# RAL-479 - rename "approved" review status to "merged"
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-479-rename-approved-to-merged"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+[[task.cell]]
+id                     = "work"
+cwd                    = "<<ralphus:new-worktree/ral-479-rename-approved-to-merged?upstream=staging>>"
+review                 = "<<ralphus:new-review/ral-477-478-479-480-481>>"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position = "append"
+prompt                 = """
+# RAL-479: Rename review "approved" status to "merged"
+
+## Summary
+
+The review status named "approved" no longer means what it says: before PR integration existed, "approved" simply disabled polling on the review's worktrees. Now, a review auto-transitions to "approved" when its linked PR/MR actually *merges* -- but a PR/MR can also be approved (by a reviewer) without being merged, which the current status can't represent. Remove the "approved" status name and rename that transition/state to "merged" so the ralphus status matches what actually happened.
+
+## Values
+
+Ambiguous status naming makes the review page actively misleading: seeing "approved" implies a human signed off, not that the underlying PR/MR merged. Renaming to "merged" makes the status say exactly what occurred, removing the incongruity between ralphus's review status and the PR/MR's own approved/merged states on GitHub or GitLab.
+
+## Risks
+
+- This is a rename of an existing state, not just a label change -- every place that reads/writes/matches the literal "approved" status (store schema, state machine transitions, CLI/MCP output, board UI, docs) needs to move to "merged" consistently, or the two will drift.
+- Existing squads/reviews already persisted with status "approved" need a migration or compatibility mapping so historical data still displays sensibly after the rename.
+- Any CLI/MCP command, filter, or automation that currently checks for `approved` as a literal string will silently stop matching if not updated -- needs an audit, not just a search-and-replace in the obvious files.
+- Must not conflate ralphus's review-level "merged" status with the PR/MR's own GitHub/GitLab "approved" review-decision state (a reviewer approval) -- the ticket is only about ralphus's own status vocabulary, not importing PR approval state.
+- Docs (`docs/glossary.md` and anywhere the "approved" review status is documented) need updating alongside the code per this repo's vocabulary conventions.
+
+## Dependencies
+
+- Related to RAL-478 (explicit closed-PR status) -- both tickets touch how ralphus reflects PR/MR lifecycle state, so consider sequencing/coordinating if worked concurrently.
+
+## Acceptance Criteria
+
+- [ ] The review status previously named "approved" is renamed to "merged" throughout the codebase (store, scheduler/state machine, CLI, MCP, board UI, docs).
+- [ ] No remaining code path or UI surface displays or matches the literal string "approved" as a ralphus review status.
+- [ ] Existing persisted reviews with the old "approved" status are migrated or mapped correctly to "merged".
+- [ ] `docs/glossary.md` and any other status-naming docs are updated to reflect "merged".
+- [ ] Make sure auto-formatters run, linting passes, and tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-479 - rename "approved" review status to "merged"
+
+Q. Is `approved` a persisted lifecycle state today?
+A. Yes. `GuardianStatus` stores and exposes `approved`; it means human approval, is terminal, and can be reopened. `deployed` is separate. See `daemon/src/guardian.rs:156` and `daemon/src/guardian.rs:4654`.
+
+Q. Is this merely a display-label change?
+A. No. This is an end-to-end lifecycle redesign. `merged` must reflect merged PR/review work. `closed` must be a distinct terminal operational stop that halts polling, in-flight agents, and other review-owned deterministic or LLM work without being cancellation. The overloaded `approved` status should be removed everywhere except deliberately retained compatibility boundaries. Closing a review must stop all activity across its PR worktrees.
+"""
+
+[[task.cell.proof]]
+id                     = "fmt-clippy"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix formatting and lint failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run `cargo fmt --all -- --check`; if it fails, run `cargo fmt --all` and re-run the check. Then run `cargo clippy --all-targets -- -D warnings` and fix only failures caused by this ticket, re-running up to 3 times. If failures remain, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "tests"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run focused tests for this ticket: `cargo nextest run -p ralphus-daemon --lib`. Do NOT run `cargo test --all-targets` or `cargo nextest run --all-targets` - this is a dogfooding environment and all-targets locks the running daemon/librarian executables and can hang. Confirm no remaining code path matches the literal string \"approved\" as a review status, and that existing persisted \"approved\" reviews migrate/map to \"merged\". Fix ticket-caused failures and re-run up to 3 times. If failures remain, report exactly what ran and fail."
+
+[[task.cell.proof]]
+id                     = "web"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix lint, type, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "From the repository root run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and `npm test`. Fix failures caused by this ticket and re-run the failing checks up to 3 times. If they still fail, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "rename-audit"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position = "append"
+prompt                 = "Verify and report each item. 1) Grep the store, scheduler/state machine, CLI, MCP, board UI, and docs for the literal string \"approved\" used as a review status -- confirm none remain except deliberately retained compatibility boundaries. 2) Existing persisted reviews with status \"approved\" are migrated or mapped to \"merged\". 3) `docs/glossary.md` reflects \"merged\" as the status name. 4) ralphus's new \"merged\" review status is not conflated with a PR/MR's own GitHub/GitLab \"approved\" review-decision state. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/ral-479-rename-approved-to-merged?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-479, stage only the intended files, commit with an appropriate RAL-479 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
+
+
+# ---------------------------------------------------------------------------
+# RAL-480 - merged review worktree status (depends on RAL-479)
+# ---------------------------------------------------------------------------
+
+[[task]]
+name       = "ral-480-merged-worktree-status"
+project    = "ralphus"
+agent      = "claude-code"
+model      = "sonnet"
+depends_on = ["ral-479-rename-approved-to-merged"]
+
+[[task.cell]]
+id                     = "work"
+cwd                    = "<<ralphus:new-worktree/ral-480-merged-worktree-status?upstream=staging>>"
+review                 = "<<ralphus:new-review/ral-477-478-479-480-481>>"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position = "append"
+prompt                 = """
+# RAL-480: Track merged review worktree status
+
+## Summary
+
+Add a per-worktree `merged` status to reviews so an individual review worktree can be recorded as already integrated upstream. A merged worktree must remain in the review stack and continue to participate in required rebases, while the system stops attempting to create or update its GitHub pull request or GitLab merge request. Detect and surface this status when upstream has received that worktree's commits, including when stacked changes are merged only partially or individual worktrees are merged serially.
+
+## Values
+
+Supports legitimate partial merges of a review stack without treating the whole review as merged. Prevents review automation from modifying or otherwise interfering with a PR/MR after its worktree has already landed upstream, while preserving stack consistency for remaining work.
+
+## Risks
+
+- Commit-equivalence detection can be complicated by rebases, squash merges, and forge-specific PR/MR state.
+- Skipping PR/MR updates must not cause a merged worktree to be omitted from stack rebases or corrupt later review promotion.
+
+## Acceptance Criteria
+
+- [ ] Each review worktree has an independently visible `merged` status; the overall review status is unchanged solely because one worktree is merged.
+- [ ] A worktree whose commits are integrated upstream is marked merged, including in a partially merged GitHub PR stack and GitLab MR stack.
+- [ ] A merged worktree remains in the linear review stack and participates in subsequent rebases.
+- [ ] Automation does not create, update, or otherwise mutate the GitHub PR or GitLab MR associated with a merged worktree.
+- [ ] Remaining unmerged worktrees continue their normal PR/MR update and promotion behavior.
+- [ ] Auto-formatters run, linting passes, and relevant tests pass.
+
+## Dependencies
+
+- RAL-479 (upstream dependency)
+
+## Technical Notes
+
+- Preserve GitHub/GitLab feature parity and use each provider's REST API directly for forge operations.
+- Keep any PR/MR submission and base-resync behavior within the existing linear review PR stack, with regression coverage that proves the stack remains intact.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-480 - merged review worktree status
+
+Q. What worktree status is currently displayed?
+A. Expanded branches show only the review-worktree path; the review metadata shows only the combined-worktree path. No dedicated worktree status exists. See `librarian/assets/board/65-reviews.js:916` and `librarian/assets/board/65-reviews.js:1026`.
+
+Q. How should merged review worktrees behave and display?
+A. A merged worktree stays untouched on disk. It becomes retireable only once its review reaches a terminal state such as merged, cancelled, or closed. Display a new inline `merged` badge on the same row as the Review Worktree, replacing the usual in-progress/failed/done-style worktree badge.
+
+Note: this task is scheduled after RAL-479 lands in this same batch -- use RAL-479's post-rename "merged" review-status vocabulary (not the old "approved" name) when wiring this worktree-level status in.
+"""
+
+[[task.cell.proof]]
+id                     = "fmt-clippy"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix formatting and lint failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run `cargo fmt --all -- --check`; if it fails, run `cargo fmt --all` and re-run the check. Then run `cargo clippy --all-targets -- -D warnings` and fix only failures caused by this ticket, re-running up to 3 times. If failures remain, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "tests"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "Run focused tests for this ticket: `cargo nextest run -p ralphus-daemon --lib`. Do NOT run `cargo test --all-targets` or `cargo nextest run --all-targets` - this is a dogfooding environment and all-targets locks the running daemon/librarian executables and can hang. Confirm coverage for: a merged worktree keeps participating in rebases, automation stops touching its PR/MR, and a partially merged PR/MR stack correctly marks only the merged worktrees. Fix ticket-caused failures and re-run up to 3 times. If failures remain, report exactly what ran and fail."
+
+[[task.cell.proof]]
+id                     = "web"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix lint, type, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "From the repository root run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and `npm test`. Fix failures caused by this ticket and re-run the failing checks up to 3 times. If they still fail, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "stack-integrity"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position = "append"
+prompt                 = "Verify and report each item. 1) Each review worktree has an independently visible merged status, without changing the overall review status. 2) A worktree with upstream-integrated commits is marked merged, including under a partially merged GitHub PR stack or GitLab MR stack. 3) A merged worktree stays in the linear review stack and still participates in later rebases. 4) Automation never creates/updates/mutates the PR or MR tied to a merged worktree. 5) Remaining unmerged worktrees keep their normal PR/MR update and promotion behavior, and a regression test proves the PR/MR stack stays intact. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/ral-480-merged-worktree-status?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-480, stage only the intended files, commit with an appropriate RAL-480 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
+
+
+# ---------------------------------------------------------------------------
+# RAL-481 - preserve live terminal scroll
+# ---------------------------------------------------------------------------
+
+[[task]]
+name    = "ral-481-preserve-live-terminal-scroll"
+project = "ralphus"
+agent   = "claude-code"
+model   = "sonnet"
+
+[[task.cell]]
+id                     = "work"
+cwd                    = "<<ralphus:new-worktree/ral-481-preserve-live-terminal-scroll?upstream=staging>>"
+review                 = "<<ralphus:new-review/ral-477-478-479-480-481>>"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. You are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as described and keep your changes only within the worktree."
+system_prompt_position = "append"
+prompt                 = """
+# RAL-481: Preserve live terminal scroll across worktrees
+
+## Summary
+
+Prevent the review worktree feedback page from resetting its terminal scroll position to the top when the user changes to another worktree while the live terminal view is open. In particular, a user who has selected Show Live and Jump to Latest must remain at the latest terminal output after switching worktrees, even when new output arrives during the switch.
+
+## Values
+
+Reviewers can move among worktrees without losing their place in an active terminal transcript, making live feedback monitoring dependable and less disruptive.
+
+## Risks
+
+- Terminal-output updates and worktree selection changes may race, so the fix must preserve intentional user scroll positions without suppressing legitimate live updates.
+
+## Acceptance Criteria
+
+- [ ] With a review worktree's live terminal shown, selecting Jump to Latest and then another review worktree does not reset the terminal view to the top.
+- [ ] The view remains at the latest output when terminal data arrives while the worktree switch is in progress.
+- [ ] Existing intentional scrolling behavior is preserved when the user is not following live output.
+- [ ] Auto-formatters run, linting passes, and relevant tests pass.
+
+---
+
+# Prior research and interview answers (authoritative)
+
+# RAL-481 - preserve live terminal scroll
+
+Q. What preservation behavior already exists?
+A. The live terminal records scroll position and whether it is at bottom, follows appended output only when already at bottom, preserves the viewport while prepending historical transcript content, and restores scroll after DOM rebuilds. See `librarian/assets/board/35-terminal-logs.js:234`, `:459`, and `:519`.
+
+Q. What remaining failure is being observed?
+A. While staying on the same review, clicking from one review worktree/branch to another appears to force the review-detail scroll back to the page top. Preserve the scroll position through that interaction; direct `renderReviewDetail()` calls are a likely cause.
+"""
+
+[[task.cell.proof]]
+id                     = "web"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. Fix lint, type, and test failures in the dedicated worktree and leave all changes uncommitted."
+system_prompt_position = "append"
+prompt                 = "From the repository root run `npm install --no-audit --no-fund`, `npm run lint`, `npm run typecheck`, `npm run knip`, and `npm test`. Fix failures caused by this ticket and re-run the failing checks up to 3 times. If they still fail, report the exact errors and fail."
+
+[[task.cell.proof]]
+id                     = "scroll-behavior"
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "Do NOT commit and do NOT push under any circumstances. This is a verification step only; make only the minimal edits needed to satisfy it."
+system_prompt_position = "append"
+prompt                 = "Verify and report each item. 1) With a review worktree's live terminal shown and Jump to Latest selected, switching to another review worktree does not reset the terminal view to the top. 2) The view stays at the latest output if terminal data arrives mid-switch. 3) Existing intentional (non-following) scroll behavior is unaffected. 4) The fix addresses `renderReviewDetail()` re-render calls resetting scroll, not just the terminal-log append path. Fail if any item is unmet."
+
+[[task.cell]]
+id                     = "finalize"
+cwd                    = "<<ralphus:new-worktree/ral-481-preserve-live-terminal-scroll?upstream=staging>>"
+depends_on             = ["work"]
+agent                  = "claude-code"
+model                  = "haiku"
+system_prompt          = "ONLY inspect the final diff, stage the intended source files, commit them, and push the commit if a remote exists. Do not run formatters, linters, tests, or make code changes. Do not stage build artifacts, generated junk, temporary files, or unrelated changes."
+system_prompt_position = "append"
+prompt                 = "Review the final diff for RAL-481, stage only the intended files, commit with an appropriate RAL-481 message and Co-Authored-By trailer if applicable, then push if a remote exists."
+
+[[task.cell.proof]]
+id      = "clean-tree"
+command = "git diff --quiet --exit-code && git diff --cached --quiet --exit-code"
