@@ -1319,6 +1319,31 @@ fn execute_squad_inner(
                 .unwrap_or_default();
             let any_soloed = !soloed_tasks.is_empty();
 
+            // A status override can land while this worker still carries a
+            // proof failure in `progress`. The proof row is the durable source
+            // of truth, so accept a cell that now reads Done before using the
+            // in-memory failure to cascade into its dependents.
+            let failed_cells: Vec<usize> = {
+                let prog = progress.lock().expect("progress mutex poisoned");
+                (0..n)
+                    .filter(|&i| prog.status[i] == CellState::Failed)
+                    .collect()
+            };
+            let manually_resolved_cells: HashSet<usize> = {
+                let guard = store.lock();
+                failed_cells
+                    .into_iter()
+                    .filter(|&i| {
+                        guard
+                            .effective_state_for_cell(squad_id, cells[i].task_idx, cells[i].idx)
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some("done")
+                    })
+                    .collect()
+            };
+
             let mut to_dispatch: Vec<usize> = Vec::new();
             let mut blocked: Vec<usize> = Vec::new();
             let mut blocked_cancelled: Vec<usize> = Vec::new();
@@ -1326,6 +1351,11 @@ fn execute_squad_inner(
             let mut active = false;
             {
                 let mut prog = progress.lock().expect("progress mutex poisoned");
+                for &i in &manually_resolved_cells {
+                    if prog.status[i] == CellState::Failed {
+                        prog.status[i] = CellState::Done;
+                    }
+                }
                 // Indexes several parallel collections (status, deps, cells),
                 // so a range loop is the natural form here.
                 #[allow(clippy::needless_range_loop)]
@@ -7240,6 +7270,54 @@ mod tests {
         assert_eq!(
             squad.tasks[1].state, "done",
             "task 'b' re-ran and succeeded"
+        );
+    }
+
+    #[test]
+    fn manual_proof_done_then_restart_downstream_cell_unblocks_it() {
+        // A cell-proof failure makes a same-task dependent terminally failed.
+        // Once an operator accepts that proof through Set Status, retrying the
+        // dependent must rebuild its dependency state from the corrected proof
+        // row instead of retaining the previous run's failure.
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"work\"\ncwd=\".\"\ncommand=\"cmd-work\"\n\
+            [[task.cell.proof]]\ncommand=\"exit 1\"\n\
+            [[task.cell]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"cmd-finalize\"\ndepends_on=[\"work\"]\n";
+        let (store, id) = store_with(toml);
+
+        execute_squad(&store, Arc::new(FakeRunner { fail_on: None }).as_ref(), &id);
+        {
+            let squad = store.lock().get_squad(&id).unwrap();
+            assert_eq!(squad.tasks[0].cells[1].state, "failed");
+            assert_eq!(
+                squad.tasks[0].cells[1].error.as_deref(),
+                Some("blocked by a failed dependency")
+            );
+        }
+
+        {
+            let guard = store.lock();
+            guard
+                .set_proof_state(&id, 0, "cell", 0, 0, NodeState::Done)
+                .unwrap();
+            guard.restart_cell(&id, 0, 1).unwrap();
+        }
+
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        execute_squad(
+            &store,
+            Arc::new(CountingRunner {
+                fail_on: None,
+                invoked: Arc::clone(&invoked),
+            })
+            .as_ref(),
+            &id,
+        );
+
+        assert_eq!(*invoked.lock().unwrap(), vec!["cmd-finalize"]);
+        assert_eq!(
+            store.lock().get_squad(&id).unwrap().tasks[0].cells[1].state,
+            "done"
         );
     }
 
