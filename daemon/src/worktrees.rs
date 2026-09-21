@@ -941,7 +941,7 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
 /// Best-effort: failure is logged and swallowed, exactly like
 /// [`sync_coauthor_hook_best_effort`] -- a failed identity write must never
 /// block a squad's actual work.
-fn apply_worktree_git_identity_best_effort(
+pub(crate) fn apply_worktree_git_identity_best_effort(
     worktree_dir: &Path,
     identity: &crate::project_forks::GitIdentity,
 ) {
@@ -1037,7 +1037,7 @@ fn credential_helper_command() -> String {
 /// write must never block a squad's actual work (an agent's plain `git
 /// push` simply falls back to whatever ambient auth the host already has,
 /// exactly like before this existed).
-fn apply_worktree_credential_helper_best_effort(
+pub(crate) fn apply_worktree_credential_helper_best_effort(
     store: &Store,
     worktree_dir: &Path,
     submitter: &str,
