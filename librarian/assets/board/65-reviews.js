@@ -1727,14 +1727,18 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * than firing a duplicate, or starts one now. Bounded to
        * AGENT_SELECT_LOAD_TIMEOUT_MS so a stalled request can't hang a
        * dropdown open forever -- degrades to the hardcoded fallback list on
-       * timeout, same as on a fetch error.
+       * timeout, same as on a fetch error. `cwd === ""` (no project resolved
+       * yet, e.g. the New Squad modal before a project is picked, or a cell
+       * with no `cwd` override) is still fetched, not short-circuited --
+       * `GET /api/agents` returns the global/`$RALPHUS_CONFIGURATION_PATH`
+       * agent profiles regardless of `cwd`, so skipping the fetch here hid
+       * every registered profile behind an unrelated project selection.
        * @param {string} cwd
        * @returns {Promise<AgentOptionsCacheEntry>}
        */
       async function ensureAgentOptionsLoaded(cwd) {
         const cached = agentOptionsByCwd.get(cwd);
         if (cached && cached.agents.length) return cached;
-        if (!cwd) return { agents: AGENT_SELECT_FALLBACK_AGENTS, defaultAgent: AGENT_SELECT_FALLBACK_DEFAULT };
         let pending = agentOptionsLoading.get(cwd);
         if (!pending) {
           pending = fetchAgentOptionsEntry(cwd);
@@ -1805,8 +1809,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * is unset renders just a single "agent default" placeholder option
        * until the user actually opens it -- this is what made the Project
        * Review Settings resolver-agent dropdown look permanently stuck on
-       * "Agent Default". Never throws, and does nothing when `cwd` is
-       * blank. `isStillRelevant` is re-checked once the fetch resolves so a
+       * "Agent Default". Never throws. Also warms `cwd === ""` (no project
+       * resolved yet) rather than no-op'ing on it -- see
+       * `ensureAgentOptionsLoaded`'s doc comment for why an empty `cwd`
+       * still has a real agent list (registered profiles) to fetch.
+       * `isStillRelevant` is re-checked once the fetch resolves so a
        * closed/replaced modal's late fetch doesn't re-render stale state.
        * @param {string} cwd
        * @param {() => boolean} isStillRelevant
@@ -1814,7 +1821,6 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @returns {void}
        */
       function preloadAgentSelect(cwd, isStillRelevant, rerender) {
-        if (!cwd) return;
         const cached = agentOptionsByCwd.get(cwd);
         if (cached && cached.agents.length) return;
         ensureAgentOptionsLoaded(cwd).then(() => { if (isStillRelevant()) rerender(); });

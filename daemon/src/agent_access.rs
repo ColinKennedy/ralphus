@@ -18,6 +18,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::store::Store;
+
 /// A caller's identity for agent-access purposes. `id: None` means no user
 /// identity was presented or configured -- today's common case.
 ///
@@ -67,11 +69,13 @@ const BUILTIN_AGENTS: &[&str] = &[
 /// submission/execution path yet -- see the module doc comment.
 pub trait AgentAccess: Send + Sync {
     /// # Errors
-    /// Propagates any failure loading `.ralphus.toml` agent profiles for `cwd`.
+    /// Propagates any failure loading `.ralphus.toml` agent profiles for
+    /// `cwd`, or listing RAL-473 database-backed profiles from `store`.
     fn available_agents(
         &self,
         user: &UserContext,
         cwd: &Path,
+        store: &Store,
     ) -> Result<Vec<AvailableAgent>, String>;
 }
 
@@ -85,6 +89,7 @@ impl AgentAccess for DefaultAgentAccess {
         &self,
         _user: &UserContext,
         cwd: &Path,
+        store: &Store,
     ) -> Result<Vec<AvailableAgent>, String> {
         let mut agents: Vec<AvailableAgent> = BUILTIN_AGENTS
             .iter()
@@ -94,9 +99,29 @@ impl AgentAccess for DefaultAgentAccess {
                 backend: (*name).to_string(),
             })
             .collect();
+        // RAL-473: database-backed profiles are global (no cwd layering,
+        // unlike TOML profiles) and win over a same-named legacy TOML
+        // profile -- mirrors the precedence `agent_profiles::resolve_agent_for_path_with`
+        // already applies at cell-run time, so a profile listed here
+        // resolves to the same thing it's listed as.
+        let db_profiles = store
+            .list_agent_profiles()
+            .map_err(|e| format!("could not list database agent profiles: {e}"))?;
+        let db_names: std::collections::BTreeSet<&str> =
+            db_profiles.iter().map(|p| p.name.as_str()).collect();
         for (name, profile) in crate::agent_profiles::load_profiles_for_path(cwd)? {
+            if db_names.contains(name.as_str()) {
+                continue;
+            }
             agents.push(AvailableAgent {
                 id: name,
+                kind: "profile",
+                backend: profile.backend,
+            });
+        }
+        for profile in db_profiles {
+            agents.push(AvailableAgent {
+                id: profile.name,
                 kind: "profile",
                 backend: profile.backend,
             });
@@ -127,8 +152,9 @@ mod tests {
     #[test]
     fn default_agent_access_lists_builtins_with_no_profiles() {
         let cwd = tempdir("no-profiles");
+        let store = Store::open_in_memory().expect("open store");
         let agents = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &cwd, &store)
             .expect("agents");
         assert!(
             agents
@@ -146,8 +172,9 @@ mod tests {
             "[agent.profiles.my-openrouter]\nbackend = \"claude-code\"\n",
         )
         .expect("write project config");
+        let store = Store::open_in_memory().expect("open store");
         let agents = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &cwd, &store)
             .expect("agents");
         let profile = agents
             .iter()
@@ -160,8 +187,9 @@ mod tests {
     #[test]
     fn default_agent_access_ignores_user_identity() {
         let cwd = tempdir("ignores-user");
+        let store = Store::open_in_memory().expect("open store");
         let anonymous = DefaultAgentAccess
-            .available_agents(&UserContext::default(), &cwd)
+            .available_agents(&UserContext::default(), &cwd, &store)
             .expect("agents");
         let named = DefaultAgentAccess
             .available_agents(
@@ -169,10 +197,50 @@ mod tests {
                     id: Some("colin".to_string()),
                 },
                 &cwd,
+                &store,
             )
             .expect("agents");
         let anon_ids: Vec<&str> = anonymous.iter().map(|a| a.id.as_str()).collect();
         let named_ids: Vec<&str> = named.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(anon_ids, named_ids);
+    }
+
+    #[test]
+    fn default_agent_access_includes_database_backed_profiles() {
+        let cwd = tempdir("db-profile");
+        let store = Store::open_in_memory().expect("open store");
+        store
+            .upsert_agent_profile("openrouter-deepseek", "claude-code", None, None, Vec::new())
+            .expect("save db profile");
+        let agents = DefaultAgentAccess
+            .available_agents(&UserContext::default(), &cwd, &store)
+            .expect("agents");
+        let profile = agents
+            .iter()
+            .find(|a| a.id == "openrouter-deepseek")
+            .expect("db-backed profile present regardless of cwd");
+        assert_eq!(profile.kind, "profile");
+        assert_eq!(profile.backend, "claude-code");
+    }
+
+    #[test]
+    fn default_agent_access_prefers_database_profile_over_same_named_toml_profile() {
+        let cwd = tempdir("db-vs-toml-collision");
+        fs::write(
+            cwd.join(".ralphus.toml"),
+            "[agent.profiles.shared-name]\nbackend = \"codex\"\n",
+        )
+        .expect("write project config");
+        let store = Store::open_in_memory().expect("open store");
+        store
+            .upsert_agent_profile("shared-name", "claude-code", None, None, Vec::new())
+            .expect("save db profile");
+        let agents = DefaultAgentAccess
+            .available_agents(&UserContext::default(), &cwd, &store)
+            .expect("agents");
+        let matches: Vec<&AvailableAgent> =
+            agents.iter().filter(|a| a.id == "shared-name").collect();
+        assert_eq!(matches.len(), 1, "no duplicate entry for the collision");
+        assert_eq!(matches[0].backend, "claude-code", "the DB profile wins");
     }
 }
