@@ -1004,13 +1004,31 @@ impl ForgeClient {
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
         )?;
-        if pr["mergeable_state"].as_str() == Some("dirty") {
-            return Ok(PrCiState::Failing(PrFailure {
-                reason: "merge conflicts with the base branch".to_string(),
-                job_url: None,
-                log_text: None,
-                checks: vec![],
-            }));
+        match pr["mergeable_state"].as_str() {
+            Some("dirty") => {
+                return Ok(PrCiState::Failing(PrFailure {
+                    reason: "merge conflicts with the base branch".to_string(),
+                    job_url: None,
+                    log_text: None,
+                    checks: vec![],
+                }));
+            }
+            // RAL-<new>: this poll's doc comment above has always claimed
+            // these mean "GitHub hasn't finished computing mergeability/CI
+            // for this commit yet, so hold at Pending" -- but until now
+            // nothing actually implemented that. The gap showed up right
+            // after a review-feedback push: GitHub reports "unknown" for a
+            // beat before it creates the new commit's first check-run, and
+            // with zero check-runs to inspect this fell through every guard
+            // below to `Passing`, which the poll loop's post-push settle
+            // window (`ci_watch::SUCCESS_SETTLE_DURATION`) then silently
+            // discarded instead of persisting -- so the board kept showing
+            // whatever terminal status (often a stale "failing") predated
+            // the push. Short-circuiting here, before the check-runs call,
+            // mirrors `check_gitlab_pr_ci_status`'s "no pipeline has run
+            // against this MR yet" guard.
+            Some("unknown") | Some("blocked") | Some("behind") => return Ok(PrCiState::Pending),
+            _ => {}
         }
         let Some(sha) = pr["head"]["sha"].as_str() else {
             return Ok(PrCiState::Pending);
@@ -4791,6 +4809,38 @@ mod tests {
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "in_progress", "conclusion": null}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_reports_github_pending_right_after_a_push_with_no_check_runs_yet() {
+        // Regression test for the reported "PR badge still says failed right
+        // after an auto-fix push" bug: GitHub reports "unknown" for a beat
+        // after a push while it recomputes mergeability, and in that same
+        // window the new commit has no check-runs at all yet (not even a
+        // queued one) -- distinct from the "still running" test above, which
+        // has a check-run in flight. Only the PR-object fetch should happen;
+        // reaching the check-runs/status endpoints at all would mean the
+        // short-circuit added for "unknown"/"blocked"/"behind" didn't fire.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "unknown", "head": {"sha": "deadbeef"}}"#,
                 )
                 .with_status_code(200),
             )
