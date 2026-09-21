@@ -903,6 +903,19 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       }
 
       /**
+       * Resolves the actual scrollable element behind the review-detail pane
+       * (RAL-481). `#review-detail`'s own contents are swapped wholesale by
+       * `renderReviewDetail()`, but the scrollbar itself lives one level up,
+       * on its `.col center` wrapper (`board.html`) -- the same `.col`
+       * convention `#graph`/`#details` use on the Squads page, just without
+       * the id sitting on that element here.
+       * @returns {HTMLElement|null}
+       */
+      function reviewDetailScrollEl() {
+        const inner = document.getElementById("review-detail");
+        return /** @type {HTMLElement|null} */ (inner ? inner.parentElement : null);
+      }
+      /**
        * Renders the full review detail pane (branch stack, checks, manual commands, chat, etc).
        * @returns {void}
        */
@@ -1230,7 +1243,10 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         e.stopPropagation();
         const key = `${gid}:${branchId}`;
         if (expandedBranches.has(key)) expandedBranches.delete(key); else expandedBranches.add(key);
-        renderReviewDetail();
+        // RAL-481: expanding/collapsing a different branch's detail (and the
+        // live-terminal peek box it may reveal) shouldn't jump the pane back
+        // to the top -- see selectBranchRow's matching fix.
+        preservePaneScroll(reviewDetailScrollEl(), renderReviewDetail);
       }
       // RAL-29: switch the active project tab in a multi-project review.
       /**
@@ -1239,7 +1255,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * @param {string} proj
        * @returns {void}
        */
-      function selectProjectTab(gid, proj) { selectedProjectTabs[gid] = proj; renderReviewDetail(); }
+      function selectProjectTab(gid, proj) { selectedProjectTabs[gid] = proj; preservePaneScroll(reviewDetailScrollEl(), renderReviewDetail); }
       // branch drag-to-reorder + enable/disable (RAL-14/RAL-6/RAL-43).
       // pendingReorder holds both the staged order and per-branch enabled flags.
       // Nothing hits the server until Save, which persists both and kicks off the
