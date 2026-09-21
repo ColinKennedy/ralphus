@@ -11,7 +11,7 @@
 // line count as padding above.
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +34,12 @@ const shell = readFileSync(shellPath, "utf8");
 const scriptStart = shell.slice(0, shell.search(/^.*<script src="\/board\//m)).split("\n").length;
 
 const knipBin = join(repoRoot, "node_modules", "knip", "bin", "knip.js");
+if (!existsSync(knipBin)) {
+  process.stderr.write(
+    "Knip is not installed in this checkout. Run `npm ci --no-audit --no-fund` from the repository root before rerunning `npm run knip`.\n",
+  );
+  process.exit(1);
+}
 const result = spawnSync(process.execPath, [knipBin], {
   cwd: repoRoot,
   encoding: "utf8",

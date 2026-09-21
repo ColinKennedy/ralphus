@@ -33,7 +33,7 @@ build-time walk and the dev-mode disk reader include the same rules file, and
 Rust tests in `src/assets.rs` pin them against the on-disk truth.
 
 ```bash
-npm install --no-audit --no-fund
+npm ci --no-audit --no-fund             # once in each git worktree
 npm run lint                        # eslint (chunks), incl. JSDoc-coverage rules
 npm run typecheck                   # tsc --checkJs over the JSDoc-annotated chunk JS
 npm run knip                        # dead code / unused deps
@@ -53,7 +53,7 @@ and a `@typedef` for any new shared object shape). Before considering the
 change done, run:**
 
 ```bash
-npm install --no-audit --no-fund   # first time / after package.json changes
+npm ci --no-audit --no-fund        # once in each git worktree / after package changes
 npm run lint                       # eslint, incl. jsdoc/require-* coverage rules
 npm run typecheck                  # tsc --checkJs; errors point at the chunk file directly
 ```
@@ -154,6 +154,13 @@ chunk and vendor directories are in knip's `ignore` list (they are inlined
 into the compiled entry, not imported); the shell itself must NOT be
 ignored. Knip otherwise audits every other JS file in this Node package
 (`eslint.config.mjs`, `scripts/*.mjs`) via its default project glob.
+
+Node dependencies are deliberately local to each checkout: `node_modules/`
+is ignored and is not shared by Git worktrees. Before running any frontend
+check in a new worktree, run `npm ci --no-audit --no-fund` from that
+worktree's repository root. If that setup is missing, `npm run knip` stops
+with this instruction rather than presenting the missing executable as a
+Knip result.
 
 ## Testing — Frontend (board chunks)
 
