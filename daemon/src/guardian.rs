@@ -1088,6 +1088,27 @@ impl Store {
         )
     }
 
+    /// Resolve a review/worktree's owning user (RAL-476): the squad's own
+    /// recorded submitter first (explicit TOML `submitter`, or whoever's
+    /// request context it was inferred from at submit time), else this
+    /// project's configured default PR user, else the daemon's own
+    /// configured default user. `None` only when none of the three resolve
+    /// (no submitter, no project default, no daemon `default_user`
+    /// configured at all).
+    pub(crate) fn resolve_review_owner(
+        &self,
+        git_root: &str,
+        squad_id: Option<&str>,
+    ) -> Option<String> {
+        squad_id
+            .and_then(|sid| self.get_squad_submitter(sid).ok().flatten())
+            .or_else(|| {
+                self.project_review_settings_for_path(git_root)
+                    .default_pr_user
+            })
+            .or_else(|| crate::config::load_daemon_config().default_user)
+    }
+
     /// Like [`Store::create_guardian_for_squad`] but also stores a stable
     /// `review_key` (from a `ralphus:new-review/<key>` link id) so later
     /// submissions can find this guardian and append their branches to it.
@@ -1146,17 +1167,7 @@ impl Store {
             .or(separate_pr_branch_stamp)
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
-        // RAL-476: every review must resolve to exactly one owning user --
-        // the squad's own recorded submitter first (explicit TOML
-        // `submitter`, or whoever's request context it was inferred from at
-        // submit time), else this project's configured default PR user,
-        // else the daemon's own configured default user. `None` only when
-        // none of the three resolve (no submitter, no project default, no
-        // daemon default_user configured at all).
-        let owner = squad_id
-            .and_then(|sid| self.get_squad_submitter(sid).ok().flatten())
-            .or_else(|| db_settings.default_pr_user.clone())
-            .or_else(|| crate::config::load_daemon_config().default_user);
+        let owner = self.resolve_review_owner(git_root, squad_id);
         // RAL-476 (interview Q6): a project can require every review it hosts
         // to route through a registered fork -- reject the submission
         // outright with a clear reason instead of silently falling back to a

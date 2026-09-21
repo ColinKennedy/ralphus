@@ -1532,6 +1532,8 @@ impl Store {
                 fork_url      TEXT NOT NULL,
                 remote_name   TEXT NOT NULL,
                 fork_owner    TEXT NOT NULL DEFAULT '',
+                git_user_name  TEXT,
+                git_user_email TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (project, user)
@@ -2232,6 +2234,15 @@ impl Store {
             // remains the daemon-local checkout for compatibility and local
             // execution; no migration guesses this value from that checkout.
             "ALTER TABLE projects ADD COLUMN clone_url TEXT",
+            // Fork identity: the git `user.name`/`user.email` to apply (via
+            // `git config --worktree`) to a worktree owned by this fork's
+            // resolved user, so commits made there are authored as the
+            // fork's registered identity rather than whatever the shared
+            // checkout's own git config happens to resolve to. Both NULL =
+            // don't override -- inherit the worktree's/checkout's existing
+            // git config exactly as before this existed.
+            "ALTER TABLE project_forks ADD COLUMN git_user_name TEXT",
+            "ALTER TABLE project_forks ADD COLUMN git_user_email TEXT",
             // RAL-304: context-window/auto-compact resolved caps, delivered
             // to the backend via its own mechanism (env var/CLI arg/settings
             // file) -- see `ralphus_core::schema::agent_supports_maximum_context`.

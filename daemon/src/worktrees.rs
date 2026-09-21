@@ -681,8 +681,12 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// ([`ensure_worktree_with_existing`]) instead freezes the marker to a
 /// resolved commit SHA, once, *after* this function returns and the branch
 /// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
-/// Guards every `git config` WRITE this module makes to a worktree's branch
-/// tracking (`set_explicit_upstream` and `freeze_commit_baseline`, below).
+/// Guards every `git config` WRITE this module makes to the shared
+/// `.git/config` (`set_explicit_upstream` and `freeze_commit_baseline`'s
+/// branch-tracking writes, plus `apply_worktree_git_identity_best_effort`'s
+/// one-time `extensions.worktreeConfig` enable -- its two per-worktree
+/// `--worktree user.name`/`user.email` writes land in that worktree's own
+/// private `config.worktree` file instead, so they need no such guard).
 /// A worktree's `.git/config` is the SAME physical file shared by every
 /// other worktree of the same project (worktrees each get their own
 /// index/HEAD, but not their own config) -- two `git config <key> <value>`
@@ -699,8 +703,8 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// can write to `.git/config` -- including `git worktree add`'s own implicit
 /// tracking-setup side effect for a newly created branch -- must be covered:
 /// `execute_worktree_plan` passes `--no-track` to every `worktree add -b`
-/// call for exactly this reason, so the *only* config writes are the two
-/// explicit, lock-guarded ones here.
+/// call for exactly this reason, so the *only* shared-`.git/config` writes
+/// are the explicit, lock-guarded ones here.
 static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
@@ -915,6 +919,57 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
             WARNING,
             "ralphus [worktrees] could not sync co-author hook for {}: {e}",
             root.display()
+        );
+    }
+}
+
+/// Apply a fork's registered git identity override (RAL-338 follow-up) to
+/// one worktree via `git config --worktree`, so commits made there are
+/// authored as the fork's registered `git_user_name`/`git_user_email`
+/// rather than whatever the shared checkout's own git config resolves to.
+/// A no-op if `identity` sets neither field.
+///
+/// Requires `extensions.worktreeConfig` enabled on the shared `.git/config`
+/// -- turned on here, idempotently, under `WORKTREE_CONFIG_LOCK` since
+/// (unlike the `--worktree`-scoped writes below, each private to their own
+/// worktree's `config.worktree`) that setting lives in the one
+/// `.git/config` every sibling worktree shares. `worktree_dir` alone is
+/// enough to reach it -- git resolves a linked worktree's shared config
+/// correctly no matter which worktree the command runs from, exactly like
+/// [`set_explicit_upstream`] already relies on.
+///
+/// Best-effort: failure is logged and swallowed, exactly like
+/// [`sync_coauthor_hook_best_effort`] -- a failed identity write must never
+/// block a squad's actual work.
+fn apply_worktree_git_identity_best_effort(
+    worktree_dir: &Path,
+    identity: &crate::project_forks::GitIdentity,
+) {
+    if identity.name.is_none() && identity.email.is_none() {
+        return;
+    }
+    let result = (|| -> Result<(), String> {
+        {
+            let _guard = WORKTREE_CONFIG_LOCK.lock();
+            git(
+                worktree_dir,
+                &["config", "extensions.worktreeConfig", "true"],
+            )?;
+        }
+        if let Some(name) = &identity.name {
+            git(worktree_dir, &["config", "--worktree", "user.name", name])?;
+        }
+        if let Some(email) = &identity.email {
+            git(worktree_dir, &["config", "--worktree", "user.email", email])?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
+        crate::rlog!(
+            WARNING,
+            "ralphus [worktrees] could not apply fork git identity for {}: {e}",
+            worktree_dir.display()
         );
     }
 }
@@ -1810,8 +1865,11 @@ pub fn resolve_placeholders(
 
 /// Makes a newly materialized task worktree writable through its submitting
 /// user's registered fork. The worktree was already created from the declared
-/// upstream, which remains the source of its initial contents; this only
-/// selects where subsequent cell and proof commits are published.
+/// upstream, which remains the source of its initial contents; this selects
+/// where subsequent cell and proof commits are published, and (RAL-338
+/// follow-up) who they're authored as -- applying the fork's registered
+/// `git_user_name`/`git_user_email`, if either is set, via `git config
+/// --worktree`.
 fn route_worktree_to_submitter_fork(
     store: &Store,
     squad_id: &str,
@@ -1835,6 +1893,13 @@ fn route_worktree_to_submitter_fork(
     crate::project_forks::ensure_fork_remote(worktree, &fork.remote_name, &fork.fork_url).map_err(
         |e| format!("could not configure fork remote for project {project_name:?}: {e}"),
     )?;
+    apply_worktree_git_identity_best_effort(
+        worktree,
+        &crate::project_forks::GitIdentity {
+            name: fork.git_user_name.clone(),
+            email: fork.git_user_email.clone(),
+        },
+    );
     let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
     let branch = branch.trim();
@@ -2596,6 +2661,77 @@ mod tests {
         assert!(
             git(&fork, &["show-ref", "--verify", "refs/heads/feature"]).is_ok(),
             "the execution branch must be published to the submitter's fork"
+        );
+    }
+
+    #[test]
+    fn submitter_forks_registered_git_identity_is_applied_to_the_worktree() {
+        let repo = init_repo("submitter-fork-identity");
+        let fork = init_bare_fork(&repo, "alice-fork-identity");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .upsert_project_fork_with_identity(
+                "proj",
+                "alice",
+                &fork.to_string_lossy(),
+                "fork-alice",
+                "",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-identity", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-identity", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-identity", "proj", &wt).unwrap();
+
+        assert_eq!(
+            git(&wt, &["config", "user.name"]).unwrap().trim(),
+            "Alice Example"
+        );
+        assert_eq!(
+            git(&wt, &["config", "user.email"]).unwrap().trim(),
+            "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn a_fork_with_no_registered_identity_leaves_the_worktrees_git_config_untouched() {
+        let repo = init_repo("submitter-fork-no-identity");
+        let fork = init_bare_fork(&repo, "bob-fork-no-identity");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("bob").unwrap();
+        store
+            .upsert_project_fork("proj", "bob", &fork.to_string_lossy(), "fork-bob", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='bob'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-no-identity", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-no-identity", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-no-identity", "proj", &wt).unwrap();
+
+        assert!(
+            git(&wt, &["config", "extensions.worktreeConfig"]).is_err(),
+            "no identity fields set on the fork means nothing about this worktree's git config \
+             should be touched at all"
         );
     }
 

@@ -11650,6 +11650,8 @@ mod tests {
             fork_url: fork_bare.to_str().unwrap().to_string(),
             remote_name: "fork".to_string(),
             fork_owner: "alice".to_string(),
+            git_user_name: None,
+            git_user_email: None,
             created_at_ms: 0,
             updated_at_ms: 0,
         };

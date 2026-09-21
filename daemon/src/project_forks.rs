@@ -34,12 +34,19 @@ pub struct ForkRecord {
     /// `owner:branch` cross-repo PR head. Left `""` for GitLab, which
     /// addresses cross-project MRs by numeric project id instead.
     pub fork_owner: String,
+    /// Git `user.name` to apply to a worktree owned by this fork's resolved
+    /// user (via `git config --worktree`). `None` = don't override --
+    /// inherit whatever the worktree's/checkout's own git config already
+    /// resolves to.
+    pub git_user_name: Option<String>,
+    /// Git `user.email`, same override semantics as `git_user_name`.
+    pub git_user_email: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
 
-const FORK_COLUMNS: &str =
-    "project, user, fork_url, remote_name, fork_owner, created_at_ms, updated_at_ms";
+const FORK_COLUMNS: &str = "project, user, fork_url, remote_name, fork_owner, git_user_name, \
+                             git_user_email, created_at_ms, updated_at_ms";
 
 fn row_to_fork_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<ForkRecord> {
     Ok(ForkRecord {
@@ -48,9 +55,21 @@ fn row_to_fork_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<ForkRecord> {
         fork_url: r.get(2)?,
         remote_name: r.get(3)?,
         fork_owner: r.get(4)?,
-        created_at_ms: r.get(5)?,
-        updated_at_ms: r.get(6)?,
+        git_user_name: r.get(5)?,
+        git_user_email: r.get(6)?,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
     })
+}
+
+/// The git identity to apply to a fork-owned worktree (RAL-338 follow-up):
+/// resolved from a [`ForkRecord`]'s `git_user_name`/`git_user_email`, kept
+/// as its own type so a caller with no fork resolved (or a fork that sets
+/// neither field) can be handed a plain `None` instead of an empty record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
 }
 
 /// Default remote name for a fork row: `"fork"` for the project-wide default
@@ -93,16 +112,48 @@ impl Store {
         remote_name: &str,
         fork_owner: &str,
     ) -> StoreResult<ForkRecord> {
+        self.upsert_project_fork_with_identity(
+            project,
+            user,
+            fork_url,
+            remote_name,
+            fork_owner,
+            None,
+            None,
+        )
+    }
+
+    /// Same as [`Self::upsert_project_fork`], additionally setting the
+    /// fork's git identity override (`None` for either leaves that field
+    /// untouched by a re-upsert, i.e. preserves whatever was there before --
+    /// see `patch_project_fork` for a purely field-selective alternative
+    /// when only the identity should change).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_project_fork_with_identity(
+        &self,
+        project: &str,
+        user: &str,
+        fork_url: &str,
+        remote_name: &str,
+        fork_owner: &str,
+        git_user_name: Option<&str>,
+        git_user_email: Option<&str>,
+    ) -> StoreResult<ForkRecord> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO project_forks(project, user, fork_url, remote_name, fork_owner, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "INSERT INTO project_forks(project, user, fork_url, remote_name, fork_owner, git_user_name, git_user_email, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
              ON CONFLICT(project, user) DO UPDATE SET
                 fork_url = excluded.fork_url,
                 remote_name = excluded.remote_name,
                 fork_owner = excluded.fork_owner,
+                git_user_name = COALESCE(excluded.git_user_name, project_forks.git_user_name),
+                git_user_email = COALESCE(excluded.git_user_email, project_forks.git_user_email),
                 updated_at_ms = excluded.updated_at_ms",
-            rusqlite::params![project, user, fork_url, remote_name, fork_owner, now],
+            rusqlite::params![project, user, fork_url, remote_name, fork_owner, git_user_name, git_user_email, now],
         )?;
         crate::rlog!(
             INFO,
@@ -138,17 +189,39 @@ impl Store {
         remote_name: Option<&str>,
         fork_owner: Option<&str>,
     ) -> StoreResult<ForkRecord> {
+        self.patch_project_fork_ex(project, user, fork_url, remote_name, fork_owner, None, None)
+    }
+
+    /// Same as [`Self::patch_project_fork`], additionally field-selective
+    /// over the git identity override (`git_user_name`/`git_user_email`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure, or [`StoreError::NotFound`] if no row
+    /// exists for `(project, user)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_project_fork_ex(
+        &self,
+        project: &str,
+        user: &str,
+        fork_url: Option<&str>,
+        remote_name: Option<&str>,
+        fork_owner: Option<&str>,
+        git_user_name: Option<&str>,
+        git_user_email: Option<&str>,
+    ) -> StoreResult<ForkRecord> {
         let Some(existing) = self.get_project_fork(project, user)? else {
             return Err(StoreError::NotFound);
         };
         let fork_url = fork_url.unwrap_or(&existing.fork_url);
         let remote_name = remote_name.unwrap_or(&existing.remote_name);
         let fork_owner = fork_owner.unwrap_or(&existing.fork_owner);
+        let git_user_name = git_user_name.or(existing.git_user_name.as_deref());
+        let git_user_email = git_user_email.or(existing.git_user_email.as_deref());
         let now = now_ms();
         self.conn.execute(
-            "UPDATE project_forks SET fork_url=?1, remote_name=?2, fork_owner=?3, updated_at_ms=?4
-             WHERE project=?5 AND user=?6",
-            rusqlite::params![fork_url, remote_name, fork_owner, now, project, user],
+            "UPDATE project_forks SET fork_url=?1, remote_name=?2, fork_owner=?3, git_user_name=?4, git_user_email=?5, updated_at_ms=?6
+             WHERE project=?7 AND user=?8",
+            rusqlite::params![fork_url, remote_name, fork_owner, git_user_name, git_user_email, now, project, user],
         )?;
         crate::rlog!(
             INFO,
@@ -787,5 +860,72 @@ mod tests {
         assert_eq!(default_remote_name(""), "fork");
         assert_eq!(default_remote_name("alice"), "fork-alice");
         assert_eq!(default_remote_name("a.weird name!"), "fork-a.weird-name-");
+    }
+
+    #[test]
+    fn upsert_with_identity_round_trips_and_a_later_plain_upsert_preserves_it() {
+        let store = Store::open_in_memory().unwrap();
+        let created = store
+            .upsert_project_fork_with_identity(
+                "proj",
+                "alice",
+                "url-1",
+                "fork-alice",
+                "alice",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        assert_eq!(created.git_user_name.as_deref(), Some("Alice Example"));
+        assert_eq!(created.git_user_email.as_deref(), Some("alice@example.com"));
+
+        // A later plain `upsert_project_fork` call (no identity args, e.g. an
+        // older caller just updating `fork_url`) must not silently wipe out
+        // an already-configured identity.
+        let updated = store
+            .upsert_project_fork("proj", "alice", "url-2", "fork-alice", "alice")
+            .unwrap();
+        assert_eq!(updated.fork_url, "url-2");
+        assert_eq!(updated.git_user_name.as_deref(), Some("Alice Example"));
+        assert_eq!(updated.git_user_email.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn a_freshly_upserted_fork_has_no_identity_by_default() {
+        let store = Store::open_in_memory().unwrap();
+        let fork = store
+            .upsert_project_fork("proj", "alice", "url", "fork-alice", "alice")
+            .unwrap();
+        assert_eq!(fork.git_user_name, None);
+        assert_eq!(fork.git_user_email, None);
+    }
+
+    #[test]
+    fn patch_ex_changes_only_the_given_identity_fields() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_project_fork_with_identity(
+                "proj",
+                "alice",
+                "url",
+                "fork-alice",
+                "alice",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        let patched = store
+            .patch_project_fork_ex(
+                "proj",
+                "alice",
+                None,
+                None,
+                None,
+                Some("Alice Renamed"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(patched.git_user_name.as_deref(), Some("Alice Renamed"));
+        assert_eq!(patched.git_user_email.as_deref(), Some("alice@example.com"));
     }
 }
