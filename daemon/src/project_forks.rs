@@ -229,19 +229,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Resolve which fork row applies for `(project, user)`: the exact
-    /// claimed-user row first, then the project-wide `user=""` default, else
-    /// `None` when the project has no registered fork at all.
+    /// Resolve the exact fork row for `(project, user)`. A submitting user
+    /// with no personal row receives no fork and continues through origin;
+    /// the empty user is reserved for daemon-internal/default routing.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn resolve_fork(&self, project: &str, user: &str) -> StoreResult<Option<ForkRecord>> {
-        if !user.is_empty() {
-            if let Some(row) = self.get_project_fork(project, user)? {
-                return Ok(Some(row));
-            }
-        }
-        self.get_project_fork(project, "")
+        self.get_project_fork(project, user)
     }
 
     /// Remove a fork record for `(project, user)`. Returns `false` if none
@@ -715,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fork_prefers_exact_user_then_falls_back_to_default() {
+    fn resolve_fork_uses_only_the_named_users_row() {
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_project_fork("proj", "", "default-url", "fork", "")
@@ -732,10 +727,7 @@ mod tests {
                 .fork_url,
             "alice-url"
         );
-        assert_eq!(
-            store.resolve_fork("proj", "bob").unwrap().unwrap().fork_url,
-            "default-url"
-        );
+        assert!(store.resolve_fork("proj", "bob").unwrap().is_none());
     }
 
     #[test]

@@ -1808,6 +1808,45 @@ pub fn resolve_placeholders(
     resolve_placeholders_with_prefetch(store, squad_id, cells, tasks, &HashMap::new(), parent)
 }
 
+/// Makes a newly materialized task worktree writable through its submitting
+/// user's registered fork. The worktree was already created from the declared
+/// upstream, which remains the source of its initial contents; this only
+/// selects where subsequent cell and proof commits are published.
+fn route_worktree_to_submitter_fork(
+    store: &Store,
+    squad_id: &str,
+    project_name: &str,
+    worktree: &Path,
+) -> Result<(), String> {
+    let Some(submitter) = store
+        .get_squad_submitter(squad_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    // A fork is personal: no row for this submitter means direct-origin
+    // behavior. Do not silently use the legacy project-wide default row.
+    let Some(fork) = store
+        .get_project_fork(project_name, &submitter)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    crate::project_forks::ensure_fork_remote(worktree, &fork.remote_name, &fork.fork_url).map_err(
+        |e| format!("could not configure fork remote for project {project_name:?}: {e}"),
+    )?;
+    let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
+    let branch = branch.trim();
+    git(worktree, &["push", "--set-upstream", &fork.remote_name, branch]).map_err(|e| {
+        format!(
+            "could not publish worktree branch {branch:?} to fork {:?} for submitter {submitter:?}: {e}",
+            fork.remote_name
+        )
+    })?;
+    Ok(())
+}
+
 /// Like [`resolve_placeholders`], but `prefetched_upstreams` supplies
 /// `(registered project name, bare upstream) -> "<remote>/<branch>"` results
 /// the caller already fetched -- see
@@ -2276,6 +2315,7 @@ fn resolve_placeholders_inner(
         store
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
+        route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
         crate::rlog!(
             INFO,
             "ralphus [scheduler] cell {squad_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved}",
@@ -2352,6 +2392,24 @@ mod tests {
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         git2_commit_all(&r, &git2::Signature::now("t", "t@t").unwrap(), "base", &[]);
         repo
+    }
+
+    fn init_bare_fork(repo: &Path, tag: &str) -> PathBuf {
+        let fork = repo.with_file_name(format!(
+            "{}-{tag}.git",
+            repo.file_name().expect("repo name").to_string_lossy()
+        ));
+        let status = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                repo.to_str().expect("repo path"),
+                fork.to_str().expect("fork path"),
+            ])
+            .status()
+            .expect("clone bare fork");
+        assert!(status.success(), "could not create bare fork");
+        fork
     }
 
     fn init_repo_with_remote_branch(tag: &str, branch: &str) -> (PathBuf, String) {
@@ -2495,6 +2553,49 @@ mod tests {
                 .unwrap()
                 .trim(),
             "feature-x"
+        );
+    }
+
+    #[test]
+    fn submitter_fork_is_the_worktree_branch_upstream() {
+        let repo = init_repo("submitter-fork");
+        let fork = init_bare_fork(&repo, "alice-fork");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork", "proj", &wt).unwrap();
+
+        assert_eq!(
+            git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            )
+            .unwrap()
+            .trim(),
+            "fork-alice/feature"
+        );
+        assert!(
+            git(&fork, &["show-ref", "--verify", "refs/heads/feature"]).is_ok(),
+            "the execution branch must be published to the submitter's fork"
         );
     }
 
