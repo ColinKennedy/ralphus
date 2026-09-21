@@ -8816,30 +8816,47 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
     let busy = busy_git_maintenance_roots(&guardians);
     for (root, machine) in collect_git_maintenance_roots(&guardians) {
         if busy.contains(&(root.clone(), machine.clone())) {
-            crate::rlog!(
-                DEBUG,
-                "ralphus [guardian] git maintenance skipped for {}: a merge is in progress",
-                root.display()
-            );
+            let guard = store.lock();
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .level(crate::logging::LogLevel::DEBUG)
+                .emit(
+                    &guard,
+                    "git maintenance skipped: a merge is in progress",
+                    serde_json::json!({ "git_root": root, "machine": machine }),
+                );
             continue;
         }
         let store = Arc::clone(store);
+        let emit_store = Arc::clone(&store);
         std::thread::spawn(move || {
             let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
-            match ws.git(&["gc", "--auto", "--quiet"]) {
+            // The store lock is taken only to record the outcome below --
+            // never held across the `git gc` call itself, which can run for
+            // minutes on a bloated repo and must not stall the rest of the
+            // daemon behind a global lock.
+            let result = ws.git(&["gc", "--auto", "--quiet"]);
+            let guard = emit_store.lock();
+            match result {
                 Ok(_) => {
-                    crate::rlog!(
-                        DEBUG,
-                        "ralphus [guardian] git maintenance ran for {}",
-                        root.display()
-                    );
+                    crate::cartographer::Note::new("guardian")
+                        .scope("guardian")
+                        .level(crate::logging::LogLevel::DEBUG)
+                        .emit(
+                            &guard,
+                            "git maintenance ran",
+                            serde_json::json!({ "git_root": root }),
+                        );
                 }
                 Err(error) => {
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [guardian] git maintenance failed for {}: {error}",
-                        root.display()
-                    );
+                    crate::cartographer::Note::new("guardian")
+                        .scope("guardian")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            &guard,
+                            "git maintenance failed",
+                            serde_json::json!({ "git_root": root, "error": error }),
+                        );
                 }
             }
         });
