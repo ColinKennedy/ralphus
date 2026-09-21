@@ -598,6 +598,17 @@ struct ProjectForksResponse {
     forks: Vec<crate::project_forks::ForkRecord>,
 }
 
+#[derive(Deserialize)]
+struct SetUserForgeTokenBody {
+    host: String,
+    token: String,
+}
+
+#[derive(Serialize)]
+struct UserForgeTokensResponse {
+    tokens: Vec<crate::user_forge_tokens::UserForgeTokenSummary>,
+}
+
 #[derive(Serialize)]
 struct AgentProfilesHealthResponse {
     profiles: Vec<crate::agent_profiles::ProfileHealthResult>,
@@ -1087,6 +1098,40 @@ fn route_for_user(
         // of successful/failed retirement attempts. Open to every caller
         // (read-only, like the fork reads above).
         ("GET", ["api", "worktree-retirements"]) => worktree_retirements(daemon),
+        // RAL-338 follow-up: a ralphus user's own forge personal-access
+        // tokens, keyed by host. Self-or-admin gated like the fork rows
+        // above -- a user manages their own credentials, an admin can too.
+        // List/GET never return the token value itself (see
+        // `UserForgeTokenSummary`); only `route_worktree_to_submitter_fork`'s
+        // credential-grant path ever reads the raw value.
+        ("GET", ["api", "users", user, "forge-tokens"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                list_user_forge_tokens(daemon, &target_user)
+            })
+        }
+        ("POST", ["api", "users", user, "forge-tokens"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                set_user_forge_token(daemon, &target_user, body)
+            })
+        }
+        ("DELETE", ["api", "users", user, "forge-tokens", host]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                delete_user_forge_token(daemon, &target_user, &url_decode(host))
+            })
+        }
+        // RAL-338 follow-up: fetch path for a worktree's git-credential
+        // helper. Deliberately NOT self-or-admin gated -- the caller makes
+        // no identity claim at all, `worktree_id`+`grant` (query params) is
+        // the entire authorization, checked inside the handler against
+        // `worktree_credential_grants`. Still passes through this route's
+        // normal bearer-token check like every other endpoint, so
+        // possessing the grant alone is not sufficient either -- both are
+        // required.
+        // ralphus[ignore-endpoint-cli]: called only by the git-credential helper this ticket adds, never a task file or the CLI directly
+        ("GET", ["api", "internal", "fork-credential"]) => fetch_fork_credential(daemon, query),
         ("GET", ["api", "projects", name, "forks"]) => {
             list_project_forks(daemon, &url_decode(name))
         }
@@ -5197,6 +5242,86 @@ fn delete_project_fork(daemon: &Daemon, project: &str, user: &str) -> Reply {
             404,
             "not_found",
             &format!("no fork registered for project {project:?} user {user:?}"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/users/{user}/forge-tokens` (RAL-338 follow-up): which hosts
+/// `user` has a token configured for. Never includes the token value.
+fn list_user_forge_tokens(daemon: &Daemon, user: &str) -> Reply {
+    match daemon.lock().list_user_forge_tokens(user) {
+        Ok(tokens) => json(200, &UserForgeTokensResponse { tokens }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/users/{user}/forge-tokens` (RAL-338 follow-up): set or replace
+/// `user`'s token for one host. Body: `{"host": "gitlab.com", "token": "..."}`.
+fn set_user_forge_token(daemon: &Daemon, user: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetUserForgeTokenBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include non-empty \"host\" and \"token\" strings",
+            vec![],
+        );
+    };
+    let host = req.host.trim();
+    let token = req.token.trim();
+    if host.is_empty() {
+        return error(400, "invalid_value", "'host' must not be empty", vec![]);
+    }
+    if token.is_empty() {
+        return error(400, "invalid_value", "'token' must not be empty", vec![]);
+    }
+    match daemon.lock().set_user_forge_token(user, host, token) {
+        Ok(()) => json(201, &serde_json::json!({"user": user, "host": host})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/users/{user}/forge-tokens/{host}` (RAL-338 follow-up).
+fn delete_user_forge_token(daemon: &Daemon, user: &str, host: &str) -> Reply {
+    match daemon.lock().delete_user_forge_token(user, host) {
+        Ok(true) => json(200, &serde_json::json!({"removed": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("no forge token configured for user {user:?} host {host:?}"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/internal/fork-credential?worktree_id=...&grant=...` (RAL-338
+/// follow-up): the git-credential helper's fetch path. See the route
+/// dispatch's doc comment for why this carries no self-or-admin identity
+/// check -- `worktree_id`+`grant` (matched against
+/// [`Store::resolve_worktree_credential`]) is the entire authorization.
+fn fetch_fork_credential(daemon: &Daemon, query: &str) -> Reply {
+    let Some(worktree_id) = query_param(query, "worktree_id") else {
+        return error(
+            400,
+            "bad_request",
+            "missing 'worktree_id' query param",
+            vec![],
+        );
+    };
+    let Some(grant) = query_param(query, "grant") else {
+        return error(400, "bad_request", "missing 'grant' query param", vec![]);
+    };
+    match daemon
+        .lock()
+        .resolve_worktree_credential(worktree_id, grant)
+    {
+        Ok(Some(token)) => json(200, &serde_json::json!({"token": token})),
+        Ok(None) => error(
+            403,
+            "forbidden",
+            "no credential resolves for this worktree_id/grant pair",
             vec![],
         ),
         Err(e) => store_error(&e),
@@ -16301,6 +16426,115 @@ mod tests {
         let health = route(&d, "GET", "/api/health/project-forks", "");
         assert_eq!(health.status, 200, "{}", health.body);
         assert!(health.body.contains("\"checks\":[]"));
+    }
+
+    #[test]
+    fn user_forge_tokens_route_round_trips_set_list_delete_for_self() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+
+        let set = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens",
+            &serde_json::json!({"host": "gitlab.com", "token": "glpat-secret"}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(set.status, 201, "{}", set.body);
+        assert!(
+            !set.body.contains("glpat-secret"),
+            "the token value must never appear in an API response: {}",
+            set.body
+        );
+
+        let listed = route_for_user(
+            &d,
+            "GET",
+            "/api/users/alice/forge-tokens",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        assert!(listed.body.contains("gitlab.com"));
+        assert!(
+            !listed.body.contains("glpat-secret"),
+            "a listing must never expose the token value: {}",
+            listed.body
+        );
+
+        let deleted = route_for_user(
+            &d,
+            "DELETE",
+            "/api/users/alice/forge-tokens/gitlab.com",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(deleted.status, 200, "{}", deleted.body);
+
+        let listed_after = route_for_user(
+            &d,
+            "GET",
+            "/api/users/alice/forge-tokens",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(listed_after.body, "{\"tokens\":[]}");
+    }
+
+    #[test]
+    fn user_forge_tokens_route_rejects_a_different_non_admin_user() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        // Close the RAL-332 bootstrap exception (every admin-gated route
+        // treats every caller as an admin until *some* user, anywhere, is
+        // currently promoted) by leaving a *different* user permanently
+        // admin -- demoting them back down would silently reopen the
+        // bootstrap window and let bob's call through regardless of gating.
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens",
+            &serde_json::json!({"host": "gitlab.com", "token": "glpat-secret"}).to_string(),
+            Some("bob"),
+        );
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn fetch_fork_credential_route_succeeds_only_with_the_matching_grant() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock()
+            .set_user_forge_token("alice", "gitlab.com", "glpat-secret")
+            .unwrap();
+        let grant = d
+            .lock()
+            .mint_worktree_credential_grant("wt-1", "alice", "gitlab.com")
+            .unwrap();
+
+        let ok = route(
+            &d,
+            "GET",
+            &format!("/api/internal/fork-credential?worktree_id=wt-1&grant={grant}"),
+            "",
+        );
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert!(ok.body.contains("glpat-secret"));
+
+        let wrong_grant = route(
+            &d,
+            "GET",
+            "/api/internal/fork-credential?worktree_id=wt-1&grant=not-it",
+            "",
+        );
+        assert_eq!(wrong_grant.status, 403, "{}", wrong_grant.body);
+
+        let missing_params = route(&d, "GET", "/api/internal/fork-credential", "");
+        assert_eq!(missing_params.status, 400, "{}", missing_params.body);
     }
 
     #[test]

@@ -949,13 +949,7 @@ fn apply_worktree_git_identity_best_effort(
         return;
     }
     let result = (|| -> Result<(), String> {
-        {
-            let _guard = WORKTREE_CONFIG_LOCK.lock();
-            git(
-                worktree_dir,
-                &["config", "extensions.worktreeConfig", "true"],
-            )?;
-        }
+        ensure_worktree_config_extension(worktree_dir)?;
         if let Some(name) = &identity.name {
             git(worktree_dir, &["config", "--worktree", "user.name", name])?;
         }
@@ -969,6 +963,97 @@ fn apply_worktree_git_identity_best_effort(
         crate::rlog!(
             WARNING,
             "ralphus [worktrees] could not apply fork git identity for {}: {e}",
+            worktree_dir.display()
+        );
+    }
+}
+
+/// Idempotently enable `extensions.worktreeConfig` on the shared repo owning
+/// `worktree_dir`, under `WORKTREE_CONFIG_LOCK` since (unlike a
+/// `--worktree`-scoped write, private to that worktree's own
+/// `config.worktree`) this setting lives in the one `.git/config` every
+/// sibling worktree shares. Shared by both
+/// [`apply_worktree_git_identity_best_effort`] and
+/// [`apply_worktree_credential_helper_best_effort`] -- either may run
+/// without the other (a fork might set only an identity, only a credential,
+/// both, or neither), so neither can assume the extension is already on.
+fn ensure_worktree_config_extension(worktree_dir: &Path) -> Result<(), String> {
+    let _guard = WORKTREE_CONFIG_LOCK.lock();
+    git(
+        worktree_dir,
+        &["config", "extensions.worktreeConfig", "true"],
+    )
+    .map(|_| ())
+}
+
+/// Point one worktree's `credential.helper` at ralphus's own helper and mint
+/// the `(worktree_id, grant)` pair it needs (RAL-338 follow-up), so a `git
+/// push` from that worktree -- ralphus's own, or an agent's own shell
+/// command, either way -- can authenticate over HTTPS as `submitter`'s
+/// stored forge token without that token ever being written to any git
+/// config file on disk. See `daemon/src/user_forge_tokens.rs`'s module doc
+/// comment for why this exists alongside (not instead of) `forge.rs`'s
+/// env-var-only token policy.
+///
+/// A no-op when `fork_url` isn't an HTTP(S) URL: git's credential-helper
+/// protocol only ever fires for HTTP(S) transport, never SSH, so there is
+/// nothing useful to wire up for an `ssh://`/`git@host:...`-style fork
+/// remote -- that fork keeps relying on the host's own SSH key setup exactly
+/// as before this existed.
+///
+/// Best-effort: failure is logged and swallowed, same as
+/// [`apply_worktree_git_identity_best_effort`] -- a failed credential-helper
+/// write must never block a squad's actual work (an agent's plain `git
+/// push` simply falls back to whatever ambient auth the host already has,
+/// exactly like before this existed).
+fn apply_worktree_credential_helper_best_effort(
+    store: &Store,
+    worktree_dir: &Path,
+    submitter: &str,
+    fork_url: &str,
+) {
+    let trimmed = fork_url.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return;
+    }
+    let Some((host, _path)) = crate::forge::parse_remote_url(trimmed) else {
+        return;
+    };
+    let result = (|| -> Result<(), String> {
+        let worktree_id = crate::token::generate();
+        let grant = store
+            .mint_worktree_credential_grant(&worktree_id, submitter, &host)
+            .map_err(|e| e.to_string())?;
+        ensure_worktree_config_extension(worktree_dir)?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "ralphus.worktree-id", &worktree_id],
+        )?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "ralphus.worktree-grant", &grant],
+        )?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "credential.helper", ""],
+        )?;
+        git(
+            worktree_dir,
+            &[
+                "config",
+                "--worktree",
+                "--add",
+                "credential.helper",
+                "!ralphus internal fork-credential-helper",
+            ],
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
+        crate::rlog!(
+            WARNING,
+            "ralphus [worktrees] could not wire up the fork credential helper for {}: {e}",
             worktree_dir.display()
         );
     }
@@ -1912,6 +1997,7 @@ fn route_worktree_to_submitter_fork(
             email: fork.git_user_email.clone(),
         },
     );
+    apply_worktree_credential_helper_best_effort(store, worktree, &submitter, &fork.fork_url);
     let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
     let branch = branch.trim();
