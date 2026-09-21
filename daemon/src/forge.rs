@@ -3898,6 +3898,56 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// RAL-478: GitHub distinguishes closed-without-merge from merged via a
+    /// separate `merged` boolean (see `get_pull_request_state_reports_closed`
+    /// / `_reports_merged_over_closed` above); GitLab reports it directly as
+    /// two distinct `state` values (`"closed"` vs. `"merged"`) with no
+    /// separate flag to check. Pinning both here so the two providers' PR
+    /// closed/merged distinction stays covered at parity.
+    #[test]
+    fn get_pull_request_state_reports_gitlab_closed_without_merging() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_state(9).unwrap(), "closed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_pull_request_state_reports_gitlab_merged() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "merged"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(client.get_pull_request_state(9).unwrap(), "merged");
+        handle.join().unwrap();
+    }
+
     #[test]
     fn create_stack_sends_ordered_pull_request_numbers() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
