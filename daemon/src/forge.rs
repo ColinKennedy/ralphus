@@ -128,6 +128,15 @@ pub struct PrComment {
 /// count silently under-reported.
 const PER_PAGE: u32 = 100;
 
+/// Remaining-quota threshold (Track A / A7) below which
+/// [`ForgeClient::note_rate_limit_headers`] proactively starts a backoff
+/// window, read off GitHub's own `X-RateLimit-Remaining` header on an
+/// otherwise-successful response. Conservative on purpose: low enough that
+/// ordinary traffic against a 5,000/hour budget never trips it, high enough
+/// to leave a safety margin before the budget would actually run out and
+/// start failing every call outright.
+const RATE_LIMIT_LOW_WATER_MARK: i64 = 50;
+
 /// Which comment endpoint [`ForgeClient::list_pr_comments_conditional`]
 /// polls (RAL-366). GitHub splits PR feedback across two REST resources --
 /// general conversation (`/issues/{n}/comments`) and inline review comments
@@ -145,10 +154,13 @@ enum ConditionalGet {
     /// The forge returned `304`: `etag` still matches, nothing to re-parse.
     NotModified,
     /// A fresh body, plus this response's own `ETag` (`None` if the forge
-    /// didn't send one) to store for the next poll's `If-None-Match`.
+    /// didn't send one) to store for the next poll's `If-None-Match`, and
+    /// (Track A / A8) the next-page URL parsed from this response's `Link`
+    /// header, when the forge paginated it (`None` on a last/only page).
     Modified {
         value: serde_json::Value,
         etag: Option<String>,
+        link_next: Option<String>,
     },
 }
 
@@ -165,6 +177,21 @@ pub enum CommentsPoll {
         comments: Vec<PrComment>,
         etag: Option<String>,
     },
+}
+
+/// Result of [`ForgeClient::get_pull_request_state_conditional`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum PrStatePoll {
+    /// The stored ETag still matched -- the PR's state is whatever the
+    /// caller already has recorded. On GitHub a `304` does not count against
+    /// the primary rate limit at all, which is the point of asking this way.
+    NotModified,
+    /// A fresh state (`"open"`/`"closed"`/`"merged"`, normalized across both
+    /// forges exactly as [`ForgeClient::get_pull_request_state`] reports it),
+    /// plus the new ETag to store for next time (`None` if this
+    /// forge/response didn't send one, in which case the next poll falls back
+    /// to an unconditional fetch).
+    Modified { state: String, etag: Option<String> },
 }
 
 /// Live base-ref metadata used to reconcile forge-authored base edits.
@@ -351,6 +378,47 @@ pub struct ExistingPr {
 pub struct CreatedStack {
     /// Repo-scoped stack number, not a global id.
     pub number: i64,
+}
+
+/// One row from a forge's webhook-*management* API (Track E, E8) --
+/// creating/listing/deleting a hook registered on the repo itself. Distinct
+/// from `crate::webhook`, which is the *receiving* side (verifying a
+/// delivery this endpoint's counterpart sends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeWebhook {
+    /// Forge-assigned id, as a string regardless of the forge's own numeric
+    /// type -- kept opaque since nothing here does arithmetic on it, only
+    /// round-trips it back into a `DELETE .../hooks/{id}` URL.
+    pub id: String,
+    pub url: String,
+    /// `true` for a GitHub hook with `active: true`. GitLab has no
+    /// equivalent boolean on hook creation/listing -- a GitLab hook is
+    /// always reported `true` here; see [`Self::disabled`] for GitLab's own
+    /// (different) failure-state concept.
+    pub active: bool,
+    /// GitLab only (Track E, E12): `true` when the hook's `alert_status` is
+    /// `"disabled"` or `"temporarily_disabled"` -- GitLab auto-disables a
+    /// webhook after repeated delivery failures (when
+    /// `auto_disabling_web_hooks` is on for the instance), silently
+    /// dropping every delivery until it's re-enabled. GitLab's own
+    /// mechanism to re-enable a disabled hook *is* firing a test request
+    /// (`POST .../webhook/check`, E11) -- there is no separate "re-enable"
+    /// endpoint, so this field's only job is to tell a caller reading
+    /// `GET .../webhook/status` that `check` is worth trying. Always
+    /// `false` for GitHub, which has no equivalent disabled-state concept
+    /// on a hook (only a per-delivery `last_response`, not surfaced here).
+    pub disabled: bool,
+}
+
+/// The outcome of firing a forge's webhook test/ping mechanism (Track E,
+/// E11). `fired` is whether the forge *accepted* the test-fire request --
+/// not proof this daemon actually received the resulting delivery; see
+/// [`ForgeClient::test_webhook`]'s doc comment for why that distinction
+/// can't be collapsed into one boolean uniformly across both forges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookTestResult {
+    pub fired: bool,
+    pub message: String,
 }
 
 /// A resolved connection to one forge repository: enough to create PRs, list
@@ -785,30 +853,115 @@ impl ForgeClient {
     }
 
     fn get_pull_request_state_inner(&self, number: i64) -> Result<String, String> {
-        let token = self.require_token()?;
-        match self.kind {
+        match self.get_pull_request_state_conditional(number, None)? {
+            PrStatePoll::Modified { state, .. } => Ok(state),
+            // Unreachable with `etag: None` -- no `If-None-Match` is sent, so
+            // the forge has nothing to match and cannot answer `304`.
+            PrStatePoll::NotModified => Err(
+                "forge returned 304 for an unconditional pull request state request".to_string(),
+            ),
+        }
+    }
+
+    /// [`Self::get_pull_request_state`] as a conditional request: sends
+    /// `If-None-Match` when `etag` is given, so a PR whose state has not
+    /// changed since the last poll costs no forge rate-limit quota on GitHub.
+    ///
+    /// This is the merge check's hot path -- `check_pr_merges` asks it once
+    /// per open PR per poll pass, and the answer is "still open" almost every
+    /// time -- so it is the single call where a conditional request pays for
+    /// itself most.
+    ///
+    /// Returns the raw [`ForgeError`] rather than a `String` so a scheduled
+    /// caller can inspect `status`/`retry_after` and back off on a rate limit
+    /// instead of retrying next cycle as if nothing happened.
+    pub fn get_pull_request_state_conditional(
+        &self,
+        number: i64,
+        etag: Option<&str>,
+    ) -> Result<PrStatePoll, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        let req = match self.kind {
             ForgeKind::GitHub => {
                 let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
-                if resp["merged"].as_bool().unwrap_or(false) {
-                    return Ok("merged".to_string());
-                }
-                Ok(resp["state"].as_str().unwrap_or("open").to_string())
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
             }
             ForgeKind::GitLab => {
                 let url = format!(
                     "{}/projects/{}/merge_requests/{number}",
                     self.api_base, self.repo_path
                 );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(match resp["state"].as_str().unwrap_or("opened") {
-                    "opened" => "open".to_string(),
-                    other => other.to_string(),
-                })
+                ureq::get(&url).set("PRIVATE-TOKEN", token)
+            }
+        };
+        match self.get_conditional(req, etag)? {
+            ConditionalGet::NotModified => Ok(PrStatePoll::NotModified),
+            ConditionalGet::Modified {
+                value,
+                etag,
+                link_next: _,
+            } => {
+                let state = match self.kind {
+                    ForgeKind::GitHub => {
+                        if value["merged"].as_bool().unwrap_or(false) {
+                            "merged".to_string()
+                        } else {
+                            value["state"].as_str().unwrap_or("open").to_string()
+                        }
+                    }
+                    ForgeKind::GitLab => match value["state"].as_str().unwrap_or("opened") {
+                        "opened" => "open".to_string(),
+                        other => other.to_string(),
+                    },
+                };
+                Ok(PrStatePoll::Modified { state, etag })
+            }
+        }
+    }
+
+    /// `GET /repos/{o}/{r}/pulls/{n}` (GitHub) or
+    /// `GET /projects/{id}/merge_requests/{n}` (GitLab), always live.
+    ///
+    /// Track A / A3 investigated caching this for [`Self::get_pull_request_base_state`],
+    /// since `detect_forge_reorder` and `poll_pr_base_drift` both call it for
+    /// `base`/`updated_at` on the same nominal 300s cadence, for the same
+    /// guardian set, from two independently-phased background loops. A
+    /// short-TTL cache keyed by `(kind, api_base, repo, number)` was built
+    /// and then reverted: `detect_forge_reorder` is also called a second
+    /// time in immediate succession to re-verify a just-applied reorder (see
+    /// `check_and_apply_forge_reorder`'s doc, and the regression test this
+    /// caught it with,
+    /// `detect_forge_reorder_converges_after_one_apply_when_the_registered_fork_remote_matches_base_branchs_own_remote`),
+    /// and a blind cache served that re-check a stale pre-apply value --
+    /// indistinguishable, from inside the cache, from the cross-loop overlap
+    /// it was meant to catch. A correct fix needs either genuine
+    /// single-flight coalescing (only dedupe requests that are *concurrently*
+    /// in flight, never a later sequential one) or fusing the two loops'
+    /// scheduling outright -- both larger changes than this item's scope,
+    /// and the latter is exactly the tradeoff `run_pr_forge_poll_cycle`'s own
+    /// doc comment already declined for a similar pair (drift vs. comments):
+    /// "merging their call sites would add risk without saving a network
+    /// round-trip" was written about a different pair there, but the
+    /// reasoning transfers. Left as two separate, always-fresh fetches.
+    fn fetch_pr_object_for_base_state(&self, number: i64) -> Result<serde_json::Value, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                self.get_structured(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                self.get_structured(ureq::get(&url).set("PRIVATE-TOKEN", token))
             }
         }
     }
@@ -828,9 +981,26 @@ impl ForgeClient {
         self.get_pull_request_base_state(number).map(|s| s.base)
     }
 
+    /// [`Self::get_pull_request_base`], keeping the structured [`ForgeError`]
+    /// (Track A / A5) -- for a poller that needs to distinguish a rate limit
+    /// from any other failure (Track A / A6).
+    pub fn get_pull_request_base_ex(&self, number: i64) -> Result<String, ForgeError> {
+        self.get_pull_request_base_state_ex(number).map(|s| s.base)
+    }
+
     /// Fetch the live base and the forge timestamp of the edit. The timestamp
     /// is required for RAL-277's cross-system last-write-wins rule.
     pub fn get_pull_request_base_state(&self, number: i64) -> Result<PullRequestBaseState, String> {
+        self.get_pull_request_base_state_ex(number)
+            .map_err(String::from)
+    }
+
+    /// [`Self::get_pull_request_base_state`], keeping the structured
+    /// [`ForgeError`] (Track A / A5) -- see [`Self::get_pull_request_base_ex`].
+    pub fn get_pull_request_base_state_ex(
+        &self,
+        number: i64,
+    ) -> Result<PullRequestBaseState, ForgeError> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -863,45 +1033,38 @@ impl ForgeClient {
     fn get_pull_request_base_state_inner(
         &self,
         number: i64,
-    ) -> Result<PullRequestBaseState, String> {
-        let token = self.require_token()?;
+    ) -> Result<PullRequestBaseState, ForgeError> {
+        let resp = self.fetch_pr_object_for_base_state(number)?;
         let (base, updated_at) = match self.kind {
             ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
                 let base = resp["base"]["ref"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing base.ref".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing base.ref"))?;
                 let updated_at = resp["updated_at"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing updated_at"))?;
                 (base, updated_at)
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?;
                 let base = resp["target_branch"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing target_branch".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing target_branch"))?;
                 let updated_at = resp["updated_at"]
                     .as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| "forge response missing updated_at".to_string())?;
+                    .ok_or_else(|| ForgeError::other("forge response missing updated_at"))?;
                 (base, updated_at)
             }
         };
         let updated_at_ms = chrono::DateTime::parse_from_rfc3339(&updated_at)
-            .map_err(|e| format!("forge response has invalid updated_at {updated_at:?}: {e}"))?
+            .map_err(|e| {
+                ForgeError::other(format!(
+                    "forge response has invalid updated_at {updated_at:?}: {e}"
+                ))
+            })?
             .timestamp_millis();
         Ok(PullRequestBaseState {
             base,
@@ -915,6 +1078,13 @@ impl ForgeClient {
     /// merge conflict, both come back as [`PrCiState::Failing`]. Logs the
     /// outbound call (start/done/error) via `rlog!`.
     pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        self.check_pr_ci_status_ex(number).map_err(String::from)
+    }
+
+    /// [`Self::check_pr_ci_status`], keeping the structured [`ForgeError`]
+    /// (Track A / A5) -- for a poller that needs to distinguish a rate limit
+    /// from any other failure (Track A / A6).
+    pub fn check_pr_ci_status_ex(&self, number: i64) -> Result<PrCiState, ForgeError> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -942,37 +1112,70 @@ impl ForgeClient {
         result
     }
 
-    /// Poll CI and the forge's draft/WIP flag.
+    /// Poll CI and the draft/WIP flag from a single fetch of the PR/MR
+    /// object (Track A / A4): a prior version fetched it twice -- once
+    /// inside [`Self::check_pr_ci_status`] for `mergeable_state`/`head.sha`,
+    /// then again here purely to read `draft` -- doubling every standing CI
+    /// poll's cheapest call for no reason.
     pub fn check_pr_ci_status_probe(&self, number: i64) -> Result<PrCiProbe, String> {
-        let ci = self.check_pr_ci_status(number)?;
-        let token = self.require_token()?;
-        let object = match self.kind {
-            ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                self.get(
-                    ureq::get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?
-            }
-            ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                self.get(ureq::get(&url).set("PRIVATE-TOKEN", token))?
-            }
-        };
+        self.check_pr_ci_status_probe_ex(number)
+            .map_err(String::from)
+    }
+
+    /// [`Self::check_pr_ci_status_probe`], keeping the structured
+    /// [`ForgeError`] (Track A / A5) -- see [`Self::check_pr_ci_status_ex`].
+    pub fn check_pr_ci_status_probe_ex(&self, number: i64) -> Result<PrCiProbe, ForgeError> {
+        let object = self.fetch_pr_object(number)?;
+        let ci = self.check_pr_ci_status_from_object(&object)?;
         Ok(PrCiProbe {
             ci,
             draft: pr_object_draft(&object),
         })
     }
 
-    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, String> {
+    /// `GET /repos/{o}/{r}/pulls/{n}` (GitHub) or
+    /// `GET /projects/{id}/merge_requests/{n}` (GitLab), always live -- the
+    /// uncached twin of [`Self::get_pull_request_object_cached`]. Used where
+    /// a caller needs the object itself (not just one derived field) and,
+    /// like [`Self::check_pr_ci_status`], must never serve a stale one.
+    fn fetch_pr_object(&self, number: i64) -> Result<serde_json::Value, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         match self.kind {
-            ForgeKind::GitHub => self.check_github_pr_ci_status(number),
-            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(number),
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                self.get_structured(
+                    ureq::get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                self.get_structured(ureq::get(&url).set("PRIVATE-TOKEN", token))
+            }
+        }
+    }
+
+    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, ForgeError> {
+        let object = self.fetch_pr_object(number)?;
+        self.check_pr_ci_status_from_object(&object)
+    }
+
+    /// Dispatch to the per-forge CI-status derivation, given an
+    /// already-fetched PR/MR object -- shared by [`Self::check_pr_ci_status`]
+    /// (which fetches the object itself) and
+    /// [`Self::check_pr_ci_status_probe`] (which reuses the one it fetched
+    /// for the draft flag).
+    fn check_pr_ci_status_from_object(
+        &self,
+        object: &serde_json::Value,
+    ) -> Result<PrCiState, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => self.check_github_pr_ci_status(object),
+            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(object),
         }
     }
 
@@ -996,14 +1199,15 @@ impl ForgeClient {
     /// in-flight legacy status (`total_count > 0`) -- conflating them once
     /// made every such PR report `Pending` forever, no matter how green its
     /// check-runs were.
-    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
-        let token = self.require_token()?;
-        let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        let pr = self.get(
-            ureq::get(&pr_url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )?;
+    ///
+    /// `pr` must be a *fresh* fetch (Track A / A4: never
+    /// [`Self::get_pull_request_object_cached`]) -- this is exactly the
+    /// value `start_ci_watch`'s fast-then-backoff poll re-checks within
+    /// seconds of the last call to catch a rebase/force-push moving the head
+    /// sha, and a cached `mergeable_state`/`head.sha` would silently defeat
+    /// that escalation.
+    fn check_github_pr_ci_status(&self, pr: &serde_json::Value) -> Result<PrCiState, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         if pr["mergeable_state"].as_str() == Some("dirty") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the base branch".to_string(),
@@ -1020,7 +1224,7 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/check-runs",
             self.api_base, self.repo_path
         );
-        let checks = self.get(
+        let checks = self.get_structured(
             ureq::get(&checks_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1061,7 +1265,7 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/status",
             self.api_base, self.repo_path
         );
-        let status = self.get(
+        let status = self.get_structured(
             ureq::get(&status_url)
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/vnd.github+json"),
@@ -1133,13 +1337,10 @@ impl ForgeClient {
     /// same response, so no extra state to track) tells the two apart: a
     /// mismatch means the pipeline belongs to a commit that's no longer the
     /// head, so there's genuinely no verdict yet for the current one.
-    fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
-        let token = self.require_token()?;
-        let mr_url = format!(
-            "{}/projects/{}/merge_requests/{number}",
-            self.api_base, self.repo_path
-        );
-        let mr = self.get(ureq::get(&mr_url).set("PRIVATE-TOKEN", token))?;
+    /// `mr` must be a fresh fetch -- see [`Self::check_github_pr_ci_status`]'s
+    /// doc for why.
+    fn check_gitlab_pr_ci_status(&self, mr: &serde_json::Value) -> Result<PrCiState, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the target branch".to_string(),
@@ -1959,19 +2160,69 @@ impl ForgeClient {
                 ureq::get(&url).set("PRIVATE-TOKEN", token)
             }
         };
-        match self.get_conditional(req, etag)? {
-            ConditionalGet::NotModified => Ok(CommentsPoll::NotModified),
-            ConditionalGet::Modified { value, etag } => {
-                let items = value.as_array().ok_or_else(|| {
+        let (mut items, etag, mut link_next) = match self.get_conditional(req, etag)? {
+            ConditionalGet::NotModified => return Ok(CommentsPoll::NotModified),
+            ConditionalGet::Modified {
+                value,
+                etag,
+                link_next,
+            } => {
+                let items = value.as_array().cloned().ok_or_else(|| {
                     ForgeError::other(format!("unexpected comments response shape: {value}"))
                 })?;
-                let comments = match self.kind {
-                    ForgeKind::GitHub => parse_github_comments(items),
-                    ForgeKind::GitLab => parse_gitlab_notes(items),
-                };
-                Ok(CommentsPoll::Modified { comments, etag })
+                (items, etag, link_next)
             }
+        };
+        // Track A / A8: follow the forge's own pagination rather than
+        // silently truncating past the first `PER_PAGE` items -- a PR/MR
+        // with more than 100 comments previously lost every comment past
+        // the 100th with no error or warning, exactly on the long-running
+        // PRs where un-actioned feedback matters most. Each follow-up page
+        // is fetched unconditionally (no `If-None-Match`): the caller's
+        // stored etag only ever describes page 1, which is the only page a
+        // future poll can short-circuit via `NotModified` anyway.
+        while let Some(next_url) = link_next.take() {
+            let follow_req = self.authed_get(&next_url, token);
+            let (page_value, page_link_next) = self.get_with_link(follow_req)?;
+            let page_items = page_value.as_array().ok_or_else(|| {
+                ForgeError::other(format!("unexpected comments response shape: {page_value}"))
+            })?;
+            items.extend(page_items.iter().cloned());
+            link_next = page_link_next;
         }
+        let comments = match self.kind {
+            ForgeKind::GitHub => parse_github_comments(&items),
+            ForgeKind::GitLab => parse_gitlab_notes(&items),
+        };
+        Ok(CommentsPoll::Modified { comments, etag })
+    }
+
+    /// Build an authenticated `GET` for an absolute URL the forge itself
+    /// handed back (a pagination `Link` header's `rel="next"` target) --
+    /// unlike every other request builder in this file, which builds its own
+    /// URL from `self.api_base`/`self.repo_path`, this one has no path/query
+    /// of its own to construct; only the auth header depends on `self.kind`.
+    fn authed_get(&self, url: &str, token: &str) -> ureq::Request {
+        match self.kind {
+            ForgeKind::GitHub => ureq::get(url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            ForgeKind::GitLab => ureq::get(url).set("PRIVATE-TOKEN", token),
+        }
+    }
+
+    /// [`Self::get_structured`], but also returning the next-page URL parsed
+    /// from this response's `Link` header (Track A / A8), for a caller
+    /// following pagination itself.
+    fn get_with_link(
+        &self,
+        req: ureq::Request,
+    ) -> Result<(serde_json::Value, Option<String>), ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        let link_next = resp.header("Link").and_then(parse_link_next);
+        let value = parse_body(resp).map_err(ForgeError::other)?;
+        Ok((value, link_next))
     }
 
     /// Best-effort fetch of the repo's PR/MR template, so generated PR bodies
@@ -2126,14 +2377,312 @@ impl ForgeClient {
             .set("Content-Type", "application/json")
             .send_string(&payload.to_string())
             .map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
         parse_body(resp)
+    }
+
+    /// [`Self::send`], but keeping the structured [`ForgeError`] (Track E,
+    /// E8) -- same rationale as [`Self::get_structured`] alongside
+    /// [`Self::get`].
+    fn send_structured(
+        &self,
+        req: ureq::Request,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, ForgeError> {
+        let resp = req
+            .set("Content-Type", "application/json")
+            .send_string(&payload.to_string())
+            .map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        parse_body(resp).map_err(ForgeError::other)
     }
 
     /// `GET`, parsing the JSON response body. See [`Self::send`]'s doc for
     /// why every read call in this file routes through this.
     fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
         let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
         parse_body(resp)
+    }
+
+    /// [`Self::get`], but keeping the structured [`ForgeError`] rather than
+    /// collapsing it to a `String` (Track A / A5) -- so a caller polling on
+    /// a schedule can inspect `status`/`retry_after` and back off on a rate
+    /// limit instead of retrying next cycle as if nothing happened.
+    fn get_structured(&self, req: ureq::Request) -> Result<serde_json::Value, ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        parse_body(resp).map_err(ForgeError::other)
+    }
+
+    /// `DELETE`, discarding the response body -- both forges return an empty
+    /// 204 for a successful webhook-hook deletion (Track E, E8), so there is
+    /// nothing here for [`parse_body`] to parse. `req.call()` already treats
+    /// a non-2xx status as `Err`, so success is exactly "no error".
+    fn delete_structured(&self, req: ureq::Request) -> Result<(), ForgeError> {
+        req.call().map_err(|e| self.describe_evicting(e))?;
+        Ok(())
+    }
+
+    /// Create a webhook on this repo pointed at `callback_url` (Track E,
+    /// E8) -- expected to already be the full `.../api/forge/webhook/
+    /// {provider}` address, since this daemon has no way to know its own
+    /// externally-reachable URL. Subscribed only to pull/merge-request
+    /// lifecycle events, the only event type
+    /// [`crate::webhook::extract_pr_hint`] (E5) parses a PR/MR out of --
+    /// subscribing to anything broader would just be unread noise on the
+    /// receiving end.
+    pub fn create_webhook(
+        &self,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<ForgeWebhook, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "name": "web",
+                    "config": {
+                        "url": callback_url,
+                        "content_type": "json",
+                        "secret": secret,
+                        "insecure_ssl": "0",
+                    },
+                    "events": ["pull_request"],
+                    "active": true,
+                });
+                let body = self.send_structured(
+                    ureq::post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                parse_github_webhook(&body)
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/hooks", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "url": callback_url,
+                    "token": secret,
+                    "merge_requests_events": true,
+                    "push_events": false,
+                });
+                let body = self
+                    .send_structured(ureq::post(&url).set("PRIVATE-TOKEN", token), &payload)
+                    .map_err(translate_gitlab_url_blocked)?;
+                parse_gitlab_webhook(&body)
+            }
+        }
+    }
+
+    /// Update an existing webhook's callback URL and/or secret (Track E,
+    /// E9) -- covers both secret rotation and this daemon's own address
+    /// changing, since both cases are "the hook is still the right hook,
+    /// just some of its config is stale" rather than delete-and-recreate
+    /// (which would also change the hook's id, breaking anything that
+    /// recorded the old one). GitHub uses `PATCH .../hooks/{id}` with the
+    /// same body shape as create; GitLab uses `PUT .../hooks/{id}`.
+    pub fn update_webhook(
+        &self,
+        hook_id: &str,
+        callback_url: &str,
+        secret: &str,
+    ) -> Result<ForgeWebhook, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks/{hook_id}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({
+                    "config": {
+                        "url": callback_url,
+                        "content_type": "json",
+                        "secret": secret,
+                        "insecure_ssl": "0",
+                    },
+                });
+                let body = self.send_structured(
+                    ureq::patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                parse_github_webhook(&body)
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({
+                    "url": callback_url,
+                    "token": secret,
+                    "merge_requests_events": true,
+                    "push_events": false,
+                });
+                let body = self
+                    .send_structured(ureq::put(&url).set("PRIVATE-TOKEN", token), &payload)
+                    .map_err(translate_gitlab_url_blocked)?;
+                parse_gitlab_webhook(&body)
+            }
+        }
+    }
+
+    /// List every webhook registered on this repo (Track E, E8) -- not
+    /// filtered to ones this daemon created; a caller matches by URL to
+    /// find its own.
+    pub fn list_webhooks(&self) -> Result<Vec<ForgeWebhook>, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        let req = match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks", self.api_base, self.repo_path);
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {token}"))
+                    .set("Accept", "application/vnd.github+json")
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/hooks", self.api_base, self.repo_path);
+                ureq::get(&url).set("PRIVATE-TOKEN", token)
+            }
+        };
+        let body = self.get_structured(req)?;
+        let rows = body.as_array().cloned().unwrap_or_default();
+        rows.iter()
+            .map(|row| match self.kind {
+                ForgeKind::GitHub => parse_github_webhook(row),
+                ForgeKind::GitLab => parse_gitlab_webhook(row),
+            })
+            .collect()
+    }
+
+    /// Delete a webhook by its forge-assigned id (Track E, E8) -- the same
+    /// `id` [`Self::create_webhook`]/[`Self::list_webhooks`] return.
+    pub fn delete_webhook(&self, hook_id: &str) -> Result<(), ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/hooks/{hook_id}", self.api_base, self.repo_path);
+                self.delete_structured(
+                    ureq::delete(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}",
+                    self.api_base, self.repo_path
+                );
+                self.delete_structured(ureq::delete(&url).set("PRIVATE-TOKEN", token))
+            }
+        }
+    }
+
+    /// Fire the forge's own webhook test/ping mechanism against an
+    /// installed hook (Track E, E11) -- a reachability check: does a real
+    /// delivery from the forge actually reach this daemon's receive route?
+    ///
+    /// The two forges' test endpoints are not equivalent, and this method
+    /// deliberately does not paper over that: GitHub's ping endpoint is
+    /// fire-and-forget (a bare `204` means the forge *accepted* the
+    /// request, not that this daemon received it -- GitHub reports the
+    /// actual delivery outcome only via its own "Recent Deliveries" UI, not
+    /// synchronously here). GitLab's test endpoint is closer to
+    /// synchronous: it attempts the delivery itself and returns a response
+    /// body describing the outcome, surfaced verbatim in
+    /// [`WebhookTestResult::message`] rather than parsed into a guessed
+    /// shape this code isn't confident is stable across GitLab versions.
+    pub fn test_webhook(&self, hook_id: &str) -> Result<WebhookTestResult, ForgeError> {
+        let token = self.require_token().map_err(ForgeError::other)?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!(
+                    "{}/repos/{}/hooks/{hook_id}/pings",
+                    self.api_base, self.repo_path
+                );
+                self.post_no_body_structured(
+                    ureq::post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(WebhookTestResult {
+                    fired: true,
+                    message: "ping sent -- GitHub does not report delivery success \
+                              synchronously; check the hook's \"Recent Deliveries\" page on \
+                              GitHub to confirm this daemon received it."
+                        .to_string(),
+                })
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/hooks/{hook_id}/test/merge_requests_events",
+                    self.api_base, self.repo_path
+                );
+                let message = self
+                    .post_no_body_structured(ureq::post(&url).set("PRIVATE-TOKEN", token))
+                    .map_err(translate_gitlab_url_blocked)?;
+                Ok(WebhookTestResult {
+                    fired: true,
+                    message,
+                })
+            }
+        }
+    }
+
+    /// `POST` with no request body, returning the response body as raw text
+    /// rather than parsed JSON (Track E, E11) -- both forges' webhook
+    /// test-fire endpoints return diagnostic text worth surfacing verbatim
+    /// (see [`Self::test_webhook`]'s doc comment) rather than a structured
+    /// shape this code would need to guess at.
+    fn post_no_body_structured(&self, req: ureq::Request) -> Result<String, ForgeError> {
+        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.note_rate_limit_headers(&resp);
+        Ok(resp.into_string().unwrap_or_default())
+    }
+
+    /// Read GitHub's `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers off
+    /// a *successful* response and start a backoff window proactively when
+    /// remaining quota is low (Track A / A7) -- before the forge ever
+    /// answers an actual 429/403. The reactive path (A6: back off once a
+    /// rate-limit response actually happens) still exists and still matters
+    /// -- GitLab sends no equivalent headers this codebase knows how to
+    /// parse, and a proactive check can itself race a burst of concurrent
+    /// requests past the threshold -- but this catches the common case
+    /// (steady drain toward exhaustion) before it becomes a hard failure.
+    ///
+    /// Calls [`crate::pr::start_backoff`] directly rather than returning a
+    /// signal for each caller to act on: every read path in this file
+    /// (`get`/`get_structured`/`get_conditional`) shares this one check, and
+    /// [`crate::pr::PR_CACHE_BACKOFF`] is already the single, shared backoff
+    /// table every poller in the daemon consults (A6) -- adding a second
+    /// path for the same table would only invite the two to disagree.
+    fn note_rate_limit_headers(&self, resp: &ureq::Response) {
+        if self.kind != ForgeKind::GitHub {
+            // GitLab's default limit (2,000 req/min) is generous enough
+            // that proactive backoff has not been needed there, and GitLab
+            // does not send `X-RateLimit-*` under these names.
+            return;
+        }
+        let Some(remaining) = resp
+            .header("X-RateLimit-Remaining")
+            .and_then(|v| v.parse::<i64>().ok())
+        else {
+            return;
+        };
+        if remaining > RATE_LIMIT_LOW_WATER_MARK {
+            return;
+        }
+        let retry_after = resp
+            .header("X-RateLimit-Reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|reset_epoch_secs| {
+                let now_epoch_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Duration::from_secs((reset_epoch_secs - now_epoch_secs).max(1) as u64)
+            });
+        crate::pr::start_backoff(self, retry_after);
     }
 
     /// `GET` with conditional-request support (RAL-366): sets `If-None-Match`
@@ -2158,13 +2707,19 @@ impl ForgeClient {
         match req.call() {
             Ok(resp) if resp.status() == 304 => Ok(ConditionalGet::NotModified),
             Ok(resp) => {
+                self.note_rate_limit_headers(&resp);
                 let etag = resp.header("ETag").map(str::to_string);
+                let link_next = resp.header("Link").and_then(parse_link_next);
                 let body = resp
                     .into_string()
                     .map_err(|e| ForgeError::other(format!("forge API read: {e}")))?;
                 let value = serde_json::from_str(&body)
                     .map_err(|e| ForgeError::other(format!("forge API JSON parse: {e}")))?;
-                Ok(ConditionalGet::Modified { value, etag })
+                Ok(ConditionalGet::Modified {
+                    value,
+                    etag,
+                    link_next,
+                })
             }
             // Defensive: not observed with this ureq version's redirect
             // handling (a 304 without `Location` comes back `Ok` above), but
@@ -2207,7 +2762,7 @@ pub struct ForgeError {
 }
 
 impl ForgeError {
-    fn other(message: impl Into<String>) -> Self {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
         Self {
             status: None,
             retry_after: None,
@@ -2249,6 +2804,24 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Parse the `rel="next"` URL out of a GitHub/GitLab pagination `Link`
+/// header (Track A / A8), RFC 5988 form:
+/// `<https://api.github.com/...&page=2>; rel="next", <...&page=5>; rel="last"`.
+/// `None` when there is no `next` entry -- either this is the only/last
+/// page, or the forge sent no `Link` header at all (a page under
+/// [`PER_PAGE`], the overwhelmingly common case, gets no `Link` header from
+/// either forge).
+fn parse_link_next(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url_part, rel_part) = part.split_once(';')?;
+        if rel_part.trim() != r#"rel="next""# {
+            return None;
+        }
+        let url = url_part.trim().strip_prefix('<')?.strip_suffix('>')?;
+        Some(url.to_string())
+    })
+}
+
 fn describe_error(e: ureq::Error) -> ForgeError {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -2264,11 +2837,95 @@ fn describe_error(e: ureq::Error) -> ForgeError {
     }
 }
 
+/// Detect GitLab's SSRF-protection rejection (Track E, E10) -- a `422
+/// Unprocessable Entity` with a body like `{"message":{"url":["is blocked:
+/// Requests to the local network are not allowed"]}}` -- and translate it
+/// into actionable admin guidance. This is overwhelmingly the first-run
+/// failure for a self-hosted GitLab instance, or a `--daemon-url` pointing
+/// at a local/tunneled address, and GitLab's raw error alone doesn't say
+/// where the fix lives: it's an *instance-admin-only* setting ("Allow
+/// requests to the local network from webhooks and integrations" under
+/// Admin Area > Settings > Network > Outbound requests), invisible to
+/// whoever is running `webhook install`/`update` as a project maintainer.
+/// A non-matching error passes through unchanged.
+fn translate_gitlab_url_blocked(e: ForgeError) -> ForgeError {
+    if e.status != Some(422) || !e.message.to_lowercase().contains("is blocked") {
+        return e;
+    }
+    ForgeError {
+        status: e.status,
+        retry_after: e.retry_after,
+        message: format!(
+            "GitLab rejected this webhook URL as pointing to the local network (SSRF \
+             protection). A GitLab instance admin must enable \"Allow requests to the local \
+             network from webhooks and integrations\" under Admin Area > Settings > Network > \
+             Outbound requests before this will succeed -- a project maintainer running this \
+             command cannot change that setting themselves. Original error: {}",
+            e.message
+        ),
+    }
+}
+
 fn parse_body(resp: ureq::Response) -> Result<serde_json::Value, String> {
     let body = resp
         .into_string()
         .map_err(|e| format!("forge API read: {e}"))?;
     serde_json::from_str(&body).map_err(|e| format!("forge API JSON parse: {e}"))
+}
+
+/// Parse one GitHub webhook-management row (`{"id", "config": {"url"},
+/// "active"}`) into a [`ForgeWebhook`] (Track E, E8).
+fn parse_github_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeError> {
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ForgeError::other("missing hook id in GitHub response"))?;
+    let url = v
+        .get("config")
+        .and_then(|c| c.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let active = v
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(ForgeWebhook {
+        id: id.to_string(),
+        url,
+        active,
+        disabled: false,
+    })
+}
+
+/// Parse one GitLab webhook-management row (`{"id", "url", "alert_status"}`)
+/// into a [`ForgeWebhook`] (Track E, E8/E12). GitLab has no boolean `active`
+/// field on this endpoint, so a present row is always reported
+/// `active: true` here -- see [`ForgeWebhook::active`]'s doc comment.
+/// `alert_status` absent or unrecognized is treated as not-disabled: an
+/// older GitLab version without this field, or a value this code doesn't
+/// know about, should never *hide* a working hook's status by defaulting
+/// the other way.
+fn parse_gitlab_webhook(v: &serde_json::Value) -> Result<ForgeWebhook, ForgeError> {
+    let id = v
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ForgeError::other("missing hook id in GitLab response"))?;
+    let url = v
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let disabled = matches!(
+        v.get("alert_status").and_then(serde_json::Value::as_str),
+        Some("disabled" | "temporarily_disabled")
+    );
+    Ok(ForgeWebhook {
+        id: id.to_string(),
+        url,
+        active: true,
+        disabled,
+    })
 }
 
 /// Parse a git remote URL into `(host, path)`, where `path` has no leading
@@ -3799,6 +4456,43 @@ mod tests {
     }
 
     #[test]
+    fn get_pull_request_base_state_always_reaches_the_network_even_for_repeated_calls() {
+        // Track A / A3: a cache here was built and reverted (see
+        // `ForgeClient::fetch_pr_object_for_base_state`'s doc) because a
+        // deliberate immediate re-check after applying a reorder must see a
+        // fresh answer, not a stale cached one -- lock that in.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            for forge_base in ["feature-a", "feature-b"] {
+                let req = server.recv().unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"base": {{"ref": "{forge_base}"}}, "updated_at": "2026-08-29T12:34:56.789Z"}}"#
+                    ))
+                    .with_status_code(200),
+                )
+                .unwrap();
+            }
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        assert_eq!(
+            client.get_pull_request_base_state(9).unwrap().base,
+            "feature-a"
+        );
+        assert_eq!(
+            client.get_pull_request_base_state(9).unwrap().base,
+            "feature-b"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn get_pull_request_base_errors_when_the_forge_response_omits_it() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
@@ -5247,6 +5941,72 @@ mod tests {
         handle.join().unwrap();
     }
 
+    #[test]
+    fn check_pr_ci_status_probe_fetches_the_pr_object_exactly_once() {
+        // Track A / A4: a prior version fetched `/pulls/{n}` twice -- once
+        // for CI status, again purely for the draft flag.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"mergeable_state": "dirty", "draft": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // A second request here would mean the fetch was duplicated.
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let probe = client.check_pr_ci_status_probe(4).unwrap();
+        assert!(probe.draft);
+        assert!(matches!(probe.ci, PrCiState::Failing(_)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn check_pr_ci_status_probe_reads_gitlab_work_in_progress_from_the_same_fetch() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "unchecked", "work_in_progress": true}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            assert!(
+                server
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "group%2Fproj".to_string(),
+            Some("tok".to_string()),
+        );
+        let probe = client.check_pr_ci_status_probe(9).unwrap();
+        assert!(probe.draft);
+        assert_eq!(probe.ci, PrCiState::Pending);
+        handle.join().unwrap();
+    }
+
     // -----------------------------------------------------------------
     // RAL-366: structured forge errors + conditional (ETag) comment fetch
     // -----------------------------------------------------------------
@@ -5327,6 +6087,118 @@ mod tests {
         handle.join().unwrap();
     }
 
+    fn unix_epoch_secs_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn low_remaining_quota_on_a_successful_github_response_starts_a_proactive_backoff() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let reset_at = unix_epoch_secs_now() + 120;
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"base": {"ref": "main"}, "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"5"[..])
+                        .unwrap(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"X-RateLimit-Reset"[..],
+                        reset_at.to_string().as_bytes(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget-a7-low".to_string(),
+            Some("tok".to_string()),
+        );
+        assert!(!crate::pr::is_backed_off(&client));
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(
+            crate::pr::is_backed_off(&client),
+            "a near-exhausted quota must trigger a proactive backoff"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn healthy_remaining_quota_does_not_trigger_a_backoff() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"base": {"ref": "main"}, "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"4999"[..])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget-a7-healthy".to_string(),
+            Some("tok".to_string()),
+        );
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(!crate::pr::is_backed_off(&client));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn gitlab_rate_limit_headers_are_never_consulted() {
+        // GitLab sends no `X-RateLimit-*` header under these names -- a
+        // GitLab client reusing this repo path from a hypothetical GitHub
+        // low-quota response must not be affected by it (and in practice
+        // never would be, since responses are per-client anyway); this pins
+        // that the GitHub-only header check is a deliberate `self.kind`
+        // branch, not an oversight.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"target_branch": "main", "updated_at": "2026-08-29T12:34:56.789Z"}"#,
+                )
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"X-RateLimit-Remaining"[..], &b"1"[..])
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme/widget-a7-gitlab".to_string(),
+            Some("tok".to_string()),
+        );
+        client.get_pull_request_base_state(9).unwrap();
+        assert!(!crate::pr::is_backed_off(&client));
+        handle.join().unwrap();
+    }
+
     #[test]
     fn get_conditional_sends_if_none_match_and_reports_not_modified_on_304() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -5346,6 +6218,189 @@ mod tests {
         let req = ureq::get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_github_sends_if_none_match_and_returns_the_fresh_etag() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"p1\""));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"p2\""[..]).unwrap(),
+                    )
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client
+                .get_pull_request_state_conditional(7, Some("\"p1\""))
+                .unwrap(),
+            PrStatePoll::Modified {
+                state: "merged".to_string(),
+                etag: Some("\"p2\"".to_string()),
+            }
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_reports_not_modified_on_304() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req_header(&req, "If-None-Match").as_deref(), Some("\"p1\""));
+            req.respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client
+                .get_pull_request_state_conditional(7, Some("\"p1\""))
+                .unwrap(),
+            PrStatePoll::NotModified
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pr_state_conditional_gitlab_normalizes_opened_and_sends_no_etag_when_it_has_none() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/3");
+            assert_eq!(req_header(&req, "If-None-Match"), None);
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state":"opened"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        assert_eq!(
+            client.get_pull_request_state_conditional(3, None).unwrap(),
+            PrStatePoll::Modified {
+                state: "open".to_string(),
+                etag: None,
+            }
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn parse_link_next_finds_next_among_multiple_rels() {
+        let header = concat!(
+            r#"<https://api.github.com/x?page=2>; rel="next", "#,
+            r#"<https://api.github.com/x?page=5>; rel="last""#
+        );
+        assert_eq!(
+            parse_link_next(header).as_deref(),
+            Some("https://api.github.com/x?page=2")
+        );
+    }
+
+    #[test]
+    fn parse_link_next_is_none_without_a_next_rel() {
+        let header = r#"<https://api.github.com/x?page=1>; rel="prev""#;
+        assert_eq!(parse_link_next(header), None);
+    }
+
+    #[test]
+    fn list_pr_comments_conditional_follows_a_paginated_link_header() {
+        // Track A / A8: a PR with more than one page of comments must not
+        // silently lose everything past page 1.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let addr_for_thread = addr.clone();
+        let handle = std::thread::spawn(move || {
+            let addr = addr_for_thread;
+            let page1 = server.recv().unwrap();
+            assert_eq!(
+                page1.url(),
+                "/repos/acme/widget/issues/7/comments?per_page=100"
+            );
+            let next_url =
+                format!("http://{addr}/repos/acme/widget/issues/7/comments?per_page=100&page=2");
+            page1
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"id":1,"user":{"login":"alice"},"body":"p1","created_at":"2024-01-01T00:00:00Z"}]"#,
+                    )
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"c1\""[..]).unwrap(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Link"[..],
+                            format!(r#"<{next_url}>; rel="next""#).as_bytes(),
+                        )
+                        .unwrap(),
+                    ),
+            )
+            .unwrap();
+            let page2 = server.recv().unwrap();
+            // The followed request must carry the same auth header a normal
+            // request would, and must not resend the page-1 `If-None-Match`
+            // -- page 2 was never conditionally fetched before.
+            assert_eq!(
+                req_header(&page2, "Authorization").as_deref(),
+                Some("Bearer tok")
+            );
+            assert_eq!(req_header(&page2, "If-None-Match"), None);
+            page2
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"id":2,"user":{"login":"bob"},"body":"p2","created_at":"2024-01-02T00:00:00Z"}]"#,
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client
+            .list_pr_comments_conditional(7, PrCommentEndpoint::Conversation, None)
+            .unwrap();
+        let CommentsPoll::Modified { comments, etag } = result else {
+            panic!("expected Modified, got {result:?}");
+        };
+        assert_eq!(comments.len(), 2, "both pages' comments must be present");
+        assert_eq!(comments[0].author, "alice");
+        assert_eq!(comments[1].author, "bob");
+        // The etag returned must be page 1's -- the only page a future call
+        // can validate against via `If-None-Match`.
+        assert_eq!(etag.as_deref(), Some("\"c1\""));
         handle.join().unwrap();
     }
 
@@ -5476,6 +6531,445 @@ mod tests {
             panic!("expected a fresh body");
         };
         assert_eq!(comments[0].author, "carol");
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E8: webhook management (install/list/uninstall) ───────
+
+    #[test]
+    fn parse_github_webhook_reads_id_url_and_active() {
+        let row = serde_json::json!({
+            "id": 42,
+            "config": {"url": "https://ralphus.example.com/api/forge/webhook/github"},
+            "active": true,
+        });
+        let hook = parse_github_webhook(&row).unwrap();
+        assert_eq!(hook.id, "42");
+        assert_eq!(
+            hook.url,
+            "https://ralphus.example.com/api/forge/webhook/github"
+        );
+        assert!(hook.active);
+    }
+
+    #[test]
+    fn parse_github_webhook_rejects_a_missing_id() {
+        let row = serde_json::json!({"config": {"url": "https://x"}, "active": true});
+        assert!(parse_github_webhook(&row).is_err());
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reads_id_and_url_and_is_always_active() {
+        let row = serde_json::json!({
+            "id": 7,
+            "url": "https://ralphus.example.com/api/forge/webhook/gitlab",
+            "merge_requests_events": true,
+        });
+        let hook = parse_gitlab_webhook(&row).unwrap();
+        assert_eq!(hook.id, "7");
+        assert_eq!(
+            hook.url,
+            "https://ralphus.example.com/api/forge/webhook/gitlab"
+        );
+        assert!(hook.active);
+        assert!(!hook.disabled);
+    }
+
+    // ── Track E, E12: read back hook disabled-state ─────────────────────
+
+    #[test]
+    fn parse_gitlab_webhook_reports_disabled_for_disabled_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "disabled"});
+        assert!(parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_disabled_for_temporarily_disabled_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "temporarily_disabled"});
+        assert!(parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_not_disabled_for_executable_alert_status() {
+        let row = serde_json::json!({"id": 7, "url": "https://x", "alert_status": "executable"});
+        assert!(!parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_gitlab_webhook_reports_not_disabled_when_alert_status_is_absent() {
+        // An older GitLab without this field, or a value this code doesn't
+        // know about, must never hide a hook's status by defaulting the
+        // other way.
+        let row = serde_json::json!({"id": 7, "url": "https://x"});
+        assert!(!parse_gitlab_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn parse_github_webhook_is_never_disabled() {
+        let row = serde_json::json!({
+            "id": 42,
+            "config": {"url": "https://x"},
+            "active": true,
+        });
+        assert!(!parse_github_webhook(&row).unwrap().disabled);
+    }
+
+    #[test]
+    fn create_webhook_posts_the_expected_github_shape() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["config"]["url"],
+                "https://ralphus.example.com/api/forge/webhook/github"
+            );
+            assert_eq!(v["config"]["secret"], "shh");
+            assert_eq!(v["events"], serde_json::json!(["pull_request"]));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":42,"config":{"url":"https://ralphus.example.com/api/forge/webhook/github"},"active":true}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .create_webhook(
+                "https://ralphus.example.com/api/forge/webhook/github",
+                "shh",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "42");
+        assert!(hook.active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_webhook_posts_the_expected_gitlab_shape() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["url"],
+                "https://ralphus.example.com/api/forge/webhook/gitlab"
+            );
+            assert_eq!(v["token"], "shh");
+            assert_eq!(v["merge_requests_events"], true);
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":7,"url":"https://ralphus.example.com/api/forge/webhook/gitlab"}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .create_webhook(
+                "https://ralphus.example.com/api/forge/webhook/gitlab",
+                "shh",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "7");
+        assert!(hook.active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_webhooks_parses_a_github_array() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks");
+            req.respond(tiny_http::Response::from_string(
+                r#"[{"id":1,"config":{"url":"https://a"},"active":true},{"id":2,"config":{"url":"https://b"},"active":false}]"#,
+            ))
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hooks = client.list_webhooks().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].id, "1");
+        assert!(hooks[0].active);
+        assert!(!hooks[1].active);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_webhook_sends_a_delete_to_the_right_url() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Delete);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks/7");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client.delete_webhook("7").unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_webhook_sends_a_github_patch_with_the_new_config() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/42");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                v["config"]["url"],
+                "https://new.example.com/api/forge/webhook/github"
+            );
+            assert_eq!(v["config"]["secret"], "new-secret");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":42,"config":{"url":"https://new.example.com/api/forge/webhook/github"},"active":true}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .update_webhook(
+                "42",
+                "https://new.example.com/api/forge/webhook/github",
+                "new-secret",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "42");
+        assert_eq!(hook.url, "https://new.example.com/api/forge/webhook/github");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn update_webhook_sends_a_gitlab_put_with_the_new_config() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Put);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/hooks/7");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["url"], "https://new.example.com/api/forge/webhook/gitlab");
+            assert_eq!(v["token"], "new-secret");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"id":7,"url":"https://new.example.com/api/forge/webhook/gitlab"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let hook = client
+            .update_webhook(
+                "7",
+                "https://new.example.com/api/forge/webhook/gitlab",
+                "new-secret",
+            )
+            .unwrap();
+        assert_eq!(hook.id, "7");
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E10: GitLab "url is blocked" (SSRF protection) translation ──
+
+    #[test]
+    fn translate_gitlab_url_blocked_rewrites_the_message_and_keeps_the_status() {
+        let raw = ForgeError {
+            status: Some(422),
+            retry_after: None,
+            message: r#"forge API 422: {"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#.to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw);
+        assert_eq!(translated.status, Some(422));
+        assert!(
+            String::from(translated.clone()).contains("instance admin"),
+            "{}",
+            String::from(translated)
+        );
+    }
+
+    #[test]
+    fn translate_gitlab_url_blocked_passes_through_unrelated_errors() {
+        let raw = ForgeError {
+            status: Some(404),
+            retry_after: None,
+            message: "forge API 404: not found".to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw.clone());
+        assert_eq!(String::from(translated), String::from(raw));
+    }
+
+    #[test]
+    fn translate_gitlab_url_blocked_ignores_a_422_with_unrelated_text() {
+        // Same status, different reason -- must not be misidentified as the
+        // SSRF-protection case.
+        let raw = ForgeError {
+            status: Some(422),
+            retry_after: None,
+            message: r#"forge API 422: {"message":{"url":["is invalid"]}}"#.to_string(),
+        };
+        let translated = translate_gitlab_url_blocked(raw.clone());
+        assert_eq!(String::from(translated), String::from(raw));
+    }
+
+    #[test]
+    fn create_webhook_translates_gitlabs_blocked_url_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#,
+                )
+                .with_status_code(422),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client
+            .create_webhook("http://127.0.0.1:9999/api/forge/webhook/gitlab", "shh")
+            .unwrap_err();
+        assert_eq!(err.status, Some(422));
+        assert!(
+            String::from(err).contains("instance admin"),
+            "GitLab's blocked-url error should be translated into admin guidance"
+        );
+        handle.join().unwrap();
+    }
+
+    // ── Track E, E11: webhook reachability (test-fire) ──────────────────
+
+    #[test]
+    fn test_webhook_github_pings_the_right_url_and_reports_fired() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/hooks/42/pings");
+            req.respond(tiny_http::Response::empty(204)).unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client.test_webhook("42").unwrap();
+        assert!(result.fired);
+        assert!(result.message.contains("Recent Deliveries"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_webhook_gitlab_hits_the_right_trigger_url_and_surfaces_the_body() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(
+                req.url(),
+                "/projects/acme%2Fwidget/hooks/7/test/merge_requests_events"
+            );
+            req.respond(tiny_http::Response::from_string(r#"{"message":"ok"}"#))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let result = client.test_webhook("7").unwrap();
+        assert!(result.fired);
+        assert_eq!(result.message, r#"{"message":"ok"}"#);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_webhook_gitlab_translates_a_blocked_url_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"message":{"url":["is blocked: Requests to the local network are not allowed"]}}"#,
+                )
+                .with_status_code(422),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let err = client.test_webhook("7").unwrap_err();
+        assert!(String::from(err).contains("instance admin"));
         handle.join().unwrap();
     }
 }

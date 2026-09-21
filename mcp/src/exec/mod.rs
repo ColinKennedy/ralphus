@@ -134,7 +134,7 @@ fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {
         }
         if args.wait {
             if let Some(id) = &squad_id {
-                return Ok(wait_for_terminal(client, id)?);
+                return wait_for_terminal(client, id);
             }
         }
         Ok(result)
@@ -156,25 +156,52 @@ fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {
     submit_one(&texts.join("\n\n"))
 }
 
+/// How long `wait_for_terminal` waits for a squad to reach a terminal state
+/// before giving up (Track C / C1). Was unbounded: an MCP tool call has no
+/// way to signal "still working" the way the CLI's own progress printing
+/// does, so a squad that never reaches `done`/`failed`/`cancelled` pinned
+/// the calling MCP tool call forever. Generous rather than tight --
+/// agent-run squads legitimately take tens of minutes, and the failure mode
+/// this guards against is "forever", not "slower than ideal": 30 minutes is
+/// a bound that only ever bites a squad that is genuinely stuck.
+const WAIT_FOR_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// A silent (no progress printing) version of `misc::wait_for_terminal` --
 /// polls until the squad reaches a terminal state and returns it, without
 /// `println!`ing each transition (MCP has no per-tool-call progress
 /// channel to print to; a caller that wants incremental status can call
 /// `status`/`listen` itself).
-fn wait_for_terminal(
-    client: &DaemonClient,
-    squad_id: &str,
-) -> Result<Value, ralphus_cli::client::DaemonError> {
-    loop {
-        let squad = client.squad(squad_id)?;
-        if matches!(
-            squad["state"].as_str(),
-            Some("done" | "failed" | "cancelled")
-        ) {
-            return Ok(squad);
+///
+/// Bounded by [`WAIT_FOR_TERMINAL_TIMEOUT`] (Track C / C1): past that, the
+/// caller gets an explicit error naming the squad id rather than the call
+/// hanging indefinitely, and can check on it via `status`/`listen` instead.
+fn wait_for_terminal(client: &DaemonClient, squad_id: &str) -> ExecResult {
+    let check = || -> Option<ExecResult> {
+        match client.squad(squad_id) {
+            Ok(squad)
+                if matches!(
+                    squad["state"].as_str(),
+                    Some("done" | "failed" | "cancelled")
+                ) =>
+            {
+                Some(Ok(squad))
+            }
+            Ok(_) => None,
+            Err(e) => Some(Err(e.into())),
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    };
+    misc::wait_for(
+        client,
+        Some(WAIT_FOR_TERMINAL_TIMEOUT.as_secs_f64()),
+        check,
+    )
+    .unwrap_or_else(|| {
+        Err(usage(format!(
+            "squad {squad_id} did not reach a terminal state within {}s -- \
+             it may still be running; check its status with `status`/`listen` instead of waiting further",
+            WAIT_FOR_TERMINAL_TIMEOUT.as_secs()
+        )))
+    })
 }
 
 fn exec_status(client: &DaemonClient, squad_id: Option<String>, concurrency: bool) -> ExecResult {
@@ -318,21 +345,26 @@ fn exec_history(client: &DaemonClient, sel: &str) -> ExecResult {
     }))
 }
 
+/// Track C / C4: driven by the daemon's push channel via `misc::wait_for`
+/// instead of a fixed 1s poll -- see that function's doc, and C3's
+/// equivalent change to the CLI's own `cmd_listen`, which this mirrors.
 fn exec_listen(client: &DaemonClient, sel: &str, until: &str, timeout: Option<f64>) -> ExecResult {
     let target = until.to_lowercase();
-    let start = std::time::Instant::now();
-    loop {
-        let (kind, status) = misc::listen_status(client, sel)?;
-        if status.to_lowercase() == target {
-            return Ok(json!({"selector": sel, "kind": kind, "status": status}));
-        }
-        if let Some(t) = timeout {
-            if start.elapsed().as_secs_f64() >= t {
-                return Err(usage(format!("timed out after {t}s waiting for '{until}'")));
+    let check = || -> Option<Result<Value, CommandError>> {
+        match misc::listen_status(client, sel) {
+            Ok((kind, status)) if status.to_lowercase() == target => {
+                Some(Ok(json!({"selector": sel, "kind": kind, "status": status})))
             }
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    };
+    misc::wait_for(client, timeout, check).unwrap_or_else(|| {
+        Err(usage(format!(
+            "timed out after {}s waiting for '{until}'",
+            timeout.unwrap_or_default()
+        )))
+    })
 }
 
 fn exec_clear(client: &DaemonClient, args: misc::ClearArgs) -> ExecResult {

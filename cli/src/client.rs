@@ -74,14 +74,21 @@ impl DaemonClient {
         &self.base_url
     }
 
-    fn url(&self, path: &str) -> String {
+    /// `pub(crate)` (Track C / C2) so `sse::EventStream::connect` can build
+    /// the `/api/events?ticket=...` URL itself -- that request is a
+    /// long-lived streaming `GET` the shared `get`/`post`/... helpers below
+    /// can't serve (they read the whole body into one `String`), so it is
+    /// built and issued directly in `sse.rs` rather than through them.
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url.trim_end_matches('/'))
     }
 
     /// Attach `Authorization: Bearer <token>` when a token is available, so
     /// the daemon's RAL-219 auth gate doesn't reject every request. Mirrors
     /// `librarian/src/server.rs::daemon_token()`/`proxy()`.
-    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+    /// `pub(crate)` (Track C / C2) -- see [`Self::url`]'s doc for why
+    /// `sse::EventStream::connect` needs this directly.
+    pub(crate) fn authorize(&self, req: ureq::Request) -> ureq::Request {
         match daemon_token() {
             Some(token) => req.set("Authorization", &format!("Bearer {token}")),
             None => req,
@@ -98,7 +105,10 @@ impl DaemonClient {
         self.finish(path, req.call())
     }
 
-    fn post(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
+    /// `pub(crate)` (Track C / C2) so `sse::EventStream::connect` can mint
+    /// its `/api/events` ticket via `POST /api/events/ticket` through the
+    /// same tested path every other daemon write uses.
+    pub(crate) fn post(&self, path: &str, payload: Option<Value>) -> Result<Value, DaemonError> {
         let req = self.authorize(
             ureq::post(&self.url(path))
                 .timeout(self.timeout)
@@ -537,6 +547,66 @@ impl DaemonClient {
             format!("/api/projects/{project}/forks/{user}")
         };
         self.delete(&path)
+    }
+
+    /// `POST /api/projects/{name}/webhook/install` (Track E, E8).
+    /// `daemon_url` is this daemon's own externally-reachable base URL --
+    /// there is no way for the daemon process to determine that itself
+    /// (NAT, a reverse proxy, a tunnel), so the caller supplies it.
+    pub fn install_project_webhook(
+        &self,
+        project: &str,
+        daemon_url: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/install"),
+            Some(json!({"daemon_url": daemon_url})),
+        )
+    }
+
+    /// `GET /api/projects/{name}/webhook/status` (Track E, E8).
+    pub fn project_webhook_status(&self, project: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{project}/webhook/status"))
+    }
+
+    /// `POST /api/projects/{name}/webhook/uninstall` (Track E, E8).
+    pub fn uninstall_project_webhook(
+        &self,
+        project: &str,
+        hook_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/uninstall"),
+            Some(json!({"hook_id": hook_id})),
+        )
+    }
+
+    /// `POST /api/projects/{name}/webhook/update` (Track E, E9): rotate the
+    /// secret and/or callback URL on the webhook this daemon previously
+    /// recorded installing for the project, without changing its id.
+    pub fn update_project_webhook(
+        &self,
+        project: &str,
+        daemon_url: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/projects/{project}/webhook/update"),
+            Some(json!({"daemon_url": daemon_url})),
+        )
+    }
+
+    /// `POST /api/projects/{name}/webhook/check` (Track E, E11): fire the
+    /// forge's own webhook test/ping mechanism against the hook recorded
+    /// installed for the project -- a reachability check.
+    pub fn check_project_webhook(&self, project: &str) -> Result<Value, DaemonError> {
+        self.post(&format!("/api/projects/{project}/webhook/check"), None)
+    }
+
+    /// `GET /api/projects/{name}/webhook/shadow-scorecard` (Track F, F3):
+    /// aggregates the project's shadow-mode delivery history into a
+    /// scorecard.
+    pub fn project_webhook_shadow_scorecard(&self, project: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/projects/{project}/webhook/shadow-scorecard"))
     }
 
     /// Agent-profile health, evaluated inside the daemon process so

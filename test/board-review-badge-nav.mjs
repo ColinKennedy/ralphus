@@ -137,6 +137,7 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
     pollBranchConflicts: async () => {},
     pollPullRequests: async () => {},
     pollPrErrors: async () => {},
+    applyPrForgeCacheIndex: async () => {},
     fetchGuardianDetail: async () => {},
     preserveUserState: (_el, fn) => fn(),
     renderReviews: () => { calls.renderReviews++; },
@@ -149,7 +150,7 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
     "deps",
     "fetchImpl",
     `const { checkGuardianNotices, byId, markUpdated, findGuardian, visibleGuardians, syncHash, refreshExpandedBranchMessages,
-             pollBranchConflicts, pollPullRequests, pollPrErrors, fetchGuardianDetail, preserveUserState, renderReviews, renderReviewDetail,
+             pollBranchConflicts, pollPullRequests, pollPrErrors, applyPrForgeCacheIndex, fetchGuardianDetail, preserveUserState, renderReviews, renderReviewDetail,
              selectionWithin, document } = deps;
      const fetch = fetchImpl;
      var guardians = ${JSON.stringify(initialGuardians)}, selectedGuardian = null, revealedGuardianId = null,

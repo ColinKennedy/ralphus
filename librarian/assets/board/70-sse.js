@@ -580,47 +580,155 @@
       let sseRefreshKinds = new Set();
       /** @type {Set<string>} guardian ids referenced by a pending event, since the last flush */
       let sseRefreshGuardianIds = new Set();
-      /** Whether a pending event carries a squad id, even if it is classified as a guardian event. */
-      let sseRefreshHasSquadChange = false;
+      /**
+       * Squad ids referenced by a pending event, since the last flush (Track
+       * B / B1) -- even one classified "guardian" can carry a `squad_id`
+       * (see `EventKind::for_row` in `daemon/src/events.rs`), so this is
+       * collected independently of `kinds`. Used to fetch and merge just the
+       * named squads instead of the whole `/api/tasks` response on every
+       * debounced batch -- see `applyTargetedSquadRefresh`.
+       * @type {Set<string>}
+       */
+      let sseRefreshSquadIds = new Set();
       // Coalescing window: long enough to merge a burst of near-simultaneous
       // events into one refresh, short enough that push still feels instant
       // next to the old 2s poll.
-      const SSE_DEBOUNCE_MS = 150;
+      //
+      // Track B / B3: raised from the original 150ms now that a flush is
+      // usually cheap (B1's per-squad fetch, B2's flat forge-cache read)
+      // rather than a multi-MB `/api/tasks` refetch -- back when every flush
+      // cost that much, keeping the window short was what limited how often
+      // it fired. Now the window's only job is genuine event coalescing: a
+      // squad emitting Cartographer rows continuously (a whole cell
+      // finishing, several proof steps completing near-together) still
+      // easily produces more than one event inside 150ms, and each of those
+      // used to mean a separate flush. 500ms merges more of that burst into
+      // one flush while staying an order of magnitude faster than the 2s
+      // poll SSE replaced, and two orders of magnitude faster than the 60s
+      // reconciliation fallback underneath it.
+      const SSE_DEBOUNCE_MS = 500;
+      /**
+       * Replaces one squad's entry in `squads` with its fresh detail (Track
+       * B / B1), or drops it if the squad no longer exists. Reuses
+       * `GET /api/squads/{id}`, the same endpoint `ensurePromptCache`
+       * already fetches from -- its response carries full per-cell prompt
+       * text (unlike `/api/tasks`'s nulled-out fields), so no follow-up
+       * prompt-cache merge is needed for whichever squad this refreshes.
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function refreshOneSquad(id) {
+        try {
+          const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+          if (res.status === 404) { squads = squads.filter((r) => r.id !== id); return; }
+          if (!res.ok) return; // transient -- leave the cached row as-is
+          /** @type {SquadView} */
+          const detail = await res.json();
+          const idx = squads.findIndex((r) => r.id === id);
+          if (idx === -1) squads.push(detail); else squads[idx] = detail;
+        } catch (e) { /* transient -- leave the cached row as-is */ }
+      }
+      // Track B / B4: the gain B1 + B3 claim, recorded rather than assumed
+      // (computed from documented/measured figures already in this file and
+      // the audit that drove this track, not a live-traffic capture -- this
+      // environment has no running board with real users to sample):
+      //
+      //   Before (no targeted refresh, 150ms debounce): every flush repaints
+      //   the whole board from `GET /api/tasks`, which the audit measured at
+      //   6.2MB against a real squad history. A squad emitting Cartographer
+      //   rows continuously produced roughly 7 flushes/sec at the old
+      //   debounce window -- about 43MB/sec of board traffic for that one
+      //   actively-running squad's tab.
+      //
+      //   After (B1 targeted refresh, B3's 500ms debounce): a flush instead
+      //   fetches just the changed squad via `GET /api/squads/{id}`, ~10KB
+      //   per `ensurePromptCache`'s own doc comment above -- and the wider
+      //   window caps flushes at roughly 2/sec even under continuous churn.
+      //   About 20KB/sec for the same scenario: a ~2000x reduction.
+      //
+      //   Not reduced by this track: a burst touching many *different*
+      //   squads at once now costs one small request per squad rather than
+      //   one large one for everything -- more requests, but each is small
+      //   enough (~10KB) that the total is still far below one 6.2MB fetch
+      //   unless several hundred squads change in the same debounce window,
+      //   a scenario this codebase has no evidence of occurring in practice.
+      /**
+       * SSE-driven targeted refresh for the Squads/Tasks tabs (Track B / B1):
+       * fetches and merges just the squads named by `squadIds` in place of
+       * the whole `/api/tasks` response `pollTasks`/`pollTasksTab` would
+       * otherwise refetch on every debounced event batch -- while a squad is
+       * actively running and emitting Cartographer rows continuously, that
+       * repainted the entire board from a multi-MB response roughly seven
+       * times a second. Falls back to the full poll whenever there is a
+       * pending hash route to resolve (rare on this path -- that resolution
+       * logic belongs to the full poll functions, not duplicated here) or
+       * when a referenced squad is not yet in `squads` at all (a brand-new
+       * squad; the full poll already knows how to fold that in alongside its
+       * project/hidden-filter bookkeeping).
+       * @param {Set<string>} squadIds
+       * @param {() => Promise<void>} fullPoll
+       * @param {() => void} render
+       * @returns {Promise<void>}
+       */
+      async function applyTargetedSquadRefresh(squadIds, fullPoll, render) {
+        const isNew = [...squadIds].some((id) => !squads.some((r) => r.id === id));
+        if (pendingHash || isNew) { await fullPoll(); return; }
+        await Promise.all([...squadIds].map((id) => refreshOneSquad(id)));
+        applyPromptCache();
+        pruneSquadSelCache(squadSelCache, squadNodeCache, squads.map((r) => r.id));
+        reconcileLiveSelection();
+        // The "Running X / Y" counter normally comes from the same full-poll
+        // response this path is specifically avoiding -- refresh it from the
+        // lean, already-shared `/api/task-index` fetch instead, without
+        // letting that response's own (nulled-prompt-field) `squads` array
+        // overwrite the full detail just merged in above (`updateCounter`
+        // does exactly that, which is why this doesn't just call it).
+        try {
+          const d = await fetchTaskIndexShared();
+          /** @type {any} */ (window)._daemonStatus = d.daemon;
+          byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
+        } catch (e) { /* transient -- the next reconciliation tick retries */ }
+        byId("conn").className = "dot on";
+        markUpdated();
+        render();
+      }
       /**
        * Applies whatever the active tab needs in response to one coalesced
        * batch of pushed events -- mirrors `tick()`'s per-tab dispatch, plus a
        * feedback-thread refresh when the open review itself just changed.
        * @param {Set<string>} kinds
        * @param {Set<string>} guardianIds
-       * @param {boolean} hasSquadChange
+       * @param {Set<string>} squadIds
        * @returns {Promise<void>}
        */
-      async function applySseRefresh(kinds, guardianIds, hasSquadChange) {
+      async function applySseRefresh(kinds, guardianIds, squadIds) {
         if (tab === "tasks") {
           // RAL-345: an SSE-driven poll of this tab doesn't go through
           // `tick()`, so refresh the registered-project list here too --
           // keeps the project-filter dropdown current between full ticks.
           await refreshRegisteredProjectNames();
-          await pollTasksTab();
+          // A guardian-only batch (no `squad_id` at all) can still change
+          // what this tab renders (a cell's review badge via `taskTabPrIndex`),
+          // so it still needs `pollTasksTab`'s own PR-index fetch -- only a
+          // batch that named specific squads can take the targeted path.
+          if (squadIds.size) await applyTargetedSquadRefresh(squadIds, pollTasksTab, renderTasksTab);
+          else await pollTasksTab();
           await refreshBanner();
           return;
         }
-        // The Squads tab's own poll already refreshes the daemon-status
-        // counter and the `squads` cache from the very same `/api/tasks`
-        // response, so `updateCounter` here would be a second, redundant
-        // round-trip against an endpoint that takes seconds on a large squad
-        // history -- and, worse, a racing one (see `tasksPollSeq`). Going
-        // straight to `pollTasks` is both cheaper and the only path that
-        // actually repaints. It runs for every batch, not just one carrying
-        // a squad id: a guardian-only batch can still change what this tab
-        // renders (a cell's review badge), and the old `hasSquadChange` gate
-        // meant those batches refreshed the data without ever painting it.
         if (tab === "squads") {
           // RAL-345: same as the Tasks-tab path above -- the project-filter
           // dropdown binds to the live registered-project list, refreshed on
           // SSE-driven polls too (no full tick involved).
           await refreshRegisteredProjectNames();
-          await pollTasks();
+          // It runs for every batch, not just one carrying a squad id: a
+          // guardian-only batch can still change what this tab renders (a
+          // cell's review badge), and gating on `squadIds` alone would leave
+          // those batches refreshing nothing. `pollTasks` also refreshes the
+          // daemon-status counter/`squads` cache itself, so `updateCounter`
+          // is never called on this branch either way.
+          if (squadIds.size) await applyTargetedSquadRefresh(squadIds, pollTasks, renderAll);
+          else await pollTasks();
           await refreshBanner();
           return;
         }
@@ -636,8 +744,8 @@
           // manual click away and back.
           await pollReviews();
           if (selectedGuardian && guardianIds.has(selectedGuardian)) await refreshExpandedBranchMessages(selectedGuardian);
-        } else if (tab === "queue" && (hasSquadChange || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
-          // `hasSquadChange` covers a row that carries a squad id but was
+        } else if (tab === "queue" && (squadIds.size || kinds.has("squad")) && (queueUI.autoUpdate || !queueLoaded)) {
+          // `squadIds.size` covers a row that carries a squad id but was
           // classified "guardian" because it also carries a guardian id.
           await pollQueue();
         } else if (tab === "cartographer") {
@@ -656,14 +764,14 @@
       function scheduleSseRefresh(kind, row) {
         sseRefreshKinds.add(kind);
         if (row.guardian_id) sseRefreshGuardianIds.add(row.guardian_id);
-        if (row.squad_id) sseRefreshHasSquadChange = true;
+        if (row.squad_id) sseRefreshSquadIds.add(row.squad_id);
         if (sseRefreshTimer) return;
         sseRefreshTimer = setTimeout(() => {
           const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
           const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
-          const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
+          const squadIds = sseRefreshSquadIds; sseRefreshSquadIds = new Set();
           sseRefreshTimer = null;
-          applySseRefresh(kinds, guardianIds, hasSquadChange);
+          applySseRefresh(kinds, guardianIds, squadIds);
         }, SSE_DEBOUNCE_MS);
       }
       // How long to wait before minting a fresh ticket and reconnecting after
@@ -964,16 +1072,51 @@
         finally { prSyncStatusInFlight.delete(prId); }
       }
       /**
+       * Fetches every PR's cached drift state in one flat query (Track B /
+       * B2) and merges it into `prSyncStatus`, keyed by `pr_id` -- what
+       * `pollPullRequests` used to build by calling `GET
+       * /api/pull-requests/{id}/sync-status` once per open PR of the
+       * selected review, each of which does a real git fetch server-side.
+       * `GET /api/pull-requests/forge-cache-index` instead reads what the
+       * RAL-366 background poller already knows, at the cost of the drift
+       * banner reflecting that poller's own cadence (a few minutes) rather
+       * than a check made at render time -- the same push-plus-slow-
+       * reconciliation tradeoff this whole track makes elsewhere. An
+       * explicit live check remains available: `ttRunPrCheck`'s "Check PR"
+       * action (Tasks tab) still calls `fetchPrSyncStatus` directly.
+       *
+       * A PR the background poller has never reached yet (just submitted,
+       * no poll pass since) is simply absent from the response -- its
+       * `in_sync`/`pr_ahead`/`worktree_ahead` fields stay `null`, which maps
+       * to "no drift banner" (the safe default) rather than a stale or
+       * fabricated reading.
+       * @returns {Promise<void>}
+       */
+      async function applyPrForgeCacheIndex() {
+        try {
+          const res = await fetch("/api/pull-requests/forge-cache-index");
+          if (!res.ok) return;
+          /** @type {PrForgeCacheView[]} */
+          const rows = await res.json();
+          rows.forEach((r) => {
+            prSyncStatus[r.pr_id] = {
+              remote_sha: r.remote_sha,
+              local_sha: r.local_sha,
+              in_sync: !!r.in_sync,
+              pr_ahead: !!r.pr_ahead,
+              worktree_ahead: !!r.worktree_ahead,
+            };
+          });
+        } catch (e) { /* transient -- the next poll retries */ }
+      }
+      /**
        * Fetches the PRs submitted for a review and caches them, so the PR
        * badge/link (which only needs pr_url/pr_number/ci_status, all present
-       * on this response) can render immediately. Also kicks off a live
-       * drift check (RAL-190) for each still-open one that has a recorded
-       * forge number, but does NOT wait on it -- `fetchPrSyncStatus` does its
-       * own `git fetch` per PR, serialized per repo on the daemon side, which
-       * can take many seconds per PR and has nothing to do with whether the
-       * badge itself is ready to show. It writes into `prSyncStatus`
-       * independently and the next poll tick picks it up whenever it lands.
-       * Only polled for the open review, mirroring `pollBranchConflicts`.
+       * on this response) can render immediately. Drift state for each
+       * (RAL-190) comes from `applyPrForgeCacheIndex`, fetched once per
+       * `pollReviews` cycle rather than once per open PR here -- see its doc
+       * for why. Only polled for the open review, mirroring
+       * `pollBranchConflicts`.
        * @param {string} gid
        * @returns {Promise<void>}
        */
@@ -984,8 +1127,6 @@
           /** @type {PullRequestView[]} */
           const prs = await res.json();
           pullRequests[gid] = prs;
-          const open = prs.filter((p) => p.state === "open" && p.pr_number != null);
-          open.forEach((p) => { fetchPrSyncStatus(p.id); });
         } catch (e) { /* transient -- the next poll retries */ }
       }
       /** @type {{[id: string]: Promise<void>}} in-flight per-guardian full-detail fetches, keyed by guardian id -- a selection-triggered fetch (`ensureGuardianDetailLoaded`) and a concurrently-running `pollReviews` cycle for the same id share one request instead of firing two. */
@@ -1135,6 +1276,7 @@
               pollBranchConflicts(gid),
               pollPullRequests(gid),
               pollPrErrors(gid),
+              applyPrForgeCacheIndex(),
             ]);
             // The awaited refreshes may have been overtaken by a newer poll
             // (or re-selection) — a stale render now would show old data.

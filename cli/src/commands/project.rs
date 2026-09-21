@@ -47,6 +47,26 @@ pub enum ProjectCommand {
     },
     Fork(ProjectForkCommand),
     ReviewSettings(ProjectReviewSettingsCommand),
+    Webhook(ProjectWebhookCommand),
+    UsageError(String),
+}
+
+/// `ralphus project webhook <subcommand>` (Track E, E8/E9): explicit,
+/// manually-triggered install/status/uninstall/update of a live webhook on
+/// a project's forge repo, pointed at this daemon's own receive route
+/// (`POST /api/forge/webhook/{provider}`). `update` (E9) rotates the
+/// secret and/or callback URL on an already-installed hook without
+/// changing its id; project-removal cleanup is automatic (server-side,
+/// `DELETE /api/projects/{name}`), not a CLI action.
+#[derive(Debug, Clone)]
+pub enum ProjectWebhookCommand {
+    Help,
+    Install { project: String, daemon_url: String },
+    Status { project: String },
+    Uninstall { project: String, hook_id: String },
+    Update { project: String, daemon_url: String },
+    Check { project: String },
+    ShadowScorecard { project: String },
     UsageError(String),
 }
 
@@ -141,8 +161,100 @@ pub fn parse(args: &[String]) -> ProjectCommand {
         Some("review-settings") => {
             ProjectCommand::ReviewSettings(parse_review_settings(&scanner.remaining()))
         }
+        Some("webhook") => ProjectCommand::Webhook(parse_webhook(&scanner.remaining())),
         Some(other) => ProjectCommand::UsageError(format!("unknown project subcommand: {other}")),
     }
+}
+
+fn parse_webhook(args: &[String]) -> ProjectWebhookCommand {
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ProjectWebhookCommand::Help,
+        Some("install") => match parse_webhook_install(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectWebhookCommand::UsageError(e.0),
+        },
+        Some("status") => match scanner.clone().remaining().into_iter().next() {
+            Some(project) => ProjectWebhookCommand::Status { project },
+            None => ProjectWebhookCommand::UsageError(
+                "project webhook status requires a <project> argument".to_string(),
+            ),
+        },
+        Some("uninstall") => match parse_webhook_uninstall(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectWebhookCommand::UsageError(e.0),
+        },
+        Some("update") => match parse_webhook_update(&mut scanner) {
+            Ok(cmd) => cmd,
+            Err(e) => ProjectWebhookCommand::UsageError(e.0),
+        },
+        Some("check") => match scanner.clone().remaining().into_iter().next() {
+            Some(project) => ProjectWebhookCommand::Check { project },
+            None => ProjectWebhookCommand::UsageError(
+                "project webhook check requires a <project> argument".to_string(),
+            ),
+        },
+        Some("shadow-scorecard") => match scanner.clone().remaining().into_iter().next() {
+            Some(project) => ProjectWebhookCommand::ShadowScorecard { project },
+            None => ProjectWebhookCommand::UsageError(
+                "project webhook shadow-scorecard requires a <project> argument".to_string(),
+            ),
+        },
+        Some(other) => ProjectWebhookCommand::UsageError(format!(
+            "unknown project webhook subcommand: {other}"
+        )),
+    }
+}
+
+fn parse_webhook_update(scanner: &mut Scanner) -> Result<ProjectWebhookCommand, UsageError> {
+    let daemon_url = scanner.take_value("--daemon-url")?;
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project webhook update requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(daemon_url) = daemon_url else {
+        return Err(UsageError(
+            "project webhook update requires --daemon-url".to_string(),
+        ));
+    };
+    Ok(ProjectWebhookCommand::Update {
+        project,
+        daemon_url,
+    })
+}
+
+fn parse_webhook_install(scanner: &mut Scanner) -> Result<ProjectWebhookCommand, UsageError> {
+    let daemon_url = scanner.take_value("--daemon-url")?;
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project webhook install requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(daemon_url) = daemon_url else {
+        return Err(UsageError(
+            "project webhook install requires --daemon-url".to_string(),
+        ));
+    };
+    Ok(ProjectWebhookCommand::Install {
+        project,
+        daemon_url,
+    })
+}
+
+fn parse_webhook_uninstall(scanner: &mut Scanner) -> Result<ProjectWebhookCommand, UsageError> {
+    let hook_id = scanner.take_value("--hook-id")?;
+    let Some(project) = scanner.clone().remaining().into_iter().next() else {
+        return Err(UsageError(
+            "project webhook uninstall requires a <project> argument".to_string(),
+        ));
+    };
+    let Some(hook_id) = hook_id else {
+        return Err(UsageError(
+            "project webhook uninstall requires --hook-id".to_string(),
+        ));
+    };
+    Ok(ProjectWebhookCommand::Uninstall { project, hook_id })
 }
 
 fn non_empty(s: Option<String>) -> Option<String> {
@@ -434,6 +546,115 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
         },
         ProjectCommand::Fork(cmd) => dispatch_fork(cmd, opts),
         ProjectCommand::ReviewSettings(cmd) => dispatch_review_settings(cmd, opts),
+        ProjectCommand::Webhook(cmd) => dispatch_webhook(cmd, opts),
+    }
+}
+
+#[must_use]
+fn dispatch_webhook(cmd: ProjectWebhookCommand, opts: &GlobalOpts) -> i32 {
+    let client = opts.client();
+    match cmd {
+        ProjectWebhookCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["project", "webhook"])
+                    .expect("project webhook help exists")
+            );
+            0
+        }
+        ProjectWebhookCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ProjectWebhookCommand::Install {
+            project,
+            daemon_url,
+        } => match client.install_project_webhook(&project, &daemon_url) {
+            Ok(hook) => {
+                println!("installed webhook for project \"{project}\"");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&hook).unwrap_or_default()
+                );
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectWebhookCommand::Status { project } => {
+            match client.project_webhook_status(&project) {
+                Ok(status) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&status).unwrap_or_default()
+                    );
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    2
+                }
+            }
+        }
+        ProjectWebhookCommand::Uninstall { project, hook_id } => {
+            match client.uninstall_project_webhook(&project, &hook_id) {
+                Ok(_) => {
+                    println!("removed webhook {hook_id} from project \"{project}\"");
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    1
+                }
+            }
+        }
+        ProjectWebhookCommand::Update {
+            project,
+            daemon_url,
+        } => match client.update_project_webhook(&project, &daemon_url) {
+            Ok(hook) => {
+                println!("updated webhook for project \"{project}\"");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&hook).unwrap_or_default()
+                );
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectWebhookCommand::Check { project } => match client.check_project_webhook(&project) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).unwrap_or_default()
+                );
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        ProjectWebhookCommand::ShadowScorecard { project } => {
+            match client.project_webhook_shadow_scorecard(&project) {
+                Ok(card) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&card).unwrap_or_default()
+                    );
+                    0
+                }
+                Err(e) => {
+                    CommandError::Daemon(e).print(false, None);
+                    2
+                }
+            }
+        }
     }
 }
 
@@ -1267,6 +1488,179 @@ mod tests {
         assert!(matches!(
             parse(&v(&["review-settings", "bogus"])),
             ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    // ── Track E, E8: project webhook install/status/uninstall ──────────
+
+    #[test]
+    fn parses_webhook_install_with_required_flags() {
+        match parse(&v(&[
+            "webhook",
+            "install",
+            "proj",
+            "--daemon-url",
+            "https://ralphus.example.com",
+        ])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Install {
+                project,
+                daemon_url,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(daemon_url, "https://ralphus.example.com");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_install_requires_daemon_url() {
+        assert!(matches!(
+            parse(&v(&["webhook", "install", "proj"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_install_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&[
+                "webhook",
+                "install",
+                "--daemon-url",
+                "https://ralphus.example.com"
+            ])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_status() {
+        match parse(&v(&["webhook", "status", "proj"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Status { project }) => {
+                assert_eq!(project, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_status_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&["webhook", "status"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_uninstall_with_required_flags() {
+        match parse(&v(&["webhook", "uninstall", "proj", "--hook-id", "9"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Uninstall { project, hook_id }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(hook_id, "9");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_uninstall_requires_hook_id() {
+        assert!(matches!(
+            parse(&v(&["webhook", "uninstall", "proj"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn bare_webhook_is_help() {
+        assert!(matches!(
+            parse(&v(&["webhook"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn unknown_webhook_subcommand_is_a_usage_error() {
+        assert!(matches!(
+            parse(&v(&["webhook", "bogus"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_update_with_required_flags() {
+        match parse(&v(&[
+            "webhook",
+            "update",
+            "proj",
+            "--daemon-url",
+            "https://new.example.com",
+        ])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Update {
+                project,
+                daemon_url,
+            }) => {
+                assert_eq!(project, "proj");
+                assert_eq!(daemon_url, "https://new.example.com");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_update_requires_daemon_url() {
+        assert!(matches!(
+            parse(&v(&["webhook", "update", "proj"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn webhook_update_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&[
+                "webhook",
+                "update",
+                "--daemon-url",
+                "https://new.example.com"
+            ])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_check() {
+        match parse(&v(&["webhook", "check", "proj"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::Check { project }) => {
+                assert_eq!(project, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_check_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&["webhook", "check"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_webhook_shadow_scorecard() {
+        match parse(&v(&["webhook", "shadow-scorecard", "proj"])) {
+            ProjectCommand::Webhook(ProjectWebhookCommand::ShadowScorecard { project }) => {
+                assert_eq!(project, "proj");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webhook_shadow_scorecard_requires_a_project_argument() {
+        assert!(matches!(
+            parse(&v(&["webhook", "shadow-scorecard"])),
+            ProjectCommand::Webhook(ProjectWebhookCommand::UsageError(_))
         ));
     }
 }

@@ -719,6 +719,78 @@ pub fn load_health_sweep_config() -> HealthSweepConfig {
         .unwrap_or_default()
 }
 
+/// The per-guardian throttle on the linked-PR merge check
+/// ([`crate::pr::check_pr_merges_polled`]). The merge check is fired from the
+/// `review_maintenance` sweep, which runs on a 5s cadence, so without a
+/// throttle of its own it issues one `GET /pulls/{n}` per open PR every five
+/// seconds -- the single largest consumer of the forge rate-limit budget.
+/// Daemon-singleton configuration, same "global file only, no per-project
+/// layering" rationale as [`PrCacheConfig`]: one sweep spans every project's
+/// reviews rather than being scoped to a single repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct MergeCheckConfig {
+    /// `false` disables the *polled* merge check entirely -- the sweep never
+    /// asks the forge whether a linked PR merged, and a review only settles
+    /// when a manual "Merge / rebase" trigger asks (which is never throttled,
+    /// see [`crate::pr::check_pr_merges`]). `None`/absent defaults to enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Minimum seconds between polled merge checks for the same guardian.
+    /// `None` defaults to [`DEFAULT_MERGE_CHECK_INTERVAL_SECS`].
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// Fallback [`MergeCheckConfig::poll_interval_secs`] when unset. One minute:
+/// a 12x reduction against the `review_maintenance` cadence this check
+/// otherwise inherits, while still settling a merged review well inside the
+/// time a human takes to notice one landed.
+pub const DEFAULT_MERGE_CHECK_INTERVAL_SECS: u64 = 60;
+
+impl MergeCheckConfig {
+    /// Whether the polled merge check should run at all. Defaults to `true`.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// The effective throttle interval, defaulting to
+    /// [`DEFAULT_MERGE_CHECK_INTERVAL_SECS`] when unset or implausibly small
+    /// (a misconfigured `0` would otherwise restore the unthrottled
+    /// every-sweep behaviour this exists to remove).
+    #[must_use]
+    pub fn poll_interval(&self) -> Duration {
+        const MIN_SECS: u64 = 5;
+        Duration::from_secs(
+            self.poll_interval_secs
+                .filter(|&secs| secs >= MIN_SECS)
+                .unwrap_or(DEFAULT_MERGE_CHECK_INTERVAL_SECS),
+        )
+    }
+}
+
+/// Parse a `MergeCheckConfig` from the given TOML text; the default
+/// (enabled, 60s) when the `[merge_check]` table is absent.
+#[must_use]
+pub fn merge_check_from_toml_str(s: &str) -> MergeCheckConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .merge_check
+        .unwrap_or_default()
+}
+
+/// Load the daemon-singleton merge-check throttle config from the global
+/// config file only -- see [`MergeCheckConfig`]'s doc comment for why.
+/// Computed fresh at each call site, matching [`load_pr_cache_config`]'s
+/// "load config fresh where needed" style.
+#[must_use]
+pub fn load_merge_check_config() -> MergeCheckConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| merge_check_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// A project's known monorepo subproject identifiers (`[monorepo]` table,
 /// RAL-346) -- an explicit, user-provided hint rather than an auto-detected
 /// directory scan (per this ticket's Out-of-Scope note: "perfect
@@ -924,6 +996,22 @@ pub struct DaemonConfig {
     /// from creating an exporter.
     #[serde(default)]
     pub opentelemetry: Option<bool>,
+    /// This daemon's own externally-reachable base URL -- what GitHub/GitLab
+    /// can actually reach it at (through NAT, a reverse proxy, a tunnel),
+    /// which is not derivable from the bind address `ralphus-daemon serve`
+    /// listens on. `None` (the default) means webhook auto-reconciliation
+    /// (`webhook_reconcile::spawn_webhook_reconciliation`) does nothing --
+    /// every project's `[webhook]` stays exactly as manually installed via
+    /// `ralphus project webhook install`/`update`, matching this field's
+    /// absence in every config written before it existed. Set once here
+    /// instead of re-passed as `--daemon-url` on every manual call: on
+    /// every daemon startup, this value is compared against each webhook-
+    /// enabled project's last-recorded `daemon_url`, and any mismatch is
+    /// repointed in place (never deleted and recreated, which would leave
+    /// the stale hook behind pointed at nothing -- neither forge cleans
+    /// that up promptly, see `webhook_reconcile`'s module doc).
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 impl DaemonConfig {
@@ -1484,6 +1572,150 @@ impl ForgeConfig {
     }
 }
 
+/// Webhook receiving mode (Track E / E1) -- a closed set, deliberately not a
+/// free-form string. An unrecognized `[webhook] mode` value is rejected
+/// loudly (see [`WebhookConfig::mode`]) rather than silently treated as
+/// `disabled` -- the same "a silently-wrong value is worse than a loud one"
+/// call this file already made once, for `pull_request_branch_convention`
+/// (RAL-244): security-adjacent config (a receiving secret, signature
+/// verification) is exactly the case where a user believing webhooks are on
+/// when they are not is the worse failure mode.
+///
+/// `Shadow` and `Active` are laid out now, even though only `Shadow` is
+/// reachable by anything this track (E/F) builds -- `Active` is Track G
+/// territory, cutover, out of scope here -- so `mode` has its full, stable
+/// vocabulary from the start instead of growing a third value later as a
+/// breaking change to what's already shipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookMode {
+    /// Webhooks are off. Polling is the daemon's only source of truth. The
+    /// default -- an unconfigured `[webhook]` table changes nothing.
+    Disabled,
+    /// Deliveries are received, verified, deduped, and recorded against what
+    /// polling independently discovers (Track F) -- but never acted on.
+    /// Polling still drives every outcome.
+    Shadow,
+    /// Deliveries drive refresh; polling relaxes to a slow reconciliation
+    /// sweep (Track G). Not reachable by any code this track ships.
+    Active,
+}
+
+impl WebhookMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Shadow => "shadow",
+            Self::Active => "active",
+        }
+    }
+}
+
+impl std::str::FromStr for WebhookMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "disabled" => Ok(Self::Disabled),
+            "shadow" => Ok(Self::Shadow),
+            "active" => Ok(Self::Active),
+            other => Err(format!(
+                "unknown [webhook] mode {other:?} -- expected one of \"disabled\", \"shadow\", \"active\""
+            )),
+        }
+    }
+}
+
+/// Fallback [`WebhookConfig::secret_env`] environment variable name when
+/// unset.
+pub const DEFAULT_WEBHOOK_SECRET_ENV: &str = "RALPHUS_WEBHOOK_SECRET";
+
+/// Daemon-singleton webhook receiving config (Track E / E1, narrowed from
+/// per-project to daemon-singleton per explicit user direction after E1-F4
+/// shipped: a project's own `.ralphus.toml` never influences this table),
+/// `[webhook]` table -- one `mode`/`secret_env` for the whole daemon, not
+/// resolved per-project like [`ForgeConfig`]/[`ReviewConfig`]. Loaded from
+/// the global config file only via [`load_webhook_config`], the same
+/// "daemon-singleton, global-only" pattern [`PrCacheConfig`]/
+/// [`MergeCheckConfig`]/[`HealthSweepConfig`] already use: the receive
+/// route (`server::route_webhook`) verifies every delivery against one
+/// shared secret rather than trying each registered project's own secret in
+/// turn to discover which project a delivery is for. `install`/`update`/
+/// `status`/`uninstall`/`check`/`shadow-scorecard` stay project-scoped
+/// routes regardless -- that's inherent to what a webhook *is* (GitHub/
+/// GitLab always register a hook against one specific repo), not a
+/// per-project *config* concern.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WebhookConfig {
+    /// Raw mode string. Deliberately *not* validated at deserialization
+    /// time -- every other malformed field in this file falls back to a
+    /// default rather than failing the whole config load (`toml::from_str`
+    /// parses the entire `ConfigFile` in one shot; a hard `enum` rejection
+    /// here would silently revert every *other* table -- `[forge]`,
+    /// `[review]`, everything -- to defaults too, exactly the failure mode
+    /// this field exists to avoid). [`Self::mode`] validates it explicitly
+    /// instead, so a bad value surfaces as its own clear error without
+    /// corrupting unrelated config.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Name of the environment variable holding the webhook's shared
+    /// secret -- the HMAC key GitHub's `X-Hub-Signature-256` is verified
+    /// against (Track E / E3), or the shared token GitLab's
+    /// `X-Gitlab-Token` is compared to (Track E / E4). Mirrors
+    /// [`ForgeConfig::token_env`]'s own "name of an env var, not the value
+    /// itself" convention -- a secret never belongs in a checked-in
+    /// `.ralphus.toml`. `None` falls back to [`DEFAULT_WEBHOOK_SECRET_ENV`].
+    #[serde(default)]
+    pub secret_env: Option<String>,
+}
+
+impl WebhookConfig {
+    /// The validated mode: [`WebhookMode::Disabled`] when unset, or the
+    /// parsed value -- `Err` names the specific unrecognized string rather
+    /// than silently falling back, so a typo (`"shado"`) is loud rather than
+    /// indistinguishable from a deliberately-disabled daemon. Callers that
+    /// need a mode to act on (the receive route, `webhook install`/`status`)
+    /// should surface this error directly rather than defaulting past it.
+    pub fn mode(&self) -> std::result::Result<WebhookMode, String> {
+        match &self.mode {
+            None => Ok(WebhookMode::Disabled),
+            Some(s) => s.parse(),
+        }
+    }
+
+    /// The effective secret env var name: the configured value, or
+    /// [`DEFAULT_WEBHOOK_SECRET_ENV`] when unset.
+    #[must_use]
+    pub fn resolved_secret_env(&self) -> &str {
+        self.secret_env
+            .as_deref()
+            .unwrap_or(DEFAULT_WEBHOOK_SECRET_ENV)
+    }
+}
+
+/// Parse a `WebhookConfig` from the given TOML text; the default (unset
+/// mode, unset secret env) when the `[webhook]` table is absent.
+#[must_use]
+pub fn webhook_from_toml_str(s: &str) -> WebhookConfig {
+    toml::from_str::<ConfigFile>(s)
+        .unwrap_or_default()
+        .webhook
+        .unwrap_or_default()
+}
+
+/// Load the daemon-singleton `[webhook]` config from the global config file
+/// only -- see [`WebhookConfig`]'s doc comment for why there is deliberately
+/// no per-project layering. Computed fresh at each call site, matching this
+/// module's "load config fresh where needed" style (e.g.
+/// [`load_pr_cache_config`]).
+#[must_use]
+pub fn load_webhook_config() -> WebhookConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| webhook_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// Provider-specific PR/MR submission defaults (`[github]`/`[gitlab]` tables,
 /// RAL-196). Each provider's table holds the same knobs, so both parse into
 /// this one struct — the fields on [`ConfigFile`] choose the table. Today
@@ -1928,6 +2160,8 @@ struct ConfigFile {
     #[serde(default)]
     health: Option<HealthSweepConfig>,
     #[serde(default)]
+    merge_check: Option<MergeCheckConfig>,
+    #[serde(default)]
     monorepo: Option<MonorepoConfig>,
     #[serde(default)]
     commits: Option<CommitConfig>,
@@ -1947,6 +2181,8 @@ struct ConfigFile {
     thrash: Option<ThrashConfig>,
     #[serde(default)]
     forge: Option<ForgeConfig>,
+    #[serde(default)]
+    webhook: Option<WebhookConfig>,
     /// `[github]` provider-specific defaults table (RAL-196), see
     /// [`ForgeProviderConfig`].
     #[serde(default)]
@@ -2075,6 +2311,7 @@ fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
         default_user_is_admin: over.default_user_is_admin.or(base.default_user_is_admin),
         max_concurrent: over.max_concurrent.or(base.max_concurrent),
         opentelemetry: over.opentelemetry.or(base.opentelemetry),
+        public_url: over.public_url.or(base.public_url),
     }
 }
 
@@ -2094,16 +2331,27 @@ fn configuration_path_entries(configuration_path_env: Option<&str>) -> Vec<PathB
 /// Load the effective daemon config, lowest to highest precedence:
 /// `$RALPHUS_CONFIG_HOME/config.toml` (or its `~/.config/ralphus/` default),
 /// then `$RALPHUS_CONFIGURATION_PATH` entries in order, then the
-/// project-local `.ralphus.toml` found by walking up from `cwd` --
-/// matching the precedence `agent_profiles::load_profiles_for_path_with`
-/// and `machine_targets`'s equivalent already use. `load_daemon_config`
-/// used to skip the `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a
-/// field (e.g. `default_user`) set only via that established convention
-/// silently never loaded.
+/// project-local `.ralphus.toml` found by walking up from `cwd`, then
+/// `$RALPHUS_DAEMON_PUBLIC_URL` overriding just `public_url` above all of
+/// that -- matching the precedence `agent_profiles::load_profiles_for_path_with`
+/// and `machine_targets`'s equivalent already use for everything up through
+/// project-local. `load_daemon_config` used to skip the
+/// `$RALPHUS_CONFIGURATION_PATH` layer entirely, so a field (e.g.
+/// `default_user`) set only via that established convention silently never
+/// loaded.
+///
+/// `$RALPHUS_DAEMON_PUBLIC_URL` exists so a launch script (`build-debug.sh`/
+/// `.cmd`'s `--webhook-tunnel`) can hand the daemon a value it can only know
+/// at the moment it starts a tunnel (ngrok's public URL changes on every
+/// restart on its free tier) without editing `.ralphus.toml` on every run --
+/// the file stays the sticky fallback for a stable address (a paid tunnel, a
+/// real reverse proxy), the env var is the "this run's actual address" live
+/// override on top of it.
 #[must_use]
 fn load_daemon_config_with(
     cwd: Option<&Path>,
     configuration_path_env: Option<&str>,
+    public_url_env: Option<&str>,
 ) -> DaemonConfig {
     let mut merged = global_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2119,14 +2367,19 @@ fn load_daemon_config_with(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| daemon_from_toml_str(&s))
         .unwrap_or_default();
-    merge_daemon_config(merged, local)
+    let mut cfg = merge_daemon_config(merged, local);
+    if let Some(url) = public_url_env.map(str::trim).filter(|u| !u.is_empty()) {
+        cfg.public_url = Some(url.to_string());
+    }
+    cfg
 }
 
 #[must_use]
 pub fn load_daemon_config() -> DaemonConfig {
     let cwd = std::env::current_dir().ok();
     let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
-    load_daemon_config_with(cwd.as_deref(), raw.as_deref())
+    let public_url_env = std::env::var("RALPHUS_DAEMON_PUBLIC_URL").ok();
+    load_daemon_config_with(cwd.as_deref(), raw.as_deref(), public_url_env.as_deref())
 }
 
 /// Parse a `CartographerConfig` from the given TOML text; the default (30
@@ -2802,6 +3055,114 @@ mod tests {
         assert_eq!(c.poll_interval(), Duration::from_secs(3600));
     }
 
+    // ── webhook config (Track E / E1) ───────────────────────────────────────
+
+    #[test]
+    fn webhook_config_unset_resolves_to_disabled_mode_and_default_secret_env() {
+        let c = WebhookConfig::default();
+        assert_eq!(c.mode().unwrap(), WebhookMode::Disabled);
+        assert_eq!(c.resolved_secret_env(), "RALPHUS_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn webhook_config_absent_table_is_default() {
+        assert_eq!(
+            webhook_from_toml_str("[review]\nskip_worktrees = true\n"),
+            WebhookConfig::default()
+        );
+    }
+
+    #[test]
+    fn parse_webhook_config_overrides() {
+        let c = webhook_from_toml_str(
+            "[webhook]\nmode = \"shadow\"\nsecret_env = \"MY_WEBHOOK_SECRET\"\n",
+        );
+        assert_eq!(c.mode().unwrap(), WebhookMode::Shadow);
+        assert_eq!(c.resolved_secret_env(), "MY_WEBHOOK_SECRET");
+    }
+
+    #[test]
+    fn webhook_mode_parses_every_documented_value() {
+        assert_eq!(
+            "disabled".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Disabled
+        );
+        assert_eq!(
+            "shadow".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Shadow
+        );
+        assert_eq!(
+            "active".parse::<WebhookMode>().unwrap(),
+            WebhookMode::Active
+        );
+    }
+
+    #[test]
+    fn webhook_mode_rejects_an_unrecognized_value_loudly() {
+        // Track E / E1: unlike every other malformed field in this file, an
+        // invalid mode must not silently resolve to Disabled -- it must
+        // surface as its own explicit error.
+        let c = webhook_from_toml_str("[webhook]\nmode = \"shado\"\n");
+        let err = c.mode().unwrap_err();
+        assert!(err.contains("shado"), "{err}");
+        assert!(err.contains("disabled"), "{err}");
+        assert!(err.contains("shadow"), "{err}");
+        assert!(err.contains("active"), "{err}");
+    }
+
+    #[test]
+    fn webhook_mode_as_str_round_trips_through_from_str() {
+        for mode in [
+            WebhookMode::Disabled,
+            WebhookMode::Shadow,
+            WebhookMode::Active,
+        ] {
+            assert_eq!(mode.as_str().parse::<WebhookMode>().unwrap(), mode);
+        }
+    }
+
+    // `load_webhook_config` itself (the filesystem-dependent wrapper around
+    // `webhook_from_toml_str`) is deliberately not separately tested here --
+    // no daemon-singleton `load_*_config` function in this file is (see
+    // `load_pr_cache_config`), since it reads a fixed, non-injectable global
+    // path (`global_config_path()`). `webhook_from_toml_str`'s tests above
+    // are the pure, directly-testable half; `load_webhook_config` is a thin
+    // "read one file, parse" wrapper around it, trusted the same way every
+    // other daemon-singleton loader already is.
+
+    // ── merge check throttle ────────────────────────────────────────────────
+
+    #[test]
+    fn merge_check_config_unset_is_enabled_with_the_default_interval() {
+        let c = MergeCheckConfig::default();
+        assert!(c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn merge_check_config_absent_table_is_default() {
+        assert_eq!(
+            merge_check_from_toml_str("[review]\nskip_worktrees = true\n"),
+            MergeCheckConfig::default()
+        );
+    }
+
+    #[test]
+    fn parse_merge_check_config_overrides() {
+        let c =
+            merge_check_from_toml_str("[merge_check]\nenabled = false\npoll_interval_secs = 900\n");
+        assert!(!c.enabled());
+        assert_eq!(c.poll_interval(), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn merge_check_config_clamps_an_implausibly_small_interval_to_the_default() {
+        // A misconfigured `0` must not restore the unthrottled
+        // every-`review_maintenance`-pass merge check.
+        let c = merge_check_from_toml_str("[merge_check]\npoll_interval_secs = 0\n");
+        assert_eq!(c.poll_interval(), Duration::from_secs(60));
+    }
+
     // ── monorepo (RAL-346) ──────────────────────────────────────────────────
 
     #[test]
@@ -3148,7 +3509,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let cfg = load_daemon_config_with(Some(&cwd), Some(config_file.to_str().unwrap()));
+        let cfg = load_daemon_config_with(Some(&cwd), Some(config_file.to_str().unwrap()), None);
         assert_eq!(cfg.default_user.as_deref(), Some("from-configuration-path"));
 
         let _ = std::fs::remove_dir_all(&config_dir);
@@ -3184,10 +3545,67 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = load_daemon_config_with(Some(&project_root), Some(config_file.to_str().unwrap()));
+        let cfg = load_daemon_config_with(
+            Some(&project_root),
+            Some(config_file.to_str().unwrap()),
+            None,
+        );
         assert_eq!(cfg.default_user.as_deref(), Some("from-project-local"));
 
         let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn load_daemon_config_with_public_url_env_overrides_everything_else() {
+        let project_root = std::env::temp_dir().join(format!(
+            "ralphus-cfg-public-url-env-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".ralphus.toml"),
+            "[daemon]\npublic_url = \"https://from-file.example.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_daemon_config_with(
+            Some(&project_root),
+            None,
+            Some("https://from-ngrok-this-run.example.com"),
+        );
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://from-ngrok-this-run.example.com")
+        );
+
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn load_daemon_config_with_blank_public_url_env_is_ignored() {
+        let project_root = std::env::temp_dir().join(format!(
+            "ralphus-cfg-public-url-env-blank-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(
+            project_root.join(".ralphus.toml"),
+            "[daemon]\npublic_url = \"https://from-file.example.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_daemon_config_with(Some(&project_root), None, Some("   "));
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://from-file.example.com"),
+            "a blank env var must not clobber a real configured value"
+        );
+
         let _ = std::fs::remove_dir_all(&project_root);
     }
 
@@ -3607,6 +4025,45 @@ mod tests {
     fn opentelemetry_defaults_to_enabled_and_can_be_disabled() {
         assert!(daemon_from_toml_str("").opentelemetry_enabled());
         assert!(!daemon_from_toml_str("[daemon]\nopentelemetry = false\n").opentelemetry_enabled());
+    }
+
+    #[test]
+    fn public_url_defaults_to_unset() {
+        assert_eq!(daemon_from_toml_str("").public_url, None);
+    }
+
+    #[test]
+    fn public_url_parses_from_the_daemon_table() {
+        let cfg = daemon_from_toml_str("[daemon]\npublic_url = \"https://ralphus.example.com\"\n");
+        assert_eq!(
+            cfg.public_url.as_deref(),
+            Some("https://ralphus.example.com")
+        );
+    }
+
+    #[test]
+    fn public_url_project_local_wins_over_global_on_merge() {
+        let global =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let project =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://project.example.com\"\n");
+        let merged = merge_daemon_config(global, project);
+        assert_eq!(
+            merged.public_url.as_deref(),
+            Some("https://project.example.com")
+        );
+    }
+
+    #[test]
+    fn public_url_unset_locally_falls_back_to_global_on_merge() {
+        let global =
+            daemon_from_toml_str("[daemon]\npublic_url = \"https://global.example.com\"\n");
+        let project = daemon_from_toml_str("");
+        let merged = merge_daemon_config(global, project);
+        assert_eq!(
+            merged.public_url.as_deref(),
+            Some("https://global.example.com")
+        );
     }
 
     #[test]

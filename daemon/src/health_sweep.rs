@@ -271,6 +271,17 @@ pub fn spawn_health_sweep(state: HealthSweepState) {
             if !cfg.enabled() {
                 continue;
             }
+            // Track A / A9: skip a cycle entirely during a configured
+            // `[daemon].downtime` window (RAL-122), same "opportunistic
+            // background work yields the same way scheduled cell claims do"
+            // reasoning as `crate::pr::spawn_pr_base_drift_poller`. This
+            // sweep's own checks are all daemon-local except one outbound
+            // HTTP GET to Ollama; the cached report simply goes stale for
+            // the length of the window rather than being refreshed, same as
+            // any other sweep this track gates.
+            if crate::config::scheduler_in_downtime() {
+                continue;
+            }
             state.set(run_sweep());
         }
     });

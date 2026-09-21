@@ -280,20 +280,30 @@ pub fn read_submit_source(source: &str) -> Result<String, String> {
     std::fs::read_to_string(source).map_err(|e| format!("could not read {source}: {e}"))
 }
 
+/// Track C / C3: driven by the daemon's push channel instead of a fixed 2s
+/// poll -- see `wait_for`. `timeout: None` (unbounded) matches this
+/// function's pre-existing behavior; a human running `submit --wait` can
+/// always Ctrl-C, unlike the MCP twin C1 bounded for exactly that reason.
 fn wait_for_terminal(client: &DaemonClient, squad_id: &str) -> Result<Value, DaemonError> {
     let mut last_state: Option<String> = None;
-    loop {
-        let squad = client.squad(squad_id)?;
+    let check = || -> Option<Result<Value, DaemonError>> {
+        let squad = match client.squad(squad_id) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
         let state = squad["state"].as_str().map(str::to_string);
         if state != last_state {
             println!("{squad_id}: {}", state.as_deref().unwrap_or("?"));
             last_state = state.clone();
         }
         if matches!(state.as_deref(), Some("done" | "failed" | "cancelled")) {
-            return Ok(squad);
+            Some(Ok(squad))
+        } else {
+            None
         }
-        std::thread::sleep(Duration::from_secs(2));
-    }
+    };
+    wait_for(client, None, check)
+        .expect("wait_for(timeout: None) only returns None after timing out, which can't happen")
 }
 
 fn finish_submission(
@@ -913,6 +923,79 @@ fn format_debug_event_line(e: &Value) -> String {
     }
 }
 
+// ---- push-driven wait (Track C / C3) ---------------------------------------
+
+/// How often [`wait_for`] falls back to a plain poll when the SSE connection
+/// itself can't be established or just dropped -- matches the interval
+/// `listen`/`submit --wait` polled at unconditionally before this track,
+/// so a daemon that genuinely can't serve `/api/events` (an old build, a
+/// network path that blocks long-lived connections) degrades to exactly the
+/// old behavior rather than failing outright.
+const WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Calls `check()` once immediately, then again every time the daemon's
+/// push channel (`/api/events`) delivers an event, until it returns
+/// `Some(_)` or `timeout` seconds elapse -- the shared shape behind both
+/// `cmd_listen` and `wait_for_terminal` (Track C / C3). Neither knows or
+/// cares *what* changed; an event is a doorbell, and `check()` is the one
+/// authoritative answer, the same "push signals, one real fetch decides"
+/// split the daemon's own CI/PR pollers use.
+///
+/// Falls back to polling every [`WAIT_FALLBACK_POLL_INTERVAL`] whenever the
+/// SSE connection can't be opened at all, or drops mid-wait -- reconnection
+/// is attempted again on the next outer loop iteration regardless, so a
+/// transient daemon restart recovers on its own instead of getting stuck on
+/// the fallback path forever.
+///
+/// `None` on timeout expiring before `check()` ever returned `Some(_)`.
+///
+/// `pub` (Track C / C4): `ralphus-mcp`'s own `exec_listen`/`wait_for_terminal`
+/// reuse this directly rather than re-implementing the same push-driven
+/// wait a second time -- the same "otherwise-private helper made `pub` for
+/// `mcp`'s one external call site" pattern `cli/AGENTS.md` already documents
+/// for `resolve_scoped`/`with_uri`/etc.
+pub fn wait_for<T>(
+    client: &DaemonClient,
+    timeout: Option<f64>,
+    mut check: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = std::time::Instant::now();
+    let timed_out =
+        |start: std::time::Instant| timeout.is_some_and(|t| start.elapsed().as_secs_f64() >= t);
+    if let Some(v) = check() {
+        return Some(v);
+    }
+    loop {
+        if timed_out(start) {
+            return None;
+        }
+        match crate::sse::EventStream::connect(client) {
+            Ok(mut stream) => loop {
+                if timed_out(start) {
+                    return None;
+                }
+                match stream.next_event() {
+                    Ok(Some(_)) => {
+                        if let Some(v) = check() {
+                            return Some(v);
+                        }
+                    }
+                    // Clean close or a read/idle error -- either way, break
+                    // out to the outer loop and reconnect rather than
+                    // treating this as fatal.
+                    Ok(None) | Err(_) => break,
+                }
+            },
+            Err(_) => {
+                std::thread::sleep(WAIT_FALLBACK_POLL_INTERVAL);
+                if let Some(v) = check() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+}
+
 // ---- listen -----------------------------------------------------------------
 
 pub fn parse_listen(scanner: &mut Scanner) -> super::Command {
@@ -937,8 +1020,11 @@ pub fn parse_listen(scanner: &mut Scanner) -> super::Command {
 pub fn cmd_listen(opts: &GlobalOpts, selector: &str, until: &str, timeout: Option<f64>) -> i32 {
     let client = opts.client();
     let target = until.to_lowercase();
-    let start = std::time::Instant::now();
-    loop {
+    // Track C / C3: driven by the daemon's push channel instead of a fixed
+    // 1s poll -- see `wait_for`. `check` is the same "did we reach the
+    // target, or hit an error" decision the old loop made every tick; it now
+    // runs once up front and again each time an event arrives.
+    let check = || -> Option<i32> {
         match listen_status(&client, selector) {
             Ok((kind, status)) => {
                 if status.to_lowercase() == target {
@@ -953,21 +1039,26 @@ pub fn cmd_listen(opts: &GlobalOpts, selector: &str, until: &str, timeout: Optio
                             );
                         },
                     );
-                    return 0;
+                    Some(0)
+                } else {
+                    None
                 }
             }
             Err(e) => {
                 e.print(opts.json, None);
-                return e.exit_code();
+                Some(e.exit_code())
             }
         }
-        if let Some(t) = timeout {
-            if start.elapsed().as_secs_f64() >= t {
-                println!("error: timed out after {t}s waiting for '{until}'");
-                return 1;
-            }
+    };
+    match wait_for(&client, timeout, check) {
+        Some(code) => code,
+        None => {
+            println!(
+                "error: timed out after {}s waiting for '{until}'",
+                timeout.unwrap_or_default()
+            );
+            1
         }
-        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -1465,6 +1556,31 @@ pub fn cmd_initialize_git(path: Option<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── wait_for (Track C / C3) ─────────────────────────────────────────────
+    //
+    // Both cases here return before `wait_for` ever attempts an SSE connect
+    // (the immediate up-front `check()`, and the timeout check that runs
+    // before the first connect attempt), so neither needs a live daemon --
+    // the fallback-poll and push-driven paths genuinely do, and are exactly
+    // the "everything else about the board/CLI is tested manually" territory
+    // this codebase's own testing conventions already accept.
+
+    #[test]
+    fn wait_for_returns_immediately_when_the_first_check_already_succeeds() {
+        let client = DaemonClient::new("http://127.0.0.1:1");
+        let result = wait_for(&client, None, || Some(42));
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn wait_for_times_out_without_ever_touching_the_network() {
+        let client = DaemonClient::new("http://127.0.0.1:1");
+        // A zero-second timeout: the very first `timed_out` check (which
+        // runs before any connect attempt) must already be true.
+        let result = wait_for(&client, Some(0.0), || None::<()>);
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn parse_check_defaults_to_no_flags() {

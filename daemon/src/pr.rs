@@ -1087,6 +1087,40 @@ impl Store {
             .unwrap_or((None, None)))
     }
 
+    /// Read the ETag [`check_pr_merges`] last recorded for this PR's
+    /// `GET /pulls/{n}`, if any -- so the next merge check can send
+    /// `If-None-Match` and cost no forge quota when the PR has not changed.
+    pub(crate) fn pr_state_etag(&self, pr_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT etag_pr_state FROM guardian_pr_forge_cache WHERE pr_id=?",
+                params![pr_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the ETag a merge-state fetch returned for this PR.
+    ///
+    /// Only `etag_pr_state` is ever updated on an existing row: the rolled-up
+    /// `last_checked_at_ms`/`status` columns describe the RAL-366 poller's
+    /// two halves (drift and comments), and the merge check is neither of
+    /// them, so it must not move them. They are seeded on insert purely
+    /// because `last_checked_at_ms` is `NOT NULL` -- with `ok`, since
+    /// reaching this call at all means a forge fetch just succeeded, and both
+    /// half-columns left NULL to say "never attempted".
+    pub(crate) fn set_pr_state_etag(&self, pr_id: &str, etag: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO guardian_pr_forge_cache(pr_id, last_checked_at_ms, status, etag_pr_state)
+             VALUES(?,?,'ok',?)
+             ON CONFLICT(pr_id) DO UPDATE SET etag_pr_state = excluded.etag_pr_state",
+            params![pr_id, now_ms(), etag],
+        )?;
+        Ok(())
+    }
+
     /// Wholesale-replace the comment/note ids the RAL-366 poller last fetched
     /// for `(pr_id, endpoint)` -- called only after a fresh (non-304)
     /// conditional fetch, so a comment deleted on the forge between polls
@@ -2455,6 +2489,67 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
     });
 }
 
+/// Last time [`check_pr_merges`] actually asked the forge about a guardian,
+/// keyed by guardian id -- mirrors `ci_watch::STANDING_POLL_LAST`'s shape,
+/// but keyed and intervaled independently since it throttles a different
+/// forge call. Entries are dropped once a review reaches a terminal status
+/// (see [`check_pr_merges`]), so this tracks live reviews only.
+static MERGE_CHECK_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The throttled entry point to [`check_pr_merges`], for the background
+/// `review_maintenance` sweep.
+///
+/// `review_maintenance` runs on a 5s cadence, and [`check_pr_merges`] fires
+/// one `GET /pulls/{n}` per open PR per call -- 720 forge requests per hour
+/// per open PR, which is the single largest consumer of the rate-limit
+/// budget and enough on its own to exhaust GitHub's authenticated hourly
+/// limit at roughly six open PRs. This asks at most once per
+/// [`crate::config::MergeCheckConfig::poll_interval`] per guardian instead.
+///
+/// Manual triggers (the "Merge / rebase" button's `kickoff_merge` path) call
+/// [`check_pr_merges`] directly and are deliberately never throttled: a user
+/// who just asked deserves a live answer. Those calls do refresh this
+/// throttle's window, so the sweep doesn't re-ask on top of one.
+///
+/// Returns whether anything changed, exactly as [`check_pr_merges`] does --
+/// a skipped (throttled or disabled) pass changed nothing, so returns
+/// `false`.
+pub fn check_pr_merges_polled(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let cfg = crate::config::load_merge_check_config();
+    if !cfg.enabled() {
+        return false;
+    }
+    {
+        let last = MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !merge_check_due(
+            last.get(id).copied(),
+            std::time::Instant::now(),
+            cfg.poll_interval(),
+        ) {
+            return false;
+        }
+    }
+    check_pr_merges(store, id)
+}
+
+/// Whether a guardian last checked at `last` is due for another merge check
+/// at `now`. A guardian never checked in this process's lifetime is always
+/// due. Split out from [`check_pr_merges_polled`] so the interval decision is
+/// testable without a monotonic clock that can be wound backwards.
+fn merge_check_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    // `saturating_duration_since` rather than `duration_since`: an entry
+    // stamped fractionally ahead of `now` (two threads reading the clock in
+    // the other order) must read as "no time has passed", not panic.
+    last.is_none_or(|prev| now.saturating_duration_since(prev) >= interval)
+}
+
 /// Poll every PR/MR linked to `id` for a live "merged" state and settle the
 /// review accordingly (RAL-300).
 ///
@@ -2488,8 +2583,22 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return false;
     };
     if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+        // A terminal review is never polled again -- drop its throttle entry
+        // rather than leaving it to accumulate for the daemon's lifetime.
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
         return false;
     }
+    // Every caller that reaches this point is about to ask the forge, so
+    // record the attempt even on the unthrottled (manual) path: a manual
+    // "Merge / rebase" answers the same question the sweep would have, and
+    // the sweep should not immediately re-ask on top of it.
+    MERGE_CHECK_LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id.to_string(), std::time::Instant::now());
     let prs = store
         .lock()
         .list_pull_requests_for_guardian(id)
@@ -2504,13 +2613,17 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         return settle_pr_merge_states(store, id, &[]);
     }
 
-    // Resolve each open PR's forge client up front (cheap, local config/DB
-    // reads); the actual forge call is the only genuinely slow part here,
-    // and is fired off concurrently below since one PR's merge state has no
-    // bearing on any other's.
+    // Resolve each open PR's forge client and last-seen ETag up front
+    // (cheap, local config/DB reads); the actual forge call is the only
+    // genuinely slow part here, and is fired off concurrently below since
+    // one PR's merge state has no bearing on any other's.
     struct MergeCheckJob<'a> {
         pr: &'a PullRequestView,
         client: crate::forge::ForgeClient,
+        /// The ETag the last merge check recorded for this PR, sent as
+        /// `If-None-Match` so an unchanged PR answers `304` and costs no
+        /// GitHub rate-limit quota. `None` until the first check records one.
+        etag: Option<String>,
     }
     let mut jobs = Vec::new();
     for pr in prs
@@ -2538,9 +2651,19 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
         match routing.client_for(&pr.repo) {
             Some(client) if client.kind().as_str() == pr.forge => {
+                // Track A / A6: a client already cooling down from a prior
+                // rate-limit response is skipped rather than re-asked --
+                // this is the hottest poller in the daemon (every open PR,
+                // every throttle interval), so it is also the one most able
+                // to push a rate limit past exhaustion if it never backs off.
+                if is_backed_off(client) {
+                    continue;
+                }
+                let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
                 jobs.push(MergeCheckJob {
                     pr,
                     client: client.clone(),
+                    etag,
                 });
             }
             Some(client) => {
@@ -2571,24 +2694,30 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         }
     }
 
-    let fetched: Vec<Option<std::result::Result<String, String>>> = std::thread::scope(|scope| {
+    let fetched: Vec<
+        Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
+    > = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .iter()
-            .map(|job| scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client)))
+            .map(|job| {
+                scope.spawn(|| fetch_pr_merge_state(job.pr, &job.client, job.etag.as_deref()))
+            })
             .collect();
         handles
             .into_iter()
             .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Some(Err("forge merge check panicked".to_string())))
+                handle.join().unwrap_or_else(|_| {
+                    Some(Err(crate::forge::ForgeError::other(
+                        "forge merge check panicked",
+                    )))
+                })
             })
             .collect()
     });
 
     let mut freshly_merged = Vec::new();
     for (job, result) in jobs.iter().zip(fetched) {
-        apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
+        apply_pr_merge_state(store, id, job.pr, &job.client, result, &mut freshly_merged);
     }
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
@@ -2862,8 +2991,9 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     for pr in prs.iter().filter(|p| p.state == "open") {
-        let fetched = fetch_pr_merge_state(pr, client);
-        apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
+        let etag = store.lock().pr_state_etag(&pr.id).unwrap_or_default();
+        let fetched = fetch_pr_merge_state(pr, client, etag.as_deref());
+        apply_pr_merge_state(store, id, pr, client, fetched, &mut freshly_merged);
     }
 
     settle_pr_merge_states(store, id, &freshly_merged)
@@ -2876,9 +3006,10 @@ fn apply_pr_merge_check(
 fn fetch_pr_merge_state(
     pr: &PullRequestView,
     client: &crate::forge::ForgeClient,
-) -> Option<std::result::Result<String, String>> {
+    etag: Option<&str>,
+) -> Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>> {
     let number = pr.pr_number?;
-    Some(client.get_pull_request_state(number))
+    Some(client.get_pull_request_state_conditional(number, etag))
 }
 
 /// The store-writing half of a single PR's merge-state check: apply an
@@ -2889,55 +3020,72 @@ fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
-    fetched: Option<std::result::Result<String, String>>,
+    client: &crate::forge::ForgeClient,
+    fetched: Option<std::result::Result<crate::forge::PrStatePoll, crate::forge::ForgeError>>,
     freshly_merged: &mut Vec<PullRequestView>,
 ) {
     let Some(result) = fetched else {
         return;
     };
-    match result {
-        Ok(state) if state != "open" => {
-            let _ = store.lock().update_pull_request_ex(
-                &pr.id,
-                None,
-                None,
-                None,
-                Some(&state),
-                None,
-                None,
-                None,
-            );
-            if state == "merged" {
-                freshly_merged.push(pr.clone());
-            } else {
-                // RAL-<new>: a PR closed without merging (state == "closed")
-                // was previously written with zero logging, unlike the
-                // sibling forge-error arm below -- a review can never satisfy
-                // "every linked PR merged" after this and would sit in
-                // `in_review` forever with no record of why.
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [pr] review {id} pr {} observed closed (not merged) on the forge",
-                    pr.id
-                );
-                let guard = store.lock();
-                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::WARNING,
-                    source: "pr",
-                    message: "linked pr closed without merging",
-                    scope: Some("guardian"),
-                    squad_id: None,
-                    guardian_id: Some(id),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({"pr_id": pr.id}),
-                    admin_only: false,
-                });
+    let (state, etag) = match result {
+        // The stored ETag still matched, so nothing about this PR has
+        // changed since the last check -- including its state. Keep the
+        // recorded one and spend no further work on it.
+        Ok(crate::forge::PrStatePoll::NotModified) => return,
+        Ok(crate::forge::PrStatePoll::Modified { state, etag }) => (state, etag),
+        Err(error) => {
+            // Track A / A6: a rate limit here must hold off the *next*
+            // pass's job for this client, not just get logged and retried
+            // on the very next throttle interval as if nothing happened.
+            if error.is_rate_limited() {
+                start_backoff(client, error.retry_after);
             }
+            log_pr_merge_check_failure(store, id, pr, &error.to_string());
+            return;
         }
-        Ok(_) => {}
-        Err(error) => log_pr_merge_check_failure(store, id, pr, &error),
+    };
+    // Record the new ETag even when the state itself is unchanged: this
+    // response is the one the *next* poll wants to ask "still this?" against.
+    let _ = store.lock().set_pr_state_etag(&pr.id, etag.as_deref());
+    if state != "open" {
+        let _ = store.lock().update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            Some(&state),
+            None,
+            None,
+            None,
+        );
+        if state == "merged" {
+            freshly_merged.push(pr.clone());
+        } else {
+            // RAL-<new>: a PR closed without merging (state == "closed")
+            // was previously written with zero logging, unlike the
+            // sibling forge-error arm below -- a review can never satisfy
+            // "every linked PR merged" after this and would sit in
+            // `in_review` forever with no record of why.
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr {} observed closed (not merged) on the forge",
+                pr.id
+            );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "pr",
+                message: "linked pr closed without merging",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"pr_id": pr.id}),
+                admin_only: false,
+            });
+        }
     }
 }
 
@@ -3464,7 +3612,23 @@ pub fn detect_forge_reorder(
                 pr.forge, pr.repo
             ));
         };
-        let state = client.get_pull_request_base_state(num)?;
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked.
+        if is_backed_off(client) {
+            return Err(format!(
+                "forge rate-limited; backing off ({}/{})",
+                pr.forge, pr.repo
+            ));
+        }
+        let state = match client.get_pull_request_base_state_ex(num) {
+            Ok(state) => state,
+            Err(e) => {
+                if e.is_rate_limited() {
+                    start_backoff(client, e.retry_after);
+                }
+                return Err(e.to_string());
+            }
+        };
         live_state.insert((*branch_id).to_string(), state);
     }
     let Some((forge_base, base_changed_at_ms, order)) =
@@ -3926,8 +4090,19 @@ pub fn poll_pr_base_drift(
         let Some(client) = routing.client_for(&pr.repo) else {
             continue;
         };
-        let Ok(forge_base) = client.get_pull_request_base(number) else {
+        // Track A / A6: a client already cooling down from a prior
+        // rate-limit response is skipped rather than re-asked.
+        if is_backed_off(client) {
             continue;
+        }
+        let forge_base = match client.get_pull_request_base_ex(number) {
+            Ok(base) => base,
+            Err(e) => {
+                if e.is_rate_limited() {
+                    start_backoff(client, e.retry_after);
+                }
+                continue;
+            }
         };
         match classify_base_drift(
             &pr.base_ref,
@@ -4010,17 +4185,20 @@ const DEFAULT_RATE_LIMIT_BACKOFF: std::time::Duration = std::time::Duration::fro
 /// -- shared across every guardian's poll pass in this process, so a
 /// 429/403 observed while polling one guardian's PRs also holds off comment
 /// fetches for another guardian on the same repo within the same cycle,
-/// rather than each rediscovering the rate limit independently.
+/// rather than each rediscovering the rate limit independently. Also shared
+/// with `ci_watch.rs` (Track A / A6) -- one backoff table per forge client,
+/// regardless of which poller tripped it or which poller checks it next.
 static PR_CACHE_BACKOFF: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn forge_client_backoff_key(client: &crate::forge::ForgeClient) -> String {
+pub(crate) fn forge_client_backoff_key(client: &crate::forge::ForgeClient) -> String {
     format!("{}:{}", client.kind().as_str(), client.repo_label())
 }
 
 /// Whether `client` is still cooling down from a prior rate-limit response
-/// this process has already seen.
-fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
+/// this process has already seen. `pub(crate)` (Track A / A6): every forge
+/// poller in the daemon consults this, not only the ones in this module.
+pub(crate) fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
     let key = forge_client_backoff_key(client);
     PR_CACHE_BACKOFF
         .lock()
@@ -4031,7 +4209,11 @@ fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
 
 /// Start (or extend) a rate-limit backoff window for `client`, honoring the
 /// forge's own `Retry-After` when it sent one instead of guessing.
-fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::time::Duration>) {
+/// `pub(crate)` (Track A / A6): see [`is_backed_off`].
+pub(crate) fn start_backoff(
+    client: &crate::forge::ForgeClient,
+    retry_after: Option<std::time::Duration>,
+) {
     let key = forge_client_backoff_key(client);
     let resume_at = std::time::Instant::now() + retry_after.unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF);
     PR_CACHE_BACKOFF
@@ -10141,6 +10323,106 @@ mod tests {
         assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
     }
 
+    /// A real, minimal git repo + registered project + guardian with one
+    /// open, forge-numbered PR -- `detect_forge_reorder`/`poll_pr_base_drift`
+    /// need to resolve an actual `ForgeClient` to exercise their Track A / A6
+    /// backoff check, unlike their `"/repo"`-fixture tests above, which rely
+    /// on that resolution failing before any client is ever built.
+    fn guardian_with_resolvable_client_and_one_open_pr(
+        store: &crate::store_lock::StoreHandle,
+        tag: &str,
+        repo_label: &str,
+    ) -> (String, String) {
+        let root_dir = tmp_dir(tag);
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{repo_label}.git"),
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            "[forge]\nkind = \"github\"\napi_base = \"http://127.0.0.1:1\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n",
+        )
+        .unwrap();
+        store
+            .lock()
+            .register_project(tag, "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian(tag, "main", root_dir.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch_id),
+                "github",
+                repo_label,
+                "a",
+                "main",
+                "A",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        (gid, pr_id)
+    }
+
+    #[test]
+    fn detect_forge_reorder_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, _pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-reorder",
+            "acme/widget-a6-reorder",
+        );
+        // Port 1 is never listening -- if the backoff check is skipped, this
+        // reaches a real connection attempt and fails with a *connection*
+        // error, not the "rate-limited" message asserted below.
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-reorder".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        let err = detect_forge_reorder(&store, &gid).unwrap_err();
+        assert!(err.contains("rate-limited"), "{err}");
+    }
+
+    #[test]
+    fn poll_pr_base_drift_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, _pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-drift",
+            "acme/widget-a6-drift",
+        );
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-drift".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        // Fail-safe-per-PR, like the rest of this poller: a backed-off
+        // client is skipped (0 pulled), not an error.
+        assert_eq!(poll_pr_base_drift(&store, &gid).unwrap(), 0);
+    }
+
     #[test]
     fn auto_fix_retry_gate_resets_on_a_new_push_even_with_no_intervening_non_failing_status() {
         // Regression test for guardian-000000000119 / GitHub PR #235: the
@@ -10702,6 +10984,122 @@ mod tests {
         handle.join().unwrap();
     }
 
+    fn req_header(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+        req.headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    }
+
+    /// An `in_review` guardian with one open, forge-numbered PR.
+    fn guardian_with_one_open_pr(store: &crate::store_lock::StoreHandle) -> (String, String) {
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        (gid, pr_id)
+    }
+
+    #[test]
+    fn merge_check_records_the_returned_etag_and_sends_it_on_the_next_pass() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // First pass: nothing stored yet, so no conditional header.
+            let first = server.recv().unwrap();
+            assert_eq!(req_header(&first, "If-None-Match"), None);
+            first
+                .respond(
+                    tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"s1\""[..]).unwrap(),
+                        )
+                        .with_status_code(200),
+                )
+                .unwrap();
+            // Second pass: the recorded ETag must come back out as
+            // `If-None-Match`, and a 304 must leave the PR exactly as it was.
+            let second = server.recv().unwrap();
+            assert_eq!(
+                req_header(&second, "If-None-Match").as_deref(),
+                Some("\"s1\"")
+            );
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, pr_id) = guardian_with_one_open_pr(&store);
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(
+            store.lock().pr_state_etag(&pr_id).unwrap().as_deref(),
+            Some("\"s1\""),
+            "a fresh response's etag must be recorded for the next pass"
+        );
+
+        assert!(!apply_pr_merge_check(&store, &gid, &prs, &client));
+        assert_eq!(
+            store.lock().get_pull_request(&pr_id).unwrap().state,
+            "open",
+            "a 304 means nothing changed, including the recorded state"
+        );
+        assert_eq!(
+            store.lock().pr_state_etag(&pr_id).unwrap().as_deref(),
+            Some("\"s1\""),
+            "a 304 must not clear the etag it was validated against"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn merge_check_etag_write_does_not_disturb_the_poller_half_columns() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (_gid, pr_id) = guardian_with_one_open_pr(&store);
+
+        store
+            .lock()
+            .set_pr_state_etag(&pr_id, Some("\"s1\""))
+            .unwrap();
+
+        let cached = store.lock().get_pr_forge_cache(&pr_id).unwrap().unwrap();
+        assert_eq!(
+            cached.drift_checked_at_ms, None,
+            "the merge check is not the drift half and must not claim to have run it"
+        );
+        assert_eq!(
+            cached.comments_checked_at_ms, None,
+            "the merge check is not the comments half and must not claim to have run it"
+        );
+    }
+
     #[test]
     fn check_pr_merges_drops_a_pr_merged_out_of_band_while_mid_flight() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -10783,6 +11181,182 @@ mod tests {
         assert!(messages[0].message.contains("dropped from the review"));
 
         handle.join().unwrap();
+    }
+
+    /// A guardian sitting in `in_review` whose one linked PR is already
+    /// recorded `merged` -- `check_pr_merges` settles it to `approved`
+    /// without any forge call, which makes "did the check actually run?"
+    /// observable as a status change rather than as wall-clock timing.
+    fn guardian_ready_to_settle(store: &crate::store_lock::StoreHandle) -> String {
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .update_pull_request(&pr_id, None, None, None, Some("merged"))
+            .unwrap();
+        gid
+    }
+
+    #[test]
+    fn check_pr_merges_polled_skips_a_guardian_inside_its_throttle_window() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+
+        assert!(
+            !check_pr_merges_polled(&store, &gid),
+            "a guardian checked a moment ago must not be re-checked"
+        );
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().status,
+            "in_review",
+            "the throttled pass must not have reached `check_pr_merges`"
+        );
+    }
+
+    #[test]
+    fn check_pr_merges_polled_runs_for_a_guardian_it_has_never_checked() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&gid);
+
+        assert!(check_pr_merges_polled(&store, &gid));
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
+    }
+
+    #[test]
+    fn merge_check_is_due_once_the_interval_has_elapsed() {
+        // Expressed as time moving *forward* from a real reading: a
+        // monotonic clock cannot reliably be wound back far enough to
+        // backdate an `Instant` by a whole interval.
+        let interval = std::time::Duration::from_secs(60);
+        let last = std::time::Instant::now();
+
+        assert!(
+            !merge_check_due(Some(last), last, interval),
+            "a guardian checked this instant is not due"
+        );
+        assert!(
+            !merge_check_due(
+                Some(last),
+                last + interval - std::time::Duration::from_millis(1),
+                interval
+            ),
+            "a guardian checked a moment inside the window is not due"
+        );
+        assert!(
+            merge_check_due(Some(last), last + interval, interval),
+            "a guardian checked exactly one interval ago is due"
+        );
+        assert!(
+            merge_check_due(None, last, interval),
+            "a guardian never checked is always due"
+        );
+    }
+
+    #[test]
+    fn merge_check_treats_a_last_stamp_from_the_future_as_not_due() {
+        // Two threads can read the clock in the opposite order to the order
+        // they store it; that must read as "no time has passed", not panic.
+        let interval = std::time::Duration::from_secs(60);
+        let now = std::time::Instant::now();
+        assert!(!merge_check_due(
+            Some(now + std::time::Duration::from_secs(5)),
+            now,
+            interval
+        ));
+    }
+
+    #[test]
+    fn check_pr_merges_is_never_throttled_for_a_manual_trigger() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        // The sweep polled a moment ago; the "Merge / rebase" button must
+        // still get a live answer rather than the sweep's cooldown.
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+
+        assert!(check_pr_merges(&store, &gid));
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
+    }
+
+    #[test]
+    fn check_pr_merges_drops_the_throttle_entry_for_a_terminal_guardian() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = guardian_ready_to_settle(&store);
+        MERGE_CHECK_LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gid.clone(), std::time::Instant::now());
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::Deployed, None)
+            .unwrap();
+
+        assert!(!check_pr_merges(&store, &gid));
+        assert!(
+            !MERGE_CHECK_LAST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&gid),
+            "a terminal review's throttle entry must not accumulate"
+        );
+    }
+
+    #[test]
+    fn check_pr_merges_skips_a_backed_off_client_without_a_network_call() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, pr_id) = guardian_with_resolvable_client_and_one_open_pr(
+            &store,
+            "a6-merge",
+            "acme/widget-a6-merge",
+        );
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            "http://127.0.0.1:1".to_string(),
+            "acme/widget-a6-merge".to_string(),
+            None,
+        );
+        start_backoff(&client, None);
+
+        // A skipped job changes nothing, so this reads as "no merges
+        // observed" rather than an error -- matching the rest of this
+        // function's fail-safe-per-PR shape.
+        assert!(!check_pr_merges(&store, &gid));
+        assert_eq!(
+            store.lock().get_pull_request(&pr_id).unwrap().state,
+            "open",
+            "a skipped job must not touch the pr row"
+        );
     }
 
     #[test]

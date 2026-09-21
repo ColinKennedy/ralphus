@@ -1112,6 +1112,83 @@ unset) -- existing reviews are unaffected.",
     ),
 ];
 
+// Track E, E8: explicit, manually-triggered forge webhook
+// install/status/uninstall -- see `crate::commands::project::ProjectWebhookCommand`.
+const PROJECT_WEBHOOK_CHILDREN: &[HelpNode] = &[
+    node(
+        "install",
+        &["project [str]"],
+        &["--daemon-url [url]"],
+        "Register a live webhook on the project's forge repo, pointed at this daemon's own \
+POST /api/forge/webhook/{provider} receive route. --daemon-url is this daemon's own \
+externally-reachable base URL (it cannot determine that itself). Requires the daemon's \
+(daemon-singleton) [webhook] secret_env variable to already be set in its own process \
+environment.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "status",
+        &["project [str]"],
+        &[],
+        "List every webhook currently registered on the project's forge repo (not filtered \
+to ones ralphus installed -- match by url).",
+        false,
+        true, // ("project", "webhook", "status")
+        &[],
+    ),
+    node(
+        "uninstall",
+        &["project [str]"],
+        &["--hook-id [id]"],
+        "Delete one webhook from the project's forge repo by its forge-assigned id (see \
+`project webhook status` for the id).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "update",
+        &["project [str]"],
+        &["--daemon-url [url]"],
+        "Rotate the secret and/or callback URL on the webhook this daemon previously \
+recorded installing for the project (`webhook install`), without changing its forge-assigned \
+id. Fails with 404 if no webhook was ever recorded installed for this project -- run \
+`webhook install` first.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "check",
+        &["project [str]"],
+        &[],
+        "Fire the forge's own webhook test/ping mechanism against the hook recorded installed \
+for the project -- a reachability check for whether a real delivery from the forge actually \
+reaches this daemon's receive route. GitHub's ping is fire-and-forget (check the hook's \
+\"Recent Deliveries\" page on GitHub to confirm receipt); GitLab's test endpoint reports its \
+outcome synchronously in the response. Fails with 404 if no webhook was ever recorded \
+installed for this project.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "shadow-scorecard",
+        &["project [str]"],
+        &[],
+        "Show the project's shadow-mode webhook delivery scorecard: total deliveries, \
+missed-change count (a resolved PR the poll had never checked as of the delivery), spurious \
+deliveries (verified but resolved to no PR), average/max poll lag, and out-of-order arrivals -- \
+the evidence for whether [webhook] mode is ready to move from \"shadow\" to \"active\". \
+Read-only, no forge call.",
+        false,
+        true, // ("project", "webhook", "shadow-scorecard")
+        &[],
+    ),
+];
+
 const PROJECT_CHILDREN: &[HelpNode] = &[
     node(
         "fork",
@@ -1178,6 +1255,16 @@ agent/model, machine, budget, proof scope, and the project-level equivalents of 
         false,
         false,
         PROJECT_REVIEW_SETTINGS_CHILDREN,
+    ),
+    node(
+        "webhook",
+        &[],
+        &[],
+        "Manage a live forge webhook for a project (Track E, E8): explicit install/status/\
+uninstall only -- no automatic lifecycle management (secret rotation, address change) yet.",
+        false,
+        false,
+        PROJECT_WEBHOOK_CHILDREN,
     ),
 ];
 

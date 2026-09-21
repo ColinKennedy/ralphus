@@ -1690,6 +1690,13 @@ impl Store {
                 local_sha          TEXT,
                 etag_conversation  TEXT,
                 etag_review        TEXT,
+                -- The merge check's own `GET /pulls/{n}` ETag. Owned by
+                -- `check_pr_merges`, not by either poll half below: that
+                -- check asks the single hottest forge question ralphus has
+                -- (has this PR merged yet?), and sending `If-None-Match`
+                -- makes the overwhelmingly common no answer a 304, which
+                -- GitHub does not charge against the primary rate limit.
+                etag_pr_state      TEXT,
                 -- Per-half freshness. `last_checked_at_ms`/`status`/
                 -- `last_error` above are the rolled-up most-recent-of-either;
                 -- these describe each half on its own, because a pass
@@ -1728,6 +1735,65 @@ impl Store {
                 PRIMARY KEY (pr_id, endpoint, external_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pr_forge_comments_pr ON guardian_pr_forge_comments(pr_id);
+            -- Track E, E6: delivery-id dedup for the forge webhook receive
+            -- route (GitHub's `X-GitHub-Delivery` / GitLab's
+            -- `X-Gitlab-Event-UUID`). Both forges retry an undelivered
+            -- webhook, and a retry must still be acknowledged with a 200
+            -- but must not be re-processed -- re-resolving its PR and
+            -- re-emitting its Cartographer row would double-count it in
+            -- Track F's shadow-mode scorecard. Keyed on `(provider,
+            -- delivery_id)` rather than `delivery_id` alone since the two
+            -- forges mint IDs from separate namespaces with no uniqueness
+            -- guarantee across them.
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                provider       TEXT NOT NULL,
+                delivery_id    TEXT NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (provider, delivery_id)
+            );
+            -- Track E, E9: which forge webhook (if any) this daemon
+            -- installed for a project (E8), so hook lifecycle actions --
+            -- rotating the secret / updating the callback URL (`POST
+            -- .../webhook/update`), and best-effort cleanup when the
+            -- project itself is removed -- know which hook id to act on
+            -- without asking the caller to look it up and pass it back in.
+            -- One row per project; `project_name` is not a foreign key into
+            -- `projects` (a project can be re-registered under the same
+            -- name after removal, and this row should not silently vanish
+            -- with it if cleanup already ran).
+            CREATE TABLE IF NOT EXISTS project_webhooks (
+                project_name    TEXT PRIMARY KEY,
+                provider        TEXT NOT NULL,
+                hook_id         TEXT NOT NULL,
+                daemon_url      TEXT NOT NULL,
+                installed_at_ms INTEGER NOT NULL
+            );
+            -- Track F, F1/F2: one row per verified webhook delivery while a
+            -- project's [webhook] mode is \"shadow\" -- recorded, never
+            -- acted on, purely to build confidence the delivery stream can
+            -- be trusted before flipping a project to \"active\". `pr_id`
+            -- NULL means E5 couldn't resolve a PR for this delivery (a
+            -- spurious delivery for scorecard purposes, F3).
+            -- `poll_last_checked_at_ms` is a snapshot of
+            -- `guardian_pr_forge_cache.last_checked_at_ms` for the resolved
+            -- PR taken at record time (F2) -- NULL means the poll had never
+            -- checked this PR as of the delivery's arrival, the clearest
+            -- \"the poll would have missed this entirely\" signal.
+            -- `poll_lag_ms` is the derived
+            -- `arrived_at_ms - poll_last_checked_at_ms` delta, NULL under
+            -- the same condition.
+            CREATE TABLE IF NOT EXISTS webhook_shadow_deliveries (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider                TEXT NOT NULL,
+                delivery_id             TEXT,
+                project_name            TEXT NOT NULL,
+                pr_id                   TEXT,
+                arrived_at_ms           INTEGER NOT NULL,
+                poll_last_checked_at_ms INTEGER,
+                poll_lag_ms             INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_shadow_deliveries_project
+                ON webhook_shadow_deliveries(project_name);
             -- RAL-164: tracks in-flight/completed 'set it for me' AI resolution
             -- of a named CheckInput, one row per (guardian_id, input_name).
             -- Existence of this table (rather than a JSON blob on `guardians`)
@@ -2815,6 +2881,12 @@ impl Store {
             // column can still be NULL for guardians created before this
             // migration.
             "ALTER TABLE guardians ADD COLUMN owner TEXT",
+            // The merge check's own `GET /pulls/{n}` ETag -- see this
+            // column's comment on `guardian_pr_forge_cache`'s CREATE TABLE
+            // above. NULL on an existing row means "never asked
+            // conditionally"; the first merge check after this migration
+            // fetches unconditionally and records the ETag it gets back.
+            "ALTER TABLE guardian_pr_forge_cache ADD COLUMN etag_pr_state TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
