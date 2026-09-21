@@ -1425,7 +1425,7 @@ HEALTH_ROUTES: Routes = {
 
 #: Lifecycle states `daemon/src/guardian_merge.rs`'s `WorktreeRetirementEntry`
 #: doc comment enumerates, in the same order the board's own
-#: `RETIREMENT_STATES` (librarian/assets/board/81-worktree-retirement.js) lists
+#: `RETIREMENT_STATES` (librarian/assets/board/79-worktree-retirement.js) lists
 #: them -- see `WORKTREE_RETIREMENT_ROWS` above for the one-row-per-state
 #: version this mirrors at load scale.
 _RETIREMENT_STATES: tuple[str, ...] = (

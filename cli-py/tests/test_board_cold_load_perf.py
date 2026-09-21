@@ -38,10 +38,9 @@ file and are not:
    sequence calls `tick()` directly for the default (no-hash / `#/squads`)
    case instead of routing through `showTab()`, and only `showTab()`
    (`25-chrome.js`) wraps a navigation with `RalphusTiming.timeNav`. Every
-   other tab's first load here goes through `showTab()` -- either because
-   its hash is recognized by the boot dispatch in `80-queue.js`, or, for
-   `worktree-retirement` (see below), because the test calls `showTab()`
-   itself -- and does get a real breakdown.
+   other tab's first load here goes through `showTab()` because its hash is
+   recognized by the boot dispatch in `80-queue.js`, and does get a real
+   breakdown.
 
 Because of point 2, this module's pass/fail assertion is always the
 wall-clock elapsed time (`time.perf_counter()` around
@@ -50,16 +49,9 @@ that breakdown is attached to the failure message purely as extra
 diagnostic context, falling back to the literal string
 "no client timing available" when it's `None`.
 
-`worktree-retirement` has no dedicated URL hash at all: `parseHash()`
-(`25-chrome.js`) and the boot dispatch (`80-queue.js`) recognize
-`tasks`/`reviews`/`resources`/`queue`/`cartographer`/`projects`/`machines`/
-`triage`/`users`/`secrets`/`prefs`, but never `worktree-retirement` -- the
-only way in is `showTab('worktree-retirement', true)`, exactly like
-`docsgen/shots.py`'s own `_worktree_retirement_overview` scenario. This test
-mirrors that scenario's exact recipe: land on `#/tasks` (itself a real,
-supported cold navigation), then call `showTab` via `page.evaluate` as the
-very next step on that same fresh context, then wait for the tab's real
-data marker -- still one continuous cold-session timing window.
+`#/retirement` is the public hash route for the `worktree-retirement` tab.
+This test uses that route directly so it measures the same cold navigation a
+bookmark or shared link uses.
 
 Marked `heavy` (large fixtures, a real subprocess, a real Chromium tab) --
 run with `-m heavy`, or exclude with `-m "not heavy"`; a plain
@@ -139,7 +131,7 @@ TASKS_ROUTES: fixtures.Routes = {
     "/api/queue": {"items": []},
 }
 
-#: Retirements tab (`showTab('worktree-retirement', true)` -- no dedicated hash) -- 650 rows.
+#: Retirements tab (`#/retirement`) -- 650 rows.
 WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
     "/api/tasks": _empty_board(),
     "/api/task-index": {"daemon": _daemon_status(), "squads": []},
@@ -245,14 +237,10 @@ def _cold_nav(
     hash_: str,
     ready_selector: str,
     tab: str,
-    *,
-    post_goto_js: str | None = None,
 ) -> tuple[float, fixtures.Json | None]:
     """One cold navigation on a fresh context: times `page.goto()` through
-    `page.wait_for_selector(ready_selector)`, optionally running
-    `post_goto_js` (the `worktree-retirement` `showTab()` workaround, see the
-    module docstring) in between, and returns
-    `(elapsed_ms, RalphusTiming.getLast(tab))`.
+    `page.wait_for_selector(ready_selector)`, and returns `(elapsed_ms,
+    RalphusTiming.getLast(tab))`.
 
     Retries up to `_MAX_ATTEMPTS` times, each on a brand-new
     `browser.new_context()` (so a retry is exactly as "cold" as the first
@@ -272,8 +260,6 @@ def _cold_nav(
             page = context.new_page()
             start = time.perf_counter()
             page.goto(f"{base_url}/?ralphusTiming=1{hash_}")
-            if post_goto_js is not None:
-                page.evaluate(post_goto_js)
             page.wait_for_selector(ready_selector)
             elapsed_ms = (time.perf_counter() - start) * 1000
             timing = page.evaluate(
@@ -317,10 +303,9 @@ def test_worktree_retirement_tab_cold_load_under_budget(browser: Browser) -> Non
         elapsed_ms, timing = _cold_nav(
             browser,
             base_url,
-            "#/tasks",
+            "#/retirement",
             "#worktree-retirement .proj-table",
             "worktree-retirement",
-            post_goto_js="showTab('worktree-retirement', true)",
         )
     assert elapsed_ms < BUDGET_MS, _failure_message(
         "worktree-retirement", fixture_size, elapsed_ms, timing
