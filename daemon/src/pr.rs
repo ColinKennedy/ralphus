@@ -4532,6 +4532,27 @@ fn resolve_fork_routing(
             )
         },
     )?;
+    // RAL-338 follow-up: this `root` is a review/guardian-merge worktree,
+    // separate from (and created after) the cell worktree
+    // `route_worktree_to_submitter_fork` already wires identity/credentials
+    // onto -- without this, a stacked-PR push from here has no git identity
+    // override and, for an HTTPS fork, no way to authenticate at all (git
+    // falls back to an interactive credential prompt that fails immediately
+    // in a non-interactive context: "credential-cache unavailable... could
+    // not read Username").
+    crate::worktrees::apply_worktree_git_identity_best_effort(
+        root,
+        &crate::project_forks::GitIdentity {
+            name: fork.git_user_name.clone(),
+            email: fork.git_user_email.clone(),
+        },
+    );
+    crate::worktrees::apply_worktree_credential_helper_best_effort(
+        &store.lock(),
+        root,
+        user,
+        &fork.fork_url,
+    );
     let parent_remote_name = crate::forge::resolve_remote_name_excluding(
         root,
         &guardian.base_branch,
@@ -11763,6 +11784,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
         let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-338 follow-up regression: `resolve_fork_routing`'s `root` is a
+    /// review/guardian-merge worktree, separate from the cell worktree
+    /// `route_worktree_to_submitter_fork` already wires identity/credential
+    /// config onto -- a stacked-PR push from here had no way to
+    /// authenticate against an HTTPS fork at all until this was fixed
+    /// (observed live: "credential-cache unavailable... could not read
+    /// Username").
+    #[test]
+    fn resolve_fork_routing_wires_identity_and_credential_helper_onto_the_review_worktree() {
+        let root_dir = tmp_dir("fork-routing-cred-wiring");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        store
+            .lock()
+            .register_project("demo", "d", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        store.lock().create_user("alice").unwrap();
+        store
+            .lock()
+            .set_user_forge_token("alice", "github.com", "ghp-unused")
+            .unwrap();
+        store
+            .lock()
+            .upsert_project_fork_with_identity(
+                "demo",
+                "alice",
+                "https://github.com/alice/widget.git",
+                "fork-alice",
+                "alice",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root_dir.to_str().unwrap())
+            .unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let forge_cfg = crate::config::ForgeConfig::default();
+
+        resolve_fork_routing(&store, &root_dir, &guardian, &forge_cfg, "alice").unwrap();
+
+        assert_eq!(
+            g(&root_dir, &["config", "user.name"]).trim(),
+            "Alice Example"
+        );
+        assert_eq!(
+            g(&root_dir, &["config", "user.email"]).trim(),
+            "alice@example.com"
+        );
+        let helper = g(&root_dir, &["config", "--get", "credential.helper"]);
+        assert!(
+            helper.trim().starts_with('!')
+                && helper.trim().ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value: {helper:?}"
+        );
+        let worktree_id = g(&root_dir, &["config", "--get", "ralphus.worktree-id"]);
+        assert!(!worktree_id.trim().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 
     /// RAL-395 regression: a stack submitted one branch at a time via
