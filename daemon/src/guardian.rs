@@ -8099,14 +8099,14 @@ mod tests {
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
     }
 
-    /// Guards the fix above from over-widening: a terminal `approved` review
+    /// Guards the fix above from over-widening: a terminal `merged` review
     /// must still refuse to be reset back to `collecting`.
     #[test]
     fn reset_guardian_to_collecting_still_rejects_a_terminal_status() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .set_guardian_status(&id, GuardianStatus::Approved, None)
+            .set_guardian_status(&id, GuardianStatus::Merged, None)
             .unwrap();
 
         assert!(store.reset_guardian_to_collecting(&id).is_err());
