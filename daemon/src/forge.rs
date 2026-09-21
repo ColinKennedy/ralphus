@@ -4800,7 +4800,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "unknown", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "unstable", "head": {"sha": "deadbeef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -4896,7 +4896,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "unknown", "head": {"sha": "newsha"}}"#,
+                    r#"{"mergeable_state": "unstable", "head": {"sha": "newsha"}}"#,
                 )
                 .with_status_code(200),
             )
