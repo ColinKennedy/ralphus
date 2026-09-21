@@ -52,8 +52,11 @@ pub fn load_or_create(path: &Path) -> io::Result<String> {
     Ok(token)
 }
 
-/// Generate a fresh random token, hex-encoded.
-fn generate() -> String {
+/// Generate a fresh random token, hex-encoded. `pub(crate)` beyond this
+/// module's own use in [`load_or_create`] so other daemon-internal secrets
+/// needing the same randomness source (e.g. `user_forge_tokens`' per-worktree
+/// credential grants) don't duplicate it.
+pub(crate) fn generate() -> String {
     let mut buf = [0u8; TOKEN_BYTES];
     getrandom::getrandom(&mut buf).expect("OS randomness source available");
     buf.iter().map(|b| format!("{b:02x}")).collect()

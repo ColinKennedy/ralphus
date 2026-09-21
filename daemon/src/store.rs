@@ -1538,6 +1538,43 @@ impl Store {
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (project, user)
             );
+            -- A ralphus user's personal access token for one forge host
+            -- (RAL-338 follow-up), e.g. user = Colin Kennedy, host = gitlab.com.
+            -- Deliberately DOES cascade on user deletion, unlike project_forks
+            -- above: a fork *routing* row should stay visible when orphaned
+            -- (see project_forks.rs), but a *secret* should not linger once its
+            -- owning user is gone. The token value itself never appears in any
+            -- list/show API response -- only presence/host/timestamps do (see
+            -- `list_user_forge_tokens`); only the credential-fetch path
+            -- (`Store::resolve_worktree_credential`) ever reads the raw value.
+            CREATE TABLE IF NOT EXISTS user_forge_tokens (
+                user          TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                host          TEXT NOT NULL,
+                token         TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (user, host)
+            );
+            -- A short-lived grant minted once per worktree at fork-routing time
+            -- (RAL-338 follow-up, `route_worktree_to_submitter_fork`), so that
+            -- worktree's git-credential helper can later fetch its owner's
+            -- forge token without the token ever being written to any git
+            -- config file on disk. `worktree_id` and `grant_secret` are both
+            -- stamped into the worktree's own `--worktree`-scoped git config
+            -- alongside the identity fields; the credential-fetch endpoint
+            -- requires BOTH to match this row before releasing a token, so
+            -- holding the daemon's general API bearer token alone (which every
+            -- local cell already has) is not sufficient to read another
+            -- worktree's credential -- see the design discussion this
+            -- followed for why that distinction matters once a host runs work
+            -- for more than one person.
+            CREATE TABLE IF NOT EXISTS worktree_credential_grants (
+                worktree_id   TEXT PRIMARY KEY,
+                grant_secret  TEXT NOT NULL,
+                user          TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );
             -- RAL-328: view preferences are scoped to a registered user and
             -- reference exactly one squad, review, or (RAL-365) task. Entity
             -- deletion removes the preference before sequential ids can be
