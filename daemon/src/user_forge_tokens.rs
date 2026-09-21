@@ -68,14 +68,24 @@ impl Store {
     }
 
     /// The raw token value for `(user, host)`. Internal use only (credential
-    /// resolution) -- never surface this over an API response; see
+    /// resolution, and RAL-338 follow-up: as a fork's own forge REST API
+    /// token override) -- never surface this over an API response; see
     /// [`Self::list_user_forge_tokens`] for the redacted, listable form.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    /// [`Self::resolve_worktree_credential_conn`]'s doc comment explains why
-    /// this takes any connection rather than `&self` -- it must be callable
-    /// from the RAL-393 Stage 3 read pool, not just the locked writer.
+    pub(crate) fn get_user_forge_token(
+        &self,
+        user: &str,
+        host: &str,
+    ) -> StoreResult<Option<String>> {
+        Self::get_user_forge_token_conn(&self.conn, user, host)
+    }
+
+    /// [`Self::get_user_forge_token`] against any connection -- see
+    /// [`Self::resolve_worktree_credential_conn`]'s doc comment for why
+    /// this exists (callable from the RAL-393 Stage 3 read pool, not just
+    /// the locked writer).
     pub(crate) fn get_user_forge_token_conn(
         conn: &rusqlite::Connection,
         user: &str,

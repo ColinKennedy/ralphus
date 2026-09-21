@@ -4560,7 +4560,29 @@ fn resolve_fork_routing(
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)?;
-    let fork_client = crate::forge::resolve_remote_for(root, &fork.remote_name, forge_cfg)?;
+    // RAL-338 follow-up: the fork's own forge REST API client must
+    // authenticate as the fork's owning user, not the daemon's single
+    // shared identity -- unlike the parent client above (there is only
+    // ever one parent, so the daemon's own env-var/CLI-token identity is
+    // correct there), the fork's owner may be a different person entirely.
+    // Without this, git push (already routed through this user's stored
+    // token via the credential helper) succeeds, but the REST call to
+    // actually open the PR/MR fails with a permissions error, since it
+    // authenticated as whoever the daemon's shared identity is instead of
+    // the fork's actual owner.
+    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
+        store
+            .lock()
+            .get_user_forge_token(user, &host)
+            .ok()
+            .flatten()
+    });
+    let fork_client = crate::forge::resolve_remote_for_as(
+        root,
+        &fork.remote_name,
+        forge_cfg,
+        fork_token.as_deref(),
+    )?;
     let parent_project_id = if fork_client.kind() == crate::forge::ForgeKind::GitLab {
         Some(
             parent_client
