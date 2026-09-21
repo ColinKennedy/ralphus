@@ -8781,10 +8781,18 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
 /// per-PR sync-status polling (RAL-190) pays the same tax concurrently on the
 /// very same repo, contending for `pr::SYNC_FETCH_LOCKS`.
 ///
-/// Best-effort and silent on failure: a `git gc` that can't run (a machine
-/// provider with no `gc` support, a transient lock held by a concurrent git
-/// process) just leaves the root exactly as loose-object-heavy as it already
-/// was, no worse off, and gets another chance tomorrow.
+/// A `git gc` that can't run (a machine provider with no `gc` support, a
+/// transient lock held by a concurrent git process) is logged and gets
+/// another chance tomorrow -- best-effort, same as every other daily sweep
+/// in this file. What it leaves the root in when it fails partway through is
+/// less certain than that framing suggests, though: a real attempt against
+/// ralphus's own dev repo hit `fatal: index file corrupt` / `failed to run
+/// repack` after racing a concurrently-running guardian merge on the same
+/// root, and a follow-up `git fsck` transiently (not permanently -- every
+/// flagged object resolved fine moments later) reported objects as missing.
+/// Nothing was actually lost, but "no worse off" is an assumption this
+/// hasn't earned; [`busy_git_maintenance_roots`] exists to make that race
+/// less likely to occur at all, not just to survive it.
 ///
 /// Dispatched one thread per root rather than run inline: on a heavily
 /// bloated repo `git gc` is not a quick check, it is minutes of real work
@@ -8801,10 +8809,20 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             .map(|g| GuardianRootInfo {
                 git_root: g.git_root,
                 machine: g.machine,
+                status: g.status,
             })
             .collect()
     };
+    let busy = busy_git_maintenance_roots(&guardians);
     for (root, machine) in collect_git_maintenance_roots(&guardians) {
+        if busy.contains(&(root.clone(), machine.clone())) {
+            crate::rlog!(
+                DEBUG,
+                "ralphus [guardian] git maintenance skipped for {}: a merge is in progress",
+                root.display()
+            );
+            continue;
+        }
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
@@ -8828,13 +8846,15 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
     }
 }
 
-/// The `(git_root, machine)` fields [`collect_git_maintenance_roots`] needs
-/// from a guardian -- narrowed down from the full `GuardianView` the same way
-/// [`GuardianBaseFetchInfo`] narrows it for `collect_base_fetch_targets`, so
-/// the pure dedup logic can be unit-tested without constructing a whole view.
+/// The `(git_root, machine, status)` fields [`collect_git_maintenance_roots`]
+/// and [`busy_git_maintenance_roots`] need from a guardian -- narrowed down
+/// from the full `GuardianView` the same way [`GuardianBaseFetchInfo`]
+/// narrows it for `collect_base_fetch_targets`, so the pure dedup/filter
+/// logic can be unit-tested without constructing a whole view.
 pub(crate) struct GuardianRootInfo {
     pub git_root: String,
     pub machine: Option<String>,
+    pub status: String,
 }
 
 /// Every distinct `(root, machine)` git checkout across every guardian this
@@ -8855,6 +8875,26 @@ pub(crate) fn collect_git_maintenance_roots(
         }
     }
     roots
+}
+
+/// Every `(root, machine)` with at least one guardian currently `merging` --
+/// a live, multi-minute chain of `git worktree`/`checkout`/`rebase`/`commit`
+/// subprocesses against that same root. `run_periodic_git_maintenance` skips
+/// these: a concurrent `git gc` racing that chain is what produced a real
+/// `fatal: index file corrupt` failure against ralphus's own dev repo (see
+/// that function's doc comment). Other guardian states (`collecting`,
+/// `in_review`, ...) don't chain sustained git activity against the root the
+/// same way a rebase in progress does, so they aren't checked here. Pure, no
+/// I/O -- callers already have the same guardian list `collect_git_maintenance_roots`
+/// consumes.
+pub(crate) fn busy_git_maintenance_roots(
+    guardians: &[GuardianRootInfo],
+) -> HashSet<(PathBuf, Option<String>)> {
+    guardians
+        .iter()
+        .filter(|g| g.status == GuardianStatus::Merging.as_str())
+        .map(|g| (PathBuf::from(&g.git_root), g.machine.clone()))
+        .collect()
 }
 
 /// The operator-facing worktree-retirement view (RAL-385, states widened by
@@ -11071,25 +11111,21 @@ mod tests {
         assert!(collect_base_fetch_targets(&guardians).is_empty());
     }
 
+    fn root_info(git_root: &str, machine: Option<&str>, status: &str) -> GuardianRootInfo {
+        GuardianRootInfo {
+            git_root: git_root.to_string(),
+            machine: machine.map(str::to_string),
+            status: status.to_string(),
+        }
+    }
+
     #[test]
     fn collect_git_maintenance_roots_dedupes_a_root_shared_across_guardians() {
         let guardians = vec![
-            GuardianRootInfo {
-                git_root: "/repo/a".to_string(),
-                machine: None,
-            },
-            GuardianRootInfo {
-                git_root: "/repo/a".to_string(),
-                machine: None,
-            },
-            GuardianRootInfo {
-                git_root: "/repo/a".to_string(),
-                machine: Some("build-farm-1".to_string()),
-            },
-            GuardianRootInfo {
-                git_root: "/repo/b".to_string(),
-                machine: None,
-            },
+            root_info("/repo/a", None, "in_review"),
+            root_info("/repo/a", None, "merge_failed"),
+            root_info("/repo/a", Some("build-farm-1"), "in_review"),
+            root_info("/repo/b", None, "in_review"),
         ];
         let roots = collect_git_maintenance_roots(&guardians);
         assert_eq!(roots.len(), 3, "got: {roots:?}");
@@ -11103,13 +11139,36 @@ mod tests {
         // Unlike `collect_base_fetch_targets`, a deployed/cancelled guardian's
         // root still carries whatever loose-object debt its review left
         // behind -- this list is never status-filtered.
-        let guardians = vec![GuardianRootInfo {
-            git_root: "/repo/a".to_string(),
-            machine: None,
-        }];
+        let guardians = vec![root_info("/repo/a", None, "deployed")];
         assert_eq!(
             collect_git_maintenance_roots(&guardians),
             vec![(PathBuf::from("/repo/a"), None)]
+        );
+    }
+
+    #[test]
+    fn busy_git_maintenance_roots_flags_only_a_root_with_a_merge_in_progress() {
+        let guardians = vec![
+            root_info("/repo/a", None, "merging"),
+            root_info("/repo/b", None, "in_review"),
+            root_info("/repo/c", None, "collecting"),
+            root_info("/repo/d", None, "merge_failed"),
+        ];
+        let busy = busy_git_maintenance_roots(&guardians);
+        assert_eq!(busy.len(), 1, "got: {busy:?}");
+        assert!(busy.contains(&(PathBuf::from("/repo/a"), None)));
+    }
+
+    #[test]
+    fn busy_git_maintenance_roots_distinguishes_machines_sharing_a_root() {
+        let guardians = vec![
+            root_info("/repo/a", None, "in_review"),
+            root_info("/repo/a", Some("build-farm-1"), "merging"),
+        ];
+        let busy = busy_git_maintenance_roots(&guardians);
+        assert_eq!(
+            busy,
+            HashSet::from([(PathBuf::from("/repo/a"), Some("build-farm-1".to_string()))])
         );
     }
 
