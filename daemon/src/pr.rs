@@ -2025,7 +2025,27 @@ fn resolve_pr_repo_routing(
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg).ok();
-    let fork_client = crate::forge::resolve_remote_for(root, &fork.remote_name, forge_cfg).ok();
+    // RAL-338 follow-up: the fork's own client must authenticate as the
+    // fork's registered owner (`fork.user`), not the daemon's single shared
+    // identity -- unlike the parent client above (there is only ever one
+    // parent), the fork's owner may be a different person entirely, and the
+    // daemon's own token routinely lacks visibility into that user's fork
+    // (GitLab/GitHub answer with a 404, not a 403, for a resource the
+    // token can't see, so this looked identical to "the PR doesn't exist").
+    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
+        store
+            .lock()
+            .get_user_forge_token(&fork.user, &host)
+            .ok()
+            .flatten()
+    });
+    let fork_client = crate::forge::resolve_remote_for_as(
+        root,
+        &fork.remote_name,
+        forge_cfg,
+        fork_token.as_deref(),
+    )
+    .ok();
     PrRepoRouting {
         parent_client,
         parent_remote_name,
@@ -10294,6 +10314,23 @@ mod tests {
         assert!(
             routing_with_owner.fork_client.is_some(),
             "the guardian's own owner must be tried against the fork table, not only \"\""
+        );
+
+        // Once alice has a stored token for this host, the fork client built
+        // on her behalf must carry it -- this is what actually fixes the
+        // 404s: without it, a maintenance-path forge call for alice's fork
+        // authenticated as the daemon's own shared identity instead, which
+        // routinely lacks visibility into a fork it doesn't own.
+        store.lock().create_user("alice").unwrap();
+        store
+            .lock()
+            .set_user_forge_token("alice", "github.com", "alices-own-token")
+            .unwrap();
+        let routing_with_token =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        assert_eq!(
+            routing_with_token.fork_client.unwrap().token(),
+            Some("alices-own-token")
         );
 
         let _ = std::fs::remove_dir_all(root_dir);
