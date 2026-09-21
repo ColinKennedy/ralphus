@@ -11248,7 +11248,7 @@ mod tests {
             .remove(&gid);
 
         assert!(check_pr_merges_polled(&store, &gid));
-        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
     }
 
     #[test]
@@ -11306,7 +11306,7 @@ mod tests {
             .insert(gid.clone(), std::time::Instant::now());
 
         assert!(check_pr_merges(&store, &gid));
-        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "approved");
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
     }
 
     #[test]
