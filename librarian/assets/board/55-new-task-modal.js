@@ -22,6 +22,8 @@
        * part of any one squad's form data.
        */
       let ntSubmitAnother = false;
+      /** @type {Promise<void>|null} the in-flight refresh for the Simple tab's project selector */
+      let ntProjectOptionsLoad = null;
       /**
        * Whether the just-clicked Submit button was a Shift-click, captured
        * by the button's own `onclick` (before `submitTask()` runs) so the
@@ -62,9 +64,7 @@
         ntModalOpen = true;
         renderNewTaskModal();
         loadNtSimpleConfig();
-        if (!projects.length) {
-          pollProjects().then(() => { if (ntTab === "simple") renderNewTaskModal(); });
-        }
+        ntLoadProjectOptions();
       }
       /**
        * Renders the New Task modal (Simple, Files, or Paste tab).
@@ -311,6 +311,53 @@
       function ntSimpleAgentCwd() {
         const project = projects.find((p) => p.name === ntSimple.project);
         return project ? project.path : "";
+      }
+      /**
+       * Builds the project selector's placeholder and registered-project options.
+       * @returns {string}
+       */
+      function ntProjectOptionsHtml() {
+        return `<option value="">(select a project)</option>${projects.map((p) => `<option value="${esc(p.name)}" ${p.name === ntSimple.project ? "selected" : ""}>${esc(p.name)}</option>`).join("")}`;
+      }
+      /**
+       * Fetches the current registered projects and updates the open modal's
+       * selector in place. Updating only its options lets a native picker that
+       * is already open receive the response without replacing the control.
+       * Concurrent open and picker-open refreshes share one request.
+       * @returns {Promise<void>}
+       */
+      function ntLoadProjectOptions() {
+        if (!ntProjectOptionsLoad) {
+          ntProjectOptionsLoad = pollProjects().finally(() => { ntProjectOptionsLoad = null; });
+        }
+        return ntProjectOptionsLoad.then(() => {
+          if (!ntModalOpen || ntTab !== "simple") return;
+          const select = /** @type {HTMLSelectElement|null} */ (document.getElementById("nt-project"));
+          if (select) select.innerHTML = ntProjectOptionsHtml();
+        });
+      }
+      /**
+       * Opens the Project picker with real registered-project data. When the
+       * first request is still loading, suppresses its empty native popup and
+       * reopens it after the options arrive.
+       * @param {MouseEvent} e
+       * @param {HTMLSelectElement} select
+       * @returns {void}
+       */
+      function onNtProjectMouseDown(e, select) {
+        if (projects.length) {
+          ntLoadProjectOptions();
+          return;
+        }
+        e.preventDefault();
+        ntLoadProjectOptions().then(() => {
+          if (!select.isConnected) return;
+          if (typeof select.showPicker === "function") {
+            try { select.showPicker(); } catch (_) { select.focus(); }
+          } else {
+            select.focus();
+          }
+        });
       }
       /**
        * Warms the shared agent-select cache for `cwd` and, unlike
@@ -1033,7 +1080,7 @@
           </label>${ntFieldErrorHtml(`field:${f.name}`)}`).join("");
         const agentCwd = ntSimpleAgentCwd();
         const agentStyle = NT_INPUT_STYLE + (ntFieldErrorText("agent") ? ";border-color:var(--failed)" : "");
-        const projectOptions = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === ntSimple.project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+        const projectOptions = ntProjectOptionsHtml();
         const selectedProject = projects.find((p) => p.name === ntSimple.project);
         const showUpstream = !!(selectedProject && selectedProject.vcs === "git");
         return `
@@ -1066,7 +1113,7 @@
           <div class="row" style="gap:8px;margin-top:8px;align-items:flex-start">
             <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="Which registered project the work runs against. The task always runs in a fresh worktree branch for this project — never the project's raw checkout directly.">
               Project
-              <select class="${ntFieldErrorText("project") ? "err" : ""}" style="${NT_INPUT_STYLE}" onchange="ntSimple.project=this.value;ntClearFieldError('project');ntPreloadNewTaskAgentDefault(ntSimpleAgentCwd());renderNewTaskModal()"><option value="">(select a project)</option>${projectOptions}</select>
+              <select id="nt-project" class="${ntFieldErrorText("project") ? "err" : ""}" style="${NT_INPUT_STYLE}" onmousedown="onNtProjectMouseDown(event,this)" onchange="ntSimple.project=this.value;ntClearFieldError('project');ntPreloadNewTaskAgentDefault(ntSimpleAgentCwd());renderNewTaskModal()">${projectOptions}</select>
               ${ntFieldErrorHtml("project")}
             </label>
             ${showUpstream ? `
@@ -1401,4 +1448,3 @@
         errEl.innerHTML = lines.join("<br>");
         taEl.classList.toggle("err", !v.valid);
       }
-

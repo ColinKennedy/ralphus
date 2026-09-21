@@ -415,6 +415,22 @@ test("openNewTask resets the Simple tab via ntSimpleResetKeepingProjectFields, n
   assert.doesNotMatch(fn, /\bntSimpleReset\(\);/, "openNewTask must not call the bare full reset directly");
 });
 
+test("the Simple tab refreshes project options in place when its Project selector is opened", () => {
+  const openBody = boardSource.slice(boardSource.indexOf("function openNewTask()"));
+  const openFn = openBody.slice(0, openBody.indexOf("\n      }\n") + 1);
+  assert.match(openFn, /ntLoadProjectOptions\(\);/, "opening the modal must start a project refresh");
+  const loadBody = boardSource.slice(boardSource.indexOf("function ntLoadProjectOptions()"));
+  const loadFn = loadBody.slice(0, loadBody.indexOf("\n      }\n") + 1);
+  assert.match(loadFn, /pollProjects\(\)/, "the selector refresh must request /api/projects through pollProjects");
+  assert.match(loadFn, /select\.innerHTML\s*=\s*ntProjectOptionsHtml\(\)/, "the response must update only the selector options, not rerender the modal");
+  const pickerBody = boardSource.slice(boardSource.indexOf("function onNtProjectMouseDown("));
+  const pickerFn = pickerBody.slice(0, pickerBody.indexOf("\n      }\n") + 1);
+  assert.match(pickerFn, /e\.preventDefault\(\)/, "a cold Project selector must suppress its empty native popup");
+  assert.match(pickerFn, /ntLoadProjectOptions\(\)\.then/, "the first selector click must wait for the requested options");
+  assert.match(pickerFn, /select\.showPicker\(\)/, "the picker must reopen automatically once its options arrive");
+  assert.match(boardSource, /id="nt-project"[^>]*onmousedown="onNtProjectMouseDown\(event,this\)"/, "mouse-down on Project must immediately refresh its options");
+});
+
 test("a successful submitTaskSimple resets via ntSimpleResetKeepingProjectFields, not a bare full reset", () => {
   const body = boardSource.slice(boardSource.indexOf("async function submitTaskSimple()"));
   const fn = body.slice(0, body.indexOf("\n      }\n") + 1);
