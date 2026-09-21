@@ -1020,16 +1020,12 @@ pub fn terminal_modes_for(
     resolver_agent: Option<&str>,
     has_session_id: bool,
     has_worktree: bool,
-    conn: &Connection,
-    cwd: &Path,
+    default_agent: &str,
 ) -> Vec<&'static str> {
     if has_session_id {
         return vec!["readonly", "open"];
     }
-    let default_agent = Store::resolve_review_config_conn(conn, cwd)
-        .default_resolver_agent()
-        .to_string();
-    let agent = resolver_agent.unwrap_or(&default_agent);
+    let agent = resolver_agent.unwrap_or(default_agent);
     let is_cli_agent = matches!(agent, "claude-code" | "codex" | "codex-cli" | "pi");
     if is_cli_agent && has_worktree {
         return vec!["worktree"];
@@ -4233,6 +4229,18 @@ impl Store {
         row: GuardianRow,
         ctx: &GuardianHydrationCtx,
     ) -> Result<GuardianView> {
+        // GUARDIAN_PERF.local.md follow-up: `terminal_modes_for` only needs
+        // the default resolver agent, already resolved once per distinct
+        // `git_root` in `ctx` -- looked up here, once per guardian, instead
+        // of every branch re-triggering its own `resolve_review_config_conn`
+        // (a `projects` table scan plus a `.ralphus.toml` filesystem walk).
+        let default_agent = ctx
+            .config_by_git_root
+            .get(&row.git_root)
+            .map(|(project_review_config, _, _)| {
+                project_review_config.default_resolver_agent().to_string()
+            })
+            .unwrap_or_default();
         // RAL-121: one correlated subquery per branch (finding that branch's
         // most-recent cell by rowid) instead of the previous four -- each of
         // state/squad_id/task_idx/idx was a separate subquery re-scanning
@@ -4276,8 +4284,7 @@ impl Store {
                     row.resolver_agent.as_deref(),
                     resolver_agent_session_id.is_some(),
                     worktree.is_some(),
-                    conn,
-                    Path::new(&row.git_root),
+                    &default_agent,
                 );
                 Ok(BranchView {
                     id: r.get(18)?,
@@ -5094,23 +5101,21 @@ mod tests {
     fn terminal_modes_with_session_id_are_always_readonly_and_open() {
         // A resolver cell id makes both modes available regardless of agent
         // or worktree presence.
-        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(None, true, false, &store.conn, Path::new(".")),
+            terminal_modes_for(None, true, false, "ollama"),
             vec!["readonly", "open"]
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), true, true, &store.conn, Path::new(".")),
+            terminal_modes_for(Some("ollama"), true, true, "ollama"),
             vec!["readonly", "open"]
         );
     }
 
     #[test]
     fn terminal_modes_cli_agent_with_worktree_offers_worktree_only() {
-        let store = Store::open_in_memory().unwrap();
         for agent in ["claude-code", "codex", "codex-cli", "pi"] {
             assert_eq!(
-                terminal_modes_for(Some(agent), false, true, &store.conn, Path::new(".")),
+                terminal_modes_for(Some(agent), false, true, "ollama"),
                 vec!["worktree"]
             );
         }
@@ -5118,23 +5123,16 @@ mod tests {
 
     #[test]
     fn terminal_modes_none_available_without_cell_or_worktree() {
-        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(
-                Some("claude-code"),
-                false,
-                false,
-                &store.conn,
-                Path::new(".")
-            ),
+            terminal_modes_for(Some("claude-code"), false, false, "ollama"),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), false, true, &store.conn, Path::new(".")),
+            terminal_modes_for(Some("ollama"), false, true, "ollama"),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(None, false, false, &store.conn, Path::new(".")),
+            terminal_modes_for(None, false, false, "ollama"),
             Vec::<&str>::new()
         );
     }
