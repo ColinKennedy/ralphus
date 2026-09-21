@@ -241,18 +241,30 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
 
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let client = match crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) {
-        Ok(c) => c,
-        Err(e) => {
+    // RAL-338 follow-up: resolved per-PR via `pr.repo`, not a single client
+    // derived from the guardian's own base branch -- a fork-routed stack's
+    // root PR is filed against the parent while every other stacked PR is
+    // filed against the fork, so a single guardian-wide client can only ever
+    // answer for one of them (see `crate::pr::PrRepoRouting`'s doc comment).
+    let client = match crate::pr::forge_client_for_pr(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        &pr.repo,
+        guardian.owner.as_deref(),
+    ) {
+        Some(c) => c,
+        None => {
             log_ci_watch(
                 store,
                 guardian_id,
                 branch_id,
                 LogLevel::WARNING,
                 format!(
-                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} could not resolve forge client: {e}"
+                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} could not resolve forge client"
                 ),
-                serde_json::json!({"outcome": "unavailable", "error": e}),
+                serde_json::json!({"outcome": "unavailable"}),
             );
             return;
         }
@@ -603,22 +615,6 @@ pub fn poll_open_pr_ci_status(
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let client = match crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            log_ci_watch(
-                store,
-                guardian_id,
-                "",
-                LogLevel::DEBUG,
-                format!(
-                    "ralphus [ci-watch] review {guardian_id} standing poll: could not resolve forge client: {e}"
-                ),
-                serde_json::json!({"outcome": "unavailable", "error": e}),
-            );
-            return;
-        }
-    };
     // Known slow spot: every open PR in this guardian is polled sequentially
     // here (2-3 blocking GitHub calls each), all inside the same
     // `STANDING_POLL_INTERVAL` window. Fine for the PR counts seen so far
@@ -638,6 +634,31 @@ pub fn poll_open_pr_ci_status(
     let mut polled: Vec<(PullRequestView, PrCiState)> = Vec::with_capacity(open.len());
     for pr in open {
         let number = pr.pr_number.expect("filtered above");
+        // RAL-338 follow-up: resolved per-PR via `pr.repo` -- a fork-routed
+        // stack's root PR is filed against the parent while every other
+        // stacked PR is filed against the fork, so a single guardian-wide
+        // client (as this used to resolve once before the loop) can only
+        // ever answer for one of them, and silently 404s polling the rest.
+        let Some(client) = crate::pr::forge_client_for_pr(
+            store,
+            &root,
+            &guardian.base_branch,
+            &forge_cfg,
+            &pr.repo,
+            guardian.owner.as_deref(),
+        ) else {
+            log_ci_watch(
+                store,
+                guardian_id,
+                pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} pr #{number} standing poll: could not resolve forge client"
+                ),
+                serde_json::json!({"pr_number": number, "outcome": "unavailable"}),
+            );
+            continue;
+        };
         let probe = match client.check_pr_ci_status_probe(number) {
             Ok(p) => p,
             Err(e) => {
@@ -670,6 +691,16 @@ pub fn poll_open_pr_ci_status(
     // matters here.
     for decision in plan_auto_fix_dispatch(&guardian, &polled) {
         if decision.dispatch {
+            let Some(client) = crate::pr::forge_client_for_pr(
+                store,
+                &root,
+                &guardian.base_branch,
+                &forge_cfg,
+                &decision.pr.repo,
+                guardian.owner.as_deref(),
+            ) else {
+                continue;
+            };
             dispatch_pr_auto_fix(
                 store,
                 runner,

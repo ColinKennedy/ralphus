@@ -1948,8 +1948,9 @@ fn forge_parent_remote_name(
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
 ) -> String {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg).parent_remote_name
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner).parent_remote_name
 }
 
 /// Resolve [`PrRepoRouting`] for `guardian`'s project (by `guardian.git_root`
@@ -1969,24 +1970,45 @@ pub fn forge_client_for_pr(
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     repo: &str,
+    owner: Option<&str>,
 ) -> Option<crate::forge::ForgeClient> {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg)
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner)
         .client_for(repo)
         .cloned()
 }
 
+/// `owner` should be the guardian's own resolved `owner` (submitter/
+/// `default_pr_user`/daemon default, per [`crate::guardian::resolve_review_owner`])
+/// -- RAL-338 follow-up: a project's fork row is keyed by whichever real user
+/// registered it (see `project_fork add --owner`/`project fork set`), never
+/// by an empty string, so a caller that only ever tried `user=""` here found
+/// no fork row at all and silently fell back to a single parent-only client.
+/// Every PR actually filed on that fork then got probed/PATCHed through the
+/// *parent's* client instead -- and since GitLab/GitHub issue PR/MR numbers
+/// per-repository starting from 1, a fork-hosted PR's number routinely
+/// collides with a same-numbered PR in the unrelated parent project, so this
+/// wasn't merely a 404: it read and rewrote whichever parent PR happened to
+/// share that number, including its target branch. `owner` is tried first,
+/// falling back to the empty-string project-wide-default row for any
+/// project that does use that convention, so a guardian with no owner (or an
+/// owner with no fork of its own) still resolves the same fork a
+/// project-wide default would have named.
 fn resolve_pr_repo_routing(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
 ) -> PrRepoRouting {
     let project_name = store
         .lock()
         .project_name_for_path(root.to_str().unwrap_or_default());
-    let fork = project_name
-        .as_deref()
-        .and_then(|p| store.lock().resolve_fork(p, "").ok().flatten());
+    let fork = project_name.as_deref().and_then(|p| {
+        owner
+            .filter(|o| !o.is_empty())
+            .and_then(|o| store.lock().resolve_fork(p, o).ok().flatten())
+            .or_else(|| store.lock().resolve_fork(p, "").ok().flatten())
+    });
     let Some(fork) = fork else {
         let parent_remote_name = crate::forge::resolve_remote_name(root, base_branch, forge_cfg);
         return PrRepoRouting {
@@ -2026,13 +2048,13 @@ fn resolve_pr_repo_routing(
 pub(crate) fn resolve_feedback_fork_remote(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
+    owner: Option<&str>,
 ) -> Option<String> {
     let project_name = store.lock().project_name_for_path(root.to_str()?)?;
-    let fork = store
-        .lock()
-        .resolve_fork(&project_name, "")
-        .ok()
-        .flatten()?;
+    let fork = owner
+        .filter(|o| !o.is_empty())
+        .and_then(|o| store.lock().resolve_fork(&project_name, o).ok().flatten())
+        .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())?;
     crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url).ok()?;
     Some(fork.remote_name)
 }
@@ -2061,7 +2083,13 @@ fn resync_pr_bases_inner(
     }
     let alias_by_branch = open_alias_by_branch(&prs);
 
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let (parent_client, fork_client) = (routing.parent_client, routing.fork_client);
     let resolved_client_err = if parent_client.is_none() && fork_client.is_none() {
         crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg).err()
@@ -2535,7 +2563,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         // else against the fork) -- resolve both candidates and pick
         // whichever matches this PR's own recorded `repo`, rather than a
         // single `resolve_remote` call that can only ever match one of them.
-        let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+        let routing = resolve_pr_repo_routing(
+            store,
+            &root,
+            &guardian.base_branch,
+            &forge_cfg,
+            guardian.owner.as_deref(),
+        );
         match routing.client_for(&pr.repo) {
             Some(client) if client.kind().as_str() == pr.forge => {
                 jobs.push(MergeCheckJob {
@@ -3186,7 +3220,13 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     // root (its PR is filed against the parent, but its ref still lives on
     // the fork) -- so resolve per-PR rather than one remote for the whole
     // guardian.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
 
     for pr in open_prs {
         let remote_name = routing.remote_for(&pr.repo);
@@ -3442,7 +3482,13 @@ pub fn detect_forge_reorder(
     // RAL-338: a fork-mode review's PRs may be split across two repositories,
     // so resolve both candidate clients up front and pick per-PR via each
     // row's own stored `repo` -- see [`PrRepoRouting`].
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
 
     let prs = store
@@ -3650,7 +3696,7 @@ pub fn check_and_apply_forge_reorder(
         drift.base_changed,
         drift.order_changed
     );
-    let (root, base_branch, forge_cfg) = {
+    let (root, base_branch, forge_cfg, owner) = {
         let guardian = match store.lock().get_guardian(id) {
             Ok(g) => g,
             Err(e) => {
@@ -3663,9 +3709,10 @@ pub fn check_and_apply_forge_reorder(
         };
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        (root, guardian.base_branch, forge_cfg)
+        (root, guardian.base_branch, forge_cfg, guardian.owner)
     };
-    let remote_name = forge_parent_remote_name(store, &root, &base_branch, &forge_cfg);
+    let remote_name =
+        forge_parent_remote_name(store, &root, &base_branch, &forge_cfg, owner.as_deref());
     let local_base = qualify_forge_base(&base_branch, &remote_name, &drift.base);
     {
         let mut guard = store.lock();
@@ -3871,7 +3918,13 @@ pub fn poll_pr_base_drift(
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: resolve both candidate clients so each PR's base-drift check
     // uses whichever repository it's actually filed on.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
 
     let prs = store
@@ -4156,9 +4209,15 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let backed_off = {
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg)
-            .client_for("")
-            .is_some_and(is_backed_off)
+        resolve_pr_repo_routing(
+            store,
+            &root,
+            &guardian.base_branch,
+            &forge_cfg,
+            guardian.owner.as_deref(),
+        )
+        .client_for("")
+        .is_some_and(is_backed_off)
     };
     if backed_off {
         // ralphus[ignore-rlog-pair]: rate-limit path records the structured outcome; this routine only skips a poll
@@ -4180,7 +4239,13 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for("").to_string();
 
     // Drift pass. Every `SYNC_FETCH_LOCKS` guard this takes is confined to this
@@ -6531,7 +6596,13 @@ fn fetch_remote_pr_tip(
     // RAL-338: this PR's branch alias lives on the fork's remote in fork
     // mode, including the root's (its PR is filed against the parent, but
     // its ref still lives on the fork).
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
     // Held across both commands so a concurrent re-check of this same PR
@@ -6786,7 +6857,13 @@ pub fn pull_pr_commits(
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: pull from whichever remote this PR's own alias actually lives
     // on (the fork in fork mode, including the root's).
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
     let pulled = guardian_merge::pull_pr_commits(
@@ -7104,7 +7181,13 @@ fn action_pr_feedback_inner(
     // RAL-338: this PR may be filed on either the parent or the fork --
     // resolve both candidates and use whichever matches its own recorded
     // `repo` for both the comments read and (below) the push-back remote.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
     let client = routing.client_for(&pr.repo).cloned().ok_or_else(|| {
         format!(
@@ -10118,7 +10201,7 @@ mod tests {
         // apply block calls, so this test breaks if that call site ever
         // drifts back to a plain, non-excluding remote resolution.
         let forge_cfg = crate::config::resolve_forge(&root_dir);
-        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg);
+        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg, None);
         let local_base = qualify_forge_base("alt/main", &remote_name, &drift.base);
         assert!(
             store
@@ -10137,6 +10220,82 @@ mod tests {
              nothing is left to fix, instead of looping forever"
         );
         handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn resolve_pr_repo_routing_finds_a_fork_registered_under_a_real_user_not_only_the_empty_default()
+     {
+        // RAL-338 follow-up: every maintenance-path forge client (base drift,
+        // reorder detection, merge checks, ci-watch) used to look up a
+        // guardian's fork via a hardcoded `user=""`, which only ever matched
+        // a project registered with that literal empty-string convention.
+        // Registering a fork under a real username (as `project fork
+        // add`/`project fork set` actually do) made every one of those
+        // lookups silently miss, degrading to a single parent-only client --
+        // and since GitHub/GitLab number PRs/MRs per repository starting
+        // from 1, that parent-only client would then read/PATCH whatever
+        // unrelated PR in the *parent* happened to share a fork-hosted PR's
+        // number.
+        let root_dir = tmp_dir("fork-routing-real-user");
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "fork-alice",
+                "https://github.com/alice/widget.git",
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            "[forge]\nkind = \"github\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        store
+            .lock()
+            .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        // Registered under a real username, never the empty-string row.
+        store
+            .lock()
+            .upsert_project_fork(
+                "demo",
+                "alice",
+                "https://github.com/alice/widget.git",
+                "fork-alice",
+                "alice",
+            )
+            .unwrap();
+
+        let forge_cfg = crate::config::resolve_forge(&root_dir);
+
+        let routing_no_owner =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, None);
+        assert!(
+            routing_no_owner.fork_client.is_none(),
+            "with no owner to try and no empty-string default row registered, no fork should resolve"
+        );
+
+        let routing_with_owner =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        assert!(
+            routing_with_owner.fork_client.is_some(),
+            "the guardian's own owner must be tried against the fork table, not only \"\""
+        );
+
         let _ = std::fs::remove_dir_all(root_dir);
     }
 

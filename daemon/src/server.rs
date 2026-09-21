@@ -13384,6 +13384,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
+        guardian.owner.as_deref(),
     ) {
         Some(c) => c,
         None => {
