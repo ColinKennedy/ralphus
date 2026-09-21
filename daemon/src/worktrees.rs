@@ -986,6 +986,37 @@ fn ensure_worktree_config_extension(worktree_dir: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The `credential.helper` value to install: the *absolute path* to the
+/// `ralphus` CLI binary sitting next to this daemon's own executable,
+/// POSIX-shell-quoted for the `!`-prefixed form git spawns via `sh -c`,
+/// falling back to the bare `ralphus` command (relying on PATH) only if the
+/// sibling binary can't be located. Resolving via PATH alone is fragile --
+/// neither the daemon process's own environment nor the shell git spawns
+/// for a `!`-prefixed helper is guaranteed to have `ralphus`'s directory on
+/// it (a real failure mode: git silently gets no credential, falls back to
+/// an interactive terminal prompt nothing can answer, and hangs until
+/// ralphus's own subprocess timeout kills the push).
+fn credential_helper_command() -> String {
+    let fallback = "!ralphus internal fork-credential-helper".to_string();
+    let Ok(daemon_exe) = std::env::current_exe() else {
+        return fallback;
+    };
+    let Some(dir) = daemon_exe.parent() else {
+        return fallback;
+    };
+    let cli_path = dir.join(format!("ralphus{}", std::env::consts::EXE_SUFFIX));
+    if !cli_path.is_file() {
+        return fallback;
+    }
+    // Forward slashes + single-quoted: `sh -c` (what git invokes a
+    // `!`-prefixed helper through, including on Windows via Git for
+    // Windows' bundled MSYS bash) treats backslashes as escapes, so a raw
+    // Windows path would corrupt itself; single-quoting handles spaces and
+    // anything else short of a literal single quote in the path.
+    let path_str = cli_path.to_string_lossy().replace('\\', "/");
+    format!("!'{path_str}' internal fork-credential-helper")
+}
+
 /// Point one worktree's `credential.helper` at ralphus's own helper and mint
 /// the `(worktree_id, grant)` pair it needs (RAL-338 follow-up), so a `git
 /// push` from that worktree -- ralphus's own, or an agent's own shell
@@ -1044,7 +1075,7 @@ fn apply_worktree_credential_helper_best_effort(
                 "--worktree",
                 "--add",
                 "credential.helper",
-                "!ralphus internal fork-credential-helper",
+                &credential_helper_command(),
             ],
         )?;
         Ok(())
@@ -2883,11 +2914,20 @@ mod tests {
             .to_string();
         assert!(!worktree_id.is_empty());
         assert!(!grant.is_empty());
-        assert_eq!(
-            git(&wt, &["config", "--get", "credential.helper"])
-                .unwrap()
-                .trim(),
-            "!ralphus internal fork-credential-helper"
+        // The exact command string is environment-dependent -- it's the
+        // absolute path to whatever `ralphus`/`ralphus.exe` sits next to
+        // this test binary's own executable when one exists (see
+        // `credential_helper_command`'s doc comment for why: resolving via
+        // bare `ralphus` on PATH alone is exactly the fragility this
+        // replaces), falling back to the bare command otherwise. Assert the
+        // shape, not a literal string.
+        let helper = git(&wt, &["config", "--get", "credential.helper"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            helper.starts_with('!') && helper.ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value: {helper:?}"
         );
         assert_eq!(
             store

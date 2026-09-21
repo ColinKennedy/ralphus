@@ -73,20 +73,22 @@ impl Store {
     ///
     /// # Errors
     /// Propagates any SQLite failure.
-    pub(crate) fn get_user_forge_token(
-        &self,
+    /// [`Self::resolve_worktree_credential_conn`]'s doc comment explains why
+    /// this takes any connection rather than `&self` -- it must be callable
+    /// from the RAL-393 Stage 3 read pool, not just the locked writer.
+    pub(crate) fn get_user_forge_token_conn(
+        conn: &rusqlite::Connection,
         user: &str,
         host: &str,
     ) -> StoreResult<Option<String>> {
         use rusqlite::OptionalExtension as _;
-        self.conn
-            .query_row(
-                "SELECT token FROM user_forge_tokens WHERE user=?1 AND host=?2",
-                rusqlite::params![user, host],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        conn.query_row(
+            "SELECT token FROM user_forge_tokens WHERE user=?1 AND host=?2",
+            rusqlite::params![user, host],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Every forge host `user` has a token configured for, without the token
@@ -177,9 +179,28 @@ impl Store {
         worktree_id: &str,
         grant_secret: &str,
     ) -> StoreResult<Option<String>> {
+        Self::resolve_worktree_credential_conn(&self.conn, worktree_id, grant_secret)
+    }
+
+    /// [`Self::resolve_worktree_credential`] against any connection, so the
+    /// RAL-393 Stage 3 read pool (`Daemon::read_pool`/`ReadConnPool`) can
+    /// serve this query without `StoreMutex` -- this is not just extra
+    /// concurrency, it avoids a genuine self-deadlock: `route_worktree_to_submitter_fork`
+    /// (`daemon/src/worktrees.rs`) runs its `git push` while holding
+    /// `StoreMutex` (materialization's existing, accepted lock scope), and
+    /// that push's own credential-helper subprocess calls back into this
+    /// exact daemon's `/api/internal/fork-credential` endpoint -- if that
+    /// handler also needed `StoreMutex`, it would block forever waiting on
+    /// a lock the (also blocked, waiting on this same push) materialization
+    /// thread already holds. Routing this one read through a pooled,
+    /// independent connection breaks that cycle entirely.
+    pub(crate) fn resolve_worktree_credential_conn(
+        conn: &rusqlite::Connection,
+        worktree_id: &str,
+        grant_secret: &str,
+    ) -> StoreResult<Option<String>> {
         use rusqlite::OptionalExtension as _;
-        let grant: Option<(String, String, String)> = self
-            .conn
+        let grant: Option<(String, String, String)> = conn
             .query_row(
                 "SELECT grant_secret, user, host FROM worktree_credential_grants WHERE worktree_id=?1",
                 rusqlite::params![worktree_id],
@@ -194,7 +215,7 @@ impl Store {
         if !constant_time_eq(expected_secret.as_bytes(), grant_secret.as_bytes()) {
             return Ok(None);
         }
-        self.get_user_forge_token(&user, &host)
+        Self::get_user_forge_token_conn(conn, &user, &host)
     }
 }
 
@@ -229,7 +250,7 @@ mod tests {
         assert_eq!(listed[0].host, "gitlab.com");
 
         assert_eq!(
-            store.get_user_forge_token("alice", "gitlab.com").unwrap(),
+            Store::get_user_forge_token_conn(&store.conn, "alice", "gitlab.com").unwrap(),
             Some("glpat-secret".to_string())
         );
     }
@@ -250,7 +271,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(listed[0].updated_at_ms >= listed[0].created_at_ms);
         assert_eq!(
-            store.get_user_forge_token("alice", "gitlab.com").unwrap(),
+            Store::get_user_forge_token_conn(&store.conn, "alice", "gitlab.com").unwrap(),
             Some("token-2".to_string())
         );
     }
@@ -273,8 +294,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            store
-                .get_user_forge_token("alice", "gitlab.com")
+            Store::get_user_forge_token_conn(&store.conn, "alice", "gitlab.com")
                 .unwrap()
                 .is_none()
         );
@@ -289,8 +309,7 @@ mod tests {
             .unwrap();
         store.delete_user("alice").unwrap();
         assert!(
-            store
-                .get_user_forge_token("alice", "gitlab.com")
+            Store::get_user_forge_token_conn(&store.conn, "alice", "gitlab.com")
                 .unwrap()
                 .is_none(),
             "a user forge token must be removed when its owning user is (unlike project_forks rows)"

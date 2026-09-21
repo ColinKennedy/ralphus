@@ -462,6 +462,24 @@ impl Daemon {
         }
     }
 
+    /// [`Store::resolve_worktree_credential`] routed through the RAL-393
+    /// Stage 3 read pool -- see that method's doc comment for why this must
+    /// never wait on `StoreMutex`: doing so would self-deadlock against
+    /// `route_worktree_to_submitter_fork`'s own `git push`, whose
+    /// credential-helper subprocess calls back into this exact endpoint.
+    pub(crate) fn read_resolve_worktree_credential(
+        &self,
+        worktree_id: &str,
+        grant_secret: &str,
+    ) -> crate::store::Result<Option<String>> {
+        match self.read_pool.acquire() {
+            Some(conn) => Store::resolve_worktree_credential_conn(&conn, worktree_id, grant_secret),
+            None => self
+                .lock()
+                .resolve_worktree_credential(worktree_id, grant_secret),
+        }
+    }
+
     /// Request that `run_http_loop` stop accepting new requests and return,
     /// so `serve()` returns and the daemon process exits. See the `shutdown`
     /// field's doc comment.
@@ -5313,10 +5331,7 @@ fn fetch_fork_credential(daemon: &Daemon, query: &str) -> Reply {
     let Some(grant) = query_param(query, "grant") else {
         return error(400, "bad_request", "missing 'grant' query param", vec![]);
     };
-    match daemon
-        .lock()
-        .resolve_worktree_credential(worktree_id, grant)
-    {
+    match daemon.read_resolve_worktree_credential(worktree_id, grant) {
         Ok(Some(token)) => json(200, &serde_json::json!({"token": token})),
         Ok(None) => error(
             403,
@@ -16535,6 +16550,59 @@ mod tests {
 
         let missing_params = route(&d, "GET", "/api/internal/fork-credential", "");
         assert_eq!(missing_params.status, 400, "{}", missing_params.body);
+    }
+
+    #[test]
+    fn fetch_fork_credential_does_not_wait_behind_a_held_store_lock() {
+        // Regression test for a real, observed self-deadlock:
+        // `route_worktree_to_submitter_fork` runs its own `git push` while
+        // holding `StoreMutex` (materialization's existing, accepted lock
+        // scope), and that push's credential-helper subprocess calls back
+        // into this exact endpoint. If the endpoint's handler also needed
+        // `StoreMutex`, that callback would block forever behind a lock its
+        // own caller already holds -- the push (and therefore the lock)
+        // never releases until the callback answers, which never happens.
+        // `read_resolve_worktree_credential` (RAL-393 Stage 3 pool) fixes
+        // this by never touching `StoreMutex` at all; this test proves that
+        // property holds by asserting the fetch stays fast even while
+        // something else holds the lock for multiple seconds.
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock()
+            .set_user_forge_token("alice", "gitlab.com", "glpat-secret")
+            .unwrap();
+        let grant = d
+            .lock()
+            .mint_worktree_credential_grant("wt-1", "alice", "gitlab.com")
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _guard = d.lock();
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            });
+            // Give the holder thread a moment to actually acquire the lock
+            // before racing the fetch against it.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            let started = std::time::Instant::now();
+            let r = route(
+                &d,
+                "GET",
+                &format!("/api/internal/fork-credential?worktree_id=wt-1&grant={grant}"),
+                "",
+            );
+            let elapsed = started.elapsed();
+            assert_eq!(r.status, 200, "{}", r.body);
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "fetch_fork_credential took {elapsed:?} while another thread held StoreMutex -- \
+                 it must never wait on that lock, or a real fork-routed push's own \
+                 credential-helper callback would deadlock against itself"
+            );
+
+            holder.join().unwrap();
+        });
     }
 
     #[test]
