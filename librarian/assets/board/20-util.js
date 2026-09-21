@@ -774,6 +774,26 @@
        * @returns {string}
        */
       const failLogBtn = (err) => `<button class="logs-btn fail" data-tip="View the failure log — the full error traceback for this cell." data-full="${esc(err)}" onclick="event.stopPropagation();openErrPopup(event)">📄 Failure log</button>`;
+      // RAL-477: shared single-line, ellipsis-truncated status/detail summary.
+      // A `detail` string (a review/branch status message, often a raw agent
+      // error) can run to multiple KB with embedded tool-call JSON or
+      // ANSI-laden pane output -- rendered inline at full length it wraps out
+      // to fill the whole card and pushes everything else off-screen. This
+      // renders it as one CSS-ellipsized line instead, with the untruncated
+      // text opened in a copyable popup (`openDetailPopup`) on click. Pass
+      // `kind: "fail"` for an actual failure to get the same red-themed
+      // popup as `openErrPopup` (RAL-190); any other status text gets the
+      // neutral popup styling.
+      /**
+       * Renders `text` as a single-line, ellipsis-truncated summary that opens
+       * the full untruncated text in a copyable popup when clicked.
+       * @param {string} text
+       * @param {string} [title]
+       * @param {"info"|"fail"} [kind]
+       * @returns {string}
+       */
+      const detailSummary = (text, title = "Detail", kind = "info") =>
+        `<span class="detail-summary" data-tip="Click to view the full text in a copyable popup." data-full="${esc(text)}" data-popup-title="${esc(title)}" data-popup-kind="${kind}" onclick="event.stopPropagation();openDetailPopup(event)">${esc(text)}</span>`;
       /**
        * Writes text to the clipboard, falling back to a hidden textarea +
        * `execCommand` in insecure contexts where `navigator.clipboard` is unavailable.

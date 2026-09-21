@@ -1247,12 +1247,14 @@
       // A failed cell/finalize shows only a badge + this button; the full
       // error (often a long traceback) opens here instead of flooding the graph.
       /**
-       * Opens a modal popup showing a cell's full failure traceback (from `data-full`).
-       * @param {MouseEvent} e
+       * Renders the shared failure-styled (red) popup for `text`, titled
+       * "Failure log". Factored out of `openErrPopup` so `openDetailPopup`
+       * (RAL-477) can reuse the exact same styling for a `detailSummary` line
+       * whose `data-popup-kind` marks it as an actual failure.
+       * @param {string} text
        * @returns {void}
        */
-      function openErrPopup(e) {
-        const text = /** @type {HTMLElement} */ (e.currentTarget).dataset.full || "";
+      function renderFailurePopup(text) {
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:720px;max-width:94vw">
             <h2 style="color:var(--failed);padding-right:26px">Failure log</h2>
@@ -1260,6 +1262,32 @@
             <pre style="margin:0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--failed);border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:13px;color:var(--failed)">${esc(text)}</pre>
             <div class="btn-row"><button class="btn" onclick="closeModal()" data-tip="Close this popup.">Close</button></div>
           </div></div>`;
+      }
+      /**
+       * Opens a modal popup showing a cell's full failure traceback (from `data-full`).
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function openErrPopup(e) {
+        const text = /** @type {HTMLElement} */ (e.currentTarget).dataset.full || "";
+        renderFailurePopup(text);
+      }
+      // RAL-477: click handler for `detailSummary`'s truncated status/detail
+      // line. `data-popup-kind="fail"` reuses `renderFailurePopup`'s red
+      // styling for an actual failure (e.g. a "⚠ conflict" branch's detail);
+      // anything else falls back to the neutral `showTextPopup`.
+      /**
+       * Opens a modal popup showing a truncated status/detail summary's full
+       * text (from `data-full`/`data-popup-title`/`data-popup-kind`, set by
+       * `detailSummary`).
+       * @param {MouseEvent} e
+       * @returns {void}
+       */
+      function openDetailPopup(e) {
+        const el = /** @type {HTMLElement} */ (e.currentTarget);
+        const text = el.dataset.full || "";
+        if (el.dataset.popupKind === "fail") { renderFailurePopup(text); return; }
+        showTextPopup(el.dataset.popupTitle || "Detail", text);
       }
 
       /**
