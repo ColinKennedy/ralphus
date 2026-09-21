@@ -2420,12 +2420,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // the "ready to act on" signal. Show a dismissible banner that jumps to it.
       /**
        * Renders the dismissible "review is ready" banner for every in_review guardian.
+       * @param {GuardianView[]|GuardianIndexEntry[]} [items]
        * @returns {void}
        */
-      function renderReadyBanner() {
+      function renderReadyBanner(items = guardians) {
         const el = document.getElementById("ready-banner");
         if (!el) return;
-        const ready = (guardians || []).filter((g) => g.status === "in_review" && !dismissedReady.has(g.id));
+        const ready = items.filter((g) => g.status === "in_review" && !dismissedReady.has(g.id));
         el.innerHTML = ready.map((g) => `<div class="ready-banner">
             <span>✅ Review <b>${esc(g.name)}</b> is ready.</span>
             <a href="#" data-click="gotoReview" data-guardian-id="${esc(g.id)}" data-tip="Open this review on the Reviews tab to approve or inspect it.">Open review →</a>
@@ -2451,6 +2452,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // On the reviews tab `guardians` is already fresh; elsewhere fetch
         // it -- the lean list is all `renderReadyBanner` below needs
         // (status/id/name), and this runs on every tick regardless of tab.
-        if (tab !== "reviews") { try { guardians = await (await fetch("/api/guardian-index")).json(); } catch (_) {} }
-        if (!userIsSelecting()) renderReadyBanner();
+        // Keep that lean snapshot local: a request can start on another tab
+        // and finish after the user opens a review, and replacing `guardians`
+        // then would discard the selected review's already-loaded full detail.
+        /** @type {GuardianView[]|GuardianIndexEntry[]} */
+        let items = guardians;
+        if (tab !== "reviews") { try { items = await (await fetch("/api/guardian-index")).json(); } catch (_) {} }
+        if (!userIsSelecting()) renderReadyBanner(items);
       }
