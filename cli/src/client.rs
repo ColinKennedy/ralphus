@@ -539,6 +539,48 @@ impl DaemonClient {
         self.delete(&path)
     }
 
+    /// `GET /api/users/{user}/forge-tokens` (RAL-338 follow-up): which forge
+    /// hosts `user` has a personal access token configured for. Never
+    /// includes the token value itself.
+    pub fn list_user_forge_tokens(&self, user: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/users/{user}/forge-tokens"))
+    }
+
+    /// `POST /api/users/{user}/forge-tokens` (RAL-338 follow-up): set or
+    /// replace `user`'s token for one forge host.
+    pub fn set_user_forge_token(
+        &self,
+        user: &str,
+        host: &str,
+        token: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/users/{user}/forge-tokens"),
+            Some(json!({"host": host, "token": token})),
+        )
+    }
+
+    /// `DELETE /api/users/{user}/forge-tokens/{host}` (RAL-338 follow-up).
+    pub fn delete_user_forge_token(&self, user: &str, host: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/users/{user}/forge-tokens/{host}"))
+    }
+
+    /// `GET /api/internal/fork-credential` (RAL-338 follow-up): the
+    /// git-credential helper's fetch path -- `worktree_id`+`grant` is the
+    /// entire authorization for *which* credential comes back, no user
+    /// identity claim involved.
+    pub fn fetch_fork_credential(
+        &self,
+        worktree_id: &str,
+        grant: &str,
+    ) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("worktree_id", Some(worktree_id.to_string())),
+            ("grant", Some(grant.to_string())),
+        ]);
+        self.get(&format!("/api/internal/fork-credential{qs}"))
+    }
+
     /// Agent-profile health, evaluated inside the daemon process so
     /// `from_env`/`executable` resolution reflects the daemon's own
     /// environment/PATH rather than the CLI's -- see
