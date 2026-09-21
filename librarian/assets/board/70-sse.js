@@ -576,6 +576,8 @@
       let currentEventSource = null;
       /** @type {ReturnType<typeof setTimeout>|null} */
       let sseRefreshTimer = null;
+      /** Whether a coalesced batch is currently awaiting `applySseRefresh` -- guards against a slow tab poll (e.g. `/api/guardian-index` against a large review history) overlapping itself when events keep arriving faster than it can complete. */
+      let sseRefreshInFlight = false;
       /** @type {Set<string>} event kinds ("squad"/"guardian"/"other") seen since the last flush */
       let sseRefreshKinds = new Set();
       /** @type {Set<string>} guardian ids referenced by a pending event, since the last flush */
@@ -649,6 +651,12 @@
       }
       /**
        * Records one pushed event and (re)schedules a debounced `applySseRefresh`.
+       * A batch already in flight is never joined by a second, overlapping one --
+       * an event arriving mid-flight still gets folded into the (fresh) pending
+       * sets below, but `runSseRefresh` is the one that reschedules for it once
+       * the current batch finishes, so a continuous stream of events (e.g. an
+       * agent actively working a merge) can never fire faster than each batch's
+       * own slowest fetch completes.
        * @param {string} kind
        * @param {CartographerRow} row
        * @returns {void}
@@ -657,14 +665,30 @@
         sseRefreshKinds.add(kind);
         if (row.guardian_id) sseRefreshGuardianIds.add(row.guardian_id);
         if (row.squad_id) sseRefreshHasSquadChange = true;
-        if (sseRefreshTimer) return;
-        sseRefreshTimer = setTimeout(() => {
-          const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
-          const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
-          const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
-          sseRefreshTimer = null;
-          applySseRefresh(kinds, guardianIds, hasSquadChange);
-        }, SSE_DEBOUNCE_MS);
+        if (sseRefreshInFlight || sseRefreshTimer) return;
+        sseRefreshTimer = setTimeout(runSseRefresh, SSE_DEBOUNCE_MS);
+      }
+      /**
+       * Flushes the pending coalesced batch through `applySseRefresh`. Guarded
+       * by `sseRefreshInFlight` for the whole await, then re-arms itself
+       * (skipping the debounce wait -- these events already waited out one
+       * full batch) if any new events landed in the pending sets while it ran.
+       * @returns {Promise<void>}
+       */
+      async function runSseRefresh() {
+        sseRefreshTimer = null;
+        const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
+        const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
+        const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;
+        sseRefreshInFlight = true;
+        try {
+          await applySseRefresh(kinds, guardianIds, hasSquadChange);
+        } finally {
+          sseRefreshInFlight = false;
+        }
+        if (sseRefreshKinds.size || sseRefreshGuardianIds.size || sseRefreshHasSquadChange) {
+          sseRefreshTimer = setTimeout(runSseRefresh, SSE_DEBOUNCE_MS);
+        }
       }
       // How long to wait before minting a fresh ticket and reconnecting after
       // `/api/events` drops or a connect attempt fails outright (RAL-222).
