@@ -229,10 +229,13 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     let Ok(prs) = store.lock().list_pull_requests_for_guardian(guardian_id) else {
         return;
     };
-    let Some(pr) = prs
-        .iter()
-        .find(|pr| pr.branch_id.as_deref() == Some(branch_id) && pr.state == "open")
-    else {
+    // RAL-<new>: only the "parent" PR's CI/merge-readiness matters -- a
+    // dual-root-PR mode "stack" row is never expected to merge (it's closed
+    // once its parent PR does), so watching it would only add wasted forge
+    // calls and clutter mailbox/auto-fix plumbing for a PR nobody looks at.
+    let Some(pr) = prs.iter().find(|pr| {
+        pr.branch_id.as_deref() == Some(branch_id) && pr.state == "open" && pr.pr_kind == "parent"
+    }) else {
         return;
     };
     let Some(number) = pr.pr_number else {

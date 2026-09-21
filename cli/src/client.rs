@@ -465,6 +465,7 @@ impl DaemonClient {
             patch.match_pr_branch_name,
         );
         set_if_some(&mut body, "separate_pr_branch", patch.separate_pr_branch);
+        set_if_some(&mut body, "dual_root_pr", patch.dual_root_pr);
         set_if_some(&mut body, "auto_build", patch.auto_build);
         set_if_some(
             &mut body,
@@ -1584,6 +1585,7 @@ impl DaemonClient {
             settings.auto_submit_pr_stack,
         );
         set_if_some(&mut body, "separate_pr_branch", settings.separate_pr_branch);
+        set_if_some(&mut body, "dual_root_pr", settings.dual_root_pr);
         set_if_some(&mut body, "auto_fix_pr_errors", settings.auto_fix_pr_errors);
         set_if_some(
             &mut body,
@@ -1881,6 +1883,12 @@ pub struct GuardianSettings<'a> {
     /// RAL-378: whether this review's pull request is pushed to a branch
     /// separate from its review branch.
     pub separate_pr_branch: Option<bool>,
+    /// RAL-<new>: fork-routed only. Whether this review's stack root branch
+    /// gets a second, same-repo PR into a mirror of the parent's base
+    /// branch, so it visually chains into the rest of the PR stack,
+    /// alongside the existing cross-repo PR (unchanged, still the one that
+    /// actually merges).
+    pub dual_root_pr: Option<bool>,
     /// RAL-395: whether this review auto-dispatches its agent to fix a
     /// failing PR's CI status.
     pub auto_fix_pr_errors: Option<bool>,
@@ -1912,6 +1920,7 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub skip_base_updates: Option<bool>,
     pub match_pr_branch_name: Option<bool>,
     pub separate_pr_branch: Option<bool>,
+    pub dual_root_pr: Option<bool>,
     pub auto_build: Option<&'a str>,
     pub auto_submit_pr_stack: Option<bool>,
     pub auto_fix_pr_errors: Option<bool>,

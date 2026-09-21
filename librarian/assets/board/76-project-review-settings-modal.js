@@ -47,6 +47,8 @@
        * @property {boolean} originalMatchPrBranchName
        * @property {boolean} separatePrBranch
        * @property {boolean} originalSeparatePrBranch
+       * @property {boolean} dualRootPr
+       * @property {boolean} originalDualRootPr
        * @property {string} autoBuild
        * @property {string} originalAutoBuild
        * @property {boolean} autoSubmitPrStack
@@ -97,6 +99,7 @@
         const skipBaseUpdates = boolOr(s.skip_base_updates, effective.skip_base_updates);
         const matchPrBranchName = boolOr(s.match_pr_branch_name, effective.match_pr_branch_name);
         const separatePrBranch = boolOr(s.separate_pr_branch, effective.separate_pr_branch);
+        const dualRootPr = boolOr(s.dual_root_pr, effective.dual_root_pr);
         const autoBuild = str(s.auto_build);
         const autoSubmitPrStack = boolOr(s.auto_submit_pr_stack, effective.auto_submit_pr_stack);
         const autoFixPrErrors = boolOr(s.auto_fix_pr_errors, effective.auto_fix_pr_errors);
@@ -115,6 +118,7 @@
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
+          dualRootPr, originalDualRootPr: dualRootPr,
           autoBuild, originalAutoBuild: autoBuild,
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
@@ -231,6 +235,12 @@
         renderProjectReviewSettingsModal();
       }
       /**
+       * Stages the dual-root-PR default.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditDualRootPr(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.dualRootPr = checked; }
+      /**
        * Stages the match-worktree-branch-name default.
        * @param {boolean} checked
        * @returns {void}
@@ -276,7 +286,7 @@
         if (!draft) return;
         const resolverSection = renderResolverFieldsHtml(draft.cwd, draft.resolverAgent, draft.resolverModel, false, "onProjectEditResolverAgent", "onProjectEditResolverModel");
         const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onProjectEditProofScope", "onProjectEditProofSkipAutoClean", true);
-        const prSettingsSection = renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, "onProjectEditSeparatePrBranch", "onProjectEditMatchPrBranchName", "onProjectEditAutoSubmitPrStack");
+        const prSettingsSection = renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onProjectEditSeparatePrBranch", "onProjectEditMatchPrBranchName", "onProjectEditAutoSubmitPrStack", "onProjectEditDualRootPr");
         const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate");
         const err = projectReviewSettingsError ? `<div id="project-review-settings-err" class="verr">${esc(projectReviewSettingsError)}</div>` : `<div id="project-review-settings-err" class="verr"></div>`;
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeProjectReviewSettingsModal()"><div class="modal review-edit-modal">
@@ -332,6 +342,7 @@
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
+        if (draft.dualRootPr !== draft.originalDualRootPr) body.dual_root_pr = draft.dualRootPr;
         if (draft.autoBuild !== draft.originalAutoBuild) body.auto_build = draft.autoBuild;
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
@@ -356,4 +367,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditSeparatePrBranch, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate];

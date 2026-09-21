@@ -341,6 +341,8 @@
        * @property {boolean} [effective_match_pr_branch_name] - RAL-307: match_pr_branch_name resolved against the project/global default -- what PR submission actually gates on unless a per-submission override is passed.
        * @property {boolean|null} [separate_pr_branch] - RAL-378: this review's own override for whether its pull request is pushed to a branch separate from its review branch, or null to inherit the project/global default. Stamped from the project's effective value at review creation.
        * @property {boolean} [effective_separate_pr_branch] - RAL-378: separate_pr_branch resolved against the project/global default. False (the default) means the PR is opened from the review branch itself, and both match_pr_branch_name and the branch convention are ignored.
+       * @property {boolean|null} [dual_root_pr] - RAL-<new>: fork-routed only. This review's own override for whether its stack root branch (and whichever branch later gets promoted to root) gets a second, same-repo "stack" PR into a mirror of the parent's base branch, or null to inherit the project/global default. Stamped from the project's effective value at review creation.
+       * @property {boolean} [effective_dual_root_pr] - RAL-<new>: dual_root_pr resolved against the project/global default. False (the default) means today's single-PR-per-root behavior, unchanged.
        * @property {boolean} [readable_review_branch] - RAL-378: whether this review's combined worktree branch is named readably rather than as the internal guardian/<id>/review ref. False for reviews created before readable naming landed.
        * @property {string|null} [review_branch_name] - RAL-378: the sticky readable name claimed for this review's combined worktree branch, derived from its name at the first combined build.
        * @property {boolean|null} [auto_submit_pr_stack] - RAL-317: this review's own override for whether the PR stack is auto-submitted/grown as each branch reaches a terminal merge state, or null to inherit the project/global default. Stamped from the project's effective value at review creation.
@@ -395,6 +397,7 @@
        * @property {string|null} [ci_status] - RAL-395: "pending" | "passing" | "failing", from the last standing CI/CD poll. null if never polled.
        * @property {string|null} [ci_failure_job_url] - RAL-395: the failing job's forge URL, when `ci_status === "failing"` and the forge gave one.
        * @property {boolean|null} [draft] - RAL-353: whether the forge reports this PR/MR as a draft (WIP). null only for rows recorded before the column existed and never polled since; the board treats null as not-draft.
+       * @property {string} [pr_kind] - RAL-<new>: "parent" (the default, and every pre-dual_root_pr row) | "stack". A "stack" row is a fork-routed root branch's second, same-repo PR into a mirror of the parent's base branch (dual_root_pr mode) -- it visually chains the branch into the rest of the stack, is never expected to merge, and closes once the branch's "parent" PR does.
        */
       /**
        * One past "submit a stack" call for a review (RAL-302): every PR row
@@ -649,6 +652,7 @@
        * @property {boolean|null|undefined} skip_base_updates
        * @property {boolean|null|undefined} match_pr_branch_name
        * @property {boolean|null|undefined} separate_pr_branch
+       * @property {boolean|null|undefined} dual_root_pr
        * @property {string|null|undefined} auto_build
        * @property {boolean|null|undefined} auto_submit_pr_stack
        * @property {boolean|null|undefined} auto_fix_pr_errors
@@ -669,6 +673,7 @@
        * @property {boolean} skip_base_updates
        * @property {boolean} match_pr_branch_name
        * @property {boolean} separate_pr_branch
+       * @property {boolean} dual_root_pr
        * @property {string|undefined} auto_build
        * @property {boolean} auto_submit_pr_stack
        * @property {boolean} auto_fix_pr_errors

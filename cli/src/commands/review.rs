@@ -108,6 +108,12 @@ pub enum ReviewCommand {
         /// RAL-378: this review's own override for whether its pull request
         /// is pushed to a branch separate from its review branch.
         separate_pr_branch: Option<bool>,
+        /// RAL-<new>: fork-routed only. Whether this review's stack root
+        /// branch gets a second, same-repo PR into a mirror of the parent's
+        /// base branch, so it visually chains into the rest of the PR
+        /// stack, alongside the existing cross-repo PR (unchanged, still
+        /// the one that actually merges).
+        dual_root_pr: Option<bool>,
         /// RAL-395: whether this review auto-dispatches its agent to fix a
         /// failing PR's CI status.
         auto_fix_pr_errors: Option<bool>,
@@ -392,6 +398,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
             let auto_submit_pr_stack = take_tri_bool(&mut scanner, "--auto-submit-pr-stack");
             let separate_pr_branch = take_tri_bool(&mut scanner, "--separate-pr-branch");
+            let dual_root_pr = take_tri_bool(&mut scanner, "--dual-root-pr");
             let auto_fix_pr_errors = take_tri_bool(&mut scanner, "--auto-fix-pr-errors");
             let auto_fix_prompt_template = scanner
                 .take_value("--auto-fix-prompt-template")
@@ -411,6 +418,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                dual_root_pr,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template,
             })
@@ -1310,6 +1318,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             match_pr_branch_name,
             auto_submit_pr_stack,
             separate_pr_branch,
+            dual_root_pr,
             auto_fix_pr_errors,
             auto_fix_prompt_template,
         } => run_and_report(opts, None, || {
@@ -1327,6 +1336,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                dual_root_pr,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
             };

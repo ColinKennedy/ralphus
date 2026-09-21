@@ -278,6 +278,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "skip_auto_clean",
     "match_pr_branch_name",
     "separate_pr_branch",
+    "dual_root_pr",
     "auto_build",
     "skip_auto_build",
     "auto_fix_pr_errors",
@@ -1829,6 +1830,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "skip_auto_clean", Ty::Bool, &rpath, header);
         check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
         check_type(ctx, table, "separate_pr_branch", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "dual_root_pr", Ty::Bool, &rpath, header);
         if table.contains_key("skip_auto_clean")
             && table.get("proof_scope").and_then(toml::Value::as_str)
                 != Some(crate::schema::PROOF_SCOPE_EACH_BRANCH)
@@ -3130,7 +3132,7 @@ prompt = "make it build"
 
     #[test]
     fn review_settings_bool_fields_are_accepted() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\ndual_root_pr=true\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -3144,6 +3146,7 @@ prompt = "make it build"
             "skip_auto_clean",
             "match_pr_branch_name",
             "separate_pr_branch",
+            "dual_root_pr",
         ] {
             let src = format!(
                 "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\n{key}=\"yes\"\n"

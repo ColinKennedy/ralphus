@@ -1251,6 +1251,16 @@ pub struct ReviewDef {
     /// branch.
     #[serde(default)]
     pub separate_pr_branch: Option<bool>,
+    /// RAL-<new>: fork-routed only. Whether this review's stack root branch
+    /// (and whichever branch later gets promoted to root) gets a second,
+    /// same-repo "stack" PR into a ralphus-maintained mirror of the parent's
+    /// base branch, in addition to the existing cross-repo "parent" PR --
+    /// so the root branch visually chains into the rest of the stack on
+    /// GitHub/GitLab instead of standing apart from it. Unset inherits the
+    /// project-level `.ralphus.toml [review] dual_root_pr` default, then
+    /// `false` (today's single-PR behavior, unchanged).
+    #[serde(default)]
+    pub dual_root_pr: Option<bool>,
     /// User-declared test actions shown as labelled buttons in the board UI.
     #[serde(default)]
     pub action: Vec<ReviewActionDef>,

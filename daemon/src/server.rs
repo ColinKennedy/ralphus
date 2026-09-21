@@ -2703,6 +2703,7 @@ struct EffectiveReviewDefaults {
     skip_base_updates: bool,
     match_pr_branch_name: bool,
     separate_pr_branch: bool,
+    dual_root_pr: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_build: Option<String>,
     auto_submit_pr_stack: bool,
@@ -2724,6 +2725,7 @@ impl EffectiveReviewDefaults {
             skip_base_updates: cfg.skip_base_updates(),
             match_pr_branch_name: cfg.match_pr_branch_name(),
             separate_pr_branch: cfg.separate_pr_branch(),
+            dual_root_pr: cfg.dual_root_pr(),
             auto_build: cfg.auto_build.clone(),
             auto_submit_pr_stack: cfg.auto_submit_pr_stack(),
             auto_fix_pr_errors: cfg.auto_fix_pr_errors(),
@@ -2807,6 +2809,8 @@ struct ProjectReviewSettingsBody {
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     #[serde(default)]
     auto_build: Option<String>,
     #[serde(default)]
@@ -2952,6 +2956,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.separate_pr_branch {
         settings.separate_pr_branch = Some(v);
+    }
+    if let Some(v) = req.dual_root_pr {
+        settings.dual_root_pr = Some(v);
     }
     if let Some(v) = req.auto_build {
         settings.auto_build = clear_if_empty(v);
@@ -12237,6 +12244,12 @@ struct GuardianSettingsBody {
     /// field being absent) means "inherit the project/global default".
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    /// RAL-<new>: this review's own override for whether its fork-routed
+    /// stack root gets a second, same-repo "stack" PR into a mirror of the
+    /// parent's base branch. `None` (or the field being absent) means
+    /// "inherit the project/global default".
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     /// RAL-395: this review's own override for whether it auto-dispatches
     /// its agent to fix a failing PR/MR CI status. `None` (or the field
     /// being absent) means "inherit the project/global default".
@@ -12278,6 +12291,8 @@ struct GuardianDetailsBody {
     skip_worktrees: Option<bool>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     #[serde(default)]
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
@@ -12638,6 +12653,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.dual_root_pr {
+        if let Err(e) = store.set_guardian_dual_root_pr(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(enabled) = req.auto_fix_pr_errors {
         if let Err(e) = store.set_guardian_auto_fix_pr_errors(id, Some(enabled)) {
             return store_error(&e);
@@ -12922,6 +12942,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.separate_pr_branch {
         if let Err(e) = store.set_guardian_separate_pr_branch(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.dual_root_pr {
+        if let Err(e) = store.set_guardian_dual_root_pr(id, Some(enabled)) {
             return store_error(&e);
         }
     }

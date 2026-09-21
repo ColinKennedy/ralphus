@@ -422,6 +422,14 @@ Tip: validate before submitting -- `ralphus validate file.toml`
         bool    Push a PR to a branch separate from the review branch.
                 Overrides the project-level .ralphus.toml [review]
                 separate_pr_branch setting.
+ dual_root_pr
+        bool    Fork-routed only. Give this review's stack root branch a
+                second, same-repo PR into a mirror of the parent's base
+                branch, so it visually chains into the rest of the PR
+                stack, alongside the existing cross-repo PR (unchanged,
+                still the one that actually merges). Unset inherits the
+                project-level .ralphus.toml [review] dual_root_pr
+                default, then false.
  auto_submit_pr_stack
         bool    Opt this review into auto-submitting/growing its PR
                 stack as each branch reaches a terminal merge state,
@@ -505,7 +513,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 
  RAL-408: the same project-level defaults (plus skip_worktrees,
  skip_base_updates, match_pr_branch_name, separate_pr_branch,
- auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
+ dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
