@@ -145,7 +145,7 @@ uv sync --dev && uv run ruff check . && uv run ruff format --check . && uv run m
 python scripts/check_bench_patience_comments.py
 
 # Web (from repo root; lints/type-checks the librarian board chunks) — see librarian/AGENTS.md
-npm install --no-audit --no-fund && npm run lint && npm run typecheck && npm run knip && npm test
+npm ci --no-audit --no-fund && npm run lint && npm run typecheck && npm run knip && npm test
 ```
 
 CI is `.github/workflows/ci.yml` (a Rust job, a Python job, and a web job).

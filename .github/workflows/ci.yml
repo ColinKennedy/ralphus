@@ -224,7 +224,7 @@ jobs:
           # script behaves identically under sh here and cmd.exe on Windows.
           node-version: "22"
       - name: Install lint deps
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: ESLint (board chunk JS, incl. JSDoc coverage)
         run: npm run lint
       - name: Type-check the board chunks' JSDoc-annotated JS (tsc --checkJs)
