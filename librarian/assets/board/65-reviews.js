@@ -383,7 +383,11 @@
          * @returns {number}
          */
         const cnt = (f) => g.branches.filter(f).length;
-        const done = cnt((b) => b.merge_status === "done");
+        // RAL-480: a branch already merged upstream is a clean-merge outcome
+        // like "done" -- just one whose PR/MR automation stopped early --
+        // so it counts in the same green slice rather than falling out of
+        // every bucket and leaving the bar short of `total`.
+        const done = cnt((b) => b.merge_status === "done" || b.merge_status === "merged");
         const resolved = cnt((b) => b.merge_status === "conflict_resolved");
         // RAL-149/<new>: proof_pending and actioning are transient sub-states
         // of "in progress" — conflicts are resolved/committed but the
@@ -474,6 +478,15 @@
           <div class="kv-row" data-tip="${cumulativeTip}"><span class="k">cumulative cost</span><span>input ${g.cumulative_tokens_in ?? 0} · output ${g.cumulative_tokens_out ?? 0} · ${fmtCostUsd(g.cumulative_cost_usd)}${capNote}${overCap ? ` <span style="color:var(--failed)">⚠ over cap</span>` : ""}</span></div>`;
       }
       /**
+       * Renders the RAL-480 "already merged upstream" badge shared by
+       * `branchBadge` (the branch row) and the review-worktree detail row --
+       * kept as one function so both spots show identical wording.
+       * @returns {string}
+       */
+      function mergedBranchBadge() {
+        return `<span class="badge done" data-tip="This branch's commits are already integrated upstream.\nWho/when: a partial or serial stack merge landed this branch's PR/MR (or its base already absorbed its commits) before the rest of the review finished.\nRalphus will not create, update, or otherwise touch this branch's PR/MR again -- it stays enabled and keeps rebasing normally with the rest of the stack.">✓ merged</span>`;
+      }
+      /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
        * @param {GuardianBranch} b
        * @returns {string}
@@ -520,6 +533,16 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // conflict/failure badge once the whole feedback pass finishes.
         if (b.merge_status === "actioning") return `<span class="badge live" data-tip="Reviewer feedback is being applied — the resolver agent is revising this branch now.\nWho/when: you submitted feedback and want confirmation it's actually being worked.\nClears automatically once the revision is committed (and pushed, if applicable).">✎ actioning</span>`;
         if (b.merge_status === "conflict_resolved") return `<span class="badge warn2" data-tip="Conflict was resolved by the guardian agent — ${esc(b.detail || "resolved")}">✓ resolved</span>`;
+        // RAL-480: this branch's own commits are already integrated upstream
+        // (detected by git ancestry during a rebase, or by the forge
+        // reporting its linked PR/MR as merged) -- shown in place of the
+        // ordinary "done" pill so a reviewer can tell at a glance that this
+        // branch's PR/MR is frozen: ralphus will never create, update, or
+        // otherwise touch it again, even though the branch stays enabled and
+        // keeps participating in the stack's rebases. One review can carry a
+        // mix of `merged` and not-yet-merged branches (a partial stack
+        // merge) without the review itself leaving `in_review`.
+        if (b.merge_status === "merged") return mergedBranchBadge();
         return "";
       }
       // RAL-146: per-branch live progress bars (rebase position + conflict
@@ -973,7 +996,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             : `<span class="br-toggle placeholder">▸</span>`;
           const detail = hasDetail ? `<div class="branch-detail ${open ? "" : "hidden"}">
               ${b.detail ? `<div class="kv-row" style="margin:0 0 4px"><span class="k" style="text-transform:none;letter-spacing:0">status</span><span class="v" style="font-size:12px">${detailSummary(b.detail, "Branch detail")}</span></div>` : ""}
-              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span></div>` : ""}
+              ${b.worktree ? `<div class="kv-row" style="margin:0"><span class="k" style="text-transform:none;letter-spacing:0">review worktree</span><span class="v mono" style="font-size:11px">${esc(b.worktree)}</span>${b.merge_status === "merged" ? ` ${mergedBranchBadge()}` : ""}</div>` : ""}
               ${(b.worktree || b.source_squad_id != null) ? `<div class="row" style="margin:2px 0 4px">${worktreeCellBtn(b, `${g.id}:${b.id}`)}</div>` : ""}
               <div class="btn-row" style="margin-top:4px;position:relative;gap:0">${resolverTerminalBtns(g, b)}</div>
               ${resolverPeekBox(g, b)}

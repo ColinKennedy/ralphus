@@ -47,7 +47,7 @@ use opentelemetry::trace::{SpanKind, Status};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::guardian::{BranchView, GuardianView};
+use crate::guardian::{BranchView, GuardianView, MergeStatus};
 use crate::guardian_merge::{self, git};
 use crate::runner::{Runner, RunnerSpec};
 use crate::server::Reply;
@@ -3000,12 +3000,44 @@ fn settle_pr_merge_states(
                 pull_request.state != "dropped" && pull_request.superseded_by.is_none()
             })
             .collect();
+        // RAL-480: a review's stack can merge partially -- one PR/MR merges
+        // on the forge (a human merging branches one at a time, or a GitHub/
+        // GitLab stack merged in pieces) well before every sibling does.
+        // Surface that on the individual branch right away rather than
+        // waiting for `all_merged` below, which only ever fires once every
+        // live PR has merged. Safe to do unconditionally here: the guardian
+        // is idle (`in_review`), so no rebase worker owns these branches'
+        // worktrees concurrently -- unlike the mid-flight branch below,
+        // which deliberately leaves branch/guardian state alone instead.
+        let mut any_branch_freshly_marked_merged = false;
+        for pull_request in &live_prs {
+            if pull_request.state != "merged" {
+                continue;
+            }
+            let Some(branch_id) = pull_request.branch_id.as_deref() else {
+                continue;
+            };
+            let already_marked = current_guardian
+                .branches
+                .iter()
+                .find(|b| b.id == branch_id)
+                .is_some_and(|b| b.merge_status == MergeStatus::Merged.as_str());
+            if !already_marked {
+                let _ = store.lock().set_branch_status(
+                    id,
+                    branch_id,
+                    MergeStatus::Merged,
+                    Some("pr merged"),
+                );
+                any_branch_freshly_marked_merged = true;
+            }
+        }
         let all_merged = !live_prs.is_empty()
             && live_prs
                 .iter()
                 .all(|pull_request| pull_request.state == "merged");
         if !all_merged {
-            return false;
+            return any_branch_freshly_marked_merged;
         }
         let merged = store.lock().approve_guardian(id).is_ok();
         if merged {
@@ -7627,6 +7659,28 @@ mod tests {
     }
 
     #[test]
+    fn stack_base_for_chains_around_a_merged_mid_stack_branch() {
+        // RAL-480: a branch already merged upstream (`merge_status ==
+        // "merged"`) never gets a PR/MR of its own -- automation must not
+        // create, update, or otherwise touch one -- so it never has an alias
+        // in `alias_by_branch` either. The stack must not corrupt as a
+        // result: the next branch still chains onto the nearest earlier
+        // branch that DOES have an open PR, exactly like any other gap
+        // (`stack_base_for_skips_gaps_without_breaking_the_chain`), proving
+        // this specific, newly-introduced status doesn't need (and must not
+        // get) special-cased handling of its own.
+        let a = test_branch("b-a", 0);
+        let mut merged = test_branch("b-b", 1);
+        merged.merge_status = "merged".to_string();
+        let c = test_branch("b-c", 2);
+        let ordered: Vec<&BranchView> = vec![&a, &merged, &c];
+        let mut aliases = HashMap::new();
+        aliases.insert("b-a".to_string(), "alias-a".to_string());
+
+        assert_eq!(stack_base_for(&ordered, &aliases, 2, "main"), "alias-a");
+    }
+
+    #[test]
     fn stack_base_for_seeded_from_a_prior_call_still_chains() {
         // Reproduces the reported bug: branch 0's PR was submitted in an
         // earlier call (so its alias is already in `alias_by_branch`, not
@@ -10528,6 +10582,124 @@ mod tests {
 
         assert!(apply_pr_merge_check(&store, &gid, &prs, &client));
         assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
+    }
+
+    #[test]
+    fn check_pr_merges_marks_only_the_merged_branch_when_the_stack_merges_partially() {
+        // RAL-480: a review's stack can merge one branch at a time -- a human
+        // merging PRs individually, or a partially-merged GitHub/GitLab
+        // native stack. The still-open sibling's branch must be untouched
+        // and the review itself must stay `in_review` (not jump to
+        // `merged`), while the merged branch's own `merge_status` becomes
+        // independently visible right away rather than waiting for every
+        // sibling to merge too.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Branch A's pr: merged.
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // Branch B's pr: still open.
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "open", "merged": false}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "feature/a").unwrap();
+        store.lock().add_guardian_branch(&gid, "feature/b").unwrap();
+        let branches = store.lock().get_guardian(&gid).unwrap().branches;
+        let branch_a = branches[0].id.clone();
+        let branch_b = branches[1].id.clone();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_a, MergeStatus::Done, None)
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_b, MergeStatus::Done, None)
+            .unwrap();
+
+        let pr_a = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch_a),
+                "github",
+                "acme/widget",
+                "feature/a",
+                "main",
+                "Add a",
+                "Adds a.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch_b),
+                "github",
+                "acme/widget",
+                "feature/b",
+                "feature/a",
+                "Add b",
+                "Adds b.",
+                Some(8),
+                None,
+            )
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+        assert!(
+            changed,
+            "marking one branch merged must report a change even though the \
+             review itself stays in_review"
+        );
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(
+            guardian.status.as_str(),
+            "in_review",
+            "the review must not jump to merged while a sibling branch's pr is still open"
+        );
+        let branch_a_view = guardian.branches.iter().find(|b| b.id == branch_a).unwrap();
+        assert_eq!(branch_a_view.merge_status, MergeStatus::Merged.as_str());
+        let branch_b_view = guardian.branches.iter().find(|b| b.id == branch_b).unwrap();
+        assert_eq!(
+            branch_b_view.merge_status,
+            MergeStatus::Done.as_str(),
+            "the still-open sibling branch must be untouched"
+        );
+
+        let pr_a_row = store.lock().get_pull_request(&pr_a).unwrap();
+        assert_eq!(pr_a_row.state, "merged");
+
+        handle.join().unwrap();
     }
 
     #[test]

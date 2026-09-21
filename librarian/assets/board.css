@@ -158,6 +158,7 @@
       .p-in_progress { color: var(--running); border-color: var(--running); }
       .p-actioning { color: var(--running); border-color: var(--running); }
       .p-ready { color: var(--teal); border-color: var(--teal); }
+      .p-merged { color: var(--done); border-color: var(--done); }
       .badge.ready { color: var(--teal); border-color: var(--teal); }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 
@@ -358,6 +359,7 @@
       .badge.bad { color: var(--failed); border-color: var(--failed); }
       .badge.empty { color: var(--empty); border-color: var(--empty); }
       .badge.live { color: var(--running); border-color: var(--running); }
+      .badge.done { color: var(--done); border-color: var(--done); }
       /* RAL-472: a badge carrying a `data-full` payload opens a copyable text popup on click. */
       .badge[data-full] { cursor: pointer; }
       .badge[data-full]:hover { color: var(--accent); border-color: var(--accent); }

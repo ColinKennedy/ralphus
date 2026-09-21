@@ -146,6 +146,20 @@ cell/task/proof — so no new color was added. Once a PR is no longer `open`
 existing PR-lifecycle coloring (`--accent`/`--done`/`--cancelled`/`--failed`)
 documented for `TT_PR_COLORS`/`PR_STATE_COLORS`.
 
+### Branch already merged upstream — `--done` (RAL-480)
+A review branch whose own commits are already integrated upstream
+(`merge_status == "merged"`, distinct from the whole review's own `merged`
+status) shows its pill/badge in `--done` green, same as `done` and the
+whole-review `merged` status. It reuses the role rather than adding a new
+one: like `done`, it means "this branch's work landed cleanly" — the only
+difference is that it landed *before* this review's own PR/MR automation
+finished with it (e.g. a human merged one branch in the stack directly,
+serially, or the base branch already absorbed it), so automation stops
+touching that branch's PR/MR going forward. That is a behavioral
+distinction (tracked by the `merge_status` string itself), not a visual one,
+so it does not warrant `--ignored` (reserved for the real `ignored` status)
+or any other cautionary hue.
+
 ### PR draft state — no color (RAL-353)
 The Tasks tab's PR filter (`ttRowMatchesPrFilter`) and the " · draft" text
 a `PullRequestView`/`PrIndexRow` whose `draft` is true appends to its badge

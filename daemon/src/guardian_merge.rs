@@ -5407,7 +5407,8 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                 // diff empty too even though the task genuinely committed.
                 // Confirm against the same original-branch-vs-boundary check
                 // before treating it as a real failure.
-                if review_ref_has_no_changes(&wt, &combined_branch, "HEAD")
+                let post_rebase_is_empty = review_ref_has_no_changes(&wt, &combined_branch, "HEAD");
+                if post_rebase_is_empty
                     && note_if_branch_is_empty(store, id, &ob.id, &ob.branch, &wt, base_sha)
                 {
                     fail_branch(
@@ -5428,11 +5429,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                     RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
                     // RAL-168: proofed but no conflict occurred -- still `Done`.
                     RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
-                    RebaseOutcome::Clean => (
-                        MergeStatus::Done,
-                        review_ref_has_no_changes(&wt, &combined_branch, "HEAD")
-                            .then(|| "no new commits over base (already merged?)".to_string()),
-                    ),
+                    RebaseOutcome::Clean => clean_rebase_status(post_rebase_is_empty),
                 };
                 promote_branch_terminal(
                     store,
@@ -7677,7 +7674,8 @@ fn stack_pick(
             // this diff empty too even though the task genuinely committed.
             // Confirm against the same original-branch-vs-boundary check
             // before treating it as a real failure.
-            if review_ref_has_no_changes(wt, newbase, rev)
+            let post_rebase_is_empty = review_ref_has_no_changes(wt, newbase, rev);
+            if post_rebase_is_empty
                 && note_if_branch_is_empty(store, id, branch_id, feature_branch, wt, base_sha)
             {
                 fail_branch(
@@ -7694,13 +7692,7 @@ fn stack_pick(
                 RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
                 // RAL-168: proofed but no conflict occurred -- still `Done`.
                 RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
-                RebaseOutcome::Clean => (
-                    MergeStatus::Done,
-                    // Surface a branch that added nothing over the base rather than
-                    // reporting a silent, work-free "done".
-                    review_ref_has_no_changes(wt, newbase, rev)
-                        .then(|| "no new commits over base (already merged?)".to_string()),
-                ),
+                RebaseOutcome::Clean => clean_rebase_status(post_rebase_is_empty),
             };
             promote_branch_terminal(
                 store,
@@ -9032,7 +9024,13 @@ fn promote_branch_terminal(
             let _ = guard.set_branch_resolver_session_id(id, branch_id, sid);
         }
     }
-    crate::pr::schedule_auto_submit_branch(store, id, branch_id);
+    // RAL-480: a branch already merged upstream never needs a PR/MR of its
+    // own -- `auto_submit_terminal_branches` would filter it out anyway
+    // (its eligibility check only matches `done`/`conflict_resolved`), but
+    // skip queuing the sweep at all rather than relying on that filter alone.
+    if status != MergeStatus::Merged {
+        crate::pr::schedule_auto_submit_branch(store, id, branch_id);
+    }
 }
 
 /// Mark a branch failed and the guardian merge-failed with a reason.
@@ -9069,6 +9067,27 @@ enum RebaseOutcome {
     /// detail message to record (e.g. "resolved by agent; final proof
     /// passed/failed: ...", or "...skipped (Proof scope)").
     Resolved(String),
+}
+
+/// The terminal status/detail for a branch that rebased with [`RebaseOutcome::Clean`]
+/// (no conflicts, no dedicated proof call). By the time this is called,
+/// `note_if_branch_is_empty` has already run against the *original*
+/// pre-rebase branch and returned `false` (the caller returns early via
+/// `fail_branch` otherwise) -- so `post_rebase_is_empty` here can only mean
+/// the branch's real commits are already present on `newbase`, not that the
+/// task never committed (RAL-193 covers that distinction). RAL-480 promotes
+/// that case from a `Done` branch carrying an "(already merged?)" guess in
+/// its free-text `detail` to an explicit, independently-visible `Merged`
+/// status.
+fn clean_rebase_status(post_rebase_is_empty: bool) -> (MergeStatus, Option<String>) {
+    if post_rebase_is_empty {
+        (
+            MergeStatus::Merged,
+            Some("already merged upstream: no new commits over the base".to_string()),
+        )
+    } else {
+        (MergeStatus::Done, None)
+    }
 }
 
 /// List candidate base branches for a guardian, scoped to the remote that owns
@@ -10726,6 +10745,26 @@ mod tests {
     use super::*;
     use crate::runner::RunnerResult;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // -----------------------------------------------------------------------
+    // RAL-480: clean_rebase_status -- shared by `stack_pick` and
+    // `run_merge_shared`'s legacy fallback, so one test covers both call
+    // sites' `RebaseOutcome::Clean` handling.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clean_rebase_status_is_done_when_the_rebase_produced_a_real_diff() {
+        let (status, detail) = clean_rebase_status(false);
+        assert_eq!(status, MergeStatus::Done);
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn clean_rebase_status_is_merged_when_the_rebase_produced_no_diff() {
+        let (status, detail) = clean_rebase_status(true);
+        assert_eq!(status, MergeStatus::Merged);
+        assert!(detail.unwrap().contains("already merged upstream"));
+    }
 
     // -----------------------------------------------------------------------
     // review_maintenance in-flight guard + idle-tier cadence (contention fix)
@@ -14109,6 +14148,27 @@ mod tests {
                 .contains("already merged"),
             "expected the friendly already-merged note, got {:?}",
             branch.detail
+        );
+        // RAL-480: an already-merged-upstream branch gets its own explicit
+        // status, independently visible from a plain `done` rebase, so PR/MR
+        // automation (and the board) can tell the two apart without parsing
+        // the free-text detail string.
+        assert_eq!(
+            branch.merge_status,
+            crate::guardian::MergeStatus::Merged.as_str(),
+            "an already-merged-upstream branch must be MergeStatus::Merged, not Done"
+        );
+        assert!(
+            branch.enabled,
+            "a merged branch must stay enabled and in the stack (RAL-480)"
+        );
+        // RAL-480: `promote_branch_terminal` must not queue this branch for a
+        // PR/MR auto-submit sweep -- a merged branch's PR/MR must never be
+        // created, updated, or otherwise touched by automation.
+        let due = store.lock().take_due_auto_submits(i64::MAX / 2, 0).unwrap();
+        assert!(
+            !due.contains(&id),
+            "a merged branch must never queue an auto-submit sweep (RAL-480)"
         );
 
         let _ = std::fs::remove_dir_all(&base);

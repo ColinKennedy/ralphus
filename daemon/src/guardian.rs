@@ -249,6 +249,21 @@ pub enum MergeStatus {
     ConflictResolved,
     /// Failed to rebase.
     Failed,
+    /// RAL-480: this branch's own commits are already integrated upstream --
+    /// detected either by git ancestry (a clean rebase producing no diff over
+    /// the base, once [`crate::guardian_merge::note_if_branch_is_empty`] has
+    /// confirmed the branch is not simply empty) or by the forge reporting
+    /// its linked PR/MR as merged. Distinct from [`Self::Done`]: a `Done`
+    /// branch's PR/MR is still expected to be created/updated/promoted
+    /// normally, while a `Merged` branch's is not -- automation must never
+    /// create, update, or otherwise mutate the PR/MR tied to a `Merged`
+    /// branch. The branch itself stays enabled and in the stack, and keeps
+    /// participating in rebases exactly like any other terminal branch: only
+    /// PR/MR submission is skipped, not stack membership. A review's overall
+    /// status is unaffected by any one branch reaching this state -- a
+    /// review with a mix of `Merged` and not-yet-merged branches (a partial
+    /// stack merge) simply stays `in_review`.
+    Merged,
 }
 
 impl MergeStatus {
@@ -265,6 +280,7 @@ impl MergeStatus {
             Self::ProofPending => "proof_pending",
             Self::ConflictResolved => "conflict_resolved",
             Self::Failed => "failed",
+            Self::Merged => "merged",
         }
     }
 }
