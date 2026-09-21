@@ -1121,8 +1121,9 @@ const PROJECT_WEBHOOK_CHILDREN: &[HelpNode] = &[
         &["--daemon-url [url]"],
         "Register a live webhook on the project's forge repo, pointed at this daemon's own \
 POST /api/forge/webhook/{provider} receive route. --daemon-url is this daemon's own \
-externally-reachable base URL (it cannot determine that itself). Requires the project's \
-[webhook] secret_env variable to already be set in the daemon's own process environment.",
+externally-reachable base URL (it cannot determine that itself). Requires the daemon's \
+(daemon-singleton) [webhook] secret_env variable to already be set in its own process \
+environment.",
         false,
         false,
         &[],

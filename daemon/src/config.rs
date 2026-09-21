@@ -1630,13 +1630,21 @@ impl std::str::FromStr for WebhookMode {
 /// unset.
 pub const DEFAULT_WEBHOOK_SECRET_ENV: &str = "RALPHUS_WEBHOOK_SECRET";
 
-/// Per-project webhook receiving config (Track E / E1), `[webhook]` table.
-/// Layered per-project over the global default like [`ForgeConfig`]/
-/// [`ReviewConfig`] (unlike [`PrCacheConfig`]/[`MergeCheckConfig`]/
-/// [`HealthSweepConfig`], which are daemon-singleton) -- a webhook is
-/// registered against one specific project's forge repository, so its
-/// config is inherently per-project, the same reasoning [`ForgeConfig`]
-/// itself already documents.
+/// Daemon-singleton webhook receiving config (Track E / E1, narrowed from
+/// per-project to daemon-singleton per explicit user direction after E1-F4
+/// shipped: a project's own `.ralphus.toml` never influences this table),
+/// `[webhook]` table -- one `mode`/`secret_env` for the whole daemon, not
+/// resolved per-project like [`ForgeConfig`]/[`ReviewConfig`]. Loaded from
+/// the global config file only via [`load_webhook_config`], the same
+/// "daemon-singleton, global-only" pattern [`PrCacheConfig`]/
+/// [`MergeCheckConfig`]/[`HealthSweepConfig`] already use: the receive
+/// route (`server::route_webhook`) verifies every delivery against one
+/// shared secret rather than trying each registered project's own secret in
+/// turn to discover which project a delivery is for. `install`/`update`/
+/// `status`/`uninstall`/`check`/`shadow-scorecard` stay project-scoped
+/// routes regardless -- that's inherent to what a webhook *is* (GitHub/
+/// GitLab always register a hook against one specific repo), not a
+/// per-project *config* concern.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct WebhookConfig {
     /// Raw mode string. Deliberately *not* validated at deserialization
@@ -1662,20 +1670,10 @@ pub struct WebhookConfig {
 }
 
 impl WebhookConfig {
-    /// Layer `self` (global) under `over` (per-project). Per-project scalars
-    /// win when present, same semantics as [`ForgeConfig::merge`].
-    #[must_use]
-    pub fn merge(self, over: WebhookConfig) -> WebhookConfig {
-        WebhookConfig {
-            mode: over.mode.or(self.mode),
-            secret_env: over.secret_env.or(self.secret_env),
-        }
-    }
-
     /// The validated mode: [`WebhookMode::Disabled`] when unset, or the
     /// parsed value -- `Err` names the specific unrecognized string rather
     /// than silently falling back, so a typo (`"shado"`) is loud rather than
-    /// indistinguishable from a deliberately-disabled project. Callers that
+    /// indistinguishable from a deliberately-disabled daemon. Callers that
     /// need a mode to act on (the receive route, `webhook install`/`status`)
     /// should surface this error directly rather than defaulting past it.
     pub fn mode(&self) -> std::result::Result<WebhookMode, String> {
@@ -1705,24 +1703,17 @@ pub fn webhook_from_toml_str(s: &str) -> WebhookConfig {
         .unwrap_or_default()
 }
 
-fn load_webhook_file(path: &Path) -> WebhookConfig {
-    std::fs::read_to_string(path)
+/// Load the daemon-singleton `[webhook]` config from the global config file
+/// only -- see [`WebhookConfig`]'s doc comment for why there is deliberately
+/// no per-project layering. Computed fresh at each call site, matching this
+/// module's "load config fresh where needed" style (e.g.
+/// [`load_pr_cache_config`]).
+#[must_use]
+pub fn load_webhook_config() -> WebhookConfig {
+    global_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| webhook_from_toml_str(&s))
         .unwrap_or_default()
-}
-
-/// Resolve the effective webhook config for a project rooted at `cwd`: the
-/// global config layered under the nearest per-project `.ralphus.toml`
-/// (per-project scalars win), same layering as [`resolve_forge`].
-#[must_use]
-pub fn resolve_webhook(cwd: &Path) -> WebhookConfig {
-    let global = global_config_path()
-        .map(|p| load_webhook_file(&p))
-        .unwrap_or_default();
-    let project = find_project_config(cwd)
-        .map(|p| load_webhook_file(&p))
-        .unwrap_or_default();
-    global.merge(project)
 }
 
 /// Provider-specific PR/MR submission defaults (`[github]`/`[gitlab]` tables,
@@ -3130,25 +3121,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn webhook_config_merge_prefers_project_scalars_over_global() {
-        let global =
-            webhook_from_toml_str("[webhook]\nmode = \"shadow\"\nsecret_env = \"GLOBAL\"\n");
-        let project = webhook_from_toml_str("[webhook]\nsecret_env = \"PROJECT\"\n");
-        let merged = global.merge(project);
-        // Project left `mode` unset -- global's value survives.
-        assert_eq!(merged.mode().unwrap(), WebhookMode::Shadow);
-        // Project set `secret_env` -- it wins over global's.
-        assert_eq!(merged.resolved_secret_env(), "PROJECT");
-    }
-
-    // `resolve_webhook` itself (the env-var/filesystem-dependent wrapper
-    // around `merge`) is deliberately not separately tested here -- no
-    // `resolve_*` function in this file is, since `unsafe_code = "forbid"`
-    // (workspace-wide) rules out the `std::env::set_var` an isolated test
-    // would need to point it at a fixture directory. `merge` above is the
-    // pure, directly-testable half; `resolve_webhook` is `resolve_forge`'s
-    // same thin "read two files, merge" wrapper, trusted the same way.
+    // `load_webhook_config` itself (the filesystem-dependent wrapper around
+    // `webhook_from_toml_str`) is deliberately not separately tested here --
+    // no daemon-singleton `load_*_config` function in this file is (see
+    // `load_pr_cache_config`), since it reads a fixed, non-injectable global
+    // path (`global_config_path()`). `webhook_from_toml_str`'s tests above
+    // are the pure, directly-testable half; `load_webhook_config` is a thin
+    // "read one file, parse" wrapper around it, trusted the same way every
+    // other daemon-singleton loader already is.
 
     // ── merge check throttle ────────────────────────────────────────────────
 

@@ -2515,34 +2515,43 @@ returns a hard rate-limit error (Track A / A7).
 
 #### Webhook receiving (`[webhook]`, Track E / E1-E4)
 
-Per-project config (global + `.ralphus.toml` override, same layering as
-`[forge]`/`[review]`) controlling whether [`POST
-/api/forge/webhook/{provider}`](#post-apiforgewebhookprovider-track-e-e2-e4)
-below treats a project as a webhook delivery target at all:
+Daemon-singleton config (global config file only, same "global-only, no
+per-project layering" rationale as `[pr_cache]`/`[merge_check]` — a webhook
+delivery is verified against one shared secret for the whole daemon, not
+matched against each registered project's own) controlling whether
+[`POST /api/forge/webhook/{provider}`](#post-apiforgewebhookprovider-track-e-e2-e4)
+below accepts deliveries at all:
 
 | `.ralphus.toml [webhook]` key | Meaning | Unset resolves to |
 |---|---|---|
 | `mode` | `"disabled"`, `"shadow"`, or `"active"`. An unrecognized value fails config load loudly (not silently treated as `"disabled"`) — security-adjacent config should fail closed and visibly, not leave webhooks off while the operator believes they're on. | `"disabled"` |
-| `secret_env` | Name of the environment variable (read from the daemon process's own environment, not stored in config) holding this project's webhook shared secret. | `RALPHUS_WEBHOOK_SECRET` |
+| `secret_env` | Name of the environment variable (read from the daemon process's own environment, not stored in config) holding the webhook shared secret. | `RALPHUS_WEBHOOK_SECRET` |
 
-`mode` gates whether a project is *considered* by the receive route
-(`"disabled"` is skipped outright, never counted as a verification
-candidate) and, once a delivery verifies, what happens next:
+`mode` gates whether the receive route verifies deliveries at all
+(`"disabled"` means every delivery is rejected `401`, unconditionally) and,
+once a delivery verifies, what happens next:
 
-- **`"shadow"`** (Track F, F1/F2): the delivery is recorded (provider,
-  delivery id, resolved PR, arrival time) purely for later comparison
-  against what the poll independently found -- never acted on, and this
-  route's response is unaffected either way. At record time, the poll's
-  current knowledge of the resolved PR (`guardian_pr_forge_cache.last_checked_at_ms`)
-  is snapshotted and the delta folded into the same `"verified webhook
-  delivery received"` Cartographer row (F2) under a `shadow` key:
-  `poll_last_checked_at_ms` (`null` if the poll had never checked this PR
-  as of the delivery's arrival -- the clearest "the poll would have missed
-  this" signal) and `poll_lag_ms` (`arrived_at_ms - poll_last_checked_at_ms`).
-  Nothing currently *acts* on a webhook delivery regardless of mode (no
-  state transition is driven by receiving one yet), so `"shadow"` vs
-  `"active"` doesn't yet change this route's behavior beyond whether the
-  recording happens -- the distinction exists to build the delivery-vs-poll
+- **`"shadow"`** (Track F, F1/F2): a delivery that resolves to an
+  already-recorded PR row (`crate::webhook::extract_pr_hint` + `Store::
+  find_pull_request_by_number`, E5) is recorded — attributed to that PR's
+  guardian's own resolved project (`GuardianView::project`, RAL-396) —
+  purely for later comparison against what the poll independently found;
+  never acted on, and this route's response is unaffected either way. A
+  verified delivery that never resolves to a known PR is not attributed to
+  any project and is not recorded — there is no per-project secret left to
+  identify "whose" delivery it was, only the payload's own content, and an
+  unresolved delivery's payload doesn't reliably carry that. At record
+  time, the poll's current knowledge of the resolved PR
+  (`guardian_pr_forge_cache.last_checked_at_ms`) is snapshotted and the
+  delta folded into the same `"verified webhook delivery received"`
+  Cartographer row (F2) under a `shadow` key: `poll_last_checked_at_ms`
+  (`null` if the poll had never checked this PR as of the delivery's
+  arrival -- the clearest "the poll would have missed this" signal) and
+  `poll_lag_ms` (`arrived_at_ms - poll_last_checked_at_ms`). Nothing
+  currently *acts* on a webhook delivery regardless of mode (no state
+  transition is driven by receiving one yet), so `"shadow"` vs `"active"`
+  doesn't yet change this route's behavior beyond whether the recording
+  happens -- the distinction exists to build the delivery-vs-poll
   comparison history (surfaced as a scorecard, F3) before any future ticket
   makes a webhook delivery actually trigger something.
 - **`"active"`**: no recording; reserved for a future ticket that acts on a
@@ -2556,24 +2565,27 @@ NAT, a reverse proxy, or a tunnel, and that can never be *derived*, only set
 once. `[daemon].public_url` is that one-time setting (daemon-singleton, not
 per-project, same global/`$RALPHUS_CONFIGURATION_PATH`/project-local
 layering every other `[daemon]` scalar gets — see `DaemonConfig::public_url`
-in `daemon/src/config.rs`). Once set, every daemon startup spawns a one-shot
-background pass (`server::spawn_webhook_reconciliation`, never blocking
-request serving) that walks every registered project and, for each one
-whose effective `[webhook]` mode isn't `"disabled"`:
+in `daemon/src/config.rs`). Once set — and `[webhook].mode` isn't
+`"disabled"` — every daemon startup spawns a one-shot background pass
+(`server::spawn_webhook_reconciliation`, never blocking request serving)
+that walks every registered project (`install`/`update`/`status`/etc. stay
+project-scoped routes regardless of `[webhook]` being daemon-singleton —
+that's inherent to what a webhook *is*, a hook registered against one
+specific forge repo, not a per-project *config* concern) and, for each one:
 
 - installs a webhook for the first time if none is recorded yet;
 - **repoints** an already-recorded webhook **in place** (`webhook update`'s
   own PATCH-by-id call, not a fresh `install`) if its last-recorded URL no
   longer matches the configured `public_url` — i.e. this daemon's address
   changed since it was installed;
-- leaves it alone if the recorded URL already matches;
-- skips the project with a warning (both `rlog!` and Cartographer) if
-  `[webhook].secret_env` names a variable unset in this daemon's own process
-  environment — installing anyway would create a hook that can never verify
-  a delivery.
+- leaves it alone if the recorded URL already matches.
 
-Unset (the default), this whole pass is a no-op and every project's webhook
-stays exactly as manually installed. Repointing in place instead of
+If `[webhook].secret_env` names a variable unset in this daemon's own
+process environment, the whole pass is skipped with one warning (both
+`rlog!` and Cartographer) rather than per project — installing anyway would
+create hooks that can never verify a delivery. Unset `public_url` (the
+default), this whole pass is a no-op and every project's webhook stays
+exactly as manually installed. Repointing in place instead of
 deleting and reinstalling matters because neither forge cleans up an
 orphaned hook promptly: **GitHub never automatically disables a failing
 webhook at all** — a hook left pointed at a dead address just accumulates
@@ -3871,21 +3883,20 @@ Receives a forge-delivered webhook event. `{provider}` is `github` or
 send this daemon's bearer token, so `run_http_loop`'s HTTP boundary
 special-cases this exact path ahead of the ordinary `Daemon::authorized`
 check (see `answer_request` in `server.rs`) and dispatches to a dedicated
-handler instead. In its place, the delivery authenticates itself:
+handler instead. In its place, the delivery authenticates itself against the
+daemon-singleton `[webhook]` secret (see `[webhook]` below — one secret for
+the whole daemon, not per project):
 
-- **GitHub**: `X-Hub-Signature-256` — HMAC-SHA256 over the raw request body,
-  keyed by the project's configured webhook secret (`sha256=<hex digest>`).
+- **GitHub**: `X-Hub-Signature-256` — HMAC-SHA256 over the raw request body
+  (`sha256=<hex digest>`).
 - **GitLab**: `X-Gitlab-Token` — the shared secret sent verbatim, checked
   with a constant-time compare.
 
 The URL carries no project name, since a forge delivers to one fixed
-endpoint per provider, not per project. Which project a delivery belongs to
-is discovered by whose configured secret it verifies against, not asserted
-by the caller: every registered project's effective `[webhook]` config
-(global + `.ralphus.toml`, see `[webhook]` below) is tried in turn, skipping
-any project whose resolved `mode` is `"disabled"` or whose configured secret
-env var isn't set in this process's environment. The first project whose
-secret verifies the delivery is the match.
+endpoint per provider, not per project — and unlike before `[webhook]`
+became daemon-singleton, verification itself no longer needs to know which
+project a delivery is for at all, only whether it matches the one
+configured secret.
 
 **Dedup (E6).** GitHub's `X-GitHub-Delivery` / GitLab's `X-Gitlab-Event-UUID`
 identify one delivery; both forges retry an undelivered webhook under the
@@ -3895,22 +3906,28 @@ log entirely — a retry storm never double-counts one delivery. A delivery
 with no id header (an older forge/proxy that doesn't send one) is always
 treated as first-time.
 
-**Resolution (E5).** A first-time verified delivery's body is read exactly
-once more, as a hint: GitHub's `pull_request.number` / GitLab's
-`object_attributes.iid`, paired with the repository (`repository.full_name`
-/ `project.path_with_namespace`, percent-encoded for GitLab to match the
-`repo` column's own shape). This is used solely to look up an
-already-recorded PR row (`GET /api/pull-requests`'s same
-forge+repo+pr_number lookup) — the parsed body is discarded immediately
-after, and an unresolved hint (an event type this daemon doesn't parse for a
-PR, or a PR ralphus never submitted) is expected, not an error.
+**Resolution (E5) and project attribution.** A first-time verified
+delivery's body is read exactly once more, as a hint: GitHub's
+`pull_request.number` / GitLab's `object_attributes.iid`, paired with the
+repository (`repository.full_name` / `project.path_with_namespace`,
+percent-encoded for GitLab to match the `repo` column's own shape). This is
+used solely to look up an already-recorded PR row (`GET
+/api/pull-requests`'s same forge+repo+pr_number lookup) — the parsed body is
+discarded immediately after, and an unresolved hint (an event type this
+daemon doesn't parse for a PR, or a PR ralphus never submitted) is expected,
+not an error. When a PR does resolve, the *project* it belongs to (needed
+only for shadow-mode recording, F1) is read off that PR's guardian's own
+already-resolved project name (`GuardianView::project`, RAL-396) — the only
+project-identifying signal left now that verification doesn't depend on a
+per-project secret. A delivery that never resolves to a known PR is not
+attributed to any project.
 
 A verified, non-duplicate delivery gets `200 {"status": "accepted", "pr_id":
 "<id>"|null}` and a Cartographer row (`source: "webhook"`, `guardian_id` set
-when a PR resolved) naming the provider, matched project, and resolved
-`pr_id`. An unverifiable delivery (wrong/missing signature, or no project's
-secret matches) gets `401 unauthorized` — the same error envelope as a
-missing bearer token elsewhere in the API.
+when a PR resolved) naming the provider, resolved project (if any), and
+resolved `pr_id`. An unverifiable delivery (wrong/missing signature, or the
+daemon-singleton secret doesn't match) gets `401 unauthorized` — the same
+error envelope as a missing bearer token elsewhere in the API.
 
 **Acknowledge within 10s always (E7).** This route is answered on its own
 freshly spawned thread rather than `write_pool`'s single-worker queue every
@@ -3935,7 +3952,7 @@ attacker-controlled URL).
 `daemon_url` is this daemon's own externally-reachable base URL — there is no
 way for the daemon process to determine that itself (NAT, a reverse proxy, a
 tunnel), so the caller supplies it; `/api/forge/webhook/{provider}` is
-appended automatically. Requires the project's effective `[webhook]`
+appended automatically. Requires the daemon-singleton `[webhook]`
 `secret_env` variable (see below) to already be set in this daemon's own
 process environment — `400 bad_request` naming the unset variable
 otherwise, since an installed hook with no matching secret would never
@@ -4067,7 +4084,7 @@ with no shadow-mode history yet.
 {
   "total_deliveries": 42,
   "missed_count": 3,
-  "spurious_count": 5,
+  "spurious_count": 0,
   "avg_lag_ms": 812.4,
   "max_lag_ms": 4500,
   "out_of_order_count": 0
@@ -4076,14 +4093,16 @@ with no shadow-mode history yet.
 
 - `missed_count` — deliveries that resolved to a real PR the poll had never
   checked as of arrival. The poll would have missed this entirely without
-  the webhook. Deliberately excludes `spurious_count`'s rows: a delivery
-  with no resolved PR trivially has no poll data either, but that's a
-  different failure mode (not one the poll could ever have caught) from
-  "the poll hadn't caught up yet" — counting both under `missed_count` would
-  double-count every spurious delivery.
-- `spurious_count` — deliveries that verified but resolved to no PR at all
-  (an event type E5 doesn't parse a PR/MR from, or a PR ralphus never
-  submitted).
+  the webhook.
+- `spurious_count` — deliveries that verified but resolved to no PR at all.
+  Always `0` now that `[webhook]` is daemon-singleton (see the receive
+  route's own doc comment, `server::route_webhook`): project attribution
+  for shadow recording depends entirely on a delivery resolving to a known
+  PR (there's no per-project secret left to identify "whose" delivery an
+  unresolved one was), so an unresolved-but-verified delivery is never
+  recorded against any project's scorecard at all rather than recorded
+  with `pr_id` unset — the field stays in this response for schema
+  stability, not because it can currently report anything else.
 - `avg_lag_ms`/`max_lag_ms` — mean/max `poll_lag_ms` across deliveries where
   it was computed (i.e. excluding `missed_count`'s rows, which have no lag
   to average). `null` when there's nothing to average.
@@ -4094,27 +4113,27 @@ with no shadow-mode history yet.
   a comparison against a true forge-side event sequence.
 
 **Exit criterion for leaving shadow mode (Track F, F4).** F1-F3 build the
-tooling; graduating a project's `[webhook]` mode from `"shadow"` to
-`"active"` is an operational decision made against real traffic over real
+tooling; graduating the daemon's `[webhook]` mode from `"shadow"` to
+`"active"` (one setting, applying to every registered project's deliveries
+alike) is an operational decision made against real traffic over real
 calendar time, not something this codebase can complete on its own — there
 is no code left to write here, only a criterion to state and a way to
-evaluate it, both already available once a project has run in `"shadow"`
-mode long enough to accumulate a meaningful `shadow-scorecard`.
+evaluate it, both already available once the daemon has run in `"shadow"`
+mode long enough to accumulate a meaningful `shadow-scorecard` per project.
 
-A project is ready to graduate once, over a sustained observation window
-(e.g. two weeks of real PR/MR activity — a `total_deliveries` count in at
-least the low tens per project is a reasonable floor before trusting the
-percentages at all):
+A project's scorecard is ready to help justify graduating once, over a
+sustained observation window (e.g. two weeks of real PR/MR activity — a
+`total_deliveries` count in at least the low tens per project is a
+reasonable floor before trusting the percentages at all):
 
 - `missed_count` stays at or near zero — the webhook is reliably arriving
   ahead of (or is the *only* signal for) what the poll would otherwise have
   caught, not silently failing to fire on real changes.
-- `spurious_count` is low and, more importantly, *understood* — a nonzero
-  count from event types this daemon doesn't yet parse a PR from (E5) is
-  expected and harmless; a nonzero count from deliveries that *should* have
-  resolved a PR but didn't is a signal something upstream (project
-  registration, forge repo naming) is misconfigured and needs fixing before
-  trusting delivery-driven behavior.
+- `spurious_count` — always `0` under the current daemon-singleton
+  `[webhook]` design (see the scorecard route's own field description
+  above), so it carries no signal to evaluate here today; kept in the
+  criterion list for when a future ticket restores per-delivery project
+  attribution independent of PR resolution.
 - `avg_lag_ms`/`max_lag_ms` are consistent with the poll interval this
   project would otherwise rely on (Track A) — a webhook arriving *after*
   the poll would have caught the same change anyway isn't adding value, and
@@ -4125,11 +4144,11 @@ percentages at all):
   daemon must already tolerate, since nothing here assumes in-order
   arrival), but an unexplained *pattern* of it is worth understanding first.
 
-Evaluating this is a `GET .../webhook/shadow-scorecard` call (repeated
-periodically, by a human or a script, against each project still in
-`"shadow"` mode) — nothing in this codebase runs that evaluation
-automatically or flips a project's mode on its own; `mode` remains a value
-someone edits in `.ralphus.toml` once satisfied.
+Evaluating this is a `GET .../webhook/shadow-scorecard` call per project
+(repeated periodically, by a human or a script, against every registered
+project) — nothing in this codebase runs that evaluation automatically or
+flips `[webhook].mode` on its own; it remains a value someone edits in the
+global config once satisfied.
 
 ## Notes on future evolution
 

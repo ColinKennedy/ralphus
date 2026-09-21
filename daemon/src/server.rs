@@ -5488,7 +5488,7 @@ fn project_webhook_install(daemon: &Daemon, name: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
     let root = std::path::Path::new(&project.path);
-    let webhook_config = crate::config::resolve_webhook(root);
+    let webhook_config = crate::config::load_webhook_config();
     let secret = match std::env::var(webhook_config.resolved_secret_env()) {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -5687,7 +5687,7 @@ fn project_webhook_update(daemon: &Daemon, name: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
     let root = std::path::Path::new(&project.path);
-    let webhook_config = crate::config::resolve_webhook(root);
+    let webhook_config = crate::config::load_webhook_config();
     let secret = match std::env::var(webhook_config.resolved_secret_env()) {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -5764,22 +5764,14 @@ fn update_webhook_for_project(
 
 /// One decision for how to reconcile a single project's webhook against
 /// this daemon's configured `[daemon].public_url`. Pure -- every input is a
-/// parameter rather than a live config/env/DB read, so every branch here is
-/// directly unit-testable without a mock forge server. See
-/// `run_webhook_reconciliation_pass` for what executes each variant.
+/// parameter rather than a live config/DB read, so every branch here is
+/// directly unit-testable without a mock forge server. Whether to run this
+/// at all (daemon-singleton `[webhook].mode`/`secret_env`, resolved once
+/// per pass rather than per project) is decided by the caller,
+/// `run_webhook_reconciliation_pass`, before this is ever reached -- see
+/// its own doc comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WebhookReconcileAction {
-    /// `[webhook].mode` resolves to `disabled` (the default, and also what
-    /// an unrecognized mode string falls back to here -- a config typo is
-    /// already reported loudly elsewhere, the receive route and `webhook
-    /// install`; this pass just skips what it can't classify rather than
-    /// failing the whole reconciliation over one project). Nothing to do.
-    Disabled,
-    /// `[webhook].secret_env` names an environment variable that is unset
-    /// (or empty) in this daemon's own process. Installing anyway would
-    /// create a hook that can never verify a delivery, so this project is
-    /// skipped with a warning instead of silently shipping a broken hook.
-    MissingSecret,
     /// A webhook is already recorded for this project and already points
     /// at the configured `public_url`. Nothing to do.
     UpToDate,
@@ -5791,20 +5783,12 @@ enum WebhookReconcileAction {
     Update { hook_id: String },
 }
 
-/// Decide [`WebhookReconcileAction`] for one project.
+/// Decide [`WebhookReconcileAction`] for one project, given `[webhook]`
+/// mode/secret are already known to allow reconciling at all.
 fn plan_webhook_reconcile(
-    mode: std::result::Result<crate::config::WebhookMode, String>,
     existing: Option<&crate::webhook::ProjectWebhookRecord>,
     public_url: &str,
-    secret_present: bool,
 ) -> WebhookReconcileAction {
-    if mode.unwrap_or(crate::config::WebhookMode::Disabled) == crate::config::WebhookMode::Disabled
-    {
-        return WebhookReconcileAction::Disabled;
-    }
-    if !secret_present {
-        return WebhookReconcileAction::MissingSecret;
-    }
     match existing {
         None => WebhookReconcileAction::Install,
         Some(record)
@@ -5818,28 +5802,29 @@ fn plan_webhook_reconcile(
     }
 }
 
-fn log_webhook_reconcile_missing_secret(
-    store: &crate::store_lock::StoreHandle,
-    project_name: &str,
-    secret_env: &str,
-) {
+/// `[webhook].secret_env` (daemon-singleton) names an environment variable
+/// that is unset (or empty) in this daemon's own process. Reconciling
+/// anyway would create hooks that can never verify a delivery, so the whole
+/// pass is skipped with one warning instead of silently shipping broken
+/// hooks project by project.
+fn log_webhook_reconcile_missing_secret(store: &crate::store_lock::StoreHandle, secret_env: &str) {
     crate::rlog!(
         WARNING,
-        "ralphus [webhook] {project_name} wants shadow/active mode but ${secret_env} is unset in this daemon's environment -- skipping auto-reconcile"
+        "ralphus [webhook] shadow/active mode is set but ${secret_env} is unset in this daemon's environment -- skipping auto-reconcile entirely"
     );
     let _ = store
         .lock()
         .cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::WARNING,
             source: "webhook",
-            message: "webhook auto-reconcile skipped: secret env var unset",
-            scope: Some("project"),
+            message: "webhook auto-reconcile pass skipped: secret env var unset",
+            scope: None,
             squad_id: None,
             guardian_id: None,
             cell_id: None,
             task: None,
             log_path: None,
-            payload: serde_json::json!({"project": project_name, "secret_env": secret_env}),
+            payload: serde_json::json!({"secret_env": secret_env}),
             admin_only: false,
         });
 }
@@ -5908,7 +5893,26 @@ fn log_webhook_reconcile_failed(
 /// every project's webhook stays exactly as manually installed via
 /// `ralphus project webhook install`/`update`. One project's forge-call
 /// failure is logged and skipped here, never aborting the rest of the pass.
-fn run_webhook_reconciliation_pass(store: &crate::store_lock::StoreHandle, public_url: &str) {
+///
+/// `[webhook].mode`/`secret_env` are daemon-singleton (`load_webhook_config`,
+/// same as `[pr_cache]`), not per project -- but `load_webhook_config`
+/// itself is not called here: it reads a fixed, non-injectable filesystem
+/// path, which would make this function's tests depend on whatever happens
+/// to be in the real global config on the machine running them. Instead
+/// [`spawn_webhook_reconciliation`] resolves it once, decides whether
+/// `[webhook].mode` even allows reconciling at all (an unset/disabled mode
+/// means this function is never called), and passes `secret_env` in --
+/// mirroring `public_url`'s own testability split above.
+fn run_webhook_reconciliation_pass(
+    store: &crate::store_lock::StoreHandle,
+    public_url: &str,
+    secret_env: &str,
+) {
+    let Some(secret) = std::env::var(secret_env).ok().filter(|s| !s.is_empty()) else {
+        log_webhook_reconcile_missing_secret(store, secret_env);
+        return;
+    };
+
     let projects = match store.lock().list_projects() {
         Ok(p) => p,
         Err(e) => {
@@ -5936,9 +5940,6 @@ fn run_webhook_reconciliation_pass(store: &crate::store_lock::StoreHandle, publi
     };
     for project in projects {
         let root = std::path::Path::new(&project.path);
-        let webhook_cfg = crate::config::resolve_webhook(root);
-        let secret_env = webhook_cfg.resolved_secret_env().to_string();
-        let secret = std::env::var(&secret_env).ok().filter(|s| !s.is_empty());
         let existing = match store.lock().get_project_webhook(&project.name) {
             Ok(r) => r,
             Err(e) => {
@@ -5946,21 +5947,10 @@ fn run_webhook_reconciliation_pass(store: &crate::store_lock::StoreHandle, publi
                 continue;
             }
         };
-        let action = plan_webhook_reconcile(
-            webhook_cfg.mode(),
-            existing.as_ref(),
-            public_url,
-            secret.is_some(),
-        );
+        let action = plan_webhook_reconcile(existing.as_ref(), public_url);
         match action {
-            WebhookReconcileAction::Disabled | WebhookReconcileAction::UpToDate => {}
-            WebhookReconcileAction::MissingSecret => {
-                log_webhook_reconcile_missing_secret(store, &project.name, &secret_env);
-            }
+            WebhookReconcileAction::UpToDate => {}
             WebhookReconcileAction::Install => {
-                // `secret` is guaranteed `Some` here: `plan_webhook_reconcile`
-                // only returns `Install` when `secret_present` was true.
-                let Some(secret) = secret else { continue };
                 match install_webhook_for_project(root, &secret, public_url) {
                     Ok((kind, hook)) => {
                         let _ = store.lock().record_project_webhook(
@@ -5980,7 +5970,6 @@ fn run_webhook_reconciliation_pass(store: &crate::store_lock::StoreHandle, publi
                 }
             }
             WebhookReconcileAction::Update { hook_id } => {
-                let Some(secret) = secret else { continue };
                 match update_webhook_for_project(root, &hook_id, &secret, public_url) {
                     Ok((kind, hook)) => {
                         let _ = store.lock().record_project_webhook(
@@ -6026,8 +6015,17 @@ pub fn spawn_webhook_reconciliation(store: crate::store_lock::StoreHandle) {
         else {
             return;
         };
+        let webhook_cfg = crate::config::load_webhook_config();
+        if webhook_cfg
+            .mode()
+            .unwrap_or(crate::config::WebhookMode::Disabled)
+            == crate::config::WebhookMode::Disabled
+        {
+            return;
+        }
+        let secret_env = webhook_cfg.resolved_secret_env().to_string();
         let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_webhook_reconciliation_pass(&store, &public_url);
+            run_webhook_reconciliation_pass(&store, &public_url, &secret_env);
         }));
         if pass.is_err() {
             crate::rlog!(ERROR, "ralphus [webhook] auto-reconciliation pass panicked");
@@ -15756,49 +15754,44 @@ fn webhook_provider_from_path(url: &str) -> Option<String> {
     }
 }
 
-/// Pure candidate-matching step for [`route_webhook`]: given each
-/// registered project's already-resolved webhook secret (`None` for a
-/// project with no live secret -- `[webhook].mode` is `Disabled`, its mode
-/// failed to parse, or its configured secret env var isn't set), find the
-/// first one the delivery verifies against.
+/// Pure verification step for [`route_webhook`]: does this delivery verify
+/// against the daemon's one configured secret? `secret` is `None` when
+/// `[webhook].mode` is `Disabled`/failed to parse, or its configured secret
+/// env var isn't set -- always fails verification in that case, same as an
+/// empty candidate list did before `[webhook]` became daemon-singleton.
 ///
-/// Takes resolved secrets as a parameter rather than reading config/env
+/// Takes the resolved secret as a parameter rather than reading config/env
 /// itself, so it is directly testable without touching this process's real
 /// environment (`std::env::set_var` is `unsafe` and this workspace forbids
 /// `unsafe_code` outright) -- see `configuration_path_entries` in
 /// `config.rs` for the same testability pattern applied to another
 /// env-dependent config field.
-fn find_verified_webhook_project<'a>(
+fn verify_webhook_signature(
     kind: crate::forge::ForgeKind,
     body: &str,
     github_signature: Option<&str>,
     gitlab_token: Option<&str>,
-    candidates: &'a [(String, Option<String>)],
-) -> Option<&'a str> {
-    candidates.iter().find_map(|(name, secret)| {
-        let secret = secret.as_deref()?;
-        let verified = match kind {
-            crate::forge::ForgeKind::GitHub => github_signature.is_some_and(|sig| {
-                crate::webhook::verify_github_signature(secret.as_bytes(), body.as_bytes(), sig)
-            }),
-            crate::forge::ForgeKind::GitLab => {
-                gitlab_token.is_some_and(|token| crate::webhook::verify_gitlab_token(secret, token))
-            }
-        };
-        verified.then_some(name.as_str())
-    })
+    secret: Option<&str>,
+) -> bool {
+    let Some(secret) = secret else { return false };
+    match kind {
+        crate::forge::ForgeKind::GitHub => github_signature.is_some_and(|sig| {
+            crate::webhook::verify_github_signature(secret.as_bytes(), body.as_bytes(), sig)
+        }),
+        crate::forge::ForgeKind::GitLab => {
+            gitlab_token.is_some_and(|token| crate::webhook::verify_gitlab_token(secret, token))
+        }
+    }
 }
 
 /// Handle a verified (or not) forge webhook delivery (Track E, E2-E4).
 ///
 /// Unlike every other route, the URL carries no project name -- a forge
-/// delivers to one fixed endpoint per provider, not per project -- so which
-/// project a delivery belongs to is discovered by whose configured secret
-/// verifies it, not asserted by the caller. Each registered project's
-/// `[webhook]` config (`crate::config::resolve_webhook`) is resolved to a
-/// candidate secret (or `None`, see [`find_verified_webhook_project`]'s doc
-/// comment for the skip conditions), and the actual matching is delegated
-/// to that pure function.
+/// delivers to one fixed endpoint per provider, not per project. Since
+/// `[webhook]` narrowed from per-project to daemon-singleton config, that no
+/// longer matters for verification: every delivery is checked against the
+/// one secret [`crate::config::load_webhook_config`] resolves, via
+/// [`verify_webhook_signature`].
 ///
 /// Once verified, the delivery's body is used exactly once more: as a hint
 /// (`crate::webhook::extract_pr_hint`) to look up an already-recorded PR row
@@ -15815,8 +15808,16 @@ fn find_verified_webhook_project<'a>(
 /// at all is always treated as first-time (there's nothing to dedupe
 /// against).
 ///
-/// Scope note: the acknowledge-within-10s budget is Track E's next item
-/// (E7), not implemented here.
+/// A verified delivery that resolves to a known PR is attributed, for
+/// shadow-recording purposes only, to that PR's guardian's own already-
+/// resolved project name (`GuardianView::project`, RAL-396) -- there is no
+/// other way left to know which project a delivery is "for" now that
+/// verification no longer depends on a per-project secret. A delivery that
+/// verifies but never resolves to a known PR (previously attributable to
+/// whichever project's secret matched, now attributable to nothing) is
+/// simply not recorded in any project's shadow scorecard -- narrower than
+/// before, a deliberate trade accepted when `[webhook]` moved off
+/// per-project config, not an oversight.
 fn route_webhook(
     daemon: &Daemon,
     provider: &str,
@@ -15830,136 +15831,118 @@ fn route_webhook(
         return error(404, "not_found", "unknown webhook provider", vec![]);
     };
 
-    let projects = match daemon.lock().list_projects() {
-        Ok(projects) => projects,
-        Err(e) => return store_error(&e),
+    let webhook_cfg = crate::config::load_webhook_config();
+    let secret = match webhook_cfg.mode() {
+        Ok(crate::config::WebhookMode::Disabled) | Err(_) => None,
+        Ok(_) => std::env::var(webhook_cfg.resolved_secret_env()).ok(),
     };
+    let mode = webhook_cfg.mode();
 
-    let candidates: Vec<(String, Option<String>)> = projects
-        .iter()
-        .map(|project| {
-            let config = crate::config::resolve_webhook(std::path::Path::new(&project.path));
-            let secret = match config.mode() {
-                Ok(crate::config::WebhookMode::Disabled) | Err(_) => None,
-                Ok(_) => std::env::var(config.resolved_secret_env()).ok(),
-            };
-            (project.name.clone(), secret)
-        })
-        .collect();
-
-    match find_verified_webhook_project(kind, body, github_signature, gitlab_token, &candidates) {
-        Some(project_name) => {
-            let delivery_id = match kind {
-                crate::forge::ForgeKind::GitHub => github_delivery_id,
-                crate::forge::ForgeKind::GitLab => gitlab_event_uuid,
-            };
-            // E6: fail open on a DB error (treat as first-time) -- a
-            // transient store error dropping a legitimate delivery is worse
-            // than occasionally reprocessing one, and reprocessing here is
-            // just a lookup plus a log entry, not a side effect that
-            // compounds.
-            let first_time = delivery_id
-                .map(|id| {
-                    daemon
-                        .lock()
-                        .record_webhook_delivery(kind.as_str(), id)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true);
-            if !first_time {
-                return json(
-                    200,
-                    &serde_json::json!({"status": "accepted", "duplicate": true}),
-                );
-            }
-            // E5: the payload is a hint only -- used to look up an already
-            // recorded PR row, never stored or trusted on its own. A
-            // GitHub/GitLab retry storm on an event type this daemon
-            // doesn't parse for a PR/MR (or a delivery for a PR ralphus
-            // never submitted) resolves to `None` here, which is expected
-            // and not an error: the delivery was still verified and still
-            // gets a `200`.
-            let resolved_pr =
-                crate::webhook::extract_pr_hint(kind, body).and_then(|(repo, pr_number)| {
-                    daemon
-                        .lock()
-                        .find_pull_request_by_number(kind.as_str(), &repo, pr_number)
-                        .ok()
-                        .flatten()
-                });
-            let resolved_pr_id = resolved_pr.as_ref().map(|pr| pr.id.as_str());
-            let resolved_guardian_id = resolved_pr.as_ref().map(|pr| pr.guardian_id.as_str());
-
-            // Track F, F1: while this project's webhook mode is "shadow",
-            // record the delivery purely for later comparison against what
-            // the poll independently found -- never acted on, never
-            // changes what this route returns. The mode is re-resolved
-            // here rather than threaded through `candidates` above: only
-            // the winning project's mode is ever relevant, so resolving
-            // every candidate's mode a second time (the first was
-            // `.mode()` inside the map that built `candidates`) would be
-            // wasted work on every project that didn't verify.
-            let shadow_project_mode = projects
-                .iter()
-                .find(|p| p.name == project_name)
-                .map(|p| crate::config::resolve_webhook(std::path::Path::new(&p.path)).mode());
-            let shadow_delivery =
-                if shadow_project_mode == Some(Ok(crate::config::WebhookMode::Shadow)) {
-                    daemon
-                        .lock()
-                        .record_webhook_shadow_delivery(
-                            kind.as_str(),
-                            delivery_id,
-                            project_name,
-                            resolved_pr_id,
-                        )
-                        .ok()
-                } else {
-                    None
-                };
-
-            // Track F, F2: the delta between what the webhook just told us
-            // and what the poll's own most recent look already knew --
-            // computed once, at record time (`poll_lag_ms` above), and
-            // folded into the same Cartographer row rather than a second
-            // log call, so a shadow-mode delivery's comparison data lives
-            // alongside its receipt event instead of as a separate,
-            // independently-timestamped row that could drift apart from it.
-            let _ = daemon
-                .lock()
-                .cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::INFO,
-                    source: "webhook",
-                    message: "verified webhook delivery received",
-                    scope: Some("webhook"),
-                    squad_id: None,
-                    guardian_id: resolved_guardian_id,
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({
-                        "provider": kind.as_str(),
-                        "project": project_name,
-                        "pr_id": resolved_pr_id,
-                        "shadow": shadow_delivery.as_ref().map(|d| serde_json::json!({
-                            "poll_last_checked_at_ms": d.poll_last_checked_at_ms,
-                            "poll_lag_ms": d.poll_lag_ms,
-                        })),
-                    }),
-                    admin_only: false,
-                });
-            json(
-                200,
-                &serde_json::json!({"status": "accepted", "pr_id": resolved_pr_id}),
-            )
-        }
-        None => error(
+    if !verify_webhook_signature(
+        kind,
+        body,
+        github_signature,
+        gitlab_token,
+        secret.as_deref(),
+    ) {
+        return error(
             401,
             "unauthorized",
             "webhook signature verification failed",
             vec![],
-        ),
+        );
     }
+
+    let delivery_id = match kind {
+        crate::forge::ForgeKind::GitHub => github_delivery_id,
+        crate::forge::ForgeKind::GitLab => gitlab_event_uuid,
+    };
+    // E6: fail open on a DB error (treat as first-time) -- a transient store
+    // error dropping a legitimate delivery is worse than occasionally
+    // reprocessing one, and reprocessing here is just a lookup plus a log
+    // entry, not a side effect that compounds.
+    let first_time = delivery_id
+        .map(|id| {
+            daemon
+                .lock()
+                .record_webhook_delivery(kind.as_str(), id)
+                .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    if !first_time {
+        return json(
+            200,
+            &serde_json::json!({"status": "accepted", "duplicate": true}),
+        );
+    }
+    // E5: the payload is a hint only -- used to look up an already recorded
+    // PR row, never stored or trusted on its own. A GitHub/GitLab retry
+    // storm on an event type this daemon doesn't parse for a PR/MR (or a
+    // delivery for a PR ralphus never submitted) resolves to `None` here,
+    // which is expected and not an error: the delivery was still verified
+    // and still gets a `200`.
+    let resolved_pr = crate::webhook::extract_pr_hint(kind, body).and_then(|(repo, pr_number)| {
+        daemon
+            .lock()
+            .find_pull_request_by_number(kind.as_str(), &repo, pr_number)
+            .ok()
+            .flatten()
+    });
+    let resolved_pr_id = resolved_pr.as_ref().map(|pr| pr.id.as_str());
+    let resolved_guardian_id = resolved_pr.as_ref().map(|pr| pr.guardian_id.as_str());
+    let project_name = resolved_guardian_id
+        .and_then(|gid| daemon.lock().get_guardian(gid).ok().and_then(|g| g.project));
+
+    // Track F, F1: while `[webhook].mode` is "shadow", record the delivery
+    // purely for later comparison against what the poll independently
+    // found -- never acted on, never changes what this route returns.
+    // Requires a resolved project name -- see this function's doc comment
+    // for why a delivery with no resolved PR can't be attributed to one.
+    let shadow_delivery = if mode == Ok(crate::config::WebhookMode::Shadow) {
+        project_name.as_deref().and_then(|name| {
+            daemon
+                .lock()
+                .record_webhook_shadow_delivery(kind.as_str(), delivery_id, name, resolved_pr_id)
+                .ok()
+        })
+    } else {
+        None
+    };
+
+    // Track F, F2: the delta between what the webhook just told us and what
+    // the poll's own most recent look already knew -- computed once, at
+    // record time (`poll_lag_ms` above), and folded into the same
+    // Cartographer row rather than a second log call, so a shadow-mode
+    // delivery's comparison data lives alongside its receipt event instead
+    // of as a separate, independently-timestamped row that could drift
+    // apart from it.
+    let _ = daemon
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "webhook",
+            message: "verified webhook delivery received",
+            scope: Some("webhook"),
+            squad_id: None,
+            guardian_id: resolved_guardian_id,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "provider": kind.as_str(),
+                "project": project_name,
+                "pr_id": resolved_pr_id,
+                "shadow": shadow_delivery.as_ref().map(|d| serde_json::json!({
+                    "poll_last_checked_at_ms": d.poll_last_checked_at_ms,
+                    "poll_lag_ms": d.poll_lag_ms,
+                })),
+            }),
+            admin_only: false,
+        });
+    json(
+        200,
+        &serde_json::json!({"status": "accepted", "pr_id": resolved_pr_id}),
+    )
 }
 
 /// Case-insensitive header lookup (`tiny_http::Header::field` compares
@@ -27820,66 +27803,52 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn find_verified_webhook_project_matches_github_signature_against_the_right_candidate() {
+    fn verify_webhook_signature_accepts_a_correct_github_signature() {
         let body = r#"{"action":"opened"}"#;
-        let header = github_signed_header("secret-b", body);
-        let candidates = vec![
-            ("project-a".to_string(), Some("secret-a".to_string())),
-            ("project-b".to_string(), Some("secret-b".to_string())),
-        ];
-        let matched = find_verified_webhook_project(
+        let header = github_signed_header("the-secret", body);
+        assert!(verify_webhook_signature(
             crate::forge::ForgeKind::GitHub,
             body,
             Some(&header),
             None,
-            &candidates,
-        );
-        assert_eq!(matched, Some("project-b"));
+            Some("the-secret"),
+        ));
     }
 
     #[test]
-    fn find_verified_webhook_project_matches_gitlab_token_against_the_right_candidate() {
-        let candidates = vec![
-            ("project-a".to_string(), Some("secret-a".to_string())),
-            ("project-b".to_string(), Some("secret-b".to_string())),
-        ];
-        let matched = find_verified_webhook_project(
+    fn verify_webhook_signature_accepts_a_correct_gitlab_token() {
+        assert!(verify_webhook_signature(
             crate::forge::ForgeKind::GitLab,
             "{}",
             None,
-            Some("secret-b"),
-            &candidates,
-        );
-        assert_eq!(matched, Some("project-b"));
+            Some("the-secret"),
+            Some("the-secret"),
+        ));
     }
 
     #[test]
-    fn find_verified_webhook_project_skips_candidates_with_no_resolved_secret() {
-        // `None` models a project whose `[webhook].mode` is `Disabled`, its
-        // mode failed to parse, or its secret env var isn't set -- none of
-        // these should ever be treated as a match, even by coincidence.
-        let candidates = vec![("project-a".to_string(), None)];
-        let matched = find_verified_webhook_project(
+    fn verify_webhook_signature_rejects_when_no_secret_is_configured() {
+        // `None` models `[webhook].mode` being `Disabled`, its mode failing
+        // to parse, or its secret env var being unset -- never a match,
+        // even by coincidence with an empty token.
+        assert!(!verify_webhook_signature(
             crate::forge::ForgeKind::GitLab,
             "{}",
             None,
             Some(""),
-            &candidates,
-        );
-        assert_eq!(matched, None);
+            None,
+        ));
     }
 
     #[test]
-    fn find_verified_webhook_project_returns_none_when_nothing_verifies() {
-        let candidates = vec![("project-a".to_string(), Some("secret-a".to_string()))];
-        let matched = find_verified_webhook_project(
+    fn verify_webhook_signature_rejects_a_wrong_guess() {
+        assert!(!verify_webhook_signature(
             crate::forge::ForgeKind::GitLab,
             "{}",
             None,
             Some("wrong-guess"),
-            &candidates,
-        );
-        assert_eq!(matched, None);
+            Some("the-secret"),
+        ));
     }
 
     #[test]
@@ -27890,10 +27859,10 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn route_webhook_rejects_when_no_project_verifies() {
-        // No projects are registered in this in-memory store, so there are
-        // no candidates at all -- the delivery must still be rejected
-        // (401), not accepted by default.
+    fn route_webhook_rejects_when_no_secret_is_configured() {
+        // The in-memory test daemon's global config has no `[webhook]`
+        // table, so `[webhook].mode` resolves to `Disabled` -- the delivery
+        // must still be rejected (401), not accepted by default.
         let d = daemon();
         let reply = route_webhook(
             &d,
@@ -27967,13 +27936,16 @@ command=\"cargo test\"
 
     #[test]
     fn project_webhook_install_route_rejects_when_secret_env_is_unset() {
+        // `[webhook].secret_env` is daemon-singleton (`load_webhook_config`,
+        // resolved from the global config file, not this project's own
+        // `.ralphus.toml`) -- nothing here can override it to a fixture
+        // name, so this asserts against whatever this test machine's real
+        // global config resolves to (the default `RALPHUS_WEBHOOK_SECRET`
+        // when, as in CI, no global config customizes it), matching how
+        // every other daemon-singleton config (`[pr_cache]`, `[daemon]`) is
+        // already tested in this file.
         let d = daemon();
         let repo = tmp_git_repo("webhook-install-no-secret");
-        std::fs::write(
-            repo.join(".ralphus.toml"),
-            "[webhook]\nsecret_env = \"RALPHUS_TEST_NEVER_SET_WEBHOOK_SECRET_E8\"\n",
-        )
-        .unwrap();
         route(
             &d,
             "POST",
@@ -27986,12 +27958,20 @@ command=\"cargo test\"
             "/api/projects/webhook-proj-1/webhook/install",
             &serde_json::json!({"daemon_url": "https://ralphus.example.com"}).to_string(),
         );
+        let secret_env = crate::config::load_webhook_config()
+            .resolved_secret_env()
+            .to_string();
+        if std::env::var(&secret_env).is_ok_and(|s| !s.is_empty()) {
+            // This test machine's real environment happens to have the
+            // resolved secret env var set -- install would (correctly)
+            // succeed rather than 400, so there is nothing left to assert
+            // for "unset" here. Matches every other real-environment-
+            // dependent daemon-singleton config test's acceptance of this
+            // gap rather than skipping outright.
+            return;
+        }
         assert_eq!(r.status, 400, "{}", r.body);
-        assert!(
-            r.body.contains("RALPHUS_TEST_NEVER_SET_WEBHOOK_SECRET_E8"),
-            "{}",
-            r.body
-        );
+        assert!(r.body.contains(&secret_env), "{}", r.body);
     }
 
     #[test]
@@ -28150,53 +28130,9 @@ command=\"cargo test\"
     // ── webhook auto-reconciliation (`[daemon].public_url`) ─────────────
 
     #[test]
-    fn plan_webhook_reconcile_disabled_mode_needs_nothing() {
-        assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Disabled),
-                None,
-                "https://ralphus.example.com",
-                true,
-            ),
-            WebhookReconcileAction::Disabled
-        );
-    }
-
-    #[test]
-    fn plan_webhook_reconcile_unrecognized_mode_string_behaves_like_disabled() {
-        assert_eq!(
-            plan_webhook_reconcile(
-                Err("unknown [webhook] mode \"shado\"".to_string()),
-                None,
-                "https://ralphus.example.com",
-                true,
-            ),
-            WebhookReconcileAction::Disabled
-        );
-    }
-
-    #[test]
-    fn plan_webhook_reconcile_shadow_with_no_secret_is_skipped() {
-        assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Shadow),
-                None,
-                "https://ralphus.example.com",
-                false,
-            ),
-            WebhookReconcileAction::MissingSecret
-        );
-    }
-
-    #[test]
     fn plan_webhook_reconcile_with_no_existing_record_installs() {
         assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Shadow),
-                None,
-                "https://ralphus.example.com",
-                true,
-            ),
+            plan_webhook_reconcile(None, "https://ralphus.example.com"),
             WebhookReconcileAction::Install
         );
     }
@@ -28210,12 +28146,7 @@ command=\"cargo test\"
             installed_at_ms: 0,
         };
         assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Active),
-                Some(&record),
-                "https://ralphus.example.com",
-                true,
-            ),
+            plan_webhook_reconcile(Some(&record), "https://ralphus.example.com"),
             WebhookReconcileAction::UpToDate
         );
     }
@@ -28229,12 +28160,7 @@ command=\"cargo test\"
             installed_at_ms: 0,
         };
         assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Shadow),
-                Some(&record),
-                "https://ralphus.example.com",
-                true,
-            ),
+            plan_webhook_reconcile(Some(&record), "https://ralphus.example.com"),
             WebhookReconcileAction::UpToDate
         );
     }
@@ -28248,12 +28174,7 @@ command=\"cargo test\"
             installed_at_ms: 0,
         };
         assert_eq!(
-            plan_webhook_reconcile(
-                Ok(crate::config::WebhookMode::Shadow),
-                Some(&record),
-                "https://new.example.com",
-                true,
-            ),
+            plan_webhook_reconcile(Some(&record), "https://new.example.com"),
             WebhookReconcileAction::Update {
                 hook_id: "9".to_string()
             }
@@ -28261,34 +28182,9 @@ command=\"cargo test\"
     }
 
     #[test]
-    fn webhook_reconciliation_pass_skips_a_project_with_no_webhook_config_at_all() {
-        let d = daemon();
-        let repo = tmp_git_repo("reconcile-disabled");
-        route(
-            &d,
-            "POST",
-            "/api/projects",
-            &register_body("reconcile-disabled-proj", &repo.to_string_lossy(), ""),
-        );
-        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
-        assert_eq!(
-            d.lock()
-                .get_project_webhook("reconcile-disabled-proj")
-                .unwrap(),
-            None,
-            "disabled mode must never install a webhook"
-        );
-    }
-
-    #[test]
-    fn webhook_reconciliation_pass_skips_a_project_whose_secret_env_is_unset() {
+    fn webhook_reconciliation_pass_skips_every_project_when_the_secret_env_is_unset() {
         let d = daemon();
         let repo = tmp_git_repo("reconcile-missing-secret");
-        std::fs::write(
-            repo.join(".ralphus.toml"),
-            "[webhook]\nmode = \"shadow\"\nsecret_env = \"RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET\"\n",
-        )
-        .unwrap();
         route(
             &d,
             "POST",
@@ -28298,14 +28194,23 @@ command=\"cargo test\"
         // No mock forge server is started -- if the pass tried to call out
         // despite the missing secret, this would hang or error instead of
         // returning, so the assertion below reaching at all is itself part
-        // of the proof, in addition to the recorded-webhook check.
-        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
+        // of the proof, in addition to the recorded-webhook check. Whether
+        // `[webhook].mode` even allows reconciling at all is decided by
+        // `spawn_webhook_reconciliation`, not tested here (see this
+        // function's own doc comment) -- this test is purely about the
+        // secret-presence check `run_webhook_reconciliation_pass` still
+        // does itself.
+        run_webhook_reconciliation_pass(
+            &d.store_handle(),
+            "https://ralphus.example.com",
+            "RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET",
+        );
         assert_eq!(
             d.lock()
                 .get_project_webhook("reconcile-missing-secret-proj")
                 .unwrap(),
             None,
-            "a project whose secret env var is unset must never get an installed webhook"
+            "a project must never get an installed webhook while the secret env var is unset"
         );
     }
 
@@ -28313,11 +28218,6 @@ command=\"cargo test\"
     fn webhook_reconciliation_pass_never_clobbers_an_existing_record_it_cannot_act_on() {
         let d = daemon();
         let repo = tmp_git_repo("reconcile-up-to-date");
-        std::fs::write(
-            repo.join(".ralphus.toml"),
-            "[webhook]\nmode = \"shadow\"\nsecret_env = \"RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET_2\"\n",
-        )
-        .unwrap();
         route(
             &d,
             "POST",
@@ -28332,13 +28232,17 @@ command=\"cargo test\"
                 "https://ralphus.example.com",
             )
             .unwrap();
-        // The secret env var is unset, so this pass can only ever reach
-        // `MissingSecret` here (never a real `UpToDate`/`Update` decision --
-        // `plan_webhook_reconcile_matching_recorded_url_is_up_to_date` above
-        // covers `UpToDate` itself, without needing a real secret). What
-        // this proves instead: reading an existing record and being unable
-        // to act on it never clears or corrupts that record.
-        run_webhook_reconciliation_pass(&d.store_handle(), "https://ralphus.example.com");
+        // The secret env var is unset, so this pass returns before even
+        // listing projects (`plan_webhook_reconcile_matching_recorded_url_is_up_to_date`
+        // above covers the real `UpToDate` decision itself, without needing
+        // a real secret). What this proves instead: reading an existing
+        // record and being unable to act on it never clears or corrupts
+        // that record.
+        run_webhook_reconciliation_pass(
+            &d.store_handle(),
+            "https://ralphus.example.com",
+            "RALPHUS_TEST_NEVER_SET_RECONCILE_SECRET_2",
+        );
         let record = d
             .lock()
             .get_project_webhook("reconcile-up-to-date-proj")
