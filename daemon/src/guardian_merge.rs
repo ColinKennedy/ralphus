@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,52 @@ pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
 /// session name a feedback pass actually runs under, both live and after
 /// the fact.
 pub(crate) const FEEDBACK_TASK: &str = "feedback";
+
+/// A git root on a particular machine. The machine is part of the key because
+/// identical path strings on two hosts name independent repositories.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct GitMaintenanceRoot {
+    root: PathBuf,
+    machine: Option<String>,
+}
+
+/// Per-root guards shared by review git operations and periodic maintenance.
+/// Entries intentionally live for the daemon lifetime: a root is a durable
+/// guardian configuration, and retaining its small coordination primitive
+/// avoids an ABA race from removing it while another thread is acquiring it.
+static GIT_MAINTENANCE_LOCKS: LazyLock<Mutex<HashMap<GitMaintenanceRoot, &'static RwLock<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn git_maintenance_lock(root: &Path, machine: Option<&str>) -> &'static RwLock<()> {
+    let key = GitMaintenanceRoot {
+        root: root.to_path_buf(),
+        machine: machine.map(str::to_string),
+    };
+    let mut locks = GIT_MAINTENANCE_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| Box::leak(Box::new(RwLock::new(()))))
+}
+
+/// Hold a shared guard for a review operation's git chain. Maintenance takes
+/// the exclusive side, so it cannot repack while a review is rebasing.
+fn git_review_operation_guard(root: &Path, machine: Option<&str>) -> RwLockReadGuard<'static, ()> {
+    git_maintenance_lock(root, machine)
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquire the exclusive maintenance guard without delaying a review. A busy
+/// root is retried on the next daily sweep rather than making a user-initiated
+/// merge wait behind a potentially multi-minute repack.
+fn try_git_maintenance_guard(
+    root: &Path,
+    machine: Option<&str>,
+) -> Option<RwLockWriteGuard<'static, ()>> {
+    git_maintenance_lock(root, machine).try_write().ok()
+}
 
 /// The static authored system prompt the conflict-resolution fix pass feeds
 /// its resolver agent (RAL-102) -- hoisted to a module constant (RAL-428) so
@@ -2849,6 +2895,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     set_status: &F,
     cancel: &CancelToken,
 ) {
+    let _git_operation = git_review_operation_guard(root.root(), root.machine());
     // Queue this restack and try to claim it immediately -- claiming only
     // succeeds once every branch's worktree lease is free (see the
     // `worktree lease` glossary entry), so a restack can never rebase a
@@ -4217,6 +4264,8 @@ pub fn run_merge_staged(
         }
         return;
     }
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         let _ = store.lock().set_guardian_status(id, s, detail);
     };
@@ -4861,6 +4910,8 @@ pub fn run_merge_cancellable(
         Ok(g) => g,
         Err(_) => return,
     };
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     // RAL-193: every call is its own merge/rebase attempt -- bump the
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
@@ -5898,6 +5949,8 @@ pub fn run_feedback(
             return FeedbackOutcome::default();
         }
     };
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let base = guardian.base_branch.clone();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         fail_message();
@@ -8829,20 +8882,22 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
     let busy = busy_git_maintenance_roots(&guardians);
     for (root, machine) in collect_git_maintenance_roots(&guardians) {
         if busy.contains(&(root.clone(), machine.clone())) {
-            let guard = store.lock();
-            crate::cartographer::Note::new("guardian")
-                .scope("guardian")
-                .level(crate::logging::LogLevel::DEBUG)
-                .emit(
-                    &guard,
-                    "git maintenance skipped: a merge is in progress",
-                    serde_json::json!({ "git_root": root, "machine": machine }),
-                );
+            log_git_maintenance_skipped(store, &root, machine.as_deref());
             continue;
         }
         let store = Arc::clone(store);
         let emit_store = Arc::clone(&store);
         std::thread::spawn(move || {
+            // The status snapshot above is useful for avoiding needless
+            // threads, but it cannot make a check-then-act guarantee: a
+            // review can claim this root immediately after it was read. The
+            // exclusive guard is that guarantee; every review rebase holds
+            // its shared side for the complete git-operation chain.
+            let Some(_maintenance_guard) = try_git_maintenance_guard(&root, machine.as_deref())
+            else {
+                log_git_maintenance_skipped(&emit_store, &root, machine.as_deref());
+                return;
+            };
             let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
             // The store lock is taken only to record the outcome below --
             // never held across the `git gc` call itself, which can run for
@@ -8874,6 +8929,22 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             }
         });
     }
+}
+
+fn log_git_maintenance_skipped(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    machine: Option<&str>,
+) {
+    let guard = store.lock();
+    crate::cartographer::Note::new("guardian")
+        .scope("guardian")
+        .level(crate::logging::LogLevel::DEBUG)
+        .emit(
+            &guard,
+            "git maintenance skipped: a review git operation is in progress",
+            serde_json::json!({ "git_root": root, "machine": machine }),
+        );
 }
 
 /// The `(git_root, machine, status)` fields [`collect_git_maintenance_roots`]
@@ -11199,6 +11270,21 @@ mod tests {
         assert_eq!(
             busy,
             HashSet::from([(PathBuf::from("/repo/a"), Some("build-farm-1".to_string()))])
+        );
+    }
+
+    #[test]
+    fn git_maintenance_guard_excludes_a_review_git_operation() {
+        let root = Path::new("/maintenance-lock-test");
+        let review = git_review_operation_guard(root, None);
+        assert!(
+            try_git_maintenance_guard(root, None).is_none(),
+            "maintenance must skip rather than race a review git operation"
+        );
+        drop(review);
+        assert!(
+            try_git_maintenance_guard(root, None).is_some(),
+            "maintenance can run once the review operation finishes"
         );
     }
 
