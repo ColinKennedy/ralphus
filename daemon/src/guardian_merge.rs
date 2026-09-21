@@ -8799,6 +8799,19 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
 /// (repacking, reachability across every worktree's HEAD), and the scheduler
 /// loop's own tick must not stall behind it -- the exact same reasoning
 /// [`poll_base_branch_freshness_once`] already applies to its own fetches.
+///
+/// Deliberately **not** also called once at daemon startup the way
+/// `retire_stale_worktrees` is (`scheduler.rs`'s startup sequence). Startup is
+/// exactly when `recover_interrupted_reviews`/`start_reviews` are about to
+/// promote a `collecting` guardian to `merging` from a background thread that
+/// only flips the DB status once it actually wins the claim -- there is no
+/// synchronization point before the main loop where [`busy_git_maintenance_roots`]
+/// checking "is anything merging right now" is actually a meaningful answer,
+/// since the guardian that is about to start merging still reads as
+/// `collecting` up until the moment its own thread claims it. Confining this
+/// to the ordinary daily-interval tick, well after that startup recovery
+/// stampede has settled, is what actually reduces the collision risk;
+/// running it eagerly at startup would reliably raise it instead.
 pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
     let guardians: Vec<GuardianRootInfo> = {
         let guard = store.lock();

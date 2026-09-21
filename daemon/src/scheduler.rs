@@ -464,12 +464,17 @@ pub fn run_loop(
     // waiting a day for the first interval to elapse.
     crate::guardian_merge::retire_stale_worktrees(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
-    // Same daily cadence as the retirement sweep just above -- a repo this
-    // daemon manages otherwise never gets its accumulated loose objects
-    // packed, and every git fetch (including the "Merge / rebase" button's
-    // own preflight) pays for that pile on its "have" negotiation walk. See
-    // `guardian_merge::run_periodic_git_maintenance`.
-    crate::guardian_merge::run_periodic_git_maintenance(&store);
+    // Same daily cadence as the retirement sweep just above, but deliberately
+    // NOT also run once here at startup the way that sweep is: startup is
+    // exactly when `recover_interrupted_reviews`/`start_reviews` below are
+    // about to promote `collecting` guardians to `merging` on a background
+    // thread that flips the DB status only once it actually claims the merge
+    // -- there is no point before the main loop where "nothing is about to
+    // start merging" is actually true. Running it here raced exactly that on
+    // ralphus's own dev repo. The first pass instead happens on this timer's
+    // normal interval, once the startup recovery stampede has long settled.
+    // See `guardian_merge::run_periodic_git_maintenance` and
+    // `guardian_merge::busy_git_maintenance_roots`.
     let mut last_git_maintenance = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
     // Run once at startup too, so a freshly (re)started daemon doesn't wait a
