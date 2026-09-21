@@ -1,5 +1,6 @@
 //! RAL-445: the `prepare-commit-msg` hook that force-adds
-//! `Co-authored-by: Ralphus <ralphus-bot@github.com>` to commits made in a
+//! `Co-authored-by: ralphus-bot <ralphus-bot@users.noreply.github.com>` to
+//! commits made in a
 //! Ralphus-managed project, plus the per-project switch
 //! (`[commits] add_coauthor` in `.ralphus.toml`, see `crate::config::CommitConfig`)
 //! that lets a project opt out.
@@ -57,7 +58,7 @@ fn hook_script() -> String {
 }
 
 /// The exact trailer value every enabled project's commits receive.
-pub const COAUTHOR_TRAILER: &str = "Ralphus <ralphus-bot@github.com>";
+pub const COAUTHOR_TRAILER: &str = "ralphus-bot <ralphus-bot@users.noreply.github.com>";
 
 /// Resolve the effective git hooks directory for the repository containing
 /// `root` -- `git rev-parse --git-path hooks`, which honors a configured

@@ -1386,7 +1386,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       async function pollPrefs() {
         try {
-          await pollWatches();
+          await Promise.all([pollWatches(), pollPreferenceForks(), pollProjects()]);
           await pollMailboxHistory();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
@@ -1425,6 +1425,74 @@ Work submitted against it will fail — fix the machine or deregister the provid
           hiddenError = "daemon unreachable";
         }
         renderPrefs();
+      }
+      /**
+       * Loads the exact per-project fork mappings for the user whose
+       * Preferences page is open. Legacy project-wide fallback rows never
+       * apply to this personal UI.
+       * @returns {Promise<void>}
+       */
+      async function pollPreferenceForks() {
+        const user = prefsUserName();
+        if (!user) { preferenceForks = []; return; }
+        try {
+          const r = await fetch("/api/project-forks");
+          if (!r.ok) { preferenceForksError = await responseError(r, "could not load forks"); return; }
+          const d = await r.json();
+          preferenceForks = (d.forks || []).filter((/** @type {ForkRecord} */ f) => f.user === user);
+          preferenceForksError = "";
+        } catch (_) { preferenceForksError = "daemon unreachable"; }
+      }
+      /**
+       * Saves this Preferences page's new personal project-to-fork mapping.
+       * @returns {Promise<void>}
+       */
+      async function addPreferenceFork() {
+        const user = prefsUserName();
+        const draft = preferenceForkDraft;
+        if (!user || !draft.project || !draft.fork_url.trim()) {
+          preferenceForksError = "Choose a project and enter its fork clone URL.";
+          renderPrefs();
+          return;
+        }
+        /** @type {{user: string, fork_url: string, remote_name?: string, fork_owner?: string}} */
+        const body = { user, fork_url: draft.fork_url.trim() };
+        if (draft.remote_name.trim()) body.remote_name = draft.remote_name.trim();
+        if (draft.fork_owner.trim()) body.fork_owner = draft.fork_owner.trim();
+        try {
+          const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/forks`, {
+            method: "POST", headers: { ...prefsUserHeaders(), "Content-Type": "application/json" }, body: JSON.stringify(body),
+          });
+          if (!r.ok) { preferenceForksError = await responseError(r, "save failed"); renderPrefs(); return; }
+          preferenceForkDraft = { project: "", fork_url: "", remote_name: "", fork_owner: "" };
+          await pollPreferenceForks();
+        } catch (_) { preferenceForksError = "daemon unreachable"; }
+        renderPrefs();
+      }
+      /**
+       * Removes one personal project-to-fork mapping.
+       * @param {string} project
+       * @returns {Promise<void>}
+       */
+      async function removePreferenceFork(project) {
+        const user = prefsUserName();
+        if (!user || !project || !confirm(`Remove your fork mapping for "${project}"? This cannot be undone.`)) return;
+        try {
+          const r = await fetch(`/api/projects/${encodeURIComponent(project)}/forks/${encodeURIComponent(user)}`, { method: "DELETE", headers: prefsUserHeaders() });
+          preferenceForksError = r.ok ? "" : await responseError(r, "remove failed");
+          if (r.ok) await pollPreferenceForks();
+        } catch (_) { preferenceForksError = "daemon unreachable"; }
+        renderPrefs();
+      }
+      /**
+       * Renders the personal project-to-fork mapping table in Preferences.
+       * @returns {void}
+       */
+      function renderPreferenceForks() {
+        const rows = preferenceForks.slice().sort((a, b) => a.project.localeCompare(b.project)).map((f) => `<tr><td>${esc(f.project)}</td><td class="mono">${esc(f.fork_url)}</td><td class="mono">${esc(f.remote_name)}</td><td><button class="btn" data-click="removePreferenceFork" data-project="${esc(f.project)}" data-tip="Remove this user's fork mapping for ${esc(f.project)}. This cannot be undone.">Remove</button></td></tr>`).join("");
+        const d = preferenceForkDraft;
+        const choices = projects.map((p) => `<option value="${esc(p.name)}" ${d.project === p.name ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+        byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><input type="text" value="${esc(d.fork_url)}" oninput="preferenceForkDraft.fork_url=this.value" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project."/><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
       }
       /**
        * Updates the Preferences tab's free-text hidden-item filter and re-renders.
@@ -1492,6 +1560,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       function renderPrefs() {
         renderMailboxHistory();
+        renderPreferenceForks();
         const banner = byId("prefs-visit-banner");
         if (prefsViewingAs) {
           banner.style.display = "";

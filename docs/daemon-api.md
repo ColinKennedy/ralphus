@@ -609,6 +609,23 @@ the `git remote set-head` call itself fails (e.g. no `origin` remote, or
 `origin` was never fetched so it has no local remote-tracking branch to point
 at); `404` if no project is registered under that exact name.
 
+### Commit co-author attribution
+
+Ralphus adds a `Co-authored-by: ralphus-bot
+<ralphus-bot@users.noreply.github.com>` trailer to commits made in a managed
+git project by installing a managed `prepare-commit-msg` hook. Attribution is
+enabled by default. Disable it in the project's `.ralphus.toml` (or the
+global config layered below it):
+
+```toml
+[commits]
+add_coauthor = false
+```
+
+The per-project value wins over the global value. Ralphus creates, updates, or
+removes its managed hook the next time the project is registered or a
+worktree is materialized; it never overwrites a hook it did not install.
+
 ### `GET /api/agents`
 List the agents selectable for a project -- built-in backends plus whatever
 `.ralphus.toml` custom `[agent.profiles.*]` entries apply there (see the
@@ -2230,18 +2247,13 @@ guardian doesn't exist. `200`:
 
 ### Fork registration (RAL-338)
 
-A **fork** is the writable repository a project's review branches are pushed
-to when the acting user cannot push directly to the project's registered
-**parent**. Rows are keyed by `(project, user)`, with an empty `user`
-segment/field acting as the project-wide fallback row used when no
-user-specific row exists (`resolve_fork`: exact user match first, then the
-default row, then no fork at all). The `user` field is a lookup detail, not
-an authorization boundary — every mutation below is admin-gated the same way
-`POST /api/projects` is, but any admin can create/edit/remove any row,
-including one naming a user later deleted from the registry (rows
-deliberately do not cascade on user deletion, so a health check or the board
-can flag it rather than it silently vanishing). Ralphus only *registers* an
-existing fork; it never creates one through a forge API.
+A **fork** is the writable repository a project's worktree and review branches
+are pushed to for one submitting user. Rows are keyed by `(project, user)`;
+when that user has no row, ralphus uses the project's origin. A user may
+create, edit, or remove their own row, while an admin may manage any row.
+Rows deliberately do not cascade on user deletion, so a health check or the
+board can flag them rather than silently losing the history. Ralphus only
+*registers* an existing fork; it never creates one through a forge API.
 
 ```json
 {
@@ -2257,8 +2269,7 @@ existing fork; it never creates one through a forge API.
 
 `GET /api/project-forks` and `GET /api/projects/{name}/forks` return
 `{"forks": [...]}` of the shape above. `POST /api/projects/{name}/forks`
-registers or replaces a row; `user` defaults to `""` (the project-wide row)
-when omitted. `remote_name` defaults to `"fork"` for the default row, else
+registers or replaces a row. `remote_name` defaults to
 `"fork-<sanitized-user>"`. `fork_owner` (the GitHub owner/org login the fork
 lives under, used to build the `owner:branch` cross-repo PR head) is
 auto-derived from `fork_url` when omitted and the URL looks like a GitHub

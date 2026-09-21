@@ -1020,16 +1020,12 @@ pub fn terminal_modes_for(
     resolver_agent: Option<&str>,
     has_session_id: bool,
     has_worktree: bool,
-    conn: &Connection,
-    cwd: &Path,
+    default_agent: &str,
 ) -> Vec<&'static str> {
     if has_session_id {
         return vec!["readonly", "open"];
     }
-    let default_agent = Store::resolve_review_config_conn(conn, cwd)
-        .default_resolver_agent()
-        .to_string();
-    let agent = resolver_agent.unwrap_or(&default_agent);
+    let agent = resolver_agent.unwrap_or(default_agent);
     let is_cli_agent = matches!(agent, "claude-code" | "codex" | "codex-cli" | "pi");
     if is_cli_agent && has_worktree {
         return vec!["worktree"];
@@ -1092,6 +1088,27 @@ impl Store {
         )
     }
 
+    /// Resolve a review/worktree's owning user (RAL-476): the squad's own
+    /// recorded submitter first (explicit TOML `submitter`, or whoever's
+    /// request context it was inferred from at submit time), else this
+    /// project's configured default PR user, else the daemon's own
+    /// configured default user. `None` only when none of the three resolve
+    /// (no submitter, no project default, no daemon `default_user`
+    /// configured at all).
+    pub(crate) fn resolve_review_owner(
+        &self,
+        git_root: &str,
+        squad_id: Option<&str>,
+    ) -> Option<String> {
+        squad_id
+            .and_then(|sid| self.get_squad_submitter(sid).ok().flatten())
+            .or_else(|| {
+                self.project_review_settings_for_path(git_root)
+                    .default_pr_user
+            })
+            .or_else(|| crate::config::load_daemon_config().default_user)
+    }
+
     /// Like [`Store::create_guardian_for_squad`] but also stores a stable
     /// `review_key` (from a `ralphus:new-review/<key>` link id) so later
     /// submissions can find this guardian and append their branches to it.
@@ -1150,17 +1167,7 @@ impl Store {
             .or(separate_pr_branch_stamp)
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
-        // RAL-476: every review must resolve to exactly one owning user --
-        // the squad's own recorded submitter first (explicit TOML
-        // `submitter`, or whoever's request context it was inferred from at
-        // submit time), else this project's configured default PR user,
-        // else the daemon's own configured default user. `None` only when
-        // none of the three resolve (no submitter, no project default, no
-        // daemon default_user configured at all).
-        let owner = squad_id
-            .and_then(|sid| self.get_squad_submitter(sid).ok().flatten())
-            .or_else(|| db_settings.default_pr_user.clone())
-            .or_else(|| crate::config::load_daemon_config().default_user);
+        let owner = self.resolve_review_owner(git_root, squad_id);
         // RAL-476 (interview Q6): a project can require every review it hosts
         // to route through a registered fork -- reject the submission
         // outright with a clear reason instead of silently falling back to a
@@ -4233,6 +4240,18 @@ impl Store {
         row: GuardianRow,
         ctx: &GuardianHydrationCtx,
     ) -> Result<GuardianView> {
+        // GUARDIAN_PERF.local.md follow-up: `terminal_modes_for` only needs
+        // the default resolver agent, already resolved once per distinct
+        // `git_root` in `ctx` -- looked up here, once per guardian, instead
+        // of every branch re-triggering its own `resolve_review_config_conn`
+        // (a `projects` table scan plus a `.ralphus.toml` filesystem walk).
+        let default_agent = ctx
+            .config_by_git_root
+            .get(&row.git_root)
+            .map(|(project_review_config, _, _)| {
+                project_review_config.default_resolver_agent().to_string()
+            })
+            .unwrap_or_default();
         // RAL-121: one correlated subquery per branch (finding that branch's
         // most-recent cell by rowid) instead of the previous four -- each of
         // state/squad_id/task_idx/idx was a separate subquery re-scanning
@@ -4276,8 +4295,7 @@ impl Store {
                     row.resolver_agent.as_deref(),
                     resolver_agent_session_id.is_some(),
                     worktree.is_some(),
-                    conn,
-                    Path::new(&row.git_root),
+                    &default_agent,
                 );
                 Ok(BranchView {
                     id: r.get(18)?,
@@ -5094,23 +5112,21 @@ mod tests {
     fn terminal_modes_with_session_id_are_always_readonly_and_open() {
         // A resolver cell id makes both modes available regardless of agent
         // or worktree presence.
-        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(None, true, false, &store.conn, Path::new(".")),
+            terminal_modes_for(None, true, false, "ollama"),
             vec!["readonly", "open"]
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), true, true, &store.conn, Path::new(".")),
+            terminal_modes_for(Some("ollama"), true, true, "ollama"),
             vec!["readonly", "open"]
         );
     }
 
     #[test]
     fn terminal_modes_cli_agent_with_worktree_offers_worktree_only() {
-        let store = Store::open_in_memory().unwrap();
         for agent in ["claude-code", "codex", "codex-cli", "pi"] {
             assert_eq!(
-                terminal_modes_for(Some(agent), false, true, &store.conn, Path::new(".")),
+                terminal_modes_for(Some(agent), false, true, "ollama"),
                 vec!["worktree"]
             );
         }
@@ -5118,23 +5134,16 @@ mod tests {
 
     #[test]
     fn terminal_modes_none_available_without_cell_or_worktree() {
-        let store = Store::open_in_memory().unwrap();
         assert_eq!(
-            terminal_modes_for(
-                Some("claude-code"),
-                false,
-                false,
-                &store.conn,
-                Path::new(".")
-            ),
+            terminal_modes_for(Some("claude-code"), false, false, "ollama"),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(Some("ollama"), false, true, &store.conn, Path::new(".")),
+            terminal_modes_for(Some("ollama"), false, true, "ollama"),
             Vec::<&str>::new()
         );
         assert_eq!(
-            terminal_modes_for(None, false, false, &store.conn, Path::new(".")),
+            terminal_modes_for(None, false, false, "ollama"),
             Vec::<&str>::new()
         );
     }

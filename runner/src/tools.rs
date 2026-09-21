@@ -167,9 +167,7 @@ impl Workspace {
 
 #[cfg(target_os = "windows")]
 fn shell_command(command: &str) -> Command {
-    let mut c = Command::new("cmd");
-    c.arg("/C").arg(command);
-    c
+    crate::shellcmd::cmd_raw_shell_command(command)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -317,6 +315,28 @@ mod tests {
         let out = ws.run_bash("exit 3", None).unwrap();
         assert_eq!(out.exit_code, 3);
         assert!(!out.ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_bash_preserves_quotes_for_cmd_commands() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-runner-test-cmd-quote-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::create(&dir).unwrap();
+
+        let out = ws
+            .run_bash("echo hello > \"file with spaces.txt\"", None)
+            .unwrap();
+
+        assert!(out.ok(), "command failed: {}", out.stderr);
+        assert_eq!(
+            ws.read_file("file with spaces.txt").unwrap().trim(),
+            "hello"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

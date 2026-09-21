@@ -71,6 +71,12 @@
       let projectForksEditUser = null;
       /** @type {{fork_url?: string, remote_name?: string, fork_owner?: string}} draft for the fork row being edited. */
       let projectForksEditDraft = {};
+      /** @type {ForkRecord[]} fork rows belonging to the user whose Preferences page is open. */
+      let preferenceForks = [];
+      /** Error from the Preferences page's personal-fork controls. */
+      let preferenceForksError = "";
+      /** Draft row for adding a personal fork mapping. */
+      let preferenceForkDraft = { project: "", fork_url: "", remote_name: "", fork_owner: "" };
       /** @type {ProjectView[]} */
       let projects = [];
       /** @type {string[]} registered project names (RAL-345) -- the live, non-admin source for the Tasks/Squads project-filter dropdowns, refreshed from `GET /api/projects` on every poll of those tabs (reads are open to every caller, RAL-332; only mutations are admin-gated). Empty until the first such poll lands -- never a stale snapshot. */

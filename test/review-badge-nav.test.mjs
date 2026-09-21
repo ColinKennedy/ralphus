@@ -16,7 +16,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boardSource, makeBadgeRenderer, makeGotoReview, makePollReviews, resolveJson } from "./board-review-badge-nav.mjs";
+import { boardSource, makeBadgeRenderer, makeGotoReview, makePollReviews, makeRefreshBanner, resolveJson } from "./board-review-badge-nav.mjs";
 
 // ---------- badge lane markup (sliced real source) ----------
 
@@ -290,6 +290,21 @@ test("a completed poll stamps the freshness indicator", async () => {
   resolveJson(poll.pendingFetches[0], [{ id: "review-a", name: "a", status: "in_review" }]);
   await promise;
   assert.equal(poll.calls.markUpdated, 1);
+});
+
+test("a ready-banner fetch that finishes after entering Reviews cannot erase loaded review detail", async () => {
+  const loaded = [{ id: "review-a", name: "A", status: "in_review", branches: [{ branch: "feature" }] }];
+  const banner = makeRefreshBanner({ initialTab: "tasks", initialGuardians: loaded });
+  const promise = banner.refreshBanner();
+
+  assert.equal(banner.pendingFetches.length, 1, "the off-tab banner refresh fetches the lean index");
+  banner.setTab("reviews");
+  const lean = [{ id: "review-a", name: "A", status: "in_review", branch_count: 1 }];
+  resolveJson(banner.pendingFetches[0], lean);
+  await promise;
+
+  assert.deepEqual(banner.state().guardians, loaded, "the full review cache remains intact");
+  assert.deepEqual(banner.renders, [lean], "the banner still renders from its fetched lean snapshot");
 });
 
 test("a poll abandoned by a newer one (RAL-382 guard) never stamps a time it did not render", async () => {

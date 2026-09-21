@@ -773,7 +773,8 @@ pub fn load_monorepo_config(start: &Path) -> MonorepoConfig {
 
 /// Commit-trailer configuration (`[commits]` table, RAL-445): whether a
 /// Ralphus-managed project's commits automatically receive the
-/// `Co-authored-by: Ralphus <ralphus-bot@github.com>` trailer, injected by
+/// `Co-authored-by: ralphus-bot <ralphus-bot@users.noreply.github.com>`
+/// trailer, injected by
 /// the `prepare-commit-msg` hook `crate::git_hooks::sync_coauthor_hook`
 /// installs. `None` means unset (so a lower layer can supply it); resolved
 /// callers use [`add_coauthor`](Self::add_coauthor), which falls back to

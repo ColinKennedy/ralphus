@@ -205,8 +205,17 @@ test("the trigger is a real <button> with aria-haspopup/aria-controls wired to t
   const { statusDropdownTriggerHtml, config, statusDropdownMenuId } = makeStatusDropdown();
   const html = statusDropdownTriggerHtml(config);
   assert.match(html, /<button /);
+  assert.match(html, /data-tip="Filter by Status\. Opens a menu of every status/);
   assert.match(html, /aria-haspopup="true"/);
   assert.match(html, new RegExp(`aria-controls="${statusDropdownMenuId(config.id)}"`));
+});
+
+test("multi-mode gives every status option its own tooltip", () => {
+  const { statusDropdownMultiRowsHtml, config } = makeStatusDropdown();
+  const html = statusDropdownMultiRowsHtml(config);
+  for (const option of config.options) {
+    assert.match(html, new RegExp(`data-tip="Show or hide ${option.label} entries\\."`));
+  }
 });
 
 test("multi-mode rows use native checkboxes exposing checked state", () => {

@@ -178,6 +178,10 @@ Only pick a `claude-code`/`codex`/`pi`/`raw` agent if the corresponding CLI is
 actually installed; `claude`/`anthropic`/`ollama` never need anything
 installed beyond network access to the model.
 
+**`pi` 0.85.1 or later is the recommended version.** Check your installed
+version with `pi --version` and upgrade via whatever channel you installed
+it from (e.g. `npm install -g @pi/cli`).
+
 On Windows, the Pi backend supports local worktree paths, including paths in
 the `\\?\C:\...` extended-length form. It does not support a worktree hosted
 on a genuine UNC share (`\\server\share\...` or `\\?\UNC\server\share\...`):

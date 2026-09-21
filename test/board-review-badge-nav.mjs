@@ -53,8 +53,9 @@ function constSourceOf(name) {
  * forward from the opening brace counting depth instead of stopping at the
  * first `}`. */
 function funcSourceOf(name) {
-  const start = boardSource.indexOf(`function ${name}(`);
+  let start = boardSource.indexOf(`function ${name}(`);
   if (start === -1) throw new Error(`board-review-badge-nav: could not find the ${name} definition in the board source.`);
+  if (boardSource.slice(start - 6, start) === "async ") start -= 6;
   const bodyStart = boardSource.indexOf("{", start);
   let depth = 0;
   for (let i = bodyStart; i < boardSource.length; i++) {
@@ -164,6 +165,35 @@ export function makePollReviews({ selectionWithin = () => false, pendingHash = n
   const callState = () => api.state();
   const api = factory(deps, fetchImpl);
   return { ...api, calls, pendingFetches };
+}
+
+/**
+ * Builds the real `refreshBanner` with a controllable index fetch so tests can
+ * reproduce a request that starts outside Reviews and completes after entry.
+ */
+export function makeRefreshBanner({ initialTab = "squads", initialGuardians = [] } = {}) {
+  const renders = [];
+  const pendingFetches = [];
+  const fetchImpl = (url) => new Promise((resolve, reject) => { pendingFetches.push({ url, resolve, reject }); });
+  // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
+  const factory = new Function(
+    "deps",
+    "fetchImpl",
+    `const { renderReadyBanner, userIsSelecting } = deps;
+     const fetch = fetchImpl;
+     var tab = ${JSON.stringify(initialTab)}, guardians = ${JSON.stringify(initialGuardians)};
+     ${funcSourceOf("refreshBanner")}
+     return {
+       refreshBanner,
+       setTab: (next) => { tab = next; },
+       state: () => ({ tab, guardians }),
+     };`,
+  );
+  const api = factory({
+    renderReadyBanner: (items) => { renders.push(items); },
+    userIsSelecting: () => false,
+  }, fetchImpl);
+  return { ...api, renders, pendingFetches };
 }
 
 /** Resolves one queued fetch with a JSON payload. */

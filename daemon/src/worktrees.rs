@@ -681,8 +681,12 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// ([`ensure_worktree_with_existing`]) instead freezes the marker to a
 /// resolved commit SHA, once, *after* this function returns and the branch
 /// has been resynced -- see [`crate::reviews::set_worktree_commit_baseline`].
-/// Guards every `git config` WRITE this module makes to a worktree's branch
-/// tracking (`set_explicit_upstream` and `freeze_commit_baseline`, below).
+/// Guards every `git config` WRITE this module makes to the shared
+/// `.git/config` (`set_explicit_upstream` and `freeze_commit_baseline`'s
+/// branch-tracking writes, plus `apply_worktree_git_identity_best_effort`'s
+/// one-time `extensions.worktreeConfig` enable -- its two per-worktree
+/// `--worktree user.name`/`user.email` writes land in that worktree's own
+/// private `config.worktree` file instead, so they need no such guard).
 /// A worktree's `.git/config` is the SAME physical file shared by every
 /// other worktree of the same project (worktrees each get their own
 /// index/HEAD, but not their own config) -- two `git config <key> <value>`
@@ -699,8 +703,8 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
 /// can write to `.git/config` -- including `git worktree add`'s own implicit
 /// tracking-setup side effect for a newly created branch -- must be covered:
 /// `execute_worktree_plan` passes `--no-track` to every `worktree add -b`
-/// call for exactly this reason, so the *only* config writes are the two
-/// explicit, lock-guarded ones here.
+/// call for exactly this reason, so the *only* shared-`.git/config` writes
+/// are the explicit, lock-guarded ones here.
 static WORKTREE_CONFIG_LOCK: LazyLock<parking_lot::Mutex<()>> =
     LazyLock::new(|| parking_lot::Mutex::new(()));
 
@@ -915,6 +919,57 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
             WARNING,
             "ralphus [worktrees] could not sync co-author hook for {}: {e}",
             root.display()
+        );
+    }
+}
+
+/// Apply a fork's registered git identity override (RAL-338 follow-up) to
+/// one worktree via `git config --worktree`, so commits made there are
+/// authored as the fork's registered `git_user_name`/`git_user_email`
+/// rather than whatever the shared checkout's own git config resolves to.
+/// A no-op if `identity` sets neither field.
+///
+/// Requires `extensions.worktreeConfig` enabled on the shared `.git/config`
+/// -- turned on here, idempotently, under `WORKTREE_CONFIG_LOCK` since
+/// (unlike the `--worktree`-scoped writes below, each private to their own
+/// worktree's `config.worktree`) that setting lives in the one
+/// `.git/config` every sibling worktree shares. `worktree_dir` alone is
+/// enough to reach it -- git resolves a linked worktree's shared config
+/// correctly no matter which worktree the command runs from, exactly like
+/// [`set_explicit_upstream`] already relies on.
+///
+/// Best-effort: failure is logged and swallowed, exactly like
+/// [`sync_coauthor_hook_best_effort`] -- a failed identity write must never
+/// block a squad's actual work.
+fn apply_worktree_git_identity_best_effort(
+    worktree_dir: &Path,
+    identity: &crate::project_forks::GitIdentity,
+) {
+    if identity.name.is_none() && identity.email.is_none() {
+        return;
+    }
+    let result = (|| -> Result<(), String> {
+        {
+            let _guard = WORKTREE_CONFIG_LOCK.lock();
+            git(
+                worktree_dir,
+                &["config", "extensions.worktreeConfig", "true"],
+            )?;
+        }
+        if let Some(name) = &identity.name {
+            git(worktree_dir, &["config", "--worktree", "user.name", name])?;
+        }
+        if let Some(email) = &identity.email {
+            git(worktree_dir, &["config", "--worktree", "user.email", email])?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
+        crate::rlog!(
+            WARNING,
+            "ralphus [worktrees] could not apply fork git identity for {}: {e}",
+            worktree_dir.display()
         );
     }
 }
@@ -1252,14 +1307,26 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 // what a live re-query would show it, since this is the only
                 // thing that could have changed the on-disk state since the
                 // snapshot was taken.
-                ctx.on_disk_worktrees
-                    .borrow_mut()
-                    .get_mut(&root_key)
-                    .expect("populated above")
-                    .insert(
-                        crate::short_paths::short_name(branch).to_string(),
-                        branch.to_string(),
-                    );
+                //
+                // Keyed by the *actual* directory basename `materialized`
+                // resolved to (e.g. "hello-world-7"), never
+                // `short_paths::short_name(branch)` directly -- that raw
+                // short name is only the undisambiguated base
+                // `resolve_task_worktree_dir_with_existing` starts probing
+                // from, so two distinct branches sharing a short-name prefix
+                // (any two names that agree on the first ~12 chars) would
+                // otherwise overwrite the same base-name cache entry,
+                // hiding this branch's real `-N` slot from the next cell's
+                // lookup and letting it walk straight past the
+                // just-created directory into reusing it for a different
+                // branch.
+                if let Some(short) = materialized.file_name().and_then(|n| n.to_str()) {
+                    ctx.on_disk_worktrees
+                        .borrow_mut()
+                        .get_mut(&root_key)
+                        .expect("populated above")
+                        .insert(short.to_string(), branch.to_string());
+                }
                 materialized.to_string_lossy().into_owned()
             }
         };
@@ -1808,6 +1875,55 @@ pub fn resolve_placeholders(
     resolve_placeholders_with_prefetch(store, squad_id, cells, tasks, &HashMap::new(), parent)
 }
 
+/// Makes a newly materialized task worktree writable through its submitting
+/// user's registered fork. The worktree was already created from the declared
+/// upstream, which remains the source of its initial contents; this selects
+/// where subsequent cell and proof commits are published, and (RAL-338
+/// follow-up) who they're authored as -- applying the fork's registered
+/// `git_user_name`/`git_user_email`, if either is set, via `git config
+/// --worktree`.
+fn route_worktree_to_submitter_fork(
+    store: &Store,
+    squad_id: &str,
+    project_name: &str,
+    worktree: &Path,
+) -> Result<(), String> {
+    let Some(submitter) = store
+        .get_squad_submitter(squad_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    // A fork is personal: no row for this submitter means direct-origin
+    // behavior. Do not silently use the legacy project-wide default row.
+    let Some(fork) = store
+        .get_project_fork(project_name, &submitter)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    crate::project_forks::ensure_fork_remote(worktree, &fork.remote_name, &fork.fork_url).map_err(
+        |e| format!("could not configure fork remote for project {project_name:?}: {e}"),
+    )?;
+    apply_worktree_git_identity_best_effort(
+        worktree,
+        &crate::project_forks::GitIdentity {
+            name: fork.git_user_name.clone(),
+            email: fork.git_user_email.clone(),
+        },
+    );
+    let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
+    let branch = branch.trim();
+    git(worktree, &["push", "--set-upstream", &fork.remote_name, branch]).map_err(|e| {
+        format!(
+            "could not publish worktree branch {branch:?} to fork {:?} for submitter {submitter:?}: {e}",
+            fork.remote_name
+        )
+    })?;
+    Ok(())
+}
+
 /// Like [`resolve_placeholders`], but `prefetched_upstreams` supplies
 /// `(registered project name, bare upstream) -> "<remote>/<branch>"` results
 /// the caller already fetched -- see
@@ -2276,6 +2392,7 @@ fn resolve_placeholders_inner(
         store
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
+        route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
         crate::rlog!(
             INFO,
             "ralphus [scheduler] cell {squad_id}/{} cwd placeholder \"{cwd}\" resolved to {resolved}",
@@ -2352,6 +2469,24 @@ mod tests {
         std::fs::write(repo.join("base.txt"), "base\n").unwrap();
         git2_commit_all(&r, &git2::Signature::now("t", "t@t").unwrap(), "base", &[]);
         repo
+    }
+
+    fn init_bare_fork(repo: &Path, tag: &str) -> PathBuf {
+        let fork = repo.with_file_name(format!(
+            "{}-{tag}.git",
+            repo.file_name().expect("repo name").to_string_lossy()
+        ));
+        let status = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                repo.to_str().expect("repo path"),
+                fork.to_str().expect("fork path"),
+            ])
+            .status()
+            .expect("clone bare fork");
+        assert!(status.success(), "could not create bare fork");
+        fork
     }
 
     fn init_repo_with_remote_branch(tag: &str, branch: &str) -> (PathBuf, String) {
@@ -2495,6 +2630,120 @@ mod tests {
                 .unwrap()
                 .trim(),
             "feature-x"
+        );
+    }
+
+    #[test]
+    fn submitter_fork_is_the_worktree_branch_upstream() {
+        let repo = init_repo("submitter-fork");
+        let fork = init_bare_fork(&repo, "alice-fork");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork", "proj", &wt).unwrap();
+
+        assert_eq!(
+            git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            )
+            .unwrap()
+            .trim(),
+            "fork-alice/feature"
+        );
+        assert!(
+            git(&fork, &["show-ref", "--verify", "refs/heads/feature"]).is_ok(),
+            "the execution branch must be published to the submitter's fork"
+        );
+    }
+
+    #[test]
+    fn submitter_forks_registered_git_identity_is_applied_to_the_worktree() {
+        let repo = init_repo("submitter-fork-identity");
+        let fork = init_bare_fork(&repo, "alice-fork-identity");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .upsert_project_fork_with_identity(
+                "proj",
+                "alice",
+                &fork.to_string_lossy(),
+                "fork-alice",
+                "",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-identity", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-identity", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-identity", "proj", &wt).unwrap();
+
+        assert_eq!(
+            git(&wt, &["config", "user.name"]).unwrap().trim(),
+            "Alice Example"
+        );
+        assert_eq!(
+            git(&wt, &["config", "user.email"]).unwrap().trim(),
+            "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn a_fork_with_no_registered_identity_leaves_the_worktrees_git_config_untouched() {
+        let repo = init_repo("submitter-fork-no-identity");
+        let fork = init_bare_fork(&repo, "bob-fork-no-identity");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("bob").unwrap();
+        store
+            .upsert_project_fork("proj", "bob", &fork.to_string_lossy(), "fork-bob", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='bob'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-no-identity", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-no-identity", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-no-identity", "proj", &wt).unwrap();
+
+        assert!(
+            git(&wt, &["config", "extensions.worktreeConfig"]).is_err(),
+            "no identity fields set on the fork means nothing about this worktree's git config \
+             should be touched at all"
         );
     }
 
@@ -3665,6 +3914,79 @@ mod tests {
                 .trim(),
             "test-pr-submission-b"
         );
+    }
+
+    #[test]
+    fn resolve_placeholders_disambiguates_three_tasks_whose_branches_share_a_short_name() {
+        // Regression: with only two colliding branches, the first happens to
+        // land in the bare, undisambiguated directory (no `-2` suffix
+        // needed yet), so `GitProjectStartupAdapter::resolve_placeholder`
+        // recording it back into `on_disk_worktrees` under the raw
+        // `short_name(branch)` key -- instead of the actual directory
+        // `ensure_worktree_with_existing` returned -- happens to be correct
+        // by coincidence. The third colliding branch exposes it: the
+        // second branch's real `-2` directory was never recorded under its
+        // own key, so the third cell's lookup walks straight past it,
+        // thinks it's free, and reuses the second branch's already
+        // materialized worktree instead of creating its own.
+        let repo = init_repo("three-task-collide");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+            ),
+            cell_row(
+                1,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+            ),
+            cell_row(
+                2,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-c?upstream=main"),
+            ),
+        ];
+        let tasks = vec![
+            task_row(0, Some("ralphus")),
+            task_row(1, Some("ralphus")),
+            task_row(2, Some("ralphus")),
+        ];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize all three");
+
+        let resolved: Vec<String> = cells
+            .iter()
+            .map(|c| c.cwd.clone().expect("resolved"))
+            .collect();
+        assert_eq!(
+            resolved
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each task's branch must materialize its own worktree, got {resolved:?}"
+        );
+        for (cwd, branch) in resolved.iter().zip([
+            "test-pr-submission-a",
+            "test-pr-submission-b",
+            "test-pr-submission-c",
+        ]) {
+            assert_eq!(
+                git(Path::new(cwd), &["symbolic-ref", "--short", "HEAD"])
+                    .unwrap()
+                    .trim(),
+                branch,
+                "worktree {cwd} checked out the wrong branch"
+            );
+        }
     }
 
     #[test]

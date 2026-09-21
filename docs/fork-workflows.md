@@ -18,13 +18,11 @@ forge API. Create the fork yourself (the forge's own "Fork" button, or
 `gh repo fork`/`glab repo fork`), then register it:
 
 ```
-ralphus project fork add <project> --url <fork-clone-url> [--user <name>] [--remote-name <name>] [--owner <owner>]
+ralphus project fork add <project> --user <name> --url <fork-clone-url> [--remote-name <name>] [--owner <owner>]
 ```
 
-- Omit `--user` to register the **project-wide default row** (`user = ""`),
-  used whenever no user-specific row exists for whoever is submitting.
-- `--remote-name` defaults to `fork` for the default row, else
-  `fork-<user>`. It names the local git remote ralphus creates/updates
+- `--remote-name` defaults to `fork-<user>`. It names the local git remote
+  ralphus creates/updates
   automatically the first time it pushes through this fork — you don't need
   to run `git remote add` yourself.
 - `--owner` is the GitHub owner/org login the fork lives under, needed to
