@@ -2834,6 +2834,104 @@ mod tests {
     }
 
     #[test]
+    fn submitter_forks_https_url_wires_up_the_credential_helper() {
+        let repo = init_repo("submitter-fork-https-cred-helper");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .set_user_forge_token("alice", "127.0.0.1:1", "glpat-test-secret")
+            .unwrap();
+        // A URL that fails fast (connection refused, no DNS lookup) rather
+        // than hanging or depending on real network access. The `git push`
+        // this triggers is expected to fail; what this test actually
+        // verifies is the credential-helper git config wiring, which
+        // happens before that push and survives regardless of whether it
+        // succeeds.
+        store
+            .upsert_project_fork(
+                "proj",
+                "alice",
+                "https://127.0.0.1:1/owner/repo.git",
+                "fork-alice",
+                "",
+            )
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-https", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-https", "main").unwrap();
+
+        // The push itself is expected to fail (nothing listens on
+        // 127.0.0.1:1) -- this test only cares about the git config wiring
+        // that happens before it.
+        let _ = route_worktree_to_submitter_fork(&store, "squad-fork-https", "proj", &wt);
+
+        let worktree_id = git(&wt, &["config", "--get", "ralphus.worktree-id"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let grant = git(&wt, &["config", "--get", "ralphus.worktree-grant"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!worktree_id.is_empty());
+        assert!(!grant.is_empty());
+        assert_eq!(
+            git(&wt, &["config", "--get", "credential.helper"])
+                .unwrap()
+                .trim(),
+            "!ralphus internal fork-credential-helper"
+        );
+        assert_eq!(
+            store
+                .resolve_worktree_credential(&worktree_id, &grant)
+                .unwrap(),
+            Some("glpat-test-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn submitter_forks_non_http_url_does_not_wire_up_the_credential_helper() {
+        let repo = init_repo("submitter-fork-non-http-no-cred-helper");
+        let fork = init_bare_fork(&repo, "alice-fork-non-http");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .set_user_forge_token("alice", "gitlab.com", "glpat-should-be-unused")
+            .unwrap();
+        store
+            .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-non-http", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-non-http", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-non-http", "proj", &wt).unwrap();
+
+        assert!(
+            git(&wt, &["config", "--get", "ralphus.worktree-id"]).is_err(),
+            "a non-HTTP(S) fork remote (SSH, or a bare local path as used here) must never get \
+             the credential helper wired up -- git's credential-helper protocol only ever fires \
+             for HTTP(S) transport"
+        );
+    }
+
+    #[test]
     fn ensure_worktree_forks_new_branches_from_the_resolved_upstream_not_the_checkouts_current_head()
      {
         // RAL-<pending>: a fresh task branch materialized while the shared
