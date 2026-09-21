@@ -268,7 +268,7 @@
       }, true);
 
       const STATES = ["running","done","failed","pending","queued","cancelled","ignored"];
-      const GUARDIAN_STATES = ["collecting","merging","merge_failed","merge_stopped","in_review","approved","cancelled","deployed"];
+      const GUARDIAN_STATES = ["collecting","merging","merge_failed","merge_stopped","in_review","merged","cancelled","deployed"];
       const SQUAD_STATES = ["materializing","queued","pending","running","done","failed","cancelled","ignored"];
       const NODE_STATES = ["pending","running","done","failed","cancelled","ignored"];
       const IRREVERSIBLE_STATES = new Set(["done","failed","cancelled"]);

@@ -837,7 +837,7 @@
         return [...map.values()];
       }
       /** RAL-362 §3: review statuses in most-attention-wanting-first order, for picking which review a multi-review task's badge is tinted by. */
-      const TT_REVIEW_ATTENTION_RANK = ["merge_failed", "merge_stopped", "in_review", "collecting", "merging", "proof_pending", "conflict_resolved", "approved", "deployed", "cancelled"];
+      const TT_REVIEW_ATTENTION_RANK = ["merge_failed", "merge_stopped", "in_review", "collecting", "merging", "proof_pending", "conflict_resolved", "merged", "deployed", "cancelled"];
       /**
        * Picks the single most-attention-wanting review out of a task's own
        * review union, for the row's Review badge.
@@ -1043,7 +1043,7 @@
        * "needs me" consistent with how notify tiers read everywhere else.
        */
       /** @type {{[key: string]: string}} */
-      const TT_NEEDS_ME_TIER = { failed: "urgent", in_review: "high", approved_no_pr: "normal" };
+      const TT_NEEDS_ME_TIER = { failed: "urgent", in_review: "high", merged_no_pr: "normal" };
       /**
        * Whether an effectively-watched task's watch tiers permit a given
        * trigger to count toward "needs me" (RAL-362 §5).
@@ -1056,7 +1056,7 @@
       }
       /**
        * RAL-362 §5 "needs me" predicate: WATCHED and blocked on the user --
-       * failed, awaiting the user's review approval, or approved with no PR
+       * failed, awaiting the user's review approval, or merged with no PR
        * submitted. Unwatched work never nags, and PR-side signals (drift,
        * un-actioned feedback) are deliberately excluded (they need per-PR
        * network calls -- see Phase 5, offered on-demand instead).
@@ -1076,9 +1076,9 @@
         if (inReview && ttTierAllows(notifyTiers, "in_review")) {
           return { needs: true, reason: `Review "${inReview.name}" is in_review, awaiting your approval.` };
         }
-        const approved = reviews.find((r) => r.status === "approved");
-        if (approved && !prCount && ttTierAllows(notifyTiers, "approved_no_pr")) {
-          return { needs: true, reason: `Review "${approved.name}" is approved with no PR submitted yet.` };
+        const merged = reviews.find((r) => r.status === "merged");
+        if (merged && !prCount && ttTierAllows(notifyTiers, "merged_no_pr")) {
+          return { needs: true, reason: `Review "${merged.name}" is merged with no PR submitted yet.` };
         }
         return { needs: false, reason: null };
       }

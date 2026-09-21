@@ -40,7 +40,7 @@
        * @property {string} originalName
        * @property {string} baseBranch
        * @property {string} originalBaseBranch
-       * @property {boolean} resolverFrozen - True once the review is approved/deployed -- base/resolver are rejected server-side past that point.
+       * @property {boolean} resolverFrozen - True once the review is merged/deployed -- base/resolver are rejected server-side past that point.
        * @property {string} resolverAgent
        * @property {string} originalResolverAgent
        * @property {string} resolverModel
@@ -132,7 +132,7 @@
           originalName: g.name,
           baseBranch: g.base_branch || "",
           originalBaseBranch: g.base_branch || "",
-          resolverFrozen: ["approved", "deployed"].includes(g.status),
+          resolverFrozen: ["merged", "deployed"].includes(g.status),
           resolverAgent: g.resolver_agent || "",
           originalResolverAgent: g.resolver_agent || "",
           resolverModel: g.resolver_model || "",
@@ -437,7 +437,7 @@
        * different draft globals -- inline `onchange`/`oninput` attributes
        * need a literal function name, not a closure). `frozen` (review-only
        * -- a project default is never frozen) renders the resolved values
-       * read-only, same as an approved/deployed review's own resolver
+       * read-only, same as a merged/deployed review's own resolver
        * fields.
        * @param {string} cwd
        * @param {string} resolverAgent

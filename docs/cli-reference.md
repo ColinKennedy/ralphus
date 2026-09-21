@@ -296,7 +296,7 @@ the daemon's hourly Free-tier background sweep
 
 | Command | What |
 |---|---|
-| `review list [--status] [--pr-ready]` | List reviews (`--pr-ready`: only fully-rebased `in_review`/`approved` reviews with no failed branches — the candidates `review pr submit` cares about) |
+| `review list [--status] [--pr-ready]` | List reviews (`--pr-ready`: only fully-rebased `in_review`/`merged` reviews with no failed branches — the candidates `review pr submit` cares about) |
 | `review show <selector>` | Review detail, incl. `ready`/`merge_progress`/`summary_state` |
 | `review logs <selector>` | State-transition audit log |
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
@@ -304,7 +304,7 @@ the daemon's hourly Free-tier background sweep
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
-| `review reopen <selector>` | Reopen a cancelled or approved review, immediately staging in whatever branches are already ready |
+| `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
 | `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
@@ -765,7 +765,7 @@ use; see `READ_ONLY_NOTE`.
             - unlink selector [uri]  {Bulk-drop every currently open PR row for a review and clear its registered forge PR stack number, so a later submission starts a fresh stack instead of appending to one whose PRs were just unlinked (RAL-317).}
             - update pr_id [id] --branch-alias [name] --pr-number [integer] --pr-url [url] --state [open|merged|closed]  {Mutate the recorded PR mapping, e.g. after a PR is closed and reopened under a new number.}
         - rename selector [uri] name [str]  {Rename a review.}
-        - reopen selector [uri]  {Reopen a cancelled or approved review and immediately stage in whatever branches are already ready, without waiting for the rest.}
+        - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
         - settings selector [uri] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}

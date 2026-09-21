@@ -105,7 +105,7 @@ test("ttTaskReviews unions per-cell review refs into one entry per review id, co
   const task = {
     cells: [
       { reviews: [{ id: "g1", name: "R1", status: "in_review", branch: "b1", origin: "explicit" }] },
-      { reviews: [{ id: "g1", name: "R1", status: "approved", branch: "b2", origin: "explicit" }] },
+      { reviews: [{ id: "g1", name: "R1", status: "merged", branch: "b2", origin: "explicit" }] },
       { reviews: [{ id: "g2", name: "R2", status: "collecting", branch: "b1", origin: "arbiter" }] },
     ],
   };
@@ -114,12 +114,12 @@ test("ttTaskReviews unions per-cell review refs into one entry per review id, co
   const r1 = reviews.find((r) => r.id === "g1");
   assert.deepEqual(r1.branches, ["b1", "b2"]);
   // Last-seen cell wins for the union's status (mirrors the per-cell iteration order).
-  assert.equal(r1.status, "approved");
+  assert.equal(r1.status, "merged");
 });
 
 test("ttPickReviewBadge picks the most attention-needing review and counts every review on the task", () => {
   const reviews = [
-    { id: "g1", name: "R1", status: "approved", branches: ["b1"] },
+    { id: "g1", name: "R1", status: "merged", branches: ["b1"] },
     { id: "g2", name: "R2", status: "in_review", branches: ["b2"] },
   ];
   const badge = ttPickReviewBadge(reviews);
@@ -254,9 +254,9 @@ test("ttTaskNeedsMe fires for a watched task with a review in_review", () => {
   assert.match(r.reason, /in_review/);
 });
 
-test("ttTaskNeedsMe fires for an approved review with no PR, but not once a PR exists", () => {
+test("ttTaskNeedsMe fires for a merged review with no PR, but not once a PR exists", () => {
   const task = { state: "running" };
-  const reviews = [{ name: "R1", status: "approved" }];
+  const reviews = [{ name: "R1", status: "merged" }];
   assert.equal(ttTaskNeedsMe(task, { watched: true }, [], reviews, 0).needs, true);
   assert.equal(ttTaskNeedsMe(task, { watched: true }, [], reviews, 1).needs, false);
 });

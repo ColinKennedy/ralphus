@@ -12679,9 +12679,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Err(e) => return store_error(&e),
     };
 
-    // Guard: base/resolver are frozen once approved/deployed, same as
+    // Guard: base/resolver are frozen once merged/deployed, same as
     // guardian_change_base's existing check.
-    let frozen = matches!(guardian.status.as_str(), "approved" | "deployed");
+    let frozen = matches!(guardian.status.as_str(), "merged" | "deployed");
     if frozen
         && (req
             .base_branch
@@ -12693,7 +12693,7 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(
             409,
             "invalid_transition",
-            "cannot change base branch or resolver on an approved or deployed review",
+            "cannot change base branch or resolver on a merged or deployed review",
             vec![],
         );
     }
@@ -13652,7 +13652,7 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     }
 }
 
-/// Reopen a `cancelled` or `approved` review (status → `collecting`) and
+/// Reopen a `cancelled` or `merged` review (status → `collecting`) and
 /// immediately try a fresh merge pass if the daemon has capacity -- see
 /// [`crate::guardian_merge::reopen_guardian_merge`].
 fn guardian_reopen(daemon: &Daemon, id: &str) -> Reply {
@@ -14044,7 +14044,7 @@ struct ChangeBaseReply {
 }
 
 /// Change the base branch of a review and trigger a rebuild. Guards against
-/// `approved`/`deployed` status; all other states are permitted.
+/// `merged`/`deployed` status; all other states are permitted.
 fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<ChangeBaseBody>(body) else {
         return error(400, "bad_request", "body must be {branch}", vec![]);
@@ -14058,11 +14058,11 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
-    if matches!(guardian.status.as_str(), "approved" | "deployed") {
+    if matches!(guardian.status.as_str(), "merged" | "deployed") {
         return error(
             409,
             "invalid_transition",
-            "cannot change the base of an approved or deployed review",
+            "cannot change the base of a merged or deployed review",
             vec![],
         );
     }
@@ -14163,14 +14163,14 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
             },
         ),
         Ok(crate::guardian_merge::StartMergeOutcome::AlreadyMerged) => {
-            let approved_guardian = daemon.lock().get_guardian(id).unwrap_or(updated_guardian);
+            let merged_guardian = daemon.lock().get_guardian(id).unwrap_or(updated_guardian);
             json(
                 200,
                 &ChangeBaseReply {
-                    guardian: approved_guardian,
+                    guardian: merged_guardian,
                     base_change: ChangeBaseStatus {
-                        status: "approved".to_string(),
-                        message: "This review's work was already merged, so it was approved instead of rebased.".to_string(),
+                        status: "merged".to_string(),
+                        message: "This review's work was already merged, so it was marked merged instead of rebased.".to_string(),
                         action: None,
                     },
                 },
@@ -24940,11 +24940,11 @@ command=\"c\"
     }
 
     #[test]
-    fn guardian_details_frozen_fields_rejected_when_approved_but_others_still_apply() {
+    fn guardian_details_frozen_fields_rejected_when_merged_but_others_still_apply() {
         let d = daemon();
         let gid = make_guardian(&d);
         d.lock()
-            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Approved, None)
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merged, None)
             .unwrap();
 
         let frozen = serde_json::json!({"base_branch": "develop"}).to_string();
@@ -24965,7 +24965,7 @@ command=\"c\"
         );
         assert_eq!(r.status, 409, "{}", r.body);
 
-        // A non-frozen field on the same (approved) guardian still applies.
+        // A non-frozen field on the same (merged) guardian still applies.
         let allowed = serde_json::json!({"name": "still renamable"}).to_string();
         let r = route(
             &d,

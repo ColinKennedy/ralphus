@@ -123,12 +123,12 @@
 
       // ---------- reviews (list + detail, read-only for now) ----------
       /** @type {{[key: string]: string}} */
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", approved:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", merged:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
       // States in which a review may be cancelled — mirrors the backend's
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
       // "Cancel review" appears in the same states everywhere.
-      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "merge_stopped", "in_review", "approved"];
+      const G_CANCELLABLE = ["collecting", "merging", "merge_failed", "merge_stopped", "in_review", "merged"];
       /**
        * Renders a colored status dot for a guardian/branch/merge state.
        * @param {string} s
@@ -329,7 +329,7 @@
           ? `<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>`
           : g.status === "cancelled"
             ? `<div data-click="reopenReview" data-guardian-id="${esc(id)}" data-tip="Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.\nAny branch still waiting on its task keeps the review in collecting until it finishes.">↺ Reopen review</div>`
-            : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, merge_failed, in_review, or approved.">No actions available</div>`;
+            : `<div style="color:var(--muted);padding:6px 10px;font-size:12px" data-tip="No actions are available because this review's status is '${g.status}'.\nActions like Cancel are only available while the review is collecting, merging, merge_failed, in_review, or merged.">No actions available</div>`;
         const stacksItem = `<div data-click="openReviewPrStacks" data-guardian-id="${esc(id)}" data-tip="View every PR stack previously submitted for this review, in any state -- including ones dropped because their linked PR merged on the forge while the review was still mid-flight (RAL-300).\nWho/when: use this to see what was submitted before deciding whether/how to resubmit.\nRead-only -- does not resubmit or replay anything.">📜 View past PR stacks</div>`;
         menu.innerHTML = cancelItem + stacksItem;
         document.body.appendChild(menu);
@@ -349,11 +349,11 @@
         tick();
       }
       /**
-       * Reopens a cancelled or approved review, immediately trying a fresh
+       * Reopens a cancelled or merged review, immediately trying a fresh
        * merge pass. Shares its pending/disabled tracking with the
        * "Merge / rebase" button (`pendingMergeActions`) since "Reopen"
        * occupies that same button slot once a review is cancelled or
-       * approved (see `REOPEN_ELIGIBLE`).
+       * merged (see `REOPEN_ELIGIBLE`).
        * @param {string} id
        * @returns {Promise<void>}
        */
@@ -485,7 +485,7 @@
         // thing, so the reviewer knows to go look at the task's cell rather
         // than at a diff or a rebase conflict.
         if (b.is_empty) return `<span class="badge empty" data-tip="This branch adds no changes over the branch beneath it in the stack, so it failed the review.
-Almost always means its task never committed its work — the review would otherwise have approved a stack containing none of that task's changes.
+Almost always means its task never committed its work — the review would otherwise have marked a stack merged containing none of that task's changes.
 Who/when: you are looking at a failed review and need to know why this branch stopped it.
 Check the task's cell output and re-run it — or, if this branch is meant to be empty, disable it to drop it from the stack.">⌀ empty</span>`;
         // RAL-317: a one-shot marker for the most recent auto-submit-PR-stack
@@ -812,7 +812,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       /** @type {Record<string, string>} Why the button is unavailable, keyed by the review's status. */
       const MERGE_DISABLED_REASON = {
         merging: "A rebase is already in progress — wait for it to finish, or press Stop to halt it mid-rebase.\nTo restart from scratch, stop then merge, or cancel the running merge first.",
-        approved: "This review has already been approved — merge/rebase locks once a review is approved.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
+        merged: "This review has already been marked merged — merge/rebase locks once a review is merged.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         cancelled: "This review was cancelled — merge/rebase is not available for a cancelled review.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
         deployed: "This review has already been deployed — merge/rebase is not available once deployed.\nOnly available when status is collecting, in_review, merge_stopped, or merge_failed.",
       };
@@ -873,15 +873,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       // RALPHUS-MERGE-BUTTON:END
 
       /** Review statuses whose primary action button is "Reopen" instead of "Merge / rebase" -- mirrors the backend's `Store::reopen_guardian` (daemon/src/guardian.rs). */
-      const REOPEN_ELIGIBLE = ["cancelled", "approved"];
+      const REOPEN_ELIGIBLE = ["cancelled", "merged"];
 
       /**
        * How the "Reopen" button should read, for a review that occupies the
-       * "Merge / rebase" button's slot once it is cancelled or approved --
+       * "Merge / rebase" button's slot once it is cancelled or merged --
        * both are otherwise dead ends for that button (see
        * `MERGE_DISABLED_REASON`), so reopening back into `collecting` is the
        * only way to continue one instead of starting over from scratch.
-       * @param {string} status the review's current status ("cancelled" or "approved")
+       * @param {string} status the review's current status ("cancelled" or "merged")
        * @param {boolean} pending whether a reopen kickoff is already in flight
        * @returns {{label: string, enabled: boolean, tip: string}}
        */
@@ -896,8 +896,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         return {
           label: "↺ Reopen review",
           enabled: true,
-          tip: status === "approved"
-            ? "Reopen this approved review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-approved review instead of starting a new one from scratch."
+          tip: status === "merged"
+            ? "Reopen this merged review back into collecting and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this to make further changes to an already-merged review instead of starting a new one from scratch."
             : "Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.",
         };
       }
@@ -935,8 +935,8 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         }
         reviewDetailLoading = null;
         // RAL-14: reorder is allowed while the review is still open — not once it
-        // is approved/deployed (those branches are considered merged/shipped).
-        const canReorder = !["approved", "cancelled", "deployed"].includes(g.status);
+        // is merged/deployed (those branches are considered merged/shipped).
+        const canReorder = !["merged", "cancelled", "deployed"].includes(g.status);
         const drag = canReorder ? `draggable="true" ondragstart="brDragStart(event)" ondragover="brDragOver(event)" ondragleave="brDragLeave(event)" ondrop="brDrop(event,this.dataset.guardianId)" ondragend="brDragEnd(event)"` : "";
         // Staged reorder + enable state (RAL-6, RAL-43): pendingReorder holds both
         // the branch order and per-branch enabled flags, committed only on Save.
@@ -1122,7 +1122,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               // mouseover listener never sees it — data-tip must live on a
               // wrapping <span> instead whenever the button may be disabled.
               //
-              // Once a review is cancelled or approved, "Merge / rebase" is a
+              // Once a review is cancelled or merged, "Merge / rebase" is a
               // dead end (see MERGE_DISABLED_REASON) -- this same slot becomes
               // "Reopen" instead, so there is always a live action here rather
               // than a permanently greyed-out button.
@@ -1148,13 +1148,13 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             })()}
             ${(() => {
               const isPending = pendingGuardianActions.has(g.id);
-              const alreadyApproved = g.status === "approved";
-              const disabled = isPending || alreadyApproved;
+              const alreadyMerged = g.status === "merged";
+              const disabled = isPending || alreadyMerged;
               const approveTip = isPending
                 ? "Approval is in flight — waiting for the daemon to confirm."
-                : alreadyApproved
-                  ? "This review is already approved.\nPress Reopen review above to make further changes, then approve again."
-                  : "Approve this review for deployment — marks it as approved once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
+                : alreadyMerged
+                  ? "This review is already merged.\nPress Reopen review above to make further changes, then approve again."
+                  : "Approve this review for deployment — marks it as merged once all merges and check gates have passed.\nCan be pressed at any time; the daemon rejects it if the review isn't in a state that can be approved yet.";
               const approveBtn = `<button class="btn" data-click="approveReview" data-guardian-id="${esc(g.id)}" ${disabled ? "disabled" : ""} data-tip="${approveTip}">${isPending ? "Approving…" : "Approve"}</button>`;
               return disabled ? `<span data-tip="${approveTip}">${approveBtn}</span>` : approveBtn;
             })()}
@@ -2273,7 +2273,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         // Exclude the current review and reviews that can no longer accept new
         // work (mirrors the canReorder gate used for the move button itself).
-        const targets = guardians.filter((x) => x.id !== gid && !["approved", "cancelled", "deployed"].includes(x.status));
+        const targets = guardians.filter((x) => x.id !== gid && !["merged", "cancelled", "deployed"].includes(x.status));
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
         menu.innerHTML = targets.length

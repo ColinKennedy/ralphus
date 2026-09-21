@@ -166,8 +166,12 @@ pub enum GuardianStatus {
     MergeStopped,
     /// Stack built; awaiting human review.
     InReview,
-    /// Approved by a human.
-    Approved,
+    /// The review's linked PR/MR has merged (RAL-479; formerly named
+    /// `Approved` -- that name implied a human had signed off, but this
+    /// transition only ever fires because the underlying PR/MR merged, which
+    /// is a distinct fact from a reviewer's own approve decision on the
+    /// forge).
+    Merged,
     /// Cancelled by the user — the current run is discarded; can be restarted.
     Cancelled,
     /// Deployed (terminal; deploy itself is a stub).
@@ -179,7 +183,7 @@ impl GuardianStatus {
     /// must leave it unchanged until it is explicitly reopened.
     #[must_use]
     pub fn is_terminal_status(status: &str) -> bool {
-        matches!(status, "approved" | "cancelled" | "deployed")
+        matches!(status, "merged" | "cancelled" | "deployed")
     }
 
     /// The stored lowercase string.
@@ -191,7 +195,7 @@ impl GuardianStatus {
             Self::MergeFailed => "merge_failed",
             Self::MergeStopped => "merge_stopped",
             Self::InReview => "in_review",
-            Self::Approved => "approved",
+            Self::Merged => "merged",
             Self::Cancelled => "cancelled",
             Self::Deployed => "deployed",
         }
@@ -204,7 +208,7 @@ impl GuardianStatus {
             "merge_failed" => Self::MergeFailed,
             "merge_stopped" => Self::MergeStopped,
             "in_review" => Self::InReview,
-            "approved" => Self::Approved,
+            "merged" => Self::Merged,
             "cancelled" => Self::Cancelled,
             "deployed" => Self::Deployed,
             _ => return None,
@@ -1200,7 +1204,7 @@ impl Store {
     /// through to `done`. Returns `true` when this call won the transition (the
     /// caller should proceed with the merge), `false` when the guardian was
     /// already `merging`, or in a state that must never be reopened implicitly
-    /// (`approved`, `deployed`, `cancelled`) — another caller claimed it first,
+    /// (`merged`, `deployed`, `cancelled`) — another caller claimed it first,
     /// or an explicit cancel is required. `merge_stopped` (RAL-249) is
     /// claimable so a stopped rebase can be resumed. States this transitions
     /// into `merging`: `collecting`, `merge_failed`, `merge_stopped`,
@@ -1814,7 +1818,7 @@ impl Store {
     /// (for the user-facing "Merge / rebase" button), so the two now overlap on
     /// `in_review`/`merge_failed`; this one stays separate because it omits
     /// `collecting`, which the straggler sweep never targets. Guardians that
-    /// are `approved`, `deployed`, or `cancelled` are never matched and therefore
+    /// are `merged`, `deployed`, or `cancelled` are never matched and therefore
     /// never reopened.
     pub fn reopen_guardian_merge(&self, id: &str) -> Result<bool> {
         let n = self.conn.execute(
@@ -4742,12 +4746,12 @@ impl Store {
         }
     }
 
-    /// Approve a guardian that is in review.
+    /// Mark a guardian in review as merged (its linked PR/MR has merged).
     pub fn approve_guardian(&self, id: &str) -> Result<GuardianStatus> {
         match GuardianStatus::parse(&self.guardian_status_str(id)?) {
             Some(GuardianStatus::InReview) => {
-                self.set_guardian_status(id, GuardianStatus::Approved, None)?;
-                Ok(GuardianStatus::Approved)
+                self.set_guardian_status(id, GuardianStatus::Merged, None)?;
+                Ok(GuardianStatus::Merged)
             }
             Some(other) => Err(StoreError::InvalidTransition(format!(
                 "can only approve a guardian in review, it is {}",
@@ -4757,7 +4761,7 @@ impl Store {
         }
     }
 
-    /// Cancel a guardian that is in a cancellable state (collecting, merging, in_review, merge_failed, merge_stopped, or approved).
+    /// Cancel a guardian that is in a cancellable state (collecting, merging, in_review, merge_failed, merge_stopped, or merged).
     /// Background threads that are still running should check the status on completion
     /// and discard their result if the guardian is already cancelled.
     pub fn cancel_guardian(&self, id: &str) -> Result<GuardianStatus> {
@@ -4768,7 +4772,7 @@ impl Store {
                 | GuardianStatus::MergeFailed
                 | GuardianStatus::MergeStopped
                 | GuardianStatus::InReview
-                | GuardianStatus::Approved,
+                | GuardianStatus::Merged,
             ) => {
                 self.set_guardian_status(id, GuardianStatus::Cancelled, None)?;
                 Ok(GuardianStatus::Cancelled)
@@ -4812,26 +4816,26 @@ impl Store {
         }
     }
 
-    /// Reopen a `cancelled` or `approved` guardian back to `collecting` so a
+    /// Reopen a `cancelled` or `merged` guardian back to `collecting` so a
     /// fresh merge can be attempted. Distinct from
     /// [`Self::reset_guardian_to_collecting`] (which resumes an in-flight
     /// `merging`/`in_review` guardian whose worker must be stopped first):
-    /// neither `cancelled` nor `approved` can have a merge worker still
+    /// neither `cancelled` nor `merged` can have a merge worker still
     /// running against them (a cancelled review's worker was already stopped
     /// before the `cancelled` write landed, see `stop_merge_worker_for_cancel`;
-    /// an approved review only ever arrives there from `in_review`, which has
+    /// a merged review only ever arrives there from `in_review`, which has
     /// none), so there is nothing to interrupt here -- only the terminal
     /// status itself blocks a fresh start.
     pub fn reopen_guardian(&self, id: &str) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE guardians SET status='collecting', detail=NULL, updated_at_ms=? \
-             WHERE id=? AND status IN ('cancelled','approved')",
+             WHERE id=? AND status IN ('cancelled','merged')",
             params![crate::store::now_ms(), id],
         )?;
         if n == 0 {
             let status = self.guardian_status_str(id)?; // propagate NotFound if missing
             return Err(StoreError::InvalidTransition(format!(
-                "can only reopen a guardian that is cancelled or approved, it is {status}"
+                "can only reopen a guardian that is cancelled or merged, it is {status}"
             )));
         }
         let _ = self.log_event(
@@ -5861,11 +5865,8 @@ mod tests {
         store
             .set_guardian_status(&id, GuardianStatus::InReview, None)
             .unwrap();
-        assert_eq!(
-            store.approve_guardian(&id).unwrap(),
-            GuardianStatus::Approved
-        );
-        assert_eq!(store.get_guardian(&id).unwrap().status, "approved");
+        assert_eq!(store.approve_guardian(&id).unwrap(), GuardianStatus::Merged);
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merged");
         let expected_uri = format!("guardian:{id}");
         let messages = store
             .personal_mailbox_messages_for_user("watcher", false, None)
@@ -6311,12 +6312,12 @@ mod tests {
     }
 
     #[test]
-    fn reopen_guardian_only_accepts_cancelled_or_approved() {
+    fn reopen_guardian_only_accepts_cancelled_or_merged() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
 
-        // Not cancelled or approved yet: reopen must be rejected.
+        // Not cancelled or merged yet: reopen must be rejected.
         assert!(store.reopen_guardian(&id).is_err());
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
 
@@ -6335,7 +6336,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_guardian_accepts_approved() {
+    fn reopen_guardian_accepts_merged() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store.add_guardian_branch(&id, "feat").unwrap();
@@ -6343,11 +6344,8 @@ mod tests {
         store
             .set_guardian_status(&id, GuardianStatus::InReview, None)
             .unwrap();
-        assert_eq!(
-            store.approve_guardian(&id).unwrap(),
-            GuardianStatus::Approved
-        );
-        assert_eq!(store.get_guardian(&id).unwrap().status, "approved");
+        assert_eq!(store.approve_guardian(&id).unwrap(), GuardianStatus::Merged);
+        assert_eq!(store.get_guardian(&id).unwrap().status, "merged");
 
         store.reopen_guardian(&id).unwrap();
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
@@ -7822,14 +7820,14 @@ mod tests {
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
     }
 
-    /// Guards the fix above from over-widening: a terminal `approved` review
+    /// Guards the fix above from over-widening: a terminal `merged` review
     /// must still refuse to be reset back to `collecting`.
     #[test]
     fn reset_guardian_to_collecting_still_rejects_a_terminal_status() {
         let store = Store::open_in_memory().unwrap();
         let id = store.create_guardian("r", "main", "/repo").unwrap();
         store
-            .set_guardian_status(&id, GuardianStatus::Approved, None)
+            .set_guardian_status(&id, GuardianStatus::Merged, None)
             .unwrap();
 
         assert!(store.reset_guardian_to_collecting(&id).is_err());

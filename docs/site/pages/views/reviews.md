@@ -3,7 +3,7 @@
 A Guardian review takes the branches produced by a squad's tasks and stacks
 them into a single rebased review branch — resolving merge conflicts with an
 agent, running your declared check gates, and giving you a per-branch
-feedback thread to request changes before anything is approved. The Reviews
+feedback thread to request changes before anything is marked merged. The Reviews
 tab is where you watch and steer that process.
 
 ## Branch order — and how it relates to task dependencies
@@ -14,7 +14,7 @@ A review's branches start out in the same order as the task dependency graph
 they came from — if `rollout` depends on `provisioning`, its branch is
 initially stacked after `provisioning`'s. But that's just the *starting*
 order, not a constraint: you're free to drag branches into a different merge
-order any time before the review is approved (the grip handle on each row),
+order any time before the review is merged (the grip handle on each row),
 the same lazy-anchoring drag mechanics as the [Queue](queue.md). Reordering
 only changes how the stack is rebuilt going forward — it doesn't touch
 anything that already merged.

@@ -88,7 +88,7 @@
         <label data-tip="Include tasks you've explicitly hidden and tasks belonging to a squad you've hidden (Squads tab). A revealed hidden row is marked with 🙈.\nA personal preference — it never changes anything's status, and never affects what other users see.">
           <input type="checkbox" id="tt-show-hidden" onchange="ttToggleShowHidden(this.checked)"> show hidden
         </label>
-        <label class="tt-needs-me-chip" data-tip="Only rows you're watching (directly or via a watched squad) that are blocked on you: failed, awaiting your review approval, or approved with no PR submitted yet.\nUnwatched work never appears here, even if it's failed -- turn on Auto-watch in Preferences to watch everything.">
+        <label class="tt-needs-me-chip" data-tip="Only rows you're watching (directly or via a watched squad) that are blocked on you: failed, awaiting your review approval, or merged with no PR submitted yet.\nUnwatched work never appears here, even if it's failed -- turn on Auto-watch in Preferences to watch everything.">
           <input type="checkbox" id="tt-needs-me" onchange="ttToggleNeedsMe(this.checked)"> needs me <span id="tt-needs-me-count" class="chip" style="padding:1px 6px"></span>
         </label>
         <button class="btn" onclick="ttExpandAll()" data-tip="Expand every currently-filtered task row to show its cells.">Expand all</button>

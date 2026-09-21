@@ -60,18 +60,18 @@ test("the review badge tooltip explains both the jump and the +N affordance", ()
   assert.match(html, /\+N opens the full list\./);
 });
 
-test("PR badge behavior is unchanged (inline onclick, opens the forge) and the approved-no-PR placeholder survives", () => {
+test("PR badge behavior is unchanged (inline onclick, opens the forge) and the merged-no-PR placeholder survives", () => {
   const { ttReviewPrBadgesHtml } = makeBadgeRenderer();
   const withPr = ttReviewPrBadgesHtml(
     { review: { id: "guardian-1", name: "r", status: "in_review", origin: "explicit", branches: [] }, count: 1 },
     { pr: { pr_url: "https://forge/x/42", pr_number: 42, state: "open", forge: "gh", repo: "x" }, count: 1 },
   );
   assert.match(withPr, /onclick="event\.stopPropagation\(\);ttOpenPr\('https:\/\/forge\/x\/42'\)"/);
-  const approvedNoPr = ttReviewPrBadgesHtml(
-    { review: { id: "guardian-1", name: "r", status: "approved", origin: "explicit", branches: [] }, count: 1 },
+  const mergedNoPr = ttReviewPrBadgesHtml(
+    { review: { id: "guardian-1", name: "r", status: "merged", origin: "explicit", branches: [] }, count: 1 },
     null,
   );
-  assert.match(approvedNoPr, /pr-placeholder/);
+  assert.match(mergedNoPr, /pr-placeholder/);
 });
 
 // ---------- PR CI/CD status coloring (RAL-402) ----------

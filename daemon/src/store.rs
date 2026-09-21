@@ -2818,6 +2818,15 @@ impl Store {
         ] {
             let _ = self.conn.execute(stmt, []);
         }
+        // RAL-479: the review status literal "approved" was renamed to
+        // "merged" -- it always meant the linked PR/MR had merged, never
+        // that a human had approved it. Remap every already-persisted row
+        // so historical reviews display under the new name. Idempotent: a
+        // no-op once no row still says "approved".
+        let _ = self.conn.execute(
+            "UPDATE guardians SET status='merged' WHERE status='approved'",
+            [],
+        );
         // RAL-155: task-scoped Cartographer filtering (`?task=`, and the
         // `entity=task:...` addressing scheme) needs this to not degrade into
         // a full-table scan as `cartographer_events` grows. Created after the
@@ -4435,7 +4444,7 @@ impl Store {
     /// cells that happen to record the identical branch *string* are never
     /// conflated; falls back to the `cells.review_branch = guardian_branches.branch`
     /// string join for a pre-RAL-314 row. No status filter -- a squad's
-    /// review list has always included terminal (approved/deployed/cancelled)
+    /// review list has always included terminal (merged/deployed/cancelled)
     /// reviews too.
     fn reviews_for_squad(conn: &Connection, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
         let mut stmt = conn.prepare(
@@ -15298,7 +15307,7 @@ command = "e"
         // longer excludes. It must not block, and it must not be visible to
         // the transaction already in progress.
         store
-            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Approved, None)
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merged, None)
             .expect("concurrent write must not block behind the open read");
 
         // Rules out "the write never landed" as the reason the snapshot
