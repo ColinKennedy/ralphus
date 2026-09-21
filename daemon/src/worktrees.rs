@@ -1307,14 +1307,26 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 // what a live re-query would show it, since this is the only
                 // thing that could have changed the on-disk state since the
                 // snapshot was taken.
-                ctx.on_disk_worktrees
-                    .borrow_mut()
-                    .get_mut(&root_key)
-                    .expect("populated above")
-                    .insert(
-                        crate::short_paths::short_name(branch).to_string(),
-                        branch.to_string(),
-                    );
+                //
+                // Keyed by the *actual* directory basename `materialized`
+                // resolved to (e.g. "hello-world-7"), never
+                // `short_paths::short_name(branch)` directly -- that raw
+                // short name is only the undisambiguated base
+                // `resolve_task_worktree_dir_with_existing` starts probing
+                // from, so two distinct branches sharing a short-name prefix
+                // (any two names that agree on the first ~12 chars) would
+                // otherwise overwrite the same base-name cache entry,
+                // hiding this branch's real `-N` slot from the next cell's
+                // lookup and letting it walk straight past the
+                // just-created directory into reusing it for a different
+                // branch.
+                if let Some(short) = materialized.file_name().and_then(|n| n.to_str()) {
+                    ctx.on_disk_worktrees
+                        .borrow_mut()
+                        .get_mut(&root_key)
+                        .expect("populated above")
+                        .insert(short.to_string(), branch.to_string());
+                }
                 materialized.to_string_lossy().into_owned()
             }
         };
@@ -3902,6 +3914,79 @@ mod tests {
                 .trim(),
             "test-pr-submission-b"
         );
+    }
+
+    #[test]
+    fn resolve_placeholders_disambiguates_three_tasks_whose_branches_share_a_short_name() {
+        // Regression: with only two colliding branches, the first happens to
+        // land in the bare, undisambiguated directory (no `-2` suffix
+        // needed yet), so `GitProjectStartupAdapter::resolve_placeholder`
+        // recording it back into `on_disk_worktrees` under the raw
+        // `short_name(branch)` key -- instead of the actual directory
+        // `ensure_worktree_with_existing` returned -- happens to be correct
+        // by coincidence. The third colliding branch exposes it: the
+        // second branch's real `-2` directory was never recorded under its
+        // own key, so the third cell's lookup walks straight past it,
+        // thinks it's free, and reuses the second branch's already
+        // materialized worktree instead of creating its own.
+        let repo = init_repo("three-task-collide");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("ralphus", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
+            ),
+            cell_row(
+                1,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
+            ),
+            cell_row(
+                2,
+                0,
+                "work",
+                Some("ralphus:new-worktree/test-pr-submission-c?upstream=main"),
+            ),
+        ];
+        let tasks = vec![
+            task_row(0, Some("ralphus")),
+            task_row(1, Some("ralphus")),
+            task_row(2, Some("ralphus")),
+        ];
+        resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
+            .expect("materialize all three");
+
+        let resolved: Vec<String> = cells
+            .iter()
+            .map(|c| c.cwd.clone().expect("resolved"))
+            .collect();
+        assert_eq!(
+            resolved
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each task's branch must materialize its own worktree, got {resolved:?}"
+        );
+        for (cwd, branch) in resolved.iter().zip([
+            "test-pr-submission-a",
+            "test-pr-submission-b",
+            "test-pr-submission-c",
+        ]) {
+            assert_eq!(
+                git(Path::new(cwd), &["symbolic-ref", "--short", "HEAD"])
+                    .unwrap()
+                    .trim(),
+                branch,
+                "worktree {cwd} checked out the wrong branch"
+            );
+        }
     }
 
     #[test]
