@@ -79,6 +79,14 @@ pub const EXCLUDED: &[(&[&str], &str)] = &[
         "See `quick-start watcher claude-code`'s exclusion reason -- one interactive backend \
          choice for the same non-portable launch.",
     ),
+    (
+        &["internal", "fork-credential-helper"],
+        "Implements git's credential-helper protocol (RAL-338 follow-up): git invokes it with a \
+         request on stdin and expects a plain-text response on stdout, from within the specific \
+         worktree whose git config names the credential to fetch. An MCP tool call has no stdin \
+         request body in that shape and no notion of 'the worktree this call is running inside' \
+         -- there is nothing a generic tool caller could sensibly pass it.",
+    ),
 ];
 
 /// `true` if `path` is excluded from the MCP tool surface.

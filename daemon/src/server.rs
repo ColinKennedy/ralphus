@@ -1129,8 +1129,8 @@ fn route_for_user(
         // `worktree_credential_grants`. Still passes through this route's
         // normal bearer-token check like every other endpoint, so
         // possessing the grant alone is not sufficient either -- both are
-        // required.
-        // ralphus[ignore-endpoint-cli]: called only by the git-credential helper this ticket adds, never a task file or the CLI directly
+        // required. Its only caller is `ralphus internal fork-credential-helper`
+        // (see `check_endpoint_cli_parity.py`'s `ENDPOINT_TO_CLI` mapping).
         ("GET", ["api", "internal", "fork-credential"]) => fetch_fork_credential(daemon, query),
         ("GET", ["api", "projects", name, "forks"]) => {
             list_project_forks(daemon, &url_decode(name))

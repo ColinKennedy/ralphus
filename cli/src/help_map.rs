@@ -1112,6 +1112,54 @@ unset) -- existing reviews are unaffected.",
     ),
 ];
 
+// RAL-338 follow-up: a ralphus user's own forge personal access tokens --
+// see `crate::commands::user::UserCommand`.
+const USER_CHILDREN: &[HelpNode] = &[
+    node(
+        "set-forge-token",
+        &["user [str]"],
+        &["--host [host]", "--token [token]"],
+        "Set or replace a ralphus user's personal access token for one forge host (e.g. \
+gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "list-forge-tokens",
+        &["user [str]"],
+        &[],
+        "List which forge hosts a ralphus user has a token configured for. Never returns the \
+token value itself.",
+        false,
+        true, // ("user", "list-forge-tokens")
+        &[],
+    ),
+    node(
+        "delete-forge-token",
+        &["user [str]", "host [str]"],
+        &[],
+        "Remove a ralphus user's personal access token for one forge host.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+// RAL-338 follow-up: machine-invoked interfaces with no interactive/task-file
+// use -- see `crate::commands::internal::InternalCommand`.
+const INTERNAL_CHILDREN: &[HelpNode] = &[node(
+    "fork-credential-helper",
+    &["action [str]"],
+    &[],
+    "Git credential-helper entry point installed on a fork-routed worktree's git config \
+(never invoked directly by a human or a task file) -- implements git's credential protocol so \
+a push authenticates using that worktree owner's stored forge token.",
+    false,
+    false,
+    &[],
+)];
+
 const PROJECT_CHILDREN: &[HelpNode] = &[
     node(
         "fork",
@@ -2083,6 +2131,24 @@ classification categories (RAL-318).",
             false,
             false,
             TRIAGE_CHILDREN,
+        ),
+        node(
+            "user",
+            &[],
+            &[],
+            "Manage a ralphus user's own forge personal access tokens (RAL-338 follow-up).",
+            false,
+            false,
+            USER_CHILDREN,
+        ),
+        node(
+            "internal",
+            &[],
+            &[],
+            "Machine-invoked interfaces with no interactive/task-file use (RAL-338 follow-up).",
+            false,
+            false,
+            INTERNAL_CHILDREN,
         ),
         // ralphus[ignore-endpoint-cli]: prints the built-in tutorial text bundled in the CLI binary
         node(
