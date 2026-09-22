@@ -29,6 +29,7 @@ MAPPING = {
     "auto_submit_pr_stack": "auto_submit_pr_stack",
     "auto_pr_feedback": "auto_pr_feedback",
     "separate_pr_branch": "separate_pr_branch",
+    "dual_root_pr": "dual_root_pr",
     "auto_fix_pr_errors": "auto_fix_pr_errors",
     "auto_fix_prompt_template": "auto_fix_prompt_template",
 }
