@@ -59,6 +59,8 @@
        * @property {boolean} originalMatchPrBranchName
        * @property {boolean} autoSubmitPrStack
        * @property {boolean} originalAutoSubmitPrStack
+       * @property {boolean} dualRootPr
+       * @property {boolean} originalDualRootPr
        * @property {boolean} autoFixPrErrors
        * @property {boolean} originalAutoFixPrErrors
        * @property {string} autoFixPromptTemplate
@@ -124,6 +126,7 @@
         const separatePrBranch = !!g.effective_separate_pr_branch;
         const matchPrBranchName = !!g.effective_match_pr_branch_name;
         const autoSubmitPrStack = !!g.effective_auto_submit_pr_stack;
+        const dualRootPr = !!g.effective_dual_root_pr;
         const autoFixPrErrors = !!g.auto_fix_pr_errors;
         const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
         return {
@@ -144,6 +147,7 @@
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
+          dualRootPr, originalDualRootPr: dualRootPr,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           squash,
@@ -289,6 +293,12 @@
        * @returns {void}
        */
       function onEditAutoSubmitPrStack(checked) { if (reviewEditDraft) reviewEditDraft.autoSubmitPrStack = checked; }
+      /**
+       * Stages the dual-root-PR flag.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditDualRootPr(checked) { if (reviewEditDraft) reviewEditDraft.dualRootPr = checked; }
       /**
        * Stages the auto-fix-PR-errors flag.
        * @param {boolean} checked
@@ -482,22 +492,27 @@
       }
       /**
        * RAL-408: pull-request settings fields (separate PR branch / match
-       * worktree branch name / auto-submit PR stack), shared as above.
+       * worktree branch name / auto-submit PR stack / dual root PR), shared
+       * as above.
        * @param {boolean} separatePrBranch
        * @param {boolean} matchPrBranchName
        * @param {boolean} autoSubmitPrStack
+       * @param {boolean} dualRootPr
        * @param {string} onSeparateChange
        * @param {string} onMatchChange
        * @param {string} onAutoSubmitChange
+       * @param {string} onDualRootPrChange
        * @returns {string}
        */
-      function renderPrSettingsFieldsHtml(separatePrBranch, matchPrBranchName, autoSubmitPrStack, onSeparateChange, onMatchChange, onAutoSubmitChange) {
+      function renderPrSettingsFieldsHtml(separatePrBranch, matchPrBranchName, autoSubmitPrStack, dualRootPr, onSeparateChange, onMatchChange, onAutoSubmitChange, onDualRootPrChange) {
         return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:6px" data-tip="Push this review's PRs to a branch of their own, derived from the task branch, instead of opening them straight from the review branch. Applies on Save.">
             <input type="checkbox" ${separatePrBranch ? "checked" : ""} onchange="${onSeparateChange}(this.checked)">separate PR branch</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px${separatePrBranch ? "" : ";opacity:0.5"}" data-tip="Only applies when 'separate PR branch' is on. Use the exact worktree/feature branch name as the PR branch. Applies on Save.">
             <input type="checkbox" ${matchPrBranchName ? "checked" : ""} ${separatePrBranch ? "" : "disabled"} onchange="${onMatchChange}(this.checked)">match worktree branch name</label>
           <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically submit/grow this review's PR stack as each branch finishes rebasing. Applies on Save.">
-            <input type="checkbox" ${autoSubmitPrStack ? "checked" : ""} onchange="${onAutoSubmitChange}(this.checked)">auto-submit PR stack</label>`;
+            <input type="checkbox" ${autoSubmitPrStack ? "checked" : ""} onchange="${onAutoSubmitChange}(this.checked)">auto-submit PR stack</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Fork-routed reviews only. When on, the stack's root branch (and whichever branch later gets promoted to root) gets a second, same-repo PR into a mirror of the parent's base branch, so it visually joins the rest of the PR stack -- alongside the existing PR that actually gets merged. Off by default. Applies on Save.">
+            <input type="checkbox" ${dualRootPr ? "checked" : ""} onchange="${onDualRootPrChange}(this.checked)">dual root PR</label>`;
       }
       /**
        * RAL-408: auto-fix-PR-errors checkbox + prompt-template textarea,
@@ -554,7 +569,7 @@
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
             <h3 class="section">squash</h3>${squashSection}
             <h3 class="section">pull requests</h3>
-            ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack")}
+            ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack", "onEditDualRootPr")}
             ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate")}
             <h3 class="section">environment overrides</h3>
             ${buildEnvSection}
@@ -627,6 +642,7 @@
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
+        if (draft.dualRootPr !== draft.originalDualRootPr) body.dual_root_pr = draft.dualRootPr;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
@@ -677,4 +693,4 @@
         }
       }
 
-      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate];
+      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate];

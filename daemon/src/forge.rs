@@ -418,6 +418,17 @@ impl ForgeClient {
         &self.repo_path
     }
 
+    /// The API token this client will authenticate with, if any -- test-only,
+    /// so a caller resolving a client on someone else's behalf (e.g. a
+    /// fork's registered owner) can assert that the intended identity's
+    /// token actually made it through, rather than silently falling back to
+    /// the daemon's own env-var/CLI identity.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// The `head` value to use when this client's own repo owns both the
     /// branch and the PR/MR -- i.e. everywhere except the GitHub cross-repo
     /// fork root, which already builds its own `owner:branch` head from the
@@ -2892,7 +2903,41 @@ pub fn resolve_remote_for(
     remote_name: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
-    let result = resolve_remote_for_inner(root, remote_name, cfg);
+    resolve_remote_for_logged(root, remote_name, cfg, None)
+}
+
+/// Like [`resolve_remote_for`], but resolves the API token from
+/// `token_override` first (RAL-338 follow-up: a per-user stored forge
+/// token, see `daemon/src/user_forge_tokens.rs`) instead of the daemon-wide
+/// env-var/CLI-token chain, when one is given. `None` behaves identically
+/// to [`resolve_remote_for`].
+///
+/// Used specifically when building a *fork's own* client: the daemon's
+/// single env-var-resolved identity is the right choice for the
+/// parent/origin client (there's only ever one of those), but a fork has a
+/// distinct per-user owner who may not be who that shared identity
+/// authenticates as -- calling the forge REST API as the wrong identity to
+/// open a cross-repo PR/MR sourced from someone else's fork fails with a
+/// permissions error even though the underlying git push (already routed
+/// through that same per-user token via the credential helper) succeeds,
+/// since the REST API and git-push authentication are entirely separate
+/// paths.
+pub fn resolve_remote_for_as(
+    root: &Path,
+    remote_name: &str,
+    cfg: &ForgeConfig,
+    token_override: Option<&str>,
+) -> Result<ForgeClient, String> {
+    resolve_remote_for_logged(root, remote_name, cfg, token_override)
+}
+
+fn resolve_remote_for_logged(
+    root: &Path,
+    remote_name: &str,
+    cfg: &ForgeConfig,
+    token_override: Option<&str>,
+) -> Result<ForgeClient, String> {
+    let result = resolve_remote_for_inner(root, remote_name, cfg, token_override);
     match &result {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         Ok(client) => crate::rlog!(
@@ -2912,6 +2957,7 @@ fn resolve_remote_for_inner(
     root: &Path,
     remote_name: &str,
     cfg: &ForgeConfig,
+    token_override: Option<&str>,
 ) -> Result<ForgeClient, String> {
     let url = crate::guardian_merge::git(root, &["remote", "get-url", remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
@@ -2936,36 +2982,41 @@ fn resolve_remote_for_inner(
         .token_env
         .clone()
         .unwrap_or_else(|| kind.default_token_env().to_string());
-    // Env var wins when set; otherwise fall back to the forge CLI's own
-    // cached login (see `resolve_cli_token`'s doc comment for scope/limits).
-    // A failed fallback is logged loudly rather than folded silently into
-    // "no token" -- a client built with no token still makes unauthenticated
-    // requests (see the module doc's "Auth" section), which only 404 much
-    // later against a private repo with zero clue as to why.
+    // `token_override` (RAL-338 follow-up: a per-user stored forge token)
+    // wins when given; otherwise the env var wins when set; otherwise fall
+    // back to the forge CLI's own cached login (see `resolve_cli_token`'s
+    // doc comment for scope/limits). A failed fallback is logged loudly
+    // rather than folded silently into "no token" -- a client built with no
+    // token still makes unauthenticated requests (see the module doc's
+    // "Auth" section), which only 404 much later against a private repo
+    // with zero clue as to why.
     // TODO: Replace with real user-service authentication once RAL-245 is complete.
-    let token = match std::env::var(&token_env) {
-        Ok(t) => Some(t),
-        Err(_) => match resolve_cli_token_cached(kind, &host) {
-            Ok(t) => {
-                // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-                crate::rlog!(
-                    DEBUG,
-                    "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
-                    kind.as_str()
-                );
-                Some(t)
-            }
-            Err(reason) => {
-                // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [forge] no {} token available -- env {token_env} is unset and the CLI \
-                     fallback failed: {reason}. Requests will go out unauthenticated and may fail \
-                     (e.g. 404) against a private repo.",
-                    kind.as_str()
-                );
-                None
-            }
+    let token = match token_override {
+        Some(t) => Some(t.to_string()),
+        None => match std::env::var(&token_env) {
+            Ok(t) => Some(t),
+            Err(_) => match resolve_cli_token_cached(kind, &host) {
+                Ok(t) => {
+                    // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+                    crate::rlog!(
+                        DEBUG,
+                        "ralphus [forge] resolved token via CLI fallback kind={} host={host}",
+                        kind.as_str()
+                    );
+                    Some(t)
+                }
+                Err(reason) => {
+                    // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [forge] no {} token available -- env {token_env} is unset and the \
+                         CLI fallback failed: {reason}. Requests will go out unauthenticated and may \
+                         fail (e.g. 404) against a private repo.",
+                        kind.as_str()
+                    );
+                    None
+                }
+            },
         },
     };
 
@@ -4361,6 +4412,53 @@ mod tests {
             "a slash-namespaced branch name (e.g. features/foo/bar) whose leading segment isn't a \
              configured remote must not be mistaken for one either"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-338 follow-up: `resolve_remote_for_as`'s whole reason to exist --
+    /// a fork's own forge REST API client must authenticate as the fork's
+    /// owning user, via their stored token, not whatever the daemon's
+    /// shared env-var/CLI identity happens to be.
+    #[test]
+    fn resolve_remote_for_as_prefers_the_token_override_over_the_env_var() {
+        let root = tmp_dir("resolve-remote-token-override");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/alice/widget.git",
+            ],
+        );
+
+        let cfg = ForgeConfig::default();
+        let client = resolve_remote_for_as(&root, "fork", &cfg, Some("alices-own-token")).unwrap();
+        assert_eq!(client.token.as_deref(), Some("alices-own-token"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_remote_for_as_with_no_override_behaves_like_resolve_remote_for() {
+        let root = tmp_dir("resolve-remote-token-no-override");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/alice/widget.git",
+            ],
+        );
+
+        let cfg = ForgeConfig::default();
+        let with_none = resolve_remote_for_as(&root, "fork", &cfg, None).unwrap();
+        let plain = resolve_remote_for(&root, "fork", &cfg).unwrap();
+        assert_eq!(with_none.token, plain.token);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

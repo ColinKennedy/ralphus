@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
+pub mod internal;
 pub mod machine;
 pub mod mailbox;
 pub mod mcp;
@@ -27,6 +28,7 @@ pub mod show;
 pub mod squad;
 pub mod task;
 pub mod triage;
+pub mod user;
 
 use serde_json::Value;
 
@@ -198,6 +200,8 @@ pub enum Command {
     Mailbox(mailbox::MailboxCommand),
     QuickStart(quick_start::QuickStartCommand),
     Triage(triage::TriageCommand),
+    User(user::UserCommand),
+    Internal(internal::InternalCommand),
     UsageError(String),
 }
 
@@ -279,6 +283,8 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("mailbox") => Command::Mailbox(mailbox::parse(&scanner.remaining())),
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
         Some("triage") => Command::Triage(triage::parse(&scanner.remaining())),
+        Some("user") => Command::User(user::parse(&scanner.remaining())),
+        Some("internal") => Command::Internal(internal::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
 }
@@ -351,6 +357,8 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Mailbox(c) => mailbox::dispatch(c, opts),
         Command::QuickStart(c) => quick_start::dispatch(c, opts),
         Command::Triage(c) => triage::dispatch(c, opts),
+        Command::User(c) => user::dispatch(c, opts),
+        Command::Internal(c) => internal::dispatch(c, opts),
     }
 }
 

@@ -378,6 +378,44 @@ pub(crate) fn ensure_fork_remote(
     }
 }
 
+/// Fast-forward the fork's `base_branch_name` to the parent branch's current
+/// tip. A dual-root stack PR can then target the fork's ordinary base branch,
+/// keeping several reviews on one fork visually aligned. `root` must already
+/// carry both remotes, with the
+/// fork remote's credential helper/identity already wired (see
+/// `pr::resolve_fork_routing`, which every caller of this function runs
+/// through first).
+///
+/// The push deliberately omits `--force`: a fork base branch that contains
+/// work outside the parent branch must be reconciled by its owner rather than
+/// overwritten by ralphus. Concurrent maintenance attempts are safe: Git
+/// accepts an already-current branch and rejects a non-fast-forward race.
+///
+/// # Errors
+/// Propagates the underlying `git fetch`/`git push` failure.
+pub(crate) fn sync_fork_base_branch(
+    root: &std::path::Path,
+    parent_remote_name: &str,
+    fork_remote_name: &str,
+    base_branch_name: &str,
+) -> Result<(), String> {
+    crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
+        .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
+    let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("could not resolve fetched tip: {e}"))?;
+    crate::guardian_merge::git(
+        root,
+        &[
+            "push",
+            fork_remote_name,
+            &format!("{tip}:refs/heads/{base_branch_name}"),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("could not fast-forward fork branch {base_branch_name}: {e}"))
+}
+
 /// One health finding for a registered fork row (RAL-338 Phase 6). Advisory
 /// only -- see [`check_fork_health`]'s doc comment; submission's own
 /// pre-flight (`crate::pr::run_fork_preflight`) is what actually prevents a

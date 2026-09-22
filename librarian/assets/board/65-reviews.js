@@ -714,10 +714,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
       /** @type {{[state: string]: number}} */
       const BRANCH_PR_STATE_RANK = { open: 0, merged: 1, closed: 2 };
       /**
-       * Picks the single most relevant visible PR for a branch's compact link
+       * Picks the single most relevant visible PR within one `pr_kind` group
        * (RAL-478): prefers a still-open PR, falling back to merged then
        * closed, so a stale closed/merged link never shadows a genuinely
-       * active one when a branch somehow carries more than one visible row.
+       * active one when a branch somehow carries more than one visible row
+       * of the same kind.
        * @param {PullRequestView[]} prs
        * @returns {PullRequestView|null}
        */
@@ -726,6 +727,24 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         if (!visible.length) return null;
         return visible.reduce((best, p) =>
           (BRANCH_PR_STATE_RANK[p.state] ?? 99) < (BRANCH_PR_STATE_RANK[best.state] ?? 99) ? p : best);
+      }
+      /**
+       * Picks up to one visible PR per `pr_kind` ("parent" first, then
+       * "stack") for a branch's compact link (RAL-<new>): dual_root_pr mode
+       * gives a fork-routed root branch two concurrently-open PRs -- the real
+       * "parent" merge target and a "stack" PR that only exists so the
+       * branch visually chains into the rest of the review's PR stack -- so
+       * a branch can have up to one visible link *per kind*, not just one
+       * overall. A row with no `pr_kind` (impossible for any row created
+       * after this ticket, but tolerated for defense in depth) is treated as
+       * "parent".
+       * @param {PullRequestView[]} prs
+       * @returns {PullRequestView[]}
+       */
+      function pickBranchPrsByKind(prs) {
+        const picked = ["parent", "stack"].map((kind) =>
+          pickBranchPr(prs.filter((p) => (p.pr_kind || "parent") === kind)));
+        return /** @type {PullRequestView[]} */ (picked.filter((p) => p !== null));
       }
       // RALPHUS-PR-VISIBLE-STATES:END
       /**
@@ -766,24 +785,49 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
           </div>`;
       }
       /**
-       * Renders a compact clickable link to this branch's most relevant PR/MR
-       * (RAL-478: open, or -- once no longer open -- merged/closed), if one
-       * exists, directly in the branch row (RAL-190) -- so a branch that
-       * already has a PR stays one click away from GitHub/GitLab without
-       * expanding its detail. `branchPrSection` below shows the fuller card
-       * (with drift info) once expanded; this is just the always-visible
-       * shortcut the per-branch submit button used to give for free.
+       * Renders one compact clickable PR/MR badge (RAL-478, split out of
+       * `branchPrLink` by RAL-<new> so a dual_root_pr mode root branch can
+       * show one badge per `pr_kind` instead of collapsing to a single
+       * winner). `dual` is whether a sibling badge of the other kind is also
+       * being shown alongside this one, which changes what the tooltip needs
+       * to clarify.
+       * @param {PullRequestView} pr
+       * @param {boolean} dual
+       * @returns {string}
+       */
+      function branchPrBadge(pr, dual) {
+        if (!pr.pr_url) return "";
+        const color = prColorVar(pr);
+        const ciNote = pr.state === "open" && pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
+        const canQueryForge = pr.state === "open" && pr.pr_number != null;
+        const kindNote = pr.pr_kind === "stack"
+          ? " This is the stack PR dual-root-PR mode uses so this branch visually joins the rest of the review's PR stack -- it is never actually merged, and closes automatically once the parent PR beside it merges."
+          : dual
+            ? " This is the PR that actually gets merged; the other badge alongside it is a stack-only PR kept just for visual chaining."
+            : "";
+        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote}${kindNote} Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+      }
+      /**
+       * Renders compact clickable link(s) to this branch's most relevant
+       * PR/MR(s) (RAL-478: open, or -- once no longer open -- merged/closed),
+       * if any exist, directly in the branch row (RAL-190) -- so a branch
+       * that already has a PR stays one click away from GitHub/GitLab
+       * without expanding its detail. RAL-<new>: a fork-routed root branch
+       * in dual_root_pr mode carries two concurrently-open PRs (its real
+       * "parent" merge target and a same-repo "stack" PR for visual
+       * chaining), so this can render up to two badges, not just one.
+       * `branchPrSection` below shows the fuller card(s) (with drift info)
+       * once expanded; this is just the always-visible shortcut the
+       * per-branch submit button used to give for free.
        * @param {GuardianView} g
        * @param {GuardianBranch} b
        * @returns {string}
        */
       function branchPrLink(g, b) {
-        const pr = pickBranchPr((pullRequests[g.id] || []).filter((p) => p.branch_id === b.id));
-        if (!pr || !pr.pr_url) return "";
-        const color = prColorVar(pr);
-        const ciNote = pr.state === "open" && pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
-        const canQueryForge = pr.state === "open" && pr.pr_number != null;
-        return `<a href="${esc(pr.pr_url)}" target="_blank" rel="noopener" class="badge mono" style="color:${color};border-color:${color}" onclick="event.stopPropagation()" data-ctx="openPrMenu" data-pr-id="${esc(pr.id)}" data-pr-open="${canQueryForge ? "1" : "0"}" data-tip="Open this branch's pull/merge request on ${esc(pr.forge)}.${ciNote} Right-click to refresh its status or pull in feedback.">${esc(pr.forge)} #${pr.pr_number ?? "?"}</a>`;
+        const prs = pickBranchPrsByKind((pullRequests[g.id] || []).filter((p) => p.branch_id === b.id));
+        if (!prs.length) return "";
+        const dual = prs.length > 1;
+        return prs.map((pr) => branchPrBadge(pr, dual)).join(" ");
       }
       /**
        * Renders the PR status section for one stacked branch (RAL-190+): its

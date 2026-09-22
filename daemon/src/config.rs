@@ -213,6 +213,20 @@ pub struct ReviewConfig {
     /// `Guardian::separate_pr_branch` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub separate_pr_branch: Option<bool>,
+    /// RAL-<new>: fork-routed only. Whether a review's stack root branch
+    /// (and whichever branch later gets promoted to root) gets a second,
+    /// same-repo "stack" PR into a mirror of the parent's base branch,
+    /// alongside the existing cross-repo "parent" PR, so the root branch
+    /// visually chains into the rest of the stack instead of standing apart
+    /// from it.
+    ///
+    /// `None` means unset, which resolves to `false` (see
+    /// [`Self::dual_root_pr`]) -- today's single-PR-per-root behavior.
+    /// Per-project scalars win over the global layer, same as
+    /// `skip_worktrees`; a per-review override (see `Guardian::dual_root_pr`
+    /// in `guardian.rs`) wins over this.
+    #[serde(default)]
+    pub dual_root_pr: Option<bool>,
     /// RAL-395: whether a review automatically dispatches its agent to fix a
     /// failing PR/MR CI status. `None` means unset, which resolves to
     /// `false` (see [`Self::auto_fix_pr_errors`]); per-project scalars win
@@ -343,6 +357,14 @@ impl ReviewConfig {
         self.separate_pr_branch.unwrap_or(false)
     }
 
+    /// Whether a fork-routed review's stack root gets a second, same-repo
+    /// "stack" PR into a mirror of the parent's base branch (unset resolves
+    /// to `false` -- today's single-PR-per-root behavior). RAL-<new>.
+    #[must_use]
+    pub fn dual_root_pr(&self) -> bool {
+        self.dual_root_pr.unwrap_or(false)
+    }
+
     /// Whether a review automatically dispatches its agent to fix a failing
     /// PR/MR CI status (unset resolves to `false`). RAL-395.
     #[must_use]
@@ -404,6 +426,7 @@ impl ReviewConfig {
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
             auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
             separate_pr_branch: over.separate_pr_branch.or(self.separate_pr_branch),
+            dual_root_pr: over.dual_root_pr.or(self.dual_root_pr),
             auto_fix_pr_errors: over.auto_fix_pr_errors.or(self.auto_fix_pr_errors),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -513,6 +536,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "separate_pr_branch",
         ReviewFieldDefault::ProjectDefault(|c| c.separate_pr_branch.is_some()),
+    ),
+    (
+        "dual_root_pr",
+        ReviewFieldDefault::ProjectDefault(|c| c.dual_root_pr.is_some()),
     ),
     (
         "action",

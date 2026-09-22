@@ -462,6 +462,24 @@ impl Daemon {
         }
     }
 
+    /// [`Store::resolve_worktree_credential`] routed through the RAL-393
+    /// Stage 3 read pool -- see that method's doc comment for why this must
+    /// never wait on `StoreMutex`: doing so would self-deadlock against
+    /// `route_worktree_to_submitter_fork`'s own `git push`, whose
+    /// credential-helper subprocess calls back into this exact endpoint.
+    pub(crate) fn read_resolve_worktree_credential(
+        &self,
+        worktree_id: &str,
+        grant_secret: &str,
+    ) -> crate::store::Result<Option<String>> {
+        match self.read_pool.acquire() {
+            Some(conn) => Store::resolve_worktree_credential_conn(&conn, worktree_id, grant_secret),
+            None => self
+                .lock()
+                .resolve_worktree_credential(worktree_id, grant_secret),
+        }
+    }
+
     /// Request that `run_http_loop` stop accepting new requests and return,
     /// so `serve()` returns and the daemon process exits. See the `shutdown`
     /// field's doc comment.
@@ -596,6 +614,17 @@ struct PatchProjectForkBody {
 #[derive(Serialize)]
 struct ProjectForksResponse {
     forks: Vec<crate::project_forks::ForkRecord>,
+}
+
+#[derive(Deserialize)]
+struct SetUserForgeTokenBody {
+    host: String,
+    token: String,
+}
+
+#[derive(Serialize)]
+struct UserForgeTokensResponse {
+    tokens: Vec<crate::user_forge_tokens::UserForgeTokenSummary>,
 }
 
 #[derive(Serialize)]
@@ -1087,6 +1116,40 @@ fn route_for_user(
         // of successful/failed retirement attempts. Open to every caller
         // (read-only, like the fork reads above).
         ("GET", ["api", "worktree-retirements"]) => worktree_retirements(daemon),
+        // RAL-338 follow-up: a ralphus user's own forge personal-access
+        // tokens, keyed by host. Self-or-admin gated like the fork rows
+        // above -- a user manages their own credentials, an admin can too.
+        // List/GET never return the token value itself (see
+        // `UserForgeTokenSummary`); only `route_worktree_to_submitter_fork`'s
+        // credential-grant path ever reads the raw value.
+        ("GET", ["api", "users", user, "forge-tokens"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                list_user_forge_tokens(daemon, &target_user)
+            })
+        }
+        ("POST", ["api", "users", user, "forge-tokens"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                set_user_forge_token(daemon, &target_user, body)
+            })
+        }
+        ("DELETE", ["api", "users", user, "forge-tokens", host]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                delete_user_forge_token(daemon, &target_user, &url_decode(host))
+            })
+        }
+        // RAL-338 follow-up: fetch path for a worktree's git-credential
+        // helper. Deliberately NOT self-or-admin gated -- the caller makes
+        // no identity claim at all, `worktree_id`+`grant` (query params) is
+        // the entire authorization, checked inside the handler against
+        // `worktree_credential_grants`. Still passes through this route's
+        // normal bearer-token check like every other endpoint, so
+        // possessing the grant alone is not sufficient either -- both are
+        // required. Its only caller is `ralphus internal fork-credential-helper`
+        // (see `check_endpoint_cli_parity.py`'s `ENDPOINT_TO_CLI` mapping).
+        ("GET", ["api", "internal", "fork-credential"]) => fetch_fork_credential(daemon, query),
         ("GET", ["api", "projects", name, "forks"]) => {
             list_project_forks(daemon, &url_decode(name))
         }
@@ -2640,6 +2703,7 @@ struct EffectiveReviewDefaults {
     skip_base_updates: bool,
     match_pr_branch_name: bool,
     separate_pr_branch: bool,
+    dual_root_pr: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_build: Option<String>,
     auto_submit_pr_stack: bool,
@@ -2661,6 +2725,7 @@ impl EffectiveReviewDefaults {
             skip_base_updates: cfg.skip_base_updates(),
             match_pr_branch_name: cfg.match_pr_branch_name(),
             separate_pr_branch: cfg.separate_pr_branch(),
+            dual_root_pr: cfg.dual_root_pr(),
             auto_build: cfg.auto_build.clone(),
             auto_submit_pr_stack: cfg.auto_submit_pr_stack(),
             auto_fix_pr_errors: cfg.auto_fix_pr_errors(),
@@ -2744,6 +2809,8 @@ struct ProjectReviewSettingsBody {
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     #[serde(default)]
     auto_build: Option<String>,
     #[serde(default)]
@@ -2889,6 +2956,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.separate_pr_branch {
         settings.separate_pr_branch = Some(v);
+    }
+    if let Some(v) = req.dual_root_pr {
+        settings.dual_root_pr = Some(v);
     }
     if let Some(v) = req.auto_build {
         settings.auto_build = clear_if_empty(v);
@@ -5197,6 +5267,83 @@ fn delete_project_fork(daemon: &Daemon, project: &str, user: &str) -> Reply {
             404,
             "not_found",
             &format!("no fork registered for project {project:?} user {user:?}"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/users/{user}/forge-tokens` (RAL-338 follow-up): which hosts
+/// `user` has a token configured for. Never includes the token value.
+fn list_user_forge_tokens(daemon: &Daemon, user: &str) -> Reply {
+    match daemon.lock().list_user_forge_tokens(user) {
+        Ok(tokens) => json(200, &UserForgeTokensResponse { tokens }),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/users/{user}/forge-tokens` (RAL-338 follow-up): set or replace
+/// `user`'s token for one host. Body: `{"host": "gitlab.com", "token": "..."}`.
+fn set_user_forge_token(daemon: &Daemon, user: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetUserForgeTokenBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include non-empty \"host\" and \"token\" strings",
+            vec![],
+        );
+    };
+    let host = req.host.trim();
+    let token = req.token.trim();
+    if host.is_empty() {
+        return error(400, "invalid_value", "'host' must not be empty", vec![]);
+    }
+    if token.is_empty() {
+        return error(400, "invalid_value", "'token' must not be empty", vec![]);
+    }
+    match daemon.lock().set_user_forge_token(user, host, token) {
+        Ok(()) => json(201, &serde_json::json!({"user": user, "host": host})),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `DELETE /api/users/{user}/forge-tokens/{host}` (RAL-338 follow-up).
+fn delete_user_forge_token(daemon: &Daemon, user: &str, host: &str) -> Reply {
+    match daemon.lock().delete_user_forge_token(user, host) {
+        Ok(true) => json(200, &serde_json::json!({"removed": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("no forge token configured for user {user:?} host {host:?}"),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/internal/fork-credential?worktree_id=...&grant=...` (RAL-338
+/// follow-up): the git-credential helper's fetch path. See the route
+/// dispatch's doc comment for why this carries no self-or-admin identity
+/// check -- `worktree_id`+`grant` (matched against
+/// [`Store::resolve_worktree_credential`]) is the entire authorization.
+fn fetch_fork_credential(daemon: &Daemon, query: &str) -> Reply {
+    let Some(worktree_id) = query_param(query, "worktree_id") else {
+        return error(
+            400,
+            "bad_request",
+            "missing 'worktree_id' query param",
+            vec![],
+        );
+    };
+    let Some(grant) = query_param(query, "grant") else {
+        return error(400, "bad_request", "missing 'grant' query param", vec![]);
+    };
+    match daemon.read_resolve_worktree_credential(worktree_id, grant) {
+        Ok(Some(token)) => json(200, &serde_json::json!({"token": token})),
+        Ok(None) => error(
+            403,
+            "forbidden",
+            "no credential resolves for this worktree_id/grant pair",
             vec![],
         ),
         Err(e) => store_error(&e),
@@ -12097,6 +12244,12 @@ struct GuardianSettingsBody {
     /// field being absent) means "inherit the project/global default".
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    /// RAL-<new>: this review's own override for whether its fork-routed
+    /// stack root gets a second, same-repo "stack" PR into a mirror of the
+    /// parent's base branch. `None` (or the field being absent) means
+    /// "inherit the project/global default".
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     /// RAL-395: this review's own override for whether it auto-dispatches
     /// its agent to fix a failing PR/MR CI status. `None` (or the field
     /// being absent) means "inherit the project/global default".
@@ -12138,6 +12291,8 @@ struct GuardianDetailsBody {
     skip_worktrees: Option<bool>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
+    #[serde(default)]
+    dual_root_pr: Option<bool>,
     #[serde(default)]
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
@@ -12498,6 +12653,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.dual_root_pr {
+        if let Err(e) = store.set_guardian_dual_root_pr(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(enabled) = req.auto_fix_pr_errors {
         if let Err(e) = store.set_guardian_auto_fix_pr_errors(id, Some(enabled)) {
             return store_error(&e);
@@ -12782,6 +12942,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.separate_pr_branch {
         if let Err(e) = store.set_guardian_separate_pr_branch(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.dual_root_pr {
+        if let Err(e) = store.set_guardian_dual_root_pr(id, Some(enabled)) {
             return store_error(&e);
         }
     }
@@ -13244,6 +13409,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
+        guardian.owner.as_deref(),
     ) {
         Some(c) => c,
         None => {
@@ -16301,6 +16467,168 @@ mod tests {
         let health = route(&d, "GET", "/api/health/project-forks", "");
         assert_eq!(health.status, 200, "{}", health.body);
         assert!(health.body.contains("\"checks\":[]"));
+    }
+
+    #[test]
+    fn user_forge_tokens_route_round_trips_set_list_delete_for_self() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+
+        let set = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens",
+            &serde_json::json!({"host": "gitlab.com", "token": "glpat-secret"}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(set.status, 201, "{}", set.body);
+        assert!(
+            !set.body.contains("glpat-secret"),
+            "the token value must never appear in an API response: {}",
+            set.body
+        );
+
+        let listed = route_for_user(
+            &d,
+            "GET",
+            "/api/users/alice/forge-tokens",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        assert!(listed.body.contains("gitlab.com"));
+        assert!(
+            !listed.body.contains("glpat-secret"),
+            "a listing must never expose the token value: {}",
+            listed.body
+        );
+
+        let deleted = route_for_user(
+            &d,
+            "DELETE",
+            "/api/users/alice/forge-tokens/gitlab.com",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(deleted.status, 200, "{}", deleted.body);
+
+        let listed_after = route_for_user(
+            &d,
+            "GET",
+            "/api/users/alice/forge-tokens",
+            "",
+            Some("alice"),
+        );
+        assert_eq!(listed_after.body, "{\"tokens\":[]}");
+    }
+
+    #[test]
+    fn user_forge_tokens_route_rejects_a_different_non_admin_user() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        // Close the RAL-332 bootstrap exception (every admin-gated route
+        // treats every caller as an admin until *some* user, anywhere, is
+        // currently promoted) by leaving a *different* user permanently
+        // admin -- demoting them back down would silently reopen the
+        // bootstrap window and let bob's call through regardless of gating.
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens",
+            &serde_json::json!({"host": "gitlab.com", "token": "glpat-secret"}).to_string(),
+            Some("bob"),
+        );
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn fetch_fork_credential_route_succeeds_only_with_the_matching_grant() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock()
+            .set_user_forge_token("alice", "gitlab.com", "glpat-secret")
+            .unwrap();
+        let grant = d
+            .lock()
+            .mint_worktree_credential_grant("wt-1", "alice", "gitlab.com")
+            .unwrap();
+
+        let ok = route(
+            &d,
+            "GET",
+            &format!("/api/internal/fork-credential?worktree_id=wt-1&grant={grant}"),
+            "",
+        );
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert!(ok.body.contains("glpat-secret"));
+
+        let wrong_grant = route(
+            &d,
+            "GET",
+            "/api/internal/fork-credential?worktree_id=wt-1&grant=not-it",
+            "",
+        );
+        assert_eq!(wrong_grant.status, 403, "{}", wrong_grant.body);
+
+        let missing_params = route(&d, "GET", "/api/internal/fork-credential", "");
+        assert_eq!(missing_params.status, 400, "{}", missing_params.body);
+    }
+
+    #[test]
+    fn fetch_fork_credential_does_not_wait_behind_a_held_store_lock() {
+        // Regression test for a real, observed self-deadlock:
+        // `route_worktree_to_submitter_fork` runs its own `git push` while
+        // holding `StoreMutex` (materialization's existing, accepted lock
+        // scope), and that push's credential-helper subprocess calls back
+        // into this exact endpoint. If the endpoint's handler also needed
+        // `StoreMutex`, that callback would block forever behind a lock its
+        // own caller already holds -- the push (and therefore the lock)
+        // never releases until the callback answers, which never happens.
+        // `read_resolve_worktree_credential` (RAL-393 Stage 3 pool) fixes
+        // this by never touching `StoreMutex` at all; this test proves that
+        // property holds by asserting the fetch stays fast even while
+        // something else holds the lock for multiple seconds.
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock()
+            .set_user_forge_token("alice", "gitlab.com", "glpat-secret")
+            .unwrap();
+        let grant = d
+            .lock()
+            .mint_worktree_credential_grant("wt-1", "alice", "gitlab.com")
+            .unwrap();
+
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                let _guard = d.lock();
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            });
+            // Give the holder thread a moment to actually acquire the lock
+            // before racing the fetch against it.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            let started = std::time::Instant::now();
+            let r = route(
+                &d,
+                "GET",
+                &format!("/api/internal/fork-credential?worktree_id=wt-1&grant={grant}"),
+                "",
+            );
+            let elapsed = started.elapsed();
+            assert_eq!(r.status, 200, "{}", r.body);
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "fetch_fork_credential took {elapsed:?} while another thread held StoreMutex -- \
+                 it must never wait on that lock, or a real fork-routed push's own \
+                 credential-helper callback would deadlock against itself"
+            );
+
+            holder.join().unwrap();
+        });
     }
 
     #[test]

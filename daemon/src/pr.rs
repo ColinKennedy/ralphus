@@ -151,6 +151,15 @@ pub struct PullRequestView {
     /// before the column existed and never polled since -- the board treats
     /// that as not-draft.
     pub draft: Option<bool>,
+    /// RAL-<new>: `"parent"` (the default, and every pre-`dual_root_pr` row)
+    /// or `"stack"` -- a fork-routed root branch's second, same-repo PR into
+    /// the fork's maintained base branch, only created when `dual_root_pr` is enabled. A
+    /// `"stack"` row is deliberately excluded from base-drift/resync
+    /// (`open_prs_by_branch`), the "every PR must merge" completion gate
+    /// (`settle_pr_merge_states`), and `ci_watch::run_watch` -- its target
+    /// never changes with stack reordering and it's meant to be closed, not
+    /// merged.
+    pub pr_kind: String,
 }
 
 /// One past "submit a stack" call for a review (RAL-302): every PR row that
@@ -256,6 +265,7 @@ struct PrRow {
     auto_fix_attempted_at_ms: Option<i64>,
     auto_fix_exhausted_notified_at_ms: Option<i64>,
     draft: Option<bool>,
+    pr_kind: String,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -285,11 +295,12 @@ impl From<PrRow> for PullRequestView {
             auto_fix_attempted_at_ms: r.auto_fix_attempted_at_ms,
             auto_fix_exhausted_notified_at_ms: r.auto_fix_exhausted_notified_at_ms,
             draft: r.draft,
+            pr_kind: r.pr_kind,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft, auto_fix_exhausted_notified_at_ms";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft, auto_fix_exhausted_notified_at_ms, pr_kind";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -317,6 +328,7 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         auto_fix_attempted_at_ms: r.get(21)?,
         draft: r.get(22)?,
         auto_fix_exhausted_notified_at_ms: r.get(23)?,
+        pr_kind: r.get(24)?,
     })
 }
 
@@ -349,6 +361,7 @@ impl Store {
             pr_url,
             None,
             false,
+            "parent",
         )
     }
 
@@ -358,7 +371,10 @@ impl Store {
     /// past submission later, even if some of them are since dropped
     /// (see [`Self::drop_pull_request`]). `draft` (RAL-353) is the forge's
     /// own draft (WIP) state from the create/adopt response, recorded verbatim
-    /// so an adoption/refresh can't clobber it.
+    /// so an adoption/refresh can't clobber it. `pr_kind` (RAL-<new>) is
+    /// `"parent"` for every ordinary PR or `"stack"` for a fork-routed root
+    /// branch's second, same-repo PR into the fork's maintained base branch -- see
+    /// [`PullRequestView::pr_kind`].
     #[allow(clippy::too_many_arguments)]
     pub fn create_pull_request_ex(
         &self,
@@ -374,6 +390,7 @@ impl Store {
         pr_url: Option<&str>,
         stack_id: Option<&str>,
         draft: bool,
+        pr_kind: &str,
     ) -> Result<String> {
         let id = self.next_id("guardian_pr_seq", "pr")?;
         let now = now_ms();
@@ -381,8 +398,8 @@ impl Store {
             "INSERT INTO guardian_pull_requests(
                 id, guardian_id, branch_id, forge, repo, branch_alias, base_ref,
                 title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms,
-                stack_id, draft
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?)",
+                stack_id, draft, pr_kind
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?)",
             params![
                 id,
                 guardian_id,
@@ -399,6 +416,7 @@ impl Store {
                 now,
                 stack_id,
                 draft,
+                pr_kind,
             ],
         )?;
         Ok(id)
@@ -1808,14 +1826,24 @@ fn open_alias_by_branch(prs: &[PullRequestView]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Groups `prs` by branch id, open PRs only, "most recently created wins" when
-/// a branch has more than one historical row (e.g. a resubmission) -- shared
-/// by [`resync_pr_bases`] (which needs the full row to PATCH the forge PR) and
-/// [`open_alias_by_branch`] (which only needs the alias).
+/// Groups `prs` by branch id, open **parent-kind** PRs only, "most recently
+/// created wins" when a branch has more than one historical row (e.g. a
+/// resubmission) -- shared by [`resync_pr_bases`] (which needs the full row
+/// to PATCH the forge PR), [`open_alias_by_branch`] (which only needs the
+/// alias), and `reconcile_native_pr_stack`'s GitHub native-stack chain
+/// building.
+///
+/// RAL-<new>: a `"stack"`-kind row (a fork-routed root branch's second,
+/// same-repo PR into the fork's maintained base branch) is deliberately excluded here, not
+/// merely uncommon -- its target never changes with stack reordering, so it
+/// structurally never needs base-drift resync, and it must never be folded
+/// into GitHub's native same-repo stack chain, which it would otherwise look
+/// like a legitimate member of (it shares a head branch with its sibling
+/// `"parent"` row, which no repo-only check catches).
 fn open_prs_by_branch(prs: &[PullRequestView]) -> HashMap<&str, &PullRequestView> {
     let mut by_branch: HashMap<&str, &PullRequestView> = HashMap::new();
     for pr in prs {
-        if pr.state != "open" {
+        if pr.state != "open" || pr.pr_kind != "parent" {
             continue;
         }
         if let Some(bid) = pr.branch_id.as_deref() {
@@ -1948,8 +1976,9 @@ fn forge_parent_remote_name(
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
 ) -> String {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg).parent_remote_name
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner).parent_remote_name
 }
 
 /// Resolve [`PrRepoRouting`] for `guardian`'s project (by `guardian.git_root`
@@ -1969,24 +1998,45 @@ pub fn forge_client_for_pr(
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     repo: &str,
+    owner: Option<&str>,
 ) -> Option<crate::forge::ForgeClient> {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg)
+    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner)
         .client_for(repo)
         .cloned()
 }
 
+/// `owner` should be the guardian's own resolved `owner` (submitter/
+/// `default_pr_user`/daemon default, per [`crate::guardian::resolve_review_owner`])
+/// -- RAL-338 follow-up: a project's fork row is keyed by whichever real user
+/// registered it (see `project_fork add --owner`/`project fork set`), never
+/// by an empty string, so a caller that only ever tried `user=""` here found
+/// no fork row at all and silently fell back to a single parent-only client.
+/// Every PR actually filed on that fork then got probed/PATCHed through the
+/// *parent's* client instead -- and since GitLab/GitHub issue PR/MR numbers
+/// per-repository starting from 1, a fork-hosted PR's number routinely
+/// collides with a same-numbered PR in the unrelated parent project, so this
+/// wasn't merely a 404: it read and rewrote whichever parent PR happened to
+/// share that number, including its target branch. `owner` is tried first,
+/// falling back to the empty-string project-wide-default row for any
+/// project that does use that convention, so a guardian with no owner (or an
+/// owner with no fork of its own) still resolves the same fork a
+/// project-wide default would have named.
 fn resolve_pr_repo_routing(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
 ) -> PrRepoRouting {
     let project_name = store
         .lock()
         .project_name_for_path(root.to_str().unwrap_or_default());
-    let fork = project_name
-        .as_deref()
-        .and_then(|p| store.lock().resolve_fork(p, "").ok().flatten());
+    let fork = project_name.as_deref().and_then(|p| {
+        owner
+            .filter(|o| !o.is_empty())
+            .and_then(|o| store.lock().resolve_fork(p, o).ok().flatten())
+            .or_else(|| store.lock().resolve_fork(p, "").ok().flatten())
+    });
     let Some(fork) = fork else {
         let parent_remote_name = crate::forge::resolve_remote_name(root, base_branch, forge_cfg);
         return PrRepoRouting {
@@ -2003,7 +2053,27 @@ fn resolve_pr_repo_routing(
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg).ok();
-    let fork_client = crate::forge::resolve_remote_for(root, &fork.remote_name, forge_cfg).ok();
+    // RAL-338 follow-up: the fork's own client must authenticate as the
+    // fork's registered owner (`fork.user`), not the daemon's single shared
+    // identity -- unlike the parent client above (there is only ever one
+    // parent), the fork's owner may be a different person entirely, and the
+    // daemon's own token routinely lacks visibility into that user's fork
+    // (GitLab/GitHub answer with a 404, not a 403, for a resource the
+    // token can't see, so this looked identical to "the PR doesn't exist").
+    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
+        store
+            .lock()
+            .get_user_forge_token(&fork.user, &host)
+            .ok()
+            .flatten()
+    });
+    let fork_client = crate::forge::resolve_remote_for_as(
+        root,
+        &fork.remote_name,
+        forge_cfg,
+        fork_token.as_deref(),
+    )
+    .ok();
     PrRepoRouting {
         parent_client,
         parent_remote_name,
@@ -2026,13 +2096,13 @@ fn resolve_pr_repo_routing(
 pub(crate) fn resolve_feedback_fork_remote(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
+    owner: Option<&str>,
 ) -> Option<String> {
     let project_name = store.lock().project_name_for_path(root.to_str()?)?;
-    let fork = store
-        .lock()
-        .resolve_fork(&project_name, "")
-        .ok()
-        .flatten()?;
+    let fork = owner
+        .filter(|o| !o.is_empty())
+        .and_then(|o| store.lock().resolve_fork(&project_name, o).ok().flatten())
+        .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())?;
     crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url).ok()?;
     Some(fork.remote_name)
 }
@@ -2061,7 +2131,13 @@ fn resync_pr_bases_inner(
     }
     let alias_by_branch = open_alias_by_branch(&prs);
 
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let (parent_client, fork_client) = (routing.parent_client, routing.fork_client);
     let resolved_client_err = if parent_client.is_none() && fork_client.is_none() {
         crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg).err()
@@ -2535,7 +2611,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         // else against the fork) -- resolve both candidates and pick
         // whichever matches this PR's own recorded `repo`, rather than a
         // single `resolve_remote` call that can only ever match one of them.
-        let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+        let routing = resolve_pr_repo_routing(
+            store,
+            &root,
+            &guardian.base_branch,
+            &forge_cfg,
+            guardian.owner.as_deref(),
+        );
         match routing.client_for(&pr.repo) {
             Some(client) if client.kind().as_str() == pr.forge => {
                 jobs.push(MergeCheckJob {
@@ -2692,6 +2774,55 @@ fn maybe_promote_fork_root(
         .lock()
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
+    // RAL-<new>: dual-root-PR mode -- this branch's own PR just merged (it
+    // WAS the stack's root), so its "stack" PR (if `dual_root_pr` was on)
+    // has done its job and must be closed too. Gated on "this branch's own
+    // parent PR just merged," not on "a successor exists to promote" below:
+    // the last branch in a stack has no successor, but its stack PR is just
+    // as orphaned once its parent PR merges, and needs the same cleanup.
+    if guardian.effective_dual_root_pr {
+        if let Some(old_stack_pr) = prs.iter().find(|pr| {
+            pr.pr_kind == "stack"
+                && pr.state == "open"
+                && pr.branch_id.as_deref() == merged_root.branch_id.as_deref()
+        }) {
+            if let Some(number) = old_stack_pr.pr_number {
+                let pointer = format!(
+                    "This branch's real merge target just merged for real: {}",
+                    merged_root
+                        .pr_url
+                        .as_deref()
+                        .unwrap_or("(see this branch's parent PR)")
+                );
+                if let Err(e) = routing.fork_client.close_pull_request(number) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} could not close stack pr={} whose branch's \
+                         parent pr just merged: {e}",
+                        old_stack_pr.id
+                    );
+                }
+                if let Err(e) = routing.fork_client.post_pr_comment(number, &pointer) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} could not post the pointer comment on stack \
+                         pr={}: {e}",
+                        old_stack_pr.id
+                    );
+                }
+            }
+            let _ = store.lock().update_pull_request_ex(
+                &old_stack_pr.id,
+                None,
+                None,
+                None,
+                Some("closed"),
+                None,
+                None,
+                None,
+            );
+        }
+    }
     // Walk forward from the merged root's position to the first enabled
     // branch that still has an *open* PR -- not simply the literal next
     // branch by position, which may itself have also merged in this same
@@ -2799,6 +2930,7 @@ fn maybe_promote_fork_root(
         Some(&created.url),
         successor_pr.stack_id.as_deref(),
         created.draft,
+        "parent",
     );
     let _ = store.lock().update_pull_request_ex(
         &successor_pr.id,
@@ -2846,6 +2978,87 @@ fn maybe_promote_fork_root(
                 successor_pr.id,
                 created.number
             );
+        }
+    }
+    // RAL-<new>: dual-root-PR mode -- the successor is now the stack's
+    // root, so it needs its own "stack" PR the same way a fresh
+    // submission's root branch does (see `submit_stacked_branch_pr`).
+    // A failed fork-base maintenance step cannot undo the promotion above,
+    // but it must prevent a stack PR from being filed against a stale base.
+    if guardian.effective_dual_root_pr {
+        if let Err(e) = crate::project_forks::sync_fork_base_branch(
+            &root,
+            &parent_remote_name,
+            &routing.fork.remote_name,
+            &base_branch_name,
+        ) {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} could not fast-forward the fork base branch during \
+                 promotion: {e}"
+            );
+            return;
+        }
+        let stack_route = stack_pr_route(&routing, &successor_pr.branch_alias, &base_branch_name);
+        let stack_result = match stack_route.find_existing_pull_request() {
+            Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
+            Ok(None) => stack_route
+                .create_pull_request(
+                    &successor_pr.title,
+                    &successor_pr.description,
+                    successor_pr.draft.unwrap_or(false),
+                )
+                .map(|c| (c.number, c.url, c.draft)),
+            Err(e) => Err(e),
+        };
+        match stack_result {
+            Ok((number, url, stack_draft)) => {
+                if let Err(e) = store.lock().create_pull_request_ex(
+                    id,
+                    Some(successor_branch.id.as_str()),
+                    stack_route.client.kind().as_str(),
+                    &stack_route.repo,
+                    &successor_pr.branch_alias,
+                    &base_branch_name,
+                    &successor_pr.title,
+                    &successor_pr.description,
+                    Some(number),
+                    Some(&url),
+                    successor_pr.stack_id.as_deref(),
+                    stack_draft,
+                    "stack",
+                ) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} promoted successor's stack pr created on the \
+                         forge (number={number}) but failed to record it locally: {e}"
+                    );
+                    let guard = store.lock();
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::WARNING,
+                        source: "pr",
+                        message: "promoted successor stack PR was not recorded locally",
+                        scope: Some("guardian"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "branch_id": successor_branch.id,
+                            "pr_number": number,
+                        }),
+                        admin_only: false,
+                    });
+                }
+            }
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not create/adopt the promoted successor's \
+                     dual-root-PR mode stack pr: {e}"
+                );
+            }
         }
     }
 }
@@ -2994,10 +3207,17 @@ fn settle_pr_merge_states(
         // review that was ever promoted could never satisfy "every linked pr
         // has merged" again either. Its replacement row is what actually
         // needs to merge.
+        // RAL-<new>: a `"stack"`-kind row (dual-root-PR mode's second,
+        // same-repo PR into the fork's maintained base branch) is never expected to merge --
+        // it's closed instead once its branch's parent PR merges (see
+        // `maybe_promote_fork_root`) -- so it must never gate this "every
+        // linked PR has merged" completion check.
         let live_prs: Vec<&PullRequestView> = current_prs
             .iter()
             .filter(|pull_request| {
-                pull_request.state != "dropped" && pull_request.superseded_by.is_none()
+                pull_request.state != "dropped"
+                    && pull_request.superseded_by.is_none()
+                    && pull_request.pr_kind != "stack"
             })
             .collect();
         // RAL-480: a review's stack can merge partially -- one PR/MR merges
@@ -3186,7 +3406,13 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     // root (its PR is filed against the parent, but its ref still lives on
     // the fork) -- so resolve per-PR rather than one remote for the whole
     // guardian.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
 
     for pr in open_prs {
         let remote_name = routing.remote_for(&pr.repo);
@@ -3442,7 +3668,13 @@ pub fn detect_forge_reorder(
     // RAL-338: a fork-mode review's PRs may be split across two repositories,
     // so resolve both candidate clients up front and pick per-PR via each
     // row's own stored `repo` -- see [`PrRepoRouting`].
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
 
     let prs = store
@@ -3650,7 +3882,7 @@ pub fn check_and_apply_forge_reorder(
         drift.base_changed,
         drift.order_changed
     );
-    let (root, base_branch, forge_cfg) = {
+    let (root, base_branch, forge_cfg, owner) = {
         let guardian = match store.lock().get_guardian(id) {
             Ok(g) => g,
             Err(e) => {
@@ -3663,9 +3895,10 @@ pub fn check_and_apply_forge_reorder(
         };
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        (root, guardian.base_branch, forge_cfg)
+        (root, guardian.base_branch, forge_cfg, guardian.owner)
     };
-    let remote_name = forge_parent_remote_name(store, &root, &base_branch, &forge_cfg);
+    let remote_name =
+        forge_parent_remote_name(store, &root, &base_branch, &forge_cfg, owner.as_deref());
     let local_base = qualify_forge_base(&base_branch, &remote_name, &drift.base);
     {
         let mut guard = store.lock();
@@ -3871,7 +4104,13 @@ pub fn poll_pr_base_drift(
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: resolve both candidate clients so each PR's base-drift check
     // uses whichever repository it's actually filed on.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
 
     let prs = store
@@ -4156,9 +4395,15 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let backed_off = {
         let root = PathBuf::from(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(&root);
-        resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg)
-            .client_for("")
-            .is_some_and(is_backed_off)
+        resolve_pr_repo_routing(
+            store,
+            &root,
+            &guardian.base_branch,
+            &forge_cfg,
+            guardian.owner.as_deref(),
+        )
+        .client_for("")
+        .is_some_and(is_backed_off)
     };
     if backed_off {
         // ralphus[ignore-rlog-pair]: rate-limit path records the structured outcome; this routine only skips a poll
@@ -4180,7 +4425,13 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for("").to_string();
 
     // Drift pass. Every `SYNC_FETCH_LOCKS` guard this takes is confined to this
@@ -4532,6 +4783,27 @@ fn resolve_fork_routing(
             )
         },
     )?;
+    // RAL-338 follow-up: this `root` is a review/guardian-merge worktree,
+    // separate from (and created after) the cell worktree
+    // `route_worktree_to_submitter_fork` already wires identity/credentials
+    // onto -- without this, a stacked-PR push from here has no git identity
+    // override and, for an HTTPS fork, no way to authenticate at all (git
+    // falls back to an interactive credential prompt that fails immediately
+    // in a non-interactive context: "credential-cache unavailable... could
+    // not read Username").
+    crate::worktrees::apply_worktree_git_identity_best_effort(
+        root,
+        &crate::project_forks::GitIdentity {
+            name: fork.git_user_name.clone(),
+            email: fork.git_user_email.clone(),
+        },
+    );
+    crate::worktrees::apply_worktree_credential_helper_best_effort(
+        &store.lock(),
+        root,
+        user,
+        &fork.fork_url,
+    );
     let parent_remote_name = crate::forge::resolve_remote_name_excluding(
         root,
         &guardian.base_branch,
@@ -4539,7 +4811,29 @@ fn resolve_fork_routing(
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)?;
-    let fork_client = crate::forge::resolve_remote_for(root, &fork.remote_name, forge_cfg)?;
+    // RAL-338 follow-up: the fork's own forge REST API client must
+    // authenticate as the fork's owning user, not the daemon's single
+    // shared identity -- unlike the parent client above (there is only
+    // ever one parent, so the daemon's own env-var/CLI-token identity is
+    // correct there), the fork's owner may be a different person entirely.
+    // Without this, git push (already routed through this user's stored
+    // token via the credential helper) succeeds, but the REST call to
+    // actually open the PR/MR fails with a permissions error, since it
+    // authenticated as whoever the daemon's shared identity is instead of
+    // the fork's actual owner.
+    let fork_token = crate::forge::parse_remote_url(fork.fork_url.trim()).and_then(|(host, _)| {
+        store
+            .lock()
+            .get_user_forge_token(user, &host)
+            .ok()
+            .flatten()
+    });
+    let fork_client = crate::forge::resolve_remote_for_as(
+        root,
+        &fork.remote_name,
+        forge_cfg,
+        fork_token.as_deref(),
+    )?;
     let parent_project_id = if fork_client.kind() == crate::forge::ForgeKind::GitLab {
         Some(
             parent_client
@@ -4619,6 +4913,29 @@ fn fork_aware_route(
             target_project_id: None,
             repo: routing.fork_client.repo_label().to_string(),
         }),
+    }
+}
+
+/// The route for a dual-root-PR mode "stack" PR (RAL-<new>): always
+/// same-repo within the fork, targeting the fork's maintained copy of the
+/// parent's base branch instead of another stack branch's alias -- so it
+/// visually chains into the rest of the stack, since both ends live in the
+/// fork, without ever needing to touch the parent repository. Unlike [`fork_aware_route`]'s cross-repo
+/// root case, this never needs `fork.fork_owner` -- it's never a GitHub
+/// cross-repo PR, so [`crate::forge::ForgeClient::same_repo_head`] (already
+/// what every non-root branch's head goes through today) is always safe to
+/// build, for both forges.
+fn stack_pr_route(
+    routing: &ForkRouting,
+    alias: &str,
+    base_branch_name: &str,
+) -> crate::forge::PrRoute {
+    crate::forge::PrRoute {
+        client: routing.fork_client.clone(),
+        head: routing.fork_client.same_repo_head(alias),
+        base: base_branch_name.to_string(),
+        target_project_id: None,
+        repo: routing.fork_client.repo_label().to_string(),
     }
 }
 
@@ -5006,6 +5323,7 @@ fn submit_stacked_branch_pr(
             Some(&created_pr.url),
             Some(stack_id),
             created_pr.draft,
+            "parent",
         )
         .map_err(|e| e.to_string())?;
     if let Some(sha) = &pushed_sha {
@@ -5046,6 +5364,61 @@ fn submit_stacked_branch_pr(
             }),
             admin_only: false,
         });
+    }
+    // RAL-<new>: dual-root-PR mode -- this branch's PR is the stack's root
+    // (`base == base_branch_name`, the same predicate `fork_aware_route`
+    // itself uses to decide root routing) and the setting is on: also
+    // create/adopt a second, same-repo "stack" PR into the fork base branch, so
+    // this branch visually chains into the rest of the stack alongside the
+    // parent PR above (unchanged -- still the one that actually gets
+    // merged). Reuses the same title/description already resolved for the
+    // parent PR rather than re-running `resolve_title_description` (which
+    // may be an LLM call) a second time for the same branch. Best-effort:
+    // failing to create the stack PR must not fail the whole submission --
+    // the parent PR above is what actually matters for merge-readiness.
+    if guardian.effective_dual_root_pr && base == base_branch_name {
+        if let Some(routing) = fork_routing {
+            let stack_route = stack_pr_route(routing, &alias, base_branch_name);
+            let stack_result = match stack_route.find_existing_pull_request() {
+                Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
+                Ok(None) => stack_route
+                    .create_pull_request(&title, &description, draft)
+                    .map(|c| (c.number, c.url, c.draft)),
+                Err(e) => Err(e),
+            };
+            match stack_result {
+                Ok((number, url, stack_draft)) => {
+                    if let Err(e) = store.lock().create_pull_request_ex(
+                        id,
+                        Some(branch_id),
+                        stack_route.client.kind().as_str(),
+                        &stack_route.repo,
+                        &alias,
+                        base_branch_name,
+                        &title,
+                        &description,
+                        Some(number),
+                        Some(&url),
+                        Some(stack_id),
+                        stack_draft,
+                        "stack",
+                    ) {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} branch {branch_id} created the stack PR on \
+                             the forge (number={number}) but failed to record it locally: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} branch {branch_id} could not create/adopt its \
+                         dual-root-PR mode stack PR: {e}"
+                    );
+                }
+            }
+        }
     }
     // So a later branch in the same batch (or the whole-stack loop) chains
     // its own base onto this one instead of falling back to the guardian's
@@ -5756,6 +6129,22 @@ fn auto_submit_terminal_branches(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
+    // branch, fast-forwarded from the parent once per submission call (not per
+    // branch -- which branch is currently root is a per-branch question
+    // `fork_aware_route` answers deep inside the loop below, and syncing
+    // unconditionally here is cheap and correctness-safe even when this
+    // particular call doesn't happen to touch the root branch).
+    if let Some(routing) = &fork_routing {
+        if guardian.effective_dual_root_pr {
+            crate::project_forks::sync_fork_base_branch(
+                &root,
+                &parent_remote_name,
+                &routing.fork.remote_name,
+                &base_branch_name,
+            )?;
+        }
+    }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
     let client = match &fork_routing {
         Some(routing) => routing.fork_client.clone(),
@@ -6153,6 +6542,22 @@ fn submit_pull_requests_inner(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
+    // branch, fast-forwarded from the parent once per submission call (not per
+    // branch -- which branch is currently root is a per-branch question
+    // `fork_aware_route` answers deep inside the loop below, and syncing
+    // unconditionally here is cheap and correctness-safe even when this
+    // particular call doesn't happen to touch the root branch).
+    if let Some(routing) = &fork_routing {
+        if guardian.effective_dual_root_pr {
+            crate::project_forks::sync_fork_base_branch(
+                &root,
+                &parent_remote_name,
+                &routing.fork.remote_name,
+                &base_branch_name,
+            )?;
+        }
+    }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
     let client = match &fork_routing {
         Some(routing) => routing.fork_client.clone(),
@@ -6488,7 +6893,13 @@ fn fetch_remote_pr_tip(
     // RAL-338: this PR's branch alias lives on the fork's remote in fork
     // mode, including the root's (its PR is filed against the parent, but
     // its ref still lives on the fork).
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
     // Held across both commands so a concurrent re-check of this same PR
@@ -6743,7 +7154,13 @@ pub fn pull_pr_commits(
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: pull from whichever remote this PR's own alias actually lives
     // on (the fork in fork mode, including the root's).
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
 
     let pulled = guardian_merge::pull_pr_commits(
@@ -7061,7 +7478,13 @@ fn action_pr_feedback_inner(
     // RAL-338: this PR may be filed on either the parent or the fork --
     // resolve both candidates and use whichever matches its own recorded
     // `repo` for both the comments read and (below) the push-back remote.
-    let routing = resolve_pr_repo_routing(store, &root, &guardian.base_branch, &forge_cfg);
+    let routing = resolve_pr_repo_routing(
+        store,
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    );
     let remote_name = routing.remote_for(&pr.repo).to_string();
     let client = routing.client_for(&pr.repo).cloned().ok_or_else(|| {
         format!(
@@ -7819,7 +8242,172 @@ mod tests {
             auto_fix_attempted_at_ms: None,
             auto_fix_exhausted_notified_at_ms: None,
             draft: None,
+            pr_kind: "parent".to_string(),
         }
+    }
+
+    #[test]
+    fn open_prs_by_branch_excludes_stack_kind_rows() {
+        // RAL-<new>: a dual-root-PR mode root branch can have TWO open rows
+        // for the same branch_id -- "parent" (the real merge target) and
+        // "stack" (the fork-base-targeting visual-chain PR). Base-drift resync/
+        // GitHub native-stack reconciliation must only ever see the parent
+        // one; the stack row's target is fixed and never needs resyncing,
+        // and it must never be folded into a native same-repo stack chain.
+        let mut parent = test_pr("root-review", "main");
+        parent.branch_id = Some("branch-1".to_string());
+        let mut stack = test_pr("root-review", "main");
+        stack.branch_id = Some("branch-1".to_string());
+        stack.pr_kind = "stack".to_string();
+
+        let prs = [parent.clone(), stack];
+        let by_branch = open_prs_by_branch(&prs);
+        assert_eq!(by_branch.len(), 1);
+        assert_eq!(by_branch["branch-1"].pr_kind, "parent");
+        assert_eq!(by_branch["branch-1"].base_ref, parent.base_ref);
+    }
+
+    #[test]
+    fn stack_pr_route_targets_the_fork_base_branch_same_repo_on_both_forges() {
+        for kind in [
+            crate::forge::ForgeKind::GitHub,
+            crate::forge::ForgeKind::GitLab,
+        ] {
+            let fork_client = crate::forge::ForgeClient::new(
+                kind,
+                "http://x".to_string(),
+                if kind == crate::forge::ForgeKind::GitHub {
+                    "alice/widget".to_string()
+                } else {
+                    "alice%2Fwidget".to_string()
+                },
+                Some("tok".to_string()),
+            );
+            let parent_client = crate::forge::ForgeClient::new(
+                kind,
+                "http://x".to_string(),
+                "acme/widget".to_string(),
+                Some("tok".to_string()),
+            );
+            let routing = ForkRouting {
+                fork: crate::project_forks::ForkRecord {
+                    project: "demo".to_string(),
+                    user: "alice".to_string(),
+                    fork_url: "https://example.invalid/alice/widget.git".to_string(),
+                    remote_name: "fork".to_string(),
+                    fork_owner: "alice".to_string(),
+                    git_user_name: None,
+                    git_user_email: None,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                parent_client,
+                fork_client: fork_client.clone(),
+                parent_project_id: Some(999),
+            };
+            let route = stack_pr_route(&routing, "b-alias", "main");
+            assert_eq!(route.base, "main");
+            assert_eq!(route.target_project_id, None);
+            assert_eq!(route.repo, fork_client.repo_label());
+            assert_eq!(route.head, fork_client.same_repo_head("b-alias"));
+        }
+    }
+
+    #[test]
+    fn sync_fork_base_branch_fast_forwards_to_the_parents_current_tip() {
+        // Fully hermetic -- both "remotes" are real local bare repos, no
+        // HTTP/network involved, exercising the actual git fetch+push this
+        // helper performs.
+        let parent_bare = tmp_dir("fork-base-sync-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+        let fork_bare = tmp_dir("fork-base-sync-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let root_dir = tmp_dir("fork-base-sync-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "v1\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "v1"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "release:release"]);
+        let v1_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
+
+        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
+            .unwrap();
+        let fork_tip = g(&fork_bare, &["rev-parse", "refs/heads/release"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            fork_tip, v1_sha,
+            "the fork base branch must match the parent's current tip"
+        );
+
+        // Advance the parent past the fork base and confirm a second sync
+        // fast-forwards it to match -- idempotent/re-syncable, not a one-shot
+        // creation.
+        gwrite(&root_dir, "base.txt", "v2\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "v2"]);
+        g(&root_dir, &["push", "origin", "release:release"]);
+        let v2_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
+        assert_ne!(v1_sha, v2_sha);
+
+        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
+            .unwrap();
+        let fork_tip_after = g(&fork_bare, &["rev-parse", "refs/heads/release"])
+            .trim()
+            .to_string();
+        assert_eq!(fork_tip_after, v2_sha);
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn sync_fork_base_branch_refuses_to_overwrite_a_diverged_fork_branch() {
+        let parent_bare = tmp_dir("fork-base-diverged-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+        let fork_bare = tmp_dir("fork-base-diverged-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+        let root_dir = tmp_dir("fork-base-diverged-work");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "base.txt", "parent\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "parent"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "main:main"]);
+        g(&root_dir, &["checkout", "-b", "fork-only"]);
+        gwrite(&root_dir, "fork.txt", "fork only\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "fork only"]);
+        g(&root_dir, &["push", "fork", "HEAD:main"]);
+
+        let error =
+            crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "main")
+                .unwrap_err();
+        assert!(
+            error.contains("could not fast-forward fork branch main"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
     }
 
     #[test]
@@ -10075,7 +10663,7 @@ mod tests {
         // apply block calls, so this test breaks if that call site ever
         // drifts back to a plain, non-excluding remote resolution.
         let forge_cfg = crate::config::resolve_forge(&root_dir);
-        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg);
+        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg, None);
         let local_base = qualify_forge_base("alt/main", &remote_name, &drift.base);
         assert!(
             store
@@ -10094,6 +10682,99 @@ mod tests {
              nothing is left to fix, instead of looping forever"
         );
         handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn resolve_pr_repo_routing_finds_a_fork_registered_under_a_real_user_not_only_the_empty_default()
+     {
+        // RAL-338 follow-up: every maintenance-path forge client (base drift,
+        // reorder detection, merge checks, ci-watch) used to look up a
+        // guardian's fork via a hardcoded `user=""`, which only ever matched
+        // a project registered with that literal empty-string convention.
+        // Registering a fork under a real username (as `project fork
+        // add`/`project fork set` actually do) made every one of those
+        // lookups silently miss, degrading to a single parent-only client --
+        // and since GitHub/GitLab number PRs/MRs per repository starting
+        // from 1, that parent-only client would then read/PATCH whatever
+        // unrelated PR in the *parent* happened to share a fork-hosted PR's
+        // number.
+        let root_dir = tmp_dir("fork-routing-real-user");
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "fork-alice",
+                "https://github.com/alice/widget.git",
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            "[forge]\nkind = \"github\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        store
+            .lock()
+            .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        // Registered under a real username, never the empty-string row.
+        store
+            .lock()
+            .upsert_project_fork(
+                "demo",
+                "alice",
+                "https://github.com/alice/widget.git",
+                "fork-alice",
+                "alice",
+            )
+            .unwrap();
+
+        let forge_cfg = crate::config::resolve_forge(&root_dir);
+
+        let routing_no_owner =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, None);
+        assert!(
+            routing_no_owner.fork_client.is_none(),
+            "with no owner to try and no empty-string default row registered, no fork should resolve"
+        );
+
+        let routing_with_owner =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        assert!(
+            routing_with_owner.fork_client.is_some(),
+            "the guardian's own owner must be tried against the fork table, not only \"\""
+        );
+
+        // Once alice has a stored token for this host, the fork client built
+        // on her behalf must carry it -- this is what actually fixes the
+        // 404s: without it, a maintenance-path forge call for alice's fork
+        // authenticated as the daemon's own shared identity instead, which
+        // routinely lacks visibility into a fork it doesn't own.
+        store.lock().create_user("alice").unwrap();
+        store
+            .lock()
+            .set_user_forge_token("alice", "github.com", "alices-own-token")
+            .unwrap();
+        let routing_with_token =
+            resolve_pr_repo_routing(&store, &root_dir, "origin/main", &forge_cfg, Some("alice"));
+        assert_eq!(
+            routing_with_token.fork_client.unwrap().token(),
+            Some("alices-own-token")
+        );
+
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -10542,6 +11223,105 @@ mod tests {
     }
 
     #[test]
+    fn check_pr_merges_approves_even_while_a_stack_kind_pr_is_still_open() {
+        // RAL-<new>: dual-root-PR mode's "stack" PR is never expected to
+        // merge -- it's closed once its branch's parent PR merges (see
+        // `maybe_promote_fork_root`), not merged itself. The "every linked
+        // PR has merged" completion gate must ignore it entirely, the same
+        // way it already ignores a dropped or superseded row.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // The parent PR (#7) merged for real.
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // The stack PR (#8) is still open -- and must stay that way
+            // without blocking the review's completion.
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/8");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "open", "merged": false}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        let stack_pr_id = store
+            .lock()
+            .create_pull_request_ex(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(8),
+                None,
+                None,
+                false,
+                "stack",
+            )
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+        assert!(changed, "the parent pr merging must report a change");
+
+        let updated_guardian = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(
+            updated_guardian.status.as_str(),
+            "merged",
+            "the review must complete even though its stack pr is still open"
+        );
+        let updated_stack_pr = store.lock().get_pull_request(&stack_pr_id).unwrap();
+        assert_eq!(
+            updated_stack_pr.state, "open",
+            "the stack pr's own state must be left alone -- it's closed \
+             explicitly by promotion, never expected to merge"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn check_pr_merges_marks_merged_when_all_merges_were_already_recorded() {
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
@@ -10882,6 +11662,24 @@ mod tests {
                 "https://github.com/alice/widget.git",
                 "fork",
                 "alice",
+            )
+            .unwrap();
+        // Pin the resolved owner to "" (matching the fork row registered
+        // above) so this fixture is deterministic on any machine, regardless
+        // of that machine's own real `~/.ralphus/config.toml` `default_user`
+        // -- `resolve_review_owner`'s final fallback step reads that live
+        // global config, which this in-memory store never touches otherwise.
+        // Setting the project's own `default_pr_user` here short-circuits
+        // that fallback chain one step earlier, before it ever reaches the
+        // real machine's config.
+        store
+            .lock()
+            .set_project_review_settings(
+                "demo",
+                &crate::store::ProjectReviewSettings {
+                    default_pr_user: Some(String::new()),
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -11455,6 +12253,19 @@ mod tests {
                 "",
             )
             .unwrap();
+        // Pin the resolved owner to "" (matching the fork row registered
+        // above) so this fixture is deterministic on any machine -- see the
+        // identical comment on `fork_promotion_fixture`.
+        store
+            .lock()
+            .set_project_review_settings(
+                "demo",
+                &crate::store::ProjectReviewSettings {
+                    default_pr_user: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         let gid = store
             .lock()
@@ -11763,6 +12574,313 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
         let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn dual_root_pr_mode_creates_a_second_same_repo_stack_pr_for_the_root_branch_only() {
+        // RAL-<new>: with `dual_root_pr` enabled, the stack's root branch
+        // gets a second, same-repo PR into the maintained fork base branch, alongside the
+        // existing cross-repo "parent" PR (unchanged) -- so it visually
+        // chains into the rest of the stack. Disabled (the default) is
+        // covered by every other fork-mode submission test in this module,
+        // which all still see exactly one PR per branch.
+        let fork_bare = tmp_dir("dual-root-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let expect_none_then_create =
+            |server: &tiny_http::Server, repo: &str, number: i64, url: &str| {
+                let req = server.recv().unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                assert!(
+                    req.url().starts_with(&format!("/repos/{repo}/pulls?")),
+                    "{}",
+                    req.url()
+                );
+                req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                    .unwrap();
+
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.url(), format!("/repos/{repo}/pulls"));
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"number":{number},"html_url":"{url}"}}"#
+                    ))
+                    .with_status_code(201),
+                )
+                .unwrap();
+                payload
+            };
+        let handle = std::thread::spawn(move || {
+            // The existing "parent" PR: cross-repository, filed at the
+            // parent, unchanged from today's single-PR behavior.
+            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
+            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
+            assert_eq!(payload["base"], serde_json::json!("release"));
+
+            // The new "stack" PR: same-repo within the fork, into the
+            // fork base branch -- not the parent's real base branch.
+            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
+            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
+            assert_eq!(payload["base"], serde_json::json!("release"));
+
+            // The following branch remains based on the root's alias, not
+            // on the shared fork base branch used by the visual root PR.
+            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
+            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
+            assert_eq!(payload["base"], serde_json::json!("a-alias"));
+        });
+
+        let root_dir = tmp_dir("dual-root-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(&root_dir, &["checkout", "-b", "review/a"]);
+        gwrite(&root_dir, "a.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add a.txt"]);
+        g(&root_dir, &["checkout", "-b", "review/b"]);
+        gwrite(&root_dir, "b.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add b.txt"]);
+        g(&root_dir, &["checkout", "release"]);
+        crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
+            .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_dual_root_pr(&gid, Some(true))
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        store.lock().add_guardian_branch(&gid, "b").unwrap();
+        let branch_ids: Vec<String> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|branch| branch.id.clone())
+            .collect();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_ids[0], "review/a", "wt")
+            .unwrap();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_ids[1], "review/b", "wt")
+            .unwrap();
+
+        let fork = crate::project_forks::ForkRecord {
+            project: "demo".to_string(),
+            user: String::new(),
+            fork_url: fork_bare.to_str().unwrap().to_string(),
+            remote_name: "fork".to_string(),
+            fork_owner: "alice".to_string(),
+            git_user_name: None,
+            git_user_email: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let parent_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let fork_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "alice/widget".to_string(),
+            Some("tok".to_string()),
+        );
+        let routing = ForkRouting {
+            fork,
+            parent_client,
+            fork_client: fork_client.clone(),
+            parent_project_id: None,
+        };
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        assert!(
+            guardian.effective_dual_root_pr,
+            "the setting must actually be on for this test to mean anything"
+        );
+        let branch = &guardian.branches[0];
+        let successor = &guardian.branches[1];
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let mut alias_by_branch: HashMap<String, String> = HashMap::new();
+        let runner = NoopRunner;
+        let req = PrRequest {
+            branch_id: Some(branch.id.clone()),
+            branch_alias: None,
+            title: Some("Title".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &fork_client,
+            &gid,
+            &root_dir,
+            "fork",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "release",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            Some(&routing),
+            false,
+        )
+        .unwrap();
+        let successor_req = PrRequest {
+            branch_id: Some(successor.id.clone()),
+            branch_alias: None,
+            title: Some("Successor".to_string()),
+            description: Some("Follows the root".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &fork_client,
+            &gid,
+            &root_dir,
+            "fork",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "release",
+            successor,
+            &successor_req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            Some(&routing),
+            false,
+        )
+        .unwrap();
+
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the root gets parent + stack rows, and its successor remains chained"
+        );
+        let parent_row = rows.iter().find(|p| p.pr_kind == "parent").unwrap();
+        assert_eq!(parent_row.repo, "acme/widget");
+        assert_eq!(parent_row.base_ref, "release");
+        assert_eq!(parent_row.pr_number, Some(1));
+
+        let stack_row = rows.iter().find(|p| p.pr_kind == "stack").unwrap();
+        assert_eq!(stack_row.repo, "alice/widget");
+        assert_eq!(stack_row.base_ref, "release");
+        assert_eq!(stack_row.pr_number, Some(2));
+        assert_eq!(stack_row.branch_id.as_deref(), Some(branch.id.as_str()));
+        let successor_row = rows
+            .iter()
+            .find(|p| {
+                p.branch_id.as_deref() == Some(successor.id.as_str()) && p.pr_kind == "parent"
+            })
+            .unwrap();
+        assert_eq!(successor_row.repo, "alice/widget");
+        assert_eq!(successor_row.base_ref, "a-alias");
+        assert_eq!(successor_row.pr_number, Some(3));
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-338 follow-up regression: `resolve_fork_routing`'s `root` is a
+    /// review/guardian-merge worktree, separate from the cell worktree
+    /// `route_worktree_to_submitter_fork` already wires identity/credential
+    /// config onto -- a stacked-PR push from here had no way to
+    /// authenticate against an HTTPS fork at all until this was fixed
+    /// (observed live: "credential-cache unavailable... could not read
+    /// Username").
+    #[test]
+    fn resolve_fork_routing_wires_identity_and_credential_helper_onto_the_review_worktree() {
+        let root_dir = tmp_dir("fork-routing-cred-wiring");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        store
+            .lock()
+            .register_project("demo", "d", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        store.lock().create_user("alice").unwrap();
+        store
+            .lock()
+            .set_user_forge_token("alice", "github.com", "ghp-unused")
+            .unwrap();
+        store
+            .lock()
+            .upsert_project_fork_with_identity(
+                "demo",
+                "alice",
+                "https://github.com/alice/widget.git",
+                "fork-alice",
+                "alice",
+                Some("Alice Example"),
+                Some("alice@example.com"),
+            )
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root_dir.to_str().unwrap())
+            .unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let forge_cfg = crate::config::ForgeConfig::default();
+
+        resolve_fork_routing(&store, &root_dir, &guardian, &forge_cfg, "alice").unwrap();
+
+        assert_eq!(
+            g(&root_dir, &["config", "user.name"]).trim(),
+            "Alice Example"
+        );
+        assert_eq!(
+            g(&root_dir, &["config", "user.email"]).trim(),
+            "alice@example.com"
+        );
+        let helper = g(&root_dir, &["config", "--get", "credential.helper"]);
+        assert!(
+            helper.trim().starts_with('!')
+                && helper.trim().ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value: {helper:?}"
+        );
+        let worktree_id = g(&root_dir, &["config", "--get", "ralphus.worktree-id"]);
+        assert!(!worktree_id.trim().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 
     /// RAL-395 regression: a stack submitted one branch at a time via
@@ -14378,6 +15496,7 @@ mod tests {
                 Some("https://example.invalid/pr/9"),
                 Some("stack-1"),
                 true,
+                "parent",
             )
             .unwrap();
         assert_eq!(s.get_pull_request(&id).unwrap().draft, Some(true));
@@ -14459,6 +15578,7 @@ mod tests {
                 Some("https://example.invalid/pr/9"),
                 None,
                 true,
+                "parent",
             )
             .unwrap();
         s.set_pr_ci_status(&id, "failing", None).unwrap();

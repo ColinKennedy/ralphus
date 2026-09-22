@@ -66,6 +66,7 @@ pub mod timeline;
 pub mod tmux;
 pub mod token;
 pub mod triage;
+pub mod user_forge_tokens;
 pub mod users;
 pub mod vcs;
 pub mod watches;

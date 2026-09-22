@@ -465,6 +465,7 @@ impl DaemonClient {
             patch.match_pr_branch_name,
         );
         set_if_some(&mut body, "separate_pr_branch", patch.separate_pr_branch);
+        set_if_some(&mut body, "dual_root_pr", patch.dual_root_pr);
         set_if_some(&mut body, "auto_build", patch.auto_build);
         set_if_some(
             &mut body,
@@ -537,6 +538,48 @@ impl DaemonClient {
             format!("/api/projects/{project}/forks/{user}")
         };
         self.delete(&path)
+    }
+
+    /// `GET /api/users/{user}/forge-tokens` (RAL-338 follow-up): which forge
+    /// hosts `user` has a personal access token configured for. Never
+    /// includes the token value itself.
+    pub fn list_user_forge_tokens(&self, user: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/users/{user}/forge-tokens"))
+    }
+
+    /// `POST /api/users/{user}/forge-tokens` (RAL-338 follow-up): set or
+    /// replace `user`'s token for one forge host.
+    pub fn set_user_forge_token(
+        &self,
+        user: &str,
+        host: &str,
+        token: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/users/{user}/forge-tokens"),
+            Some(json!({"host": host, "token": token})),
+        )
+    }
+
+    /// `DELETE /api/users/{user}/forge-tokens/{host}` (RAL-338 follow-up).
+    pub fn delete_user_forge_token(&self, user: &str, host: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/users/{user}/forge-tokens/{host}"))
+    }
+
+    /// `GET /api/internal/fork-credential` (RAL-338 follow-up): the
+    /// git-credential helper's fetch path -- `worktree_id`+`grant` is the
+    /// entire authorization for *which* credential comes back, no user
+    /// identity claim involved.
+    pub fn fetch_fork_credential(
+        &self,
+        worktree_id: &str,
+        grant: &str,
+    ) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("worktree_id", Some(worktree_id.to_string())),
+            ("grant", Some(grant.to_string())),
+        ]);
+        self.get(&format!("/api/internal/fork-credential{qs}"))
     }
 
     /// Agent-profile health, evaluated inside the daemon process so
@@ -1542,6 +1585,7 @@ impl DaemonClient {
             settings.auto_submit_pr_stack,
         );
         set_if_some(&mut body, "separate_pr_branch", settings.separate_pr_branch);
+        set_if_some(&mut body, "dual_root_pr", settings.dual_root_pr);
         set_if_some(&mut body, "auto_fix_pr_errors", settings.auto_fix_pr_errors);
         set_if_some(
             &mut body,
@@ -1839,6 +1883,12 @@ pub struct GuardianSettings<'a> {
     /// RAL-378: whether this review's pull request is pushed to a branch
     /// separate from its review branch.
     pub separate_pr_branch: Option<bool>,
+    /// RAL-<new>: fork-routed only. Whether this review's stack root branch
+    /// gets a second, same-repo PR into a mirror of the parent's base
+    /// branch, so it visually chains into the rest of the PR stack,
+    /// alongside the existing cross-repo PR (unchanged, still the one that
+    /// actually merges).
+    pub dual_root_pr: Option<bool>,
     /// RAL-395: whether this review auto-dispatches its agent to fix a
     /// failing PR's CI status.
     pub auto_fix_pr_errors: Option<bool>,
@@ -1870,6 +1920,7 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub skip_base_updates: Option<bool>,
     pub match_pr_branch_name: Option<bool>,
     pub separate_pr_branch: Option<bool>,
+    pub dual_root_pr: Option<bool>,
     pub auto_build: Option<&'a str>,
     pub auto_submit_pr_stack: Option<bool>,
     pub auto_fix_pr_errors: Option<bool>,

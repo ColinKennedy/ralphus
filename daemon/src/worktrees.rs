@@ -941,7 +941,7 @@ fn sync_coauthor_hook_best_effort(root: &Path) {
 /// Best-effort: failure is logged and swallowed, exactly like
 /// [`sync_coauthor_hook_best_effort`] -- a failed identity write must never
 /// block a squad's actual work.
-fn apply_worktree_git_identity_best_effort(
+pub(crate) fn apply_worktree_git_identity_best_effort(
     worktree_dir: &Path,
     identity: &crate::project_forks::GitIdentity,
 ) {
@@ -949,13 +949,7 @@ fn apply_worktree_git_identity_best_effort(
         return;
     }
     let result = (|| -> Result<(), String> {
-        {
-            let _guard = WORKTREE_CONFIG_LOCK.lock();
-            git(
-                worktree_dir,
-                &["config", "extensions.worktreeConfig", "true"],
-            )?;
-        }
+        ensure_worktree_config_extension(worktree_dir)?;
         if let Some(name) = &identity.name {
             git(worktree_dir, &["config", "--worktree", "user.name", name])?;
         }
@@ -969,6 +963,128 @@ fn apply_worktree_git_identity_best_effort(
         crate::rlog!(
             WARNING,
             "ralphus [worktrees] could not apply fork git identity for {}: {e}",
+            worktree_dir.display()
+        );
+    }
+}
+
+/// Idempotently enable `extensions.worktreeConfig` on the shared repo owning
+/// `worktree_dir`, under `WORKTREE_CONFIG_LOCK` since (unlike a
+/// `--worktree`-scoped write, private to that worktree's own
+/// `config.worktree`) this setting lives in the one `.git/config` every
+/// sibling worktree shares. Shared by both
+/// [`apply_worktree_git_identity_best_effort`] and
+/// [`apply_worktree_credential_helper_best_effort`] -- either may run
+/// without the other (a fork might set only an identity, only a credential,
+/// both, or neither), so neither can assume the extension is already on.
+fn ensure_worktree_config_extension(worktree_dir: &Path) -> Result<(), String> {
+    let _guard = WORKTREE_CONFIG_LOCK.lock();
+    git(
+        worktree_dir,
+        &["config", "extensions.worktreeConfig", "true"],
+    )
+    .map(|_| ())
+}
+
+/// The `credential.helper` value to install: the *absolute path* to the
+/// `ralphus` CLI binary sitting next to this daemon's own executable,
+/// POSIX-shell-quoted for the `!`-prefixed form git spawns via `sh -c`,
+/// falling back to the bare `ralphus` command (relying on PATH) only if the
+/// sibling binary can't be located. Resolving via PATH alone is fragile --
+/// neither the daemon process's own environment nor the shell git spawns
+/// for a `!`-prefixed helper is guaranteed to have `ralphus`'s directory on
+/// it (a real failure mode: git silently gets no credential, falls back to
+/// an interactive terminal prompt nothing can answer, and hangs until
+/// ralphus's own subprocess timeout kills the push).
+fn credential_helper_command() -> String {
+    let fallback = "!ralphus internal fork-credential-helper".to_string();
+    let Ok(daemon_exe) = std::env::current_exe() else {
+        return fallback;
+    };
+    let Some(dir) = daemon_exe.parent() else {
+        return fallback;
+    };
+    let cli_path = dir.join(format!("ralphus{}", std::env::consts::EXE_SUFFIX));
+    if !cli_path.is_file() {
+        return fallback;
+    }
+    // Forward slashes + single-quoted: `sh -c` (what git invokes a
+    // `!`-prefixed helper through, including on Windows via Git for
+    // Windows' bundled MSYS bash) treats backslashes as escapes, so a raw
+    // Windows path would corrupt itself; single-quoting handles spaces and
+    // anything else short of a literal single quote in the path.
+    let path_str = cli_path.to_string_lossy().replace('\\', "/");
+    format!("!'{path_str}' internal fork-credential-helper")
+}
+
+/// Point one worktree's `credential.helper` at ralphus's own helper and mint
+/// the `(worktree_id, grant)` pair it needs (RAL-338 follow-up), so a `git
+/// push` from that worktree -- ralphus's own, or an agent's own shell
+/// command, either way -- can authenticate over HTTPS as `submitter`'s
+/// stored forge token without that token ever being written to any git
+/// config file on disk. See `daemon/src/user_forge_tokens.rs`'s module doc
+/// comment for why this exists alongside (not instead of) `forge.rs`'s
+/// env-var-only token policy.
+///
+/// A no-op when `fork_url` isn't an HTTP(S) URL: git's credential-helper
+/// protocol only ever fires for HTTP(S) transport, never SSH, so there is
+/// nothing useful to wire up for an `ssh://`/`git@host:...`-style fork
+/// remote -- that fork keeps relying on the host's own SSH key setup exactly
+/// as before this existed.
+///
+/// Best-effort: failure is logged and swallowed, same as
+/// [`apply_worktree_git_identity_best_effort`] -- a failed credential-helper
+/// write must never block a squad's actual work (an agent's plain `git
+/// push` simply falls back to whatever ambient auth the host already has,
+/// exactly like before this existed).
+pub(crate) fn apply_worktree_credential_helper_best_effort(
+    store: &Store,
+    worktree_dir: &Path,
+    submitter: &str,
+    fork_url: &str,
+) {
+    let trimmed = fork_url.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return;
+    }
+    let Some((host, _path)) = crate::forge::parse_remote_url(trimmed) else {
+        return;
+    };
+    let result = (|| -> Result<(), String> {
+        let worktree_id = crate::token::generate();
+        let grant = store
+            .mint_worktree_credential_grant(&worktree_id, submitter, &host)
+            .map_err(|e| e.to_string())?;
+        ensure_worktree_config_extension(worktree_dir)?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "ralphus.worktree-id", &worktree_id],
+        )?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "ralphus.worktree-grant", &grant],
+        )?;
+        git(
+            worktree_dir,
+            &["config", "--worktree", "credential.helper", ""],
+        )?;
+        git(
+            worktree_dir,
+            &[
+                "config",
+                "--worktree",
+                "--add",
+                "credential.helper",
+                &credential_helper_command(),
+            ],
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // ralphus[ignore-rlog-pair]: worktree setup helper without access to Store for Cartographer logging
+        crate::rlog!(
+            WARNING,
+            "ralphus [worktrees] could not wire up the fork credential helper for {}: {e}",
             worktree_dir.display()
         );
     }
@@ -1912,6 +2028,7 @@ fn route_worktree_to_submitter_fork(
             email: fork.git_user_email.clone(),
         },
     );
+    apply_worktree_credential_helper_best_effort(store, worktree, &submitter, &fork.fork_url);
     let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
     let branch = branch.trim();
@@ -2744,6 +2861,113 @@ mod tests {
             git(&wt, &["config", "extensions.worktreeConfig"]).is_err(),
             "no identity fields set on the fork means nothing about this worktree's git config \
              should be touched at all"
+        );
+    }
+
+    #[test]
+    fn submitter_forks_https_url_wires_up_the_credential_helper() {
+        let repo = init_repo("submitter-fork-https-cred-helper");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .set_user_forge_token("alice", "127.0.0.1:1", "glpat-test-secret")
+            .unwrap();
+        // A URL that fails fast (connection refused, no DNS lookup) rather
+        // than hanging or depending on real network access. The `git push`
+        // this triggers is expected to fail; what this test actually
+        // verifies is the credential-helper git config wiring, which
+        // happens before that push and survives regardless of whether it
+        // succeeds.
+        store
+            .upsert_project_fork(
+                "proj",
+                "alice",
+                "https://127.0.0.1:1/owner/repo.git",
+                "fork-alice",
+                "",
+            )
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-https", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-https", "main").unwrap();
+
+        // The push itself is expected to fail (nothing listens on
+        // 127.0.0.1:1) -- this test only cares about the git config wiring
+        // that happens before it.
+        let _ = route_worktree_to_submitter_fork(&store, "squad-fork-https", "proj", &wt);
+
+        let worktree_id = git(&wt, &["config", "--get", "ralphus.worktree-id"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let grant = git(&wt, &["config", "--get", "ralphus.worktree-grant"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!worktree_id.is_empty());
+        assert!(!grant.is_empty());
+        // The exact command string is environment-dependent -- it's the
+        // absolute path to whatever `ralphus`/`ralphus.exe` sits next to
+        // this test binary's own executable when one exists (see
+        // `credential_helper_command`'s doc comment for why: resolving via
+        // bare `ralphus` on PATH alone is exactly the fragility this
+        // replaces), falling back to the bare command otherwise. Assert the
+        // shape, not a literal string.
+        let helper = git(&wt, &["config", "--get", "credential.helper"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            helper.starts_with('!') && helper.ends_with(" internal fork-credential-helper"),
+            "unexpected credential.helper value: {helper:?}"
+        );
+        assert_eq!(
+            store
+                .resolve_worktree_credential(&worktree_id, &grant)
+                .unwrap(),
+            Some("glpat-test-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn submitter_forks_non_http_url_does_not_wire_up_the_credential_helper() {
+        let repo = init_repo("submitter-fork-non-http-no-cred-helper");
+        let fork = init_bare_fork(&repo, "alice-fork-non-http");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        store.create_user("alice").unwrap();
+        store
+            .set_user_forge_token("alice", "gitlab.com", "glpat-should-be-unused")
+            .unwrap();
+        store
+            .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "submitter='alice'\n[[task]]\nname='task'\n[[task.cell]]\ncwd='.'\nprompt='go'\n",
+        )
+        .unwrap();
+        store
+            .insert_squad_with_id("squad-fork-non-http", &file, None, false)
+            .unwrap();
+        let wt = ensure_worktree(&repo, "feature-non-http", "main").unwrap();
+
+        route_worktree_to_submitter_fork(&store, "squad-fork-non-http", "proj", &wt).unwrap();
+
+        assert!(
+            git(&wt, &["config", "--get", "ralphus.worktree-id"]).is_err(),
+            "a non-HTTP(S) fork remote (SSH, or a bare local path as used here) must never get \
+             the credential helper wired up -- git's credential-helper protocol only ever fires \
+             for HTTP(S) transport"
         );
     }
 

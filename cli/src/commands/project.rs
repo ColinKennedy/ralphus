@@ -75,6 +75,7 @@ pub enum ProjectReviewSettingsCommand {
         skip_base_updates: Option<bool>,
         match_pr_branch_name: Option<bool>,
         separate_pr_branch: Option<bool>,
+        dual_root_pr: Option<bool>,
         auto_build: Option<String>,
         auto_submit_pr_stack: Option<bool>,
         auto_fix_pr_errors: Option<bool>,
@@ -302,6 +303,7 @@ fn parse_review_settings_set(
         crate::commands::review::take_tri_bool(scanner, "--match-pr-branch-name");
     let separate_pr_branch =
         crate::commands::review::take_tri_bool(scanner, "--separate-pr-branch");
+    let dual_root_pr = crate::commands::review::take_tri_bool(scanner, "--dual-root-pr");
     let auto_build = scanner.take_value("--auto-build")?;
     let auto_submit_pr_stack =
         crate::commands::review::take_tri_bool(scanner, "--auto-submit-pr-stack");
@@ -341,6 +343,7 @@ fn parse_review_settings_set(
         skip_base_updates,
         match_pr_branch_name,
         separate_pr_branch,
+        dual_root_pr,
         auto_build,
         auto_submit_pr_stack,
         auto_fix_pr_errors,
@@ -478,6 +481,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             skip_base_updates,
             match_pr_branch_name,
             separate_pr_branch,
+            dual_root_pr,
             auto_build,
             auto_submit_pr_stack,
             auto_fix_pr_errors,
@@ -495,6 +499,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 skip_base_updates,
                 match_pr_branch_name,
                 separate_pr_branch,
+                dual_root_pr,
                 auto_build: auto_build.as_deref(),
                 auto_submit_pr_stack,
                 auto_fix_pr_errors,
@@ -560,6 +565,7 @@ fn render_review_settings(payload: &Value) {
     row_bool("skip base updates:", "skip_base_updates");
     row_bool("match pr branch name:", "match_pr_branch_name");
     row_bool("separate pr branch:", "separate_pr_branch");
+    row_bool("dual root pr:", "dual_root_pr");
     row_str("auto build:", "auto_build");
     row_bool("auto submit pr stack:", "auto_submit_pr_stack");
     row_bool("auto fix pr errors:", "auto_fix_pr_errors");

@@ -155,6 +155,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             match_pr_branch_name,
             auto_submit_pr_stack,
             separate_pr_branch,
+            dual_root_pr,
             auto_fix_pr_errors,
             auto_fix_prompt_template,
         } => {
@@ -172,6 +173,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
+                dual_root_pr,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
             };

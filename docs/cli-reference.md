@@ -679,6 +679,8 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) history selector [uri]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
+    - internal  {Machine-invoked interfaces with no interactive/task-file use (RAL-338 follow-up).}
+        - fork-credential-helper action [str]  {Git credential-helper entry point installed on a fork-routed worktree's git config (never invoked directly by a human or a task file) -- implements git's credential protocol so a push authenticates using that worktree owner's stored forge token.}
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [uri] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
@@ -712,7 +714,7 @@ use; see `READ_ONLY_NOTE`.
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
-            - set name [str] --auto-build [command] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-submit-pr-stack/--no-auto-submit-pr-stack --clear-maximum-budget-usd --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
+            - set name [str] --auto-build [command] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-submit-pr-stack/--no-auto-submit-pr-stack --clear-maximum-budget-usd --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
     - proof  {Inspect and act on proof steps.}
         - edit selector [uri] --agent [name] --brain [text] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt/brain overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
@@ -768,7 +770,7 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [uri] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [uri] --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --dual-root-pr/--no-dual-root-pr --match-pr-branch-name/--no-match-pr-branch-name --proof-scope [each_branch|final_branch|nothing] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-build/--no-skip-auto-build --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
@@ -813,6 +815,10 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) list  {List every registered Triage type, including the built-in "unclassified" type.}
             - register name [str] --description [text] --label [text]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318).}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
+    - user  {Manage a ralphus user's own forge personal access tokens (RAL-338 follow-up).}
+        - delete-forge-token user [str] host [str]  {Remove a ralphus user's personal access token for one forge host.}
+        - (read-only-safe) list-forge-tokens user [str]  {List which forge hosts a ralphus user has a token configured for. Never returns the token value itself.}
+        - set-forge-token user [str] --host [host] --token [token]  {Set or replace a ralphus user's personal access token for one forge host (e.g. gitlab.com), so their fork-routed worktrees can push over HTTPS without any SSH key setup.}
     - (read-only-safe) validate file [path...]  {Validate one or more task TOML files.}
 ```
 <!-- END GENERATED HELP-MAP (RAL-110) -->

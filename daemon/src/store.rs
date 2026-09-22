@@ -704,6 +704,8 @@ pub struct ProjectReviewSettings {
     #[serde(default)]
     pub separate_pr_branch: Option<bool>,
     #[serde(default)]
+    pub dual_root_pr: Option<bool>,
+    #[serde(default)]
     pub auto_build: Option<String>,
     #[serde(default)]
     pub auto_submit_pr_stack: Option<bool>,
@@ -752,6 +754,7 @@ impl ProjectReviewSettings {
             match_pr_branch_name: self.match_pr_branch_name,
             auto_submit_pr_stack: self.auto_submit_pr_stack,
             separate_pr_branch: self.separate_pr_branch,
+            dual_root_pr: self.dual_root_pr,
             auto_fix_pr_errors: self.auto_fix_pr_errors,
             auto_fix_prompt_template: self.auto_fix_prompt_template,
         }
@@ -977,6 +980,7 @@ pub(crate) struct ProjectStamps {
     pub match_pr_branch_name: Option<bool>,
     pub auto_submit_pr_stack: Option<bool>,
     pub separate_pr_branch: Option<bool>,
+    pub dual_root_pr: Option<bool>,
 }
 
 impl Store {
@@ -1537,6 +1541,43 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (project, user)
+            );
+            -- A ralphus user's personal access token for one forge host
+            -- (RAL-338 follow-up), e.g. user = Colin Kennedy, host = gitlab.com.
+            -- Deliberately DOES cascade on user deletion, unlike project_forks
+            -- above: a fork *routing* row should stay visible when orphaned
+            -- (see project_forks.rs), but a *secret* should not linger once its
+            -- owning user is gone. The token value itself never appears in any
+            -- list/show API response -- only presence/host/timestamps do (see
+            -- `list_user_forge_tokens`); only the credential-fetch path
+            -- (`Store::resolve_worktree_credential`) ever reads the raw value.
+            CREATE TABLE IF NOT EXISTS user_forge_tokens (
+                user          TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                host          TEXT NOT NULL,
+                token         TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (user, host)
+            );
+            -- A short-lived grant minted once per worktree at fork-routing time
+            -- (RAL-338 follow-up, `route_worktree_to_submitter_fork`), so that
+            -- worktree's git-credential helper can later fetch its owner's
+            -- forge token without the token ever being written to any git
+            -- config file on disk. `worktree_id` and `grant_secret` are both
+            -- stamped into the worktree's own `--worktree`-scoped git config
+            -- alongside the identity fields; the credential-fetch endpoint
+            -- requires BOTH to match this row before releasing a token, so
+            -- holding the daemon's general API bearer token alone (which every
+            -- local cell already has) is not sufficient to read another
+            -- worktree's credential -- see the design discussion this
+            -- followed for why that distinction matters once a host runs work
+            -- for more than one person.
+            CREATE TABLE IF NOT EXISTS worktree_credential_grants (
+                worktree_id   TEXT PRIMARY KEY,
+                grant_secret  TEXT NOT NULL,
+                user          TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
             );
             -- RAL-328: view preferences are scoped to a registered user and
             -- reference exactly one squad, review, or (RAL-365) task. Entity
@@ -2317,6 +2358,26 @@ impl Store {
             // deliberate no-backfill (NULL for every project registered
             // earlier), as `auto_submit_pr_stack`.
             "ALTER TABLE projects ADD COLUMN separate_pr_branch INTEGER",
+            // RAL-<new>: fork-routed only. Whether this review's stack root
+            // (and whichever branch later gets promoted to root) gets a
+            // second, same-repo "stack" PR into a mirror of the parent's
+            // base branch, alongside the existing cross-repo "parent" PR.
+            // NULL inherits the project/global `[review] dual_root_pr`
+            // default, which resolves to `0` (today's single-PR behavior).
+            // See `GuardianView::effective_dual_root_pr`.
+            "ALTER TABLE guardians ADD COLUMN dual_root_pr INTEGER",
+            // RAL-<new>: the `dual_root_pr` value a project stamped from the
+            // live global config when it was first registered -- same
+            // always-from-global shape and deliberate no-backfill as
+            // `separate_pr_branch`/`auto_submit_pr_stack` above.
+            "ALTER TABLE projects ADD COLUMN dual_root_pr INTEGER",
+            // RAL-<new>: distinguishes a fork-routed root branch's two PR
+            // rows -- "parent" (the existing cross-repo PR, unchanged) vs
+            // "stack" (the new same-repo PR into the mirror branch, only
+            // created when `dual_root_pr` is enabled). `DEFAULT 'parent'`
+            // back-fills every pre-existing row for free, since they're all
+            // the "parent" kind by construction.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN pr_kind TEXT NOT NULL DEFAULT 'parent'",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -4847,6 +4908,9 @@ impl Store {
         // RAL-378: same always-from-global stamping shape as
         // `auto_submit_pr_stack`.
         let separate_pr_branch = crate::config::global_review_config().separate_pr_branch();
+        // RAL-<new>: same always-from-global stamping shape as
+        // `separate_pr_branch`.
+        let dual_root_pr = crate::config::global_review_config().dual_root_pr();
         self.register_project_with_clone_url_and_stamp(
             name,
             description,
@@ -4857,6 +4921,7 @@ impl Store {
             Some(match_pr_branch_name),
             Some(auto_submit_pr_stack),
             Some(separate_pr_branch),
+            Some(dual_root_pr),
         )
     }
 
@@ -4879,6 +4944,7 @@ impl Store {
         match_pr_branch_name_stamp: Option<bool>,
         auto_submit_pr_stack_stamp: Option<bool>,
         separate_pr_branch_stamp: Option<bool>,
+        dual_root_pr_stamp: Option<bool>,
     ) -> Result<()> {
         self.register_project_with_clone_url_and_stamp(
             name,
@@ -4890,6 +4956,7 @@ impl Store {
             match_pr_branch_name_stamp,
             auto_submit_pr_stack_stamp,
             separate_pr_branch_stamp,
+            dual_root_pr_stamp,
         )
     }
 
@@ -4905,6 +4972,7 @@ impl Store {
         match_pr_branch_name_stamp: Option<bool>,
         auto_submit_pr_stack_stamp: Option<bool>,
         separate_pr_branch_stamp: Option<bool>,
+        dual_root_pr_stamp: Option<bool>,
     ) -> Result<()> {
         // An existing project being re-registered (an upsert update, not a
         // first insert) is deliberately left untouched -- the ticket's explicit
@@ -4936,9 +5004,10 @@ impl Store {
         } else {
             separate_pr_branch_stamp
         };
+        let dual_root_pr_stamp = if exists { None } else { dual_root_pr_stamp };
         self.conn.execute(
-            "INSERT INTO projects(name, description, path, clone_url, vcs, created_at_ms, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch)
-             VALUES(?,?,?,?,?,?,?,?,?,?)
+            "INSERT INTO projects(name, description, path, clone_url, vcs, created_at_ms, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, dual_root_pr)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, path=excluded.path, clone_url=COALESCE(excluded.clone_url, projects.clone_url), vcs=excluded.vcs",
             params![
                 name,
@@ -4950,7 +5019,8 @@ impl Store {
                 skip_base_updates_stamp.map(i64::from),
                 match_pr_branch_name_stamp.map(i64::from),
                 auto_submit_pr_stack_stamp.map(i64::from),
-                separate_pr_branch_stamp.map(i64::from)
+                separate_pr_branch_stamp.map(i64::from),
+                dual_root_pr_stamp.map(i64::from)
             ],
         )?;
         crate::rlog!(
@@ -5172,6 +5242,14 @@ impl Store {
         self.project_bool_stamp(path, "separate_pr_branch")
     }
 
+    /// RAL-<new>: the `dual_root_pr` value a project stamped (from the live
+    /// global config) when it was first registered, looked up by repo path
+    /// -- same lookup/ancestry semantics as
+    /// [`Self::project_skip_base_updates_stamp`].
+    pub fn project_dual_root_pr_stamp(&self, path: &str) -> Option<bool> {
+        self.project_bool_stamp(path, "dual_root_pr")
+    }
+
     /// The registered project name whose `path` is `path` itself or an
     /// ancestor of it (RAL-338) -- same lookup/ancestry semantics as
     /// [`Self::project_skip_base_updates_stamp`], but returning the project's
@@ -5253,7 +5331,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn load_all_project_stamps_conn(conn: &Connection) -> Vec<(String, ProjectStamps)> {
         let mut stmt = match conn.prepare(
-            "SELECT path, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch FROM projects",
+            "SELECT path, skip_base_updates, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, dual_root_pr FROM projects",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -5266,6 +5344,7 @@ impl Store {
                     match_pr_branch_name: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
                     auto_submit_pr_stack: r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
                     separate_pr_branch: r.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                    dual_root_pr: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
                 },
             ))
         }) else {
@@ -14538,6 +14617,7 @@ command = "e"
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14564,6 +14644,7 @@ command = "e"
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -14578,6 +14659,7 @@ command = "e"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
                 None,
                 None,
@@ -14601,6 +14683,7 @@ command = "e"
                 "C:/repos/ralphus",
                 "git",
                 Some(false),
+                None,
                 None,
                 None,
                 None,
@@ -14653,6 +14736,7 @@ command = "e"
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14662,6 +14746,7 @@ command = "e"
                 "C:/repos/proj-b",
                 "git",
                 Some(false),
+                None,
                 None,
                 None,
                 None,
@@ -14764,6 +14849,7 @@ command = "e"
                 None,
                 Some(true),
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14790,6 +14876,7 @@ command = "e"
                 None,
                 Some(true),
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14801,6 +14888,7 @@ command = "e"
                 None,
                 None,
                 Some(false),
+                None,
                 None,
             )
             .unwrap();
@@ -14828,6 +14916,7 @@ command = "e"
                 None,
                 None,
                 Some(true),
+                None,
                 None,
             )
             .unwrap();
@@ -14889,6 +14978,7 @@ command = "e"
             skip_base_updates: Some(false),
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(false),
+            dual_root_pr: Some(true),
             auto_build: Some("make build".to_string()),
             auto_submit_pr_stack: Some(true),
             auto_fix_pr_errors: Some(true),

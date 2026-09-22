@@ -776,6 +776,19 @@ pub struct GuardianView {
     /// [`Self::effective_match_pr_branch_name`] is read. Those two only take
     /// effect when this is `true`.
     pub effective_separate_pr_branch: bool,
+    /// RAL-<new>: fork-routed only. This review's own override for whether
+    /// its stack root branch (and whichever branch later gets promoted to
+    /// root) gets a second, same-repo "stack" PR into a mirror of the
+    /// parent's base branch, alongside the existing cross-repo "parent" PR.
+    /// `None` means "inherit the project/global default" (resolved into
+    /// [`Self::effective_dual_root_pr`] at hydration time). Same
+    /// stamped-then-editable shape as [`Self::separate_pr_branch`].
+    pub dual_root_pr: Option<bool>,
+    /// RAL-<new>: [`Self::dual_root_pr`] resolved against the project-level
+    /// `.ralphus.toml [review] dual_root_pr` default, this project's
+    /// creation-time stamp, and the live global config. `false` -- the
+    /// default -- means today's single-PR-per-root behavior, unchanged.
+    pub effective_dual_root_pr: bool,
     /// RAL-378: `true` once this review's *combined* worktree branch is named
     /// readably rather than as the internal `guardian/<id>/review` ref.
     /// `false` for every review created before readable naming landed. Only
@@ -1167,6 +1180,14 @@ impl Store {
             .or(separate_pr_branch_stamp)
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
+        // RAL-<new>: same stamping shape again.
+        let dual_root_pr_stamp = self.project_dual_root_pr_stamp(git_root);
+        let dual_root_pr = db_settings
+            .dual_root_pr
+            .or(explicit_project.dual_root_pr)
+            .or(dual_root_pr_stamp)
+            .or(live_global.dual_root_pr)
+            .unwrap_or(false);
         let owner = self.resolve_review_owner(git_root, squad_id);
         // RAL-476 (interview Q6): a project can require every review it hosts
         // to route through a registered fork -- reject the submission
@@ -1184,9 +1205,9 @@ impl Store {
             }
         }
         self.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch, owner)
-             VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?)",
-            params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner],
+            "INSERT INTO guardians(id, name, base_branch, git_root, project, review_branch, status, detail, squad_id, review_key, created_at_ms, updated_at_ms, base_changed_at_ms, match_pr_branch_name, auto_submit_pr_stack, separate_pr_branch, readable_review_branch, owner, dual_root_pr)
+             VALUES(?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,1,?,?)",
+            params![id, name, base_branch, git_root, project, GuardianStatus::Collecting.as_str(), squad_id, review_key, now, now, now, i64::from(match_pr_branch_name), i64::from(auto_submit_pr_stack), i64::from(separate_pr_branch), owner, i64::from(dual_root_pr)],
         )?;
         // RAL-<new>: a new review coming into existence is the single most
         // consequential event in this file, and every route into it
@@ -2715,6 +2736,21 @@ impl Store {
         }
     }
 
+    /// RAL-<new>: set this review's own override for whether its fork-routed
+    /// stack root gets a second, same-repo "stack" PR into a mirror of the
+    /// parent's base branch. `None` inherits the project/global default.
+    pub fn set_guardian_dual_root_pr(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET dual_root_pr=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set this review's own override for whether it auto-dispatches its
     /// agent to fix a failing PR/MR CI status (RAL-395). `None` inherits the
     /// project/global default.
@@ -4085,7 +4121,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4104,7 +4140,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4223,6 +4259,7 @@ impl Store {
             post_merge_started_at_ms: r.get(58)?,
             post_merge_finished_at_ms: r.get(59)?,
             owner: r.get(60)?,
+            dual_root_pr: r.get::<_, Option<i64>>(61)?.map(|v| v != 0),
         })
     }
 
@@ -4575,6 +4612,15 @@ impl Store {
             .or(live_global.separate_pr_branch)
             .unwrap_or(false);
 
+        // RAL-<new>: same layering as `effective_separate_pr_branch` above.
+        let effective_dual_root_pr = row
+            .dual_root_pr
+            .or(db_settings.dual_root_pr)
+            .or(explicit_project.dual_root_pr)
+            .or(stamps.and_then(|s| s.dual_root_pr))
+            .or(live_global.dual_root_pr)
+            .unwrap_or(false);
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -4642,6 +4688,8 @@ impl Store {
             effective_match_pr_branch_name,
             separate_pr_branch: row.separate_pr_branch,
             effective_separate_pr_branch,
+            dual_root_pr: row.dual_root_pr,
+            effective_dual_root_pr,
             readable_review_branch: row.readable_review_branch,
             review_branch_name: row.review_branch_name,
             auto_submit_pr_stack: row.auto_submit_pr_stack,
@@ -5027,6 +5075,9 @@ struct GuardianRow {
     /// RAL-378: per-review separate-PR-branch override. `None` inherits the
     /// project/global default.
     separate_pr_branch: Option<bool>,
+    /// RAL-<new>: per-review dual-root-PR override. `None` inherits the
+    /// project/global default.
+    dual_root_pr: Option<bool>,
     /// RAL-378: whether this review's combined branch is named readably.
     readable_review_branch: bool,
     /// RAL-378: the sticky readable name claimed for the combined branch.

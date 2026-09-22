@@ -6278,17 +6278,20 @@ pub fn run_feedback(
             // a hardcoded `"origin"` that may not exist at all, silently
             // failing every feedback push (human-submitted or RAL-395
             // auto-fix) until one succeeds by luck.
-            let push_remote =
-                crate::pr::resolve_feedback_fork_remote(store, Path::new(&branch_project)).or_else(
-                    || {
-                        let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
-                        Some(crate::forge::resolve_remote_name(
-                            Path::new(&branch_project),
-                            &base,
-                            &forge_cfg,
-                        ))
-                    },
-                );
+            let owner = store.lock().get_guardian(id).ok().and_then(|g| g.owner);
+            let push_remote = crate::pr::resolve_feedback_fork_remote(
+                store,
+                Path::new(&branch_project),
+                owner.as_deref(),
+            )
+            .or_else(|| {
+                let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
+                Some(crate::forge::resolve_remote_name(
+                    Path::new(&branch_project),
+                    &base,
+                    &forge_cfg,
+                ))
+            });
             match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
                 Ok(sha) => {
                     pushed = true;
