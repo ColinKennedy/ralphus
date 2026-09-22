@@ -801,7 +801,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const ciNote = pr.state === "open" && pr.ci_status ? ` CI/CD: ${esc(pr.ci_status)}.` : "";
         const canQueryForge = pr.state === "open" && pr.pr_number != null;
         const kindNote = pr.pr_kind === "stack"
-          ? " This is the stack PR a dual-root-PR mirror-branch trick uses so this branch visually joins the rest of the review's PR stack -- it is never actually merged, and closes automatically once the parent PR beside it merges."
+          ? " This is the stack PR dual-root-PR mode uses so this branch visually joins the rest of the review's PR stack -- it is never actually merged, and closes automatically once the parent PR beside it merges."
           : dual
             ? " This is the PR that actually gets merged; the other badge alongside it is a stack-only PR kept just for visual chaining."
             : "";

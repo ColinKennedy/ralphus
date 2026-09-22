@@ -153,7 +153,7 @@ pub struct PullRequestView {
     pub draft: Option<bool>,
     /// RAL-<new>: `"parent"` (the default, and every pre-`dual_root_pr` row)
     /// or `"stack"` -- a fork-routed root branch's second, same-repo PR into
-    /// the mirror branch, only created when `dual_root_pr` is enabled. A
+    /// the fork's maintained base branch, only created when `dual_root_pr` is enabled. A
     /// `"stack"` row is deliberately excluded from base-drift/resync
     /// (`open_prs_by_branch`), the "every PR must merge" completion gate
     /// (`settle_pr_merge_states`), and `ci_watch::run_watch` -- its target
@@ -373,7 +373,7 @@ impl Store {
     /// own draft (WIP) state from the create/adopt response, recorded verbatim
     /// so an adoption/refresh can't clobber it. `pr_kind` (RAL-<new>) is
     /// `"parent"` for every ordinary PR or `"stack"` for a fork-routed root
-    /// branch's second, same-repo PR into the mirror branch -- see
+    /// branch's second, same-repo PR into the fork's maintained base branch -- see
     /// [`PullRequestView::pr_kind`].
     #[allow(clippy::too_many_arguments)]
     pub fn create_pull_request_ex(
@@ -1834,7 +1834,7 @@ fn open_alias_by_branch(prs: &[PullRequestView]) -> HashMap<String, String> {
 /// building.
 ///
 /// RAL-<new>: a `"stack"`-kind row (a fork-routed root branch's second,
-/// same-repo PR into the mirror branch) is deliberately excluded here, not
+/// same-repo PR into the fork's maintained base branch) is deliberately excluded here, not
 /// merely uncommon -- its target never changes with stack reordering, so it
 /// structurally never needs base-drift resync, and it must never be folded
 /// into GitHub's native same-repo stack chain, which it would otherwise look
@@ -2983,24 +2983,23 @@ fn maybe_promote_fork_root(
     // RAL-<new>: dual-root-PR mode -- the successor is now the stack's
     // root, so it needs its own "stack" PR the same way a fresh
     // submission's root branch does (see `submit_stacked_branch_pr`).
-    // Best-effort: a failure here must not undo the promotion above, which
-    // already succeeded on the forge regardless of what happens next.
+    // A failed fork-base maintenance step cannot undo the promotion above,
+    // but it must prevent a stack PR from being filed against a stale base.
     if guardian.effective_dual_root_pr {
-        if let Err(e) = crate::project_forks::sync_fork_mirror_branch(
+        if let Err(e) = crate::project_forks::sync_fork_base_branch(
             &root,
             &parent_remote_name,
             &routing.fork.remote_name,
             &base_branch_name,
-            id,
         ) {
             crate::rlog!(
                 WARNING,
-                "ralphus [pr] review {id} could not sync the dual-root-PR mirror branch during \
+                "ralphus [pr] review {id} could not fast-forward the fork base branch during \
                  promotion: {e}"
             );
+            return;
         }
-        let mirror_branch = crate::project_forks::mirror_branch_name(&base_branch_name, id);
-        let stack_route = stack_pr_route(&routing, &successor_pr.branch_alias, &mirror_branch);
+        let stack_route = stack_pr_route(&routing, &successor_pr.branch_alias, &base_branch_name);
         let stack_result = match stack_route.find_existing_pull_request() {
             Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
             Ok(None) => stack_route
@@ -3020,7 +3019,7 @@ fn maybe_promote_fork_root(
                     stack_route.client.kind().as_str(),
                     &stack_route.repo,
                     &successor_pr.branch_alias,
-                    &mirror_branch,
+                    &base_branch_name,
                     &successor_pr.title,
                     &successor_pr.description,
                     Some(number),
@@ -3192,7 +3191,7 @@ fn settle_pr_merge_states(
         // has merged" again either. Its replacement row is what actually
         // needs to merge.
         // RAL-<new>: a `"stack"`-kind row (dual-root-PR mode's second,
-        // same-repo PR into the mirror branch) is never expected to merge --
+        // same-repo PR into the fork's maintained base branch) is never expected to merge --
         // it's closed instead once its branch's parent PR merges (see
         // `maybe_promote_fork_root`) -- so it must never gate this "every
         // linked PR has merged" completion check.
@@ -4901,11 +4900,10 @@ fn fork_aware_route(
 }
 
 /// The route for a dual-root-PR mode "stack" PR (RAL-<new>): always
-/// same-repo within the fork, targeting the mirror of the parent's base
-/// branch (see [`crate::project_forks::mirror_branch_name`]) instead of
-/// another stack branch's alias -- so it visually chains into the rest of
-/// the stack, since both ends live in the fork, without ever needing to
-/// touch the parent repository. Unlike [`fork_aware_route`]'s cross-repo
+/// same-repo within the fork, targeting the fork's maintained copy of the
+/// parent's base branch instead of another stack branch's alias -- so it
+/// visually chains into the rest of the stack, since both ends live in the
+/// fork, without ever needing to touch the parent repository. Unlike [`fork_aware_route`]'s cross-repo
 /// root case, this never needs `fork.fork_owner` -- it's never a GitHub
 /// cross-repo PR, so [`crate::forge::ForgeClient::same_repo_head`] (already
 /// what every non-root branch's head goes through today) is always safe to
@@ -4913,12 +4911,12 @@ fn fork_aware_route(
 fn stack_pr_route(
     routing: &ForkRouting,
     alias: &str,
-    mirror_branch: &str,
+    base_branch_name: &str,
 ) -> crate::forge::PrRoute {
     crate::forge::PrRoute {
         client: routing.fork_client.clone(),
         head: routing.fork_client.same_repo_head(alias),
-        base: mirror_branch.to_string(),
+        base: base_branch_name.to_string(),
         target_project_id: None,
         repo: routing.fork_client.repo_label().to_string(),
     }
@@ -5353,7 +5351,7 @@ fn submit_stacked_branch_pr(
     // RAL-<new>: dual-root-PR mode -- this branch's PR is the stack's root
     // (`base == base_branch_name`, the same predicate `fork_aware_route`
     // itself uses to decide root routing) and the setting is on: also
-    // create/adopt a second, same-repo "stack" PR into the mirror branch, so
+    // create/adopt a second, same-repo "stack" PR into the fork base branch, so
     // this branch visually chains into the rest of the stack alongside the
     // parent PR above (unchanged -- still the one that actually gets
     // merged). Reuses the same title/description already resolved for the
@@ -5363,8 +5361,7 @@ fn submit_stacked_branch_pr(
     // the parent PR above is what actually matters for merge-readiness.
     if guardian.effective_dual_root_pr && base == base_branch_name {
         if let Some(routing) = fork_routing {
-            let mirror_branch = crate::project_forks::mirror_branch_name(base_branch_name, id);
-            let stack_route = stack_pr_route(routing, &alias, &mirror_branch);
+            let stack_route = stack_pr_route(routing, &alias, base_branch_name);
             let stack_result = match stack_route.find_existing_pull_request() {
                 Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
                 Ok(None) => stack_route
@@ -5380,7 +5377,7 @@ fn submit_stacked_branch_pr(
                         stack_route.client.kind().as_str(),
                         &stack_route.repo,
                         &alias,
-                        &mirror_branch,
+                        base_branch_name,
                         &title,
                         &description,
                         Some(number),
@@ -6115,29 +6112,20 @@ fn auto_submit_terminal_branches(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
-    // RAL-<new>: dual-root-PR mode's "stack" PR targets a mirror of the
-    // parent's base branch, kept in sync once per submission call (not per
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
+    // branch, fast-forwarded from the parent once per submission call (not per
     // branch -- which branch is currently root is a per-branch question
     // `fork_aware_route` answers deep inside the loop below, and syncing
     // unconditionally here is cheap and correctness-safe even when this
-    // particular call doesn't happen to touch the root branch). Best-effort:
-    // a sync failure here must not block the rest of submission, since the
-    // mirror only matters for the stack PR, not the parent PR that actually
-    // gets merged.
+    // particular call doesn't happen to touch the root branch).
     if let Some(routing) = &fork_routing {
         if guardian.effective_dual_root_pr {
-            if let Err(e) = crate::project_forks::sync_fork_mirror_branch(
+            crate::project_forks::sync_fork_base_branch(
                 &root,
                 &parent_remote_name,
                 &routing.fork.remote_name,
                 &base_branch_name,
-                id,
-            ) {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [pr] review {id} could not sync the dual-root-PR mirror branch: {e}"
-                );
-            }
+            )?;
         }
     }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
@@ -6537,29 +6525,20 @@ fn submit_pull_requests_inner(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
-    // RAL-<new>: dual-root-PR mode's "stack" PR targets a mirror of the
-    // parent's base branch, kept in sync once per submission call (not per
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
+    // branch, fast-forwarded from the parent once per submission call (not per
     // branch -- which branch is currently root is a per-branch question
     // `fork_aware_route` answers deep inside the loop below, and syncing
     // unconditionally here is cheap and correctness-safe even when this
-    // particular call doesn't happen to touch the root branch). Best-effort:
-    // a sync failure here must not block the rest of submission, since the
-    // mirror only matters for the stack PR, not the parent PR that actually
-    // gets merged.
+    // particular call doesn't happen to touch the root branch).
     if let Some(routing) = &fork_routing {
         if guardian.effective_dual_root_pr {
-            if let Err(e) = crate::project_forks::sync_fork_mirror_branch(
+            crate::project_forks::sync_fork_base_branch(
                 &root,
                 &parent_remote_name,
                 &routing.fork.remote_name,
                 &base_branch_name,
-                id,
-            ) {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [pr] review {id} could not sync the dual-root-PR mirror branch: {e}"
-                );
-            }
+            )?;
         }
     }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
@@ -8254,13 +8233,13 @@ mod tests {
     fn open_prs_by_branch_excludes_stack_kind_rows() {
         // RAL-<new>: a dual-root-PR mode root branch can have TWO open rows
         // for the same branch_id -- "parent" (the real merge target) and
-        // "stack" (the mirror-targeting visual-chain PR). Base-drift resync/
+        // "stack" (the fork-base-targeting visual-chain PR). Base-drift resync/
         // GitHub native-stack reconciliation must only ever see the parent
         // one; the stack row's target is fixed and never needs resyncing,
         // and it must never be folded into a native same-repo stack chain.
         let mut parent = test_pr("root-review", "main");
         parent.branch_id = Some("branch-1".to_string());
-        let mut stack = test_pr("root-review", "ralphus-mirror/main/guardian-1");
+        let mut stack = test_pr("root-review", "main");
         stack.branch_id = Some("branch-1".to_string());
         stack.pr_kind = "stack".to_string();
 
@@ -8272,7 +8251,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_pr_route_targets_the_mirror_branch_same_repo_on_both_forges() {
+    fn stack_pr_route_targets_the_fork_base_branch_same_repo_on_both_forges() {
         for kind in [
             crate::forge::ForgeKind::GitHub,
             crate::forge::ForgeKind::GitLab,
@@ -8309,8 +8288,8 @@ mod tests {
                 fork_client: fork_client.clone(),
                 parent_project_id: Some(999),
             };
-            let route = stack_pr_route(&routing, "b-alias", "ralphus-mirror/main/guardian-1");
-            assert_eq!(route.base, "ralphus-mirror/main/guardian-1");
+            let route = stack_pr_route(&routing, "b-alias", "main");
+            assert_eq!(route.base, "main");
             assert_eq!(route.target_project_id, None);
             assert_eq!(route.repo, fork_client.repo_label());
             assert_eq!(route.head, fork_client.same_repo_head("b-alias"));
@@ -8318,29 +8297,16 @@ mod tests {
     }
 
     #[test]
-    fn mirror_branch_name_is_scoped_per_review() {
-        assert_eq!(
-            crate::project_forks::mirror_branch_name("main", "guardian-000000000001"),
-            "ralphus-mirror/main/guardian-000000000001"
-        );
-        assert_ne!(
-            crate::project_forks::mirror_branch_name("main", "guardian-000000000001"),
-            crate::project_forks::mirror_branch_name("main", "guardian-000000000002"),
-            "two concurrent reviews against the same fork+base branch must never share a mirror"
-        );
-    }
-
-    #[test]
-    fn sync_fork_mirror_branch_force_pushes_the_parents_current_tip_to_the_fork() {
+    fn sync_fork_base_branch_fast_forwards_to_the_parents_current_tip() {
         // Fully hermetic -- both "remotes" are real local bare repos, no
         // HTTP/network involved, exercising the actual git fetch+push this
         // helper performs.
-        let parent_bare = tmp_dir("mirror-sync-parent-bare");
+        let parent_bare = tmp_dir("fork-base-sync-parent-bare");
         g(&parent_bare, &["init", "--bare"]);
-        let fork_bare = tmp_dir("mirror-sync-fork-bare");
+        let fork_bare = tmp_dir("fork-base-sync-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
 
-        let root_dir = tmp_dir("mirror-sync-work");
+        let root_dir = tmp_dir("fork-base-sync-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
         gwrite(&root_dir, "base.txt", "v1\n");
         g(&root_dir, &["add", "."]);
@@ -8356,29 +8322,19 @@ mod tests {
         g(&root_dir, &["push", "origin", "release:release"]);
         let v1_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
 
-        let mirror = crate::project_forks::sync_fork_mirror_branch(
-            &root_dir,
-            "origin",
-            "fork",
-            "release",
-            "guardian-1",
-        )
-        .unwrap();
-        assert_eq!(mirror, "ralphus-mirror/release/guardian-1");
-        let fork_tip = g(
-            &fork_bare,
-            &["rev-parse", "refs/heads/ralphus-mirror/release/guardian-1"],
-        )
-        .trim()
-        .to_string();
+        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
+            .unwrap();
+        let fork_tip = g(&fork_bare, &["rev-parse", "refs/heads/release"])
+            .trim()
+            .to_string();
         assert_eq!(
             fork_tip, v1_sha,
-            "the mirror branch must match the parent's current tip"
+            "the fork base branch must match the parent's current tip"
         );
 
-        // Advance the parent past what the fork's mirror currently has, and
-        // confirm a second sync fast-forwards (force-pushes) it to match --
-        // idempotent/re-syncable, not a one-shot creation.
+        // Advance the parent past the fork base and confirm a second sync
+        // fast-forwards it to match -- idempotent/re-syncable, not a one-shot
+        // creation.
         gwrite(&root_dir, "base.txt", "v2\n");
         g(&root_dir, &["add", "."]);
         g(&root_dir, &["commit", "--message", "v2"]);
@@ -8386,21 +8342,51 @@ mod tests {
         let v2_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
         assert_ne!(v1_sha, v2_sha);
 
-        crate::project_forks::sync_fork_mirror_branch(
-            &root_dir,
-            "origin",
-            "fork",
-            "release",
-            "guardian-1",
-        )
-        .unwrap();
-        let fork_tip_after = g(
-            &fork_bare,
-            &["rev-parse", "refs/heads/ralphus-mirror/release/guardian-1"],
-        )
-        .trim()
-        .to_string();
+        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
+            .unwrap();
+        let fork_tip_after = g(&fork_bare, &["rev-parse", "refs/heads/release"])
+            .trim()
+            .to_string();
         assert_eq!(fork_tip_after, v2_sha);
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn sync_fork_base_branch_refuses_to_overwrite_a_diverged_fork_branch() {
+        let parent_bare = tmp_dir("fork-base-diverged-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+        let fork_bare = tmp_dir("fork-base-diverged-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+        let root_dir = tmp_dir("fork-base-diverged-work");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "base.txt", "parent\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "parent"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "main:main"]);
+        g(&root_dir, &["checkout", "-b", "fork-only"]);
+        gwrite(&root_dir, "fork.txt", "fork only\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "fork only"]);
+        g(&root_dir, &["push", "fork", "HEAD:main"]);
+
+        let error =
+            crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "main")
+                .unwrap_err();
+        assert!(
+            error.contains("could not fast-forward fork branch main"),
+            "{error}"
+        );
 
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
@@ -11280,7 +11266,7 @@ mod tests {
                 "github",
                 "acme/widget",
                 "feature/foo",
-                "ralphus-mirror/main/guardian-1",
+                "main",
                 "Add foo",
                 "Adds the foo thing.",
                 Some(8),
@@ -12576,7 +12562,7 @@ mod tests {
     #[test]
     fn dual_root_pr_mode_creates_a_second_same_repo_stack_pr_for_the_root_branch_only() {
         // RAL-<new>: with `dual_root_pr` enabled, the stack's root branch
-        // gets a second, same-repo PR into the mirror branch, alongside the
+        // gets a second, same-repo PR into the maintained fork base branch, alongside the
         // existing cross-repo "parent" PR (unchanged) -- so it visually
         // chains into the rest of the stack. Disabled (the default) is
         // covered by every other fork-mode submission test in this module,
@@ -12620,17 +12606,16 @@ mod tests {
             assert_eq!(payload["base"], serde_json::json!("release"));
 
             // The new "stack" PR: same-repo within the fork, into the
-            // mirror branch -- not the parent's real base branch.
+            // fork base branch -- not the parent's real base branch.
             let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
-            assert!(
-                payload["base"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("ralphus-mirror/release/"),
-                "{}",
-                payload["base"]
-            );
+            assert_eq!(payload["base"], serde_json::json!("release"));
+
+            // The following branch remains based on the root's alias, not
+            // on the shared fork base branch used by the visual root PR.
+            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
+            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
+            assert_eq!(payload["base"], serde_json::json!("a-alias"));
         });
 
         let root_dir = tmp_dir("dual-root-work");
@@ -12642,6 +12627,10 @@ mod tests {
         gwrite(&root_dir, "a.txt", "content\n");
         g(&root_dir, &["add", "."]);
         g(&root_dir, &["commit", "--message", "add a.txt"]);
+        g(&root_dir, &["checkout", "-b", "review/b"]);
+        gwrite(&root_dir, "b.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add b.txt"]);
         g(&root_dir, &["checkout", "release"]);
         crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
             .unwrap();
@@ -12656,12 +12645,22 @@ mod tests {
             .set_guardian_dual_root_pr(&gid, Some(true))
             .unwrap();
         store.lock().add_guardian_branch(&gid, "a").unwrap();
-        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
-            .id
-            .clone();
+        store.lock().add_guardian_branch(&gid, "b").unwrap();
+        let branch_ids: Vec<String> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|branch| branch.id.clone())
+            .collect();
         store
             .lock()
-            .set_branch_review(&gid, &branch_id, "review/a", "wt")
+            .set_branch_review(&gid, &branch_ids[0], "review/a", "wt")
+            .unwrap();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_ids[1], "review/b", "wt")
             .unwrap();
 
         let fork = crate::project_forks::ForkRecord {
@@ -12700,7 +12699,8 @@ mod tests {
             "the setting must actually be on for this test to mean anything"
         );
         let branch = &guardian.branches[0];
-        let ordered_enabled: Vec<&BranchView> = vec![branch];
+        let successor = &guardian.branches[1];
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let mut alias_by_branch: HashMap<String, String> = HashMap::new();
         let runner = NoopRunner;
         let req = PrRequest {
@@ -12731,12 +12731,40 @@ mod tests {
             false,
         )
         .unwrap();
+        let successor_req = PrRequest {
+            branch_id: Some(successor.id.clone()),
+            branch_alias: None,
+            title: Some("Successor".to_string()),
+            description: Some("Follows the root".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &fork_client,
+            &gid,
+            &root_dir,
+            "fork",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "release",
+            successor,
+            &successor_req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            Some(&routing),
+            false,
+        )
+        .unwrap();
 
         let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
         assert_eq!(
             rows.len(),
-            2,
-            "the root branch must get exactly two rows: parent + stack"
+            3,
+            "the root gets parent + stack rows, and its successor remains chained"
         );
         let parent_row = rows.iter().find(|p| p.pr_kind == "parent").unwrap();
         assert_eq!(parent_row.repo, "acme/widget");
@@ -12745,9 +12773,18 @@ mod tests {
 
         let stack_row = rows.iter().find(|p| p.pr_kind == "stack").unwrap();
         assert_eq!(stack_row.repo, "alice/widget");
-        assert!(stack_row.base_ref.starts_with("ralphus-mirror/release/"));
+        assert_eq!(stack_row.base_ref, "release");
         assert_eq!(stack_row.pr_number, Some(2));
         assert_eq!(stack_row.branch_id.as_deref(), Some(branch.id.as_str()));
+        let successor_row = rows
+            .iter()
+            .find(|p| {
+                p.branch_id.as_deref() == Some(successor.id.as_str()) && p.pr_kind == "parent"
+            })
+            .unwrap();
+        assert_eq!(successor_row.repo, "alice/widget");
+        assert_eq!(successor_row.base_ref, "a-alias");
+        assert_eq!(successor_row.pr_number, Some(3));
 
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root_dir);

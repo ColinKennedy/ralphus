@@ -47,6 +47,13 @@ from the **fork**. Only where the PR/MR is *filed* differs:
 | Lowest enabled, unmerged branch (the **root**) | fork | parent repository, logically | parent's base branch |
 | Every later branch | fork | fork | preceding branch's own alias |
 
+When `dual_root_pr` is enabled, the root also has a second, fork-internal
+stack PR targeted at the fork's copy of the parent base branch. Before ralphus
+creates that PR, it fast-forwards the fork branch from the parent branch. It
+never force-pushes: a diverged fork base branch blocks submission until its
+owner reconciles it. Several reviews may target that same maintained fork
+branch concurrently.
+
 "Filed on" is the logical destination; the forge API call itself is
 asymmetric between GitLab and GitHub:
 

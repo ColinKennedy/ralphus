@@ -378,51 +378,42 @@ pub(crate) fn ensure_fork_remote(
     }
 }
 
-/// The fork-side branch name a dual-root-PR mode "stack" PR targets (RAL-
-/// <new>): a mirror of the parent's base branch, scoped per-review so
-/// concurrent guardians sharing one fork+base-branch pair never race to
-/// force-push the same ref. Never stored -- always recomputed, matching
-/// [`default_remote_name`]'s own convention.
-#[must_use]
-pub(crate) fn mirror_branch_name(base_branch_name: &str, guardian_id: &str) -> String {
-    format!("ralphus-mirror/{base_branch_name}/{guardian_id}")
-}
-
-/// Force-push `fork_remote_name`'s [`mirror_branch_name`] branch to
-/// `parent_remote_name`'s current tip of `base_branch_name` (RAL-<new>), so a
-/// dual-root-PR mode "stack" PR always targets an up-to-date snapshot of the
-/// parent's real base branch. `root` must already carry both remotes, with
-/// the fork remote's credential helper/identity already wired (see
+/// Fast-forward the fork's `base_branch_name` to the parent branch's current
+/// tip. A dual-root stack PR can then target the fork's ordinary base branch,
+/// keeping several reviews on one fork visually aligned. `root` must already
+/// carry both remotes, with the
+/// fork remote's credential helper/identity already wired (see
 /// `pr::resolve_fork_routing`, which every caller of this function runs
-/// through first). Idempotent -- force-pushing an already-matching tip is a
-/// harmless no-op. Returns the mirror branch name pushed, for convenience.
+/// through first).
+///
+/// The push deliberately omits `--force`: a fork base branch that contains
+/// work outside the parent branch must be reconciled by its owner rather than
+/// overwritten by ralphus. Concurrent maintenance attempts are safe: Git
+/// accepts an already-current branch and rejects a non-fast-forward race.
 ///
 /// # Errors
 /// Propagates the underlying `git fetch`/`git push` failure.
-pub(crate) fn sync_fork_mirror_branch(
+pub(crate) fn sync_fork_base_branch(
     root: &std::path::Path,
     parent_remote_name: &str,
     fork_remote_name: &str,
     base_branch_name: &str,
-    guardian_id: &str,
-) -> Result<String, String> {
+) -> Result<(), String> {
     crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
         .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
     let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("could not resolve fetched tip: {e}"))?;
-    let mirror = mirror_branch_name(base_branch_name, guardian_id);
     crate::guardian_merge::git(
         root,
         &[
             "push",
             fork_remote_name,
-            "--force",
-            &format!("{tip}:refs/heads/{mirror}"),
+            &format!("{tip}:refs/heads/{base_branch_name}"),
         ],
     )
-    .map(|_| mirror)
-    .map_err(|e| format!("could not force-push mirror branch: {e}"))
+    .map(|_| ())
+    .map_err(|e| format!("could not fast-forward fork branch {base_branch_name}: {e}"))
 }
 
 /// One health finding for a registered fork row (RAL-338 Phase 6). Advisory
