@@ -138,6 +138,19 @@ impl Store {
                 INFO,
                 "ralphus [store] forge token removed for user {user:?} host {host:?}"
             );
+            let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "store",
+                message: "user forge token removed",
+                scope: Some("user_forge_token"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "user": user, "host": host }),
+                admin_only: false,
+            });
         }
         Ok(n > 0)
     }

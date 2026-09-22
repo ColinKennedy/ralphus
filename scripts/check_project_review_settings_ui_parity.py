@@ -40,6 +40,7 @@ MAPPING = {
     "skip_base_updates": "skip_base_updates",
     "match_pr_branch_name": "match_pr_branch_name",
     "separate_pr_branch": "separate_pr_branch",
+    "dual_root_pr": "dual_root_pr",
     "auto_build": "auto_build",
     "auto_fix_pr_errors": "auto_fix_pr_errors",
     "auto_fix_prompt_template": "auto_fix_prompt_template",

@@ -3033,6 +3033,23 @@ fn maybe_promote_fork_root(
                         "ralphus [pr] review {id} promoted successor's stack pr created on the \
                          forge (number={number}) but failed to record it locally: {e}"
                     );
+                    let guard = store.lock();
+                    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::WARNING,
+                        source: "pr",
+                        message: "promoted successor stack PR was not recorded locally",
+                        scope: Some("guardian"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "branch_id": successor_branch.id,
+                            "pr_number": number,
+                        }),
+                        admin_only: false,
+                    });
                 }
             }
             Err(e) => {
