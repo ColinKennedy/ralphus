@@ -2948,16 +2948,6 @@ impl Store {
             // column can still be NULL for guardians created before this
             // migration.
             "ALTER TABLE guardians ADD COLUMN owner TEXT",
-            // RAL-<new>: the transient, review-specific fork-side branch a
-            // `dual_root_pr` stack PR targets --
-            // `ralphus/review/<id>/upstream`, collision-suffixed, allocated
-            // at the first dual-root submission and force-pushed to the
-            // parent's base tip on every base fetch. NULL for every review
-            // that never used dual-root mode (pre-existing shared-fork-base
-            // reviews are deliberately not migrated). Cleared once the
-            // branch has been retired -- terminal review state or review
-            // deletion.
-            "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
             // RAL-487/RAL-488: the resolved command-remediation contract for a
             // `command`-kind cell/proof step -- see
             // `ralphus_core::schema::CellDef::mode`/`ProofStep::mode`. Stored
