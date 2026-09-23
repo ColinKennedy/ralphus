@@ -77,6 +77,17 @@
       let preferenceForksError = "";
       /** Draft row for adding a personal fork mapping. */
       let preferenceForkDraft = { project: "", fork_url: "", remote_name: "", fork_owner: "" };
+      // ---- Forge tokens (RAL-490) ----
+      /** @type {string[]} forge kinds the daemon supports (`GET /api/forge/kinds`), e.g. ["github","gitlab"]. */
+      let forgeKinds = [];
+      /** @type {UserForgeTokenSummary[]} forge-token host rows belonging to the user whose Preferences page is open. Never carries a token value. */
+      let preferenceForgeTokens = [];
+      /** Error from the Preferences page's forge-token controls. */
+      let preferenceForgeTokensError = "";
+      /** @type {{kind: string, host: string, token: string}} draft for the "add/apply a forge token" row. */
+      let preferenceForgeTokenDraft = { kind: "github", host: "github.com", token: "" };
+      /** @type {"idle"|"saving"|"valid"|"invalid"|"unreachable"} outcome of the last "Apply" click's live verification, shown next to the form. Resets to "idle" whenever the draft changes. */
+      let preferenceForgeTokenVerify = "idle";
       /** @type {ProjectView[]} */
       let projects = [];
       /** @type {string[]} registered project names (RAL-345) -- the live, non-admin source for the Tasks/Squads project-filter dropdowns, refreshed from `GET /api/projects` on every poll of those tabs (reads are open to every caller, RAL-332; only mutations are admin-gated). Empty until the first such poll lands -- never a stale snapshot. */

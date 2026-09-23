@@ -243,6 +243,10 @@
         <div id="preference-forks"><div class="empty">Loading…</div></div>
       </div>
       <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)">
+        <b data-tip="Personal access tokens (RAL-490) this user has configured, one per forge host. Ralphus uses these to authenticate PR/MR submission, CI-status checks, and other forge REST calls made on this user's behalf.\nWho/when: set a token here after generating a PAT from GitHub/GitLab's own settings.\nCaveats: a saved token is never redisplayed -- re-paste it here to change it.">Forge tokens</b>
+        <div id="preference-forge-tokens"><div class="empty">Loading…</div></div>
+      </div>
+      <div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)">
         <b data-tip="Everything you watch, independent of who created it. Watchers receive typed mailbox notifications at their selected priority tiers.">Watches</b>
         <label style="display:block;margin:10px 0" data-tip="Automatically watch new squads and reviews you create. Turning this off keeps all existing watches."><input id="auto-watch" type="checkbox" onchange="setAutoWatch(this.checked)"> Watch everything I create</label>
         <div id="watched-items"><div class="empty">Loading…</div></div>

@@ -627,6 +627,28 @@ struct UserForgeTokensResponse {
     tokens: Vec<crate::user_forge_tokens::UserForgeTokenSummary>,
 }
 
+/// `GET /api/forge/kinds` (RAL-490): every [`crate::forge::ForgeKind`]'s wire
+/// string, so the personal-settings UI's forge dropdown is sourced from the
+/// daemon rather than a hard-coded frontend list.
+#[derive(Serialize)]
+struct ForgeKindsResponse {
+    kinds: Vec<&'static str>,
+}
+
+#[derive(Deserialize)]
+struct VerifyUserForgeTokenBody {
+    kind: String,
+    host: String,
+    token: String,
+}
+
+/// `outcome` is one of `"valid"` / `"invalid"` / `"unreachable"` -- see
+/// [`crate::forge::TokenVerifyOutcome`].
+#[derive(Serialize)]
+struct VerifyUserForgeTokenResponse {
+    outcome: &'static str,
+}
+
 #[derive(Serialize)]
 struct AgentProfilesHealthResponse {
     profiles: Vec<crate::agent_profiles::ProfileHealthResult>,
@@ -1116,6 +1138,12 @@ fn route_for_user(
         // of successful/failed retirement attempts. Open to every caller
         // (read-only, like the fork reads above).
         ("GET", ["api", "worktree-retirements"]) => worktree_retirements(daemon),
+        // RAL-490: every supported forge kind's wire string, so the
+        // personal-settings UI's forge dropdown is sourced from this daemon
+        // rather than a hard-coded frontend list. Read-only and carries no
+        // per-user data, so (like `project-forks` above) it's open to any
+        // caller that clears the route's normal bearer-token check.
+        ("GET", ["api", "forge", "kinds"]) => forge_kinds(),
         // RAL-338 follow-up: a ralphus user's own forge personal-access
         // tokens, keyed by host. Self-or-admin gated like the fork rows
         // above -- a user manages their own credentials, an admin can too.
@@ -1138,6 +1166,19 @@ fn route_for_user(
             let target_user = url_decode(user);
             self_or_admin_gated(daemon, user_header, &target_user, || {
                 delete_user_forge_token(daemon, &target_user, &url_decode(host))
+            })
+        }
+        // RAL-490: live authenticated ping using a token the caller just
+        // typed in (not necessarily the one already saved for this host),
+        // so the UI can show success/failure right after "Apply" instead of
+        // only surfacing a bad token the next time a PR/MR submission needs
+        // it. Self-or-admin gated like the rows above -- the request body
+        // carries a plaintext token, so this must not be reachable for
+        // another user's account.
+        ("POST", ["api", "users", user, "forge-tokens", "verify"]) => {
+            let target_user = url_decode(user);
+            self_or_admin_gated(daemon, user_header, &target_user, || {
+                verify_user_forge_token(body)
             })
         }
         // RAL-338 follow-up: fetch path for a worktree's git-credential
@@ -5321,6 +5362,63 @@ fn delete_user_forge_token(daemon: &Daemon, user: &str, host: &str) -> Reply {
         ),
         Err(e) => store_error(&e),
     }
+}
+
+/// `GET /api/forge/kinds` (RAL-490).
+fn forge_kinds() -> Reply {
+    json(
+        200,
+        &ForgeKindsResponse {
+            kinds: crate::forge::ForgeKind::all()
+                .iter()
+                .map(|k| k.as_str())
+                .collect(),
+        },
+    )
+}
+
+/// `POST /api/users/{user}/forge-tokens/verify` (RAL-490): live-ping
+/// `body.host` as `body.kind` using `body.token`, without persisting
+/// anything -- distinct from [`set_user_forge_token`], which is the call
+/// that actually saves a token. The two are meant to be called back-to-back
+/// from "Apply" in the personal-settings UI, in that order.
+fn verify_user_forge_token(body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<VerifyUserForgeTokenBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include non-empty \"kind\", \"host\", and \"token\" strings",
+            vec![],
+        );
+    };
+    let Some(kind) = crate::forge::ForgeKind::parse(&req.kind) else {
+        return error(
+            400,
+            "invalid_value",
+            &format!("unknown forge kind {:?}", req.kind),
+            vec![],
+        );
+    };
+    let host = req.host.trim();
+    let token = req.token.trim();
+    if host.is_empty() {
+        return error(400, "invalid_value", "'host' must not be empty", vec![]);
+    }
+    if token.is_empty() {
+        return error(400, "invalid_value", "'token' must not be empty", vec![]);
+    }
+    let api_base = kind.default_api_base(host);
+    let outcome = crate::forge::verify_forge_token(kind, &api_base, token);
+    json(
+        200,
+        &VerifyUserForgeTokenResponse {
+            outcome: match outcome {
+                crate::forge::TokenVerifyOutcome::Valid => "valid",
+                crate::forge::TokenVerifyOutcome::Invalid => "invalid",
+                crate::forge::TokenVerifyOutcome::Unreachable => "unreachable",
+            },
+        },
+    )
 }
 
 /// `GET /api/internal/fork-credential?worktree_id=...&grant=...` (RAL-338
@@ -16344,6 +16442,83 @@ mod tests {
         assert!(got.body.contains("\"name\":\"t\""));
     }
 
+    /// RAL-476: an explicit `submitter` matching the caller's own resolved
+    /// identity is stamped on the squad as-is.
+    #[test]
+    fn submit_with_explicit_submitter_matching_the_caller_stamps_it_on_the_squad() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        let toml = format!("submitter = \"alice\"\n{GOOD}");
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/squads",
+            &submit_body(&toml),
+            Some("alice"),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap();
+        assert_eq!(
+            d.lock().get_squad(squad_id).unwrap().submitter.as_deref(),
+            Some("alice")
+        );
+    }
+
+    /// RAL-476 (interview Q9): a non-admin caller may not submit a squad
+    /// claiming a different registered user as its `submitter` -- only an
+    /// admin may act on another user's behalf, and the rejection is a 400
+    /// `submitter_conflict`, not a 403 (this is a bad request body, not an
+    /// authorization boundary on an existing resource).
+    #[test]
+    fn submit_with_explicit_submitter_from_a_non_admin_caller_is_rejected_with_400() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        let toml = format!("submitter = \"alice\"\n{GOOD}");
+        let r = route_for_user(&d, "POST", "/api/squads", &submit_body(&toml), Some("bob"));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("submitter_conflict"), "{}", r.body);
+    }
+
+    /// RAL-476 (interview Q9): an admin caller may submit a squad on behalf
+    /// of a different registered user, and that user is the one stamped as
+    /// `submitter`.
+    #[test]
+    fn submit_with_explicit_submitter_from_an_admin_caller_is_allowed() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("admin-bob").unwrap();
+        d.lock().set_user_admin("admin-bob", true).unwrap();
+        let toml = format!("submitter = \"alice\"\n{GOOD}");
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/squads",
+            &submit_body(&toml),
+            Some("admin-bob"),
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let squad_id = v["squad_id"].as_str().unwrap();
+        assert_eq!(
+            d.lock().get_squad(squad_id).unwrap().submitter.as_deref(),
+            Some("alice")
+        );
+    }
+
+    /// RAL-476: an explicit `submitter` must name an already-registered
+    /// user, regardless of who is submitting -- this is a 400
+    /// `unknown_user`, distinct from the admin-conflict case above.
+    #[test]
+    fn submit_with_an_unregistered_explicit_submitter_is_rejected_with_400() {
+        let d = daemon();
+        let toml = format!("submitter = \"ghost\"\n{GOOD}");
+        let r = route(&d, "POST", "/api/squads", &submit_body(&toml));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("unknown_user"), "{}", r.body);
+    }
+
     #[test]
     fn board_reports_zero_max_concurrent_as_no_limit() {
         let d = Daemon::new(Store::open_in_memory().unwrap(), 0);
@@ -16665,6 +16840,85 @@ mod tests {
             "POST",
             "/api/users/alice/forge-tokens",
             &serde_json::json!({"host": "gitlab.com", "token": "glpat-secret"}).to_string(),
+            Some("bob"),
+        );
+        assert_eq!(r.status, 403, "{}", r.body);
+    }
+
+    #[test]
+    fn forge_kinds_route_lists_github_and_gitlab() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/forge/kinds", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["kinds"], serde_json::json!(["github", "gitlab"]));
+    }
+
+    #[test]
+    fn verify_user_forge_token_route_rejects_bad_bodies() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+
+        let missing_field = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/verify",
+            &serde_json::json!({"kind": "github", "host": "github.com"}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(missing_field.status, 400, "{}", missing_field.body);
+
+        let unknown_kind = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/verify",
+            &serde_json::json!({"kind": "bitbucket", "host": "x", "token": "t"}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(unknown_kind.status, 400, "{}", unknown_kind.body);
+
+        let empty_token = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/verify",
+            &serde_json::json!({"kind": "github", "host": "github.com", "token": ""}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(empty_token.status, 400, "{}", empty_token.body);
+    }
+
+    #[test]
+    fn verify_user_forge_token_route_reports_unreachable_for_a_dead_host() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+
+        // Port 9 (discard) refuses connections almost instantly, giving a
+        // fast, deterministic "unreachable" without depending on live
+        // internet access or a real forge account.
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/verify",
+            &serde_json::json!({"kind": "github", "host": "127.0.0.1:9", "token": "t"}).to_string(),
+            Some("alice"),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("unreachable"), "{}", r.body);
+    }
+
+    #[test]
+    fn verify_user_forge_token_route_rejects_a_different_non_admin_user() {
+        let d = daemon();
+        d.lock().create_user("alice").unwrap();
+        d.lock().create_user("bob").unwrap();
+        d.lock().create_user("some-admin").unwrap();
+        d.lock().set_user_admin("some-admin", true).unwrap();
+
+        let r = route_for_user(
+            &d,
+            "POST",
+            "/api/users/alice/forge-tokens/verify",
+            &serde_json::json!({"kind": "github", "host": "github.com", "token": "t"}).to_string(),
             Some("bob"),
         );
         assert_eq!(r.status, 403, "{}", r.body);

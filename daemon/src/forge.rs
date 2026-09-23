@@ -83,7 +83,10 @@ impl ForgeKind {
         }
     }
 
-    fn default_api_base(self, host: &str) -> String {
+    /// `pub(crate)` (RAL-490) so `server.rs`'s token-verify handler can turn
+    /// a user-supplied host into the same API base [`ForgeClient`] would
+    /// resolve, without duplicating this match.
+    pub(crate) fn default_api_base(self, host: &str) -> String {
         match self {
             Self::GitHub if host.eq_ignore_ascii_case("github.com") => {
                 "https://api.github.com".to_string()
@@ -102,6 +105,15 @@ impl ForgeKind {
             Self::GitHub => "RALPHUS_GITHUB_TOKEN",
             Self::GitLab => "RALPHUS_GITLAB_TOKEN",
         }
+    }
+
+    /// Every supported forge kind (RAL-490): backs `GET /api/forge/kinds` so
+    /// the personal-settings UI's forge dropdown is sourced from this enum
+    /// rather than a hard-coded frontend list -- adding a third forge here is
+    /// then the only change needed for it to show up there.
+    #[must_use]
+    pub fn all() -> &'static [ForgeKind] {
+        &[Self::GitHub, Self::GitLab]
     }
 }
 
@@ -2300,6 +2312,47 @@ fn parse_body(resp: ureq::Response) -> Result<serde_json::Value, String> {
     serde_json::from_str(&body).map_err(|e| format!("forge API JSON parse: {e}"))
 }
 
+/// Outcome of a live [`verify_forge_token`] ping (RAL-490). Kept distinct from
+/// [`ForgeError`] because the personal-settings UI needs to tell a user
+/// "that token is wrong" apart from "the forge didn't answer" -- the first
+/// means re-check what you pasted, the second means try again later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenVerifyOutcome {
+    /// The forge accepted the token for an authenticated request.
+    Valid,
+    /// The forge reached out and explicitly rejected the token (401/403).
+    Invalid,
+    /// No conclusive answer -- DNS/connect/timeout failure, or a response
+    /// that was neither a success nor an auth rejection.
+    Unreachable,
+}
+
+/// Bounded-timeout authenticated ping against `kind`'s "who am I" endpoint
+/// (RAL-490), used right after a user saves a personal access token from the
+/// UI so they get immediate feedback instead of discovering a typo'd token
+/// only when a PR/MR submission fails later. Deliberately standalone rather
+/// than routing through [`ForgeClient::get`]/`describe_evicting` -- this
+/// token was just typed in by a human, not resolved from the CLI-token
+/// cache, so there is nothing to evict.
+///
+/// Takes `api_base` explicitly (as [`ForgeClient::new`] does) rather than a
+/// host, so a test can point it at a local mock server the same way every
+/// other `ForgeClient` test does -- [`ForgeKind::default_api_base`] always
+/// resolves to a `https://` URL, which a plain-HTTP test server can't stand
+/// in for.
+pub fn verify_forge_token(kind: ForgeKind, api_base: &str, token: &str) -> TokenVerifyOutcome {
+    let url = format!("{api_base}/user");
+    let req = match kind {
+        ForgeKind::GitHub => ureq::get(&url).set("Authorization", &format!("Bearer {token}")),
+        ForgeKind::GitLab => ureq::get(&url).set("PRIVATE-TOKEN", token),
+    };
+    match req.timeout(Duration::from_secs(10)).call() {
+        Ok(_) => TokenVerifyOutcome::Valid,
+        Err(ureq::Error::Status(401 | 403, _)) => TokenVerifyOutcome::Invalid,
+        Err(_) => TokenVerifyOutcome::Unreachable,
+    }
+}
+
 /// Parse a git remote URL into `(host, path)`, where `path` has no leading
 /// slash, trailing slash, or `.git` suffix. Supports the three shapes git
 /// itself accepts: `git@host:owner/repo.git`, `https://host/owner/repo.git`,
@@ -4467,6 +4520,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// RAL-490: `resolve_remote_for_as`'s precedence must hold even when
+    /// `[forge].token_env` names a variable that genuinely *is* set in the
+    /// process environment -- otherwise the override would only win in the
+    /// (untested-by-the-above) coincidental case where the env var happened
+    /// to be unset. This workspace forbids `unsafe_code`, so a test can't
+    /// call the now-`unsafe` `std::env::set_var` to stand up a fake variable
+    /// (see `worktrees.rs`'s `provision_remote_with_targets` doc comment for
+    /// the same constraint elsewhere) -- pointing `token_env` at `PATH`,
+    /// which every process already has non-empty, gets the same guarantee
+    /// without mutating real process state.
+    #[test]
+    fn resolve_remote_for_as_prefers_the_token_override_over_a_populated_token_env() {
+        let root = tmp_dir("resolve-remote-token-override-vs-set-env");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/alice/widget.git",
+            ],
+        );
+
+        let path_value = std::env::var("PATH").expect("PATH must be set in the test process");
+        let cfg = ForgeConfig {
+            token_env: Some("PATH".to_string()),
+            ..ForgeConfig::default()
+        };
+
+        let client = resolve_remote_for_as(&root, "fork", &cfg, Some("alices-own-token")).unwrap();
+        assert_eq!(client.token.as_deref(), Some("alices-own-token"));
+        assert_ne!(client.token.as_deref(), Some(path_value.as_str()));
+
+        // With no override, the same populated `token_env` is the value that
+        // gets used -- confirms the env-var path itself, not just that the
+        // override test above wasn't vacuously true.
+        let plain = resolve_remote_for_as(&root, "fork", &cfg, None).unwrap();
+        assert_eq!(plain.token.as_deref(), Some(path_value.as_str()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn resolve_remote_for_as_with_no_override_behaves_like_resolve_remote_for() {
         let root = tmp_dir("resolve-remote-token-no-override");
@@ -5652,5 +5748,57 @@ mod tests {
         };
         assert_eq!(comments[0].author, "carol");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn forge_kind_all_lists_every_variant_with_a_stable_wire_string() {
+        let names: Vec<&str> = ForgeKind::all().iter().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["github", "gitlab"]);
+    }
+
+    #[test]
+    fn verify_forge_token_reports_valid_on_a_2xx_response() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/user");
+            assert_eq!(
+                req_header(&req, "Authorization").as_deref(),
+                Some("Bearer good-token")
+            );
+            req.respond(tiny_http::Response::from_string(r#"{"login":"alice"}"#))
+                .unwrap();
+        });
+        let outcome =
+            verify_forge_token(ForgeKind::GitHub, &format!("http://{addr}"), "good-token");
+        assert_eq!(outcome, TokenVerifyOutcome::Valid);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn verify_forge_token_reports_invalid_on_401_and_sends_the_gitlab_header() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req_header(&req, "PRIVATE-TOKEN").as_deref(),
+                Some("bad-token")
+            );
+            req.respond(tiny_http::Response::from_string("unauthorized").with_status_code(401))
+                .unwrap();
+        });
+        let outcome = verify_forge_token(ForgeKind::GitLab, &format!("http://{addr}"), "bad-token");
+        assert_eq!(outcome, TokenVerifyOutcome::Invalid);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn verify_forge_token_reports_unreachable_when_nothing_is_listening() {
+        // Port 0 never accepts a connection -- stands in for a network/DNS
+        // failure without this test's runtime depending on an actual timeout.
+        let outcome = verify_forge_token(ForgeKind::GitHub, "http://127.0.0.1:0", "tok");
+        assert_eq!(outcome, TokenVerifyOutcome::Unreachable);
     }
 }
