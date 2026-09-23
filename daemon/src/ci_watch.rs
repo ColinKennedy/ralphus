@@ -51,7 +51,7 @@ use crate::forge::{FailedCheck, PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
 use crate::mailbox::MailboxPriority;
-use crate::pr::PullRequestView;
+use crate::pr::{AutoFixClaim, PullRequestView};
 use crate::runner::Runner;
 #[cfg(test)]
 use crate::store::Store;
@@ -452,13 +452,7 @@ fn enqueue_ci_failure_notice(
     }
 }
 
-/// Tell a human (mailbox/notification center) that this PR's single auto-fix
-/// attempt is exhausted and CI is still failing (RAL-<new>): the background
-/// poller will not try again on its own until either a new commit lands
-/// (`Store::update_pull_request_ex`'s sha-advance clear) or CI is next
-/// observed non-failing (`Store::set_pr_ci_status`'s clear) -- both of which
-/// require *something* to change first, so without this notice a PR can sit
-/// failing indefinitely with nothing telling a person it stopped trying.
+/// Tell a human that this PR's unattended CI-fix campaign is exhausted.
 /// Fires at most once per exhausted attempt (`auto_fix_exhausted_notified_at_ms`,
 /// checked by the caller before calling this), mirroring the single-attempt
 /// cap itself so a long-stuck PR doesn't re-notify on every 2-minute standing
@@ -476,10 +470,9 @@ fn enqueue_auto_fix_exhausted_notice(
 
     let mut text = format!(
         "Auto-fix exhausted for review '{}' ({}), PR: {pr_url}\n\n\
-         The one automatic auto-fix attempt for this failure has already run and CI is still \
-         failing: {}\n\nThe background poller will not try again on its own until a new commit \
-         is pushed to this PR.\n",
-        guardian.name, guardian.id, failure.reason
+         Automatic CI fixing stopped after {} attempt(s) and CI is still failing: {}\n\n\
+         The background poller will not retry until CI passes or a person explicitly retries it.\n",
+        guardian.name, guardian.id, pr.auto_fix_attempt_count, failure.reason
     );
     if failure.checks.len() > 1 {
         text.push_str(&format!("{} failing checks:\n", failure.checks.len()));
@@ -490,10 +483,7 @@ fn enqueue_auto_fix_exhausted_notice(
     } else if let Some(job_url) = &failure.job_url {
         text.push_str(&format!("Failing job: {job_url}\n"));
     }
-    text.push_str(
-        "\nTo force another attempt: push a new commit, or use \"Action Feedback\" on this PR \
-         (bypasses the single-attempt cap for a person-initiated retry).",
-    );
+    text.push_str("\nTo force another attempt: use \"Action Feedback\" on this PR.");
 
     let entity_uri = format!("guardian:{}", guardian.id);
     let enqueued = {
@@ -988,39 +978,6 @@ pub fn dispatch_pr_auto_fix(
         );
         return;
     }
-    if pr.auto_fix_attempted_at_ms.is_some() {
-        // RAL-<new>: this is the single-attempt-per-failure cap from this
-        // function's own doc comment -- previously silent, which is exactly
-        // what made guardian-000000000119 / PR #235 look "stuck" instead of
-        // deliberately capped. Logged at the same level/shape as the
-        // stack-order deferral below so both no-retry reasons show up the
-        // same way on a PR's timeline.
-        log_ci_watch(
-            store,
-            &guardian.id,
-            pr.branch_id.as_deref().unwrap_or(""),
-            LogLevel::DEBUG,
-            format!(
-                "ralphus [ci-watch] review {} pr #{} auto-fix skipped: already attempted for this \
-                 PR's current failure (single attempt per failure)",
-                guardian.id,
-                pr.pr_number.unwrap_or_default()
-            ),
-            serde_json::json!({
-                "pr_number": pr.pr_number,
-                "outcome": "skipped_already_attempted",
-                "auto_fix_attempted_at_ms": pr.auto_fix_attempted_at_ms,
-            }),
-        );
-        // RAL-<new>: a debug log line in Cartographer is easy to miss --
-        // the human this actually matters to needs it in the notification
-        // center, once per exhausted attempt (not every 2-minute poll while
-        // it stays exhausted).
-        if pr.auto_fix_exhausted_notified_at_ms.is_none() {
-            enqueue_auto_fix_exhausted_notice(store, guardian, pr, failure);
-        }
-        return;
-    }
     let Some(branch_id) = pr_fix_branch_id(guardian, pr) else {
         log_ci_watch(
             store,
@@ -1037,11 +994,70 @@ pub fn dispatch_pr_auto_fix(
         );
         return;
     };
-
-    // RAL-395: single attempt per failure -- claim it now, before the
-    // (potentially long-running) agent dispatch below, not after.
-    let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
-
+    let cfg = store
+        .lock()
+        .resolve_review_config(Path::new(&guardian.git_root));
+    let retry_base_ms = i64::try_from(cfg.auto_fix_retry_base_seconds())
+        .unwrap_or(i64::MAX / 1_000)
+        .saturating_mul(1_000);
+    match store
+        .lock()
+        .claim_pr_auto_fix_attempt(&pr.id, cfg.auto_fix_max_attempts(), retry_base_ms)
+    {
+        Ok(AutoFixClaim::Claimed { .. }) => {}
+        Ok(AutoFixClaim::Deferred { next_attempt_at_ms }) => {
+            log_ci_watch(
+                store,
+                &guardian.id,
+                pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {} pr #{} auto-fix deferred until {next_attempt_at_ms}",
+                    guardian.id,
+                    pr.pr_number.unwrap_or_default()
+                ),
+                serde_json::json!({"pr_number": pr.pr_number, "outcome": "deferred_backoff", "next_attempt_at_ms": next_attempt_at_ms}),
+            );
+            return;
+        }
+        Ok(AutoFixClaim::Exhausted { attempts }) => {
+            log_ci_watch(
+                store,
+                &guardian.id,
+                pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {} pr #{} auto-fix stopped after {attempts} attempt(s)",
+                    guardian.id,
+                    pr.pr_number.unwrap_or_default()
+                ),
+                serde_json::json!({
+                    "pr_number": pr.pr_number,
+                    "outcome": "exhausted",
+                    "attempts": attempts,
+                }),
+            );
+            if pr.auto_fix_exhausted_notified_at_ms.is_none() {
+                enqueue_auto_fix_exhausted_notice(store, guardian, pr, failure);
+            }
+            return;
+        }
+        Err(error) => {
+            log_ci_watch(
+                store,
+                &guardian.id,
+                pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::ERROR,
+                format!(
+                    "ralphus [ci-watch] review {} pr #{} could not reserve auto-fix attempt: {error}",
+                    guardian.id,
+                    pr.pr_number.unwrap_or_default()
+                ),
+                serde_json::json!({"pr_number": pr.pr_number, "outcome": "claim_failed", "error": error.to_string()}),
+            );
+            return;
+        }
+    }
     run_pr_fix(
         store,
         runner,
@@ -1086,6 +1102,7 @@ pub fn dispatch_pr_fix_manual(
     client: &crate::forge::ForgeClient,
     submitted_by: Option<&str>,
 ) {
+    let _ = store.lock().clear_pr_auto_fix_attempted(&pr.id);
     let _ = store.lock().mark_pr_auto_fix_attempted(&pr.id);
     let author = submitted_by
         .map(str::trim)
@@ -1264,6 +1281,18 @@ fn run_pr_fix(
         true,
         &CancelToken::never(),
     );
+    if let Some(sha) = outcome.pushed_sha.as_deref().filter(|_| outcome.pushed) {
+        let _ = store.lock().update_pull_request_ex(
+            &pr.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(sha)),
+            None,
+        );
+    }
     // `require_proof: true` above means `proof_passed` is only ever `None`
     // when `run_feedback` bailed out before the resolver agent ran at all
     // (e.g. a concurrent merge/rebuild had the branch's worktree torn down
