@@ -318,8 +318,6 @@ const PROOF_KEYS: &[&str] = &[
     "agent",
     "model",
     "machine",
-    "system_prompt",
-    "system_prompt_position",
     "maximum_tool_output_tokens",
     "arguments",
     "budget_tokens",
@@ -4357,6 +4355,45 @@ project = "ralphus"
                 && e.path.contains("maximum_tool_output_tokens")
                 && e.message.contains("ollama")),
             "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_step_system_prompt_rejected_as_unknown_key() {
+        // Regression guard: `system_prompt`/`system_prompt_position` are only
+        // backed by real fields on `CellDef` (and on a review's
+        // `[[review.auto_build]]` step), not on `ProofStep` -- they must not
+        // be accepted on a `[[task.cell.proof]]` or `[[task.proof]]` block.
+        let src = "[[task]]\nname=\"t\"\nagent=\"claude-code\"\n\
+                   [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nsystem_prompt=\"x\"\nsystem_prompt_position=\"append\"\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\nsystem_prompt=\"y\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownKey
+                && e.message.contains("system_prompt")
+                && !e.message.contains("system_prompt_position")),
+            "expected system_prompt rejected on task.cell.proof: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::UnknownKey
+                    && e.message.contains("system_prompt_position")),
+            "expected system_prompt_position rejected on task.cell.proof: {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors
+                .iter()
+                .filter(|e| e.path.starts_with("task[0].proof")
+                    && e.kind == ErrorKind::UnknownKey
+                    && e.message.contains("system_prompt"))
+                .count()
+                >= 1,
+            "expected system_prompt rejected on task.proof: {:?}",
             r.errors
         );
     }
