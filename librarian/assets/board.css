@@ -224,6 +224,7 @@
          agent-only) rendered pane text (currentPeekDisplayText). */
       .peek-debug-toggle { display: flex; align-items: center; gap: 4px; white-space: nowrap; cursor: pointer; color: var(--muted); }
       .peek-debug-toggle input { margin: 0; cursor: pointer; }
+      .peek-type-filter { width: 165px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); color: var(--text); font: inherit; }
       /* Durable terminal-log attempt history (RAL-154): lists every persisted
          attempt for a cell/proof/resolver's tmux pane, independent of and
          alongside the live peek box above. */

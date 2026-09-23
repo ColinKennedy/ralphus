@@ -1954,7 +1954,7 @@ placeholder message; Python's `shell` argument is not read.)",
         node(
             "history",
             &["selector [str]"],
-            &[],
+            &["--type [str]"],
             "Show a cell/proof step's tmux history (one-shot snapshot; Python's --live \
 tailing and --wait-until-valid are not yet ported).",
             false,

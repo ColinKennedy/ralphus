@@ -408,7 +408,7 @@ fn drive_thread_events(
                     Some("command_execution") => {
                         let command = item["command"].as_str().unwrap_or("");
                         let status = item["status"].as_str().unwrap_or("");
-                        eprintln!("[tool] exec({command:?}) status={status}");
+                        eprintln!("{}", format_tool_event(command, status));
                     }
                     Some("error") => {
                         let message = item["message"].as_str().unwrap_or("");
@@ -575,6 +575,10 @@ fn drive_thread_events(
         compaction_input_tokens: 0,
         compaction_count: 0,
     })
+}
+
+fn format_tool_event(command: &str, status: &str) -> String {
+    format!("[tool.exec] exec({command:?}) status={status}")
 }
 
 /// Splits a `turn.completed` event's `usage` object into
@@ -825,5 +829,13 @@ mod tests {
         let mut cmd = Command::new("echo");
         apply_codex_home_env(&mut cmd, None);
         assert!(!cmd.get_envs().any(|(k, _)| k == "CODEX_HOME"));
+    }
+
+    #[test]
+    fn command_execution_uses_the_single_exec_tool_bucket() {
+        assert_eq!(
+            format_tool_event("cargo test", "completed"),
+            "[tool.exec] exec(\"cargo test\") status=completed"
+        );
     }
 }
