@@ -1143,6 +1143,7 @@ fn route_for_user(
         // rather than a hard-coded frontend list. Read-only and carries no
         // per-user data, so (like `project-forks` above) it's open to any
         // caller that clears the route's normal bearer-token check.
+        // ralphus[ignore-endpoint-cli]: UI-only endpoint for populating the personal-settings forge dropdown; no CLI equivalent needed since token setup is UI-driven (RAL-490)
         ("GET", ["api", "forge", "kinds"]) => forge_kinds(),
         // RAL-338 follow-up: a ralphus user's own forge personal-access
         // tokens, keyed by host. Self-or-admin gated like the fork rows
@@ -1175,6 +1176,7 @@ fn route_for_user(
         // it. Self-or-admin gated like the rows above -- the request body
         // carries a plaintext token, so this must not be reachable for
         // another user's account.
+        // ralphus[ignore-endpoint-cli]: UI-only endpoint for live forge token validation in personal-settings; no CLI equivalent since verification is part of the interactive token setup flow (RAL-490)
         ("POST", ["api", "users", user, "forge-tokens", "verify"]) => {
             let target_user = url_decode(user);
             self_or_admin_gated(daemon, user_header, &target_user, || {

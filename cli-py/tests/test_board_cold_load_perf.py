@@ -133,6 +133,8 @@ TASKS_ROUTES: fixtures.Routes = {
 
 #: Retirements tab (`#/retirement`) -- 650 rows.
 WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
+    "/api/whoami": {"name": "test-user", "is_admin": True},
+    "/api/forge/kinds": ["github", "gitlab"],
     "/api/tasks": _empty_board(),
     "/api/task-index": {"daemon": _daemon_status(), "squads": []},
     "/api/pull-requests/index": [],
