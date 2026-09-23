@@ -1913,9 +1913,18 @@ fn run_cell_with_rate_limit_retries<'a>(
     squad_id: &str,
     row: &crate::store::CellRow,
 ) -> Option<(RunnerResult, SemaphorePermit<'a>)> {
-    let mut tracker = ralphus_core::thrash::OccurrenceTracker::new(
-        ralphus_core::thrash::OccurrenceThresholds::default(),
-    );
+    // The `[review].provider_timeout_max_retries` config governs N here
+    // (default 3) -- the same knob `guardian_merge.rs`'s own rate-limit
+    // retry loop reads, so a project's configured retry budget applies
+    // uniformly to both cell/proof execution and review-worktree agent
+    // calls. `min_turn_gap` is left at its own thrash-detector default; only
+    // N is user-configurable today.
+    let max_retries = crate::config::resolve(Path::new(&spec.cwd)).provider_timeout_max_retries();
+    let mut tracker =
+        ralphus_core::thrash::OccurrenceTracker::new(ralphus_core::thrash::OccurrenceThresholds {
+            max_occurrences: max_retries,
+            min_turn_gap: ralphus_core::thrash::DEFAULT_MIN_TURN_GAP,
+        });
     let mut total_tokens_in = 0i64;
     let mut total_tokens_out = 0i64;
     let mut total_cache_creation_tokens = 0i64;
@@ -2014,9 +2023,14 @@ fn run_cell_with_rate_limit_retries<'a>(
             return Some((failed, permit));
         }
 
+        // A provider-reported delay gets a 1-second buffer on top -- e.g. a
+        // LiteLLM "Try again in 5 seconds" cooldown is retried after 6,
+        // guaranteeing the provider's own window has actually elapsed rather
+        // than racing it. The no-delay-reported fallback isn't a provider
+        // recommendation, so it isn't padded.
         let retry_after = attempt
             .retry_after_secs
-            .map(Duration::from_secs)
+            .map(|secs| Duration::from_secs(secs.saturating_add(1)))
             .unwrap_or(DEFAULT_RATE_LIMIT_RETRY);
         let wake_at_ms = crate::store::now_ms() + retry_after.as_millis() as i64;
         crate::rlog!(
@@ -2065,8 +2079,10 @@ fn run_cell_with_rate_limit_retries<'a>(
 /// RAL-435: sleeps out a Pi rate limit's suggested delay in short increments
 /// so a cancellation lands within one poll interval instead of blocking for
 /// the delay's full duration. Returns `true` if cancellation was observed
-/// before the delay fully elapsed.
-fn sleep_out_rate_limit_retry(delay: Duration, cancel: &CancelToken) -> bool {
+/// before the delay fully elapsed. `pub(crate)` so `guardian_merge.rs`'s own
+/// rate-limit retry loop can reuse the exact same cancel-aware wait instead
+/// of a second copy.
+pub(crate) fn sleep_out_rate_limit_retry(delay: Duration, cancel: &CancelToken) -> bool {
     let mut remaining = delay;
     while remaining > Duration::ZERO {
         if cancel.is_cancelled() {
@@ -3821,6 +3837,91 @@ fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<
 /// instruction text, and `agent`/`model` taken from the owning cell's
 /// resolved backend (`cell_agent`/`cell_model`), with the step's own
 /// `model` (from `proof_specs`) overriding it when set.
+/// Runs one agent-backed proof, exposing each provider retry wait as a
+/// transient proof-level delay before automatically resuming the same session.
+#[allow(clippy::too_many_arguments)]
+fn run_proof_with_rate_limit_retries(
+    spec: &mut RunnerSpec,
+    runner: &dyn Runner,
+    cancel: &CancelToken,
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    scope: &str,
+    cell_idx: i64,
+    idx: i64,
+) -> RunnerResult {
+    let max_retries = crate::config::resolve(Path::new(&spec.cwd)).provider_timeout_max_retries();
+    let mut retries = 0u32;
+    loop {
+        let mut result = runner.run_cancellable(spec, cancel);
+        if !result.is_rate_limited() || cancel.is_cancelled() {
+            let _ = store
+                .lock()
+                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            return result;
+        }
+        if retries >= max_retries {
+            let _ = store
+                .lock()
+                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            result.status = "failed".to_string();
+            result.error = Some(format!(
+                "provider rate-limit retries exhausted after {} attempt(s)",
+                retries + 1
+            ));
+            result.retry_after_secs = None;
+            return result;
+        }
+        retries += 1;
+        let delay = result
+            .retry_after_secs
+            .map(|secs| Duration::from_secs(secs.saturating_add(1)))
+            .unwrap_or(DEFAULT_RATE_LIMIT_RETRY);
+        let wake_at_ms = crate::store::now_ms() + delay.as_millis() as i64;
+        let reason = format!(
+            "Provider rate limit; retry after {} seconds (attempt {retries}/{max_retries})",
+            delay.as_secs()
+        );
+        {
+            let guard = store.lock();
+            let _ = guard.mark_proof_delayed(
+                squad_id, task_idx, scope, cell_idx, idx, wake_at_ms, &reason,
+            );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "scheduler",
+                message: "proof delayed: provider rate limit",
+                scope: Some("proof"),
+                squad_id: Some(squad_id),
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "task_idx": task_idx,
+                    "proof_scope": scope,
+                    "cell_idx": cell_idx,
+                    "idx": idx,
+                    "retry_after_secs": delay.as_secs(),
+                    "wake_at_ms": wake_at_ms,
+                }),
+                admin_only: false,
+            });
+        }
+        if sleep_out_rate_limit_retry(delay, cancel) {
+            let _ = store
+                .lock()
+                .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+            return result;
+        }
+        let _ = store
+            .lock()
+            .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
+        spec.resume_agent_session_id = result.agent_session_id;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_proofs(
     store: &crate::store_lock::StoreHandle,
@@ -4054,7 +4155,17 @@ fn run_proofs(
                     cell_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
                     task_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
                 );
-                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                let result = run_proof_with_rate_limit_retries(
+                    &mut runner_spec,
+                    runner,
+                    cancel,
+                    store,
+                    squad_id,
+                    task_idx,
+                    scope,
+                    cell_idx,
+                    idx,
+                );
                 let passed = result.is_done();
                 let output = match &result.error {
                     Some(err) if result.summary.is_empty() => err.clone(),
@@ -4148,7 +4259,17 @@ fn run_proofs(
                         runner_spec.effective_system_prompt().as_deref(),
                     );
                 }
-                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                let result = run_proof_with_rate_limit_retries(
+                    &mut runner_spec,
+                    runner,
+                    cancel,
+                    store,
+                    squad_id,
+                    task_idx,
+                    scope,
+                    cell_idx,
+                    idx,
+                );
                 let passed = result.proof_passed();
                 let output = match &result.error {
                     Some(err) if result.summary.is_empty() => err.clone(),

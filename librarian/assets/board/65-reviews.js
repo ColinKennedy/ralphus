@@ -492,6 +492,7 @@
        * @returns {string}
        */
       function branchBadge(b) {
+        if (b.delayed_until_ms) return delayedBadge(b.delayed_until_ms, b.delayed_reason || "");
         // Checked before every status badge — including "failed": an empty
         // branch fails the review (RAL-190), and the generic red "⚠ conflict"
         // badge below would say only that something broke. This says *which*

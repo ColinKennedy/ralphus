@@ -249,6 +249,22 @@ pub struct ReviewConfig {
     /// `<<prompt>>` placeholder.
     #[serde(default)]
     pub auto_fix_prompt_template: Option<String>,
+    /// How many times a review's agent calls (conflict resolution, manual
+    /// checks, feedback actioning, final proof, auto-build, manual-command
+    /// generation) retry a recognized provider rate limit
+    /// (`RunnerResult::is_rate_limited`, e.g. a LiteLLM/OpenRouter 429 or
+    /// "No deployments available" cooldown) before giving up. This counter
+    /// is separate from ordinary retry/failure handling: it only advances on
+    /// a recognized rate limit and resets the moment any other outcome
+    /// (success or a genuine failure) comes back, so a rate limit never eats
+    /// into a review's normal failure budget and a normal failure never eats
+    /// into this one. `None` means unset, which resolves to `3` (see
+    /// [`Self::provider_timeout_max_retries`]); per-project scalars win over
+    /// the global layer, same as `skip_worktrees`. Governs both
+    /// `guardian_merge.rs`'s agent calls and `scheduler.rs`'s cell/proof
+    /// rate-limit retry loop.
+    #[serde(default)]
+    pub provider_timeout_max_retries: Option<u32>,
 }
 
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
@@ -257,6 +273,9 @@ pub struct ReviewConfig {
 /// machine" phrasing (not "locally") is deliberate: the fix may run on a
 /// remote machine.
 pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
+
+/// [`ReviewConfig::provider_timeout_max_retries`]'s fallback when unset.
+pub const DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES: u32 = 3;
 
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
@@ -380,6 +399,16 @@ impl ReviewConfig {
         self.auto_fix_prompt_template.as_deref()
     }
 
+    /// How many times a review's agent calls retry a recognized provider
+    /// rate limit before giving up (unset resolves to
+    /// [`DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES`]). See the field's own doc
+    /// comment for exactly what counts and when the counter resets.
+    #[must_use]
+    pub fn provider_timeout_max_retries(&self) -> u32 {
+        self.provider_timeout_max_retries
+            .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES)
+    }
+
     /// Validate this config's own scalars, independent of a `[[review]]`
     /// submission's own validation (`ralphus_core::validate`). RAL-395: a
     /// project-level `auto_fix_prompt_template` default must contain the
@@ -431,6 +460,9 @@ impl ReviewConfig {
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
+            provider_timeout_max_retries: over
+                .provider_timeout_max_retries
+                .or(self.provider_timeout_max_retries),
         }
     }
 }
@@ -4088,6 +4120,44 @@ mod tests {
         assert!(!global.clone().merge(project).auto_submit_pr_stack());
         // Project unset falls back to the global value.
         assert!(global.merge(ReviewConfig::default()).auto_submit_pr_stack());
+    }
+
+    #[test]
+    fn provider_timeout_max_retries_defaults_to_three_when_unset() {
+        assert_eq!(
+            ReviewConfig::default().provider_timeout_max_retries(),
+            DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES
+        );
+        assert_eq!(DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES, 3);
+    }
+
+    #[test]
+    fn merge_provider_timeout_max_retries_project_wins() {
+        let global = ReviewConfig {
+            provider_timeout_max_retries: Some(5),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            provider_timeout_max_retries: Some(1),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).provider_timeout_max_retries(),
+            1
+        );
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global
+                .merge(ReviewConfig::default())
+                .provider_timeout_max_retries(),
+            5
+        );
+    }
+
+    #[test]
+    fn provider_timeout_max_retries_parses_from_the_review_table() {
+        let cfg = from_toml_str("[review]\nprovider_timeout_max_retries = 7\n");
+        assert_eq!(cfg.provider_timeout_max_retries(), 7);
     }
 
     #[test]

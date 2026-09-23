@@ -434,25 +434,30 @@ Common to both:
 - Args after a literal `--` are forwarded verbatim to the underlying
   harness, e.g. `ralphus quick-start manager claude-code -- --mode auto` or
   `ralphus quick-start manager codex -- --model gpt-5-codex`.
-- `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND` are the same env vars the
-  `claude-code`/`codex` agent backends use
-  (`ralphus.runner.claude_code_backend`/`ralphus.runner.codex_backend`) —
-  one name per harness, everywhere that harness's executable is resolved.
+- `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND` only affect this local,
+  no-daemon `quick-start` bootstrap path now (RAL-460) — a daemon-run cell or
+  review resolves its executable from the `claude-code`/`codex` agent
+  profile's own stored `executable` field instead (see "Agent Profiles"
+  below), which always wins once the daemon is involved.
 
-#### Agent Profiles (RAL-243)
+#### Agent Profiles (RAL-460)
 
-Custom backend routing belongs in `.ralphus.toml`, not in task TOML:
+Agent profiles live in the daemon's own store now, **not** in `.ralphus.toml`
+— there is no TOML syntax for `[agent.profiles.*]` anymore. Manage them from
+the board's admin-only Agent Profiles tab, or from the CLI:
 
-```toml
-[agent.profiles.openrouter-deepseek]
-backend = "pi"
-model = "openrouter/deepseek/deepseek-v4-flash-0731"
-
-[agent.profiles.openrouter-deepseek.env]
-OPENROUTER_API_KEY = { from_env = "OPENROUTER_API_KEY" }
+```bash
+ralphus agent profile register \
+  --name openrouter-deepseek \
+  --backend pi \
+  --default-model openrouter/deepseek/deepseek-v4-flash-0731 \
+  --env-link OPENROUTER_API_KEY=OPENROUTER_API_KEY
+ralphus agent profile list
+ralphus agent profile show openrouter-deepseek
+ralphus agent profile remove openrouter-deepseek
 ```
 
-Then a task or cell selects it through the existing field:
+Then a task or cell selects it through the existing field, exactly as before:
 
 ```toml
 agent = "openrouter-deepseek"
@@ -461,10 +466,11 @@ agent = "openrouter-deepseek"
 Rules:
 
 - Profile names must not collide with reserved built-in backends (`claude`, `anthropic`, `ollama`, `claude-code`, `codex`, `raw`, plus the CLI aliases).
-- `backend = "raw"` is the explicit generic external-executable backend and requires `executable`.
-- `executable` is only valid with `claude-code`, `codex`, `pi`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
-- Profile env values may be literal strings or `{ from_env = "VAR" }`; indirection is resolved in the daemon's own OS environment, so secrets never appear in task TOML or HTTP request/response bodies.
-- `model` supplies the profile's default model whenever a task or cell does not declare one. A task- or cell-level `model` overrides the profile default.
+- `--backend raw` is the explicit generic external-executable backend and requires `--executable`.
+- `--executable` is only valid with `claude-code`, `codex`, `pi`, or `raw`; it is rejected for native backends (`claude`, `anthropic`, `ollama`).
+- `--env KEY=VALUE` sets a literal value; `--env-link KEY=TARGET_VAR` resolves from another environment variable in the daemon's own OS environment at cell-run time, re-resolved on every run (so a rotated credential never needs the profile re-saved). Either way, secrets never appear in task TOML or HTTP request/response bodies — literal values are stored plaintext in the daemon's database but redacted in every API/UI response, the same as a `from_env`-resolved value always was.
+- `--default-model` supplies the profile's default model whenever a task or cell does not declare one. A task- or cell-level `model` overrides the profile default.
+- Two rows are always present and locked: `claude-code` and `codex`, representing the built-in CLI-forking backends. Their name/backend can never change and they can never be removed — the only thing `ralphus agent profile set-executable <name> --executable <path>` can change on one is which program it actually invokes. This replaces the old `$RALPHUS_CLAUDE_COMMAND`/`$RALPHUS_CODEX_COMMAND` env-var overrides for daemon-run cells (see below — those two env vars now only affect `quick-start`'s own local, no-daemon bootstrap path, not cells or reviews).
 - The old implicit fallback from an unknown `agent` name to a generic harness executable is gone. Use a named profile instead.
 - **Pi provider-qualified model names**: The `pi` backend supports model names that include a provider prefix. This allows you to specify non-default providers alongside the model name. For example, `openrouter/z-ai/glm-5.3-flash` or `openrouter/deepseek/deepseek-v4-flash-0731`. The provider prefix follows the format `<provider>/<model-path>`, and you must set the corresponding authentication environment variable (e.g., `OPENROUTER_API_KEY` for OpenRouter providers).
 

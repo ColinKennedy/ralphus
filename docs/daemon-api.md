@@ -627,11 +627,15 @@ removes its managed hook the next time the project is registered or a
 worktree is materialized; it never overwrites a hook it did not install.
 
 ### `GET /api/agents`
-List the agents selectable for a project -- built-in backends plus whatever
-`.ralphus.toml` custom `[agent.profiles.*]` entries apply there (see the
-**agent profile** glossary entry). Backs the board's review-resolver
-dropdown; not review-specific, so any future agent picker can read from it
-too.
+List the agents selectable for a project -- built-in backends plus every
+stored custom agent profile (RAL-460; see the **agent profile** glossary
+entry). Backs the board's review-resolver dropdown; not review-specific, so
+any future agent picker can read from it too.
+
+Agent profiles are daemon-global now (no more per-project layering), so
+`cwd` no longer scopes which profiles are returned -- it is kept as a
+required query param purely for backward compatibility with existing
+callers and is otherwise unused here.
 
 Query params: `cwd` (required, a project/worktree path). The optional
 caller-claimed identity is sent in `X-Ralphus-User`, with `[daemon].default_user`
@@ -677,9 +681,9 @@ Cwd-independent agent+model catalog for the board's Simple task form
 (RAL-297). Unlike `GET /api/agents`, this takes no `cwd` -- the Simple
 tab's agent/model picker is deliberately independent of its project picker
 (they're chosen side by side, neither blocking the other). Built-in
-backends plus any globally-discoverable `[agent.profiles.*]` entries, each
-with its known model list (empty means "any model accepted" -- the board
-falls back to free-text model entry).
+backends plus every stored custom agent profile, each with its known model
+list (empty means "any model accepted" -- the board falls back to free-text
+model entry).
 
 ```json
 { "agents": [
@@ -1094,6 +1098,88 @@ it deterministically every time). `400` if `machine` resolves to `local`
 (there is nothing to clean up), names an unregistered/unresolvable machine,
 `project` is empty, or the named project has no registered clone URL. `404`
 if `project` names no registered project.
+
+### `GET /api/agent-profiles`
+List every stored **agent profile** (RAL-460; see the glossary entry) --
+locked built-in-backend rows and custom profiles alike, each with its full
+`env` table, redacted. Also returns `available_backends`, the fixed backend
+enum every profile's `backend` must be one of, so a client's dropdown can
+never drift from the daemon's own validation. Admin-only, mirroring the
+Machines tab's own gating -- `GET /api/agents`/`GET /api/agents/catalog`
+above are the separate, non-admin-gated "what can I submit a task against"
+views every user needs.
+
+```json
+{ "profiles": [
+    { "name": "claude-code", "backend": "claude-code", "executable": "claude", "default_model": null, "locked": true,
+      "env": [], "created_at_ms": 0, "updated_at_ms": 0 },
+    { "name": "my-openrouter", "backend": "pi", "executable": null, "default_model": "openrouter/deepseek/deepseek-v4-flash-0731", "locked": false,
+      "env": [ { "key": "OPENROUTER_API_KEY", "kind": "link", "value": "OPENROUTER_API_KEY", "redacted": false } ],
+      "created_at_ms": 0, "updated_at_ms": 0 }
+  ],
+  "available_backends": ["claude", "claude-code", "codex", "pi", "ollama", "anthropic", "raw"] }
+```
+Each `env` entry's `kind` is `"literal"` (a raw value) or `"link"` (the
+*name* of another environment variable, resolved from the daemon process's
+own environment at cell-run time, re-resolved every run). A literal value's
+`value` is always the masked placeholder (`redacted: true`) -- the daemon
+never sends a literal's real content back over this API. A link's `value`
+is its real target variable name (`redacted: false`), since a variable name
+is not itself a secret.
+
+### `GET /api/agent-profiles/{name}`
+One stored profile by exact name, same shape as one entry above. `404` if
+it does not exist.
+
+### `POST /api/agent-profiles`
+Register (or update) a **custom** agent profile:
+```json
+{ "name": "my-openrouter", "backend": "pi",
+  "default_model": "openrouter/deepseek/deepseek-v4-flash-0731",
+  "env": [ { "key": "OPENROUTER_API_KEY", "kind": "link", "value": "OPENROUTER_API_KEY" } ] }
+```
+`executable` is required when `backend` is `"raw"`, and rejected for a
+native backend (`claude`, `anthropic`, `ollama`). `env` is a full
+replacement of the profile's environment table, not a merge -- resend every
+row you want kept. A **literal** row whose `value` is exactly the redaction
+placeholder the `GET` routes use is resolved back to whatever is already
+stored under that key instead of being written verbatim, so a client that
+never sees a literal's real value (the board's edit form, notably) can
+still round-trip "leave this row unchanged" without needing the real value
+in hand.
+
+`400` if `name`/`backend` are missing or empty, `backend` is not one of
+`available_backends`, a **new** name (one that does not already exist)
+collides with a reserved built-in backend name, or the `executable`
+rule above is violated. Refuses to touch an existing **locked** row
+entirely (`400` -- use the `executable`-only endpoint below instead).
+Response `201`:
+```json
+{ "name": "my-openrouter" }
+```
+
+### `POST /api/agent-profiles/{name}/executable`
+Change a **locked** (built-in-backend) profile row's `executable` -- the
+only field such a row can ever have changed on it; `name`/`backend` are
+permanently fixed. Replaces the old `$RALPHUS_CLAUDE_COMMAND`/
+`$RALPHUS_CODEX_COMMAND` env-var overrides for daemon-run cells.
+```json
+{ "executable": "my-claude-fork" }
+```
+`400` if `executable` is empty, or if `name` resolves to a **non-locked**
+(custom) profile instead (use `POST /api/agent-profiles` for that one).
+`404` if `name` does not exist at all.
+
+### `DELETE /api/agent-profiles/{name}`
+Remove a **custom** agent profile. `400` if `name` resolves to a locked
+row (a built-in-backend row can never be deleted). `404` if it does not
+exist. Deliberately does **not** check whether any stored squad still
+references the profile name, for the same reason `DELETE /api/machines/{scheme}`
+doesn't: that squad already resolved its agent at submit time. Response
+`200`:
+```json
+{ "deleted": true }
+```
 Response `200`:
 ```json
 { "ok": true, "removed": "/srv/ralphus/projects/ralphus-a1b2c3d4e5f60708" }
@@ -1245,8 +1331,9 @@ agent (the `agent` in this same request if given, else its stored one) rather
 than the owning cell's/task's, since a proof step carries its own backend
 (RAL-290; `[[task.cell.proof]]`'s `agent` key falls back to the owning
 cell's/task's resolved agent when unset, exactly like `model`). A custom
-`[agent.profiles.*]` name is deferred rather than rejected, the same way
-`core` defers it. Clearing the field needs no such check.
+agent profile name is deferred rather than rejected, the same way `core`
+defers it (it can't see the daemon's stored profiles). Clearing the field
+needs no such check.
 
 Editing resets execution state, scoped as narrowly as the edited node allows:
 a `squad` label edit touches nothing, a `task` edit resets the whole squad to

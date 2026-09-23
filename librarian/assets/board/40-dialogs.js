@@ -550,7 +550,6 @@
         if (!vs.length) return "";
         const rows = vs.map((v, vi) =>
           `<div class="sv-row selectable ${selCls("proof", ti, si, vi)}" data-tip="Cell proof step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after this cell completes to validate its output.\nCurrent state: ${esc(v.state)}.\nShift/Ctrl-click to multi-select; right-click for batch actions." data-click="onGraphNodeClick" data-ctx="openProofMenu" data-squad-id="${esc(squadId)}" data-kind="proof" data-ti="${ti}" data-si="${si}" data-vi="${vi}">
-             ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)}${v.output ? `<button class="logs-btn" data-tip="View proof output — the raw response from the proof step's AI call." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
+             ${sdot(v.state)}<span class="sv-name">${esc(v.id || v.kind)}</span> ${pill(v.state)}${delayedGraphBadge(v.delayed_until_ms, v.delayed_reason || "")}${v.output ? `<button class="logs-btn" data-tip="View proof output — the raw response from the proof step's AI call." data-full="${esc(v.output)}" onclick="event.stopPropagation();openCmdPopup(event)">📄</button>` : ""}</div>`).join("");
         return `<div class="sproof"><span class="label">proof</span>${rows}</div>`;
       }
-
