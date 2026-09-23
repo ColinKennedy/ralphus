@@ -2748,14 +2748,14 @@ fn maybe_promote_fork_root(
     // The cross-repository root is the only PR whose base is the guardian's
     // own base branch directly -- every other branch chains onto a preceding
     // alias (see `fork_aware_route`, which both submission and this function
-    // share). This is deliberately NOT a `repo`/client comparison: GitLab's
-    // cross-project MR is created *on the fork* (with a `target_project_id`
-    // pointing at the parent), so a GitLab root's `repo` is the fork's
-    // label, not the parent's -- only GitHub's root is filed under the
-    // parent's own repo label. Comparing `base_ref` instead works
-    // identically for both forges. `branch_id` is required -- a
-    // combined-worktree PR (`branch_id = None`) has no single "next" branch
-    // of its own to promote.
+    // share). This is deliberately a `base_ref` comparison, not a
+    // `repo`/client one: for a GitLab cross-project root, the create call
+    // POSTs through the fork while the parent allocates the MR's `iid`, so
+    // which label a stored `repo` carries depends on which ralphus version
+    // recorded the row (older rows name the fork) -- `base_ref` says "this
+    // is the root" identically for both forges and both vintages.
+    // `branch_id` is required -- a combined-worktree PR (`branch_id = None`)
+    // has no single "next" branch of its own to promote.
     let Some(merged_root) = freshly_merged
         .iter()
         .find(|pr| pr.base_ref == base_branch_name && pr.branch_id.is_some())
@@ -5225,9 +5225,14 @@ fn push_remote_for<'a>(routing: Option<&'a ForkRouting>, default: &'a str) -> &'
 /// (`resolve_pr_repo_routing`) key off the same underlying data so filing
 /// repository and base can never disagree.
 ///
-/// GitLab always calls the fork client (setting `target_project_id` only for
-/// the root); GitHub calls the *parent's* client for the cross-repo root
-/// (requiring a registered `fork_owner`) and the fork's client otherwise.
+/// The create call and the number/IID owner are two different questions for
+/// a GitLab cross-project root: the create POST goes through the fork's
+/// client (with `target_project_id` naming the parent), but the parent is
+/// the project that allocates the MR's `iid` -- so `client`/`repo` there
+/// name the parent (RAL-496), exactly like GitHub's cross-repo root, and
+/// every later IID-scoped operation resolves to the parent. GitHub's
+/// cross-repo root instead needs a registered `fork_owner` to build the
+/// `owner:branch` head. Everything else is fork-local on both forges.
 fn fork_aware_route(
     routing: &ForkRouting,
     alias: &str,
@@ -5236,17 +5241,34 @@ fn fork_aware_route(
 ) -> std::result::Result<crate::forge::PrRoute, String> {
     let is_root = computed_base == base_branch_name;
     match routing.fork_client.kind() {
-        crate::forge::ForgeKind::GitLab => Ok(crate::forge::PrRoute {
-            client: routing.fork_client.clone(),
-            head: alias.to_string(),
-            base: computed_base.to_string(),
-            target_project_id: if is_root {
-                routing.parent_project_id
-            } else {
-                None
-            },
-            repo: routing.fork_client.repo_label().to_string(),
-        }),
+        crate::forge::ForgeKind::GitLab => {
+            // RAL-496: a cross-project root MR is created on the fork (the
+            // source project) with `target_project_id` naming the parent,
+            // but the parent allocates the MR's `iid` -- so `client`/`repo`
+            // must name the parent, or every later IID-scoped call would
+            // ask the fork about a number it never issued.
+            let cross_project = is_root && routing.parent_project_id.is_some();
+            Ok(crate::forge::PrRoute {
+                client: if cross_project {
+                    routing.parent_client.clone()
+                } else {
+                    routing.fork_client.clone()
+                },
+                create_client: cross_project.then(|| routing.fork_client.clone()),
+                head: alias.to_string(),
+                base: computed_base.to_string(),
+                target_project_id: if cross_project {
+                    routing.parent_project_id
+                } else {
+                    None
+                },
+                repo: if cross_project {
+                    routing.parent_client.repo_label().to_string()
+                } else {
+                    routing.fork_client.repo_label().to_string()
+                },
+            })
+        }
         crate::forge::ForgeKind::GitHub if is_root => {
             if routing.fork.fork_owner.trim().is_empty() {
                 return Err(format!(
@@ -5257,6 +5279,7 @@ fn fork_aware_route(
             }
             Ok(crate::forge::PrRoute {
                 client: routing.parent_client.clone(),
+                create_client: None,
                 head: format!("{}:{alias}", routing.fork.fork_owner),
                 base: computed_base.to_string(),
                 target_project_id: None,
@@ -5265,6 +5288,7 @@ fn fork_aware_route(
         }
         crate::forge::ForgeKind::GitHub => Ok(crate::forge::PrRoute {
             client: routing.fork_client.clone(),
+            create_client: None,
             head: routing.fork_client.same_repo_head(alias),
             base: computed_base.to_string(),
             target_project_id: None,
@@ -5288,6 +5312,7 @@ fn fork_aware_route(
 fn stack_pr_route(routing: &ForkRouting, alias: &str, stack_base: &str) -> crate::forge::PrRoute {
     crate::forge::PrRoute {
         client: routing.fork_client.clone(),
+        create_client: None,
         head: routing.fork_client.same_repo_head(alias),
         base: stack_base.to_string(),
         target_project_id: None,
@@ -5597,6 +5622,7 @@ fn submit_stacked_branch_pr(
         Some(routing) => fork_aware_route(routing, &alias, &base, base_branch_name)?,
         None => crate::forge::PrRoute {
             client: client.clone(),
+            create_client: None,
             head: client.same_repo_head(&alias),
             base: base.clone(),
             target_project_id: None,
@@ -12743,12 +12769,14 @@ mod tests {
 
     #[test]
     fn gitlab_promotion_uses_the_forks_client_with_a_target_project_id_not_the_parents() {
-        // GitLab's cross-project MR is created *on the fork* with a
+        // GitLab's cross-project MR is *created* on the fork with a
         // `target_project_id` pointing at the parent (never on the parent's
-        // own client, unlike GitHub) -- so a promoted GitLab root's `repo`
-        // stays the fork's, not the parent's. Promotion's "is this the root"
-        // detection must key off `base_ref`, not `repo`, or it would never
-        // fire for GitLab at all.
+        // own create path, unlike GitHub) -- but the parent is the project
+        // that allocates the MR's `iid` (RAL-496), so the promoted root's
+        // recorded `repo` is the parent's. Promotion's "is this the root"
+        // detection keys off `base_ref`, not `repo`, so it also tolerates
+        // rows recorded before that correction (the fork-labeled root row
+        // seeded below).
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
@@ -12885,8 +12913,9 @@ mod tests {
             .into_iter()
             .map(|b| b.id)
             .collect();
-        // Root MR: GitLab files it on the FORK's repo (not the parent's),
-        // per the routing asymmetry -- `repo` is the fork's encoded path.
+        // Root MR: seeded with the fork's repo label, as an older ralphus
+        // vintage (or a fork-internal filing) would have recorded it --
+        // promotion must not care, it routes on `base_ref`.
         store
             .lock()
             .create_pull_request(
@@ -12929,8 +12958,9 @@ mod tests {
         assert_eq!(old_b.state, "closed");
         let new_b = rows.iter().find(|p| p.pr_number == Some(40)).unwrap();
         assert_eq!(
-            new_b.repo, "alice%2Fwidget",
-            "GitLab always files on the fork's repo"
+            new_b.repo, "acme%2Fwidget",
+            "a cross-project root MR's `iid` is allocated by the target (parent) project, so \
+             that's the label recorded -- RAL-496"
         );
         assert_eq!(new_b.base_ref, "release");
         assert_eq!(old_b.superseded_by.as_deref(), Some(new_b.id.as_str()));
@@ -13173,6 +13203,528 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
         let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-496 regression, offline: a GitLab fork-mode submission must POST
+    /// the cross-project root MR through the *fork's* client with the
+    /// parent's numeric `target_project_id`, but record the *parent's* repo
+    /// label on the row -- the parent is the project that allocates the MR's
+    /// `iid`, so every later IID-scoped call must resolve to the parent
+    /// client. Fork-internal stack MRs keep the fork's label on both the
+    /// probe and the row. Same fixture shape as the GitHub twin above: local
+    /// bare repos for git push targeting, a `127.0.0.1` mock for the API.
+    #[test]
+    fn gitlab_fork_submission_creates_the_cross_project_root_through_the_fork_but_records_the_parent_repo()
+     {
+        let fork_bare = tmp_dir("gitlab-fork-it-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Root branch: the adoption probe asks the PARENT project (the
+            // IID owner), never the fork.
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(
+                req.url(),
+                "/projects/acme%2Fwidget/merge_requests?source_branch=a-alias&state=opened"
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+
+            // ... and the create POST still goes through the FORK, with
+            // `target_project_id` naming the parent.
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["source_branch"], serde_json::json!("a-alias"));
+            assert_eq!(payload["target_branch"], serde_json::json!("release"));
+            assert_eq!(payload["target_project_id"], serde_json::json!(999));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid":10,"web_url":"http://x/10"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+
+            // Branch b: fork-internal -- probe and create both stay on the
+            // fork, and no `target_project_id` is sent.
+            let req = server.recv().unwrap();
+            assert_eq!(
+                req.url(),
+                "/projects/alice%2Fwidget/merge_requests?source_branch=b-alias&state=opened"
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/alice%2Fwidget/merge_requests");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["source_branch"], serde_json::json!("b-alias"));
+            assert!(payload.get("target_project_id").is_none());
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid":11,"web_url":"http://x/11"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+
+        let root_dir = tmp_dir("gitlab-fork-it-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        for (branch, file) in [("review/a", "a.txt"), ("review/b", "b.txt")] {
+            g(&root_dir, &["checkout", "-b", branch]);
+            gwrite(&root_dir, file, "content\n");
+            g(&root_dir, &["add", "."]);
+            g(&root_dir, &["commit", "--message", &format!("add {file}")]);
+        }
+        g(&root_dir, &["checkout", "release"]);
+        crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
+            .unwrap();
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"gitlab\"\napi_base = \"http://{addr}\"\ntoken_env = \
+                 \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        for (branch_id, review_branch) in ids.iter().zip(["review/a", "review/b"]) {
+            store
+                .lock()
+                .set_branch_review(&gid, branch_id, review_branch, "wt")
+                .unwrap();
+        }
+
+        let fork_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let routing = ForkRouting {
+            fork: crate::project_forks::ForkRecord {
+                project: "demo".to_string(),
+                user: String::new(),
+                fork_url: fork_bare.to_str().unwrap().to_string(),
+                remote_name: "fork".to_string(),
+                fork_owner: String::new(),
+                git_user_name: None,
+                git_user_email: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            parent_client: crate::forge::ForgeClient::new(
+                crate::forge::ForgeKind::GitLab,
+                format!("http://{addr}"),
+                "acme%2Fwidget".to_string(),
+                Some("tok".to_string()),
+            ),
+            fork_client: fork_client.clone(),
+            parent_project_id: Some(999),
+        };
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let mut ordered_enabled: Vec<&BranchView> =
+            guardian.branches.iter().filter(|b| b.enabled).collect();
+        ordered_enabled.sort_by_key(|b| b.position);
+        let mut alias_by_branch: HashMap<String, String> = HashMap::new();
+        for (i, branch) in ordered_enabled.iter().enumerate() {
+            let req = PrRequest {
+                branch_id: Some(branch.id.clone()),
+                branch_alias: None,
+                title: Some(format!("Title {i}")),
+                description: Some(format!("Description {i}")),
+                use_worktree_branch_name: None,
+                draft: None,
+            };
+            submit_stacked_branch_pr(
+                &store,
+                &NoopRunner,
+                &fork_client,
+                &gid,
+                &root_dir,
+                "fork",
+                &guardian,
+                &ordered_enabled,
+                &mut alias_by_branch,
+                "release",
+                branch,
+                &req,
+                "{name}-alias",
+                None,
+                "stack-1",
+                Some(&routing),
+                false,
+            )
+            .unwrap();
+        }
+
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let row_of = |alias: &str| {
+            rows.iter()
+                .find(|p| p.branch_alias == alias)
+                .unwrap()
+                .clone()
+        };
+        // The cross-project root's row carries the PARENT's label: its `iid`
+        // (10) was allocated there, so follow-up calls must resolve there.
+        let root_row = row_of("a-alias");
+        assert_eq!(root_row.repo, "acme%2Fwidget");
+        assert_eq!(root_row.pr_number, Some(10));
+        // The fork-internal successor keeps the fork's label.
+        let fork_row = row_of("b-alias");
+        assert_eq!(fork_row.repo, "alice%2Fwidget");
+        assert_eq!(fork_row.pr_number, Some(11));
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-496 regression: a GitLab fork-mode resubmission/retry must find an
+    /// already-open cross-project root MR by asking the PARENT project (the
+    /// one that allocated its `iid`) -- not the fork -- and adopt it instead
+    /// of attempting a duplicate create. The adopted MR's draft toggle also
+    /// goes to the parent.
+    #[test]
+    fn gitlab_fork_retry_adopts_the_existing_cross_project_root_mr_through_the_parent_project() {
+        let fork_bare = tmp_dir("gitlab-adopt-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = {
+            let requests = requests.clone();
+            std::thread::spawn(move || {
+                // The adoption probe hits the PARENT project.
+                let req = server.recv().unwrap();
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                assert_eq!(
+                    req.url(),
+                    "/projects/acme%2Fwidget/merge_requests?source_branch=a-alias&state=opened"
+                );
+                req.respond(
+                    tiny_http::Response::from_string(
+                        r#"[{"iid":7,"web_url":"http://x/7","target_branch":"release",
+                             "title":"Draft: Add a","description":"body","draft":true}]"#,
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+
+                // The submission asked for a non-draft PR, the existing MR is
+                // a draft -- the adoption toggle goes to the PARENT too.
+                let mut req = server.recv().unwrap();
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(req.method(), &tiny_http::Method::Put);
+                assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/7");
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["wip_event"], serde_json::json!("unwip"));
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+
+                // Exactly these two calls: no duplicate create POST.
+                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+            })
+        };
+
+        let root_dir = tmp_dir("gitlab-adopt-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(&root_dir, &["checkout", "-b", "review/a"]);
+        gwrite(&root_dir, "a.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add a.txt"]);
+        g(&root_dir, &["checkout", "release"]);
+        crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
+            .unwrap();
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"gitlab\"\napi_base = \"http://{addr}\"\ntoken_env = \
+                 \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review/a", "wt")
+            .unwrap();
+
+        let fork_client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        let routing = ForkRouting {
+            fork: crate::project_forks::ForkRecord {
+                project: "demo".to_string(),
+                user: String::new(),
+                fork_url: fork_bare.to_str().unwrap().to_string(),
+                remote_name: "fork".to_string(),
+                fork_owner: String::new(),
+                git_user_name: None,
+                git_user_email: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            parent_client: crate::forge::ForgeClient::new(
+                crate::forge::ForgeKind::GitLab,
+                format!("http://{addr}"),
+                "acme%2Fwidget".to_string(),
+                Some("tok".to_string()),
+            ),
+            fork_client: fork_client.clone(),
+            parent_project_id: Some(999),
+        };
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> =
+            guardian.branches.iter().filter(|b| b.enabled).collect();
+        let mut alias_by_branch: HashMap<String, String> = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: None,
+            title: Some("Add a".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        submit_stacked_branch_pr(
+            &store,
+            &NoopRunner,
+            &fork_client,
+            &gid,
+            &root_dir,
+            "fork",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "release",
+            ordered_enabled[0],
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            Some(&routing),
+            false,
+        )
+        .unwrap();
+
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pr_number, Some(7));
+        assert_eq!(rows[0].repo, "acme%2Fwidget");
+        assert_eq!(rows[0].base_ref, "release");
+        // The adoption recorded the forge's actual (toggled) draft state.
+        assert_eq!(rows[0].draft, Some(false));
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    /// RAL-496 regression: fork-aware base resync must address each MR
+    /// through the project that owns its `iid` -- the parent for a
+    /// cross-project root row, the fork for fork-internal stack rows.
+    #[test]
+    fn gitlab_fork_base_resync_targets_each_mr_through_the_project_that_owns_its_iid() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // Both rows are drifted (forge says "main", the stack wants
+            // "release"/"a-alias"): one GET + one PUT per row, in row
+            // order. The root's MR lives at the parent project; the
+            // successor's at the fork.
+            for (repo, number, forge_base, new_base) in [
+                ("acme%2Fwidget", 10, "main", "release"),
+                ("alice%2Fwidget", 11, "main", "a-alias"),
+            ] {
+                let req = server.recv().unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                assert_eq!(
+                    req.url(),
+                    format!("/projects/{repo}/merge_requests/{number}")
+                );
+                req.respond(
+                    tiny_http::Response::from_string(
+                        serde_json::json!({
+                            "target_branch": forge_base,
+                            "updated_at": "2026-01-01T00:00:00Z",
+                        })
+                        .to_string(),
+                    )
+                    .with_status_code(200),
+                )
+                .unwrap();
+
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.method(), &tiny_http::Method::Put);
+                assert_eq!(
+                    req.url(),
+                    format!("/projects/{repo}/merge_requests/{number}")
+                );
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["target_branch"], serde_json::json!(new_base));
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+            }
+        });
+
+        let root_dir = tmp_dir("gitlab-resync-fork");
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/acme/widget.git",
+            ],
+        );
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://gitlab.com/alice/widget.git",
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"gitlab\"\napi_base = \"http://{addr}\"\ntoken_env = \
+                 \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        store
+            .lock()
+            .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        store
+            .lock()
+            .upsert_project_fork(
+                "demo",
+                "",
+                "https://gitlab.com/alice/widget.git",
+                "fork",
+                "",
+            )
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store.lock().add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids: Vec<_> = store
+            .lock()
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        // Root MR row: repo = the PARENT's label (RAL-496); its `iid` is the
+        // parent's. Successor: fork-internal, fork's label.
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&ids[0]),
+                "gitlab",
+                "acme%2Fwidget",
+                "a-alias",
+                "main",
+                "Add a",
+                "",
+                Some(10),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&ids[1]),
+                "gitlab",
+                "alice%2Fwidget",
+                "b-alias",
+                "main",
+                "Add b",
+                "",
+                Some(11),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(resync_pr_bases_synchronously(&store, &gid).unwrap(), 2);
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|p| p.pr_number == Some(10))
+                .unwrap()
+                .base_ref,
+            "release"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|p| p.pr_number == Some(11))
+                .unwrap()
+                .base_ref,
+            "a-alias"
+        );
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 
     #[test]

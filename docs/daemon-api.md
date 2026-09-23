@@ -2283,7 +2283,9 @@ too (`GET .../pull-requests` reflects the recorded state either way).
 lowest enabled unmerged branch's ("the root's") — is pushed to and fetched
 from the fork instead of the project's own remote. Only the root's PR/MR is
 filed cross-repository against the parent's base branch (GitLab: created on
-the fork with a numeric `target_project_id`; GitHub: created on the parent
+the fork with a numeric `target_project_id`, which makes the *parent*
+allocate the MR's `iid` — so the row's `repo` and every later IID-scoped
+call address the parent; GitHub: created on the parent
 with an `owner:branch` head); every later branch stays fork-internal, based
 on the preceding branch's alias, exactly like the non-fork chain above. A
 project with no registered fork is unaffected — routing stays byte-identical
