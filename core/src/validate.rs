@@ -234,6 +234,8 @@ const CELL_KEYS: &[&str] = &[
     "subprojects",
     "prompt",
     "command",
+    "mode",
+    "remediation_attempts",
     "depends_on",
     "agent",
     "model",
@@ -313,6 +315,8 @@ const AUTO_BUILD_KEYS: &[&str] = &[
 const PROOF_KEYS: &[&str] = &[
     "id",
     "command",
+    "mode",
+    "remediation_attempts",
     "brain",
     "prompt",
     "agent",
@@ -419,6 +423,83 @@ fn check_positive_number(
             ErrorKind::InvalidValue,
             format!("'{key}' must be greater than 0"),
             line,
+        );
+    }
+}
+
+/// Validates `mode` and `remediation_attempts` (RAL-487) for a `command`
+/// cell or proof step. Both fields are only meaningful alongside `command`
+/// -- `has_command` tells this whether that key is present on `table`, so it
+/// doubles as the guard for a `prompt`-only cell/proof step (where neither
+/// field is allowed at all).
+fn check_command_mode(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    has_command: bool,
+    path: &str,
+    header: Option<u32>,
+) {
+    check_type(ctx, table, "mode", Ty::Str, path, header);
+    check_type(ctx, table, "remediation_attempts", Ty::Int, path, header);
+    check_positive_number(ctx, table, "remediation_attempts", path, header);
+
+    let mode = table.get("mode").and_then(toml::Value::as_str);
+    if let Some(m) = mode {
+        if !crate::schema::COMMAND_MODE_VALUES.contains(&m) {
+            let line = ctx.key_line(header, "mode");
+            ctx.error(
+                &format!("{path}.mode"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'mode' must be one of {} -- got \"{m}\"",
+                    crate::schema::COMMAND_MODE_VALUES
+                        .iter()
+                        .map(|v| format!("\"{v}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                line,
+            );
+        }
+    }
+
+    if !has_command {
+        if table.contains_key("mode") {
+            ctx.error(
+                &format!("{path}.mode"),
+                ErrorKind::InvalidValue,
+                "'mode' is only valid alongside 'command'",
+                ctx.key_line(header, "mode"),
+            );
+        }
+        if table.contains_key("remediation_attempts") {
+            ctx.error(
+                &format!("{path}.remediation_attempts"),
+                ErrorKind::InvalidValue,
+                "'remediation_attempts' is only valid alongside 'command'",
+                ctx.key_line(header, "remediation_attempts"),
+            );
+        }
+        return;
+    }
+
+    if mode == Some(crate::schema::COMMAND_MODE_RAW) {
+        if table.contains_key("remediation_attempts") {
+            ctx.error(
+                &format!("{path}.remediation_attempts"),
+                ErrorKind::ConflictingKeys,
+                "'remediation_attempts' requires 'mode = \"remediating\"' (or leaving 'mode' \
+                 unset, which defaults to remediating) -- remove it, or drop 'mode = \"raw\"'",
+                ctx.key_line(header, "remediation_attempts"),
+            );
+        }
+    } else if !table.contains_key("remediation_attempts") {
+        ctx.error(
+            path,
+            ErrorKind::MissingRequired,
+            "'remediation_attempts' is required for a remediating command (leave 'mode' unset, \
+             or set it explicitly to 'mode = \"remediating\"')",
+            header,
         );
     }
 }
@@ -999,6 +1080,7 @@ fn validate_cells(
                 check_type(ctx, table, "command", Ty::Str, &path, header);
             }
         }
+        check_command_mode(ctx, table, has_command, &path, header);
 
         if let Some(id_v) = table.get("id") {
             if let Some(id) = id_v.as_str() {
@@ -2534,6 +2616,7 @@ fn validate_proof_array(
                 None,
             ),
         }
+        check_command_mode(ctx, table, table.contains_key("command"), &vpath, None);
 
         check_type(ctx, table, "requires_approval", Ty::Bool, &vpath, None);
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
@@ -2736,6 +2819,7 @@ cwd = "/repo"
 prompt = "make it build"
 [[task.cell.proof]]
 command = "cargo build"
+remediation_attempts = 3
 "#;
 
     #[test]
@@ -2758,6 +2842,7 @@ prompt = "make it build"
 maximum_timeout_seconds = 1800
 [[task.cell.proof]]
 command = "cargo build"
+remediation_attempts = 3
 maximum_timeout_seconds = 60
 "#;
         let r = validate_toml(src);
@@ -2864,8 +2949,136 @@ prompt = "make it build"
 
     #[test]
     fn command_only_cell_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nremediation_attempts=3\n";
         assert!(validate_toml(src).is_ok());
+    }
+
+    #[test]
+    fn command_only_cell_with_explicit_raw_mode_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nmode=\"raw\"\n";
+        assert!(validate_toml(src).is_ok());
+    }
+
+    #[test]
+    fn command_only_cell_defaults_to_remediating_and_requires_remediation_attempts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("remediation_attempts")),
+            "expected a MissingRequired error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn command_cell_with_explicit_remediating_mode_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nmode=\"remediating\"\nremediation_attempts=3\n";
+        assert!(validate_toml(src).is_ok());
+    }
+
+    #[test]
+    fn command_cell_with_unknown_mode_value_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nmode=\"bogus\"\nremediation_attempts=3\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("mode")),
+            "expected an InvalidValue error for mode, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn command_cell_with_raw_mode_and_remediation_attempts_conflicts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nmode=\"raw\"\nremediation_attempts=3\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::ConflictingKeys),
+            "expected a ConflictingKeys error, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn command_cell_remediation_attempts_zero_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nremediation_attempts=0\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("remediation_attempts")),
+            "expected an InvalidValue error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn command_cell_remediation_attempts_negative_is_rejected() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\ncommand=\"cargo build\"\nremediation_attempts=-1\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("remediation_attempts")),
+            "expected an InvalidValue error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn prompt_only_cell_rejects_mode_and_remediation_attempts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmode=\"raw\"\nremediation_attempts=3\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("'mode' is only valid")),
+            "expected an InvalidValue error for mode, got {:?}",
+            r.errors
+        );
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("'remediation_attempts' is only valid")),
+            "expected an InvalidValue error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_command_defaults_to_remediating_and_requires_remediation_attempts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"cargo build\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("remediation_attempts")),
+            "expected a MissingRequired error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn proof_command_with_raw_mode_is_valid_without_remediation_attempts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"cargo build\"\nmode=\"raw\"\n";
+        assert!(validate_toml(src).is_ok());
+    }
+
+    #[test]
+    fn task_level_proof_command_defaults_to_remediating_and_requires_remediation_attempts() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.proof]]\ncommand=\"cargo build\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
+                && e.message.contains("remediation_attempts")),
+            "expected a MissingRequired error for remediation_attempts, got {:?}",
+            r.errors
+        );
     }
 
     #[test]
@@ -3504,7 +3717,7 @@ prompt = "make it build"
     #[test]
     fn environment_accepted_on_proof_steps() {
         // RAL-191: `environment` on `[[task.proof]]` / `[[task.cell.proof]]`.
-        let src = "[[task]]\nname=\"t\"\n[[task.proof]]\ncommand=\"c\"\nenvironment={A=\"1\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"d\"\nenvironment={B=\"2\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.proof]]\ncommand=\"c\"\nmode=\"raw\"\nenvironment={A=\"1\"}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"d\"\nmode=\"raw\"\nenvironment={B=\"2\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -3608,6 +3821,7 @@ project = "ralphus"
         [[task.cell.proof]]
         id = "chk"
         command = "true"
+        mode = "raw"
         environment = { CELL_ID = "<<ralphus:linked-field/../id>>" }
 "#;
         let r = validate_toml(src);
@@ -3733,14 +3947,14 @@ project = "ralphus"
 
     #[test]
     fn environment_link_to_parent_cell_id_from_a_proof_step_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"foo\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={CELL_ID=\"<<ralphus:linked-field/../id>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"foo\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nmode=\"raw\"\nenvironment={CELL_ID=\"<<ralphus:linked-field/../id>>\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn environment_link_to_own_proof_step_id_is_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"chk\"\ncommand=\"true\"\nenvironment={STEP_ID=\"<<ralphus:linked-field/./id>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell.proof]]\nid=\"chk\"\ncommand=\"true\"\nmode=\"raw\"\nenvironment={STEP_ID=\"<<ralphus:linked-field/./id>>\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -3862,7 +4076,7 @@ project = "ralphus"
     fn environment_link_to_a_parent_cwd_from_a_proof_step_is_valid() {
         // A cell-scoped proof step links directly to its owning cell's own
         // `cwd` -- `cwd` (unlike `environment.<key>`) may cross a `..`.
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={SUB=\"<<ralphus:linked-field/../cwd>>/logs\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nmode=\"raw\"\nenvironment={SUB=\"<<ralphus:linked-field/../cwd>>/logs\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -4338,8 +4552,8 @@ project = "ralphus"
     fn maximum_tool_output_tokens_valid_on_task_scope_and_cell_scope_proof_steps() {
         let src = "[[task]]\nname=\"t\"\nagent=\"codex\"\n\
                    [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmaximum_tool_output_tokens=1000\n\
-                   [[task.proof]]\ncommand=\"cargo fmt\"\nmaximum_tool_output_tokens=2000\n";
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmode=\"raw\"\nmaximum_tool_output_tokens=1000\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\nmode=\"raw\"\nmaximum_tool_output_tokens=2000\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -4443,8 +4657,8 @@ project = "ralphus"
     fn machine_is_valid_at_every_level() {
         let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
                    [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nmachine=\"incredibuild:A\"\nreview=\"<<review:r>>\"\n\
-                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmachine=\"incredibuild:A\"\n\
-                   [[task.proof]]\ncommand=\"cargo fmt\"\nmachine=\"local\"\n\
+                   [[task.cell.proof]]\ncommand=\"cargo test\"\nmode=\"raw\"\nmachine=\"incredibuild:A\"\n\
+                   [[task.proof]]\ncommand=\"cargo fmt\"\nmode=\"raw\"\nmachine=\"local\"\n\
                    [[review]]\nid=\"r\"\nmachine=\"incredibuild:C\"\n";
         assert!(
             validate_toml(src).is_ok(),
