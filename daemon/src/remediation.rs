@@ -799,7 +799,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     /// Redirects `terminal_log`'s storage root to an isolated temp directory
     /// for the lifetime of the guard, mirroring `terminal_log.rs`'s own
     /// `TempRoot` test helper -- `set_test_root` is `pub(crate)`, so this
