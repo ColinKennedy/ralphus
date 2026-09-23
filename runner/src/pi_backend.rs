@@ -1499,16 +1499,15 @@ fn display_terminal_error(error: &str) -> String {
 /// this is the value's very first hop, so it is never reported unclamped
 /// even to a caller within this same process.
 fn parse_retryable_rate_limit(error: &str) -> Option<std::time::Duration> {
-    if mentions_http_429(error)
-        && let Some(secs) = parse_retry_after_seconds(error)
-    {
+    if let (true, Some(secs)) = (mentions_http_429(error), parse_retry_after_seconds(error)) {
         return Some(std::time::Duration::from_secs(
             ralphus_core::rate_limit::clamp_retry_after_secs(secs),
         ));
     }
-    if mentions_no_deployments_available(error)
-        && let Some(secs) = parse_try_again_in_seconds(error)
-    {
+    if let (true, Some(secs)) = (
+        mentions_no_deployments_available(error),
+        parse_try_again_in_seconds(error),
+    ) {
         return Some(std::time::Duration::from_secs(
             ralphus_core::rate_limit::clamp_retry_after_secs(secs),
         ));
