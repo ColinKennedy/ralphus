@@ -88,6 +88,14 @@ pub const TRIAGE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 /// bounds accumulation to a day's worth of already-stale worktrees.
 pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How often to retire the transient fork-side upstream branch of every
+/// review in a terminal state that still records one (RAL-<new>,
+/// `pr::sweep_terminal_dual_root_upstream_branches`). A terminal review's
+/// dual-root stack branch is dead weight on the fork from the moment the
+/// review completes, so a few minutes -- not the worktree retirement sweep's
+/// daily cadence -- is the right latency for deleting it.
+pub const DUAL_ROOT_UPSTREAM_RETIREMENT_INTERVAL: Duration = Duration::from_secs(600);
+
 /// How often to refresh the local ref for every maintained review's base
 /// branch (see `crate::guardian_merge::poll_base_branch_freshness_once`).
 /// This is pure ref freshness with no rebuild logic of its own — a base
@@ -482,6 +490,12 @@ pub fn run_loop(
     // refresh -- same rationale as the ark call just above.
     crate::guardian_merge::poll_base_branch_freshness_once(&store);
     let mut last_base_branch_freshness_poll = std::time::Instant::now();
+    // RAL-<new>: same startup reasoning as the retirement sweep just above --
+    // a dual-root stack branch left behind by a review that went terminal
+    // while the daemon was down is retired promptly instead of waiting a full
+    // interval.
+    crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+    let mut last_dual_root_retirement = std::time::Instant::now();
     // RAL-389: self-heal a request lost to a crash between a branch's
     // terminal-status write and its durable queue write.
     crate::pr::recover_pending_auto_submits_on_startup(&store);
@@ -537,6 +551,10 @@ pub fn run_loop(
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
             last_worktree_retirement = std::time::Instant::now();
+        }
+        if last_dual_root_retirement.elapsed() >= DUAL_ROOT_UPSTREAM_RETIREMENT_INTERVAL {
+            crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
+            last_dual_root_retirement = std::time::Instant::now();
         }
         if last_git_maintenance.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::run_periodic_git_maintenance(&store);

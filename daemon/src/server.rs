@@ -12157,6 +12157,16 @@ fn clear_all(daemon: &Daemon, body: &str) -> Reply {
             crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{gid}_"));
         }
     }
+    // RAL-<new>: retire every deleted review's transient fork-side upstream
+    // branch -- snapshotted before the rows were deleted, since the fork
+    // routing can only be resolved while they exist.
+    for snapshot in &outcome.dual_root_upstreams {
+        crate::pr::retire_dual_root_upstream_branch(
+            &daemon.store_handle(),
+            snapshot,
+            "review deleted",
+        );
+    }
     let mut worktrees_purged = 0;
     if !req.keep_temporary {
         for (gid, root) in &outcome.guardian_roots {
@@ -13625,12 +13635,29 @@ fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
     // Snapshot everything needed for cleanup before the row is gone
     // (multi-project guardians span >1 root).
     let snapshot = store.get_guardian(id).ok();
+    // RAL-<new>: the transient fork-side upstream branch can only be retired
+    // while the row -- and the fork routing it is resolved from -- still
+    // exists.
+    let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
     match store.delete_guardian(id) {
         Ok(()) => {
             drop(store);
+            let store_handle = daemon.store_handle();
             if let Some(g) = snapshot {
+                if let Some(branch) = dual_root_branch {
+                    crate::pr::retire_dual_root_upstream_branch(
+                        &store_handle,
+                        &crate::store::DualRootUpstreamSnapshot {
+                            guardian_id: id.to_string(),
+                            git_root: g.git_root.clone(),
+                            owner: g.owner.clone(),
+                            branch,
+                        },
+                        "review deleted",
+                    );
+                }
                 for root in &g.projects {
-                    crate::guardian_merge::purge_worktrees(&daemon.store_handle(), root, id);
+                    crate::guardian_merge::purge_worktrees(&store_handle, root, id);
                 }
             }
             // RAL-154: same scoping as `kill_guardian_tmux_sessions` — a

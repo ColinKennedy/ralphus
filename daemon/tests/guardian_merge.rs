@@ -3117,6 +3117,135 @@ fn base_branch_freshness_poll_feeds_the_existing_rebuild_on_shift() {
     let _ = std::fs::remove_dir_all(&other_clone);
 }
 
+// RAL-<new>: the base-branch freshness poller's fetch is exactly "the review
+// fetched updates from origin", so a `dual_root_pr` review's transient
+// fork-side upstream branch must be force-pushed to the parent's fresh tip
+// by that same poll -- while the fork's own real base branch is left
+// untouched. Proves the fetch-triggered refresh end to end against real
+// bare repos, including the force-push over an already-diverged ref.
+#[test]
+fn base_freshness_poll_force_pushes_the_dual_root_upstream_branch_to_the_new_tip() {
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    let fork_dir = temp_repo();
+    git(&fork_dir, &["init", "--bare"]);
+
+    let root = temp_repo();
+    init_repo(&root);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "v1\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "v1"]);
+    git(&root, &["push", "origin", "main"]);
+    // The fork's own real base branch, carrying fork-only work its owner
+    // relies on -- the refresh must never move it.
+    git(
+        &root,
+        &["remote", "add", "fork", fork_dir.to_str().unwrap()],
+    );
+    git(&root, &["push", "fork", "main:main"]);
+    git(&root, &["checkout", "-b", "fork-only"]);
+    write(&root, "fork.txt", "fork only\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "fork only"]);
+    git(&root, &["push", "fork", "HEAD:main"]);
+    let fork_base_sha = git(&fork_dir, &["rev-parse", "refs/heads/main"])
+        .trim()
+        .to_string();
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    store
+        .lock()
+        .register_project("demo", "", root.to_str().unwrap(), "git")
+        .unwrap();
+    // Pin the resolved owner to "" (matching the fork row registered below)
+    // so the test is deterministic on any machine -- `resolve_review_owner`'s
+    // final fallback reads the live machine's own global config.
+    store
+        .lock()
+        .set_project_review_settings(
+            "demo",
+            &ralphus_daemon::store::ProjectReviewSettings {
+                default_pr_user: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .lock()
+        .upsert_project_fork("demo", "", fork_dir.to_str().unwrap(), "fork", "alice")
+        .unwrap();
+    let id = store
+        .lock()
+        .create_guardian("demo", "origin/main", root.to_str().unwrap())
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_dual_root_pr(&id, Some(true))
+        .unwrap();
+    // Simulate a prior dual-root submission having allocated the transient
+    // branch (allocation itself is covered by the pr.rs unit tests).
+    let transient = format!("ralphus/review/{id}/upstream");
+    store
+        .lock()
+        .set_guardian_dual_root_stack_branch(&id, Some(&transient))
+        .unwrap();
+    // Diverge the transient branch on the fork so the refresh has a real
+    // force-push to perform, not just a fast-forward.
+    git(
+        &root,
+        &["push", "fork", format!("HEAD:{transient}").as_str()],
+    );
+
+    // A merge lands on the forge side: an unrelated clone pushes straight to
+    // the bare parent, never touching `root`.
+    let other_clone = temp_repo();
+    git(&other_clone, &["clone", remote_dir.to_str().unwrap(), "."]);
+    git(&other_clone, &["checkout", "-B", "main", "origin/main"]);
+    write(&other_clone, "c.txt", "merged on github directly\n");
+    git(&other_clone, &["add", "."]);
+    git(&other_clone, &["commit", "-m", "merged on github directly"]);
+    git(&other_clone, &["push", "origin", "main"]);
+    let new_tip = git(&other_clone, &["rev-parse", "HEAD"]).trim().to_string();
+
+    poll_base_branch_freshness_once(&store);
+
+    // The refresh runs on a background thread; wait for the fork's transient
+    // branch to actually reach the parent's new tip.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let fork_tip = git(
+            &fork_dir,
+            &["rev-parse", &format!("refs/heads/{transient}")],
+        )
+        .trim()
+        .to_string();
+        if fork_tip == new_tip {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the poll never force-pushed {transient} to the parent's new tip: fork has {fork_tip}, want {new_tip}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The fork's own real base branch must be exactly where it was.
+    assert_eq!(
+        git(&fork_dir, &["rev-parse", "refs/heads/main"]).trim(),
+        fork_base_sha,
+        "the fork's own real base branch must never be touched by the dual-root refresh"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    let _ = std::fs::remove_dir_all(&other_clone);
+    let _ = std::fs::remove_dir_all(&fork_dir);
+}
+
 // Shared-worktree reviews cannot preserve a per-branch staged prefix. A base
 // shift entering through `run_merge_staged` must therefore take its documented
 // all-or-nothing fallback rather than executing the staged engine.

@@ -786,6 +786,25 @@ pub struct ClearOutcome {
     /// Ids of every squad actually deleted (RAL-154) — so the caller can purge
     /// `delete_squad` endpoint's cleanup.
     pub squad_ids: Vec<String>,
+    /// RAL-<new>: `(guardian_id, git_root, owner, fork-side transient upstream
+    /// branch)` snapshots for every deleted review that still had a
+    /// `dual_root_pr` stack branch on its fork — captured before the rows
+    /// were deleted, since the remote branch can only be retired while the
+    /// fork routing is still resolvable. The caller best-effort deletes each
+    /// branch from its fork remote after the store deletion.
+    pub dual_root_upstreams: Vec<DualRootUpstreamSnapshot>,
+}
+
+/// RAL-<new>: everything needed to retire one review's transient fork-side
+/// upstream branch (`ralphus/review/<id>/upstream`) after the review's own
+/// row is gone or terminal: the fork is resolved from `git_root` + `owner`,
+/// and `branch` is the persisted ref name.
+#[derive(Debug, Clone)]
+pub struct DualRootUpstreamSnapshot {
+    pub guardian_id: String,
+    pub git_root: String,
+    pub owner: Option<String>,
+    pub branch: String,
 }
 
 /// A persisted path that may be owned by a cell, proof, or review.
@@ -2903,6 +2922,16 @@ impl Store {
             // column can still be NULL for guardians created before this
             // migration.
             "ALTER TABLE guardians ADD COLUMN owner TEXT",
+            // RAL-<new>: the transient, review-specific fork-side branch a
+            // `dual_root_pr` stack PR targets --
+            // `ralphus/review/<id>/upstream`, collision-suffixed, allocated
+            // at the first dual-root submission and force-pushed to the
+            // parent's base tip on every base fetch. NULL for every review
+            // that never used dual-root mode (pre-existing shared-fork-base
+            // reviews are deliberately not migrated). Cleared once the
+            // branch has been retired -- terminal review state or review
+            // deletion.
+            "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -8597,6 +8626,10 @@ impl Store {
                 stmt.query_map([], |r| r.get::<_, String>(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?
             };
+            // RAL-<new>: snapshot every dual-root upstream branch before the
+            // guardian rows are deleted -- the remote refs can only be
+            // retired while their fork routing is still resolvable.
+            let dual_root_upstreams = self.dual_root_upstream_snapshots(false)?;
             let tx = self.conn.transaction()?;
             tx.execute("DELETE FROM events", [])?;
             tx.execute("DELETE FROM proofs", [])?;
@@ -8622,6 +8655,7 @@ impl Store {
                 guardians_deleted,
                 guardian_roots,
                 squad_ids,
+                dual_root_upstreams,
             });
         }
         // Filtered: delete only squads whose state matches, plus their children.
@@ -8653,6 +8687,7 @@ impl Store {
             guardians_deleted: 0,
             guardian_roots: Vec::new(),
             squad_ids: ids,
+            dual_root_upstreams: Vec::new(),
         })
     }
 
