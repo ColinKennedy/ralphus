@@ -4937,18 +4937,36 @@ pub(crate) fn refresh_dual_root_fork_branches_for_base(
             Some(&routing.fork.remote_name),
         );
         let parent_branch = strip_remote_prefix(&guardian.base_branch, &parent_remote);
-        if let Err(e) = crate::project_forks::sync_review_upstream_branch(
+        match crate::project_forks::sync_review_upstream_branch(
             &guardian_root,
             &parent_remote,
             &routing.fork.remote_name,
             &parent_branch,
             &guardian.id,
         ) {
-            crate::rlog!(
-                WARNING,
-                "ralphus [pr] review {} could not refresh its dual-root fork branch after base fetch: {e}",
-                guardian.id
-            );
+            Ok(branch) => {
+                let guard = store.lock();
+                let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "refreshed dual-root fork branch after base fetch",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&guardian.id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({"branch": branch}),
+                    admin_only: false,
+                });
+            }
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {} could not refresh its dual-root fork branch after base fetch: {e}",
+                    guardian.id
+                );
+            }
         }
     }
 }
@@ -5508,14 +5526,40 @@ fn submit_stacked_branch_pr(
             }
             let stack_route = stack_pr_route(routing, &alias, id);
             let stack_result = match stack_route.find_existing_pull_request() {
-                Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
+                Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft, true)),
                 Ok(None) => stack_route
                     .create_pull_request(&title, &description, draft)
-                    .map(|c| (c.number, c.url, c.draft)),
+                    .map(|c| (c.number, c.url, c.draft, false)),
                 Err(e) => Err(e),
             };
             match stack_result {
-                Ok((number, url, stack_draft)) => {
+                Ok((number, url, stack_draft, stack_adopted)) => {
+                    {
+                        let guard = store.lock();
+                        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                            level: crate::logging::LogLevel::INFO,
+                            source: "pr",
+                            message: if stack_adopted {
+                                "stack pull request adopted"
+                            } else {
+                                "stack pull request created"
+                            },
+                            scope: Some("branch"),
+                            squad_id: None,
+                            guardian_id: Some(id),
+                            cell_id: None,
+                            task: None,
+                            log_path: None,
+                            payload: serde_json::json!({
+                                "branch_id": branch_id,
+                                "alias": alias,
+                                "pr_number": number,
+                                "pr_url": url,
+                                "adopted": stack_adopted,
+                            }),
+                            admin_only: false,
+                        });
+                    }
                     if let Err(e) = store.lock().create_pull_request_ex(
                         id,
                         Some(branch_id),
