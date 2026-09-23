@@ -965,25 +965,21 @@ fn check_db_profiles_health(store: &Store) -> Vec<ProfileHealthResult> {
     let mut results = Vec::new();
     let commands = store.list_agent_backend_commands().unwrap_or_default();
     for cmd in &commands {
-        let program = cmd.command.split_whitespace().next().unwrap_or("");
         let check_name = format!("agent-backend-command:{}", cmd.backend);
-        match resolve_executable(program) {
-            Ok(resolved) => results.push(ProfileHealthResult {
-                name: check_name,
-                status: "pass",
-                detail: format!("command={:?} -> {resolved}", cmd.command),
-            }),
-            Err(reason) => results.push(ProfileHealthResult {
-                name: check_name,
-                status: "fail",
-                detail: format!(
-                    "command={:?} {reason} in the daemon process's PATH. Install it (or fix \
-                     the command) where `ralphus-daemon serve` runs -- no daemon restart is \
-                     needed once fixed.",
-                    cmd.command
-                ),
-            }),
-        }
+        // RAL-485: evaluated through the same `diagnose_backend_command`
+        // every other surface (the Health/Agents tabs' claude-command/
+        // codex-command/pi-command checks) uses, rather than a naive
+        // `command.split_whitespace().next()` guess at the executable --
+        // that guess mis-evaluated any command carrying arguments (it
+        // resolved and executability-checked only the first word) and never
+        // recognized a genuinely complex, shell-routed command as anything
+        // other than "the first token", silently testing the wrong thing.
+        let health = crate::health_sweep::diagnose_backend_command(&cmd.backend, &cmd.command);
+        results.push(ProfileHealthResult {
+            name: check_name,
+            status: health.status,
+            detail: format!("command={:?} {}", cmd.command, health.detail),
+        });
     }
     let profiles = store.list_agent_profiles().unwrap_or_default();
     for profile in &profiles {
@@ -1809,5 +1805,28 @@ executable = "should-not-be-here"
         .expect("rewrite config");
         let err = parse_profile_file(&config).expect_err("native executable error");
         assert!(err.contains("executable is only meaningful for claude-code, codex, pi, or raw"));
+    }
+
+    /// RAL-485: a database-stored backend-command override that carries
+    /// arguments must be evaluated as a whole (compound-command detection),
+    /// not by resolving only its first whitespace-delimited token --
+    /// previously, a command like `rez-env foo -- claude` was silently
+    /// checked as `resolve_executable("rez-env")`, which could pass or fail
+    /// for reasons unrelated to whether `claude` itself was ever reachable.
+    #[test]
+    fn check_db_profiles_health_reports_a_compound_backend_command_as_skip() {
+        let store = Store::open_in_memory().expect("open store");
+        store
+            .set_agent_backend_command("claude-code", "rez-env foo -- claude")
+            .expect("set backend command override");
+
+        let results = check_db_profiles_health(&store);
+
+        let entry = results
+            .iter()
+            .find(|r| r.name == "agent-backend-command:claude-code")
+            .expect("claude-code backend-command health entry");
+        assert_eq!(entry.status, "skip", "{entry:?}");
+        assert!(entry.detail.contains("rez-env foo -- claude"), "{entry:?}");
     }
 }
