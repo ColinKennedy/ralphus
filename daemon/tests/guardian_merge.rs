@@ -1308,6 +1308,11 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
     let rev0 = view.branches[0].review_branch.clone().unwrap();
     let sha0 = git(&root, &["rev-parse", &rev0]).trim().to_string();
+    assert_eq!(
+        pr_after.last_pushed_sha.as_deref(),
+        Some(sha0.as_str()),
+        "an unattended auto-fix push must update the PR's recorded SHA"
+    );
     let files0 = git(&root, &["ls-tree", "-r", "--name-only", &rev0]);
     assert!(files0.contains("fix.txt"), "auto-fix commit on branch 0");
 

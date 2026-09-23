@@ -400,6 +400,9 @@
        * @property {string|null} [superseded_by] - RAL-338: the id of the PR row that replaced this one (fork-promotion reconcile-first). Non-null means a fresher row is the current one to show, not this one.
        * @property {string|null} [ci_status] - RAL-395: "pending" | "passing" | "failing", from the last standing CI/CD poll. null if never polled.
        * @property {string|null} [ci_failure_job_url] - RAL-395: the failing job's forge URL, when `ci_status === "failing"` and the forge gave one.
+       * @property {number} [auto_fix_attempt_count] - Number of unattended CI-fix attempts in the current failing campaign.
+       * @property {number|null} [auto_fix_next_attempt_at_ms] - UTC epoch-ms when the next backoff-limited unattended attempt may run.
+       * @property {string|null} [auto_fix_error] - Human-readable reason unattended CI fixing has stopped; null while it remains eligible.
        * @property {boolean|null} [draft] - RAL-353: whether the forge reports this PR/MR as a draft (WIP). null only for rows recorded before the column existed and never polled since; the board treats null as not-draft.
        * @property {string} [pr_kind] - RAL-<new>: "parent" (the default, and every pre-dual_root_pr row) | "stack". A "stack" row is a fork-routed root branch's second, same-repo PR into a mirror of the parent's base branch (dual_root_pr mode) -- it visually chains the branch into the rest of the stack, is never expected to merge, and closes once the branch's "parent" PR does.
        */

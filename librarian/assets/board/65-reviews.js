@@ -773,6 +773,9 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         }
         const badgeColor = prColorVar(p);
         const canQueryForge = p.state === "open" && p.pr_number != null;
+        const autoFixError = p.auto_fix_error
+          ? `<div class="row" style="margin-top:4px"><span class="badge" style="color:var(--failed);border-color:var(--failed);font-size:11px" data-tip="Automatic CI fixing has stopped for this PR/MR to prevent repeated pushes and CI runs.\nWho/when: use Action Feedback when a person has reviewed the failure and wants an explicit retry.">${esc(p.auto_fix_error)}</span></div>`
+          : "";
         const ciTip = p.state === "open" && p.ci_status
           ? ` data-tip="CI/CD status: ${esc(p.ci_status)}. Right-click to refresh its status or pull in feedback."`
           : ` data-tip="Right-click to refresh its status or pull in feedback."`;
@@ -783,6 +786,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
               <span class="badge" style="font-size:11px;color:${badgeColor};border-color:${badgeColor}" data-ctx="openPrMenu" data-pr-id="${esc(p.id)}" data-pr-open="${canQueryForge ? "1" : "0"}"${ciTip}>${badgeLabel}</span>
             </div>
             ${drift}
+            ${autoFixError}
           </div>`;
       }
       /**

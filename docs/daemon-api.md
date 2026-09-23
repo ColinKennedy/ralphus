@@ -2473,6 +2473,19 @@ most once every two minutes per guardian) and by
 Identical for GitHub- and GitLab-backed PRs — both resolve through the same
 `ForgeClient::check_pr_ci_status`.
 
+When an enabled review exhausts its unattended CI-fix campaign, PR responses
+also include `auto_fix_attempt_count`, `auto_fix_next_attempt_at_ms`, and
+`auto_fix_error`. `auto_fix_error` is the board-visible explanation that
+automatic fixing stopped; a passing CI result or an explicit person-initiated
+retry resets the campaign. Configure the ceiling and initial exponential
+backoff in `.ralphus.toml`:
+
+```toml
+[review]
+auto_fix_max_attempts = 3
+auto_fix_retry_base_seconds = 60
+```
+
 ### `GET /api/pull-requests/forge-cache-index`
 RAL-366: a flat, single-query index of every PR's *cached* forge state — the
 background poller's most recent observation of un-actioned reviewer feedback

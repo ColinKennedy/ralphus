@@ -764,6 +764,8 @@ impl ProjectReviewSettings {
             dual_root_pr: self.dual_root_pr,
             auto_fix_pr_errors: self.auto_fix_pr_errors,
             auto_fix_prompt_template: self.auto_fix_prompt_template,
+            auto_fix_max_attempts: None,
+            auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
             // same "left at their defaults" treatment as `checks`/
             // `summary_format` above; only the file-based `.ralphus.toml`
@@ -2891,6 +2893,11 @@ impl Store {
             // exhausted attempt, mirroring `auto_fix_attempted_at_ms`'s own
             // single-attempt cap, and cleared by the same paths that clear it.
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_exhausted_notified_at_ms INTEGER",
+            // Durable unattended CI-fix campaign state. Pending CI does not
+            // clear this state: only a passing result or a manual rebase does.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_attempt_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_next_attempt_at_ms INTEGER",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_error TEXT",
             // RAL-476: the user who submitted this squad, resolved once at
             // submit time (explicit TOML `submitter`, else the acting
             // request's identity) -- see `server::resolve_submitter`.
