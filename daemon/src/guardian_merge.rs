@@ -1395,22 +1395,14 @@ fn resolver_model_chain(
 ///
 /// Backs `pr.rs`'s best-effort PR-title/description synthesis, which runs from
 /// a `GuardianView` with no store handle in reach -- see [`resolver_agent`]'s
-/// doc comment for why that call site doesn't warrant the extra plumbing. A
-/// guardian configured with a *custom* resolver profile falls back to this
-/// function's error path (same as an unknown name) for this one cosmetic
-/// synthesis step only -- the real conflict-resolution path
-/// ([`resolve_resolver_agent`]) is unaffected, since it always has a store.
+/// doc comment for why that call site doesn't warrant the extra plumbing.
 pub(crate) fn resolve_resolver_agent_from_config(
     stored_agent: Option<&str>,
     stored_model: Option<&str>,
     cwd: &Path,
 ) -> Result<ResolvedResolverAgent, String> {
     let raw = resolver_agent(stored_agent, cwd);
-    // RAL-460: agent profiles moved from `.ralphus.toml` into the daemon's
-    // store, and this call site has no store handle in reach (see the doc
-    // comment above) -- only a bare built-in backend name resolves here
-    // now; a custom profile name is indistinguishable from unknown.
-    let selection = crate::agent_profiles::resolve_builtin_agent_only(&raw)?;
+    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
     let config_default = crate::config::resolve(cwd)
         .default_resolver_model()
         .map(ToString::to_string);
@@ -1464,10 +1456,7 @@ fn resolve_resolver_agent(
         .map(ToString::to_string)
         .or_else(|| std::env::var("RALPHUS_RESOLVER_AGENT").ok())
         .unwrap_or_else(|| db_cfg.default_resolver_agent().to_string());
-    let selection = {
-        let guard = store.lock();
-        crate::agent_profiles::resolve_agent(&raw, &guard)
-    }?;
+    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
     let model = resolver_model_chain(
         stored_model,
         &selection,
