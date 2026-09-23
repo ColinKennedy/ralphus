@@ -274,11 +274,12 @@ element" below). Clears automatically the next time the cell is dispatched
 (a restart, or the explicit resume-automation trigger).
 
 ### Rate-limited retry wait — `--delayed` only (RAL-435)
-A task cell's status pill grows a `⏳ delayed` badge while it reads `running`
-but is actually waiting out a recognized, retryable provider rate limit (a
-Pi 429 that also carried a suggested retry delay) before the daemon
-automatically resumes the same agent session — no human action needed,
-unlike a `⏸ detached` cell. It deliberately does not reuse `--detached`
+A task cell, agent-backed proof, or review worktree's status pill grows a
+`⏳ delayed` badge while it is waiting out a recognized, retryable provider
+rate limit before the daemon automatically resumes the same agent session —
+no human action needed, unlike a `⏸ detached` cell. Its underlying active
+status remains unchanged and resumes once the delay ends. It deliberately
+does not reuse `--detached`
 (that badge specifically means a human is or was in the driver's seat via
 "Open Agent"; this one means the daemon itself is waiting out a timer),
 `--stale` (reserved for a still-headlessly-running cell gone quiet, a sign
@@ -287,8 +288,8 @@ expected), or `--waiting` (reserved for a `pending` *squad* held back by a
 scheduler down-time window — a different entity and a different cause);
 `--delayed` exists only because no existing role fit this new concept (see
 "Adding a new UI element" below). Clears automatically once the delay
-elapses and the cell resumes, or once repeated rate limits cross RAL-435's
-anti-thrash threshold and the cell fails outright instead of retrying again.
+elapses and execution resumes, or once repeated rate limits exhaust the
+retry budget and the owning call fails outright instead of retrying again.
 
 ### Arbiter-created review — `--arbiter` only (RAL-318)
 The Reviews panel marks a review with a small "⚙ Arbiter" badge when its
