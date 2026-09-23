@@ -44,6 +44,7 @@ const exported = [
   "ttFmtCache",
   "ttFmtTurns",
   "ttFmtCost",
+  "ttTaskAgents",
   "ttTaskReviews",
   "TT_REVIEW_ATTENTION_RANK",
   "ttPickReviewBadge",

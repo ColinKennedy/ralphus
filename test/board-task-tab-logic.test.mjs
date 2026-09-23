@@ -19,6 +19,7 @@ const {
   ttFmtCache,
   ttFmtTurns,
   ttFmtCost,
+  ttTaskAgents,
   ttTaskReviews,
   ttPickReviewBadge,
   ttPrsForTask,
@@ -97,6 +98,26 @@ test("ttFmtTokens renders the in/out pair, ttFmtCache renders write/read", () =>
   const u = ttUsageOf([{ tokens_in: 10, tokens_out: 45, cache_creation_tokens: 7, cache_read_tokens: 3 }]);
   assert.equal(ttFmtTokens(u), "10 / 45");
   assert.equal(ttFmtCache(u), "7 / 3");
+});
+
+// ---------- RAL-486 Agent filter: resolved agent(s) ----------
+
+test("ttTaskAgents collects the distinct resolved agent of every cell", () => {
+  const task = { agent: null, cells: [{ agent: "claude-code" }, { agent: "codex" }, { agent: "claude-code" }] };
+  assert.deepEqual(ttTaskAgents(task).sort(), ["claude-code", "codex"]);
+});
+
+test("ttTaskAgents falls back to the task-level agent for a cell-less task", () => {
+  assert.deepEqual(ttTaskAgents({ agent: "ollama", cells: [] }), ["ollama"]);
+});
+
+test("ttTaskAgents yields no agents for a cell-less task with no task-level agent set", () => {
+  assert.deepEqual(ttTaskAgents({ agent: null, cells: [] }), []);
+});
+
+test("ttTaskAgents ignores the raw task-level agent once the task has cells -- cell agents are already resolved/inherited", () => {
+  const task = { agent: "ollama", cells: [{ agent: "claude-code" }] };
+  assert.deepEqual(ttTaskAgents(task), ["claude-code"]);
 });
 
 // ---------- review union + badge picking ----------
@@ -353,6 +374,33 @@ test("ttRowMatchesFilters applies the name filter, status set, project set, hidd
   // RAL-345: an empty projects set means "no filter"; a non-empty one is an inclusion check.
   assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["alpha"]) }, new Set(), new Set()), true);
   assert.equal(ttRowMatchesFilters(row, { ...filters, projects: new Set(["other"]) }, new Set(), new Set()), false);
+});
+
+// ---------- RAL-486 Agent filter ----------
+
+test("ttRowMatchesFilters is unaffected by the agent filter when the caller omits it (backward compat)", () => {
+  const row = { key: "s1:0", name: "T", state: "running", project: "alpha", squadId: "s1", agents: ["claude-code"] };
+  const filters = { q: "", status: new Set(["running"]), projects: new Set(), showHidden: false, needsMe: false };
+  assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), true);
+});
+
+test("ttRowMatchesFilters matches a row when ANY of its resolved agents is selected", () => {
+  const row = { key: "s1:0", name: "T", state: "running", project: "alpha", squadId: "s1", agents: ["claude-code", "codex"] };
+  const filters = { q: "", status: new Set(["running"]), projects: new Set(), showHidden: false, needsMe: false, agents: new Set(["codex"]) };
+  assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), true);
+  assert.equal(ttRowMatchesFilters(row, { ...filters, agents: new Set(["ollama"]) }, new Set(), new Set()), false);
+});
+
+test("ttRowMatchesFilters excludes everything once the agent filter is explicitly emptied (mirrors the status filter's empty-means-hide-all semantics)", () => {
+  const row = { key: "s1:0", name: "T", state: "running", project: "alpha", squadId: "s1", agents: ["claude-code"] };
+  const filters = { q: "", status: new Set(["running"]), projects: new Set(), showHidden: false, needsMe: false, agents: new Set() };
+  assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), false);
+});
+
+test("ttRowMatchesFilters excludes a row with no resolved agent at all once the agent filter is active -- there is nothing to compare", () => {
+  const row = { key: "s1:0", name: "T", state: "running", project: "alpha", squadId: "s1", agents: [] };
+  const filters = { q: "", status: new Set(["running"]), projects: new Set(), showHidden: false, needsMe: false, agents: new Set(["claude-code"]) };
+  assert.equal(ttRowMatchesFilters(row, filters, new Set(), new Set()), false);
 });
 
 // ---------- RAL-463 PR-status filter ----------
