@@ -172,27 +172,52 @@ fn short_name_under_w(path: &Path) -> Option<String> {
         .map(|w| w[3].clone())
 }
 
-/// Every task-worktree short name currently in use under `root`'s `w/`
-/// directory, mapped to the branch it's checked out on -- read straight from
-/// `git worktree list --porcelain` (the same technique
+/// Every branch checked out anywhere in `root`'s repo, read straight from a
+/// single `git worktree list --porcelain` call (the same technique
 /// `guardian_merge::find_worktree_for_branch` uses), never from `w/`'s
 /// directory listing, so a worktree git considers prunable/stale still
-/// counts as occupying its slot until git itself says otherwise.
+/// counts as occupying its branch until git itself says otherwise.
+///
+/// A worktree directly under `root`'s `.git/.ralphus/w/` is keyed by its
+/// `<short>` directory name, exactly as before -- that's what
+/// [`resolve_task_worktree_dir_with_existing`]'s slot-collision probing
+/// needs. Every OTHER worktree (one a developer created by hand anywhere
+/// else in the filesystem, RAL-491, or a guardian review worktree under
+/// `.git/.ralphus/g/`) is keyed by its own absolute path string instead.
+/// [`crate::short_paths::short_name`] only ever produces a short, sanitized
+/// candidate (<=12 ASCII alnum/`-`/`_`/`.` characters, no `/`, `\`, or `:`),
+/// so a real path can never collide with a short-name key -- meaning
+/// [`resolve_task_worktree_dir_with_existing`]'s probing is unaffected by
+/// these extra entries, while [`resolve_squad_branch`]'s "is this branch
+/// already checked out somewhere" check (which only reads map *values*, not
+/// keys) now sees them and treats the branch as occupied.
 fn existing_task_worktree_branches(root: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(list) = git(root, &["worktree", "list", "--porcelain"]) else {
         return out;
     };
+    let mut cur_path: Option<String> = None;
     let mut cur_short: Option<String> = None;
     for line in list.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            cur_short = short_name_under_w(Path::new(path.trim()));
+            let path = path.trim();
+            cur_short = short_name_under_w(Path::new(path));
+            cur_path = Some(path.to_string());
         } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
-            if let Some(short) = cur_short.take() {
-                out.insert(short, branch.trim().to_string());
+            let branch = branch.trim().to_string();
+            match cur_short.take() {
+                Some(short) => {
+                    out.insert(short, branch);
+                }
+                None => {
+                    if let Some(path) = cur_path.take() {
+                        out.insert(path, branch);
+                    }
+                }
             }
         } else if line.is_empty() {
             cur_short = None;
+            cur_path = None;
         }
     }
     out
@@ -220,10 +245,11 @@ static RESERVED_WORKTREE_SLOTS: LazyLock<
     parking_lot::Mutex<HashMap<PathBuf, HashMap<String, String>>>,
 > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-/// [`existing_task_worktree_branches`] merged with any slot this process has
-/// already reserved for `root` (see [`RESERVED_WORKTREE_SLOTS`]) but not yet
-/// materialized on disk. Use this wherever a materialization DECISION is
-/// made; the plain query alone is only safe for read-only/display purposes.
+/// [`existing_task_worktree_branches`] (repo-wide branch occupancy, not just
+/// `w/`) merged with any slot this process has already reserved for `root`
+/// (see [`RESERVED_WORKTREE_SLOTS`]) but not yet materialized on disk. Use
+/// this wherever a materialization DECISION is made; the plain query alone
+/// is only safe for read-only/display purposes.
 fn existing_and_reserved_worktree_branches(root: &Path) -> HashMap<String, String> {
     let mut out = existing_task_worktree_branches(root);
     if let Some(reserved) = RESERVED_WORKTREE_SLOTS.lock().get(root) {
@@ -369,7 +395,12 @@ const MAX_BRANCH_SUFFIX: usize = 1000;
 /// A branch counts as taken if a claim row holds it *or* a live worktree is
 /// checked out on it. The second check is what handles worktrees that predate
 /// this table (they have no row, but they are plainly still in use) and any
-/// branch a user materialized by hand.
+/// branch a user materialized by hand -- anywhere in the repo, not just under
+/// this daemon's own `.git/.ralphus/w/` (RAL-491): `on_disk`'s values cover
+/// every worktree [`existing_task_worktree_branches`] found, foreign ones
+/// included, so a branch already checked out in a hand-made worktree falls
+/// through to the next free `-2`, `-3`, ... suffix here instead of git
+/// itself rejecting the later `git worktree add`.
 ///
 /// **A remote-tracking branch is exempt and always shared.** A placeholder
 /// like `ralphus:new-worktree/origin/foo` names one specific, externally
@@ -4503,6 +4534,58 @@ mod tests {
         );
         // And the legacy worktree is left exactly as it was.
         assert!(legacy.join("in-progress.txt").exists());
+    }
+
+    #[test]
+    fn ral491_a_branch_checked_out_in_a_foreign_worktree_is_treated_as_occupied() {
+        // RAL-491: a developer (or some other tool) can check a branch out in
+        // a worktree that lives OUTSIDE this daemon's own `.git/.ralphus/w/`
+        // directory -- e.g. by hand, with a plain `git worktree add`. Git
+        // itself refuses a second `worktree add` for the same branch no
+        // matter where the first checkout lives, so resolution must detect
+        // that collision up front and fall back to `-2`, not let the raw
+        // `git worktree add` inside `execute_worktree_plan` fail.
+        let repo = init_repo("ral491-foreign-worktree");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+
+        // A worktree for "foreign-branch" materialized entirely outside
+        // ralphus's own `.git/.ralphus/w/` directory -- the exact repro from
+        // the ticket (`git worktree add ../outside/foo foreign-branch`).
+        let foreign = tmp_dir("ral491-foreign-worktree-outside");
+        g(&repo, &["branch", "foreign-branch"]);
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                foreign.to_str().expect("foreign worktree path"),
+                "foreign-branch",
+            ],
+        );
+
+        let fresh = resolve_for_squad(
+            &store,
+            &repo,
+            "squad-1",
+            "ralphus:new-worktree/foreign-branch?upstream=main",
+        );
+
+        assert_ne!(
+            PathBuf::from(&fresh),
+            foreign,
+            "the squad must not be handed the foreign worktree's own directory"
+        );
+        assert_eq!(
+            head_branch(&fresh),
+            "foreign-branch-2",
+            "the branch collision must be detected and stepped around, not \
+             failed on with a raw git error"
+        );
+        // The foreign worktree itself is left exactly as it was.
+        assert_eq!(head_branch(foreign.to_str().unwrap()), "foreign-branch");
     }
 
     #[test]
