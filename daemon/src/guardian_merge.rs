@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,52 @@ pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
 /// session name a feedback pass actually runs under, both live and after
 /// the fact.
 pub(crate) const FEEDBACK_TASK: &str = "feedback";
+
+/// A git root on a particular machine. The machine is part of the key because
+/// identical path strings on two hosts name independent repositories.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct GitMaintenanceRoot {
+    root: PathBuf,
+    machine: Option<String>,
+}
+
+/// Per-root guards shared by review git operations and periodic maintenance.
+/// Entries intentionally live for the daemon lifetime: a root is a durable
+/// guardian configuration, and retaining its small coordination primitive
+/// avoids an ABA race from removing it while another thread is acquiring it.
+static GIT_MAINTENANCE_LOCKS: LazyLock<Mutex<HashMap<GitMaintenanceRoot, &'static RwLock<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn git_maintenance_lock(root: &Path, machine: Option<&str>) -> &'static RwLock<()> {
+    let key = GitMaintenanceRoot {
+        root: root.to_path_buf(),
+        machine: machine.map(str::to_string),
+    };
+    let mut locks = GIT_MAINTENANCE_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| Box::leak(Box::new(RwLock::new(()))))
+}
+
+/// Hold a shared guard for a review operation's git chain. Maintenance takes
+/// the exclusive side, so it cannot repack while a review is rebasing.
+fn git_review_operation_guard(root: &Path, machine: Option<&str>) -> RwLockReadGuard<'static, ()> {
+    git_maintenance_lock(root, machine)
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquire the exclusive maintenance guard without delaying a review. A busy
+/// root is retried on the next daily sweep rather than making a user-initiated
+/// merge wait behind a potentially multi-minute repack.
+fn try_git_maintenance_guard(
+    root: &Path,
+    machine: Option<&str>,
+) -> Option<RwLockWriteGuard<'static, ()>> {
+    git_maintenance_lock(root, machine).try_write().ok()
+}
 
 /// The static authored system prompt the conflict-resolution fix pass feeds
 /// its resolver agent (RAL-102) -- hoisted to a module constant (RAL-428) so
@@ -2849,6 +2895,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     set_status: &F,
     cancel: &CancelToken,
 ) {
+    let _git_operation = git_review_operation_guard(root.root(), root.machine());
     // Queue this restack and try to claim it immediately -- claiming only
     // succeeds once every branch's worktree lease is free (see the
     // `worktree lease` glossary entry), so a restack can never rebase a
@@ -4217,6 +4264,8 @@ pub fn run_merge_staged(
         }
         return;
     }
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         let _ = store.lock().set_guardian_status(id, s, detail);
     };
@@ -4861,6 +4910,8 @@ pub fn run_merge_cancellable(
         Ok(g) => g,
         Err(_) => return,
     };
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     // RAL-193: every call is its own merge/rebase attempt -- bump the
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
@@ -5898,6 +5949,8 @@ pub fn run_feedback(
             return FeedbackOutcome::default();
         }
     };
+    let _git_operation =
+        git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
     let base = guardian.base_branch.clone();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         fail_message();
@@ -8764,6 +8817,187 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
     }
 }
 
+/// How often [`run_periodic_git_maintenance`] runs (see `scheduler.rs`'s
+/// `WORKTREE_RETIREMENT_INTERVAL`, whose cadence this reuses): daily is
+/// plenty, since `git gc --auto` only does real work once a root has crossed
+/// git's own loose-object/pack-count threshold, not on every call.
+///
+/// A repo this daemon manages accumulates one commit per rebased branch, per
+/// resolved conflict, and per carry-forward pin, for every review it has ever
+/// run -- and nothing else in this codebase ever packs them. Measured on
+/// ralphus's own dev repo: ~37k loose objects left every plain `git fetch`
+/// paying an ~8s "have" negotiation walk before it sends a single byte over
+/// the wire, on top of an SSH handshake that alone takes about a second. That
+/// walk cost is exactly what made the "Merge / rebase" button feel stuck --
+/// its own preflight (`pr::sync_remote_pr_commits`) fetches every open PR
+/// before the guardian even flips to `merging`, and the board's own ambient
+/// per-PR sync-status polling (RAL-190) pays the same tax concurrently on the
+/// very same repo, contending for `pr::SYNC_FETCH_LOCKS`.
+///
+/// A `git gc` that can't run (a machine provider with no `gc` support, a
+/// transient lock held by a concurrent git process) is logged and gets
+/// another chance tomorrow -- best-effort, same as every other daily sweep
+/// in this file. What it leaves the root in when it fails partway through is
+/// less certain than that framing suggests, though: a real attempt against
+/// ralphus's own dev repo hit `fatal: index file corrupt` / `failed to run
+/// repack` after racing a concurrently-running guardian merge on the same
+/// root, and a follow-up `git fsck` transiently (not permanently -- every
+/// flagged object resolved fine moments later) reported objects as missing.
+/// Nothing was actually lost, but "no worse off" is an assumption this
+/// hasn't earned; [`busy_git_maintenance_roots`] exists to make that race
+/// less likely to occur at all, not just to survive it.
+///
+/// Dispatched one thread per root rather than run inline: on a heavily
+/// bloated repo `git gc` is not a quick check, it is minutes of real work
+/// (repacking, reachability across every worktree's HEAD), and the scheduler
+/// loop's own tick must not stall behind it -- the exact same reasoning
+/// [`poll_base_branch_freshness_once`] already applies to its own fetches.
+///
+/// Deliberately **not** also called once at daemon startup the way
+/// `retire_stale_worktrees` is (`scheduler.rs`'s startup sequence). Startup is
+/// exactly when `recover_interrupted_reviews`/`start_reviews` are about to
+/// promote a `collecting` guardian to `merging` from a background thread that
+/// only flips the DB status once it actually wins the claim -- there is no
+/// synchronization point before the main loop where [`busy_git_maintenance_roots`]
+/// checking "is anything merging right now" is actually a meaningful answer,
+/// since the guardian that is about to start merging still reads as
+/// `collecting` up until the moment its own thread claims it. Confining this
+/// to the ordinary daily-interval tick, well after that startup recovery
+/// stampede has settled, is what actually reduces the collision risk;
+/// running it eagerly at startup would reliably raise it instead.
+pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
+    let guardians: Vec<GuardianRootInfo> = {
+        let guard = store.lock();
+        guard
+            .list_guardians()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| GuardianRootInfo {
+                git_root: g.git_root,
+                machine: g.machine,
+                status: g.status,
+            })
+            .collect()
+    };
+    let busy = busy_git_maintenance_roots(&guardians);
+    for (root, machine) in collect_git_maintenance_roots(&guardians) {
+        if busy.contains(&(root.clone(), machine.clone())) {
+            log_git_maintenance_skipped(store, &root, machine.as_deref());
+            continue;
+        }
+        let store = Arc::clone(store);
+        let emit_store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            // The status snapshot above is useful for avoiding needless
+            // threads, but it cannot make a check-then-act guarantee: a
+            // review can claim this root immediately after it was read. The
+            // exclusive guard is that guarantee; every review rebase holds
+            // its shared side for the complete git-operation chain.
+            let Some(_maintenance_guard) = try_git_maintenance_guard(&root, machine.as_deref())
+            else {
+                log_git_maintenance_skipped(&emit_store, &root, machine.as_deref());
+                return;
+            };
+            let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
+            // The store lock is taken only to record the outcome below --
+            // never held across the `git gc` call itself, which can run for
+            // minutes on a bloated repo and must not stall the rest of the
+            // daemon behind a global lock.
+            let result = ws.git(&["gc", "--auto", "--quiet"]);
+            let guard = emit_store.lock();
+            match result {
+                Ok(_) => {
+                    crate::cartographer::Note::new("guardian")
+                        .scope("guardian")
+                        .level(crate::logging::LogLevel::DEBUG)
+                        .emit(
+                            &guard,
+                            "git maintenance ran",
+                            serde_json::json!({ "git_root": root }),
+                        );
+                }
+                Err(error) => {
+                    crate::cartographer::Note::new("guardian")
+                        .scope("guardian")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            &guard,
+                            "git maintenance failed",
+                            serde_json::json!({ "git_root": root, "error": error }),
+                        );
+                }
+            }
+        });
+    }
+}
+
+fn log_git_maintenance_skipped(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    machine: Option<&str>,
+) {
+    let guard = store.lock();
+    crate::cartographer::Note::new("guardian")
+        .scope("guardian")
+        .level(crate::logging::LogLevel::DEBUG)
+        .emit(
+            &guard,
+            "git maintenance skipped: a review git operation is in progress",
+            serde_json::json!({ "git_root": root, "machine": machine }),
+        );
+}
+
+/// The `(git_root, machine, status)` fields [`collect_git_maintenance_roots`]
+/// and [`busy_git_maintenance_roots`] need from a guardian -- narrowed down
+/// from the full `GuardianView` the same way [`GuardianBaseFetchInfo`]
+/// narrows it for `collect_base_fetch_targets`, so the pure dedup/filter
+/// logic can be unit-tested without constructing a whole view.
+pub(crate) struct GuardianRootInfo {
+    pub git_root: String,
+    pub machine: Option<String>,
+    pub status: String,
+}
+
+/// Every distinct `(root, machine)` git checkout across every guardian this
+/// daemon knows about, regardless of status -- unlike
+/// [`collect_base_fetch_targets`], a terminal guardian's root still carries
+/// whatever loose-object debt its own review left behind, so maintenance is
+/// not scoped to "currently maintained" guardians the way base-branch
+/// freshness is. Pure, no I/O.
+pub(crate) fn collect_git_maintenance_roots(
+    guardians: &[GuardianRootInfo],
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    for g in guardians {
+        let root = (PathBuf::from(&g.git_root), g.machine.clone());
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Every `(root, machine)` with at least one guardian currently `merging` --
+/// a live, multi-minute chain of `git worktree`/`checkout`/`rebase`/`commit`
+/// subprocesses against that same root. `run_periodic_git_maintenance` skips
+/// these: a concurrent `git gc` racing that chain is what produced a real
+/// `fatal: index file corrupt` failure against ralphus's own dev repo (see
+/// that function's doc comment). Other guardian states (`collecting`,
+/// `in_review`, ...) don't chain sustained git activity against the root the
+/// same way a rebase in progress does, so they aren't checked here. Pure, no
+/// I/O -- callers already have the same guardian list `collect_git_maintenance_roots`
+/// consumes.
+pub(crate) fn busy_git_maintenance_roots(
+    guardians: &[GuardianRootInfo],
+) -> HashSet<(PathBuf, Option<String>)> {
+    guardians
+        .iter()
+        .filter(|g| g.status == GuardianStatus::Merging.as_str())
+        .map(|g| (PathBuf::from(&g.git_root), g.machine.clone()))
+        .collect()
+}
+
 /// The operator-facing worktree-retirement view (RAL-385, states widened by
 /// RAL-386): every persisted review worktree path classified by where it
 /// sits in the retirement lifecycle, plus durable history for paths already
@@ -10976,6 +11210,82 @@ mod tests {
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());
+    }
+
+    fn root_info(git_root: &str, machine: Option<&str>, status: &str) -> GuardianRootInfo {
+        GuardianRootInfo {
+            git_root: git_root.to_string(),
+            machine: machine.map(str::to_string),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn collect_git_maintenance_roots_dedupes_a_root_shared_across_guardians() {
+        let guardians = vec![
+            root_info("/repo/a", None, "in_review"),
+            root_info("/repo/a", None, "merge_failed"),
+            root_info("/repo/a", Some("build-farm-1"), "in_review"),
+            root_info("/repo/b", None, "in_review"),
+        ];
+        let roots = collect_git_maintenance_roots(&guardians);
+        assert_eq!(roots.len(), 3, "got: {roots:?}");
+        assert!(roots.contains(&(PathBuf::from("/repo/a"), None)));
+        assert!(roots.contains(&(PathBuf::from("/repo/a"), Some("build-farm-1".to_string()))));
+        assert!(roots.contains(&(PathBuf::from("/repo/b"), None)));
+    }
+
+    #[test]
+    fn collect_git_maintenance_roots_includes_terminal_guardians() {
+        // Unlike `collect_base_fetch_targets`, a deployed/cancelled guardian's
+        // root still carries whatever loose-object debt its review left
+        // behind -- this list is never status-filtered.
+        let guardians = vec![root_info("/repo/a", None, "deployed")];
+        assert_eq!(
+            collect_git_maintenance_roots(&guardians),
+            vec![(PathBuf::from("/repo/a"), None)]
+        );
+    }
+
+    #[test]
+    fn busy_git_maintenance_roots_flags_only_a_root_with_a_merge_in_progress() {
+        let guardians = vec![
+            root_info("/repo/a", None, "merging"),
+            root_info("/repo/b", None, "in_review"),
+            root_info("/repo/c", None, "collecting"),
+            root_info("/repo/d", None, "merge_failed"),
+        ];
+        let busy = busy_git_maintenance_roots(&guardians);
+        assert_eq!(busy.len(), 1, "got: {busy:?}");
+        assert!(busy.contains(&(PathBuf::from("/repo/a"), None)));
+    }
+
+    #[test]
+    fn busy_git_maintenance_roots_distinguishes_machines_sharing_a_root() {
+        let guardians = vec![
+            root_info("/repo/a", None, "in_review"),
+            root_info("/repo/a", Some("build-farm-1"), "merging"),
+        ];
+        let busy = busy_git_maintenance_roots(&guardians);
+        assert_eq!(
+            busy,
+            HashSet::from([(PathBuf::from("/repo/a"), Some("build-farm-1".to_string()))])
+        );
+    }
+
+    #[test]
+    fn git_maintenance_guard_excludes_a_review_git_operation() {
+        let root = Path::new("/maintenance-lock-test");
+        let review = git_review_operation_guard(root, None);
+        assert!(
+            try_git_maintenance_guard(root, None).is_none(),
+            "maintenance must skip rather than race a review git operation"
+        );
+        drop(review);
+        assert!(
+            try_git_maintenance_guard(root, None).is_some(),
+            "maintenance can run once the review operation finishes"
+        );
     }
 
     // -----------------------------------------------------------------------

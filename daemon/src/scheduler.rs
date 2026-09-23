@@ -464,6 +464,18 @@ pub fn run_loop(
     // waiting a day for the first interval to elapse.
     crate::guardian_merge::retire_stale_worktrees(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
+    // Same daily cadence as the retirement sweep just above, but deliberately
+    // NOT also run once here at startup the way that sweep is: startup is
+    // exactly when `recover_interrupted_reviews`/`start_reviews` below are
+    // about to promote `collecting` guardians to `merging` on a background
+    // thread that flips the DB status only once it actually claims the merge
+    // -- there is no point before the main loop where "nothing is about to
+    // start merging" is actually true. Running it here raced exactly that on
+    // ralphus's own dev repo. The first pass instead happens on this timer's
+    // normal interval, once the startup recovery stampede has long settled.
+    // See `guardian_merge::run_periodic_git_maintenance` and
+    // `guardian_merge::busy_git_maintenance_roots`.
+    let mut last_git_maintenance = std::time::Instant::now();
     let mut last_ark_check = std::time::Instant::now();
     // Run once at startup too, so a freshly (re)started daemon doesn't wait a
     // full BASE_BRANCH_FRESHNESS_POLL_INTERVAL before its first base-branch
@@ -525,6 +537,10 @@ pub fn run_loop(
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
             last_worktree_retirement = std::time::Instant::now();
+        }
+        if last_git_maintenance.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
+            crate::guardian_merge::run_periodic_git_maintenance(&store);
+            last_git_maintenance = std::time::Instant::now();
         }
         if last_prune.elapsed() >= CARTOGRAPHER_PRUNE_INTERVAL {
             let cfg = crate::config::load_cartographer_config();
