@@ -7725,6 +7725,13 @@ fn guardian_base_already_has_every_branch(
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
     let merged = store.lock().approve_guardian(id).is_ok();
     if merged {
+        if let Ok(guardian) = store.lock().get_guardian(id) {
+            crate::pr::retire_dual_root_branch_for_guardian(
+                store,
+                &guardian,
+                "review merged: base branch already contains every branch's commits",
+            );
+        }
         crate::rlog!(
             INFO,
             "ralphus [guardian] review {id} merged: base branch already contains every branch's commits"

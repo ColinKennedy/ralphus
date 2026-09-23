@@ -375,7 +375,7 @@ impl Store {
     /// own draft (WIP) state from the create/adopt response, recorded verbatim
     /// so an adoption/refresh can't clobber it. `pr_kind` (RAL-<new>) is
     /// `"parent"` for every ordinary PR or `"stack"` for a fork-routed root
-    /// branch's second, same-repo PR into the fork's maintained base branch -- see
+    /// branch's second, same-repo PR into its review-owned transient branch -- see
     /// [`PullRequestView::pr_kind`].
     #[allow(clippy::too_many_arguments)]
     pub fn create_pull_request_ex(
@@ -1836,7 +1836,7 @@ fn open_alias_by_branch(prs: &[PullRequestView]) -> HashMap<String, String> {
 /// building.
 ///
 /// RAL-<new>: a `"stack"`-kind row (a fork-routed root branch's second,
-/// same-repo PR into the fork's maintained base branch) is deliberately excluded here, not
+/// same-repo PR into a review-owned transient branch) is deliberately excluded here, not
 /// merely uncommon -- its target never changes with stack reordering, so it
 /// structurally never needs base-drift resync, and it must never be folded
 /// into GitHub's native same-repo stack chain, which it would otherwise look
@@ -3027,7 +3027,7 @@ fn maybe_promote_fork_root(
                     stack_route.client.kind().as_str(),
                     &stack_route.repo,
                     &successor_pr.branch_alias,
-                    &base_branch_name,
+                    &stack_base,
                     &successor_pr.title,
                     &successor_pr.description,
                     Some(number),
@@ -3269,6 +3269,13 @@ fn settle_pr_merge_states(
         }
         let merged = store.lock().approve_guardian(id).is_ok();
         if merged {
+            if let Ok(guardian) = store.lock().get_guardian(id) {
+                retire_dual_root_branch_for_guardian(
+                    store,
+                    &guardian,
+                    "review merged: every linked pr has merged",
+                );
+            }
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {id} merged: every linked pr has merged"
@@ -5183,6 +5190,31 @@ pub(crate) fn retire_dual_root_upstream_branch(
                 snapshot.branch
             );
         }
+    }
+}
+
+/// Retire one guardian's transient fork-side upstream branch immediately, if
+/// it recorded one, rather than waiting for the next terminal-state sweep
+/// (RAL-<new>): best-effort, called from every state transition that can
+/// move a review to terminal or delete it outright, with
+/// [`sweep_terminal_dual_root_upstream_branches`] as the backstop for
+/// whichever of those paths this misses.
+pub(crate) fn retire_dual_root_branch_for_guardian(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    reason: &str,
+) {
+    if let Ok(Some(branch)) = store.lock().guardian_dual_root_stack_branch(&guardian.id) {
+        retire_dual_root_upstream_branch(
+            store,
+            &crate::store::DualRootUpstreamSnapshot {
+                guardian_id: guardian.id.clone(),
+                git_root: guardian.git_root.clone(),
+                owner: guardian.owner.clone(),
+                branch,
+            },
+            reason,
+        );
     }
 }
 
@@ -13754,6 +13786,8 @@ mod tests {
         let fork_release_sha = g(&fork_bare, &["rev-parse", "refs/heads/release"])
             .trim()
             .to_string();
+        let parent_bare = tmp_dir("dual-root-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
 
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
@@ -13797,6 +13831,11 @@ mod tests {
         g(&root_dir, &["add", "."]);
         g(&root_dir, &["commit", "--message", "add b.txt"]);
         g(&root_dir, &["checkout", "release"]);
+        g(
+            &root_dir,
+            &["remote", "add", "origin", parent_bare.to_str().unwrap()],
+        );
+        g(&root_dir, &["push", "origin", "release:release"]);
         crate::project_forks::ensure_fork_remote(&root_dir, "fork", fork_bare.to_str().unwrap())
             .unwrap();
 

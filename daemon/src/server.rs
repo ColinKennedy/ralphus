@@ -13810,13 +13810,23 @@ fn guardian_arrange(daemon: &Daemon, id: &str, body: &str) -> Reply {
 }
 
 fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
+    let snapshot = daemon.lock().get_guardian(id).ok();
     match daemon.lock().approve_guardian(id) {
-        Ok(status) => json(
-            200,
-            &StateResponse {
-                state: status.as_str(),
-            },
-        ),
+        Ok(status) => {
+            if let Some(g) = snapshot {
+                crate::pr::retire_dual_root_branch_for_guardian(
+                    &daemon.store_handle(),
+                    &g,
+                    "review approved",
+                );
+            }
+            json(
+                200,
+                &StateResponse {
+                    state: status.as_str(),
+                },
+            )
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -13827,8 +13837,16 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     // store's cancelled-status guard prevents a late worker from reviving the
     // review, and an acknowledgement must not wait behind slow cleanup.
     crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
+    let snapshot = daemon.lock().get_guardian(id).ok();
     match daemon.lock().cancel_guardian(id) {
         Ok(status) => {
+            if let Some(g) = snapshot {
+                crate::pr::retire_dual_root_branch_for_guardian(
+                    &daemon.store_handle(),
+                    &g,
+                    "review cancelled",
+                );
+            }
             // Tmux teardown can require a process query. It belongs to the
             // cancellation cleanup path, not the HTTP acknowledgement path.
             let store = daemon.store_handle();
