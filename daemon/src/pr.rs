@@ -4914,6 +4914,24 @@ fn ensure_review_upstream_branch(
                 allocated,
                 routing.fork.remote_name
             );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "transient fork upstream branch allocated",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&guardian.id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "branch": allocated,
+                        "remote": routing.fork.remote_name,
+                    }),
+                    admin_only: false,
+                });
             allocated
         }
         Err(e) => return Err(e.to_string()),
@@ -5771,6 +5789,27 @@ fn submit_stacked_branch_pr(
                                 "ralphus [pr] review {id} branch {branch_id} created the stack PR on \
                                  the forge (number={number}) but failed to record it locally: {e}"
                             );
+                            let _ =
+                                store.lock().cartographer_log(crate::cartographer::CartographerEntry {
+                                    level: crate::logging::LogLevel::WARNING,
+                                    source: "pr",
+                                    message: "dual-root stack PR created on the forge but could not \
+                                              be recorded locally",
+                                    scope: Some("branch"),
+                                    squad_id: None,
+                                    guardian_id: Some(id),
+                                    cell_id: None,
+                                    task: None,
+                                    log_path: None,
+                                    payload: serde_json::json!({
+                                        "branch_id": branch_id,
+                                        "stack_base": stack_base,
+                                        "pr_number": number,
+                                        "pr_url": url,
+                                        "error": e.to_string(),
+                                    }),
+                                    admin_only: false,
+                                });
                         }
                     }
                     Err(e) => {
@@ -5779,6 +5818,26 @@ fn submit_stacked_branch_pr(
                             "ralphus [pr] review {id} branch {branch_id} could not create/adopt its \
                              dual-root-PR mode stack PR: {e}"
                         );
+                        let _ =
+                            store
+                                .lock()
+                                .cartographer_log(crate::cartographer::CartographerEntry {
+                                    level: crate::logging::LogLevel::WARNING,
+                                    source: "pr",
+                                    message: "could not create/adopt the dual-root stack PR",
+                                    scope: Some("branch"),
+                                    squad_id: None,
+                                    guardian_id: Some(id),
+                                    cell_id: None,
+                                    task: None,
+                                    log_path: None,
+                                    payload: serde_json::json!({
+                                        "branch_id": branch_id,
+                                        "stack_base": stack_base,
+                                        "error": e,
+                                    }),
+                                    admin_only: false,
+                                });
                     }
                 }
             }
