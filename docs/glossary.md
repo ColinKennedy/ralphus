@@ -33,6 +33,28 @@ per task. Neither viewer is the other's superset — the Squads tab shows the
 full graph for one squad at a time, the Tasks tab is cross-squad but
 task-grained (no graph, no cell-level browsing except an expanded row).
 
+## Command execution modes (RAL-487)
+
+A `command` cell (`CellDef.command`) or `command` proof step
+(`ProofStep.command`) has a `mode`, gating what happens on a nonzero exit.
+This is orthogonal to the cell/proof `prompt` kind above — a `command` never
+takes free-form agent instructions itself; `mode` only controls what the
+*orchestrator* does after the command fails.
+
+| Term | Meaning |
+|---|---|
+| **remediating command** | A `command` running in `mode = "remediating"` (the default when `mode` is unset). On failure, the command's output is persisted to an attempt-scoped file — reusing `daemon/src/terminal_log.rs`'s `attempt_path`/`write_attempt` conventions — and handed to an agent — using the owning cell's resolved `agent`/`model` — alongside a fixed repair-only system prompt, whose only job is to repair the underlying issue; it may not run tests, formatters, linters, commits, pushes, or any other verification command. Only the orchestrator re-runs the configured `command`. Retries up to `remediation_attempts` (a required, `>= 1` sibling field) times, succeeding the first time the command exits 0 and failing once attempts are exhausted. |
+| **raw command** | A `command` running in `mode = "raw"` — today's original, pre-RAL-487 behavior: the command runs once, exit 0 = pass/PASS, any nonzero exit fails the cell or FAILs the proof step outright, no agent involvement, no retry. The discouraged opt-out; `mode = "raw"` rejects `remediation_attempts` if set. |
+
+Don't reuse *remediate*/*remediation* for anything unrelated to this
+command-retry mechanism — notably not for the pre-existing, unrelated
+worktree-health "remediation" suggestions in `daemon/src/worktrees.rs`,
+which predate this term and are not being renamed.
+
+The remediation *runtime* (the actual retry-with-repair-agent loop) is
+RAL-488's job; RAL-487 only defines the schema, validation, and vocabulary
+above.
+
 ## Reviews
 
 | Term | Meaning |
