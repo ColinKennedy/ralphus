@@ -268,6 +268,7 @@ fn run_agent_with_rate_limit_retry(
         }
 
         if retries >= max_retries {
+            // ralphus[ignore-rlog-pair]: retry helper has no Store; its caller records the resulting review outcome
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian_merge] {}/{} provider rate-limit retries exhausted ({max_retries}); failing",
@@ -303,6 +304,7 @@ fn run_agent_with_rate_limit_retry(
             .retry_after_secs
             .map(|secs| std::time::Duration::from_secs(secs.saturating_add(1)))
             .unwrap_or(DEFAULT_PROVIDER_RATE_LIMIT_RETRY);
+        // ralphus[ignore-rlog-pair]: retry helper has no Store; its caller records the resulting review outcome
         crate::rlog!(
             INFO,
             "ralphus [guardian_merge] {}/{} rate limited by provider; retrying in {}s ({}/{})",
@@ -1456,7 +1458,10 @@ fn resolve_resolver_agent(
         .map(ToString::to_string)
         .or_else(|| std::env::var("RALPHUS_RESOLVER_AGENT").ok())
         .unwrap_or_else(|| db_cfg.default_resolver_agent().to_string());
-    let selection = crate::agent_profiles::resolve_agent_for_path(&raw, cwd)?;
+    let selection = {
+        let guard = store.lock();
+        crate::agent_profiles::resolve_agent_for_path_db(&raw, cwd, &guard)?
+    };
     let model = resolver_model_chain(
         stored_model,
         &selection,
@@ -11568,9 +11573,9 @@ mod tests {
                 "pi",
                 None,
                 Some("openrouter/deepseek/deepseek-v4-flash-0731"),
-                &[crate::agent_profiles::AgentProfileEnvVar {
+                &[crate::agent_profile_env::AgentEnvEntry {
                     key: "OPENROUTER_API_KEY".to_string(),
-                    kind: crate::agent_profiles::EnvValueKind::Literal,
+                    kind: crate::agent_profile_env::AgentEnvKind::Set,
                     value: "key-from-profile".to_string(),
                 }],
             )
