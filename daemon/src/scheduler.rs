@@ -2626,13 +2626,17 @@ fn run_cell_worker(
             executable: spec.executable.as_deref(),
             model: row.model.as_deref(),
         };
-        crate::remediation::run_repair_pass(
-            runner,
-            cancel,
-            &spec,
-            remediation_attempt,
-            &repair_agent,
-        );
+        {
+            let guard = store.lock();
+            crate::remediation::run_repair_pass(
+                &guard,
+                runner,
+                cancel,
+                &spec,
+                remediation_attempt,
+                &repair_agent,
+            );
+        }
         remediation_attempt += 1;
     };
     _permit = resumed_permit;
@@ -4236,7 +4240,9 @@ fn run_proofs(
                     executable: selection.executable.as_deref(),
                     model: repair_model,
                 };
+                let guard = store.lock();
                 let result: RunnerResult = crate::remediation::run_command_with_remediation(
+                    &guard,
                     runner,
                     cancel,
                     &runner_spec,
