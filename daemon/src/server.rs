@@ -9404,6 +9404,47 @@ fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), Strin
         .map_err(|e| format!("could not open default viewer: {e}"))
 }
 
+/// Resolves the environment overrides an interactive terminal/agent session
+/// should launch with (RAL-489) -- the same overrides a check-gate/manual-
+/// command run already sees in the same worktree, so a human working in a
+/// plain shell or a resumed agent session there doesn't quietly disagree
+/// with what automation ran.
+///
+/// `guardian_branch` is `Some((guardian_id, branch_id))` for a review
+/// branch's own worktree: the branch's resolved env
+/// (`Store::resolve_guardian_branch_env`, itself that branch's source
+/// cell's `squad < task < cell` env with the branch's own overrides layered
+/// on top) gets the guardian's `build_env_overrides` layered on top of
+/// that -- the same precedence `GuardianView::build_env` uses for the
+/// combined worktree's tip branch, applied here to the one branch actually
+/// being opened. `cell` is `Some((squad_id, task_idx, cell_idx))` for a
+/// plain task cell (no guardian/review context), resolving just that
+/// cell's own inherited env. Callers pass exactly one of the two.
+fn resolve_terminal_env(
+    daemon: &Daemon,
+    cell: Option<(&str, i64, i64)>,
+    guardian_branch: Option<(&str, &str)>,
+) -> std::result::Result<std::collections::BTreeMap<String, String>, StoreError> {
+    if let Some((guardian_id, branch_id)) = guardian_branch {
+        let branch_env = daemon
+            .lock()
+            .resolve_guardian_branch_env(guardian_id, branch_id)?;
+        let build_overrides = daemon
+            .lock()
+            .get_guardian_build_env_overrides(guardian_id)?;
+        Ok(crate::guardian::apply_branch_env(
+            &branch_env,
+            &build_overrides,
+        ))
+    } else if let Some((squad_id, task_idx, cell_idx)) = cell {
+        daemon
+            .lock()
+            .resolve_cell_env_overrides(squad_id, task_idx, cell_idx)
+    } else {
+        Ok(std::collections::BTreeMap::new())
+    }
+}
+
 /// Open a terminal for a task cell — the "Open Terminal Log" / "Open
 /// Agent" actions (RAL-102 follow-up).
 ///
@@ -9428,6 +9469,10 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
                 Ok(v) => v,
                 Err(e) => return store_error(&e),
             };
+        let env = match resolve_terminal_env(daemon, Some((id, task_idx, cell_idx)), None) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
         // RAL-288 Stage 6: while the cell is still genuinely running (local
         // host, a real prompt cell, a session id already pre-assigned -- see
         // `scheduler::assign_agent_session_id`), detach it cleanly first,
@@ -9459,9 +9504,23 @@ fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> 
                 Ok(v) => v,
                 Err(e) => return store_error(&e),
             };
-            return detach_and_open_agent(daemon, id, &cwd, &task, &cell_id, &agent, &session_id);
+            return detach_and_open_agent(
+                daemon,
+                id,
+                &cwd,
+                &task,
+                &cell_id,
+                &agent,
+                &session_id,
+                &env,
+            );
         }
-        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
+        return open_agent_terminal(
+            &cwd,
+            Some(agent.as_str()),
+            agent_session_id.as_deref(),
+            &env,
+        );
     }
     let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
         Ok(v) => v,
@@ -9765,20 +9824,33 @@ fn open_proof_terminal(
         };
         // A task-scope step's cwd is its task's first cell's (see
         // `Store::get_task_first_cell_cwd`'s doc comment); a cell-scope
-        // step's cwd is that exact cell's.
-        let cwd = if scope == "task" {
-            daemon.lock().get_task_first_cell_cwd(id, task_idx_n)
+        // step's cwd is that exact cell's. Its env matches the same cell
+        // (idx 0 for task scope, since cells are enumerated from 0).
+        let (cwd, env_cell_idx) = if scope == "task" {
+            (daemon.lock().get_task_first_cell_cwd(id, task_idx_n), 0)
         } else {
-            daemon
-                .lock()
-                .get_cell_agent_resume(id, task_idx_n, cell_idx_n)
-                .map(|(cwd, _, _)| cwd)
+            (
+                daemon
+                    .lock()
+                    .get_cell_agent_resume(id, task_idx_n, cell_idx_n)
+                    .map(|(cwd, _, _)| cwd),
+                cell_idx_n,
+            )
         };
         let cwd = match cwd {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
-        return open_agent_terminal(&cwd, Some(agent.as_str()), agent_session_id.as_deref());
+        let env = match resolve_terminal_env(daemon, Some((id, task_idx_n, env_cell_idx)), None) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        return open_agent_terminal(
+            &cwd,
+            Some(agent.as_str()),
+            agent_session_id.as_deref(),
+            &env,
+        );
     }
     let task = match daemon.lock().get_task_name(id, task_idx_n) {
         Ok(v) => v,
@@ -10005,12 +10077,11 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
             "-Command".to_string(),
             format!("Set-Location -LiteralPath '{safe_path}'"),
         ];
-        return match spawn_in_terminal(
-            None,
-            &shell_cmd,
-            &shell_args,
-            &std::collections::BTreeMap::new(),
-        ) {
+        let env = match resolve_terminal_env(daemon, None, Some((id, branch_id))) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        return match spawn_in_terminal(None, &shell_cmd, &shell_args, &env) {
             Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
             Err(msg) => error(500, "terminal_error", &msg, vec![]),
         };
@@ -10036,6 +10107,10 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
+        let env = match resolve_terminal_env(daemon, None, Some((id, branch_id))) {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
         // The guardian's resolver agent is set once for the whole guardian
         // (not per-branch) -- see `guardians.resolver_agent`.
         let resolver_agent = daemon
@@ -10047,6 +10122,7 @@ fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, que
             &wt_path,
             resolver_agent.as_deref(),
             agent_session_id.as_deref(),
+            &env,
         );
     }
 
@@ -10371,7 +10447,12 @@ fn mint_terminal_ticket_route(daemon: &Daemon, id: &str, ti: &str, si: &str) -> 
     )
 }
 
-fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<&str>) -> Reply {
+fn open_agent_terminal(
+    cwd: &str,
+    agent: Option<&str>,
+    agent_session_id: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Reply {
     let Some(cell_id) = agent_session_id else {
         return error(
             409,
@@ -10386,12 +10467,7 @@ fn open_agent_terminal(cwd: &str, agent: Option<&str>, agent_session_id: Option<
     // instead of a semicolon `wt.exe` can't pass through to the agent (see
     // `spawn_in_terminal`'s doc comment).
     let (shell_cmd, shell_args) = resume_shell_invocation(agent, cell_id);
-    match spawn_in_terminal(
-        Some(cwd),
-        &shell_cmd,
-        &shell_args,
-        &std::collections::BTreeMap::new(),
-    ) {
+    match spawn_in_terminal(Some(cwd), &shell_cmd, &shell_args, env) {
         Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
         Err(msg) => error(500, "terminal_error", &msg, vec![]),
     }
@@ -10419,6 +10495,7 @@ fn open_agent_terminal_via_tmux(
     cell_id: &str,
     agent: Option<&str>,
     agent_session_id: &str,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Reply {
     let tmux = match crate::tmux::Tmux::resolve() {
         Ok(t) => t,
@@ -10436,7 +10513,7 @@ fn open_agent_terminal_via_tmux(
         if let Err(e) = tmux.new_detached_session_with_command(
             &resume_session_name,
             cwd,
-            &std::collections::BTreeMap::new(),
+            env,
             &shell_cmd,
             &shell_args,
             None,
@@ -10487,6 +10564,7 @@ const DETACH_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_milli
 /// opening the real resume session. "Detach requested" is not the same
 /// guarantee as "detach happened"; two processes on one conversation
 /// transcript is exactly what corrupts it, so the wait is not optional.
+#[allow(clippy::too_many_arguments)]
 fn detach_and_open_agent(
     daemon: &Daemon,
     squad_id: &str,
@@ -10495,6 +10573,7 @@ fn detach_and_open_agent(
     cell_id: &str,
     agent: &str,
     agent_session_id: &str,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Reply {
     let tmux = match crate::tmux::Tmux::resolve() {
         Ok(t) => t,
@@ -10515,7 +10594,15 @@ fn detach_and_open_agent(
         std::thread::sleep(DETACH_POLL_INTERVAL);
     }
     std::thread::sleep(DETACH_SETTLE_DELAY);
-    open_agent_terminal_via_tmux(cwd, squad_id, task, cell_id, Some(agent), agent_session_id)
+    open_agent_terminal_via_tmux(
+        cwd,
+        squad_id,
+        task,
+        cell_id,
+        Some(agent),
+        agent_session_id,
+        env,
+    )
 }
 
 /// The live pane content of a review branch's conflict-resolver tmux
@@ -10690,7 +10777,16 @@ fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) 
             Err(e) => return store_error(&e),
         };
     if mode == "agent" {
-        return open_agent_terminal(&cwd, agent.as_deref(), agent_session_id.as_deref());
+        // RAL-489: this resumes the manual-checks generation pass's own
+        // agent conversation in the combined worktree, so it should see the
+        // same `manual_checks_env` (RAL-203) that pass itself ran under --
+        // not the per-branch/build env used elsewhere in this file.
+        let env = daemon
+            .lock()
+            .get_guardian(id)
+            .map(|g| g.manual_checks_env)
+            .unwrap_or_default();
+        return open_agent_terminal(&cwd, agent.as_deref(), agent_session_id.as_deref(), &env);
     }
     // open: attach to the generation pass's tmux session — keyed the same way
     // `guardian_merge.rs::generate_manual_commands` builds its `RunnerSpec`.
@@ -23307,6 +23403,83 @@ command = "true"
             "a tombstoned key is not part of the resolved environment: {}",
             r.body
         );
+    }
+
+    /// RAL-489 regression: opening a review branch's worktree shell (or its
+    /// resumed resolver-agent session) must see the same layered env a
+    /// check-gate/manual-command run in that worktree already sees -- the
+    /// branch's resolved env (source cell's `squad < task < cell` env with
+    /// the branch's own overrides on top) with the guardian's
+    /// `build_env_overrides` layered on top of that. Before this fix, the
+    /// worktree-shell path hardcoded an empty env map and silently dropped
+    /// all of this.
+    #[test]
+    fn resolve_terminal_env_merges_cell_branch_and_build_overrides_for_a_review_branch() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/env"),
+            &serde_json::json!({"set": {"CELL_ONLY": "from-cell", "SHARED": "from-cell"}})
+                .to_string(),
+        );
+        d.lock()
+            .set_cell_review_branch(&squad_id, 0, 0, "feat")
+            .unwrap();
+
+        let gid = make_guardian(&d);
+        d.lock().add_guardian_branch(&gid, "feat").unwrap();
+        let bid = d.lock().get_guardian(&gid).unwrap().branches[0].id.clone();
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/branches/{bid}/env"),
+            &serde_json::json!({"set": {"SHARED": "from-branch"}}).to_string(),
+        );
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/build-env"),
+            &serde_json::json!({"set": {"SHARED": "from-build"}}).to_string(),
+        );
+
+        let env = resolve_terminal_env(&d, None, Some((&gid, &bid))).unwrap();
+        assert_eq!(
+            env.get("CELL_ONLY").map(String::as_str),
+            Some("from-cell"),
+            "{env:?}"
+        );
+        assert_eq!(
+            env.get("SHARED").map(String::as_str),
+            Some("from-build"),
+            "the guardian's build-env layer must win over both the cell's \
+             and the branch's own layers: {env:?}"
+        );
+    }
+
+    /// RAL-489: the plain-cell path (no guardian/review context -- e.g. the
+    /// cell-level "Open Agent" button) resolves exactly the cell's own
+    /// `squad < task < cell` env, matching `resolve_cell_env_overrides`
+    /// directly rather than the branch/build-env precedence used above.
+    #[test]
+    fn resolve_terminal_env_for_a_plain_cell_matches_its_resolved_cell_env() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        route(
+            &d,
+            "POST",
+            &format!("/api/squads/{squad_id}/cells/0/0/env"),
+            &serde_json::json!({"set": {"FROM_CELL": "2"}}).to_string(),
+        );
+
+        let env = resolve_terminal_env(&d, Some((&squad_id, 0, 0)), None).unwrap();
+        let expected = d
+            .lock()
+            .resolve_cell_env_overrides(&squad_id, 0, 0)
+            .unwrap();
+        assert_eq!(env, expected);
+        assert_eq!(env.get("FROM_CELL").map(String::as_str), Some("2"));
     }
 
     #[test]
