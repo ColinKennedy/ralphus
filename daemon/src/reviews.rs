@@ -438,6 +438,8 @@ fn rows_from_file(file: &TaskFile) -> (Vec<CellRow>, Vec<TaskRow>, CellReviewInf
                 share_session: false,
                 maximum_timeout_sec: None,
                 task_maximum_timeout_sec: None,
+                mode: None,
+                remediation_attempts: None,
             });
             // Collect the cell's cwd and its optional review opt-in id. `review`
             // is a `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` sentinel
@@ -2586,6 +2588,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         }
     }
 
@@ -2835,6 +2839,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         }
     }
 

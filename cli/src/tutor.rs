@@ -697,8 +697,9 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  NOTE: today the runner executes `command` and `prompt` proof steps; `brain`
  (local-LLM) and `approval` (human) proof steps are still accepted by the schema
  but deferred, and stay pending. A `mode = "remediating"` command's repair-agent
- retry loop is schema/validation only for now -- the runner still runs it as a
- single raw-command attempt until that runtime lands.
+ retry loop is fully wired: a failed attempt's captured output is handed to
+ the owning cell's resolved agent/model as a file path (never inlined), and
+ the command is retried up to `remediation_attempts` times.
 
 ---------------------------------------------------------------
  Project registry + placeholder cwd

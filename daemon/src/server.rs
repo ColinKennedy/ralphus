@@ -16533,7 +16533,7 @@ mod tests {
     #[test]
     fn task_index_omits_authored_and_captured_text() {
         let d = daemon();
-        let body = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"private prompt\"\n[[task.cell.proof]]\ncommand=\"private proof\"\n";
+        let body = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"private prompt\"\n[[task.cell.proof]]\ncommand=\"private proof\"\nremediation_attempts=1\n";
         let submitted = route(&d, "POST", "/api/squads", &submit_body(body));
         assert_eq!(submitted.status, 201, "{}", submitted.body);
 
@@ -18210,6 +18210,7 @@ cwd=\".\"
 prompt=\"p\"
              [[task.cell.proof]]
 command=\"cargo test\"
+remediation_attempts=1
 machine=\"incredibuild:B\"
 ",
         );
@@ -18228,6 +18229,7 @@ cwd=\".\"
 prompt=\"p\"
              [[task.proof]]
 command=\"cargo fmt\"
+remediation_attempts=1
 machine=\"incredibuild:B\"
 ",
         );
@@ -18248,9 +18250,11 @@ prompt=\"p\"
 machine=\"incredibuild:A\"
              [[task.cell.proof]]
 command=\"cargo test\"
+remediation_attempts=1
 machine=\"incredibuild:A\"
              [[task.proof]]
 command=\"cargo fmt\"
+remediation_attempts=1
 machine=\"incredibuild:A\"
 ",
         );
@@ -19290,8 +19294,8 @@ agent=\"claude-code\"
 
     #[test]
     fn edit_cell_proof_model_resets_only_that_step_onward() {
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
         d.lock()
@@ -19356,8 +19360,10 @@ name=\"t\"
 [[task.cell]]
 cwd=\".\"
 command=\"x\"
+remediation_attempts=1
             [[task.cell.proof]]
 command=\"check\"
+remediation_attempts=1
 ";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
@@ -19373,7 +19379,7 @@ command=\"check\"
 
     #[test]
     fn edit_task_proof_model_resets_only_that_step_onward() {
-        const TASK_PROOF: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n[[task.proof]]\ncommand=\"check\"\n";
+        const TASK_PROOF: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n[[task.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(TASK_PROOF));
         d.lock()
@@ -19393,8 +19399,8 @@ command=\"check\"
     #[test]
     fn edit_proof_agent_overrides_the_owning_cells_resolved_backend() {
         // RAL-290: a proof step's own `agent` wins over the owning cell's.
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
         assert!(
@@ -19417,8 +19423,8 @@ command=\"check\"
 
     #[test]
     fn edit_proof_command_prompt_brain_stay_one_of_only_when_explicitly_supplied() {
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
 
@@ -19462,8 +19468,8 @@ command=\"check\"
         // cannot deliver the cap -- but supplying a supporting `agent` in
         // this same edit request gates on *that* one instead (mirrors the
         // cell edit's equivalent same-call gating).
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
         let body = serde_json::json!({
@@ -20570,7 +20576,7 @@ command=\"check\"
         let _troot = isolated_terminal_root();
         let toml = "[[task]]\nname=\"t\"\n\
             [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.cell.proof]]\ncommand=\"c\"\n";
+            [[task.cell.proof]]\ncommand=\"c\"\nremediation_attempts=1\n";
         route(&d, "POST", "/api/squads", &submit_body(toml));
         let squad_id = "squad-000000000001";
 
@@ -20830,9 +20836,11 @@ prompt = "p"
 [[task.cell.proof]]
 id = "check-a"
 command = "true"
+remediation_attempts = 1
 [[task.cell.proof]]
 id = "check-b"
 command = "true"
+remediation_attempts = 1
 [[task.cell]]
 id = "after"
 cwd = "/r"
@@ -20841,12 +20849,15 @@ depends_on = ["work"]
 [[task.cell.proof]]
 id = "after-check"
 command = "true"
+remediation_attempts = 1
 [[task.proof]]
 id = "task-check-a"
 command = "true"
+remediation_attempts = 1
 [[task.proof]]
 id = "task-check-b"
 command = "true"
+remediation_attempts = 1
 
 [[task]]
 name = "beta"
@@ -20858,9 +20869,11 @@ prompt = "p"
 [[task.cell.proof]]
 id = "beta-check"
 command = "true"
+remediation_attempts = 1
 [[task.proof]]
 id = "beta-task-check"
 command = "true"
+remediation_attempts = 1
 
 [[task]]
 name = "side"
@@ -20871,9 +20884,11 @@ prompt = "p"
 [[task.cell.proof]]
 id = "side-check"
 command = "true"
+remediation_attempts = 1
 [[task.proof]]
 id = "side-task-check"
 command = "true"
+remediation_attempts = 1
 "#;
     const SQUAD_1: &str = "squad-000000000001";
 
@@ -22344,7 +22359,7 @@ command = "true"
         use crate::runner::{RunnerResult, RunnerSpec};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        const TWO_INDEPENDENT_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"y\"\n";
+        const TWO_INDEPENDENT_TASKS: &str = "[[task]]\nname=\"a\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n[[task]]\nname=\"b\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"y\"\nremediation_attempts=1\n";
 
         /// Task "a" fails immediately (so its cell is already terminal by
         /// the time the test restarts it); task "b" blocks in
@@ -22501,8 +22516,8 @@ command = "true"
         use crate::runner::{RunnerResult, RunnerSpec};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
 
         /// Blocks in `run_cancellable`, polling `cancel` like a real
         /// subprocess-backed cell would, so the test can observe whether
@@ -23930,8 +23945,8 @@ command = "true"
 
     #[test]
     fn set_status_done_on_failed_proof_records_operator_acceptance_for_dependents() {
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\nid=\"check\"\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\nid=\"check\"\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         let squad_id = "squad-000000000001";
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
@@ -23983,8 +23998,8 @@ command = "true"
     /// override was retried.
     #[test]
     fn set_status_done_on_cell_with_pending_own_proof_reports_done_not_running() {
-        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\n\
-            [[task.cell.proof]]\ncommand=\"check\"\n";
+        const ONE_CELL: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\".\"\ncommand=\"x\"\nremediation_attempts=1\n\
+            [[task.cell.proof]]\ncommand=\"check\"\nremediation_attempts=1\n";
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(ONE_CELL));
         d.lock()
@@ -24129,10 +24144,10 @@ command = "true"
     /// A task with two proof steps plus a cell proof step, so the
     /// per-step routes have distinct indices to address.
     const PROOF_STEPS: &str = "[[task]]\nname=\"t\"\n\
-        [[task.proof]]\ncommand=\"a\"\n\
-        [[task.proof]]\ncommand=\"b\"\n\
+        [[task.proof]]\ncommand=\"a\"\nremediation_attempts=1\n\
+        [[task.proof]]\ncommand=\"b\"\nremediation_attempts=1\n\
         [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-        [[task.cell.proof]]\ncommand=\"c\"\n";
+        [[task.cell.proof]]\ncommand=\"c\"\nremediation_attempts=1\n";
 
     #[test]
     fn set_task_proof_step_env_targets_one_step_not_the_whole_scope() {
@@ -24562,7 +24577,7 @@ command = "true"
         let d = daemon();
         let toml = "[[task]]\nname=\"t\"\n\
             [[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
-            [[task.cell.proof]]\ncommand=\"c\"\n";
+            [[task.cell.proof]]\ncommand=\"c\"\nremediation_attempts=1\n";
         route(&d, "POST", "/api/squads", &submit_body(toml));
         {
             let store = d.lock();
@@ -24765,6 +24780,7 @@ name=\"t\"
 [[task.cell]]
 cwd=\"/r\"
 command=\"echo hi\"
+remediation_attempts=1
 ";
         route(&d, "POST", "/api/squads", &submit_body(toml));
         // A command cell has no system prompt whether or not it has been
@@ -24807,6 +24823,7 @@ cwd=\"/r\"
 prompt=\"p\"
 \n            [[task.cell.proof]]
 command=\"c\"
+remediation_attempts=1
 ";
         route(&d, "POST", "/api/squads", &submit_body(toml));
         d.lock()
@@ -25987,9 +26004,11 @@ cwd=\"/r\"
 prompt=\"p\"
 [[task.cell.proof]]
 command=\"lint\"
+remediation_attempts=1
 [[task.proof]]
 id=\"test\"
 command=\"cargo test\"
+remediation_attempts=1
 ";
 
     /// Submit `URI_RUN` and return its squad id.

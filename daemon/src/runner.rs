@@ -3182,6 +3182,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let json = serde_json::to_string(&spec).unwrap();
@@ -3221,6 +3223,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         // No `[live_view]` config file in the test environment, so this
@@ -3259,6 +3263,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(spec.maximum_context, Some(100_000));
@@ -3297,6 +3303,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(
@@ -3582,6 +3590,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let effective = RunnerSpec::from_row("run-1", &row)
             .effective_system_prompt()
@@ -3642,6 +3652,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         assert!(
             RunnerSpec::from_row("run-1", &row)
@@ -3677,6 +3689,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let json = serde_json::to_string(&RunnerSpec::from_row("run-1", &row)).unwrap();
         assert!(!json.contains("system_prompt"));
@@ -3768,6 +3782,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3812,6 +3828,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3850,6 +3868,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         let sp = spec
@@ -3894,6 +3914,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
         assert!(
@@ -4474,6 +4496,8 @@ prompt = "make it build"
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row(&run_id, &row);
         // See the sibling `..._for_a_command_kind_spec` test: cancel on
@@ -4560,6 +4584,8 @@ prompt = "make it build"
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let result = runner.run(&RunnerSpec::from_row(&run_id, &row));
         assert!(!result.is_done());
