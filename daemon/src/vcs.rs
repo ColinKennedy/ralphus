@@ -95,6 +95,32 @@ pub trait Vcs: Send + Sync {
     /// against it. `false` covers both "not a checkout at all" and "the check
     /// itself could not be answered" — either way, the path is not usable.
     fn is_repository(&self, root: &Path) -> bool;
+
+    /// Snapshot every staged, unstaged, and untracked change in the working
+    /// tree at `root` into `snapshot_dir`, so a later [`Vcs::restore_worktree`]
+    /// call can undo everything done to the tree since.
+    ///
+    /// Required on every adapter, not just [`GitOps`]: the remediating
+    /// command retry loop (RAL-488, `crate::remediation`) snapshots once
+    /// before its first attempt and restores before each subsequent repair
+    /// pass, so a failed repair agent's edits never leak into the next
+    /// attempt — and that needs to hold for any future non-git adapter too,
+    /// not only git.
+    ///
+    /// `snapshot_dir` must not be inside `root`: a snapshot that lived inside
+    /// the tree it captures would see itself as an untracked file.
+    ///
+    /// # Errors
+    /// When the current state cannot be captured.
+    fn snapshot_worktree(&self, root: &Path, snapshot_dir: &Path) -> Result<(), String>;
+
+    /// Restore the working tree at `root` to exactly the state captured by a
+    /// prior [`Vcs::snapshot_worktree`] call into `snapshot_dir`, discarding
+    /// any changes made since — including newly created untracked files.
+    ///
+    /// # Errors
+    /// When the snapshot cannot be applied.
+    fn restore_worktree(&self, root: &Path, snapshot_dir: &Path) -> Result<(), String>;
 }
 
 /// Git-specific operations with no cross-VCS equivalent: worktree creation,
@@ -234,6 +260,109 @@ impl Vcs for GitVcs {
         Self::exec_raw(root, &["rev-parse", "--is-inside-work-tree"])
             .map(|out| out.status.success())
             .unwrap_or(false)
+    }
+
+    fn snapshot_worktree(&self, root: &Path, snapshot_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(snapshot_dir).map_err(|e| {
+            format!(
+                "could not create snapshot dir {}: {e}",
+                snapshot_dir.display()
+            )
+        })?;
+
+        // `diff HEAD` covers both staged and unstaged changes in one shot;
+        // `--binary` keeps the patch applicable to non-text files too.
+        let diff = Self::exec_raw(root, &["diff", "HEAD", "--binary"])?;
+        if !diff.status.success() {
+            return Err(format!(
+                "git diff HEAD failed: {}",
+                String::from_utf8_lossy(&diff.stderr).trim()
+            ));
+        }
+        std::fs::write(snapshot_dir.join("tracked.patch"), &diff.stdout)
+            .map_err(|e| format!("could not write tracked.patch: {e}"))?;
+
+        let untracked = Self::exec_raw(root, &["ls-files", "--others", "--exclude-standard"])?;
+        if !untracked.status.success() {
+            return Err(format!(
+                "git ls-files --others failed: {}",
+                String::from_utf8_lossy(&untracked.stderr).trim()
+            ));
+        }
+        let untracked_paths: Vec<String> = String::from_utf8_lossy(&untracked.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let untracked_root = snapshot_dir.join("untracked");
+        for rel in &untracked_paths {
+            let src = root.join(rel);
+            let dst = untracked_root.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(&src, &dst)
+                .map_err(|e| format!("could not snapshot untracked file {rel}: {e}"))?;
+        }
+        std::fs::write(
+            snapshot_dir.join("untracked_files.txt"),
+            untracked_paths.join("\n"),
+        )
+        .map_err(|e| format!("could not write untracked_files.txt: {e}"))?;
+
+        Ok(())
+    }
+
+    fn restore_worktree(&self, root: &Path, snapshot_dir: &Path) -> Result<(), String> {
+        // Discard tracked changes, then wipe untracked cruft (any file the
+        // failed attempt created) before replaying the snapshot — avoids
+        // `git stash`, whose stack is shared across every worktree hanging
+        // off this daemon's checkout (see `AGENTS.md`).
+        let reset = Self::exec_raw(root, &["reset", "--hard", "HEAD"])?;
+        if !reset.status.success() {
+            return Err(format!(
+                "git reset --hard HEAD failed: {}",
+                String::from_utf8_lossy(&reset.stderr).trim()
+            ));
+        }
+        let clean = Self::exec_raw(root, &["clean", "-fd"])?;
+        if !clean.status.success() {
+            return Err(format!(
+                "git clean -fd failed: {}",
+                String::from_utf8_lossy(&clean.stderr).trim()
+            ));
+        }
+
+        let patch_path = snapshot_dir.join("tracked.patch");
+        let patch_len = std::fs::metadata(&patch_path).map(|m| m.len()).unwrap_or(0);
+        if patch_len > 0 {
+            let patch_str = patch_path.to_string_lossy().into_owned();
+            let apply = Self::exec_raw(root, &["apply", "--binary", &patch_str])?;
+            if !apply.status.success() {
+                return Err(format!(
+                    "git apply of snapshot patch failed: {}",
+                    String::from_utf8_lossy(&apply.stderr).trim()
+                ));
+            }
+        }
+
+        let untracked_root = snapshot_dir.join("untracked");
+        let listed =
+            std::fs::read_to_string(snapshot_dir.join("untracked_files.txt")).unwrap_or_default();
+        for rel in listed.lines().filter(|l| !l.is_empty()) {
+            let src = untracked_root.join(rel);
+            let dst = root.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(&src, &dst)
+                .map_err(|e| format!("could not restore untracked file {rel}: {e}"))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -399,5 +528,80 @@ mod tests {
         assert!(err.starts_with("git rev-parse"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trips_tracked_and_untracked_changes() {
+        let dir = std::env::temp_dir().join("ral488-vcs-snapshot-restore");
+        let snapshot_dir = std::env::temp_dir().join("ral488-vcs-snapshot-restore-snap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet", "--initial-branch", "main"])
+                .current_dir(&dir)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(dir.join("tracked.txt"), "original\n").unwrap();
+        for args in [
+            ["add", "."].as_slice(),
+            [
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--message",
+                "init",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .expect("git setup")
+                    .success()
+            );
+        }
+
+        // Simulate a failed attempt's edits: mutate a tracked file, add an
+        // untracked one. This is the state the snapshot must capture.
+        std::fs::write(dir.join("tracked.txt"), "attempt edit\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "scratch\n").unwrap();
+
+        GitVcs
+            .snapshot_worktree(&dir, &snapshot_dir)
+            .expect("snapshot succeeds");
+
+        // A further "agent" edit after the snapshot, including brand-new
+        // untracked cruft, must be fully undone by restore.
+        std::fs::write(dir.join("tracked.txt"), "later edit\n").unwrap();
+        std::fs::write(dir.join("scratch.txt"), "later scratch\n").unwrap();
+        std::fs::write(dir.join("new_junk.txt"), "junk\n").unwrap();
+
+        GitVcs
+            .restore_worktree(&dir, &snapshot_dir)
+            .expect("restore succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "attempt edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "scratch\n"
+        );
+        assert!(
+            !dir.join("new_junk.txt").exists(),
+            "restore must remove untracked cruft created after the snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
     }
 }
