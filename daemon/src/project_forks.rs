@@ -393,6 +393,7 @@ pub(crate) fn ensure_fork_remote(
 ///
 /// # Errors
 /// Propagates the underlying `git fetch`/`git push` failure.
+#[cfg(test)]
 pub(crate) fn sync_fork_base_branch(
     root: &std::path::Path,
     parent_remote_name: &str,
@@ -414,6 +415,61 @@ pub(crate) fn sync_fork_base_branch(
     )
     .map(|_| ())
     .map_err(|e| format!("could not fast-forward fork branch {base_branch_name}: {e}"))
+}
+
+/// The disposable fork branch that backs one review's dual-root stack PR.
+///
+/// This is a ref name only; it never becomes a worktree path. The guardian id
+/// is already unique and ref-safe, so concurrent reviews on one fork cannot
+/// contend for the same branch.
+#[must_use]
+pub(crate) fn review_upstream_branch(guardian_id: &str) -> String {
+    format!("ralphus/review/{guardian_id}/upstream")
+}
+
+/// Force the review-owned fork upstream branch to the parent's current base
+/// tip. Unlike [`sync_fork_base_branch`], this intentionally never updates a
+/// fork owner's ordinary branch: the target is derived solely from `guardian_id`.
+pub(crate) fn sync_review_upstream_branch(
+    root: &std::path::Path,
+    parent_remote_name: &str,
+    fork_remote_name: &str,
+    base_branch_name: &str,
+    guardian_id: &str,
+) -> Result<String, String> {
+    crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
+        .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
+    let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("could not resolve fetched tip: {e}"))?;
+    let branch = review_upstream_branch(guardian_id);
+    crate::guardian_merge::git(
+        root,
+        &[
+            "push",
+            "--force",
+            fork_remote_name,
+            &format!("{tip}:refs/heads/{branch}"),
+        ],
+    )
+    .map_err(|e| format!("could not force-update review fork branch {branch}: {e}"))?;
+    Ok(branch)
+}
+
+/// Best-effort deletion of a review-owned dual-root branch. Its derived name
+/// means this cannot delete a user-owned fork branch.
+pub(crate) fn delete_review_upstream_branch(
+    root: &std::path::Path,
+    fork_remote_name: &str,
+    guardian_id: &str,
+) -> Result<(), String> {
+    let branch = review_upstream_branch(guardian_id);
+    crate::guardian_merge::git(
+        root,
+        &["push", fork_remote_name, &format!(":refs/heads/{branch}")],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("could not delete review fork branch {branch}: {e}"))
 }
 
 /// One health finding for a registered fork row (RAL-338 Phase 6). Advisory

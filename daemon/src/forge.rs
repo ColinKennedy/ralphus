@@ -2560,7 +2560,13 @@ pub(crate) fn resolve_remote_name_excluding(
 /// fork's client for everything else.
 #[derive(Clone)]
 pub struct PrRoute {
+    /// The client used to create the PR/MR. GitLab cross-project creation is
+    /// necessarily fork-scoped even though the returned IID belongs to the
+    /// target parent project.
     pub client: ForgeClient,
+    /// The client that owns an existing PR/MR's number and therefore serves
+    /// head lookup and post-adoption mutation requests.
+    pub existing_client: ForgeClient,
     pub head: String,
     pub base: String,
     pub target_project_id: Option<i64>,
@@ -2602,7 +2608,8 @@ impl PrRoute {
     /// # Errors
     /// Propagates the underlying forge API failure.
     pub fn update_draft(&self, number: i64, draft: bool) -> Result<(), String> {
-        self.client.update_pull_request_draft(number, draft)
+        self.existing_client
+            .update_pull_request_draft(number, draft)
     }
 
     /// Look up whether this route's exact head already has an open PR/MR --
@@ -2614,7 +2621,7 @@ impl PrRoute {
     /// # Errors
     /// Propagates the underlying forge API failure.
     pub fn find_existing_pull_request(&self) -> Result<Option<ExistingPr>, String> {
-        self.client.find_open_pull_request(&self.head)
+        self.existing_client.find_open_pull_request(&self.head)
     }
 }
 

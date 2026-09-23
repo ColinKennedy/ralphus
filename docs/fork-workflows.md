@@ -48,21 +48,21 @@ from the **fork**. Only where the PR/MR is *filed* differs:
 | Every later branch | fork | fork | preceding branch's own alias |
 
 When `dual_root_pr` is enabled, the root also has a second, fork-internal
-stack PR targeted at the fork's copy of the parent base branch. Before ralphus
-creates that PR, it fast-forwards the fork branch from the parent branch. It
-never force-pushes: a diverged fork base branch blocks submission until its
-owner reconciles it. Several reviews may target that same maintained fork
-branch concurrently.
+stack PR targeted at a review-owned transient branch,
+`ralphus/review/<guardian-id>/upstream`. Before ralphus creates that PR, and
+after every parent-base refresh for the review, it force-pushes that disposable
+branch to the parent base tip. Ralphus never updates the fork owner's ordinary
+base branch, and deletes the transient branch when the review terminates or is
+deleted.
 
 "Filed on" is the logical destination; the forge API call itself is
 asymmetric between GitLab and GitHub:
 
 - **GitLab** always calls the *fork's* API (`POST
   /projects/{fork_id}/merge_requests`), adding a numeric `target_project_id`
-  pointing at the parent only for the root MR. A GitLab root's `repo` is
-  therefore the fork's own encoded path, not the parent's — this is why
-  ralphus never uses `repo` alone to decide "is this the root" (see
-  [Promotion](#promotion)).
+  pointing at the parent only for the root MR. The creation call is fork-scoped,
+  but that root MR's IID is target-parent-scoped, so ralphus records the parent
+  repository for every later IID-based operation.
 - **GitHub** calls the *parent's* API (`POST /repos/{parent}/pulls`) for the
   root, with `head = "<fork-owner>:<alias>"`, and the fork's API for every
   other branch.
@@ -143,9 +143,8 @@ position to the first branch that's still genuinely open (skipping any that
 also merged in the same batch) and promotes exactly that one.
 
 "Is this PR the root" is decided by comparing its recorded base against the
-guardian's own base branch, not by comparing `repo` — a GitLab root's `repo`
-is the fork's own path (see [Topology](#topology) above), so a `repo`-based
-check would never fire for GitLab at all.
+guardian's own base branch, not by comparing `repo`. This keeps the decision
+about stack position independent from the repository that owns the MR IID.
 
 GitHub's native PR-stack registration (`POST /repos/{repo}/stacks`) is
 repository-scoped and can't mix a parent PR number with fork PR numbers, so

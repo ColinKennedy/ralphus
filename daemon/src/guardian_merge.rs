@@ -7725,6 +7725,9 @@ fn guardian_base_already_has_every_branch(
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
     let merged = store.lock().approve_guardian(id).is_ok();
     if merged {
+        if let Ok(guardian) = store.lock().get_guardian(id) {
+            crate::pr::retire_dual_root_fork_branch(store, &guardian);
+        }
         crate::rlog!(
             INFO,
             "ralphus [guardian] review {id} merged: base branch already contains every branch's commits"
@@ -9704,6 +9707,12 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                             "error": e.to_string(),
                         }),
                     );
+            } else if target.machine.is_none() {
+                crate::pr::refresh_dual_root_fork_branches_for_base(
+                    &store,
+                    &target.root,
+                    &target.base_branch,
+                );
             }
         });
     }
