@@ -676,7 +676,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
-    - (read-only-safe) history selector [uri]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
     - internal  {Machine-invoked interfaces with no interactive/task-file use (RAL-338 follow-up).}
