@@ -2532,27 +2532,74 @@ fn run_cell_worker(
         return;
     }
 
-    // RAL-435: `run_cancellable` wrapped in a retry loop that catches a
-    // recognized, retryable Pi rate limit, waits out its suggested delay
-    // (releasing `_permit` for the duration), and resumes the same agent
-    // session -- guarded by the same N-in-M-turns thrash rule
-    // `runner::thrash` uses for autocompaction (RAL-339), via
-    // `ralphus_core::thrash`. Returns `None` only when a cancellation landed
-    // (mid-run or mid-wait); the (already `cancelled`) node is left as the
-    // store set it, the same "abandon this cell" treatment a cancellation
-    // gets everywhere else in this function.
-    let Some((result, resumed_permit)) = run_cell_with_rate_limit_retries(
-        &mut spec,
-        runner,
-        cancel,
-        _permit,
-        sem,
-        dispatch_priority,
-        store,
-        squad_id,
-        row,
-    ) else {
-        return;
+    // RAL-487/RAL-488: `row.mode`/`row.remediation_attempts` are only ever
+    // set for a `command`-kind cell (`None` for a `prompt` cell, or for any
+    // row inserted before this feature existed -- see
+    // `Store::insert_squad_with_id`'s `cell_mode` resolution), so this
+    // resolves to exactly 1 for every cell except a `mode = "remediating"`
+    // command, which keeps its unchanged single-attempt behavior otherwise.
+    let total_attempts = crate::remediation::resolve_total_attempts(
+        row.mode
+            .as_deref()
+            .unwrap_or(ralphus_core::schema::COMMAND_MODE_RAW),
+        row.remediation_attempts.and_then(|n| u32::try_from(n).ok()),
+    );
+    let mut remediation_attempt = 1u32;
+    let (result, resumed_permit) = loop {
+        // RAL-435: `run_cancellable` wrapped in a retry loop that catches a
+        // recognized, retryable Pi rate limit, waits out its suggested delay
+        // (releasing `_permit` for the duration), and resumes the same agent
+        // session -- guarded by the same N-in-M-turns thrash rule
+        // `runner::thrash` uses for autocompaction (RAL-339), via
+        // `ralphus_core::thrash`. Returns `None` only when a cancellation landed
+        // (mid-run or mid-wait); the (already `cancelled`) node is left as the
+        // store set it, the same "abandon this cell" treatment a cancellation
+        // gets everywhere else in this function.
+        let Some((attempt_result, permit_back)) = run_cell_with_rate_limit_retries(
+            &mut spec,
+            runner,
+            cancel,
+            _permit,
+            sem,
+            dispatch_priority,
+            store,
+            squad_id,
+            row,
+        ) else {
+            return;
+        };
+        _permit = permit_back;
+        if attempt_result.is_done()
+            || remediation_attempt >= total_attempts
+            || cancel.is_cancelled()
+        {
+            break (attempt_result, _permit);
+        }
+        // RAL-487/RAL-488: a `mode = "remediating"` command's attempt just
+        // failed and the budget isn't exhausted -- hand the captured output
+        // to this cell's own resolved agent/model to repair, then loop back
+        // for another full attempt (itself still wrapped in the rate-limit
+        // retry above, though a command cell never actually reaches a
+        // `ModelBackend` to rate-limit against).
+        crate::rlog!(
+            WARNING,
+            "ralphus [scheduler] cell {squad_id}/{} command attempt {remediation_attempt}/{total_attempts} \
+             failed, starting repair pass",
+            row.cell_id,
+        );
+        let repair_agent = crate::remediation::RepairAgent {
+            agent: &row.agent,
+            executable: spec.executable.as_deref(),
+            model: row.model.as_deref(),
+        };
+        crate::remediation::run_repair_pass(
+            runner,
+            cancel,
+            &spec,
+            remediation_attempt,
+            &repair_agent,
+        );
+        remediation_attempt += 1;
     };
     _permit = resumed_permit;
     // RAL-288 Stage 6: a deliberate human-triggered detach mid-task is
@@ -3881,6 +3928,8 @@ fn run_proofs(
             proof_budget,
             proof_maximum_tool_output_tokens,
             proof_maximum_timeout_sec,
+            proof_mode,
+            proof_remediation_attempts,
         ),
     ) in specs.iter().cloned().enumerate()
     {
@@ -4054,7 +4103,30 @@ fn run_proofs(
                     cell_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
                     task_maximum_timeout_sec.and_then(|v| u64::try_from(v).ok()),
                 );
-                let result: RunnerResult = runner.run_cancellable(&runner_spec, cancel);
+                // RAL-487/RAL-488: a `mode = "remediating"` command (the
+                // default) hands a failed attempt's captured output to the
+                // owning cell's own resolved agent/model to repair, then
+                // retries, up to `remediation_attempts` total command
+                // executions. `mode = "raw"` (or a missing attempt budget --
+                // a non-`command` step's row, where these columns are always
+                // `None`) degenerates to exactly one execution, unchanged
+                // from before this feature existed.
+                let repair_model = proof_model.as_deref().or(cell_model);
+                let repair_agent = crate::remediation::RepairAgent {
+                    agent: &selection.backend,
+                    executable: selection.executable.as_deref(),
+                    model: repair_model,
+                };
+                let result: RunnerResult = crate::remediation::run_command_with_remediation(
+                    runner,
+                    cancel,
+                    &runner_spec,
+                    proof_mode
+                        .as_deref()
+                        .unwrap_or(ralphus_core::schema::COMMAND_MODE_RAW),
+                    proof_remediation_attempts.and_then(|n| u32::try_from(n).ok()),
+                    &repair_agent,
+                );
                 let passed = result.is_done();
                 let output = match &result.error {
                     Some(err) if result.summary.is_empty() => err.clone(),
@@ -7801,6 +7873,8 @@ mod tests {
             machine: None,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         }
     }
 
@@ -7932,6 +8006,8 @@ mod tests {
             machine: None,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         };
         let work_row = crate::store::CellRow {
             task_idx: 1,
