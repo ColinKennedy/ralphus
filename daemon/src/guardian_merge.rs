@@ -11573,7 +11573,7 @@ mod tests {
                 "pi",
                 None,
                 Some("openrouter/deepseek/deepseek-v4-flash-0731"),
-                &[crate::agent_profile_env::AgentEnvEntry {
+                vec![crate::agent_profile_env::AgentEnvEntry {
                     key: "OPENROUTER_API_KEY".to_string(),
                     kind: crate::agent_profile_env::AgentEnvKind::Set,
                     value: "key-from-profile".to_string(),
@@ -11657,7 +11657,7 @@ mod tests {
         ));
         store
             .lock()
-            .upsert_agent_profile("pi-plain", "pi", None, None, &[])
+            .upsert_agent_profile("pi-plain", "pi", None, None, vec![])
             .expect("upsert profile");
 
         let resolved =
