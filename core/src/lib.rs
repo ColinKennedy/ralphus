@@ -10,6 +10,7 @@ pub mod cors;
 pub mod health_catalog;
 pub mod license;
 pub mod process;
+pub mod rate_limit;
 pub mod redact;
 pub mod schema;
 pub mod shellcmd;

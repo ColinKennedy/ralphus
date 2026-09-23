@@ -1045,6 +1045,14 @@ impl RunnerResult {
     /// [`Self::node_state`] (it never lets a `"rate_limited"` result escape
     /// its own retry loop), so this constructor exists mainly so that loop
     /// has something to build from the runner's raw JSON result.
+    ///
+    /// `retry_after_secs` is clamped to
+    /// [`ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`] (10 minutes)
+    /// here, at the point the daemon ingests it from the runner subprocess's
+    /// JSON report -- the runner's own parser (`pi_backend::parse_retryable_rate_limit`)
+    /// already clamps too, but this is the daemon's side of that process
+    /// boundary, so it never trusts an unclamped value regardless of which
+    /// backend produced it.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn rate_limited(
@@ -1076,7 +1084,9 @@ impl RunnerResult {
             agent_session_id,
             turns,
             ghost: None,
-            retry_after_secs: Some(retry_after_secs),
+            retry_after_secs: Some(ralphus_core::rate_limit::clamp_retry_after_secs(
+                retry_after_secs,
+            )),
         }
     }
 
@@ -3006,6 +3016,34 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    #[test]
+    fn rate_limited_clamps_an_absurd_retry_after_to_ten_minutes() {
+        let result = RunnerResult::rate_limited(
+            36_000, // 10 hours -- an absurd/hostile provider report
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+        );
+        assert_eq!(
+            result.retry_after_secs,
+            Some(ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS)
+        );
+    }
+
+    #[test]
+    fn rate_limited_leaves_a_reasonable_retry_after_untouched() {
+        let result =
+            RunnerResult::rate_limited(5, String::new(), 0, 0, 0, 0, 0, 0, None, 0.0, None);
+        assert_eq!(result.retry_after_secs, Some(5));
+    }
 
     #[test]
     fn pane_shows_done_sentinel_true_for_the_real_wrapper_line() {

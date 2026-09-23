@@ -1913,9 +1913,18 @@ fn run_cell_with_rate_limit_retries<'a>(
     squad_id: &str,
     row: &crate::store::CellRow,
 ) -> Option<(RunnerResult, SemaphorePermit<'a>)> {
-    let mut tracker = ralphus_core::thrash::OccurrenceTracker::new(
-        ralphus_core::thrash::OccurrenceThresholds::default(),
-    );
+    // The `[review].provider_timeout_max_retries` config governs N here
+    // (default 3) -- the same knob `guardian_merge.rs`'s own rate-limit
+    // retry loop reads, so a project's configured retry budget applies
+    // uniformly to both cell/proof execution and review-worktree agent
+    // calls. `min_turn_gap` is left at its own thrash-detector default; only
+    // N is user-configurable today.
+    let max_retries = crate::config::resolve(Path::new(&spec.cwd)).provider_timeout_max_retries();
+    let mut tracker =
+        ralphus_core::thrash::OccurrenceTracker::new(ralphus_core::thrash::OccurrenceThresholds {
+            max_occurrences: max_retries,
+            min_turn_gap: ralphus_core::thrash::DEFAULT_MIN_TURN_GAP,
+        });
     let mut total_tokens_in = 0i64;
     let mut total_tokens_out = 0i64;
     let mut total_cache_creation_tokens = 0i64;
@@ -2014,9 +2023,14 @@ fn run_cell_with_rate_limit_retries<'a>(
             return Some((failed, permit));
         }
 
+        // A provider-reported delay gets a 1-second buffer on top -- e.g. a
+        // LiteLLM "Try again in 5 seconds" cooldown is retried after 6,
+        // guaranteeing the provider's own window has actually elapsed rather
+        // than racing it. The no-delay-reported fallback isn't a provider
+        // recommendation, so it isn't padded.
         let retry_after = attempt
             .retry_after_secs
-            .map(Duration::from_secs)
+            .map(|secs| Duration::from_secs(secs.saturating_add(1)))
             .unwrap_or(DEFAULT_RATE_LIMIT_RETRY);
         let wake_at_ms = crate::store::now_ms() + retry_after.as_millis() as i64;
         crate::rlog!(
@@ -2065,8 +2079,10 @@ fn run_cell_with_rate_limit_retries<'a>(
 /// RAL-435: sleeps out a Pi rate limit's suggested delay in short increments
 /// so a cancellation lands within one poll interval instead of blocking for
 /// the delay's full duration. Returns `true` if cancellation was observed
-/// before the delay fully elapsed.
-fn sleep_out_rate_limit_retry(delay: Duration, cancel: &CancelToken) -> bool {
+/// before the delay fully elapsed. `pub(crate)` so `guardian_merge.rs`'s own
+/// rate-limit retry loop can reuse the exact same cancel-aware wait instead
+/// of a second copy.
+pub(crate) fn sleep_out_rate_limit_retry(delay: Duration, cancel: &CancelToken) -> bool {
     let mut remaining = delay;
     while remaining > Duration::ZERO {
         if cancel.is_cancelled() {

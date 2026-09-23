@@ -187,6 +187,154 @@ pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
     format!("reviewer-{branch_id}")
 }
 
+/// Fallback delay for [`run_agent_with_rate_limit_retry`] when a recognized
+/// rate limit carries no provider-suggested delay -- mirrors
+/// `scheduler::DEFAULT_RATE_LIMIT_RETRY`.
+const DEFAULT_PROVIDER_RATE_LIMIT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs one guardian-merge agent call (conflict resolution, manual checks,
+/// feedback actioning, final proof, auto-build, manual-command generation --
+/// every call site that used to invoke `runner.run_cancellable` directly),
+/// transparently retrying a recognized provider rate limit
+/// (`RunnerResult::is_rate_limited`, e.g. a LiteLLM/OpenRouter 429 or "No
+/// deployments available" cooldown -- see `runner::pi_backend`'s
+/// `parse_retryable_rate_limit`) instead of letting it die the merge attempt
+/// outright the way every one of these call sites used to.
+///
+/// Mirrors `scheduler::run_cell_with_rate_limit_retries`'s own RAL-435 loop
+/// (same accumulate-usage-across-attempts, same resume-the-same-agent-session
+/// behavior, same cancel-aware sleep via
+/// [`crate::scheduler::sleep_out_rate_limit_retry`]), but with its own
+/// counter: this is a *separate* retry budget from anything else a review's
+/// merge attempt may already retry, driven by `.ralphus.toml`'s `[review]
+/// .provider_timeout_max_retries` (default 3, resolved against `spec.cwd`)
+/// rather than the cell/proof path's turn-gap thrash rule. The counter
+/// advances only on a recognized rate limit and resets to zero the instant
+/// any other outcome (success or a genuine failure) comes back, so a rate
+/// limit never eats into a review's ordinary failure handling and vice
+/// versa. Each retry waits the provider's suggested delay plus a 1-second
+/// buffer (`scheduler`'s own reasoning: guarantee the provider's window has
+/// actually elapsed rather than racing it).
+///
+/// Once retries are exhausted, the last rate-limited attempt is converted
+/// into an ordinary `"failed"` result so every call site keeps treating the
+/// return value as a normal (`is_done`/error) outcome -- none of them need to
+/// learn about `"rate_limited"` as a third possibility.
+fn run_agent_with_rate_limit_retry(
+    spec: &mut RunnerSpec,
+    runner: &dyn Runner,
+    cancel: &CancelToken,
+) -> crate::runner::RunnerResult {
+    let max_retries = crate::config::resolve(Path::new(&spec.cwd)).provider_timeout_max_retries();
+    let mut retries = 0u32;
+    let mut total_tokens_in = 0i64;
+    let mut total_tokens_out = 0i64;
+    let mut total_cache_creation_tokens = 0i64;
+    let mut total_cache_read_tokens = 0i64;
+    let mut total_compaction_input_tokens = 0i64;
+    let mut total_compaction_count = 0i64;
+    let mut total_cost_usd = 0.0f64;
+    let mut total_turns: Option<i64> = None;
+
+    loop {
+        let attempt = runner.run_cancellable(spec, cancel);
+        total_tokens_in += attempt.tokens_in;
+        total_tokens_out += attempt.tokens_out;
+        total_cache_creation_tokens += attempt.cache_creation_tokens;
+        total_cache_read_tokens += attempt.cache_read_tokens;
+        total_compaction_input_tokens += attempt.compaction_input_tokens;
+        total_compaction_count += attempt.compaction_count;
+        total_cost_usd += attempt.cost_usd;
+        if let Some(t) = attempt.turns {
+            total_turns = Some(total_turns.unwrap_or(0) + t);
+        }
+
+        // A genuine cancellation is returned as-is (whatever shape
+        // `run_cancellable` gives a cancelled run) rather than retried --
+        // every call site's own, already-established `cancel.is_cancelled()`
+        // handling elsewhere in the merge flow picks this up exactly like it
+        // would have from an unwrapped `run_cancellable` call.
+        if !attempt.is_rate_limited() || cancel.is_cancelled() {
+            let mut merged = attempt;
+            merged.tokens_in = total_tokens_in;
+            merged.tokens_out = total_tokens_out;
+            merged.cache_creation_tokens = total_cache_creation_tokens;
+            merged.cache_read_tokens = total_cache_read_tokens;
+            merged.compaction_input_tokens = total_compaction_input_tokens;
+            merged.compaction_count = total_compaction_count;
+            merged.cost_usd = total_cost_usd;
+            merged.turns = total_turns;
+            return merged;
+        }
+
+        if retries >= max_retries {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian_merge] {}/{} provider rate-limit retries exhausted ({max_retries}); failing",
+                spec.squad_id,
+                spec.cell_id,
+            );
+            return crate::runner::RunnerResult {
+                status: "failed".to_string(),
+                tokens_in: total_tokens_in,
+                tokens_out: total_tokens_out,
+                cache_creation_tokens: total_cache_creation_tokens,
+                cache_read_tokens: total_cache_read_tokens,
+                compaction_input_tokens: total_compaction_input_tokens,
+                compaction_count: total_compaction_count,
+                cost_usd: total_cost_usd,
+                cost_is_estimated: true,
+                summary: attempt.summary,
+                error: Some(format!(
+                    "provider rate-limit retries exhausted after {} attempt(s) (see \
+                     [review].provider_timeout_max_retries in .ralphus.toml)",
+                    retries + 1
+                )),
+                proofed: None,
+                agent_session_id: attempt.agent_session_id,
+                turns: total_turns,
+                ghost: None,
+                retry_after_secs: None,
+            };
+        }
+        retries += 1;
+
+        let retry_after = attempt
+            .retry_after_secs
+            .map(|secs| std::time::Duration::from_secs(secs.saturating_add(1)))
+            .unwrap_or(DEFAULT_PROVIDER_RATE_LIMIT_RETRY);
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian_merge] {}/{} rate limited by provider; retrying in {}s ({}/{})",
+            spec.squad_id,
+            spec.cell_id,
+            retry_after.as_secs(),
+            retries,
+            max_retries,
+        );
+        if crate::scheduler::sleep_out_rate_limit_retry(retry_after, cancel) {
+            // Cancelled mid-wait -- return the rate-limited attempt as-is
+            // (usage merged in) rather than spawning one more agent call;
+            // every call site's own `cancel.is_cancelled()` handling
+            // elsewhere in the merge flow takes it from here.
+            let mut merged = attempt;
+            merged.tokens_in = total_tokens_in;
+            merged.tokens_out = total_tokens_out;
+            merged.cache_creation_tokens = total_cache_creation_tokens;
+            merged.cache_read_tokens = total_cache_read_tokens;
+            merged.compaction_input_tokens = total_compaction_input_tokens;
+            merged.compaction_count = total_compaction_count;
+            merged.cost_usd = total_cost_usd;
+            merged.turns = total_turns;
+            return merged;
+        }
+        spec.resume_agent_session_id = attempt
+            .agent_session_id
+            .clone()
+            .or_else(|| spec.resume_agent_session_id.clone());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartMergeOutcome {
@@ -1683,7 +1831,7 @@ fn synthesize_proof_instructions(
           no push, no abort, no \"do not stage\", no task-failure side-effects\n\
         Output ONLY the instruction paragraph. No headers, labels, or commentary.";
 
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         // RAL-102: squad_id/cell_id together key the tmux session name
         // (see `crate::tmux::session_name`) — must be unique per guardian so
         // concurrent guardians' agent invocations never collide on the same
@@ -1729,7 +1877,7 @@ fn synthesize_proof_instructions(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
     // `Result`) -- a budget already exceeded here is caught on the very next
     // call in `resolve_conflicts_with_agent`'s own loop.
@@ -2174,7 +2322,7 @@ fn resolve_conflicts_with_agent(
         // agent resumes its own conversation instead of starting cold. Count
         // only a completed agent pass below: a runner/backend invocation that
         // cannot produce a result is not an attempt to resolve conflicts.
-        let spec = RunnerSpec {
+        let mut spec = RunnerSpec {
             // RAL-102: unique per (guardian, branch) so the tmux session this
             // resolves through (see `crate::tmux::session_name`) never
             // collides with another guardian's or branch's resolver.
@@ -2299,7 +2447,7 @@ fn resolve_conflicts_with_agent(
         // branch's Live-View start time (COALESCE so the fix pass, fired first
         // within this attempt, wins over the final-proof call that may follow).
         let _ = store.lock().stamp_branch_started_at(id, branch_id);
-        let result = runner.run_cancellable(&spec, cancel);
+        let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
         // The fix pass has actually finished running -- stamp the branch's
         // Live-View end time regardless of outcome (a final-proof call, if
         // one follows, overwrites this with its own later finish time; see
@@ -2595,7 +2743,7 @@ fn run_final_proof(
          quality bar, so do not assume what state the code is in; inspect it yourself.{quality_note}"
     );
     let system_prompt = FINAL_PROOF_SYSTEM_PROMPT;
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         // RAL-192: keyed on the branch's stable id (not its mutable stack
         // position -- see `crate::tmux::session_name`'s doc comment) so a
         // reorder/add/remove elsewhere in the review never breaks the
@@ -2645,7 +2793,7 @@ fn run_final_proof(
     // started a fix pass keeps that (earlier) start; one that went straight to
     // proof (clean rebase) gets stamped here.
     let _ = store.lock().stamp_branch_started_at(id, branch_id);
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     // The final-proof call has actually finished running -- overwrites the
     // fix pass's own finish time above, since this call runs later within
     // the same attempt (see `Store::stamp_branch_finished_at`'s doc comment).
@@ -5802,7 +5950,7 @@ fn run_commit_step(
          commit), do not run any git add/commit command -- just say so.\n\n\
          Do not push.{notes_block}"
     );
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         squad_id: format!("guardian-{id}"),
         task: FEEDBACK_TASK.to_string(),
         cell_id: format!("{}-commit", feedback_cell_id(branch_id)),
@@ -5833,7 +5981,7 @@ fn run_commit_step(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);
     let after_sha = wt
         .git(&["rev-parse", "HEAD"])
@@ -6154,7 +6302,7 @@ pub fn run_feedback(
         MergeStatus::Actioning,
         Some("applying reviewer feedback"),
     );
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         // RAL-102: unique per guardian — a bare "guardian" squad_id collides
         // with every other guardian's tmux session name (see the identical
         // fix on `generate_final_summary`'s spec).
@@ -6220,7 +6368,7 @@ pub fn run_feedback(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
@@ -7999,7 +8147,7 @@ fn run_review_auto_build(
             return Some(format!("auto-build agent unresolvable: {message}"));
         }
     };
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         squad_id: format!("guardian-{id}"),
         task: AUTO_BUILD_TASK.to_string(),
         cell_id: AUTO_BUILD_SESSION.to_string(),
@@ -8034,7 +8182,7 @@ fn run_review_auto_build(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
     let ok = result.is_done();
     let _ = store
@@ -10691,7 +10839,7 @@ fn generate_manual_commands(
     };
     let (agent, model) = (resolved.backend.clone(), resolved.model.clone());
 
-    let spec = RunnerSpec {
+    let mut spec = RunnerSpec {
         // RAL-102/RAL-88 follow-up: unique per guardian (see the comment on
         // the resolver `RunnerSpec` in `resolve_conflicts_with_agent`) so this
         // generation's tmux session never collides with another guardian's.
@@ -10777,7 +10925,7 @@ fn generate_manual_commands(
         }),
     );
     let started = std::time::Instant::now();
-    let result = runner.run_cancellable(&spec, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
     // Generation has actually finished running -- stamp the guardian-level
     // Live-View end time regardless of outcome, mirroring the started-at stamp
     // above (plain overwrite, so a regeneration always shows the latest run's

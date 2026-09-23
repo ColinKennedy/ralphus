@@ -1475,16 +1475,45 @@ fn display_terminal_error(error: &str) -> String {
 /// `record_assistant_terminal`) as a retryable provider rate limit. Pi's own
 /// error text is free-form prose, not a structured object -- the same shape
 /// `display_terminal_error`'s OpenRouter 402 budget special-case already
-/// relies on. Deliberately conservative: only fires when the message names
-/// the explicit HTTP 429 status *and* carries a parseable "retry after N
-/// second(s)" delay (the same phrasing OpenRouter uses for its own 402
-/// budget errors). A 429 with no delay, a differently worded rate limit, or
-/// any other status is treated as a genuine failure rather than guessed at.
+/// relies on. Deliberately conservative: only fires when the message either
+///
+/// - names the explicit HTTP 429 status *and* carries a parseable "retry
+///   after N second(s)" delay (the phrasing OpenRouter uses for its own 402
+///   budget errors); or
+/// - names LiteLLM's own no-deployments-available cooldown ("No deployments
+///   available for selected model...") *and* carries a parseable "try again
+///   in N second(s)" delay. LiteLLM's `message` field never actually
+///   contains the literal "429" substring (only a sibling `code` field
+///   does, which doesn't survive into Pi's free-form error text), so this
+///   shape cannot require the 429 token the way the OpenRouter one does --
+///   see <https://github.com/BerriAI/litellm/issues/11330>.
+///
+/// A 429 with no delay, a differently worded rate limit, or any other status
+/// is treated as a genuine failure rather than guessed at.
+///
+/// The parsed delay is clamped to [`ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`]
+/// (10 minutes) -- the message is untrusted, provider-controlled text, so a
+/// misconfigured or hostile upstream reporting an absurd delay (hours, days)
+/// can never stall a cell/proof this badly. The daemon clamps again on its
+/// own side of the subprocess boundary (`RunnerResult::rate_limited`), but
+/// this is the value's very first hop, so it is never reported unclamped
+/// even to a caller within this same process.
 fn parse_retryable_rate_limit(error: &str) -> Option<std::time::Duration> {
-    if !mentions_http_429(error) {
-        return None;
+    if mentions_http_429(error) {
+        if let Some(secs) = parse_retry_after_seconds(error) {
+            return Some(std::time::Duration::from_secs(
+                ralphus_core::rate_limit::clamp_retry_after_secs(secs),
+            ));
+        }
     }
-    parse_retry_after_seconds(error).map(std::time::Duration::from_secs)
+    if mentions_no_deployments_available(error) {
+        if let Some(secs) = parse_try_again_in_seconds(error) {
+            return Some(std::time::Duration::from_secs(
+                ralphus_core::rate_limit::clamp_retry_after_secs(secs),
+            ));
+        }
+    }
+    None
 }
 
 /// Whether `error` names the explicit HTTP 429 status as a standalone token,
@@ -1495,16 +1524,39 @@ fn mentions_http_429(error: &str) -> bool {
         .any(|token| token == "429")
 }
 
+/// Whether `error` names LiteLLM's "No deployments available" cooldown
+/// message (case-insensitive) -- the router-level 429 that fires when every
+/// deployment for a model is in its cooldown window.
+fn mentions_no_deployments_available(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("no deployments available")
+}
+
 /// Parses a `"retry after N second(s)"` phrase (case-insensitive), returning
 /// the delay in whole seconds. `None` when the phrase is absent or not
 /// followed by a plain non-negative integer.
 fn parse_retry_after_seconds(error: &str) -> Option<u64> {
-    const MARKER: &str = "retry after ";
+    parse_seconds_after_marker(error, "retry after ")
+}
+
+/// Parses a `"try again in N second(s)"` phrase (case-insensitive) -- the
+/// delay wording LiteLLM's "No deployments available" cooldown message uses.
+/// `None` when the phrase is absent or not followed by a plain non-negative
+/// integer.
+fn parse_try_again_in_seconds(error: &str) -> Option<u64> {
+    parse_seconds_after_marker(error, "try again in ")
+}
+
+/// Shared digit-scan behind [`parse_retry_after_seconds`] and
+/// [`parse_try_again_in_seconds`]: finds `marker` (case-insensitive) and reads
+/// the plain non-negative integer immediately following it.
+fn parse_seconds_after_marker(error: &str, marker: &str) -> Option<u64> {
     // `to_ascii_lowercase` is byte-length- and offset-preserving for ASCII
     // input, so a byte index found in the lowercased copy is safe to slice
     // out of the original (mixed-case) string.
     let lower = error.to_ascii_lowercase();
-    let start = lower.find(MARKER)? + MARKER.len();
+    let start = lower.find(marker)? + marker.len();
     let digits: String = error[start..]
         .chars()
         .take_while(char::is_ascii_digit)
@@ -2141,6 +2193,20 @@ mod tests {
         );
     }
 
+    /// An absurd/hostile provider-reported delay is clamped to
+    /// [`ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`] rather than
+    /// honored as-is -- the message is untrusted external input.
+    #[test]
+    fn parse_retryable_rate_limit_clamps_an_absurd_delay_to_ten_minutes() {
+        let raw = "OpenRouter 429: rate_limit_exceeded; retry after 36000 seconds";
+        assert_eq!(
+            parse_retryable_rate_limit(raw),
+            Some(std::time::Duration::from_secs(
+                ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS
+            ))
+        );
+    }
+
     #[test]
     fn parse_retryable_rate_limit_rejects_a_429_with_no_delay() {
         let raw = "OpenRouter 429: rate_limit_exceeded";
@@ -2161,6 +2227,69 @@ mod tests {
     fn parse_retryable_rate_limit_rejects_429_as_a_substring_of_a_larger_number() {
         let raw = "OpenRouter 42900: some other error; retry after 5 seconds";
         assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    /// The exact LiteLLM "no deployments available" cooldown message (see
+    /// <https://github.com/BerriAI/litellm/issues/11330>) -- no literal "429"
+    /// substring anywhere in it, only the "try again in N seconds" phrasing.
+    #[test]
+    fn parse_retryable_rate_limit_recognizes_litellms_no_deployments_available_cooldown() {
+        let raw = "No deployments available for selected model, Try again in 5 seconds. Passed \
+                    model=nomic-embed. pre-call-checks=False, cooldown_list=[]";
+        assert_eq!(
+            parse_retryable_rate_limit(raw),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_is_case_insensitive_about_no_deployments_available() {
+        let raw = "NO DEPLOYMENTS AVAILABLE for selected model, try AGAIN IN 7 seconds.";
+        assert_eq!(
+            parse_retryable_rate_limit(raw),
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_rejects_no_deployments_available_with_no_delay() {
+        let raw = "No deployments available for selected model. cooldown_list=[]";
+        assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    #[test]
+    fn parse_retryable_rate_limit_rejects_a_try_again_phrase_without_the_litellm_marker() {
+        // "try again in N seconds" alone, with neither the 429 token nor
+        // LiteLLM's own cooldown wording, is not assumed to be a rate limit.
+        let raw = "Some unrelated agent error. Try again in 5 seconds.";
+        assert_eq!(parse_retryable_rate_limit(raw), None);
+    }
+
+    #[test]
+    fn pi_terminal_litellm_no_deployments_available_is_reported_as_a_retryable_outcome() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"No deployments available for selected model, Try again in \
+                                     5 seconds. Passed model=nomic-embed. \
+                                     pre-call-checks=False, cooldown_list=[]"
+                }
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        let error = state.terminal_error.expect("terminal error recorded");
+        assert_eq!(
+            parse_retryable_rate_limit(&error),
+            Some(std::time::Duration::from_secs(5))
+        );
     }
 
     #[test]
