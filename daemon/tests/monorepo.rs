@@ -167,7 +167,7 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nmode=\"raw\"\nsubprojects=[\"packages/alpha\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -215,8 +215,8 @@ fn two_subprojects_cells_get_independent_addenda() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nremediation_attempts=3\nsubprojects=[\"packages/beta\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nmode=\"raw\"\nsubprojects=[\"packages/alpha\"]\n\
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nmode=\"raw\"\nsubprojects=[\"packages/beta\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -262,7 +262,7 @@ fn no_subprojects_no_injection() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nremediation_attempts=3\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nmode=\"raw\"\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
