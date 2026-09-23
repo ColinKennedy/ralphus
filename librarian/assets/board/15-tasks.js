@@ -112,6 +112,7 @@
               watch,
               needsMe: needs.needs,
               needsMeReason: needs.reason,
+              agents: ttTaskAgents(task),
             });
           }
         }
@@ -127,6 +128,7 @@
         renderTtProjectFilter();
         renderTtPrStatusFilter();
         ttAllRows = ttBuildRows();
+        renderTtAgentFilter();
         const needsMeKeys = new Set(ttAllRows.filter((r) => r.needsMe).map((r) => r.key));
         const filtered = ttAllRows.filter((r) => ttRowMatchesFilters(r, taskTabFilters, hiddenSquadIds, needsMeKeys, hiddenTaskKeys));
         filtered.sort((a, b) => ttCompareRows(a, b, taskTabFilters.sort) * taskTabFilters.dir);
@@ -760,6 +762,83 @@
         /** @type {HTMLInputElement} */ (byId("tt-show-hidden")).checked = taskTabFilters.showHidden;
         /** @type {HTMLInputElement} */ (byId("tt-needs-me")).checked = taskTabFilters.needsMe;
       }
+      // RALPHUS-TT-AGENT-FILTER:BEGIN
+      // RAL-486: Agent dropdown -- the shared multi-select Status dropdown
+      // (RAL-475), generalized to dotless options and "agent" tooltip
+      // wording, over the resolved agent(s) currently in use across
+      // `ttAllRows` (see `ttTaskAgents`). Mirrors the Reviews tab's resolver
+      // filter: auto-synced to every agent currently in use until the user
+      // or URL picks an explicit selection (`taskTabAgentDefaulted`).
+      /**
+       * The distinct resolved agent values present in the currently-loaded
+       * Tasks-tab rows, sorted. Must be called after `ttAllRows` is fresh
+       * for this render pass.
+       * @returns {string[]}
+       */
+      function taskTabAgentOptions() { return [...new Set(ttAllRows.flatMap((r) => r.agents))].sort(); }
+      /**
+       * Until the user (or the URL) has picked an explicit agent selection, keeps
+       * `taskTabFilters.agents` synced to every agent currently in use -- so a
+       * newly-seen agent is filtered-in by default instead of silently hidden.
+       * @returns {void}
+       */
+      function syncTaskTabAgentDefault() {
+        if (!taskTabAgentDefaulted) taskTabFilters.agents = new Set(taskTabAgentOptions());
+      }
+      /**
+       * Builds the Tasks toolbar's Agent dropdown config (RAL-486).
+       * @returns {StatusDropdownConfig}
+       */
+      function ttAgentDropdownConfig() {
+        return {
+          id: "tasks-agent",
+          label: "Agent",
+          mode: "multi",
+          itemNoun: "agent",
+          options: taskTabAgentOptions().map((a) => ({ value: a, label: a })),
+          selected: taskTabFilters.agents,
+          optionTip: (a) => `Show or hide tasks using the ${a} agent.`,
+          onToggle: toggleTtAgent,
+          onAll: () => allTtAgent(true),
+          onNone: () => allTtAgent(false),
+        };
+      }
+      /**
+       * Renders the Tasks toolbar's Agent dropdown (RAL-486). Called from
+       * `renderTasksTab` once `ttAllRows` is fresh, so its options reflect
+       * the currently-loaded data.
+       * @returns {void}
+       */
+      function renderTtAgentFilter() {
+        syncTaskTabAgentDefault();
+        renderStatusDropdown("tt-agent-filter", ttAgentDropdownConfig());
+      }
+      /**
+       * Toggles one agent in/out of the Tasks tab's filter.
+       * @param {string} a
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function toggleTtAgent(a, on) {
+        taskTabAgentDefaulted = true;
+        if (on) taskTabFilters.agents.add(a); else taskTabFilters.agents.delete(a);
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+        syncHash();
+      }
+      /**
+       * Shows or hides all tasks regardless of agent.
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function allTtAgent(on) {
+        taskTabAgentDefaulted = true;
+        taskTabFilters.agents = on ? new Set(taskTabAgentOptions()) : new Set();
+        renderTasksTab();
+        ttScrollSelectionIntoView();
+        syncHash();
+      }
+      // RALPHUS-TT-AGENT-FILTER:END
       // RALPHUS-TT-PROJECT-FILTER-MENU:BEGIN
       // RAL-345: project filter -- own state/render path, deliberately not
       // shared with the Squads tab's identical-looking (non-`tt`-prefixed)

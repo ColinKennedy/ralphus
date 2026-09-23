@@ -489,6 +489,7 @@
        * @property {boolean} needsMe - RAL-362 §5: only rows the "needs me" predicate matches
        * @property {boolean} groupBySquad
        * @property {"any"|"passing"|"failing"|"pending"} prStatus - RAL-463: single-select PR-status filter over a row's currently-open PRs; "any" disables it (off by default, computes nothing)
+       * @property {Set<string>} agents - RAL-486: resolved agent values whose tasks may be shown -- a row matches if any of its own `agents` (see `TtRow`) is in this set. Auto-synced to every agent currently in use until the user/URL picks an explicit selection (see `taskTabAgentDefaulted`), mirroring the Reviews tab's resolver filter.
        */
       /**
        * @returns {TaskTabFilters}
@@ -497,7 +498,7 @@
       // *not* needs-me-first, so a first-time visitor sees the whole board
       // grouped the way the Squads tab already is, before opting into any
       // narrower filter.
-      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set(), prStatus: "any" }; }
+      function defaultTaskTabFilters() { return { q: "", sort: "squad", dir: 1, status: new Set(STATES), showHidden: false, needsMe: false, groupBySquad: false, projects: new Set(), prStatus: "any", agents: new Set() }; }
       /**
        * @typedef {object} TaskTabSel
        * @property {"task"|"cell"|null} kind
@@ -524,6 +525,10 @@
       let _ttRowMenuTaskRefs = [];
       /** @type {TaskTabFilters} */
       let taskTabFilters = defaultTaskTabFilters();
+      // RAL-486: once true, taskTabFilters.agents is a user/URL-chosen selection and
+      // is no longer auto-synced to newly-discovered agents (see renderTtAgentFilter,
+      // mirrors reviewResolverDefaulted).
+      let taskTabAgentDefaulted = false;
       /** @type {Set<string>} `"<squadId>:<taskIdx>"` keys of expanded Tasks-tab rows (RAL-362 §4) */
       let taskTabExpanded = new Set();
       // RALPHUS-TASK-TAB-COLUMNS:BEGIN
@@ -723,6 +728,7 @@
        * @property {{watched: boolean, inherited: boolean}} watch
        * @property {boolean} needsMe
        * @property {string|null} needsMeReason
+       * @property {string[]} agents - RAL-486: resolved agent(s) this row's cells use, for the Agent filter -- see `ttTaskAgents`.
        */
       /**
        * @typedef {object} TtDisplayItem
@@ -813,6 +819,22 @@
        * @returns {string}
        */
       function ttFmtCost(u) { return u.anyCost ? `${u.estimated ? "~" : ""}$${u.cost.toFixed(2)}` : "–"; }
+      /**
+       * RAL-486: a task's resolved agent(s), for the Agent filter -- the
+       * distinct resolved `agent` of each of its cells (a task's cells may
+       * use different agents, e.g. an inherited default overridden on one
+       * cell), or, for a cell-less task, its own raw task-level `agent` if
+       * set. A task with neither (a cell-less task with no task-level agent
+       * either) yields an empty list and so never matches a specific
+       * selection -- there is nothing to compare.
+       * @param {TaskView} task
+       * @returns {string[]}
+       */
+      function ttTaskAgents(task) {
+        const cells = task.cells || [];
+        if (cells.length) return [...new Set(cells.map((c) => c.agent))];
+        return task.agent ? [task.agent] : [];
+      }
       /**
        * @typedef {object} TtReview
        * @property {string} id
@@ -1152,10 +1174,13 @@
        * Whether a built row survives the toolbar's filters (RAL-362 §2):
        * name substring, status set, hidden-squad/hidden-task inclusion
        * (RAL-365), "needs me", project set (RAL-345; empty means every
-       * project passes), and the PR-status filter (RAL-463; inactive by
-       * default). Re-run on every Tasks-tab poll, so a refreshed, async
-       * pull-request index (new CI verdict, newly-observed draft state, a
-       * brand-new PR row) re-evaluates the visible rows automatically.
+       * project passes), the Agent set (RAL-486; matches if any of the
+       * row's own `agents` -- see `ttTaskAgents` -- is selected; a row with
+       * no resolved agent at all never matches), and the PR-status filter
+       * (RAL-463; inactive by default). Re-run on every Tasks-tab poll, so a
+       * refreshed, async pull-request index (new CI verdict, newly-observed
+       * draft state, a brand-new PR row) re-evaluates the visible rows
+       * automatically.
        * @param {TtRow} row
        * @param {TaskTabFilters} filters
        * @param {Set<string>} hiddenSquadIds
@@ -1167,6 +1192,7 @@
         if (filters.q && !row.name.toLowerCase().includes(filters.q)) return false;
         if (!filters.status.has(row.state)) return false;
         if (filters.projects && filters.projects.size && !filters.projects.has(row.project)) return false;
+        if (filters.agents && !(row.agents || []).some((a) => filters.agents.has(a))) return false;
         if (!filters.showHidden && (hiddenSquadIds.has(row.squadId) || (hiddenTaskKeys && hiddenTaskKeys.has(row.key)))) return false;
         if (filters.needsMe && !needsMeKeys.has(row.key)) return false;
         if (!ttRowMatchesPrFilter(row, filters)) return false;
