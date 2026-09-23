@@ -796,7 +796,7 @@ fn render_cartographer_page(page: &Value) {
 
 // ---- history --------------------------------------------------------------
 
-pub fn cmd_history(opts: &GlobalOpts, selector: &str) -> i32 {
+pub fn cmd_history(opts: &GlobalOpts, selector: &str, type_filter: Option<&str>) -> i32 {
     let client = opts.client();
     run_and_report(opts, None, || {
         let resolved = selector::resolve_squad_selector(&client, selector)?;
@@ -814,10 +814,42 @@ pub fn cmd_history(opts: &GlobalOpts, selector: &str) -> i32 {
             print_history_content(content);
         } else {
             let (content, _found) = history_debug_events(&client, &resolved)?;
-            print_history_content(&content);
+            print_history_content(&filter_debug_event_types(&content, type_filter));
         }
         Ok(())
     })
+}
+
+/// Filters a rendered debug-events stream by its bracketed type codes.
+/// Space-separated terms match case-insensitively; any term may match a line.
+#[must_use]
+pub fn filter_debug_event_types(content: &str, filter: Option<&str>) -> String {
+    let terms: Vec<String> = filter
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    if terms.is_empty() {
+        return content.to_string();
+    }
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line
+                .trim_start()
+                .strip_prefix("| ")
+                .unwrap_or(line.trim_start());
+            let Some(rest) = trimmed.strip_prefix('[') else {
+                return false;
+            };
+            let Some((type_code, _)) = rest.split_once(']') else {
+                return false;
+            };
+            let type_code = type_code.to_lowercase();
+            terms.iter().any(|term| type_code.contains(term))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_history_content(content: &str) {
@@ -1712,6 +1744,15 @@ Configuration file issues:
         assert_eq!(
             format_debug_event_line(&e),
             "[1732300000000] runner: terminal log attempt 0 written\n    | line one\n    | line two"
+        );
+    }
+
+    #[test]
+    fn filter_debug_event_types_matches_any_term_case_insensitively() {
+        let content = "[tool.Read] Read(path=\"a\")\n    | [tool.Glob] Glob(pattern=\"*.rs\")\n[usage] tokens";
+        assert_eq!(
+            filter_debug_event_types(content, Some("read GLOB")),
+            "[tool.Read] Read(path=\"a\")\n    | [tool.Glob] Glob(pattern=\"*.rs\")"
         );
     }
 }

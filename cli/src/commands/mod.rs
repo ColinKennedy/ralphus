@@ -161,6 +161,7 @@ pub enum Command {
     Cartographer(misc::CartographerArgs),
     History {
         selector: String,
+        type_filter: Option<String>,
     },
     Listen {
         selector: String,
@@ -246,9 +247,13 @@ pub fn parse_args(args: &[String]) -> Command {
             }
         }
         Some("cartographer") => misc::parse_cartographer(&mut scanner),
-        Some("history") => with_positional_arg(scanner, "selector", |selector| Command::History {
-            selector,
-        }),
+        Some("history") => {
+            let type_filter = scanner.take_value("--type").ok().flatten();
+            with_positional_arg(scanner, "selector", |selector| Command::History {
+                selector,
+                type_filter,
+            })
+        }
         Some("listen") => misc::parse_listen(&mut scanner),
         Some("retry") => with_positional_arg(scanner, "squad_id", |squad_id| Command::RetryRun {
             squad_id,
@@ -326,7 +331,10 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Graph { squad_id, dot, all } => misc::cmd_graph(opts, squad_id, dot, all),
         Command::Get { uri, field } => misc::cmd_get(opts, &uri, field.as_deref()),
         Command::Cartographer(args) => misc::cmd_cartographer(opts, args),
-        Command::History { selector } => misc::cmd_history(opts, &selector),
+        Command::History {
+            selector,
+            type_filter,
+        } => misc::cmd_history(opts, &selector, type_filter.as_deref()),
         Command::Listen {
             selector,
             until,
@@ -405,5 +413,24 @@ mod tests {
             parse_args(&v(&["history", "squad-1"])),
             Command::History { .. }
         );
+    }
+
+    #[test]
+    fn history_parses_type_filter() {
+        match parse_args(&v(&[
+            "history",
+            "--type",
+            "read glob",
+            "squad-1/task/0/cell/0",
+        ])) {
+            Command::History {
+                selector,
+                type_filter: Some(type_filter),
+            } => {
+                assert_eq!(selector, "squad-1/task/0/cell/0");
+                assert_eq!(type_filter, "read glob");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

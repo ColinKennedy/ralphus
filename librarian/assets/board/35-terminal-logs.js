@@ -159,6 +159,7 @@
         // terminal tab.
         const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
         const debugToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
+        const typeFilterHtml = promptTab || !showDebug ? "" : `<input class="peek-type-filter" value="${esc(peekTypeFilterInput[key] || "")}" oninput="setPeekTypeFilter('${esc(key)}',this.value)" placeholder="Filter types (e.g. read glob)" data-tip="Show only bracket-tagged log lines whose type code contains any space-separated term. Matching is case-insensitive and applies after you pause typing; for example, read glob shows tool.Read and tool.Glob. This filter only affects the Show Debug Messages view." aria-label="Filter log types">`;
         const thinkingToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show the model's own thinking/reasoning, expanded inline where it happened. Off folds each thinking block to a single &lt;thinking…&gt; line so routine monitoring shows what the agent did rather than how it talked itself there.\nFolding is purely a display choice and is freely reversible -- the reasoning is always captured in the transcript, so toggling this re-renders the text already loaded without refetching anything.\nThe starting state can be changed globally via the ralphus config file's [live_view] table (hide_thinking).\nOnly agent backends that report thinking as its own distinct stream have anything to fold here; a backend that does not (or a plain command cell) shows nothing either way."><input type="checkbox" ${showThinking ? "checked" : ""} onchange="toggleShowThinking('${esc(key)}',this.checked)"> Show Thinking</label>`;
         const copyTip = promptTab
           ? "Copy this step's system prompt to clipboard.\nCopies the exact text shown on this tab — the full effective prompt the agent received (ralphus's hidden instructions plus the step's authored system prompt).\nA command cell or an agent step never yet dispatched has no text to copy."
@@ -170,7 +171,7 @@
             </div>`
           : "";
         return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}${typeFilterHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             ${tabsHtml}
             ${promptTab ? `<div class="peek-pre-wrap">
               <pre id="peek-prompt-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" data-tip="The exact system prompt this step's agent received — ralphus's hidden instructions plus the step's authored system prompt.\nShown on the System Prompt tab; the ⧉ Copy control copies this text.">${esc(peekPromptDisplay(peekSystemPrompt[key]))}</pre>
@@ -400,6 +401,7 @@
           ? renderTapeLines(tapeCompleteLines(w, ended), peekShowsDebug(key), peekShowsThinking(key))
           : "";
         text = scrubSecrets(text);
+        if (peekShowsDebug(key)) text = filterLiveViewTypes(text, peekTypeFilter[key] || "");
         if (ended) {
           text = text.trim()
             ? `${text}\n\n[Read-only historical record — this terminal session has ended.]`
@@ -1181,4 +1183,3 @@
         menu.style.left = Math.min(e.clientX, window.innerWidth - 240) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 120) + "px";
       }
-

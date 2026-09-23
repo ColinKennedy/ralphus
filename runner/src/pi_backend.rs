@@ -1077,22 +1077,32 @@ fn feed_assistant_text(state: &mut ParseState, delta: &str, tool_arg_truncate_ch
 fn flush_json_buffer(state: &mut ParseState, tool_arg_truncate_chars: usize) {
     let raw = std::mem::take(&mut state.json_buffer);
     state.capturing_json = false;
-    let parsed = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|value| format_pi_tool_call(&value, tool_arg_truncate_chars));
-    match parsed {
-        Some(line) => {
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => {
             if state.printed_text_delta {
                 finish_delta_line();
                 state.printed_text_delta = false;
             }
+            // A complete JSON object is a tool-call candidate. Keep an
+            // unrecognized shape discoverable without changing its raw text.
+            let line = format_pi_tool_event(&value, &raw, tool_arg_truncate_chars);
             eprintln!("{line}");
         }
-        None => {
-            print_delta(&raw);
-            state.printed_text_delta = true;
+        Err(_) => {
+            // A balanced JSON candidate that still fails to parse is a tool
+            // entry we cannot classify. Keep the complete raw entry verbatim
+            // after the generic parse-failure tag.
+            eprintln!("{}", format_unknown_tool_event(&raw));
         }
     }
+}
+
+fn format_pi_tool_event(value: &Value, raw: &str, truncate_chars: usize) -> String {
+    format_pi_tool_call(value, truncate_chars).unwrap_or_else(|| format!("[tool.unknown] {raw}"))
+}
+
+fn format_unknown_tool_event(raw: &str) -> String {
+    format!("[tool.unknown] {raw}")
 }
 
 /// Flushes any JSON capture left incomplete when a message/turn ends (the
@@ -1202,7 +1212,7 @@ fn format_pi_tool_call(value: &Value, truncate_chars: usize) -> Option<String> {
         if let Some(timeout) = obj.get("timeout") {
             args.push(format!("timeout={timeout}"));
         }
-        return Some(format!("[tool] bash({})", args.join(", ")));
+        return Some(format!("[tool.bash] bash({})", args.join(", ")));
     }
     if let (Some(edits), Some(path)) = (
         obj.get("edits").and_then(Value::as_array),
@@ -1224,7 +1234,9 @@ fn format_pi_tool_call(value: &Value, truncate_chars: usize) -> Option<String> {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        return Some(format!("[tool] edit(path={path:?}, edits=[{edits_str}])"));
+        return Some(format!(
+            "[tool.edit] edit(path={path:?}, edits=[{edits_str}])"
+        ));
     }
     if let Some(path) = obj.get("path").and_then(Value::as_str) {
         if obj.contains_key("offset") || obj.contains_key("limit") {
@@ -1235,7 +1247,7 @@ fn format_pi_tool_call(value: &Value, truncate_chars: usize) -> Option<String> {
             if let Some(limit) = obj.get("limit") {
                 args.push(format!("limit={limit}"));
             }
-            return Some(format!("[tool] read({})", args.join(", ")));
+            return Some(format!("[tool.read] read({})", args.join(", ")));
         }
     }
     None
@@ -2354,7 +2366,7 @@ mod tests {
         .expect("a command+timeout object should be recognized as a bash call");
         assert_eq!(
             line,
-            r#"[tool] bash(command="cargo check -p ralphus-daemon", timeout=900)"#
+            r#"[tool.bash] bash(command="cargo check -p ralphus-daemon", timeout=900)"#
         );
     }
 
@@ -2364,7 +2376,7 @@ mod tests {
             .expect("recognized as a bash call");
         assert_eq!(
             line,
-            format!(r#"[tool] bash(command="{}…")"#, "a".repeat(10))
+            format!(r#"[tool.bash] bash(command="{}…")"#, "a".repeat(10))
         );
     }
 
@@ -2385,7 +2397,7 @@ mod tests {
         .expect("an edits+path object should be recognized as an edit call");
         assert_eq!(
             line,
-            r#"[tool] edit(path="daemon/src/runner.rs", edits=[#1: old_text="turns: None,", new_text="turns: Some(2),"; #2: old_text="foo", new_text="bar"])"#
+            r#"[tool.edit] edit(path="daemon/src/runner.rs", edits=[#1: old_text="turns: None,", new_text="turns: Some(2),"; #2: old_text="foo", new_text="bar"])"#
         );
     }
 
@@ -2398,7 +2410,7 @@ mod tests {
         .expect("a path+offset/limit object should be recognized as a read call");
         assert_eq!(
             line,
-            r#"[tool] read(path="daemon/src/store.rs", offset=12200, limit=75)"#
+            r#"[tool.read] read(path="daemon/src/store.rs", offset=12200, limit=75)"#
         );
     }
 
@@ -2414,6 +2426,28 @@ mod tests {
         assert_eq!(
             format_pi_tool_call(&serde_json::json!({"foo": "bar"}), 200),
             None
+        );
+    }
+
+    #[test]
+    fn format_pi_tool_event_marks_an_unrecognized_json_object_unknown() {
+        assert_eq!(
+            format_pi_tool_event(
+                &serde_json::json!({"unexpected": true}),
+                r#"{"unexpected":true}"#,
+                200,
+            ),
+            r#"[tool.unknown] {"unexpected":true}"#
+        );
+    }
+
+    #[test]
+    fn complete_unparseable_tool_candidate_uses_unknown_tag() {
+        let raw = r#"{\"unterminated\":}"#;
+        assert!(serde_json::from_str::<Value>(raw).is_err());
+        assert_eq!(
+            format_unknown_tool_event(raw),
+            r#"[tool.unknown] {\"unterminated\":}"#
         );
     }
 

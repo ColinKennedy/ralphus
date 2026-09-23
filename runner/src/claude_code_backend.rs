@@ -841,9 +841,11 @@ fn process_event(
                             }
                         }
                         Some("tool_use") => {
-                            let name = block["name"].as_str().unwrap_or("tool");
+                            let name = block["name"].as_str().filter(|name| !name.is_empty());
                             let args = format_tool_input(&block["input"], tool_arg_truncate_chars);
-                            eprintln!("[tool] {name}({args})");
+                            let tag = tool_type_code(name);
+                            let name = name.unwrap_or("tool");
+                            eprintln!("[{tag}] {name}({args})");
                             if name == "Bash"
                                 && block["input"]["run_in_background"].as_bool() == Some(true)
                             {
@@ -961,6 +963,10 @@ fn process_event(
         }
         _ => {}
     }
+}
+
+fn tool_type_code(name: Option<&str>) -> String {
+    name.map_or_else(|| "tool.unknown".to_string(), |name| format!("tool.{name}"))
 }
 
 fn wait_for_child(
@@ -1854,6 +1860,13 @@ mod tests {
             DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
         );
         assert!(state.open_background_job.is_none());
+    }
+
+    #[test]
+    fn tool_type_code_keeps_real_names_and_marks_missing_names_unknown() {
+        assert_eq!(tool_type_code(Some("Bash")), "tool.Bash");
+        assert_eq!(tool_type_code(Some("Read")), "tool.Read");
+        assert_eq!(tool_type_code(None), "tool.unknown");
     }
 
     #[test]

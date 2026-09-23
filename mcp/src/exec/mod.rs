@@ -65,7 +65,10 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Graph { squad_id, dot, all } => exec_graph(client, squad_id, dot, all),
         Command::Get { uri, field } => exec_get(client, &uri, field.as_deref()),
         Command::Cartographer(args) => exec_cartographer(client, args),
-        Command::History { selector } => exec_history(client, &selector),
+        Command::History {
+            selector,
+            type_filter,
+        } => exec_history(client, &selector, type_filter.as_deref()),
         Command::Listen {
             selector,
             until,
@@ -295,7 +298,7 @@ fn exec_cartographer(client: &DaemonClient, args: misc::CartographerArgs) -> Exe
     Ok(client.cartographer(filters)?)
 }
 
-fn exec_history(client: &DaemonClient, sel: &str) -> ExecResult {
+fn exec_history(client: &DaemonClient, sel: &str, type_filter: Option<&str>) -> ExecResult {
     let resolved = selector::resolve_squad_selector(client, sel)?;
     if resolved.kind != "cell" && resolved.kind != "proof" {
         return Err(CommandError::Selector(
@@ -314,6 +317,7 @@ fn exec_history(client: &DaemonClient, sel: &str) -> ExecResult {
         );
     }
     let (content, found) = misc::history_debug_events(client, &resolved)?;
+    let content = misc::filter_debug_event_types(&content, type_filter);
     Ok(json!({
         "active": false,
         "found": found,

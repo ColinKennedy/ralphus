@@ -1598,6 +1598,12 @@
       let showDebugMessagesDefault = false;
       /** @type {{[key: string]: boolean}} peek key -> per-pane override of whether ralphus's own diagnostic/telemetry lines are shown (RAL-232), set by toggling that pane's "Show Debug Messages" checkbox. Absent means "use showDebugMessagesDefault." Session-only, like every other peek* map -- not persisted. */
       let peekShowDebug = {};
+      /** @type {{[key: string]: string}} peek key -> text currently being typed into the debug type filter. */
+      let peekTypeFilterInput = {};
+      /** @type {{[key: string]: string}} peek key -> debounced debug type filter currently applied to the rendered log. */
+      let peekTypeFilter = {};
+      /** @type {{[key: string]: number}} peek key -> pending debounce timer id. */
+      let peekTypeFilterTimers = {};
       /** @type {boolean} config-driven default (`live_view.hide_thinking`, `.ralphus.toml`) for whether a newly-opened Live View pane starts with the model's thinking/reasoning folded away (RAL-434). Fetched once at page load by fetchLiveViewConfigDefault(); a per-pane override in peekShowThinking takes precedence over this. */
       let hideThinkingDefault = false;
       /** @type {{[key: string]: boolean}} peek key -> per-pane override of whether the model's thinking/reasoning lines are expanded (RAL-434), set by toggling that pane's "Show Thinking" checkbox. Absent means "use !hideThinkingDefault." Session-only, like every other peek* map -- not persisted. */

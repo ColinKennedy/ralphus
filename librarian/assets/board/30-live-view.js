@@ -919,6 +919,38 @@
         renderPeekTape(key);
       }
       /**
+       * Records type-filter typing and applies it after the reader pauses, so
+       * a large transcript never re-filters once per keystroke.
+       * @param {string} key
+       * @param {string} value
+       * @returns {void}
+       */
+      function setPeekTypeFilter(key, value) {
+        peekTypeFilterInput[key] = value;
+        if (peekTypeFilterTimers[key] !== undefined) clearTimeout(peekTypeFilterTimers[key]);
+        peekTypeFilterTimers[key] = window.setTimeout(() => {
+          peekTypeFilter[key] = peekTypeFilterInput[key] || "";
+          delete peekTypeFilterTimers[key];
+          if (peekTape[key] !== undefined) renderPeekTape(key);
+        }, 250);
+      }
+      /**
+       * Keeps tagged lines whose bracketed type code contains any
+       * space-separated filter term, case-insensitively. This deliberately
+       * understands every bracket kind rather than a fixed tool-name list.
+       * @param {string} text
+       * @param {string} filter
+       * @returns {string}
+       */
+      function filterLiveViewTypes(text, filter) {
+        const terms = filter.toLowerCase().split(/\s+/).filter(Boolean);
+        if (terms.length === 0) return text;
+        return text.split("\n").filter((line) => {
+          const match = line.trimStart().match(/^\[([^\]]+)\]/);
+          return match !== null && terms.some((term) => match[1].toLowerCase().includes(term));
+        }).join("\n");
+      }
+      /**
        * Whether Live View pane `key` currently expands the model's
        * thinking/reasoning lines (RAL-434) rather than folding each block to a
        * single `⟨thinking…⟩` placeholder — the per-pane override in
