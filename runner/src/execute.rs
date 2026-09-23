@@ -173,12 +173,23 @@ fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -
     match workspace.run_bash(command, timeout_sec) {
         Ok(out) if out.ok() => CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS)),
         Ok(out) => {
-            let detail = tail(&out.stderr, COMMAND_TAIL_CHARS);
-            let detail = if detail.is_empty() {
-                tail(&out.stdout, COMMAND_TAIL_CHARS)
-            } else {
-                detail
-            };
+            // RAL-488: the remediation retry loop needs the full combined
+            // stdout+stderr transcript, not just whichever stream happened to
+            // be non-empty, so a repair agent can see build output alongside
+            // an error message printed to stderr.
+            let mut detail = String::new();
+            if !out.stdout.is_empty() {
+                detail.push_str("stdout:\n");
+                detail.push_str(&out.stdout);
+            }
+            if !out.stderr.is_empty() {
+                if !detail.is_empty() {
+                    detail.push('\n');
+                }
+                detail.push_str("stderr:\n");
+                detail.push_str(&out.stderr);
+            }
+            let detail = tail(&detail, COMMAND_TAIL_CHARS);
             CellResult::failed(format!("command exited {}", out.exit_code), detail)
         }
         Err(e) => CellResult::failed(e.to_string(), ""),
