@@ -21,9 +21,9 @@
 
       /**
        * @typedef {object} StatusDropdownOption
-       * @property {string} value - the raw status/state identifier
-       * @property {string} label - human-facing label shown next to the dot
-       * @property {string} color - a documented CSS color variable role, e.g. "--done"
+       * @property {string} value - the raw status/state/agent identifier
+       * @property {string} label - human-facing label shown next to the dot (if any)
+       * @property {string} [color] - a documented CSS color variable role, e.g. "--done"; omit for a dotless option (RAL-486, e.g. an agent name with no associated lifecycle color)
        */
 
       /**
@@ -35,6 +35,7 @@
        * @property {Set<string>} [selected] - multi mode: the currently visible/selected values
        * @property {string|null} [selectedValue] - single mode: the currently selected value, or null for "any"
        * @property {string} [anyLabel] - single mode: label for the "no selection" entry
+       * @property {string} [itemNoun] - RAL-486: singular noun used in generic multi-mode tooltip wording ("every {noun}", "Select every {noun} for this view.", "Clear every {noun} for this view..."). Defaults to "status" so every pre-existing caller (Squads/Tasks/Reviews/Queue/Retirement status) keeps its current copy unchanged.
        * @property {(value: string, on: boolean) => void} [onToggle] - multi mode: fired when one option is checked/unchecked
        * @property {() => void} [onAll] - multi mode: fired by the "all" button
        * @property {() => void} [onNone] - multi mode: fired by the "none" button
@@ -76,12 +77,13 @@
       }
 
       /**
-       * Renders a colored status dot for one dropdown option.
+       * Renders a colored status dot for one dropdown option, or nothing for
+       * an option with no `color` (RAL-486, e.g. an agent name).
        * @param {StatusDropdownOption} opt
        * @returns {string}
        */
       function statusDropdownDot(opt) {
-        return `<span class="dot" style="background:${cvar(opt.color)}"></span>`;
+        return opt.color ? `<span class="dot" style="background:${cvar(opt.color)}"></span>` : "";
       }
 
       /**
@@ -124,7 +126,7 @@
        */
       function statusDropdownTriggerTip(config) {
         if (config.mode === "multi") {
-          return `Filter by ${esc(config.label)}. Opens a menu of every status -- toggle entries, or use All/None, to change what's shown here.`;
+          return `Filter by ${esc(config.label)}. Opens a menu of every ${esc(config.itemNoun || "status")} -- toggle entries, or use All/None, to change what's shown here.`;
         }
         const opt = config.options.find((o) => o.value === config.selectedValue);
         return `Filter by ${esc(config.label)}. Currently: ${esc(opt ? opt.label : (config.anyLabel || "Any"))}.`;
@@ -149,14 +151,15 @@
        */
       function statusDropdownMultiRowsHtml(config) {
         const selected = config.selected || new Set();
+        const noun = config.itemNoun || "status";
         const options = statusDropdownSortedOptions(config.options);
         const rows = options.map((opt) => {
           const tip = config.optionTip ? config.optionTip(opt.value) : `Show or hide ${esc(opt.label)} entries.`;
           return `<div class="ctx-check ${selected.has(opt.value) ? "on" : ""}"><label style="display:flex;align-items:center;gap:6px;width:100%;margin:0;cursor:pointer" data-tip="${esc(tip)}" onclick="event.stopPropagation()"><input type="checkbox" ${selected.has(opt.value) ? "checked" : ""} onchange="statusDropdownToggleOption('${esc(config.id)}','${esc(opt.value)}',this.checked)">${statusDropdownDot(opt)}${esc(opt.label)}</label></div>`;
         }).join("");
         return `<div style="display:flex;justify-content:flex-end;gap:6px;padding:2px 6px 6px" onclick="event.stopPropagation()">
-            <button type="button" class="chip" data-tip="Select every status for this view." onclick="statusDropdownSelectAll('${esc(config.id)}')">all</button>
-            <button type="button" class="chip" data-tip="Clear every status for this view -- hides every row until you re-select one." onclick="statusDropdownSelectNone('${esc(config.id)}')">none</button>
+            <button type="button" class="chip" data-tip="Select every ${esc(noun)} for this view." onclick="statusDropdownSelectAll('${esc(config.id)}')">all</button>
+            <button type="button" class="chip" data-tip="Clear every ${esc(noun)} for this view -- hides every row until you re-select one." onclick="statusDropdownSelectNone('${esc(config.id)}')">none</button>
           </div><div class="ctx-sep"></div>${rows}`;
       }
 

@@ -384,6 +384,7 @@
           if (taskTabFilters.status.size !== STATES.length) p.set("status", [...taskTabFilters.status].join(","));
           if (taskTabFilters.showHidden) p.set("hidden", "1");
           if (taskTabFilters.projects.size) p.set("project", [...taskTabFilters.projects].join(","));
+          if (taskTabAgentDefaulted) p.set("agent", [...taskTabFilters.agents].join(","));
           if (taskTabFilters.needsMe) p.set("needsme", "1");
           if (taskTabFilters.groupBySquad) p.set("group", "1");
           if (taskTabFilters.prStatus !== "any") p.set("prstatus", taskTabFilters.prStatus);
@@ -540,6 +541,9 @@
         const pstatus = p.get("status"); if (pstatus !== null) taskTabFilters.status = new Set(pstatus.split(",").filter(Boolean));
         taskTabFilters.showHidden = p.get("hidden") === "1";
         const pproject = p.get("project"); if (pproject !== null) taskTabFilters.projects = new Set(pproject.split(",").filter(Boolean));
+        const pagent = p.get("agent");
+        taskTabAgentDefaulted = pagent !== null;
+        if (pagent !== null) taskTabFilters.agents = new Set(pagent.split(",").filter(Boolean));
         taskTabFilters.needsMe = p.get("needsme") === "1";
         taskTabFilters.groupBySquad = p.get("group") === "1";
         const prstatus = p.get("prstatus");
@@ -770,15 +774,34 @@
         if (!reviewResolverDefaulted) reviewFilters.resolver = new Set(reviewResolverOptions());
       }
       /**
-       * Renders the Reviews sidebar's resolver-agent checkboxes.
+       * Builds the Reviews sidebar's Agent dropdown config (RAL-486, née the
+       * resolver-agent checkbox row) -- the shared multi-select Status
+       * dropdown (RAL-475), generalized to dotless options and "agent"
+       * tooltip wording. Options are the resolver-agent values currently
+       * present in `guardians`, sorted; see `reviewResolverOptions`.
+       * @returns {StatusDropdownConfig}
+       */
+      function reviewAgentDropdownConfig() {
+        return {
+          id: "reviews-agent",
+          label: "Agent",
+          mode: "multi",
+          itemNoun: "agent",
+          options: reviewResolverOptions().map((r) => ({ value: r, label: r })),
+          selected: reviewFilters.resolver,
+          optionTip: (r) => `Show or hide reviews resolved by ${r}.`,
+          onToggle: toggleReviewResolver,
+          onAll: () => allReviewResolver(true),
+          onNone: () => allReviewResolver(false),
+        };
+      }
+      /**
+       * Renders the Reviews sidebar's Agent dropdown (RAL-486).
        * @returns {void}
        */
       function renderReviewResolverFilters() {
-        const el = byId("review-resolver-filters");
         syncReviewResolverDefault();
-        const options = reviewResolverOptions();
-        el.innerHTML = options.map((r) => `<label data-tip="Show or hide reviews resolved by ${esc(r)}."><input type="checkbox" ${reviewFilters.resolver.has(r) ? "checked" : ""} onchange="toggleReviewResolver('${esc(r)}',this.checked)">${esc(r)}</label>`).join("")
-          + (options.length ? `<span class="chip" onclick="allReviewResolver(true)" data-tip="Show reviews from every resolver.">all</span><span class="chip" onclick="allReviewResolver(false)" data-tip="Hide all reviews — clear the resolver filter entirely.">none</span>` : "");
+        renderStatusDropdown("review-resolver-filters", reviewAgentDropdownConfig());
       }
       /**
        * Toggles one resolver agent in/out of the visible-reviews filter.

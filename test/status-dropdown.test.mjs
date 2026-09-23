@@ -243,6 +243,47 @@ test("single mode renders one radio row per option plus an 'any' row, alphabetic
   assert.ok(appleIdx < bananaIdx);
 });
 
+// ---------- RAL-486: generalization for the Agent dropdown ----------
+
+test("statusDropdownDot renders nothing for an option with no color, e.g. an agent name", () => {
+  const { statusDropdownDot } = makeStatusDropdown();
+  assert.equal(statusDropdownDot({ value: "claude-code", label: "claude-code" }), "");
+});
+
+test("statusDropdownDot still renders the colored dot for an option that has a color", () => {
+  const { statusDropdownDot } = makeStatusDropdown();
+  assert.match(statusDropdownDot({ value: "done", label: "Done", color: "--done" }), /class="dot"/);
+});
+
+test("multi-mode rows omit the dot markup entirely for dotless options", () => {
+  const { statusDropdownMultiRowsHtml, config } = makeStatusDropdown({
+    options: [
+      { value: "claude-code", label: "claude-code" },
+      { value: "codex", label: "codex" },
+    ],
+    selected: new Set(["claude-code", "codex"]),
+  });
+  const html = statusDropdownMultiRowsHtml(config);
+  assert.doesNotMatch(html, /class="dot"/);
+});
+
+test("itemNoun defaults to \"status\" so every pre-existing caller's tooltip wording is unchanged", () => {
+  const { statusDropdownMultiRowsHtml, statusDropdownTriggerTip, config } = makeStatusDropdown();
+  assert.match(statusDropdownTriggerTip(config), /every status --/);
+  const html = statusDropdownMultiRowsHtml(config);
+  assert.match(html, /Select every status for this view\./);
+  assert.match(html, /Clear every status for this view/);
+});
+
+test("itemNoun overrides the generic trigger/all/none tooltip wording, e.g. to \"agent\"", () => {
+  const { statusDropdownMultiRowsHtml, statusDropdownTriggerTip, config } = makeStatusDropdown({ label: "Agent" });
+  config.itemNoun = "agent";
+  assert.match(statusDropdownTriggerTip(config), /every agent --/);
+  const html = statusDropdownMultiRowsHtml(config);
+  assert.match(html, /Select every agent for this view\./);
+  assert.match(html, /Clear every agent for this view/);
+});
+
 test("statusDropdownSelectSingle fires onSelect and closes the menu", () => {
   const d = makeStatusDropdown({ mode: "single", selectedValue: null });
   d.renderStatusDropdown(d.containerId, d.config);

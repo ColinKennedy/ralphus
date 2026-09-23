@@ -837,6 +837,7 @@
             showTab("squads");
           } else if (h.tab === "tasks") {
             renderTtStatusFilters();
+            renderTtAgentFilter();
             if (h.uri) {
               const wantSel = taskTabSelFromUri(h.uri);
               if (wantSel) taskTabSel = wantSel; else pendingHash = h;
@@ -881,7 +882,7 @@
       });
       pendingHash = parseHash();
       loadTaskTabPrefs();
-      renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
+      renderStatusFilters(); renderSortChips(); renderTtStatusFilters(); renderTtAgentFilter(); renderReviewStatusFilters(); renderReviewResolverFilters(); renderReviewOriginFilters(); renderReviewPrStatusFilter();
       if (pendingHash && pendingHash.tab === "reviews") { showTab("reviews"); }  // keep pendingHash for pollReviews to apply guardianId
       else if (pendingHash && pendingHash.tab === "tasks") { showTab("tasks"); }  // keep pendingHash for pollTasksTab to apply the selection
       else if (pendingHash && pendingHash.tab === "resources") { pendingHash = null; showTab("resources"); }
