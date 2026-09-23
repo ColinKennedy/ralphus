@@ -2644,13 +2644,17 @@ fn run_cell_worker(
             executable: spec.executable.as_deref(),
             model: row.model.as_deref(),
         };
-        last_repair_result = Some(crate::remediation::run_repair_pass(
-            runner,
-            cancel,
-            &spec,
-            remediation_attempt,
-            &repair_agent,
-        ));
+        {
+            let guard = store.lock();
+            last_repair_result = Some(crate::remediation::run_repair_pass(
+                &guard,
+                runner,
+                cancel,
+                &spec,
+                remediation_attempt,
+                &repair_agent,
+            ));
+        }
         remediation_attempt += 1;
     };
     _permit = resumed_permit;
@@ -4267,12 +4271,14 @@ fn run_proofs(
                     executable: selection.executable.as_deref(),
                     model: repair_model,
                 };
+                let guard = store.lock();
                 // RAL-488 interview Q1: resolved once per proof step rather
                 // than hoisted to `run_proofs`'s top, since the vast majority
                 // of proof steps are `prompt`/`brain`/`approval` kinds that
                 // never touch remediation at all.
                 let vcs = crate::remediation::resolve_vcs_for_remediation(store, cwd);
                 let result: RunnerResult = crate::remediation::run_command_with_remediation(
+                    &guard,
                     runner,
                     cancel,
                     &runner_spec,
