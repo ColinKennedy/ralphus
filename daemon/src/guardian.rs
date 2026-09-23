@@ -390,6 +390,13 @@ pub struct BranchView {
     pub branch: String,
     /// Merge status string.
     pub merge_status: String,
+    /// Epoch milliseconds when an agent call in this review worktree will
+    /// retry after a provider rate limit, if currently delayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_until_ms: Option<i64>,
+    /// Safe explanation of the current provider delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_reason: Option<String>,
     /// Optional detail (e.g. conflict summary).
     pub detail: Option<String>,
     /// The review-owned branch stacked for this feature (copy; never the task's).
@@ -3488,6 +3495,32 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a review worktree as waiting for a provider-directed agent retry
+    /// without replacing its active rebase, proof, or feedback status.
+    pub fn mark_branch_delayed(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+        wake_at_ms: i64,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET delayed_until_ms=?, delayed_reason=? WHERE guardian_id=? AND id=?",
+            params![wake_at_ms, reason, guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clears the transient delay marker before the worktree agent resumes or
+    /// the owning rebase flow records a terminal result.
+    pub fn clear_branch_delayed(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET delayed_until_ms=NULL, delayed_reason=NULL WHERE guardian_id=? AND id=?",
+            params![guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
     /// RAL-375: persist feedback text as durably pending on a branch, before
     /// `guardian_merge::run_feedback` does any work -- so an unclean daemon
     /// shutdown mid-run leaves a record startup recovery can find and
@@ -4306,7 +4339,8 @@ impl Store {
                     gb.resolver_agent_session_id, gb.moved_from_guardian_id, gb.id,
                     gb.is_empty, s.machine AS source_cell_machine,
                     gb.env_overrides, gb.started_at_ms, gb.auto_submit_error,
-                    gb.readable_review_branch, gb.review_branch_name, gb.finished_at_ms
+                    gb.readable_review_branch, gb.review_branch_name, gb.finished_at_ms,
+                    gb.delayed_until_ms, gb.delayed_reason
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -4339,6 +4373,8 @@ impl Store {
                     position: r.get(0)?,
                     branch: r.get(1)?,
                     merge_status,
+                    delayed_until_ms: r.get(27)?,
+                    delayed_reason: r.get(28)?,
                     detail: r.get(3)?,
                     review_branch: r.get(4)?,
                     readable_review_branch: r.get::<_, i64>(24)? != 0,
@@ -5228,6 +5264,8 @@ mod tests {
             position: 0,
             branch: branch.to_string(),
             merge_status: merge_status.to_string(),
+            delayed_until_ms: None,
+            delayed_reason: None,
             detail: None,
             review_branch: None,
             readable_review_branch: true,

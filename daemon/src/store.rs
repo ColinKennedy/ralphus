@@ -217,6 +217,13 @@ pub struct ProofView {
     pub kind: String,
     /// Current state string.
     pub state: String,
+    /// Unix epoch milliseconds when this proof will retry after a provider
+    /// rate limit, or `None` while it is executing normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_until_ms: Option<i64>,
+    /// Safe summary of the provider retry delay currently being observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed_reason: Option<String>,
     /// Captured command output, once the proof step has run (CCTL-99).
     pub output: Option<String>,
     /// The step definition: command text, prompt text, or empty for brain/approval.
@@ -2852,6 +2859,10 @@ impl Store {
             // Cleared the moment the cell resumes (a successful retry) or
             // gives up (thrash), by `Store::clear_cell_delayed`.
             "ALTER TABLE cells ADD COLUMN delayed_until_ms INTEGER",
+            "ALTER TABLE proofs ADD COLUMN delayed_until_ms INTEGER",
+            "ALTER TABLE proofs ADD COLUMN delayed_reason TEXT",
+            "ALTER TABLE guardian_branches ADD COLUMN delayed_until_ms INTEGER",
+            "ALTER TABLE guardian_branches ADD COLUMN delayed_reason TEXT",
             // RAL-308: hard cumulative maximum-runtime cap in seconds, at
             // each of the three task-file scopes -- see
             // `ralphus_core::schema::TaskDef::maximum_timeout_seconds` /
@@ -4771,7 +4782,7 @@ impl Store {
         squad_id: &str,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -4784,23 +4795,25 @@ impl Store {
                         id: r.get::<_, Option<String>>(3)?,
                         kind: r.get::<_, String>(4)?,
                         state: r.get::<_, String>(5)?,
-                        output: r.get::<_, Option<String>>(6)?,
-                        spec: r.get::<_, String>(7)?,
-                        system_prompt: r.get::<_, Option<String>>(8)?,
-                        model: r.get::<_, Option<String>>(9)?,
-                        agent: r.get::<_, String>(10)?,
-                        agent_session_id: r.get::<_, Option<String>>(11)?,
-                        tokens_in: r.get::<_, i64>(12)?,
-                        tokens_out: r.get::<_, i64>(13)?,
-                        cost_usd: r.get::<_, f64>(14)?,
-                        env_overrides: from_json_map(&r.get::<_, String>(15)?),
-                        env_out_of_date: r.get::<_, bool>(16)?,
-                        cache_creation_tokens: r.get::<_, i64>(17)?,
-                        cache_read_tokens: r.get::<_, i64>(18)?,
-                        cost_is_estimated: r.get::<_, bool>(19)?,
-                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(20)?,
-                        compaction_input_tokens: r.get::<_, i64>(21)?,
-                        compaction_count: r.get::<_, i64>(22)?,
+                        delayed_until_ms: r.get::<_, Option<i64>>(6)?,
+                        delayed_reason: r.get::<_, Option<String>>(7)?,
+                        output: r.get::<_, Option<String>>(8)?,
+                        spec: r.get::<_, String>(9)?,
+                        system_prompt: r.get::<_, Option<String>>(10)?,
+                        model: r.get::<_, Option<String>>(11)?,
+                        agent: r.get::<_, String>(12)?,
+                        agent_session_id: r.get::<_, Option<String>>(13)?,
+                        tokens_in: r.get::<_, i64>(14)?,
+                        tokens_out: r.get::<_, i64>(15)?,
+                        cost_usd: r.get::<_, f64>(16)?,
+                        env_overrides: from_json_map(&r.get::<_, String>(17)?),
+                        env_out_of_date: r.get::<_, bool>(18)?,
+                        cache_creation_tokens: r.get::<_, i64>(19)?,
+                        cache_read_tokens: r.get::<_, i64>(20)?,
+                        cost_is_estimated: r.get::<_, bool>(21)?,
+                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(22)?,
+                        compaction_input_tokens: r.get::<_, i64>(23)?,
+                        compaction_count: r.get::<_, i64>(24)?,
                     },
                 ))
             })?
@@ -4820,7 +4833,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
+            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -4829,23 +4842,25 @@ impl Store {
                     id: r.get::<_, Option<String>>(0)?,
                     kind: r.get::<_, String>(1)?,
                     state: r.get::<_, String>(2)?,
-                    output: r.get::<_, Option<String>>(3)?,
-                    spec: r.get::<_, String>(4)?,
-                    system_prompt: r.get::<_, Option<String>>(5)?,
-                    model: r.get::<_, Option<String>>(6)?,
-                    agent: r.get::<_, String>(7)?,
-                    agent_session_id: r.get::<_, Option<String>>(8)?,
-                    tokens_in: r.get::<_, i64>(9)?,
-                    tokens_out: r.get::<_, i64>(10)?,
-                    cost_usd: r.get::<_, f64>(11)?,
-                    env_overrides: from_json_map(&r.get::<_, String>(12)?),
-                    env_out_of_date: r.get::<_, bool>(13)?,
-                    cache_creation_tokens: r.get::<_, i64>(14)?,
-                    cache_read_tokens: r.get::<_, i64>(15)?,
-                    cost_is_estimated: r.get::<_, bool>(16)?,
-                    maximum_tool_output_tokens: r.get::<_, Option<i64>>(17)?,
-                    compaction_input_tokens: r.get::<_, i64>(18)?,
-                    compaction_count: r.get::<_, i64>(19)?,
+                    delayed_until_ms: r.get::<_, Option<i64>>(3)?,
+                    delayed_reason: r.get::<_, Option<String>>(4)?,
+                    output: r.get::<_, Option<String>>(5)?,
+                    spec: r.get::<_, String>(6)?,
+                    system_prompt: r.get::<_, Option<String>>(7)?,
+                    model: r.get::<_, Option<String>>(8)?,
+                    agent: r.get::<_, String>(9)?,
+                    agent_session_id: r.get::<_, Option<String>>(10)?,
+                    tokens_in: r.get::<_, i64>(11)?,
+                    tokens_out: r.get::<_, i64>(12)?,
+                    cost_usd: r.get::<_, f64>(13)?,
+                    env_overrides: from_json_map(&r.get::<_, String>(14)?),
+                    env_out_of_date: r.get::<_, bool>(15)?,
+                    cache_creation_tokens: r.get::<_, i64>(16)?,
+                    cache_read_tokens: r.get::<_, i64>(17)?,
+                    cost_is_estimated: r.get::<_, bool>(18)?,
+                    maximum_tool_output_tokens: r.get::<_, Option<i64>>(19)?,
+                    compaction_input_tokens: r.get::<_, i64>(20)?,
+                    compaction_count: r.get::<_, i64>(21)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8967,6 +8982,41 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET delayed_until_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
             params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Marks one proof step as waiting for a provider-directed retry.
+    pub fn mark_proof_delayed(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+        wake_at_ms: i64,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET delayed_until_ms=?, delayed_reason=? WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![wake_at_ms, reason, squad_id, task_idx, scope, cell_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Clears one proof step's transient provider-delay marker before retrying
+    /// or recording its terminal result.
+    pub fn clear_proof_delayed(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE proofs SET delayed_until_ms=NULL, delayed_reason=NULL WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+            params![squad_id, task_idx, scope, cell_idx, idx],
         )?;
         Ok(())
     }

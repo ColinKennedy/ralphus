@@ -224,6 +224,7 @@ fn run_agent_with_rate_limit_retry(
     spec: &mut RunnerSpec,
     runner: &dyn Runner,
     cancel: &CancelToken,
+    delayed_branch: Option<(&crate::store_lock::StoreHandle, &str, &str)>,
 ) -> crate::runner::RunnerResult {
     let max_retries = crate::config::resolve(Path::new(&spec.cwd)).provider_timeout_max_retries();
     let mut retries = 0u32;
@@ -255,6 +256,9 @@ fn run_agent_with_rate_limit_retry(
         // handling elsewhere in the merge flow picks this up exactly like it
         // would have from an unwrapped `run_cancellable` call.
         if !attempt.is_rate_limited() || cancel.is_cancelled() {
+            if let Some((store, guardian_id, branch_id)) = delayed_branch {
+                let _ = store.lock().clear_branch_delayed(guardian_id, branch_id);
+            }
             let mut merged = attempt;
             merged.tokens_in = total_tokens_in;
             merged.tokens_out = total_tokens_out;
@@ -268,6 +272,9 @@ fn run_agent_with_rate_limit_retry(
         }
 
         if retries >= max_retries {
+            if let Some((store, guardian_id, branch_id)) = delayed_branch {
+                let _ = store.lock().clear_branch_delayed(guardian_id, branch_id);
+            }
             // ralphus[ignore-rlog-pair]: retry helper has no Store; its caller records the resulting review outcome
             crate::rlog!(
                 WARNING,
@@ -314,6 +321,16 @@ fn run_agent_with_rate_limit_retry(
             retries,
             max_retries,
         );
+        if let Some((store, guardian_id, branch_id)) = delayed_branch {
+            let wake_at_ms = crate::store::now_ms() + retry_after.as_millis() as i64;
+            let reason = format!(
+                "Provider rate limit; retry after {} seconds ({retries}/{max_retries})",
+                retry_after.as_secs()
+            );
+            let _ = store
+                .lock()
+                .mark_branch_delayed(guardian_id, branch_id, wake_at_ms, &reason);
+        }
         if crate::scheduler::sleep_out_rate_limit_retry(retry_after, cancel) {
             // Cancelled mid-wait -- return the rate-limited attempt as-is
             // (usage merged in) rather than spawning one more agent call;
@@ -328,7 +345,13 @@ fn run_agent_with_rate_limit_retry(
             merged.compaction_count = total_compaction_count;
             merged.cost_usd = total_cost_usd;
             merged.turns = total_turns;
+            if let Some((store, guardian_id, branch_id)) = delayed_branch {
+                let _ = store.lock().clear_branch_delayed(guardian_id, branch_id);
+            }
             return merged;
+        }
+        if let Some((store, guardian_id, branch_id)) = delayed_branch {
+            let _ = store.lock().clear_branch_delayed(guardian_id, branch_id);
         }
         spec.resume_agent_session_id = attempt
             .agent_session_id
@@ -1871,7 +1894,7 @@ fn synthesize_proof_instructions(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
     // `Result`) -- a budget already exceeded here is caught on the very next
     // call in `resolve_conflicts_with_agent`'s own loop.
@@ -2441,7 +2464,12 @@ fn resolve_conflicts_with_agent(
         // branch's Live-View start time (COALESCE so the fix pass, fired first
         // within this attempt, wins over the final-proof call that may follow).
         let _ = store.lock().stamp_branch_started_at(id, branch_id);
-        let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+        let result = run_agent_with_rate_limit_retry(
+            &mut spec,
+            runner,
+            cancel,
+            Some((store, id, branch_id)),
+        );
         // The fix pass has actually finished running -- stamp the branch's
         // Live-View end time regardless of outcome (a final-proof call, if
         // one follows, overwrites this with its own later finish time; see
@@ -2787,7 +2815,12 @@ fn run_final_proof(
     // started a fix pass keeps that (earlier) start; one that went straight to
     // proof (clean rebase) gets stamped here.
     let _ = store.lock().stamp_branch_started_at(id, branch_id);
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     // The final-proof call has actually finished running -- overwrites the
     // fix pass's own finish time above, since this call runs later within
     // the same attempt (see `Store::stamp_branch_finished_at`'s doc comment).
@@ -5975,7 +6008,12 @@ fn run_commit_step(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);
     let after_sha = wt
         .git(&["rev-parse", "HEAD"])
@@ -6362,7 +6400,12 @@ pub fn run_feedback(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(
+        &mut spec,
+        runner,
+        cancel,
+        Some((store, id, branch_id)),
+    );
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into
@@ -8176,7 +8219,7 @@ fn run_review_auto_build(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
     let ok = result.is_done();
     let _ = store
@@ -10919,7 +10962,7 @@ fn generate_manual_commands(
         }),
     );
     let started = std::time::Instant::now();
-    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel);
+    let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
     // Generation has actually finished running -- stamp the guardian-level
     // Live-View end time regardless of outcome, mirroring the started-at stamp
     // above (plain overwrite, so a regeneration always shows the latest run's

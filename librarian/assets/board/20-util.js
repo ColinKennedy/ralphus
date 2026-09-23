@@ -483,20 +483,22 @@
        * `delayedUntilMs` is the cell's own `delayed_until_ms` field (present
        * only while genuinely delayed).
        * @param {number|null|undefined} delayedUntilMs
+       * @param {string} [reason]
        * @returns {string}
        */
-      const delayedBadge = (delayedUntilMs) => delayedUntilMs
-        ? ` <span class="pill p-delayed" data-tip="This cell hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\nWho/when: the agent backend (Pi) reported a recognized, retryable 429 with a suggested delay; the daemon will resume the same agent session on its own once the delay elapses.\nRepeated rate limits in quick succession (3 within 2 turns) are treated as a real failure instead of retrying forever.">⏳ delayed — resumes in ~${fmtRelativeAge(Math.max(0, delayedUntilMs - Date.now()))}</span>`
+      const delayedBadge = (delayedUntilMs, reason = "") => delayedUntilMs
+        ? ` <span class="pill p-delayed" data-tip="This work hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\n${esc(reason || "The agent backend reported a recognized, retryable rate limit.")}\nThe daemon will resume the same agent session on its own once the delay elapses. Repeated rate limits exhaust the retry budget and fail normally.">⏳ delayed — resumes in ~${fmtRelativeAge(Math.max(0, delayedUntilMs - Date.now()))}</span>`
         : "";
       /**
        * Compact "delayed" badge (RAL-435) for the graph tree's cell node,
        * where space is tight — same signal and tooltip as {@link delayedBadge},
        * just the bare word instead of the full explanatory label.
        * @param {number|null|undefined} delayedUntilMs
+       * @param {string} [reason]
        * @returns {string}
        */
-      const delayedGraphBadge = (delayedUntilMs) => delayedUntilMs
-        ? ` <span class="pill p-delayed" data-tip="This cell hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\nWho/when: the agent backend (Pi) reported a recognized, retryable 429 with a suggested delay; the daemon will resume the same agent session on its own once the delay elapses.\nRepeated rate limits in quick succession (3 within 2 turns) are treated as a real failure instead of retrying forever.">delayed</span>`
+      const delayedGraphBadge = (delayedUntilMs, reason = "") => delayedUntilMs
+        ? ` <span class="pill p-delayed" data-tip="This work hit a provider rate limit and is automatically waiting out its suggested retry delay — it is not stuck, no action is needed.\n${esc(reason || "The agent backend reported a recognized, retryable rate limit.")}">delayed</span>`
         : "";
       /** @type {{[key: string]: ("task"|"cell"|"proof")[]}} */
       const GRAPH_NODE_ACTION_COMPAT = {
@@ -853,4 +855,3 @@
           setTimeout(() => { btn.textContent = "⧉"; btn.classList.remove("copied"); }, 1200);
         } catch (_) { btn.textContent = "✗"; setTimeout(() => { btn.textContent = "⧉"; }, 1200); }
       }
-

@@ -6,6 +6,8 @@
        * @property {string|null} id
        * @property {string} kind - "command" | "prompt" | "brain" | "approval"
        * @property {string} state - "pending" | "running" | "done" | "failed" | "cancelled"
+       * @property {number|null} [delayed_until_ms] - Epoch-ms when an agent-backed proof step will automatically retry after a provider rate limit; absent otherwise.
+       * @property {string|null} [delayed_reason] - Safe provider-delay summary shown while `delayed_until_ms` is set.
        * @property {string|null} output
        * @property {string} spec
        * @property {string|null} [system_prompt]
@@ -191,6 +193,8 @@
        * @property {string} [name]
        * @property {string} [project]
        * @property {string} [merge_status] - "pending" | "in_progress" | "done" | "proof_pending" | "conflict_resolved" | "failed" | "merged" | ...
+       * @property {number|null} [delayed_until_ms] - Epoch-ms when this review worktree's agent call will retry after a provider rate limit.
+       * @property {string|null} [delayed_reason] - Safe provider-delay summary shown while `delayed_until_ms` is set.
        * @property {string} [moved_from_guardian_id]
        * @property {string} [source_squad_id]
        * @property {number} [source_task_idx]
