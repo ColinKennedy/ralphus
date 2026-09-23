@@ -106,6 +106,7 @@ pub fn run_command_with_remediation(
     let mut attempt = 1u32;
     let mut last_repair_result: Option<RunnerResult> = None;
     while !result.is_done() && attempt < total_attempts && !cancel.is_cancelled() {
+        // ralphus[ignore-rlog-pair]: this module-level orchestrator has no Store access; the Runner's own Cartographer implementation records reattach/timeout/cost-limit events for inline commands
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} command attempt {attempt}/{total_attempts} \
@@ -177,6 +178,19 @@ pub(crate) fn resolve_vcs_for_remediation(
                 "ralphus [remediation] could not resolve a vcs adapter for {cwd}, remediation \
                  retries will run without a clean-slate worktree snapshot: {e}"
             );
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "remediation",
+                message: "could not resolve vcs adapter for remediation retries",
+                scope: Some("remediation"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({"cwd": cwd, "error": e.to_string()}),
+                admin_only: false,
+            });
             None
         }
     }
@@ -196,6 +210,7 @@ pub(crate) fn snapshot_worktree_before_retries(
     match vcs.snapshot_worktree(Path::new(&command_spec.cwd), &dir) {
         Ok(()) => Some(dir),
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: VCS snapshot failure is a best-effort integrity concern logged for diagnostics; the remediation loop degrades gracefully and proceeds without snapshot/restore
             crate::rlog!(
                 WARNING,
                 "ralphus [remediation] squad={} task={} cell={} could not snapshot the worktree \
@@ -225,6 +240,7 @@ pub(crate) fn restore_worktree_before_repair(
     attempt: u32,
 ) {
     if let Err(e) = vcs.restore_worktree(Path::new(&command_spec.cwd), snapshot_dir) {
+        // ralphus[ignore-rlog-pair]: VCS restore failure within retry loop is best-effort recovery; the loop continues to the next repair pass attempt without snapshot/restore
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} could not restore the worktree \
@@ -393,6 +409,7 @@ pub(crate) fn run_repair_pass(
 
     let result = runner.run_cancellable(&spec, cancel);
     if !result.is_done() {
+        // ralphus[ignore-rlog-pair]: repair pass failure is a best-effort diagnostic for the retry loop; the orchestrator decides pass/fail by re-running the configured command
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} repair pass {attempt} did not \
