@@ -3305,7 +3305,9 @@ fn health_report(daemon: &Daemon) -> Reply {
 /// Deliberately local-only; see [`health_sweep::HealthSweepState::refresh_now`]'s
 /// doc comment for why a remote-target counterpart isn't part of this route.
 fn health_report_refresh(daemon: &Daemon) -> Reply {
-    let report = daemon.health_sweep_handle().refresh_now();
+    let report = daemon
+        .health_sweep_handle()
+        .refresh_now(&daemon.store_handle());
     json(
         200,
         &serde_json::json!({
@@ -14975,7 +14977,7 @@ pub fn serve<A: ToSocketAddrs>(
     // RAL-416: hourly (configurable) sweep of every Free-tier, daemon-local
     // health check -- see `crate::health_sweep`'s module doc comment for
     // why it's scoped to a subset of the catalog.
-    crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle());
+    crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle(), daemon.store_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,

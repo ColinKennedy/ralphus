@@ -641,6 +641,16 @@ impl DaemonClient {
         self.get("/api/machines/targets/health")
     }
 
+    /// This daemon's cached hourly Free-tier sweep report (RAL-416/RAL-485),
+    /// including its `claude-command`/`codex-command`/`pi-command` checks --
+    /// evaluated inside the daemon process against its own database-backed
+    /// backend-command overrides, environment, and PATH, so `ralphus check
+    /// health` never disagrees with the board's Health/Agents tabs about
+    /// these backends' availability.
+    pub fn health_report(&self) -> Result<Value, DaemonError> {
+        self.get("/api/health/report")
+    }
+
     pub fn get_machine(&self, scheme: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/machines/{scheme}"))
     }

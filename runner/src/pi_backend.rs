@@ -2,15 +2,15 @@
 //! parsing its JSONL event stream on stdout.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::backend::{BackendError, BackendOutcome, ModelBackend, RunOptions};
-use crate::cli_agent_common::{live_session_path, write_live_session_id};
+use crate::cli_agent_common::{BackendCommandHealth, live_session_path, write_live_session_id};
 use crate::mcp_init::{
     self, McpFileEdit, McpFileEditMode, McpInitializationPlan, McpInitializer, McpThirdPartyInstall,
 };
@@ -1552,6 +1552,138 @@ fn tail(text: &str, limit: usize) -> String {
     }
 }
 
+/// RAL-485: the minimum Pi harness version Ralphus supports invoking.
+const MIN_PI_VERSION: (u64, u64, u64) = (0, 85, 1);
+
+/// RAL-485: how long [`diagnose_pi_command`]'s `--version` probe waits before
+/// the child is killed and the check reported as a timeout failure.
+const PI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Diagnoses a configured Pi launcher (RAL-485): a complex (shell-routed)
+/// command is reported [`BackendCommandHealth::skip`] without being executed
+/// (delegated to [`crate::cli_agent_common::diagnose_command`], which also
+/// resolves/executability-checks a direct one). A direct command that
+/// resolves is additionally probed with `<resolved> --version` (a five-second
+/// timeout) and its parsed version compared against [`MIN_PI_VERSION`] --
+/// a missing executable, a nonzero/timed-out/unparseable `--version`, or a
+/// below-minimum version are all reported as distinct `fail` details so an
+/// operator can tell them apart.
+#[must_use]
+pub fn diagnose_pi_command(command: &str) -> BackendCommandHealth {
+    let base = crate::cli_agent_common::diagnose_command(command);
+    if base.status != "pass" {
+        return base;
+    }
+    // `diagnose_command`'s `pass` detail is the resolved path (see its own
+    // doc comment) -- reused here rather than re-resolving.
+    let resolved_path = base.detail.clone();
+    match run_pi_version_probe(&resolved_path, PI_VERSION_TIMEOUT) {
+        Err(detail) => BackendCommandHealth::fail(command, detail),
+        Ok(output) => match parse_pi_version(&output) {
+            None => BackendCommandHealth::fail(
+                command,
+                format!(
+                    "could not parse a Pi version from {resolved_path} --version output: {}",
+                    output.trim()
+                ),
+            ),
+            Some(version) if version >= MIN_PI_VERSION => BackendCommandHealth {
+                status: "pass",
+                effective_command: command.to_string(),
+                detail: format!(
+                    "{resolved_path} version {}.{}.{}",
+                    version.0, version.1, version.2
+                ),
+                version: Some(format!("{}.{}.{}", version.0, version.1, version.2)),
+            },
+            Some(version) => BackendCommandHealth {
+                status: "fail",
+                effective_command: command.to_string(),
+                detail: format!(
+                    "{resolved_path} version {}.{}.{} is older than the required {}.{}.{}",
+                    version.0,
+                    version.1,
+                    version.2,
+                    MIN_PI_VERSION.0,
+                    MIN_PI_VERSION.1,
+                    MIN_PI_VERSION.2
+                ),
+                version: Some(format!("{}.{}.{}", version.0, version.1, version.2)),
+            },
+        },
+    }
+}
+
+/// Runs `<resolved_path> --version`, draining stdout/stderr on background
+/// threads while polling for exit so the read side can never deadlock behind
+/// a filled pipe buffer, and killing the child once `timeout` elapses without
+/// a natural exit. Returns the combined stdout+stderr text on a zero exit.
+fn run_pi_version_probe(resolved_path: &str, timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new(resolved_path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run {resolved_path} --version: {error}"))?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => return Err(format!("{resolved_path} --version: {error}")),
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{resolved_path} --version did not exit within {timeout:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("{resolved_path} --version exited with {status}"));
+    }
+    Ok(format!("{stdout}{stderr}"))
+}
+
+/// Extracts the first `major.minor.patch` version-shaped token from
+/// `--version` output (e.g. `"pi coding agent v0.85.1\n"` -> `(0, 85, 1)`).
+fn parse_pi_version(output: &str) -> Option<(u64, u64, u64)> {
+    output
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find_map(|candidate| {
+            let mut components = candidate.split('.');
+            Some((
+                components.next()?.parse().ok()?,
+                components.next()?.parse().ok()?,
+                components.next()?.parse().ok()?,
+            ))
+        })
+}
+
 #[allow(clippy::print_stdout)]
 fn print_header(model: Option<&str>, workspace: &Workspace) {
     println!(
@@ -1597,6 +1729,49 @@ fn print_thinking_line(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── diagnose_pi_command / parse_pi_version (RAL-485) ───────────────────
+
+    #[test]
+    fn parse_pi_version_accepts_surrounding_pi_output() {
+        assert_eq!(
+            parse_pi_version("pi coding agent v0.85.1\n"),
+            Some((0, 85, 1))
+        );
+        assert_eq!(parse_pi_version("version 1.2.3-beta"), Some((1, 2, 3)));
+        assert_eq!(parse_pi_version("no version here"), None);
+    }
+
+    #[test]
+    fn diagnose_pi_command_skips_a_compound_command_without_executing_it() {
+        let health = diagnose_pi_command("rez-env foo -- pi");
+        assert_eq!(health.status, "skip");
+        assert_eq!(health.effective_command, "rez-env foo -- pi");
+        assert_eq!(health.version, None);
+    }
+
+    #[test]
+    fn diagnose_pi_command_fails_a_command_that_does_not_resolve() {
+        let health = diagnose_pi_command("definitely-not-a-real-pi-ral485");
+        assert_eq!(health.status, "fail");
+        assert_eq!(health.effective_command, "definitely-not-a-real-pi-ral485");
+        assert_eq!(health.version, None);
+    }
+
+    /// `false` ignores all arguments (including the hard-coded `--version`
+    /// this probe always appends) and always exits nonzero -- mimics a
+    /// `--version` probe that runs but fails, distinct from "does not
+    /// resolve at all". Unix-only: there is no equally reliable cross-platform
+    /// "always exits nonzero regardless of args" program to probe.
+    #[cfg(unix)]
+    #[test]
+    fn run_pi_version_probe_reports_a_nonzero_exit() {
+        let Some(resolved) = ralphus_core::process::which("false") else {
+            return; // environment lacks `false`; nothing to assert
+        };
+        let result = run_pi_version_probe(&resolved, Duration::from_secs(5));
+        assert!(result.is_err(), "{result:?}");
+    }
 
     #[test]
     fn real_config_dir_uses_pis_default_when_the_env_override_is_unset() {

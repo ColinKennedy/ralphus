@@ -83,6 +83,99 @@ pub fn preflight_default_program(
     Ok(())
 }
 
+/// One backend command's health-probe result (RAL-485): the shared shape
+/// behind the daemon's Health tab, its Agents tab, and `ralphus check
+/// health`, so every surface reports the identical effective command and
+/// verdict rather than three independently-drifting implementations.
+///
+/// `effective_command` always carries the command exactly as configured
+/// (a database override, an env-var override, or the compiled default) --
+/// never a resolved absolute path -- so a complex command is shown to an
+/// operator exactly as authored. `detail` carries the human-readable
+/// resolution/failure text.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BackendCommandHealth {
+    pub status: &'static str,
+    pub effective_command: String,
+    pub detail: String,
+    /// Populated only by a backend whose health probe also reports a
+    /// version (Pi) and only once a version was actually parsed.
+    pub version: Option<String>,
+}
+
+impl BackendCommandHealth {
+    #[must_use]
+    pub fn skip(command: &str) -> Self {
+        Self {
+            status: "skip",
+            effective_command: command.to_string(),
+            detail: "complex (shell-routed) command; only a live run can confirm it actually \
+                      works, so this is displayed without being executed"
+                .to_string(),
+            version: None,
+        }
+    }
+
+    #[must_use]
+    pub fn pass(command: &str, detail: impl Into<String>) -> Self {
+        Self {
+            status: "pass",
+            effective_command: command.to_string(),
+            detail: detail.into(),
+            version: None,
+        }
+    }
+
+    #[must_use]
+    pub fn fail(command: &str, detail: impl Into<String>) -> Self {
+        Self {
+            status: "fail",
+            effective_command: command.to_string(),
+            detail: detail.into(),
+            version: None,
+        }
+    }
+}
+
+/// Diagnoses a backend's fully-resolved launcher (RAL-485): a single
+/// executable token is checked for disk/PATH accessibility and
+/// executability; a complex (shell-routed) command is reported
+/// [`BackendCommandHealth::skip`], displaying the effective command but never
+/// executed -- a health probe must never run arbitrary shell syntax.
+///
+/// Unlike [`preflight_default_program`] (which always skips a *configured*
+/// override, since validating it would mean running arbitrary shell syntax
+/// during dispatch-time gating), this always evaluates a direct single-token
+/// command -- configured or not -- since a health probe is explicitly
+/// expected to spend that check. Reuses the same
+/// `ralphus_core::process` resolution/executability helpers the daemon's
+/// health sweep already established as canonical for this exact purpose, so
+/// a database-stored backend command and an env-var/default one are judged
+/// identically.
+#[must_use]
+pub fn diagnose_command(command: &str) -> BackendCommandHealth {
+    if is_compound_command(command) {
+        return BackendCommandHealth::skip(command);
+    }
+    let path = ralphus_core::process::unquote_path(command);
+    let resolved = if Path::new(&path).components().count() > 1 {
+        path.clone()
+    } else {
+        ralphus_core::process::which(&path).unwrap_or_else(|| path.clone())
+    };
+    let resolved_path = Path::new(&resolved);
+    if !resolved_path.is_file() {
+        return BackendCommandHealth::fail(
+            command,
+            format!("{path} does not resolve to an executable file"),
+        );
+    }
+    if !ralphus_core::process::is_executable(resolved_path) {
+        return BackendCommandHealth::fail(command, format!("{resolved} is not executable"));
+    }
+    BackendCommandHealth::pass(command, resolved)
+}
+
 fn task_prompts_dir() -> PathBuf {
     ralphus_state_dir().join("task_prompts")
 }
@@ -169,5 +262,42 @@ mod tests {
         let p2 = write_prompt_file("hello world").unwrap();
         assert_eq!(p1, p2);
         std::fs::remove_file(&p1).ok();
+    }
+
+    // ── diagnose_command (RAL-485) ─────────────────────────────────────────
+
+    #[test]
+    fn diagnose_command_skips_a_compound_command_without_executing_it() {
+        let health = diagnose_command("rez-env foo -- claude");
+        assert_eq!(health.status, "skip");
+        assert_eq!(health.effective_command, "rez-env foo -- claude");
+    }
+
+    #[test]
+    fn diagnose_command_fails_a_direct_command_that_does_not_resolve() {
+        let health = diagnose_command("definitely-not-a-real-program-ral485");
+        assert_eq!(health.status, "fail");
+        assert_eq!(
+            health.effective_command,
+            "definitely-not-a-real-program-ral485"
+        );
+    }
+
+    #[test]
+    fn diagnose_command_passes_a_direct_command_known_to_resolve() {
+        // `cargo`/`rustc` must be on PATH for this test itself to have run.
+        let health = diagnose_command("cargo");
+        assert_eq!(health.status, "pass", "{health:?}");
+        assert_eq!(health.effective_command, "cargo");
+    }
+
+    #[test]
+    fn diagnose_command_reports_a_quoted_path_as_its_own_effective_command() {
+        let health = diagnose_command("\"definitely-not-a-real-program-ral485\"");
+        assert_eq!(health.status, "fail");
+        assert_eq!(
+            health.effective_command,
+            "\"definitely-not-a-real-program-ral485\""
+        );
     }
 }

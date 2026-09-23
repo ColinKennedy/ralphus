@@ -24,8 +24,6 @@
 //! own tests) -- never by filtering a dynamically-assembled list, so an
 //! `OnDemand` or `Remote` catalog entry can never accidentally end up here.
 
-use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +31,12 @@ use ralphus_core::health_catalog::{
     ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_GH, ID_GIT, ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA,
     ID_PI_COMMAND, ID_RUNNER, ID_TMUX,
 };
-use ralphus_core::process::{is_compound_shell_command, is_executable, unquote_path, which};
+use ralphus_core::process::which;
+use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
+use ralphus_runner::pi_backend;
+
+use crate::store::Store;
+use crate::store_lock::StoreHandle;
 
 const PASS: &str = "pass";
 const WARN: &str = "warn";
@@ -112,13 +115,15 @@ impl HealthSweepState {
 
     /// Runs [`run_sweep`] immediately (rather than waiting for the next
     /// scheduled pass) and caches the result -- backs the board's "check
-    /// now" affordance for this daemon's own row. Deliberately the *only*
+    /// now" affordance for this daemon's own row (both the Health tab's own
+    /// button and, RAL-485, the Agents tab's Refresh/Save/Reset actions, so
+    /// every surface stays on the same evaluation). Deliberately the *only*
     /// on-demand re-check this module exposes: it re-runs the same
     /// Free-tier, daemon-local subset the background sweep always runs,
     /// never a remote target (that would be the still-undecided "remote
     /// check-now API shape" -- see RAL-416's own report).
-    pub fn refresh_now(&self) -> SweepReport {
-        let report = run_sweep();
+    pub fn refresh_now(&self, store: &StoreHandle) -> SweepReport {
+        let report = run_sweep(store);
         self.set(report.clone());
         report
     }
@@ -234,133 +239,107 @@ fn check_ollama() -> SweepCheck {
     }
 }
 
-fn resolved_agent_command(command: &str) -> Option<String> {
-    let path = unquote_path(command);
-    let resolved = if path.contains(['/', '\\']) {
-        path
-    } else {
-        which(&path)?
-    };
-    is_executable(Path::new(&resolved)).then_some(resolved)
+/// RAL-485: this backend's currently-stored `agent_backend_commands`
+/// override, if any -- the highest-precedence source in the resolution order
+/// a real cell dispatch already uses (`agent_profiles::resolve_agent_for_path_with`):
+/// database override, then daemon environment override, then compiled
+/// default. A short, read-only store access -- callers hold the lock only
+/// long enough to read this, never across the slower probing below.
+fn backend_command_override(store: &Store, backend: &str) -> Option<String> {
+    store
+        .list_agent_backend_commands()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.backend == backend)
+        .map(|c| c.command)
 }
 
-fn check_agent_command(id: &'static str, env_var: &str, default_program: &str) -> SweepCheck {
-    let (command, source) = match std::env::var(env_var) {
-        Ok(command) => (command, format!("${env_var}")),
-        Err(_) => (default_program.to_string(), "default".to_string()),
-    };
-    if is_compound_shell_command(&command) {
-        return SweepCheck {
-            id,
-            status: PASS,
-            detail: format!("compound shell command, not executable-checked: {command}"),
-        };
-    }
-    match resolved_agent_command(&command) {
-        Some(path) => SweepCheck {
-            id,
-            status: PASS,
-            detail: format!("{path} ({source})"),
-        },
-        None => SweepCheck {
-            id,
-            status: FAIL,
-            detail: format!("{source} command '{command}' does not resolve to an executable file"),
-        },
-    }
+/// The three overridable backends' current `agent_backend_commands` rows,
+/// snapshotted under one short store lock so the (potentially slow, up to
+/// five seconds for Pi's `--version` probe) checks below never run while
+/// holding it. Mirrors `agent_profiles::AgentDbSnapshot::load`'s "read once,
+/// then release" shape.
+struct AgentCommandOverrides {
+    claude_code: Option<String>,
+    codex: Option<String>,
+    pi: Option<String>,
 }
 
-fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
-    output
-        .split(|character: char| !character.is_ascii_digit() && character != '.')
-        .find_map(|candidate| {
-            let mut components = candidate.split('.');
-            Some((
-                components.next()?.parse().ok()?,
-                components.next()?.parse().ok()?,
-                components.next()?.parse().ok()?,
-            ))
-        })
-}
-
-#[must_use]
-fn supported_pi_version(version: (u64, u64, u64)) -> bool {
-    version >= (0, 85, 1)
-}
-
-fn check_pi_command() -> SweepCheck {
-    let (command, source) = match std::env::var("RALPHUS_PI_COMMAND") {
-        Ok(command) => (command, "$RALPHUS_PI_COMMAND".to_string()),
-        Err(_) => ("pi".to_string(), "default".to_string()),
-    };
-    if is_compound_shell_command(&command) {
-        return SweepCheck {
-            id: ID_PI_COMMAND,
-            status: PASS,
-            detail: format!(
-                "compound shell command, not executable- or version-checked: {command}"
-            ),
-        };
-    }
-    let Some(path) = resolved_agent_command(&command) else {
-        return SweepCheck {
-            id: ID_PI_COMMAND,
-            status: FAIL,
-            detail: format!("{source} command '{command}' does not resolve to an executable file"),
-        };
-    };
-    match Command::new(&path).arg("--version").output() {
-        Err(error) => SweepCheck {
-            id: ID_PI_COMMAND,
-            status: FAIL,
-            detail: format!("could not run {path} --version: {error}"),
-        },
-        Ok(output) if !output.status.success() => SweepCheck {
-            id: ID_PI_COMMAND,
-            status: FAIL,
-            detail: format!("{path} --version exited with {}", output.status),
-        },
-        Ok(output) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            match parse_version(&text) {
-                Some(version) if supported_pi_version(version) => SweepCheck {
-                    id: ID_PI_COMMAND,
-                    status: PASS,
-                    detail: format!(
-                        "{path} version {}.{}.{} ({source})",
-                        version.0, version.1, version.2
-                    ),
-                },
-                Some(version) => SweepCheck {
-                    id: ID_PI_COMMAND,
-                    status: FAIL,
-                    detail: format!(
-                        "{path} version {}.{}.{} is older than required 0.85.1",
-                        version.0, version.1, version.2
-                    ),
-                },
-                None => SweepCheck {
-                    id: ID_PI_COMMAND,
-                    status: FAIL,
-                    detail: format!(
-                        "could not parse a Pi version from {path} --version output: {}",
-                        text.trim()
-                    ),
-                },
-            }
+impl AgentCommandOverrides {
+    fn load(store: &Store) -> Self {
+        Self {
+            claude_code: backend_command_override(store, "claude-code"),
+            codex: backend_command_override(store, "codex"),
+            pi: backend_command_override(store, "pi"),
         }
     }
 }
 
+/// Resolves one backend's effective command and a human-readable source
+/// label, in precedence order: database override (already snapshotted into
+/// `db_override`), then `env_var`, then `default_program` -- the identical
+/// order a real cell dispatch resolves through
+/// (`agent_profiles::resolve_agent_for_path_with`), so this check reports
+/// exactly what a real cell would invoke.
+fn resolve_effective_command(
+    db_override: Option<&str>,
+    env_var: &str,
+    default_program: &str,
+) -> (String, String) {
+    if let Some(command) = db_override {
+        return (command.to_string(), "database override".to_string());
+    }
+    match std::env::var(env_var) {
+        Ok(command) => (command, format!("${env_var}")),
+        Err(_) => (default_program.to_string(), "default".to_string()),
+    }
+}
+
+/// Diagnoses one already-resolved backend command (RAL-485): a compound
+/// (shell-routed) command is reported `skip` and displayed as-is, never
+/// executed; a direct command is checked for disk/PATH accessibility and
+/// executability, with Pi additionally version-checked against the
+/// supported minimum. `pub(crate)` and taking an already-resolved command
+/// (not a backend id/env var) so `agent_profiles::check_db_profiles_health`
+/// can reuse the identical evaluation for a database-stored backend command
+/// override -- previously a second, divergent implementation there took the
+/// first whitespace-delimited token of the command and resolved only that,
+/// silently mis-evaluating any command with arguments.
+pub(crate) fn diagnose_backend_command(backend: &str, command: &str) -> BackendCommandHealth {
+    if backend == "pi" {
+        pi_backend::diagnose_pi_command(command)
+    } else {
+        cli_agent_common::diagnose_command(command)
+    }
+}
+
+fn check_backend_command(
+    id: &'static str,
+    backend: &str,
+    db_override: Option<&str>,
+    env_var: &str,
+    default_program: &str,
+) -> SweepCheck {
+    let (command, source) = resolve_effective_command(db_override, env_var, default_program);
+    let health = diagnose_backend_command(backend, &command);
+    SweepCheck {
+        id,
+        status: health.status,
+        detail: format!("{} (source: {source}, command: {command})", health.detail),
+    }
+}
+
 /// Runs every check in [`SWEEP_CATALOG_IDS`] and returns the resulting
-/// report -- does not itself touch [`HealthSweepState`], so tests can call
-/// this without needing a state handle.
+/// report. Takes a [`StoreHandle`] only to snapshot the current
+/// `agent_backend_commands` overrides under one short lock
+/// ([`AgentCommandOverrides::load`]) -- released well before any of the
+/// slower external probing below (a Pi `--version` probe alone can take up
+/// to five seconds), so this never holds the store lock across a live
+/// subprocess/network check the way a naive `store.lock()`-for-the-whole-call
+/// would.
 #[must_use]
-pub fn run_sweep() -> SweepReport {
+pub fn run_sweep(store: &StoreHandle) -> SweepReport {
+    let overrides = AgentCommandOverrides::load(&store.lock());
     let checks = vec![
         check_git(),
         check_tmux(),
@@ -369,9 +348,27 @@ pub fn run_sweep() -> SweepReport {
         check_glab(),
         check_nvidia_smi(),
         check_ollama(),
-        check_agent_command(ID_CLAUDE_COMMAND, "RALPHUS_CLAUDE_COMMAND", "claude"),
-        check_agent_command(ID_CODEX_COMMAND, "RALPHUS_CODEX_COMMAND", "codex"),
-        check_pi_command(),
+        check_backend_command(
+            ID_CLAUDE_COMMAND,
+            "claude-code",
+            overrides.claude_code.as_deref(),
+            "RALPHUS_CLAUDE_COMMAND",
+            "claude",
+        ),
+        check_backend_command(
+            ID_CODEX_COMMAND,
+            "codex",
+            overrides.codex.as_deref(),
+            "RALPHUS_CODEX_COMMAND",
+            "codex",
+        ),
+        check_backend_command(
+            ID_PI_COMMAND,
+            "pi",
+            overrides.pi.as_deref(),
+            "RALPHUS_PI_COMMAND",
+            "pi",
+        ),
     ];
     debug_assert_eq!(
         checks.len(),
@@ -393,8 +390,8 @@ pub fn run_sweep() -> SweepReport {
 /// rationale as every other startup-plus-interval sweep in
 /// `crate::scheduler`), so a freshly (re)started daemon has a report
 /// available immediately rather than waiting a full interval.
-pub fn spawn_health_sweep(state: HealthSweepState) {
-    state.set(run_sweep());
+pub fn spawn_health_sweep(state: HealthSweepState, store: StoreHandle) {
+    state.set(run_sweep(&store));
     std::thread::spawn(move || {
         loop {
             let cfg = crate::config::load_health_sweep_config();
@@ -402,7 +399,7 @@ pub fn spawn_health_sweep(state: HealthSweepState) {
             if !cfg.enabled() {
                 continue;
             }
-            state.set(run_sweep());
+            state.set(run_sweep(&store));
         }
     });
 }
@@ -411,6 +408,12 @@ pub fn spawn_health_sweep(state: HealthSweepState) {
 mod tests {
     use super::*;
     use ralphus_core::health_catalog;
+
+    fn test_store_handle() -> StoreHandle {
+        std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().expect("open in-memory store"),
+        ))
+    }
 
     #[test]
     fn every_swept_id_is_free_and_daemon_local_in_the_catalog() {
@@ -432,38 +435,87 @@ mod tests {
 
     #[test]
     fn run_sweep_produces_one_check_per_swept_id() {
-        let report = run_sweep();
+        let report = run_sweep(&test_store_handle());
         let ids: Vec<&str> = report.checks.iter().map(|c| c.id).collect();
         for id in SWEEP_CATALOG_IDS {
             assert!(ids.contains(id), "missing check for {id}");
         }
     }
 
-    #[test]
-    fn parse_version_accepts_surrounding_pi_output() {
-        assert_eq!(parse_version("pi coding agent v0.85.1\n"), Some((0, 85, 1)));
-        assert_eq!(parse_version("version 1.2.3-beta"), Some((1, 2, 3)));
-        assert_eq!(parse_version("no version here"), None);
-    }
+    // ── RAL-485: precedence, skip semantics, and the DB-override wiring ────
 
     #[test]
-    fn pi_version_comparison_requires_0851() {
-        assert!(supported_pi_version((0, 85, 1)));
-        assert!(supported_pi_version((0, 86, 0)));
-        assert!(supported_pi_version((1, 0, 0)));
-        assert!(!supported_pi_version((0, 85, 0)));
-        assert!(!supported_pi_version((0, 84, 9)));
-    }
-
-    #[test]
-    fn compound_agent_commands_are_reported_without_execution() {
-        let result = check_agent_command(
+    fn compound_agent_commands_are_reported_as_skip_without_execution() {
+        let result = check_backend_command(
             ID_CLAUDE_COMMAND,
-            "RALPHUS_TEST_MISSING_AGENT_COMMAND_RAL484",
+            "claude-code",
+            None,
+            "RALPHUS_TEST_MISSING_AGENT_COMMAND_RAL485",
             "wrapper claude",
         );
-        assert_eq!(result.status, PASS);
-        assert!(result.detail.contains("wrapper claude"));
+        assert_eq!(result.status, "skip");
+        assert!(result.detail.contains("wrapper claude"), "{result:?}");
+    }
+
+    #[test]
+    fn database_override_takes_precedence_over_env_and_default() {
+        let (command, source) = resolve_effective_command(
+            Some("db-claude"),
+            "RALPHUS_TEST_ENV_RAL485_PRECEDENCE",
+            "claude",
+        );
+        assert_eq!(command, "db-claude");
+        assert_eq!(source, "database override");
+    }
+
+    #[test]
+    fn default_program_is_used_when_neither_database_nor_env_override_is_set() {
+        let (command, source) = resolve_effective_command(
+            None,
+            "RALPHUS_TEST_ENV_RAL485_ALMOST_CERTAINLY_UNSET",
+            "claude",
+        );
+        assert_eq!(command, "claude");
+        assert_eq!(source, "default");
+    }
+
+    #[test]
+    fn database_override_reaches_the_check_via_agent_command_overrides() {
+        let store = Store::open_in_memory().expect("open in-memory store");
+        store
+            .set_agent_backend_command("claude-code", "rez-env foo -- claude")
+            .expect("set backend command override");
+        let overrides = AgentCommandOverrides::load(&store);
+        assert_eq!(
+            overrides.claude_code.as_deref(),
+            Some("rez-env foo -- claude")
+        );
+        let result = check_backend_command(
+            ID_CLAUDE_COMMAND,
+            "claude-code",
+            overrides.claude_code.as_deref(),
+            "RALPHUS_CLAUDE_COMMAND",
+            "claude",
+        );
+        // A compound database override is skipped, never executed -- and the
+        // effective command shown is the override, not the env/default.
+        assert_eq!(result.status, "skip");
+        assert!(
+            result.detail.contains("rez-env foo -- claude"),
+            "{result:?}"
+        );
+        assert!(result.detail.contains("database override"), "{result:?}");
+    }
+
+    #[test]
+    fn diagnose_backend_command_routes_pi_through_the_pi_specific_probe() {
+        // A nonexistent program: both paths fail, but only the Pi one's
+        // failure text can ever mention a version -- this just proves the
+        // dispatch reaches `pi_backend::diagnose_pi_command`, not that a
+        // real version check ran (no real `pi` binary in a test env).
+        let health = diagnose_backend_command("pi", "definitely-not-a-real-pi-ral485");
+        assert_eq!(health.status, "fail");
+        assert_eq!(health.effective_command, "definitely-not-a-real-pi-ral485");
     }
 
     #[test]

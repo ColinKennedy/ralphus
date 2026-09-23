@@ -170,70 +170,69 @@ pub fn unquote_path(value: &str) -> String {
     ralphus_core::process::unquote_path(value)
 }
 
-fn check_agent_command(name: &str, env_var: &str, default_program: &str) -> CheckResult {
-    check_agent_command_for(name, env_var, default_program, std::env::var(env_var).ok())
-}
-
-fn check_agent_command_for(
-    name: &str,
-    env_var: &str,
-    default_program: &str,
-    override_command: Option<String>,
+/// Delegates to `GET /api/health/report` (RAL-485): the daemon's cached
+/// hourly Free-tier sweep already resolves the effective command (a
+/// database override, then an env-var override, then the compiled default --
+/// the identical precedence a real cell dispatch uses) and evaluates it --
+/// checking a direct command's disk/PATH accessibility and executability
+/// (Pi additionally version-checked), or reporting a complex command as
+/// `skip` without executing it. Delegating here, rather than
+/// re-implementing the same resolution/probing client-side (as this CLI used
+/// to, ignorant of any database override), is what keeps `ralphus check
+/// health` from ever disagreeing with the daemon's Health/Agents tabs about
+/// these three backends.
+fn check_agent_command_via_daemon(
+    daemon_url: &str,
+    id: &'static str,
+    display_name: &str,
 ) -> CheckResult {
-    let (raw, source) = match override_command {
-        Some(command) => (command, format!("${env_var}")),
-        None => (default_program.to_string(), "default".to_string()),
+    let client = DaemonClient::new(daemon_url);
+    let response = match client.health_report() {
+        Ok(response) => response,
+        Err(e) => {
+            return CheckResult::harness(
+                display_name,
+                FAIL,
+                format!("could not reach daemon to check {display_name}: {e}"),
+                "Tasks using this backend cannot be validated.",
+                "Ensure the daemon is reachable, then re-run this check.",
+            );
+        }
     };
-    if is_compound_shell_command(&raw) {
+    let checks = response["checks"].as_array().cloned().unwrap_or_default();
+    let Some(check) = checks.iter().find(|c| c["id"].as_str() == Some(id)) else {
         return CheckResult::harness(
-            name,
+            display_name,
+            FAIL,
+            "the daemon has not completed a health sweep yet",
+            "Tasks using this backend cannot be validated until the daemon's sweep completes.",
+            "Wait for the daemon's hourly sweep (or POST /api/health/report/refresh), then re-run this check.",
+        );
+    };
+    let detail = check["detail"].as_str().unwrap_or_default().to_string();
+    match check["status"].as_str() {
+        Some("pass") => CheckResult::harness(
+            display_name,
             PASS,
-            format!("compound shell command, not executable-checked: {raw}"),
+            detail,
+            "Tasks using this backend can start.",
+            "No action needed.",
+        ),
+        Some("skip") => CheckResult::harness(
+            display_name,
+            SKIP,
+            detail,
             "The command is a shell pipeline/multi-word invocation, so only a live run can confirm it actually works.",
             "No action needed; verify by running a task with this backend.",
-        )
-        .with_provenance(source);
-    }
-    let path = unquote_path(&raw);
-    let explicit_path = Path::new(&path);
-    let resolved = if explicit_path.components().count() > 1 {
-        path.clone()
-    } else {
-        which(&path).unwrap_or(path.clone())
-    };
-    let resolved_path = Path::new(&resolved);
-    if !resolved_path.is_file() {
-        return CheckResult::harness(
-            name,
+        ),
+        _ => CheckResult::harness(
+            display_name,
             FAIL,
-            format!("{path} does not resolve to an executable file"),
-            format!(
-                "Tasks using this backend cannot start; {source} command '{path}' is unavailable."
-            ),
-            format!("Install {path}, put it on PATH, or set ${env_var} to a real executable."),
-        )
-        .with_provenance(source);
+            detail,
+            "Tasks using this backend cannot start.",
+            "See the detail above and fix the effective command (a database override, an env-var override, or the compiled default).",
+        ),
     }
-    if !is_executable(resolved_path) {
-        return CheckResult::harness(
-            name,
-            FAIL,
-            format!("{resolved} is not executable"),
-            format!(
-                "Tasks using this backend cannot start; {source} command '{path}' is not executable."
-            ),
-            format!("Make {resolved} executable, or set ${env_var} to a real executable."),
-        )
-        .with_provenance(source);
-    }
-    CheckResult::harness(
-        name,
-        PASS,
-        resolved,
-        "Tasks using this backend can start.",
-        "No action needed.",
-    )
-    .with_provenance(source)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -1568,15 +1567,17 @@ pub fn run_checks(
     results.push(check_gh().with_id(ID_GH));
     results.push(check_glab().with_id(ID_GLAB));
     results.push(
-        check_agent_command("claude-command", "RALPHUS_CLAUDE_COMMAND", "claude")
+        check_agent_command_via_daemon(daemon_url, ID_CLAUDE_COMMAND, "claude-command")
             .with_id(ID_CLAUDE_COMMAND),
     );
     results.push(
-        check_agent_command("codex-command", "RALPHUS_CODEX_COMMAND", "codex")
+        check_agent_command_via_daemon(daemon_url, ID_CODEX_COMMAND, "codex-command")
             .with_id(ID_CODEX_COMMAND),
     );
-    results
-        .push(check_agent_command("pi-command", "RALPHUS_PI_COMMAND", "pi").with_id(ID_PI_COMMAND));
+    results.push(
+        check_agent_command_via_daemon(daemon_url, ID_PI_COMMAND, "pi-command")
+            .with_id(ID_PI_COMMAND),
+    );
 
     results.push(check_config(cwd).with_id(ID_CONFIG));
     results.push(check_max_concurrent(cwd).with_id(ID_DAEMON_MAX_CONCURRENT));
@@ -1667,26 +1668,19 @@ mod tests {
     }
 
     #[test]
-    fn check_agent_command_fails_when_default_is_unavailable() {
-        let result = check_agent_command_for(
-            "x-command",
-            "RALPHUS_TEST_UNSET_AGENT_VAR_XYZ",
-            "definitely-not-a-real-agent-program-ral484",
-            None,
+    fn check_agent_command_via_daemon_fails_when_the_daemon_is_unreachable() {
+        let result = check_agent_command_via_daemon(
+            "http://127.0.0.1:1",
+            ralphus_core::health_catalog::ID_CLAUDE_COMMAND,
+            "claude-command",
         );
         assert_eq!(result.status, FAIL);
-        assert!(result.detail.contains("does not resolve"));
-    }
-
-    #[test]
-    fn check_agent_command_is_harness_section() {
-        let result = check_agent_command_for(
-            "x-command",
-            "RALPHUS_TEST_UNSET_AGENT_VAR_HARNESS",
-            "definitely-not-a-real-agent-program-ral484",
-            None,
-        );
         assert_eq!(result.section, HARNESS);
+        assert!(
+            result.detail.contains("could not reach daemon"),
+            "{}",
+            result.detail
+        );
     }
 
     #[test]

@@ -8,6 +8,50 @@
       const AGENT_NATIVE_BACKENDS = ["claude", "anthropic", "ollama"];
       /** Backends with a global, admin-editable command override — mirrors `agent_profiles::command_overridable_backend`. */
       const AGENT_OVERRIDABLE_BACKENDS = ["claude-code", "codex", "pi"];
+      /** Maps an overridable backend name to its Health tab catalog check id (RAL-485) — the same `GET /api/health/report` result both tabs render, so they can never disagree.
+       * @type {Record<string, string>} */
+      const AGENT_BACKEND_HEALTH_CHECK_ID = { "claude-code": "claude-command", "codex": "codex-command", "pi": "pi-command" };
+      /** @type {Map<string, {id: string, status: string, detail: string}>} Keyed by health-catalog check id, from the daemon's cached sweep report (RAL-485). */
+      let agentBackendHealth = new Map();
+
+      /**
+       * Polls `/api/health/report` (the same cached daemon sweep the Health
+       * tab reads) and extracts the built-in backends' health (RAL-485), so
+       * the Agents tab's claude-code/codex/pi rows show the identical
+       * pass/fail/skip status without triggering a live re-check on every
+       * poll tick.
+       * @returns {Promise<void>}
+       */
+      async function pollAgentBackendHealth() {
+        try {
+          const d = await (await fetch("/api/health/report")).json();
+          const checks = /** @type {{id: string, status: string, detail: string}[]} */ (d.checks || []);
+          agentBackendHealth = new Map(checks.map((c) => [c.id, c]));
+          renderAgentBackendCommands();
+        } catch (e) {
+          // Supplementary badge only -- a failed fetch here just means no
+          // badge renders; pollAgentBackendCommands already surfaces a
+          // genuinely unreachable daemon via markUnreachable().
+        }
+      }
+
+      /**
+       * Re-runs the daemon's Free-tier health sweep immediately
+       * (`POST /api/health/report/refresh`) and re-polls this tab's backend
+       * health, so an explicit Refresh or a command Save/Reset shows an
+       * up-to-date status right away instead of waiting for the next hourly
+       * sweep (RAL-485).
+       * @returns {Promise<void>}
+       */
+      async function refreshAgentBackendHealth() {
+        try {
+          await fetch("/api/health/report/refresh", { method: "POST" });
+        } catch (e) {
+          // Best-effort -- pollAgentBackendHealth below still shows whatever
+          // the daemon has cached even if this particular refresh failed.
+        }
+        await pollAgentBackendHealth();
+      }
 
       /**
        * Polls `/api/agent-profiles` and re-renders the profile list.
@@ -42,11 +86,14 @@
       }
 
       /**
-       * Reloads both the agent profile list and the backend command overrides.
+       * Reloads the agent profile list, the backend command overrides, and
+       * (RAL-485) forces an immediate re-check of the built-in backends'
+       * health rather than waiting for the next hourly sweep -- this is the
+       * Agents tab's own explicit "Refresh" action.
        * @returns {Promise<void>}
        */
       async function refreshAgentsTab() {
-        await Promise.all([pollAgentBackendCommands(), pollAgentProfiles()]);
+        await Promise.all([pollAgentBackendCommands(), pollAgentProfiles(), refreshAgentBackendHealth()]);
       }
 
       /**
@@ -64,6 +111,25 @@
       }
 
       /**
+       * Renders a built-in backend's health badge (RAL-485), sourced from
+       * the same `GET /api/health/report` cache the Health tab renders --
+       * so the two tabs can never disagree about a claude-code/codex/pi
+       * row's pass/fail/skip status. A missing entry (no sweep has
+       * completed yet) shows a muted "not checked" placeholder rather than
+       * a false pass or fail.
+       * @param {string} backend
+       * @returns {string}
+       */
+      function agentBackendHealthBadgeHtml(backend) {
+        const checkId = AGENT_BACKEND_HEALTH_CHECK_ID[backend];
+        const check = checkId ? agentBackendHealth.get(checkId) : undefined;
+        if (!check) {
+          return `<span class="dot" style="background:${cvar("--muted")}"></span> <span style="color:var(--muted)" data-tip="No health sweep has completed yet for this backend.">not checked</span>`;
+        }
+        return `<span data-tip="${esc(check.detail)}">${healthStatusBadge(check.status)}</span>`;
+      }
+
+      /**
        * Renders one built-in backend's command-override row: a read-only
        * summary, or (once editing starts) an inline edit form with its
        * blast-radius list of affected profiles.
@@ -75,6 +141,7 @@
         if (agentBackendCommandEditing !== backend) {
           return `<tr>
             <td class="mono">${esc(backend)}</td>
+            <td>${agentBackendHealthBadgeHtml(backend)}</td>
             <td>${override ? `<span class="mono">${esc(override.command)}</span>` : `<span style="color:var(--muted)">(built-in default)</span>`}</td>
             <td style="color:var(--muted)">${override ? fmtProjCreated(override.updated_at_ms) : "—"}</td>
             <td>
@@ -89,6 +156,7 @@
           : `<div style="color:var(--muted);font-size:11px;margin-top:4px">Loading affected profiles…</div>`;
         return `<tr>
           <td class="mono">${esc(backend)}</td>
+          <td>${agentBackendHealthBadgeHtml(backend)}</td>
           <td colspan="2">
             <input id="agent-backend-command-input" type="text" class="mono" style="width:100%" value="${esc(override ? override.command : "")}" placeholder="(built-in default command)" data-tip="The command invoked for every agent profile selecting the ${esc(backend)} backend. Applies globally on Save." />
             ${blastHtml}
@@ -155,7 +223,7 @@
         }
         agentBackendCommandEditing = null;
         agentBackendCommandBlastRadius = null;
-        await pollAgentBackendCommands();
+        await Promise.all([pollAgentBackendCommands(), refreshAgentBackendHealth()]);
       }
 
       /**
@@ -171,7 +239,7 @@
         } catch (e) {
           agentBackendCommandsError = "daemon unreachable";
         }
-        await pollAgentBackendCommands();
+        await Promise.all([pollAgentBackendCommands(), refreshAgentBackendHealth()]);
       }
 
       /**
@@ -190,6 +258,7 @@
           : "";
         const table = `<table class="proj-table"><thead><tr>
             <th data-tip="Built-in backend name. Only claude-code, codex, and pi have a global, admin-editable invoked-command override -- claude/anthropic/ollama are native backends with nothing to override, and raw takes a per-profile executable instead of a shared command.">Backend</th>
+            <th data-tip="This backend's health, from the same daemon sweep the Health tab shows (RAL-485). A single-executable-token command is checked for disk/PATH accessibility and executability (Pi also version-checked); a complex, shell-routed command is shown as \"skip\" without being executed.">Health</th>
             <th data-tip="The command invoked for every agent profile selecting this backend. \"(built-in default)\" means no override is stored.">Invoked command</th>
             <th data-tip="When this override was last saved.">Updated</th>
             <th></th>
