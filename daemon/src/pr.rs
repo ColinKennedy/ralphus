@@ -8012,6 +8012,8 @@ mod tests {
             position,
             branch: id.to_string(),
             merge_status: "ready".to_string(),
+            delayed_until_ms: None,
+            delayed_reason: None,
             detail: None,
             review_branch: None,
             readable_review_branch: true,

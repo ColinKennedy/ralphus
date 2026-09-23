@@ -2815,12 +2815,8 @@ fn run_final_proof(
     // started a fix pass keeps that (earlier) start; one that went straight to
     // proof (clean rebase) gets stamped here.
     let _ = store.lock().stamp_branch_started_at(id, branch_id);
-    let result = run_agent_with_rate_limit_retry(
-        &mut spec,
-        runner,
-        cancel,
-        Some((store, id, branch_id)),
-    );
+    let result =
+        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
     // The final-proof call has actually finished running -- overwrites the
     // fix pass's own finish time above, since this call runs later within
     // the same attempt (see `Store::stamp_branch_finished_at`'s doc comment).
@@ -6008,12 +6004,8 @@ fn run_commit_step(
         allow_personal_memory: false,
         maximum_timeout: None,
     };
-    let result = run_agent_with_rate_limit_retry(
-        &mut spec,
-        runner,
-        cancel,
-        Some((store, id, branch_id)),
-    );
+    let result =
+        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback-commit", &result);
     let after_sha = wt
         .git(&["rev-parse", "HEAD"])
@@ -6400,12 +6392,8 @@ pub fn run_feedback(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result = run_agent_with_rate_limit_retry(
-        &mut spec,
-        runner,
-        cancel,
-        Some((store, id, branch_id)),
-    );
+    let result =
+        run_agent_with_rate_limit_retry(&mut spec, runner, cancel, Some((store, id, branch_id)));
     let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
     // RAL-395: the resolver's own verdict, before we know whether anything it
     // did actually ended up committed -- combined with `committed` below into

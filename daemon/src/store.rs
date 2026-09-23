@@ -8987,6 +8987,7 @@ impl Store {
     }
 
     /// Marks one proof step as waiting for a provider-directed retry.
+    #[allow(clippy::too_many_arguments)]
     pub fn mark_proof_delayed(
         &self,
         squad_id: &str,
