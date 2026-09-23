@@ -15,7 +15,6 @@
 
 use crate::cancel::CancelToken;
 use crate::runner::{Runner, RunnerResult, RunnerSpec};
-use crate::store::Store;
 
 /// Fixed, code-authored system prompt for every remediation pass. Mirrors
 /// `guardian_merge.rs`'s `CONFLICT_RESOLVER_SYSTEM_PROMPT` precedent: a
@@ -72,7 +71,6 @@ pub struct RepairAgent<'a> {
 /// command's own session and stays individually inspectable on the board.
 #[must_use]
 pub fn run_command_with_remediation(
-    store: &Store,
     runner: &dyn Runner,
     cancel: &CancelToken,
     command_spec: &RunnerSpec,
@@ -85,22 +83,15 @@ pub fn run_command_with_remediation(
     let mut result = runner.run_cancellable(command_spec, cancel);
     let mut attempt = 1u32;
     while !result.is_done() && attempt < total_attempts && !cancel.is_cancelled() {
-        let message =
-            format!("command attempt {attempt}/{total_attempts} failed, starting repair pass");
-        crate::cartographer::Note::new("remediation")
-            .level(crate::logging::LogLevel::WARNING)
-            .squad(&command_spec.squad_id)
-            .cell(&command_spec.cell_id)
-            .task(&command_spec.task)
-            .emit(
-                store,
-                &message,
-                serde_json::json!({
-                    "attempt": attempt,
-                    "total_attempts": total_attempts,
-                }),
-            );
-        run_repair_pass(store, runner, cancel, command_spec, attempt, repair_agent);
+        crate::rlog!(
+            WARNING,
+            "ralphus [remediation] squad={} task={} cell={} command attempt {attempt}/{total_attempts} \
+             failed, starting repair pass",
+            command_spec.squad_id,
+            command_spec.task,
+            command_spec.cell_id,
+        );
+        run_repair_pass(runner, cancel, command_spec, attempt, repair_agent);
         if cancel.is_cancelled() {
             break;
         }
@@ -135,7 +126,6 @@ pub(crate) fn resolve_total_attempts(mode: &str, remediation_attempts: Option<u3
 /// retries the command anyway, since the only thing that actually decides
 /// pass/fail is the next command execution.
 pub(crate) fn run_repair_pass(
-    store: &Store,
     runner: &dyn Runner,
     cancel: &CancelToken,
     command_spec: &RunnerSpec,
@@ -193,21 +183,15 @@ pub(crate) fn run_repair_pass(
 
     let result = runner.run_cancellable(&spec, cancel);
     if !result.is_done() {
-        let error_detail = result.error.as_deref().unwrap_or("no detail");
-        let message = format!("repair pass {attempt} did not complete cleanly");
-        crate::cartographer::Note::new("remediation")
-            .level(crate::logging::LogLevel::WARNING)
-            .squad(&command_spec.squad_id)
-            .cell(&command_spec.cell_id)
-            .task(&command_spec.task)
-            .emit(
-                store,
-                &message,
-                serde_json::json!({
-                    "attempt": attempt,
-                    "error": error_detail,
-                }),
-            );
+        crate::rlog!(
+            WARNING,
+            "ralphus [remediation] squad={} task={} cell={} repair pass {attempt} did not \
+             complete cleanly: {}",
+            command_spec.squad_id,
+            command_spec.task,
+            command_spec.cell_id,
+            result.error.as_deref().unwrap_or("no detail"),
+        );
     }
 }
 
@@ -322,11 +306,9 @@ mod tests {
 
     #[test]
     fn succeeds_on_first_attempt_no_repair_invoked() {
-        let store = crate::store::Store::open_in_memory().unwrap();
         let runner = ScriptedRunner::new(vec![done()]);
         let spec = command_spec("squad-1", "cell-1", "exit 0");
         let result = run_command_with_remediation(
-            &store,
             &runner,
             &CancelToken::never(),
             &spec,
@@ -344,11 +326,9 @@ mod tests {
 
     #[test]
     fn raw_mode_never_remediates_even_after_failure() {
-        let store = crate::store::Store::open_in_memory().unwrap();
         let runner = ScriptedRunner::new(vec![failed(), failed(), failed()]);
         let spec = command_spec("squad-1", "cell-1", "exit 1");
         let result = run_command_with_remediation(
-            &store,
             &runner,
             &CancelToken::never(),
             &spec,
@@ -367,11 +347,9 @@ mod tests {
     #[test]
     fn remediates_and_retries_until_success() {
         // attempt 1 (command) fails -> repair pass runs -> attempt 2 (command) succeeds.
-        let store = crate::store::Store::open_in_memory().unwrap();
         let runner = ScriptedRunner::new(vec![failed(), done(), done()]);
         let spec = command_spec("squad-1", "cell-1", "cargo build");
         let result = run_command_with_remediation(
-            &store,
             &runner,
             &CancelToken::never(),
             &spec,
@@ -405,11 +383,9 @@ mod tests {
 
     #[test]
     fn exhausts_attempts_and_fails() {
-        let store = crate::store::Store::open_in_memory().unwrap();
         let runner = ScriptedRunner::new(vec![failed(), failed(), failed()]);
         let spec = command_spec("squad-1", "cell-1", "cargo build");
         let result = run_command_with_remediation(
-            &store,
             &runner,
             &CancelToken::never(),
             &spec,
@@ -430,7 +406,6 @@ mod tests {
 
     #[test]
     fn repair_prompt_points_at_the_captured_file_instead_of_inlining_it() {
-        let store = crate::store::Store::open_in_memory().unwrap();
         let _guard = TestRootGuard::new("remediation-repair-prompt");
         let spec = command_spec("squad-2", "cell-2", "cargo test");
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
@@ -446,7 +421,6 @@ mod tests {
 
         let runner = ScriptedRunner::new(vec![failed(), done(), done()]);
         let result = run_command_with_remediation(
-            &store,
             &runner,
             &CancelToken::never(),
             &spec,
