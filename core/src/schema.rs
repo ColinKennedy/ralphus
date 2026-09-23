@@ -969,22 +969,6 @@ pub const COMMAND_MODE_RAW: &str = "raw";
 /// Every accepted `mode` literal, in the order shown to a user.
 pub const COMMAND_MODE_VALUES: &[&str] = &[COMMAND_MODE_REMEDIATING, COMMAND_MODE_RAW];
 
-/// The effective command mode for a cell: its own [`CellDef::mode`], or
-/// [`COMMAND_MODE_REMEDIATING`] when unset -- there is no task-level `mode`
-/// to inherit from (unlike `agent`/`model`/`share_session`), since a task has
-/// no `command` field of its own.
-#[must_use]
-pub fn resolve_cell_command_mode(cell: &CellDef) -> &str {
-    cell.mode.as_deref().unwrap_or(COMMAND_MODE_REMEDIATING)
-}
-
-/// The effective command mode for a proof step. See
-/// [`resolve_cell_command_mode`].
-#[must_use]
-pub fn resolve_proof_command_mode(step: &ProofStep) -> &str {
-    step.mode.as_deref().unwrap_or(COMMAND_MODE_REMEDIATING)
-}
-
 /// If `id` is a new-review placeholder (`ralphus:new-review/<key>`), return its
 /// `<key>` trimmed of surrounding whitespace. Returns `None` for a plain id or a
 /// non-matching scheme, or when the key is empty.
