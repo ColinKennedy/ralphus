@@ -891,6 +891,15 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         const autoFixError = p.auto_fix_error
           ? `<div class="row" style="margin-top:4px"><span class="badge" style="color:var(--failed);border-color:var(--failed);font-size:11px" data-tip="Automatic CI fixing has stopped for this PR/MR to prevent repeated pushes and CI runs.\nWho/when: use Action Feedback when a person has reviewed the failure and wants an explicit retry.">${esc(p.auto_fix_error)}</span></div>`
           : "";
+        // RAL-509: surface the latest auto-fix outcome even when it isn't an
+        // error -- e.g. "deferred_no_worktree"/"deferred_backoff" explain why
+        // a failing PR got no auto-fix attempt yet, which `auto_fix_error`
+        // (only set once the campaign has fully stopped) does not cover.
+        // Suppressed once `auto_fix_error` is already shown so a permanently
+        // stopped PR doesn't show two overlapping badges.
+        const autoFixOutcome = p.state === "open" && p.auto_fix_last_outcome && !p.auto_fix_error
+          ? `<div class="row" style="margin-top:4px"><span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="Latest unattended CI auto-fix outcome for this PR/MR.\nWhy: explains whether/why an automatic fix attempt ran for the most recent CI failure, even when nothing else here indicates a reason.">auto-fix: ${esc(p.auto_fix_last_outcome)}</span></div>`
+          : "";
         const ciTip = p.state === "open" && p.ci_status
           ? ` data-tip="CI/CD status: ${esc(p.ci_status)}. Right-click to refresh its status or pull in feedback."`
           : ` data-tip="Right-click to refresh its status or pull in feedback."`;
@@ -902,6 +911,7 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             </div>
             ${drift}
             ${autoFixError}
+            ${autoFixOutcome}
           </div>`;
       }
       /**

@@ -2513,6 +2513,31 @@ auto_fix_max_attempts = 3
 auto_fix_retry_base_seconds = 60
 ```
 
+PR responses also include `auto_fix_last_outcome` (RAL-509): the reason
+unattended auto-fix did or did not act on the most recent CI failure it saw
+for this PR, e.g. `"deferred_no_worktree"` (this PR's branch has no review
+worktree yet — a still-collecting stack whose restack hasn't reached it),
+`"deferred_upstream_failing"` (a ready-but-failing sibling earlier in the
+stack is fixed first, so downstream fixes aren't wasted work), `"deferred_backoff"`,
+`"exhausted"`, `"auto_fix_dispatching"`, or `"auto_fix_passed"`/`"auto_fix_failed"`
+once the resolver has run. It is cleared back to `null` whenever `ci_status`
+turns `"passing"`. Unlike `auto_fix_error`, this is populated for every
+outcome the poll reaches — including a merely-deferred one, not just a
+terminal failure — so a PR that never got auto-fixed still has a legible
+reason on the board/CLI rather than only a DEBUG Cartographer row.
+
+The standing poll (`ci_watch::poll_open_pr_ci_status`) is the *only* path
+that dispatches auto-fix, and it now also runs for a review whose guardian
+status is still `collecting` (RAL-509) — restricted to CI-only work: it
+refreshes `ci_status` and may call `dispatch_pr_auto_fix`, but none of
+`review_maintenance`'s other work (base-shift rebuilds, manual-push rebases,
+remote-PR-commit sync) runs for a `collecting` guardian, since those assume a
+settled stack that collection hasn't produced yet. `ci_watch::start_ci_watch`
+(the short-lived watch kicked off right after a PR is submitted) and
+`POST .../refresh-ci` (below) both only ever refresh `ci_status` — neither
+calls `dispatch_pr_auto_fix`, regardless of guardian status; dispatch is
+exclusively the standing poll's job.
+
 ### `GET /api/pull-requests/forge-cache-index`
 RAL-366: a flat, single-query index of every PR's *cached* forge state — the
 background poller's most recent observation of un-actioned reviewer feedback

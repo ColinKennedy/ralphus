@@ -161,6 +161,10 @@ pub struct PullRequestView {
     /// never changes with stack reordering and it's meant to be closed, not
     /// merged.
     pub pr_kind: String,
+    /// RAL-509: the latest reason unattended auto-fix did or did not run for
+    /// this PR -- see [`Store::set_pr_auto_fix_outcome`]. Intentionally
+    /// exposed to the board/CLI, the same way [`Self::auto_fix_error`] is.
+    pub auto_fix_last_outcome: Option<String>,
 }
 
 /// One past "submit a stack" call for a review (RAL-302): every PR row that
@@ -281,6 +285,7 @@ struct PrRow {
     auto_fix_exhausted_notified_at_ms: Option<i64>,
     draft: Option<bool>,
     pr_kind: String,
+    auto_fix_last_outcome: Option<String>,
 }
 
 impl From<PrRow> for PullRequestView {
@@ -314,11 +319,12 @@ impl From<PrRow> for PullRequestView {
             auto_fix_exhausted_notified_at_ms: r.auto_fix_exhausted_notified_at_ms,
             draft: r.draft,
             pr_kind: r.pr_kind,
+            auto_fix_last_outcome: r.auto_fix_last_outcome,
         }
     }
 }
 
-const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft, auto_fix_exhausted_notified_at_ms, pr_kind, auto_fix_attempt_count, auto_fix_next_attempt_at_ms, auto_fix_error";
+const PR_COLUMNS: &str = "id, guardian_id, branch_id, forge, repo, branch_alias, base_ref, title, description, pr_number, pr_url, state, created_at_ms, updated_at_ms, last_pushed_sha, last_pushed_base_ref, stack_id, dropped_reason, superseded_by, ci_status, ci_failure_job_url, auto_fix_attempted_at_ms, draft, auto_fix_exhausted_notified_at_ms, pr_kind, auto_fix_attempt_count, auto_fix_next_attempt_at_ms, auto_fix_error, auto_fix_last_outcome";
 
 fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
     Ok(PrRow {
@@ -350,6 +356,7 @@ fn map_pr_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PrRow> {
         auto_fix_attempt_count: r.get(25)?,
         auto_fix_next_attempt_at_ms: r.get(26)?,
         auto_fix_error: r.get(27)?,
+        auto_fix_last_outcome: r.get(28)?,
     })
 }
 
@@ -862,9 +869,12 @@ impl Store {
                  auto_fix_attempt_count = CASE WHEN ?='passing' THEN 0 ELSE auto_fix_attempt_count END,
                  auto_fix_next_attempt_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_next_attempt_at_ms END,
                  auto_fix_error = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_error END,
-                 auto_fix_exhausted_notified_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_exhausted_notified_at_ms END
+                 auto_fix_exhausted_notified_at_ms = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_exhausted_notified_at_ms END,
+                 auto_fix_last_outcome = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_last_outcome END
              WHERE id=?",
-            params![status, job_url, now_ms(), status, status, status, status, status, id],
+            params![
+                status, job_url, now_ms(), status, status, status, status, status, status, id
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
@@ -950,6 +960,24 @@ impl Store {
             params![now, attempt, now.saturating_add(delay), now, id],
         )?;
         Ok(AutoFixClaim::Claimed { attempt })
+    }
+
+    /// RAL-509: persist the latest reason unattended auto-fix did or did not
+    /// run for this PR -- the same `outcome` string already logged to
+    /// Cartographer by `ci_watch::log_ci_watch`, so the board/CLI can show it
+    /// without reading DEBUG-level logs. Cleared back to `NULL` once CI turns
+    /// `passing` (see [`Self::set_pr_ci_status`]), the same lifecycle as
+    /// `auto_fix_error`.
+    pub fn set_pr_auto_fix_outcome(&self, id: &str, outcome: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardian_pull_requests SET auto_fix_last_outcome=?, updated_at_ms=? WHERE id=?",
+            params![outcome, now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     /// Mark that a person explicitly requested an auto-fix style retry.
@@ -8813,6 +8841,7 @@ mod tests {
             auto_fix_exhausted_notified_at_ms: None,
             draft: None,
             pr_kind: "parent".to_string(),
+            auto_fix_last_outcome: None,
         }
     }
 

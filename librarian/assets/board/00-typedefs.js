@@ -406,6 +406,7 @@
        * @property {string|null} [auto_fix_error] - Human-readable reason unattended CI fixing has stopped; null while it remains eligible.
        * @property {boolean|null} [draft] - RAL-353: whether the forge reports this PR/MR as a draft (WIP). null only for rows recorded before the column existed and never polled since; the board treats null as not-draft.
        * @property {string} [pr_kind] - RAL-<new>: "parent" (the default, and every pre-dual_root_pr row) | "stack". A "stack" row is a fork-routed root branch's second, same-repo PR into a mirror of the parent's base branch (dual_root_pr mode) -- it visually chains the branch into the rest of the stack, is never expected to merge, and closes once the branch's "parent" PR does.
+       * @property {string|null} [auto_fix_last_outcome] - RAL-509: the latest reason unattended auto-fix did or did not run for this PR (e.g. "deferred_no_worktree", "deferred_backoff", "exhausted", "auto_fix_passed"); null if auto-fix has never evaluated this PR.
        */
       /**
        * One past "submit a stack" call for a review (RAL-302): every PR row
