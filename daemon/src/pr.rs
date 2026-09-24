@@ -153,7 +153,9 @@ pub struct PullRequestView {
     pub draft: Option<bool>,
     /// RAL-<new>: `"parent"` (the default, and every pre-`dual_root_pr` row)
     /// or `"stack"` -- a fork-routed root branch's second, same-repo PR into
-    /// the fork's maintained base branch, only created when `dual_root_pr` is enabled. A
+    /// the review's own transient fork-side upstream branch
+    /// (`ralphus/review/<id>/upstream`, force-pushed to mirror the parent's
+    /// base tip), only created when `dual_root_pr` is enabled. A
     /// `"stack"` row is deliberately excluded from base-drift/resync
     /// (`open_prs_by_branch`), the "every PR must merge" completion gate
     /// (`settle_pr_merge_states`), and `ci_watch::run_watch` -- its target
@@ -2982,24 +2984,30 @@ fn maybe_promote_fork_root(
     }
     // RAL-<new>: dual-root-PR mode -- the successor is now the stack's
     // root, so it needs its own "stack" PR the same way a fresh
-    // submission's root branch does (see `submit_stacked_branch_pr`).
-    // A failed fork-base maintenance step cannot undo the promotion above,
-    // but it must prevent a stack PR from being filed against a stale base.
+    // submission's root branch does (see `submit_stacked_branch_pr`),
+    // targeting the review's transient fork-side upstream branch. A failed
+    // upstream-refresh step cannot undo the promotion above, but it must
+    // prevent a stack PR from being filed against a stale base.
     if guardian.effective_dual_root_pr {
-        if let Err(e) = crate::project_forks::sync_fork_base_branch(
+        let stack_base = match ensure_review_upstream_branch(
+            store,
+            &routing,
             &root,
+            guardian,
             &parent_remote_name,
-            &routing.fork.remote_name,
             &base_branch_name,
         ) {
-            crate::rlog!(
-                WARNING,
-                "ralphus [pr] review {id} could not fast-forward the fork base branch during \
-                 promotion: {e}"
-            );
-            return;
-        }
-        let stack_route = stack_pr_route(&routing, &successor_pr.branch_alias, &base_branch_name);
+            Ok(branch) => branch,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} could not refresh the review's transient fork \
+                     upstream branch during promotion: {e}"
+                );
+                return;
+            }
+        };
+        let stack_route = stack_pr_route(&routing, &successor_pr.branch_alias, &stack_base);
         let stack_result = match stack_route.find_existing_pull_request() {
             Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
             Ok(None) => stack_route
@@ -4775,35 +4783,7 @@ fn resolve_fork_routing(
     let Some(fork) = fork else {
         return Ok(None);
     };
-    crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url).map_err(
-        |e| {
-            format!(
-                "could not configure fork remote {:?}: {e}",
-                fork.remote_name
-            )
-        },
-    )?;
-    // RAL-338 follow-up: this `root` is a review/guardian-merge worktree,
-    // separate from (and created after) the cell worktree
-    // `route_worktree_to_submitter_fork` already wires identity/credentials
-    // onto -- without this, a stacked-PR push from here has no git identity
-    // override and, for an HTTPS fork, no way to authenticate at all (git
-    // falls back to an interactive credential prompt that fails immediately
-    // in a non-interactive context: "credential-cache unavailable... could
-    // not read Username").
-    crate::worktrees::apply_worktree_git_identity_best_effort(
-        root,
-        &crate::project_forks::GitIdentity {
-            name: fork.git_user_name.clone(),
-            email: fork.git_user_email.clone(),
-        },
-    );
-    crate::worktrees::apply_worktree_credential_helper_best_effort(
-        &store.lock(),
-        root,
-        user,
-        &fork.fork_url,
-    );
+    prepare_fork_worktree(store, root, &fork, user)?;
     let parent_remote_name = crate::forge::resolve_remote_name_excluding(
         root,
         &guardian.base_branch,
@@ -4849,6 +4829,383 @@ fn resolve_fork_routing(
         fork_client,
         parent_project_id,
     }))
+}
+
+/// Configure `root` (a review/guardian-merge worktree) for git-level access
+/// to `fork` as `user` (RAL-338 follow-up): ensure the fork remote
+/// exists/is up to date, then wire the fork's identity and the user's stored
+/// credential helper onto the worktree. This `root` is a
+/// review/guardian-merge worktree, separate from (and created after) the
+/// cell worktree `route_worktree_to_submitter_fork` already wires
+/// identity/credentials onto -- without this, a stacked-PR push from here
+/// has no git identity override and, for an HTTPS fork, no way to
+/// authenticate at all (git falls back to an interactive credential prompt
+/// that fails immediately in a non-interactive context: "credential-cache
+/// unavailable... could not read Username"). Shared by
+/// [`resolve_fork_routing`] (submission/promotion) and the dual-root
+/// upstream refresh/retirement paths, which need the same git access
+/// without a forge REST client.
+fn prepare_fork_worktree(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    fork: &crate::project_forks::ForkRecord,
+    user: &str,
+) -> std::result::Result<(), String> {
+    crate::project_forks::ensure_fork_remote(root, &fork.remote_name, &fork.fork_url).map_err(
+        |e| {
+            format!(
+                "could not configure fork remote {:?}: {e}",
+                fork.remote_name
+            )
+        },
+    )?;
+    crate::worktrees::apply_worktree_git_identity_best_effort(
+        root,
+        &crate::project_forks::GitIdentity {
+            name: fork.git_user_name.clone(),
+            email: fork.git_user_email.clone(),
+        },
+    );
+    crate::worktrees::apply_worktree_credential_helper_best_effort(
+        &store.lock(),
+        root,
+        user,
+        &fork.fork_url,
+    );
+    Ok(())
+}
+
+/// Ensure a review's transient fork-side upstream branch exists and mirrors
+/// the parent's current base tip (RAL-<new>): the fork-side root a
+/// `dual_root_pr` stack PR targets. The branch name is allocated once (a
+/// collision-walked `ralphus/review/<id>/upstream`) and persisted, so every
+/// later sync/promotion targets the same ref; the sync itself is a
+/// force-push skipped when the fork already has the right tip. The fork's
+/// own real base branch is never touched.
+///
+/// # Errors
+/// Propagates allocation/sync failures -- at submission time these fail the
+/// submission (a stack PR against a stale or missing base must not be
+/// filed); promotion callers downgrade to a warning instead.
+fn ensure_review_upstream_branch(
+    store: &crate::store_lock::StoreHandle,
+    routing: &ForkRouting,
+    root: &Path,
+    guardian: &GuardianView,
+    parent_remote_name: &str,
+    base_branch_name: &str,
+) -> std::result::Result<String, String> {
+    let branch = match store.lock().guardian_dual_root_stack_branch(&guardian.id) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => {
+            let allocated = crate::project_forks::allocate_review_upstream_branch(
+                root,
+                &routing.fork.remote_name,
+                &guardian.id,
+            )?;
+            store
+                .lock()
+                .set_guardian_dual_root_stack_branch(&guardian.id, Some(&allocated))
+                .map_err(|e| e.to_string())?;
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {} allocated transient fork upstream branch {} on {}",
+                guardian.id,
+                allocated,
+                routing.fork.remote_name
+            );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "transient fork upstream branch allocated",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(&guardian.id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "branch": allocated,
+                        "remote": routing.fork.remote_name,
+                    }),
+                    admin_only: false,
+                });
+            allocated
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    crate::project_forks::sync_review_upstream_branch(
+        root,
+        parent_remote_name,
+        &routing.fork.remote_name,
+        base_branch_name,
+        &branch,
+    )?;
+    Ok(branch)
+}
+
+/// Log that `dual_root_pr` was requested for a review with no fork in use
+/// (RAL-<new>): the setting is a documented no-op there -- the review
+/// PR-stacks into the parent exactly as if it were unset -- and this makes
+/// that visible instead of silently doing nothing. INFO on stderr plus a
+/// Cartographer row, per the logging policy.
+fn log_dual_root_no_fork(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    parent_remote_name: &str,
+) {
+    crate::rlog!(
+        INFO,
+        "ralphus [pr] review {id} has dual_root_pr enabled but no fork is in use; ignoring it \
+         -- the PR stacks into {parent_remote_name} exactly as if the setting were unset"
+    );
+    let _ = store
+        .lock()
+        .cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "pr",
+            message: "dual_root_pr requested but no fork is in use; ignored",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({ "parent_remote": parent_remote_name }),
+            admin_only: false,
+        });
+}
+
+/// Refresh one review's transient fork-side upstream branch to mirror the
+/// parent's current base tip (RAL-<new>) -- the periodic base-branch
+/// freshness poller's dual-root follow-up, so ordinary rebases (which read
+/// the remote-tracking ref this poller refreshes) always rebase onto an
+/// upstream the review's stack PR actually mirrors. No allocation happens
+/// here: a review with no branch recorded yet has nothing to refresh (the
+/// first submission creates it), and a dual-root review with no fork in use
+/// is silently skipped -- that no-op is logged at submission time instead of
+/// spamming every poll cycle.
+pub(crate) fn refresh_dual_root_upstream_branch(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    git_root: &str,
+    owner: Option<&str>,
+    base_branch: &str,
+) {
+    let branch = match store.lock().guardian_dual_root_stack_branch(guardian_id) {
+        Ok(Some(branch)) => branch,
+        Ok(None) | Err(_) => return,
+    };
+    let root = PathBuf::from(git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    // Same fork resolution `resolve_fork_routing` does -- project owning the
+    // git root, then the owner's row (falling back to the project-wide
+    // default) -- but without any forge REST client: refreshing the branch
+    // is pure git.
+    let Some(project_name) = store.lock().project_name_for_path(git_root) else {
+        return;
+    };
+    let user = owner.unwrap_or("");
+    let Some(fork) = store
+        .lock()
+        .resolve_fork(&project_name, user)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    if let Err(e) = prepare_fork_worktree(store, &root, &fork, user) {
+        // ralphus[ignore-rlog-pair]: poll-time fork wiring diagnostic; a successful refresh logs its structured outcome
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {guardian_id} could not wire the fork remote for its dual-root \
+             upstream refresh: {e}"
+        );
+        return;
+    }
+    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+        &root,
+        base_branch,
+        &forge_cfg,
+        Some(&fork.remote_name),
+    );
+    let base_branch_name = strip_remote_prefix(base_branch, &parent_remote_name);
+    match crate::project_forks::sync_review_upstream_branch(
+        &root,
+        &parent_remote_name,
+        &fork.remote_name,
+        &base_branch_name,
+        &branch,
+    ) {
+        Ok(true) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {guardian_id} force-pushed {parent_remote_name}/{} to fork \
+                 branch {fork_remote}",
+                base_branch_name,
+                fork_remote = fork.remote_name
+            );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "dual-root upstream branch force-pushed to the parent's base tip",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(guardian_id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "fork": fork.remote_name,
+                        "branch": branch,
+                        "base_branch": base_branch_name,
+                    }),
+                    admin_only: false,
+                });
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: poll-time refresh diagnostic; the next cycle retries
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {guardian_id} could not refresh its transient fork upstream \
+                 branch {branch}: {e}"
+            );
+        }
+    }
+}
+
+/// Best-effort retirement of one review's transient fork-side upstream
+/// branch (RAL-<new>): delete it from the fork remote, then clear the
+/// review's recorded name so no later pass retries. Runs when the review
+/// reaches a terminal state (the periodic sweep) or is deleted (the delete
+/// endpoints' pre-deletion snapshots). Failures are logged and left for a
+/// later sweep to retry; an unresolvable fork (project/fork rows gone) is
+/// permanent, so the recorded name is cleared with a warning rather than
+/// retried forever -- the fork-side ref may then be orphaned, which an
+/// operator can delete by hand.
+pub(crate) fn retire_dual_root_upstream_branch(
+    store: &crate::store_lock::StoreHandle,
+    snapshot: &crate::store::DualRootUpstreamSnapshot,
+    reason: &str,
+) {
+    let root = PathBuf::from(&snapshot.git_root);
+    let clear = |store: &crate::store_lock::StoreHandle| {
+        // NotFound (review already deleted) is exactly the success shape here.
+        let _ = store
+            .lock()
+            .set_guardian_dual_root_stack_branch(&snapshot.guardian_id, None);
+    };
+    let Some(project_name) = store.lock().project_name_for_path(&snapshot.git_root) else {
+        // ralphus[ignore-rlog-pair]: unresolvable project is permanent; nothing further to log per cycle
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} dual-root upstream branch {}: no registered project owns \
+             its git root; clearing the record without deleting the fork branch",
+            snapshot.guardian_id,
+            snapshot.branch
+        );
+        clear(store);
+        return;
+    };
+    let user = snapshot.owner.as_deref().unwrap_or("");
+    let Some(fork) = store
+        .lock()
+        .resolve_fork(&project_name, user)
+        .ok()
+        .flatten()
+    else {
+        // ralphus[ignore-rlog-pair]: unresolvable fork is permanent; nothing further to log per cycle
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} dual-root upstream branch {}: no fork registered for user \
+             {user:?}; clearing the record without deleting the fork branch",
+            snapshot.guardian_id,
+            snapshot.branch
+        );
+        clear(store);
+        return;
+    };
+    if let Err(e) = prepare_fork_worktree(store, &root, &fork, user) {
+        // ralphus[ignore-rlog-pair]: retirement is retried by the sweep; the eventual outcome logs its structured note
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} could not wire the fork remote to retire its dual-root \
+             upstream branch {}: {e}",
+            snapshot.guardian_id,
+            snapshot.branch
+        );
+        return;
+    }
+    match crate::project_forks::delete_review_upstream_branch(
+        &root,
+        &fork.remote_name,
+        &snapshot.branch,
+    ) {
+        Ok(()) => {
+            clear(store);
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {} retired its transient fork upstream branch {} ({reason})",
+                snapshot.guardian_id,
+                snapshot.branch
+            );
+            let _ = store
+                .lock()
+                .cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::INFO,
+                    source: "pr",
+                    message: "dual-root upstream branch retired from the fork",
+                    scope: Some("guardian"),
+                    squad_id: None,
+                    guardian_id: Some(snapshot.guardian_id.as_str()),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "fork": fork.remote_name,
+                        "branch": snapshot.branch,
+                        "reason": reason,
+                    }),
+                    admin_only: false,
+                });
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: retirement is retried by the sweep; the eventual outcome logs its structured note
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {} could not retire its transient fork upstream branch {}: {e}",
+                snapshot.guardian_id,
+                snapshot.branch
+            );
+        }
+    }
+}
+
+/// Retire the transient fork-side upstream branch of every review in a
+/// terminal state (`merged`/`cancelled`/`deployed`) that still records one
+/// (RAL-<new>). Runs on the scheduler's periodic sweep so every terminal
+/// transition path is covered uniformly, plus once at daemon startup for
+/// leftovers from before a restart.
+pub fn sweep_terminal_dual_root_upstream_branches(store: &crate::store_lock::StoreHandle) {
+    let snapshots = match store.lock().dual_root_upstream_snapshots(true) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: transient snapshot read diagnostic; actual retirement emits its structured outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] dual-root upstream retirement snapshot failed: {e}"
+            );
+            return;
+        }
+    };
+    for snapshot in &snapshots {
+        retire_dual_root_upstream_branch(store, snapshot, "review reached a terminal state");
+    }
 }
 
 /// Which git remote a push for this guardian's submission should target
@@ -4917,23 +5274,22 @@ fn fork_aware_route(
 }
 
 /// The route for a dual-root-PR mode "stack" PR (RAL-<new>): always
-/// same-repo within the fork, targeting the fork's maintained copy of the
-/// parent's base branch instead of another stack branch's alias -- so it
-/// visually chains into the rest of the stack, since both ends live in the
-/// fork, without ever needing to touch the parent repository. Unlike [`fork_aware_route`]'s cross-repo
+/// same-repo within the fork, targeting the review's own transient
+/// fork-side upstream branch (`ralphus/review/<id>/upstream` -- see
+/// `ensure_review_upstream_branch`) instead of another stack branch's alias
+/// -- so it visually chains into the rest of the stack, since both ends live
+/// in the fork, without ever needing to touch the parent repository, and
+/// without any PR ever pointing at the fork's own real base branch. Unlike
+/// [`fork_aware_route`]'s cross-repo
 /// root case, this never needs `fork.fork_owner` -- it's never a GitHub
 /// cross-repo PR, so [`crate::forge::ForgeClient::same_repo_head`] (already
 /// what every non-root branch's head goes through today) is always safe to
 /// build, for both forges.
-fn stack_pr_route(
-    routing: &ForkRouting,
-    alias: &str,
-    base_branch_name: &str,
-) -> crate::forge::PrRoute {
+fn stack_pr_route(routing: &ForkRouting, alias: &str, stack_base: &str) -> crate::forge::PrRoute {
     crate::forge::PrRoute {
         client: routing.fork_client.clone(),
         head: routing.fork_client.same_repo_head(alias),
-        base: base_branch_name.to_string(),
+        base: stack_base.to_string(),
         target_project_id: None,
         repo: routing.fork_client.repo_label().to_string(),
     }
@@ -5368,54 +5724,121 @@ fn submit_stacked_branch_pr(
     // RAL-<new>: dual-root-PR mode -- this branch's PR is the stack's root
     // (`base == base_branch_name`, the same predicate `fork_aware_route`
     // itself uses to decide root routing) and the setting is on: also
-    // create/adopt a second, same-repo "stack" PR into the fork base branch, so
-    // this branch visually chains into the rest of the stack alongside the
-    // parent PR above (unchanged -- still the one that actually gets
-    // merged). Reuses the same title/description already resolved for the
-    // parent PR rather than re-running `resolve_title_description` (which
-    // may be an LLM call) a second time for the same branch. Best-effort:
-    // failing to create the stack PR must not fail the whole submission --
-    // the parent PR above is what actually matters for merge-readiness.
+    // create/adopt a second, same-repo "stack" PR into the review's
+    // transient fork-side upstream branch, so this branch visually chains
+    // into the rest of the stack alongside the parent PR above (unchanged --
+    // still the one that actually gets merged). The upstream branch was
+    // already allocated and force-pushed to the parent's base tip by the
+    // entry-point sync before this loop, so its name is read (never
+    // recomputed) here. Reuses the same title/description already resolved
+    // for the parent PR rather than re-running `resolve_title_description`
+    // (which may be an LLM call) a second time for the same branch.
+    // Best-effort: failing to create the stack PR must not fail the whole
+    // submission -- the parent PR above is what actually matters for
+    // merge-readiness.
     if guardian.effective_dual_root_pr && base == base_branch_name {
         if let Some(routing) = fork_routing {
-            let stack_route = stack_pr_route(routing, &alias, base_branch_name);
-            let stack_result = match stack_route.find_existing_pull_request() {
-                Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
-                Ok(None) => stack_route
-                    .create_pull_request(&title, &description, draft)
-                    .map(|c| (c.number, c.url, c.draft)),
-                Err(e) => Err(e),
-            };
-            match stack_result {
-                Ok((number, url, stack_draft)) => {
-                    if let Err(e) = store.lock().create_pull_request_ex(
-                        id,
-                        Some(branch_id),
-                        stack_route.client.kind().as_str(),
-                        &stack_route.repo,
-                        &alias,
-                        base_branch_name,
-                        &title,
-                        &description,
-                        Some(number),
-                        Some(&url),
-                        Some(stack_id),
-                        stack_draft,
-                        "stack",
-                    ) {
-                        crate::rlog!(
-                            WARNING,
-                            "ralphus [pr] review {id} branch {branch_id} created the stack PR on \
-                             the forge (number={number}) but failed to record it locally: {e}"
-                        );
-                    }
+            let stack_base = match store.lock().guardian_dual_root_stack_branch(id) {
+                Ok(Some(branch)) => Some(branch),
+                Ok(None) => {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} branch {branch_id} has dual_root_pr enabled \
+                         but no transient fork upstream branch was allocated; skipping its \
+                         stack PR"
+                    );
+                    None
                 }
                 Err(e) => {
                     crate::rlog!(
                         WARNING,
-                        "ralphus [pr] review {id} branch {branch_id} could not create/adopt its \
-                         dual-root-PR mode stack PR: {e}"
+                        "ralphus [pr] review {id} branch {branch_id} could not read its \
+                         transient fork upstream branch: {e}; skipping its stack PR"
                     );
+                    None
+                }
+            };
+            if let Some(stack_base) = stack_base {
+                let stack_route = stack_pr_route(routing, &alias, &stack_base);
+                let stack_result = match stack_route.find_existing_pull_request() {
+                    Ok(Some(existing)) => Ok((existing.number, existing.url, existing.draft)),
+                    Ok(None) => stack_route
+                        .create_pull_request(&title, &description, draft)
+                        .map(|c| (c.number, c.url, c.draft)),
+                    Err(e) => Err(e),
+                };
+                match stack_result {
+                    Ok((number, url, stack_draft)) => {
+                        if let Err(e) = store.lock().create_pull_request_ex(
+                            id,
+                            Some(branch_id),
+                            stack_route.client.kind().as_str(),
+                            &stack_route.repo,
+                            &alias,
+                            &stack_base,
+                            &title,
+                            &description,
+                            Some(number),
+                            Some(&url),
+                            Some(stack_id),
+                            stack_draft,
+                            "stack",
+                        ) {
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [pr] review {id} branch {branch_id} created the stack PR on \
+                                 the forge (number={number}) but failed to record it locally: {e}"
+                            );
+                            let _ =
+                                store.lock().cartographer_log(crate::cartographer::CartographerEntry {
+                                    level: crate::logging::LogLevel::WARNING,
+                                    source: "pr",
+                                    message: "dual-root stack PR created on the forge but could not \
+                                              be recorded locally",
+                                    scope: Some("branch"),
+                                    squad_id: None,
+                                    guardian_id: Some(id),
+                                    cell_id: None,
+                                    task: None,
+                                    log_path: None,
+                                    payload: serde_json::json!({
+                                        "branch_id": branch_id,
+                                        "stack_base": stack_base,
+                                        "pr_number": number,
+                                        "pr_url": url,
+                                        "error": e.to_string(),
+                                    }),
+                                    admin_only: false,
+                                });
+                        }
+                    }
+                    Err(e) => {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [pr] review {id} branch {branch_id} could not create/adopt its \
+                             dual-root-PR mode stack PR: {e}"
+                        );
+                        let _ =
+                            store
+                                .lock()
+                                .cartographer_log(crate::cartographer::CartographerEntry {
+                                    level: crate::logging::LogLevel::WARNING,
+                                    source: "pr",
+                                    message: "could not create/adopt the dual-root stack PR",
+                                    scope: Some("branch"),
+                                    squad_id: None,
+                                    guardian_id: Some(id),
+                                    cell_id: None,
+                                    task: None,
+                                    log_path: None,
+                                    payload: serde_json::json!({
+                                        "branch_id": branch_id,
+                                        "stack_base": stack_base,
+                                        "error": e,
+                                    }),
+                                    admin_only: false,
+                                });
+                    }
                 }
             }
         }
@@ -6129,20 +6552,28 @@ fn auto_submit_terminal_branches(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
-    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
-    // branch, fast-forwarded from the parent once per submission call (not per
-    // branch -- which branch is currently root is a per-branch question
-    // `fork_aware_route` answers deep inside the loop below, and syncing
-    // unconditionally here is cheap and correctness-safe even when this
-    // particular call doesn't happen to touch the root branch).
-    if let Some(routing) = &fork_routing {
-        if guardian.effective_dual_root_pr {
-            crate::project_forks::sync_fork_base_branch(
-                &root,
-                &parent_remote_name,
-                &routing.fork.remote_name,
-                &base_branch_name,
-            )?;
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the review's own
+    // transient fork-side upstream branch, force-pushed to the parent's base
+    // tip once per submission call (not per branch -- which branch is
+    // currently root is a per-branch question `fork_aware_route` answers
+    // deep inside the loop below, and syncing unconditionally here is cheap
+    // and correctness-safe even when this particular call doesn't happen to
+    // touch the root branch). With no fork in use the setting is a
+    // documented no-op -- logged so it stays visible rather than silently
+    // ignored.
+    if guardian.effective_dual_root_pr {
+        match &fork_routing {
+            Some(routing) => {
+                ensure_review_upstream_branch(
+                    store,
+                    routing,
+                    &root,
+                    &guardian,
+                    &parent_remote_name,
+                    &base_branch_name,
+                )?;
+            }
+            None => log_dual_root_no_fork(store, id, &parent_remote_name),
         }
     }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
@@ -6542,20 +6973,28 @@ fn submit_pull_requests_inner(
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
-    // RAL-<new>: dual-root-PR mode's "stack" PR targets the fork's base
-    // branch, fast-forwarded from the parent once per submission call (not per
-    // branch -- which branch is currently root is a per-branch question
-    // `fork_aware_route` answers deep inside the loop below, and syncing
-    // unconditionally here is cheap and correctness-safe even when this
-    // particular call doesn't happen to touch the root branch).
-    if let Some(routing) = &fork_routing {
-        if guardian.effective_dual_root_pr {
-            crate::project_forks::sync_fork_base_branch(
-                &root,
-                &parent_remote_name,
-                &routing.fork.remote_name,
-                &base_branch_name,
-            )?;
+    // RAL-<new>: dual-root-PR mode's "stack" PR targets the review's own
+    // transient fork-side upstream branch, force-pushed to the parent's base
+    // tip once per submission call (not per branch -- which branch is
+    // currently root is a per-branch question `fork_aware_route` answers
+    // deep inside the loop below, and syncing unconditionally here is cheap
+    // and correctness-safe even when this particular call doesn't happen to
+    // touch the root branch). With no fork in use the setting is a
+    // documented no-op -- logged so it stays visible rather than silently
+    // ignored.
+    if guardian.effective_dual_root_pr {
+        match &fork_routing {
+            Some(routing) => {
+                ensure_review_upstream_branch(
+                    store,
+                    routing,
+                    &root,
+                    &guardian,
+                    &parent_remote_name,
+                    &base_branch_name,
+                )?;
+            }
+            None => log_dual_root_no_fork(store, id, &parent_remote_name),
         }
     }
     let remote_name = push_remote_for(fork_routing.as_ref(), &parent_remote_name).to_string();
@@ -8270,7 +8709,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_pr_route_targets_the_fork_base_branch_same_repo_on_both_forges() {
+    fn stack_pr_route_targets_the_review_upstream_branch_same_repo_on_both_forges() {
         for kind in [
             crate::forge::ForgeKind::GitHub,
             crate::forge::ForgeKind::GitLab,
@@ -8307,8 +8746,8 @@ mod tests {
                 fork_client: fork_client.clone(),
                 parent_project_id: Some(999),
             };
-            let route = stack_pr_route(&routing, "b-alias", "main");
-            assert_eq!(route.base, "main");
+            let route = stack_pr_route(&routing, "b-alias", "ralphus/review/g-1/upstream");
+            assert_eq!(route.base, "ralphus/review/g-1/upstream");
             assert_eq!(route.target_project_id, None);
             assert_eq!(route.repo, fork_client.repo_label());
             assert_eq!(route.head, fork_client.same_repo_head("b-alias"));
@@ -8316,16 +8755,16 @@ mod tests {
     }
 
     #[test]
-    fn sync_fork_base_branch_fast_forwards_to_the_parents_current_tip() {
+    fn sync_review_upstream_branch_force_pushes_the_parents_current_tip() {
         // Fully hermetic -- both "remotes" are real local bare repos, no
         // HTTP/network involved, exercising the actual git fetch+push this
         // helper performs.
-        let parent_bare = tmp_dir("fork-base-sync-parent-bare");
+        let parent_bare = tmp_dir("fork-upstream-sync-parent-bare");
         g(&parent_bare, &["init", "--bare"]);
-        let fork_bare = tmp_dir("fork-base-sync-fork-bare");
+        let fork_bare = tmp_dir("fork-upstream-sync-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
 
-        let root_dir = tmp_dir("fork-base-sync-work");
+        let root_dir = tmp_dir("fork-upstream-sync-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
         gwrite(&root_dir, "base.txt", "v1\n");
         g(&root_dir, &["add", "."]);
@@ -8341,18 +8780,28 @@ mod tests {
         g(&root_dir, &["push", "origin", "release:release"]);
         let v1_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
 
-        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
-            .unwrap();
-        let fork_tip = g(&fork_bare, &["rev-parse", "refs/heads/release"])
-            .trim()
-            .to_string();
+        let pushed = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "release",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
+        assert!(pushed, "the first sync must create the branch");
+        let fork_tip = g(
+            &fork_bare,
+            &["rev-parse", "refs/heads/ralphus/review/g-1/upstream"],
+        )
+        .trim()
+        .to_string();
         assert_eq!(
             fork_tip, v1_sha,
-            "the fork base branch must match the parent's current tip"
+            "the review upstream branch must match the parent's current tip"
         );
 
-        // Advance the parent past the fork base and confirm a second sync
-        // fast-forwards it to match -- idempotent/re-syncable, not a one-shot
+        // Advance the parent past the branch and confirm a second sync
+        // force-updates it to match -- idempotent/re-syncable, not a one-shot
         // creation.
         gwrite(&root_dir, "base.txt", "v2\n");
         g(&root_dir, &["add", "."]);
@@ -8361,12 +8810,34 @@ mod tests {
         let v2_sha = g(&root_dir, &["rev-parse", "release"]).trim().to_string();
         assert_ne!(v1_sha, v2_sha);
 
-        crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "release")
-            .unwrap();
-        let fork_tip_after = g(&fork_bare, &["rev-parse", "refs/heads/release"])
-            .trim()
-            .to_string();
+        let pushed = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "release",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
+        assert!(pushed);
+        let fork_tip_after = g(
+            &fork_bare,
+            &["rev-parse", "refs/heads/ralphus/review/g-1/upstream"],
+        )
+        .trim()
+        .to_string();
         assert_eq!(fork_tip_after, v2_sha);
+
+        // An already-current branch skips the push entirely, so periodic
+        // refreshes stay cheap.
+        let pushed = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "release",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
+        assert!(!pushed, "an already-current branch must not be re-pushed");
 
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
@@ -8374,12 +8845,17 @@ mod tests {
     }
 
     #[test]
-    fn sync_fork_base_branch_refuses_to_overwrite_a_diverged_fork_branch() {
-        let parent_bare = tmp_dir("fork-base-diverged-parent-bare");
+    fn sync_review_upstream_branch_force_overwrites_a_diverged_branch_and_never_touches_the_forks_base()
+     {
+        // The exact regression being reverted (RAL-<new>): the transient
+        // review-owned ref is disposable and force-pushable, while the fork's
+        // own real base branch -- carrying work outside the parent branch --
+        // must never be touched by a dual-root sync.
+        let parent_bare = tmp_dir("fork-upstream-diverged-parent-bare");
         g(&parent_bare, &["init", "--bare"]);
-        let fork_bare = tmp_dir("fork-base-diverged-fork-bare");
+        let fork_bare = tmp_dir("fork-upstream-diverged-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
-        let root_dir = tmp_dir("fork-base-diverged-work");
+        let root_dir = tmp_dir("fork-upstream-diverged-work");
         g(&root_dir, &["init", "--initial-branch", "main"]);
         gwrite(&root_dir, "base.txt", "parent\n");
         g(&root_dir, &["add", "."]);
@@ -8393,22 +8869,143 @@ mod tests {
             &["remote", "add", "fork", fork_bare.to_str().unwrap()],
         );
         g(&root_dir, &["push", "origin", "main:main"]);
+        // The fork's own base branch carries fork-only work its owner relies
+        // on -- a dual-root sync must leave it exactly as-is.
+        g(&root_dir, &["push", "origin", "main:refs/heads/fork-base"]);
         g(&root_dir, &["checkout", "-b", "fork-only"]);
         gwrite(&root_dir, "fork.txt", "fork only\n");
         g(&root_dir, &["add", "."]);
         g(&root_dir, &["commit", "--message", "fork only"]);
-        g(&root_dir, &["push", "fork", "HEAD:main"]);
+        g(&root_dir, &["push", "fork", "HEAD:fork-base"]);
+        let fork_base_sha = g(&fork_bare, &["rev-parse", "refs/heads/fork-base"])
+            .trim()
+            .to_string();
+        // ... and the transient review branch starts out diverged too.
+        g(
+            &root_dir,
+            &["push", "fork", "HEAD:ralphus/review/g-1/upstream"],
+        );
+        g(&root_dir, &["checkout", "main"]);
 
-        let error =
-            crate::project_forks::sync_fork_base_branch(&root_dir, "origin", "fork", "main")
-                .unwrap_err();
+        let pushed = crate::project_forks::sync_review_upstream_branch(
+            &root_dir,
+            "origin",
+            "fork",
+            "main",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
         assert!(
-            error.contains("could not fast-forward fork branch main"),
-            "{error}"
+            pushed,
+            "a diverged transient branch must be force-overwritten"
+        );
+        let parent_sha = g(&root_dir, &["rev-parse", "origin/main"])
+            .trim()
+            .to_string();
+        let transient_sha = g(
+            &fork_bare,
+            &["rev-parse", "refs/heads/ralphus/review/g-1/upstream"],
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            transient_sha, parent_sha,
+            "the transient branch must mirror the parent's base tip after the sync"
+        );
+        assert_eq!(
+            g(&fork_bare, &["rev-parse", "refs/heads/fork-base"]).trim(),
+            fork_base_sha,
+            "the fork's own real base branch must never be touched by a dual-root sync"
         );
 
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn allocate_review_upstream_branch_walks_collisions_on_the_fork() {
+        let fork_bare = tmp_dir("fork-upstream-allocate-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+        let root_dir = tmp_dir("fork-upstream-allocate-work");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "a.txt", "a\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "a"]);
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+
+        let first =
+            crate::project_forks::allocate_review_upstream_branch(&root_dir, "fork", "guardian-1")
+                .unwrap();
+        assert_eq!(
+            first, "ralphus/review/guardian-1/upstream",
+            "an empty fork hands out the unsuffixed name"
+        );
+        // Take it, then re-allocate: the same -2/-3 walk readable review
+        // branch names use must find the next free ref.
+        g(
+            &root_dir,
+            &["push", "fork", "HEAD:ralphus/review/guardian-1/upstream"],
+        );
+        let second =
+            crate::project_forks::allocate_review_upstream_branch(&root_dir, "fork", "guardian-1")
+                .unwrap();
+        assert_eq!(second, "ralphus/review/guardian-1/upstream-2");
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&fork_bare);
+    }
+
+    #[test]
+    fn delete_review_upstream_branch_deletes_an_existing_ref_and_tolerates_a_missing_one() {
+        let fork_bare = tmp_dir("fork-upstream-delete-fork-bare");
+        g(&fork_bare, &["init", "--bare"]);
+        let root_dir = tmp_dir("fork-upstream-delete-work");
+        g(&root_dir, &["init", "--initial-branch", "main"]);
+        gwrite(&root_dir, "a.txt", "a\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "a"]);
+        g(
+            &root_dir,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+
+        // A ref the fork doesn't have is a successful no-op (it may already
+        // have been retired by an earlier pass).
+        crate::project_forks::delete_review_upstream_branch(
+            &root_dir,
+            "fork",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
+
+        g(
+            &root_dir,
+            &["push", "fork", "HEAD:ralphus/review/g-1/upstream"],
+        );
+        crate::project_forks::delete_review_upstream_branch(
+            &root_dir,
+            "fork",
+            "ralphus/review/g-1/upstream",
+        )
+        .unwrap();
+        let remaining = g(
+            &root_dir,
+            &[
+                "ls-remote",
+                "fork",
+                "refs/heads/ralphus/review/g-1/upstream",
+            ],
+        );
+        assert!(
+            remaining.trim().is_empty(),
+            "the retired ref must be gone from the fork: {remaining}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&fork_bare);
     }
 
@@ -12581,13 +13178,30 @@ mod tests {
     #[test]
     fn dual_root_pr_mode_creates_a_second_same_repo_stack_pr_for_the_root_branch_only() {
         // RAL-<new>: with `dual_root_pr` enabled, the stack's root branch
-        // gets a second, same-repo PR into the maintained fork base branch, alongside the
-        // existing cross-repo "parent" PR (unchanged) -- so it visually
-        // chains into the rest of the stack. Disabled (the default) is
-        // covered by every other fork-mode submission test in this module,
-        // which all still see exactly one PR per branch.
+        // gets a second, same-repo PR into the review's own transient
+        // fork-side upstream branch, alongside the existing cross-repo
+        // "parent" PR (unchanged) -- so it visually chains into the rest of
+        // the stack. The fork's own real base branch is never touched, and
+        // no PR ever targets it. Disabled (the default) is covered by every
+        // other fork-mode submission test in this module, which all still
+        // see exactly one PR per branch.
         let fork_bare = tmp_dir("dual-root-fork-bare");
         g(&fork_bare, &["init", "--bare"]);
+        // The fork's real base branch, carrying the fork owner's own work --
+        // a dual-root stack PR must never target or move it.
+        let seed = tmp_dir("dual-root-fork-seed");
+        g(&seed, &["init", "--initial-branch", "release"]);
+        gwrite(&seed, "fork-base.txt", "fork base\n");
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "--message", "fork base"]);
+        g(
+            &seed,
+            &["remote", "add", "fork", fork_bare.to_str().unwrap()],
+        );
+        g(&seed, &["push", "fork", "release:release"]);
+        let fork_release_sha = g(&fork_bare, &["rev-parse", "refs/heads/release"])
+            .trim()
+            .to_string();
 
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
@@ -12617,26 +13231,6 @@ mod tests {
                 .unwrap();
                 payload
             };
-        let handle = std::thread::spawn(move || {
-            // The existing "parent" PR: cross-repository, filed at the
-            // parent, unchanged from today's single-PR behavior.
-            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
-            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
-            assert_eq!(payload["base"], serde_json::json!("release"));
-
-            // The new "stack" PR: same-repo within the fork, into the
-            // fork base branch -- not the parent's real base branch.
-            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
-            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
-            assert_eq!(payload["base"], serde_json::json!("release"));
-
-            // The following branch remains based on the root's alias, not
-            // on the shared fork base branch used by the visual root PR.
-            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
-            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
-            assert_eq!(payload["base"], serde_json::json!("a-alias"));
-        });
-
         let root_dir = tmp_dir("dual-root-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
         gwrite(&root_dir, "base.txt", "base\n");
@@ -12681,6 +13275,41 @@ mod tests {
             .lock()
             .set_branch_review(&gid, &branch_ids[1], "review/b", "wt")
             .unwrap();
+
+        // RAL-<new>: the entry-point sync has already allocated and recorded
+        // the review's transient fork-side upstream branch by the time
+        // `submit_stacked_branch_pr` runs; simulate that here.
+        let transient_branch = format!("ralphus/review/{gid}/upstream");
+        store
+            .lock()
+            .set_guardian_dual_root_stack_branch(&gid, Some(&transient_branch))
+            .unwrap();
+        let expected_stack_base = transient_branch.clone();
+
+        let handle = std::thread::spawn(move || {
+            // The existing "parent" PR: cross-repository, filed at the
+            // parent, unchanged from today's single-PR behavior.
+            let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
+            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
+            assert_eq!(payload["base"], serde_json::json!("release"));
+
+            // The new "stack" PR: same-repo within the fork, into the
+            // review's transient fork-side upstream branch -- never the
+            // fork's own real base branch.
+            let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
+            assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
+            assert_eq!(
+                payload["base"],
+                serde_json::json!(expected_stack_base.as_str()),
+                "the stack PR must target the review's transient fork branch, never fork/release"
+            );
+
+            // The following branch remains based on the root's alias, not
+            // on the transient branch used by the visual root PR.
+            let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
+            assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
+            assert_eq!(payload["base"], serde_json::json!("a-alias"));
+        });
 
         let fork = crate::project_forks::ForkRecord {
             project: "demo".to_string(),
@@ -12792,7 +13421,10 @@ mod tests {
 
         let stack_row = rows.iter().find(|p| p.pr_kind == "stack").unwrap();
         assert_eq!(stack_row.repo, "alice/widget");
-        assert_eq!(stack_row.base_ref, "release");
+        assert_eq!(
+            stack_row.base_ref, transient_branch,
+            "the stack PR row must record the transient fork branch as its base"
+        );
         assert_eq!(stack_row.pr_number, Some(2));
         assert_eq!(stack_row.branch_id.as_deref(), Some(branch.id.as_str()));
         let successor_row = rows
@@ -12806,8 +13438,191 @@ mod tests {
         assert_eq!(successor_row.pr_number, Some(3));
 
         handle.join().unwrap();
+        // The fork's own real base branch must be untouched: no PR targets
+        // it and no sync moves it.
+        assert_eq!(
+            g(&fork_bare, &["rev-parse", "refs/heads/release"]).trim(),
+            fork_release_sha,
+            "the fork's own real base branch must never be touched by dual-root mode"
+        );
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&fork_bare);
+        let _ = std::fs::remove_dir_all(&seed);
+    }
+
+    /// RAL-<new> regression: `dual_root_pr` enabled on a review with NO fork
+    /// in use must be a no-op -- the submission stacks into the parent
+    /// (`origin`) exactly as if the setting were unset, no transient fork
+    /// branch is allocated or recorded, and the skip is logged (stderr plus
+    /// a Cartographer row). Drives the real submission entry point
+    /// (`submit_pull_requests_inner`) end-to-end so a future regression into
+    /// erroring, or into acting on `origin` in a dual-root way, is caught:
+    /// `origin` carries a forge-shaped URL whose *pushes* are rewritten onto
+    /// a local bare repo via git's `pushInsteadOf`, whose *fetches* (the
+    /// pre-push clobber guard's probe) are pointed at an unreachable local
+    /// port via `insteadOf` and fast-fail into the guard's tolerated
+    /// "no remote branch yet" path, and whose forge REST client targets the
+    /// mock server through `.ralphus.toml`.
+    #[test]
+    fn dual_root_pr_with_no_fork_is_a_logged_noop_that_stacks_into_origin() {
+        let parent_bare = tmp_dir("dual-root-no-fork-parent-bare");
+        g(&parent_bare, &["init", "--bare"]);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            // The single branch's one and only PR: filed at the parent,
+            // plain same-repo alias head, parent base branch -- no second
+            // "stack" PR of any kind is ever requested.
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url().starts_with("/repos/acme/widget/pulls?"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+            let mut req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(payload["head"], serde_json::json!("acme:a-review"));
+            assert_eq!(payload["base"], serde_json::json!("release"));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number":7,"html_url":"http://x/7"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+
+        let root_dir = tmp_dir("dual-root-no-fork-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+        g(&root_dir, &["checkout", "-b", "review/a"]);
+        gwrite(&root_dir, "a.txt", "content\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "add a.txt"]);
+        g(&root_dir, &["checkout", "release"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        let bare_url = parent_bare.to_str().unwrap().replace('\\', "/");
+        g(
+            &root_dir,
+            &[
+                "config",
+                format!("url.{bare_url}.pushInsteadOf").as_str(),
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        g(
+            &root_dir,
+            &[
+                "config",
+                "url.https://127.0.0.1:1/acme.insteadOf",
+                "https://github.com/acme",
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"github\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        // The project IS registered -- only its fork row is missing, which
+        // is exactly the "dual_root_pr requested but no fork in use" shape
+        // (`resolve_fork_routing` returns `None` and the no-op logs).
+        store
+            .lock()
+            .register_project("demo", "orchestrator", root_dir.to_str().unwrap(), "git")
+            .unwrap();
+        let gid = store
+            .lock()
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_dual_root_pr(&gid, Some(true))
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review/a", "wt")
+            .unwrap();
+
+        let requests = vec![PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: None,
+            title: Some("Title".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        }];
+        let created =
+            submit_pull_requests_inner(&store, &NoopRunner, &gid, requests, None, "", false)
+                .unwrap();
+
+        // Exactly one PR, filed at the parent (origin), based on the parent's
+        // base branch -- the single-PR stack dual_root_pr must not disturb.
+        assert_eq!(created.len(), 1, "no second stack PR may be created");
+        assert_eq!(created[0].repo, "acme/widget");
+        assert_eq!(created[0].base_ref, "release");
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].pr_kind, "stack");
+
+        // No transient fork branch was allocated or recorded.
+        assert!(
+            store
+                .lock()
+                .guardian_dual_root_stack_branch(&gid)
+                .unwrap()
+                .is_none(),
+            "a fork-less dual_root_pr review must not record a transient fork branch"
+        );
+
+        // The skip is visible in the Cartographer log, not just on stderr.
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                guardian_id: Some(gid.clone()),
+                q: Some("no fork is in use".to_string()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            page.rows.iter().any(|r| r.level == "info"),
+            "the dual_root_pr-without-a-fork no-op must be logged as a Cartographer row: {:?}",
+            page.rows
+        );
+
+        // The push really landed on the (rewritten) origin bare repo.
+        let parent_refs = g(
+            &parent_bare,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(parent_refs.contains("a-review"), "{parent_refs}");
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let _ = std::fs::remove_dir_all(&parent_bare);
     }
 
     /// RAL-338 follow-up regression: `resolve_fork_routing`'s `root` is a

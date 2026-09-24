@@ -48,11 +48,18 @@ from the **fork**. Only where the PR/MR is *filed* differs:
 | Every later branch | fork | fork | preceding branch's own alias |
 
 When `dual_root_pr` is enabled, the root also has a second, fork-internal
-stack PR targeted at the fork's copy of the parent base branch. Before ralphus
-creates that PR, it fast-forwards the fork branch from the parent branch. It
-never force-pushes: a diverged fork base branch blocks submission until its
-owner reconciles it. Several reviews may target that same maintained fork
-branch concurrently.
+stack PR targeted at the review's own transient fork branch
+(`ralphus/review/<review id>/upstream`, collision-suffixed `-2`, `-3`, ...
+against the fork's existing heads when needed). That branch is owned by the
+review alone: ralphus force-pushes it to the parent's current base-branch tip
+before filing the stack PR, and again every time the review fetches updates
+from the parent (the periodic base-branch freshness poll, plus every
+submission and promotion). It never touches the fork's own copy of the parent
+base branch, and no PR ever targets that maintained branch — concurrent
+reviews on one fork never contend over a shared ref, and a diverged fork base
+branch never blocks a submission. The branch is transient: ralphus deletes it
+from the fork once the review reaches a terminal state (merged, cancelled, or
+deployed) or is deleted.
 
 "Filed on" is the logical destination; the forge API call itself is
 asymmetric between GitLab and GitHub:
@@ -68,7 +75,11 @@ asymmetric between GitLab and GitHub:
   other branch.
 
 A project with **no registered fork** is completely unaffected — routing
-stays byte-identical to before this feature existed.
+stays byte-identical to before this feature existed. A `dual_root_pr` review
+in that position is a deliberate no-op: it PR-stacks into the parent exactly
+as if the setting were unset, and ralphus logs (stderr plus a Cartographer
+row) that `dual_root_pr` was requested but skipped because no fork is in use,
+so the effective behavior stays visible when debugging.
 
 ### Alias uniqueness
 

@@ -378,42 +378,143 @@ pub(crate) fn ensure_fork_remote(
     }
 }
 
-/// Fast-forward the fork's `base_branch_name` to the parent branch's current
-/// tip. A dual-root stack PR can then target the fork's ordinary base branch,
-/// keeping several reviews on one fork visually aligned. `root` must already
-/// carry both remotes, with the
-/// fork remote's credential helper/identity already wired (see
-/// `pr::resolve_fork_routing`, which every caller of this function runs
-/// through first).
+/// The unsuffixed name of a review's transient fork-side upstream branch
+/// (RAL-<new>): `ralphus/review/<guardian-id>/upstream`. This branch -- never
+/// the fork's own real base branch -- is what a `dual_root_pr` stack PR
+/// targets, and what is force-pushed to the parent's current base tip every
+/// time ralphus fetches that base for the review. It is a git ref, not a
+/// local path, so its full descriptive name is acceptable; any disk artifact
+/// derived from it must use a shorter name (Windows `MAX_PATH`).
+#[must_use]
+pub(crate) fn review_upstream_branch_base(guardian_id: &str) -> String {
+    format!("ralphus/review/{guardian_id}/upstream")
+}
+
+/// Pick a unique transient fork-side upstream branch name for one review
+/// (RAL-<new>): [`review_upstream_branch_base`], collision-suffixed `-2`,
+/// `-3`, ... against the heads that already exist on the fork remote, using
+/// the same walk as `review_branch::resolve_unique`. The result is persisted
+/// (`guardians.dual_root_stack_branch`) by the caller and never recomputed,
+/// so later syncs and promotions keep targeting the same ref.
 ///
-/// The push deliberately omits `--force`: a fork base branch that contains
-/// work outside the parent branch must be reconciled by its owner rather than
-/// overwritten by ralphus. Concurrent maintenance attempts are safe: Git
-/// accepts an already-current branch and rejects a non-fast-forward race.
+/// The collision walk matters even though the base name already embeds the
+/// guardian id: a fork may carry leftovers from a review that was deleted
+/// before its branch could be retired, and reusing a dead review's ref would
+/// force-push over whatever still points at it.
+///
+/// # Errors
+/// Propagates the underlying `git ls-remote` failure.
+pub(crate) fn allocate_review_upstream_branch(
+    root: &std::path::Path,
+    fork_remote_name: &str,
+    guardian_id: &str,
+) -> std::result::Result<String, String> {
+    let base = review_upstream_branch_base(guardian_id);
+    let listing = crate::guardian_merge::git(
+        root,
+        &[
+            "ls-remote",
+            "--heads",
+            fork_remote_name,
+            &format!("{base}*"),
+        ],
+    )
+    .map_err(|e| format!("could not list fork branches for the dual-root upstream ref: {e}"))?;
+    let taken: std::collections::HashSet<String> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(_, head)| head.trim().trim_start_matches("refs/heads/").to_string())
+        .collect();
+    crate::review_branch::resolve_unique(&base, |name| taken.contains(name))
+        .ok_or_else(|| format!("could not find a free dual-root upstream branch for {guardian_id}"))
+}
+
+/// Force-push the parent branch's current tip onto a review's transient
+/// fork-side upstream branch (RAL-<new>): the ref a `dual_root_pr` stack PR
+/// targets, kept exactly mirroring the parent's base so the stack PR always
+/// sits on the review's real intended upstream. `root` must already carry
+/// both remotes, with the fork remote's credential helper/identity already
+/// wired (see `pr::resolve_fork_routing`, which every caller of this function
+/// runs through first).
+///
+/// The push is deliberately `--force`, unlike the fork's own base branch
+/// (which ralphus never touches): this ref is disposable and owned entirely
+/// by the review, so overwriting it can never lose anyone else's work.
+/// Returns whether a push was needed -- an already-current branch skips the
+/// push entirely, so periodic refreshes stay cheap.
 ///
 /// # Errors
 /// Propagates the underlying `git fetch`/`git push` failure.
-pub(crate) fn sync_fork_base_branch(
+pub(crate) fn sync_review_upstream_branch(
     root: &std::path::Path,
     parent_remote_name: &str,
     fork_remote_name: &str,
     base_branch_name: &str,
-) -> Result<(), String> {
+    review_branch: &str,
+) -> std::result::Result<bool, String> {
     crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
         .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
     let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
         .map(|s| s.trim().to_string())
         .map_err(|e| format!("could not resolve fetched tip: {e}"))?;
+    let current = crate::guardian_merge::git(
+        root,
+        &[
+            "ls-remote",
+            fork_remote_name,
+            &format!("refs/heads/{review_branch}"),
+        ],
+    )
+    .map_err(|e| format!("could not read the fork's {review_branch} ref: {e}"))?
+    .lines()
+    .next()
+    .and_then(|line| line.split_once('\t'))
+    .map(|(sha, _)| sha.trim().to_string());
+    if current.as_deref() == Some(tip.as_str()) {
+        return Ok(false);
+    }
     crate::guardian_merge::git(
         root,
         &[
             "push",
+            "--force",
             fork_remote_name,
-            &format!("{tip}:refs/heads/{base_branch_name}"),
+            &format!("{tip}:refs/heads/{review_branch}"),
         ],
     )
-    .map(|_| ())
-    .map_err(|e| format!("could not fast-forward fork branch {base_branch_name}: {e}"))
+    .map(|_| true)
+    .map_err(|e| format!("could not force-push the review upstream branch {review_branch}: {e}"))
+}
+
+/// Delete a review's transient fork-side upstream branch (RAL-<new>): the
+/// teardown half of the branch's lifecycle, run when the review reaches a
+/// terminal state or is deleted. A ref the fork remote no longer has is a
+/// successful no-op (it may already have been retired by an earlier pass).
+///
+/// # Errors
+/// Propagates the underlying `git push --delete` failure; callers treat
+/// retirement as best-effort and retry on a later sweep.
+pub(crate) fn delete_review_upstream_branch(
+    root: &std::path::Path,
+    fork_remote_name: &str,
+    review_branch: &str,
+) -> std::result::Result<(), String> {
+    let exists = crate::guardian_merge::git(
+        root,
+        &[
+            "ls-remote",
+            "--heads",
+            fork_remote_name,
+            &format!("refs/heads/{review_branch}"),
+        ],
+    )
+    .map_err(|e| format!("could not read the fork's {review_branch} ref: {e}"))?;
+    if exists.trim().is_empty() {
+        return Ok(());
+    }
+    crate::guardian_merge::git(root, &["push", fork_remote_name, "--delete", review_branch])
+        .map(|_| ())
+        .map_err(|e| format!("could not delete the review upstream branch {review_branch}: {e}"))
 }
 
 /// One health finding for a registered fork row (RAL-338 Phase 6). Advisory

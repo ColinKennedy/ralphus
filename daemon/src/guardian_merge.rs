@@ -9549,6 +9549,13 @@ pub(crate) struct GuardianBaseFetchInfo {
     pub projects: Vec<String>,
     pub git_root: String,
     pub machine: Option<String>,
+    /// RAL-<new>: identity + dual-root flag for the follow-up fork-side
+    /// upstream refresh (`pr::refresh_dual_root_upstream_branch`) -- the
+    /// fetch this poller performs is exactly the "review fetched updates
+    /// from origin" moment that ref must mirror.
+    pub guardian_id: String,
+    pub owner: Option<String>,
+    pub dual_root_pr: bool,
 }
 
 /// One distinct (project root, machine, base branch) combination whose local
@@ -9645,6 +9652,13 @@ fn fetch_base_branch(
 static BASE_FETCH_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// RAL-<new>: dual-root fork-side upstream refreshes currently running,
+/// keyed by guardian id -- mirrors [`BASE_FETCH_IN_FLIGHT`] so one slow
+/// fork push never piles up a new thread for the same review every poll
+/// cycle.
+static DUAL_ROOT_UPSTREAM_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Refresh the local ref for every distinct base branch a maintained review
 /// targets (RAL-<pending>). Called once at daemon startup and periodically
 /// from `scheduler::run_loop` (`BASE_BRANCH_FRESHNESS_POLL_INTERVAL`).
@@ -9668,6 +9682,9 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                 projects: g.projects,
                 git_root: g.git_root,
                 machine: g.machine,
+                guardian_id: g.id,
+                owner: g.owner,
+                dual_root_pr: g.effective_dual_root_pr,
             })
             .collect()
     };
@@ -9705,6 +9722,31 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                         }),
                     );
             }
+        });
+    }
+    // RAL-<new>: dual-root-PR mode -- the fetch above is exactly "the review
+    // fetched updates from origin", so every dual-root review's transient
+    // fork-side upstream branch is force-pushed to the parent's freshly
+    // current base tip here (its own thread, one per review, claimed so a
+    // slow fork push never piles up). A review with no fork in use is
+    // silently skipped -- that no-op is logged at submission time instead of
+    // spamming every poll cycle.
+    for info in inputs.iter().filter(|g| g.dual_root_pr) {
+        let Some(claim) = InFlightClaim::acquire(&DUAL_ROOT_UPSTREAM_IN_FLIGHT, &info.guardian_id)
+        else {
+            continue;
+        };
+        let store = Arc::clone(store);
+        let info = info.clone();
+        std::thread::spawn(move || {
+            let _claim = claim;
+            crate::pr::refresh_dual_root_upstream_branch(
+                &store,
+                &info.guardian_id,
+                &info.git_root,
+                info.owner.as_deref(),
+                &info.base_branch,
+            );
         });
     }
 }
@@ -11339,6 +11381,9 @@ mod tests {
             projects: projects.iter().map(|s| s.to_string()).collect(),
             git_root: projects.first().unwrap_or(&"/repo").to_string(),
             machine: machine.map(str::to_string),
+            guardian_id: "guardian-1".to_string(),
+            owner: None,
+            dual_root_pr: false,
         }
     }
 

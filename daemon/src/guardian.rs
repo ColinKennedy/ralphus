@@ -2758,6 +2758,74 @@ impl Store {
         }
     }
 
+    /// RAL-<new>: the transient fork-side upstream branch this review's
+    /// `dual_root_pr` stack PR targets, once allocated (see
+    /// `project_forks::allocate_review_upstream_branch`). `None` for a review
+    /// that never used dual-root mode.
+    pub fn guardian_dual_root_stack_branch(&self, id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT dual_root_stack_branch FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// RAL-<new>: persist (or clear) the transient fork-side upstream branch
+    /// name. Persisted once at first allocation and never recomputed, so
+    /// later syncs/promotions keep targeting the same ref; cleared after the
+    /// branch has been retired.
+    pub fn set_guardian_dual_root_stack_branch(
+        &self,
+        id: &str,
+        branch: Option<&str>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET dual_root_stack_branch=?, updated_at_ms=? WHERE id=?",
+            params![branch, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-<new>: every review that still records a transient fork-side
+    /// upstream branch, optionally narrowed to terminal statuses (the
+    /// retirement sweep's input). With `terminal_only = false` this is the
+    /// pre-deletion snapshot `Store::clear_all` captures -- after the rows
+    /// are gone the fork routing can no longer be resolved from the store.
+    ///
+    /// # Errors
+    /// Propagates the underlying SQL failure.
+    pub fn dual_root_upstream_snapshots(
+        &self,
+        terminal_only: bool,
+    ) -> Result<Vec<crate::store::DualRootUpstreamSnapshot>> {
+        let mut sql = String::from(
+            "SELECT id, git_root, owner, dual_root_stack_branch FROM guardians \
+             WHERE dual_root_stack_branch IS NOT NULL",
+        );
+        if terminal_only {
+            sql.push_str(" AND status IN ('merged','cancelled','deployed')");
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::store::DualRootUpstreamSnapshot {
+                    guardian_id: r.get(0)?,
+                    git_root: r.get(1)?,
+                    owner: r.get(2)?,
+                    branch: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Set this review's own override for whether it auto-dispatches its
     /// agent to fix a failing PR/MR CI status (RAL-395). `None` inherits the
     /// project/global default.
