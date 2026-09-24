@@ -7725,6 +7725,19 @@ fn guardian_base_already_has_every_branch(
 fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
     let merged = store.lock().approve_guardian(id).is_ok();
     if merged {
+        // A `MutexGuard` temporary produced in an `if let` scrutinee lives
+        // for the whole `if let` (it desugars to `match`), so binding the
+        // owned `Option` first is required -- otherwise
+        // `retire_dual_root_branch_for_guardian`'s own `store.lock()`
+        // deadlocks against this still-held guard.
+        let guardian = store.lock().get_guardian(id).ok();
+        if let Some(guardian) = guardian {
+            crate::pr::retire_dual_root_branch_for_guardian(
+                store,
+                &guardian,
+                "review merged: base branch already contains every branch's commits",
+            );
+        }
         crate::rlog!(
             INFO,
             "ralphus [guardian] review {id} merged: base branch already contains every branch's commits"

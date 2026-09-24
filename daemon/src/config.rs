@@ -249,6 +249,15 @@ pub struct ReviewConfig {
     /// `<<prompt>>` placeholder.
     #[serde(default)]
     pub auto_fix_prompt_template: Option<String>,
+    /// Maximum unattended attempts for one continuously failing PR/MR CI
+    /// campaign. `None` resolves to [`DEFAULT_AUTO_FIX_MAX_ATTEMPTS`].
+    #[serde(default)]
+    pub auto_fix_max_attempts: Option<u32>,
+    /// Initial delay, in seconds, before retrying an unattended PR/MR CI
+    /// fix. Each later retry doubles this delay. `None` resolves to
+    /// [`DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS`].
+    #[serde(default)]
+    pub auto_fix_retry_base_seconds: Option<u64>,
     /// How many times a review's agent calls (conflict resolution, manual
     /// checks, feedback actioning, final proof, auto-build, manual-command
     /// generation) retry a recognized provider rate limit
@@ -273,6 +282,11 @@ pub struct ReviewConfig {
 /// machine" phrasing (not "locally") is deliberate: the fix may run on a
 /// remote machine.
 pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
+
+/// Default ceiling for an unattended PR/MR CI-fix campaign.
+pub const DEFAULT_AUTO_FIX_MAX_ATTEMPTS: u32 = 3;
+/// Default first retry delay for an unattended PR/MR CI-fix campaign.
+pub const DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS: u64 = 60;
 
 /// [`ReviewConfig::provider_timeout_max_retries`]'s fallback when unset.
 pub const DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES: u32 = 3;
@@ -399,6 +413,20 @@ impl ReviewConfig {
         self.auto_fix_prompt_template.as_deref()
     }
 
+    /// Maximum unattended CI-fix attempts for one continuously failing PR/MR.
+    #[must_use]
+    pub fn auto_fix_max_attempts(&self) -> u32 {
+        self.auto_fix_max_attempts
+            .unwrap_or(DEFAULT_AUTO_FIX_MAX_ATTEMPTS)
+    }
+
+    /// Initial unattended CI-fix retry delay in seconds.
+    #[must_use]
+    pub fn auto_fix_retry_base_seconds(&self) -> u64 {
+        self.auto_fix_retry_base_seconds
+            .unwrap_or(DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS)
+    }
+
     /// How many times a review's agent calls retry a recognized provider
     /// rate limit before giving up (unset resolves to
     /// [`DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES`]). See the field's own doc
@@ -423,6 +451,12 @@ impl ReviewConfig {
                     ralphus_core::validate::AUTO_FIX_PROMPT_PLACEHOLDER
                 ));
             }
+        }
+        if self.auto_fix_max_attempts == Some(0) {
+            return Err("[review] auto_fix_max_attempts must be at least 1".to_string());
+        }
+        if self.auto_fix_retry_base_seconds == Some(0) {
+            return Err("[review] auto_fix_retry_base_seconds must be at least 1".to_string());
         }
         Ok(())
     }
@@ -460,6 +494,10 @@ impl ReviewConfig {
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
+            auto_fix_max_attempts: over.auto_fix_max_attempts.or(self.auto_fix_max_attempts),
+            auto_fix_retry_base_seconds: over
+                .auto_fix_retry_base_seconds
+                .or(self.auto_fix_retry_base_seconds),
             provider_timeout_max_retries: over
                 .provider_timeout_max_retries
                 .or(self.provider_timeout_max_retries),
@@ -3061,6 +3099,40 @@ mod tests {
     fn auto_fix_prompt_template_reads_from_toml() {
         let c = from_toml_str("[review]\nauto_fix_prompt_template = \"fix: <<prompt>>\"\n");
         assert_eq!(c.auto_fix_prompt_template(), Some("fix: <<prompt>>"));
+    }
+
+    #[test]
+    fn auto_fix_retry_settings_read_from_toml_and_validate() {
+        let c = from_toml_str(
+            "[review]\nauto_fix_max_attempts = 4\nauto_fix_retry_base_seconds = 15\n",
+        );
+        assert_eq!(c.auto_fix_max_attempts(), 4);
+        assert_eq!(c.auto_fix_retry_base_seconds(), 15);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_fix_retry_settings_reject_zero() {
+        let attempts = ReviewConfig {
+            auto_fix_max_attempts: Some(0),
+            ..ReviewConfig::default()
+        };
+        assert!(
+            attempts
+                .validate()
+                .unwrap_err()
+                .contains("auto_fix_max_attempts")
+        );
+        let delay = ReviewConfig {
+            auto_fix_retry_base_seconds: Some(0),
+            ..ReviewConfig::default()
+        };
+        assert!(
+            delay
+                .validate()
+                .unwrap_err()
+                .contains("auto_fix_retry_base_seconds")
+        );
     }
 
     #[test]
