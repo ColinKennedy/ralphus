@@ -540,6 +540,21 @@ impl DaemonClient {
         self.delete(&path)
     }
 
+    /// `POST /api/users`: register a new user by name. Bootstrap-exempt on a
+    /// fresh instance with zero admins registered.
+    pub fn create_user(&self, name: &str) -> Result<Value, DaemonError> {
+        self.post("/api/users", Some(json!({"name": name})))
+    }
+
+    /// `POST /api/users/{name}/admin`: grant or revoke admin. Bootstrap-exempt
+    /// on a fresh instance with zero admins registered.
+    pub fn set_user_admin(&self, name: &str, is_admin: bool) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/users/{name}/admin"),
+            Some(json!({"is_admin": is_admin})),
+        )
+    }
+
     /// `GET /api/users/{user}/forge-tokens` (RAL-338 follow-up): which forge
     /// hosts `user` has a personal access token configured for. Never
     /// includes the token value itself.

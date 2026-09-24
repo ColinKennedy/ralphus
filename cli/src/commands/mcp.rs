@@ -64,7 +64,12 @@ pub fn dispatch(command: McpCommand) -> i32 {
     }
 }
 
-fn initialize(host: &str, profile_file: Option<String>, dry_run: bool, yes: bool) -> i32 {
+pub(crate) fn initialize(
+    host: &str,
+    profile_file: Option<String>,
+    dry_run: bool,
+    yes: bool,
+) -> i32 {
     if !matches!(host, "claude" | "codex" | "pi") {
         println!("error: unknown MCP host {host:?}; expected claude, codex, or pi");
         return 2;

@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
+pub mod initialize_server;
 pub mod internal;
 pub mod machine;
 pub mod mailbox;
@@ -188,10 +189,18 @@ pub enum Command {
     Queue(queue::QueueCommand),
     Mcp(mcp::McpCommand),
     /// `ralphus initialize git [--path P]`: enables git rerere+autoupdate in
-    /// the target repository (defaults to cwd). No other `initialize`
-    /// subcommand exists in the source today.
+    /// the target repository (defaults to cwd).
     InitializeGit {
         path: Option<String>,
+    },
+    /// `ralphus initialize server` (RAL-501): the interactive, hidden new
+    /// installation walkthrough -- deliberately absent from
+    /// `help_map.rs`/generated help/the MCP tool surface (see
+    /// `initialize_server.rs`'s module doc), reached only via the
+    /// `resolved_path` exception in `help_map.rs`. `--yes` accepts every
+    /// stage's default answer instead of prompting (non-interactive runs).
+    InitializeServer {
+        yes: bool,
     },
     Project(project::ProjectCommand),
     Machine(machine::MachineCommand),
@@ -271,7 +280,14 @@ pub fn parse_args(args: &[String]) -> Command {
                     let path = inner.take_value("--path").ok().flatten();
                     Command::InitializeGit { path }
                 }
-                _ => Command::UsageError("initialize: expected 'git' subcommand".to_string()),
+                Some("server") => {
+                    let mut inner = Scanner::new(&tail[1..]);
+                    let yes = inner.take_bool("--yes");
+                    Command::InitializeServer { yes }
+                }
+                _ => Command::UsageError(
+                    "initialize: expected 'git' or 'server' subcommand".to_string(),
+                ),
             }
         }
         Some("mcp") => Command::Mcp(mcp::parse(&scanner.remaining())),
@@ -357,6 +373,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Queue(c) => queue::dispatch(c, opts),
         Command::Mcp(c) => mcp::dispatch(c),
         Command::InitializeGit { path } => misc::cmd_initialize_git(path),
+        Command::InitializeServer { yes } => initialize_server::dispatch(opts, yes),
         Command::Project(c) => project::dispatch(c, opts),
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),

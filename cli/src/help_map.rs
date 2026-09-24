@@ -2735,6 +2735,18 @@ fn resolved_path(args: &[String], strict: bool) -> Result<Vec<&str>, InvocationE
             return Ok(path);
         }
         let Some(child) = node.children.iter().find(|child| child.name == candidate) else {
+            // RAL-501: `ralphus initialize server` is a hidden, interactive
+            // setup command deliberately absent from INITIALIZE_CHILDREN (so
+            // it never appears in `--help`, `show help-map`, or the
+            // help-map-derived MCP tool surface) but still directly
+            // invocable. Falling through to `break` here -- instead of
+            // erroring -- lets it reach `dispatch`; `find_registered_node`
+            // still returns `None` for this path, so `validate_invocation`
+            // requires no registered flags for it below.
+            if path.as_slice() == ["initialize"] && candidate == "server" {
+                path.push(candidate);
+                break;
+            }
             // A flag here is a flag, not a misspelled subcommand -- leave it
             // for `unknown_option` so the message names the real problem.
             if strict && !candidate.starts_with('-') {
