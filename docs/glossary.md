@@ -163,6 +163,23 @@ user-facing actions and relations use **watch** / **watcher**.
 | **watch everything I create** | The default-on per-user preference persisted in `users.auto_watch`. It creates watches for future squads and reviews; disabling it does not remove existing watches. |
 | **default notify tiers** (user preference) | A per-user preference used when a watch does not specify its own tiers, including automatic creator watches. |
 
+## Waypoints (RAL-400)
+
+Cross-squad coordination: a human-authored note that retroactively binds
+already-submitted or running work to a named join point, without requiring
+the join to be foreseeable at submit time. Distinct from **gating**
+(declared up front, in the Scheduling section below) and from a **mailbox**
+message (a broadcast push about something needing attention, not a durable
+join point another entity can be bound into later).
+
+| Term | Meaning |
+|---|---|
+| **waypoint** | A named open/closed join point (`waypoints` table, id `waypoint-…`). Carries a `label`, a required human-authored `prompt` (no silent default), an optional `agent`/`model` (required together when the agent needs one — see `agent_requires_model`), `allow_advisory` (default off), and a **roster**. Created with at least one roster entry — a waypoint with an empty roster is rejected as vacuously terminal, since it could never deliver anything. Has no `project` field of its own; any project association is inferred by hopping through its roster. |
+| **roster** | The list of entities a waypoint is bound to. v1 scope is two entity kinds: **review** and **squad** — see `RosterEntityKind`. |
+| **roster entry** | One `(entity_kind, entity_id)` pair on a waypoint's roster (`waypoint_roster` table). Carries its own `mode` (`block`/`advisory` — see `RosterMode`, survey-decided but human-overridable), a survey verdict/rationale pair (populated by the Phase 2 survey pass, `NULL` until then), and a `delivery_status` (`undelivered`/`delivered`/`via-restack`/`failed` — see `DeliveryStatus`) tracking whether the waypoint's prompt has actually reached that entity yet. |
+| **bearing** | A durable, append-only account of actual completed work relevant to a waypoint (`waypoint_bearings` table, id `bearing-…`) — a concise summary plus, when available, a Git commit id and commit-message summary, and an optional entity link. Bearings accumulate over a waypoint's lifetime; they are never edited or removed, only added. |
+| **survey** | The (not yet implemented as of this pass) LLM classification pass that evaluates each roster entry's real impact and assigns its `mode`/verdict/rationale. Fails closed on error or timeout; every verdict is recorded as a Cartographer row. |
+
 ## Scheduling
 
 | Term | Meaning |
