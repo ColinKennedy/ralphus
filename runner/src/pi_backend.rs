@@ -334,6 +334,7 @@ impl ModelBackend for PiBackend {
             workspace,
             thrash_thresholds,
             tool_arg_truncate_chars,
+            options.retry_attempt,
         )?;
 
         if !self.keep_temporary_files {
@@ -803,6 +804,7 @@ fn drive_json_events(
     workspace: &Workspace,
     thrash_thresholds: crate::thrash::ThrashThresholds,
     tool_arg_truncate_chars: usize,
+    retry_attempt: u32,
 ) -> Result<BackendOutcome, BackendError> {
     let stderr = child.stderr.take();
     let stderr_thread = stderr.map(|s| {
@@ -909,6 +911,53 @@ fn drive_json_events(
                 compaction_count: 0,
             });
         }
+
+        // RAL-497: broaden the RAL-435 mechanism to cover pi's wider set of
+        // transient provider errors (rate limits without an explicit delay,
+        // 5xx/gateway errors, network failures, premature stream endings,
+        // timeouts) rather than only the narrow HTTP-429-with-delay case
+        // handled above. Only safe to retry when this turn produced no
+        // visible output yet -- a turn that already streamed text/tool
+        // activity may have caused non-idempotent side effects, so it is
+        // surfaced as a terminal failure instead of retried.
+        if !state.terminal_error_partial_output && is_broadened_retryable_provider_error(&error) {
+            let delay = Duration::from_secs(ralphus_core::rate_limit::clamp_retry_after_secs(
+                broadened_retry_delay_ms(retry_attempt) / 1000,
+            ));
+            let message = format!(
+                "pi: retrying transient provider error (attempt {retry_attempt}, delay {}s): {}",
+                delay.as_secs(),
+                display_terminal_error(&error)
+            );
+            eprintln!("{message}");
+            crate::cartographer::emit(
+                "pi",
+                &message,
+                "warning",
+                crate::cartographer::EventContext::default(),
+                serde_json::json!({
+                    "retry_attempt": retry_attempt,
+                    "retry_after_secs": delay.as_secs(),
+                    "error": tail(&error, SUMMARY_TAIL_CHARS),
+                }),
+            );
+            return Ok(BackendOutcome {
+                summary: tail(&state.latest_assistant_message, SUMMARY_TAIL_CHARS),
+                turns: state.turns,
+                tokens_in: state.tokens_in,
+                tokens_out: state.tokens_out,
+                cache_creation_tokens: state.cache_creation_tokens,
+                cache_read_tokens: state.cache_read_tokens,
+                cost_usd: state.cost_usd,
+                agent_session_id: state.agent_session_id,
+                abandoned_background_job: None,
+                compaction_thrash: None,
+                rate_limit_retry_after: Some(delay),
+                compaction_input_tokens: 0,
+                compaction_count: 0,
+            });
+        }
+
         return Err(BackendError(format!(
             "pi: {}",
             display_terminal_error(&error)
@@ -965,6 +1014,13 @@ struct ParseState {
     /// print mode exits zero for these because they are model messages rather
     /// than thrown CLI errors, so the event is the authoritative outcome.
     terminal_error: Option<String>,
+    /// RAL-497: whether the turn that produced `terminal_error` had already
+    /// streamed visible text/tool-call output (a snapshot of
+    /// `printed_text_delta` taken in [`record_assistant_terminal`], before
+    /// it gets reset for the next turn). Gates the broadened transient-error
+    /// retry in [`drive_json_events`] -- a turn that already produced output
+    /// may have caused non-idempotent side effects, so it is not retried.
+    terminal_error_partial_output: bool,
     printed_text_delta: bool,
     /// RAL-339: shared compaction-thrash counter for this run (see
     /// `crate::thrash`).
@@ -1473,6 +1529,7 @@ fn record_assistant_terminal(state: &mut ParseState, message: &Value) {
             .or_else(|| message["stopReason"].as_str().map(str::to_string)),
         _ => None,
     };
+    state.terminal_error_partial_output = state.printed_text_delta;
 }
 
 fn display_terminal_error(error: &str) -> String {
@@ -1542,6 +1599,146 @@ fn mentions_no_deployments_available(error: &str) -> bool {
     error
         .to_ascii_lowercase()
         .contains("no deployments available")
+}
+
+/// RAL-497: quota/billing exhaustion is never retryable no matter how it's
+/// phrased -- retrying burns more of a budget that is already gone. Checked
+/// before [`RETRYABLE_PROVIDER_ERROR_SUBSTRINGS`] so a message that happens
+/// to also contain a transient-sounding word (e.g. "quota exceeded... try
+/// again next month") is never misclassified as retryable. Mirrors pi's own
+/// `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` in
+/// `packages/ai/src/utils/retry.ts` (lowercased, substring form -- see
+/// [`RETRYABLE_PROVIDER_ERROR_SUBSTRINGS`] for why this file uses substrings
+/// instead of regex).
+const NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS: &[&str] = &[
+    "gousagelimiterror",
+    "freeusagelimiterror",
+    "monthly usage limit reached",
+    "available balance",
+    "insufficient_quota",
+    "out of budget",
+    "quota exceeded",
+    "billing",
+];
+
+/// RAL-497: broadened transient-provider-error vocabulary, mirroring pi's
+/// own `RETRYABLE_PROVIDER_ERROR_PATTERN` in
+/// `packages/ai/src/utils/retry.ts` -- rate limits, 5xx/gateway errors,
+/// network/connection failures, premature stream endings, and timeouts.
+/// Deliberately excludes quota/billing wording (see
+/// [`NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS`], checked first).
+///
+/// Plain lowercase substrings rather than pi's regex: none of pi's patterns
+/// need true regex features here (the handful of `.?`-optional-character
+/// patterns, e.g. `rate.?limit`, are expanded below into their literal
+/// variants), and this avoids adding a `regex` crate dependency to the
+/// runner for a narrower, ralphus-specific check. Bare HTTP status codes
+/// ("500", "502", ...) are matched separately by
+/// [`mentions_numeric_token`] so a substring like "500" doesn't also match
+/// inside an unrelated larger number.
+const RETRYABLE_PROVIDER_ERROR_SUBSTRINGS: &[&str] = &[
+    "overloaded",
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "service unavailable",
+    "serviceunavailable",
+    "server error",
+    "servererror",
+    "internal error",
+    "internalerror",
+    "provider returned error",
+    "exceeded request buffer limit while retrying upstream",
+    "network error",
+    "networkerror",
+    "connection error",
+    "connectionerror",
+    "connection refused",
+    "connection lost",
+    "other side closed",
+    "fetch failed",
+    "getaddrinfo",
+    "enotfound",
+    "eai_again",
+    "upstream connect",
+    "upstreamconnect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed out",
+    "timedout",
+    "timeout",
+    "terminated",
+    "websocket closed",
+    "websocketclosed",
+    "websocket error",
+    "websocketerror",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "resourceexhausted",
+];
+
+/// The bare HTTP/gateway status codes that count as retryable when they
+/// appear as a standalone token (see [`mentions_numeric_token`]) -- mirrors
+/// the numeric alternatives in pi's `RETRYABLE_PROVIDER_ERROR_PATTERN`.
+/// "429" is deliberately excluded: [`parse_retryable_rate_limit`] already
+/// handles the explicit-429-with-delay case, and a bare 429 with no parsed
+/// delay falls through to this broadened check on its own.
+const RETRYABLE_HTTP_STATUS_TOKENS: &[&str] = &["429", "500", "502", "503", "504", "524"];
+
+/// RAL-497: classifies a Pi terminal `errorMessage` (see
+/// `record_assistant_terminal`) as a broadened transient provider error,
+/// per the substring lists above. Narrower than pi's own classifier only in
+/// that it's substring- rather than regex-based; see
+/// [`RETRYABLE_PROVIDER_ERROR_SUBSTRINGS`] for why that's an acceptable
+/// trade here. Case-insensitive, matching pi's own `i` regex flag.
+fn is_broadened_retryable_provider_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if NON_RETRYABLE_PROVIDER_LIMIT_SUBSTRINGS
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return false;
+    }
+    if RETRYABLE_PROVIDER_ERROR_SUBSTRINGS
+        .iter()
+        .any(|pat| lower.contains(pat))
+    {
+        return true;
+    }
+    RETRYABLE_HTTP_STATUS_TOKENS
+        .iter()
+        .any(|token| mentions_numeric_token(error, token))
+}
+
+/// Whether `error` names `token` (e.g. "500") as a standalone alphanumeric
+/// token, not merely a substring of a larger number (e.g. "45001" or
+/// "3500"). Generalizes [`mentions_http_429`]'s technique to any token.
+fn mentions_numeric_token(error: &str, token: &str) -> bool {
+    error
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == token)
+}
+
+/// RAL-497: exponential backoff for the broadened transient-error retry,
+/// mirroring pi's own `retryDelayMs` in `packages/ai/src/utils/retry.ts`
+/// (`min(baseDelayMs * 2^max(0,attempt-1), maxAgentDelayMs)`) with pi's
+/// documented default policy (`baseDelayMs: 2000, maxAgentDelayMs: 60000`).
+/// `retry_attempt` is ralphus's 0-based count of *prior* attempts (see
+/// `RunOptions::retry_attempt`), which already lines up with pi's
+/// `max(0, attempt-1)` for a 1-based `attempt` -- no extra offset needed.
+/// The exponent is capped so this can never approach shifting `2000` out of
+/// `u64` range; the `min(..., 60_000)` below makes attempts past a handful
+/// indistinguishable anyway.
+fn broadened_retry_delay_ms(retry_attempt: u32) -> u64 {
+    let exponent = retry_attempt.min(6);
+    (2_000u64.saturating_mul(1u64 << exponent)).min(60_000)
 }
 
 /// Parses a `"retry after N second(s)"` phrase (case-insensitive), returning
@@ -2326,6 +2523,309 @@ mod tests {
             parse_retryable_rate_limit(&error),
             Some(std::time::Duration::from_secs(12))
         );
+    }
+
+    // ── RAL-497: broadened transient-provider-error classification ─────────
+
+    #[test]
+    fn is_broadened_retryable_provider_error_recognizes_5xx_and_network_failures() {
+        for raw in [
+            "Upstream error from InferenceNet: Inference stream timed out: \
+             No first token received within 60000ms",
+            "connection refused while contacting upstream",
+            "socket hang up",
+            "the upstream server returned a 502 error",
+            "getaddrinfo ENOTFOUND api.example.com",
+            "stream ended before message_stop",
+            "Service Unavailable",
+            "Rate Limit exceeded, please try your request again",
+        ] {
+            assert!(
+                is_broadened_retryable_provider_error(raw),
+                "expected {raw:?} to be classified as retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_broadened_retryable_provider_error_rejects_quota_and_billing_exhaustion() {
+        for raw in [
+            "Monthly usage limit reached for this account",
+            "insufficient_quota: you have no available balance",
+            "billing issue: please update your payment method",
+            "GoUsageLimitError: quota exceeded",
+        ] {
+            assert!(
+                !is_broadened_retryable_provider_error(raw),
+                "expected {raw:?} to NOT be classified as retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_broadened_retryable_provider_error_rejects_an_unrecognized_error() {
+        assert!(!is_broadened_retryable_provider_error(
+            "the model refused the request: content policy violation"
+        ));
+    }
+
+    #[test]
+    fn is_broadened_retryable_provider_error_matches_a_bare_status_code_as_a_token() {
+        assert!(is_broadened_retryable_provider_error(
+            "upstream responded with 503"
+        ));
+    }
+
+    #[test]
+    fn is_broadened_retryable_provider_error_rejects_a_status_code_as_a_substring_of_a_larger_number()
+     {
+        assert!(!is_broadened_retryable_provider_error(
+            "order id 45001 failed validation"
+        ));
+    }
+
+    #[test]
+    fn broadened_retry_delay_ms_doubles_from_the_base_delay_and_caps_at_one_minute() {
+        assert_eq!(broadened_retry_delay_ms(0), 2_000);
+        assert_eq!(broadened_retry_delay_ms(1), 4_000);
+        assert_eq!(broadened_retry_delay_ms(2), 8_000);
+        assert_eq!(broadened_retry_delay_ms(3), 16_000);
+        assert_eq!(broadened_retry_delay_ms(4), 32_000);
+        assert_eq!(broadened_retry_delay_ms(5), 60_000);
+        assert_eq!(broadened_retry_delay_ms(6), 60_000);
+        assert_eq!(broadened_retry_delay_ms(1000), 60_000);
+    }
+
+    #[test]
+    fn pi_terminal_transient_error_with_no_prior_output_is_not_gated() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Upstream error from InferenceNet: Inference stream timed \
+                                     out: No first token received within 60000ms"
+                }
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        let error = state.terminal_error.expect("terminal error recorded");
+        assert!(!state.terminal_error_partial_output);
+        assert!(is_broadened_retryable_provider_error(&error));
+    }
+
+    #[test]
+    fn pi_terminal_transient_error_after_partial_output_is_gated_from_retry() {
+        let mut state = ParseState::default();
+        let root = Path::new(".");
+        // The turn streamed visible text before the provider connection died
+        // mid-stream -- retrying could duplicate that already-surfaced
+        // output or any side effects it triggered, so the gate must block
+        // the broadened retry even though the error text itself matches.
+        process_event(
+            &serde_json::json!({
+                "type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"Looking into it..."}
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        process_event(
+            &serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"socket hang up"
+                }
+            }),
+            &mut state,
+            root,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        let error = state.terminal_error.expect("terminal error recorded");
+        assert!(state.terminal_error_partial_output);
+        assert!(is_broadened_retryable_provider_error(&error));
+    }
+
+    /// Streams `lines` (already-built JSON events, one per line) to stdout
+    /// from a real child process. `drive_json_events` reads from an actual
+    /// `std::process::Child`, which has no public constructor other than
+    /// `spawn` -- so exercising its combined retry decision end-to-end (as
+    /// opposed to only the `process_event`/classifier pieces the tests above
+    /// cover in isolation) needs a real subprocess rather than a hand-built
+    /// reader. `type`/`cat` just streams the file's bytes back out, so this
+    /// sidesteps any shell-quoting concerns around the JSON payload itself.
+    fn spawn_child_emitting_json_lines(label: &str, lines: &[Value]) -> (Child, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pi-drive-json-events-test-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let body = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+
+        let child = if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "type"])
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn cmd /C type")
+        } else {
+            Command::new("cat")
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn cat")
+        };
+        (child, dir)
+    }
+
+    fn temp_workspace(label: &str) -> (Workspace, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pi-drive-json-events-workspace-{label}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = Workspace::create(&dir).unwrap();
+        (workspace, dir)
+    }
+
+    fn default_thrash_thresholds() -> crate::thrash::ThrashThresholds {
+        crate::thrash::ThrashThresholds {
+            max_compactions: crate::thrash::DEFAULT_MAX_COMPACTIONS,
+            min_turn_gap: crate::thrash::DEFAULT_MIN_TURN_GAP,
+        }
+    }
+
+    /// End-to-end regression test for AC4: a clean pre-first-token transient
+    /// provider error (the exact InferenceNet timeout wording from the
+    /// squad-000000000202 bug report) must be reported as a retryable
+    /// outcome, not a hard failure, so the daemon's existing rate-limit retry
+    /// loop resumes the cell instead of failing the squad.
+    #[test]
+    fn drive_json_events_retries_a_broadened_transient_error_with_no_prior_output() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "retry",
+            &[serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"Upstream error from InferenceNet: Inference stream timed \
+                                     out: No first token received within 60000ms"
+                }
+            })],
+        );
+        let (workspace, workspace_dir) = temp_workspace("retry");
+
+        let outcome = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+        )
+        .expect("a clean pre-first-token transient error must be retried, not fail the cell");
+
+        assert!(
+            outcome.rate_limit_retry_after.is_some(),
+            "expected the broadened retry path to report a retry delay instead of an error"
+        );
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
+    }
+
+    /// The other half of AC4: a terminal, non-retryable provider error (quota
+    /// exhaustion) must still fail the cell outright -- broadening the
+    /// classifier must not turn every provider error into a retry.
+    #[test]
+    fn drive_json_events_fails_terminally_for_a_non_retryable_provider_error() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "terminal",
+            &[serde_json::json!({
+                "type":"message_end",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"insufficient_quota: you have no available balance"
+                }
+            })],
+        );
+        let (workspace, workspace_dir) = temp_workspace("terminal");
+
+        let err = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+        )
+        .expect_err("quota/billing exhaustion must not be retried");
+        assert!(err.0.contains("insufficient_quota"), "{}", err.0);
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
+    }
+
+    /// A transient, otherwise-retryable error is still gated to a terminal
+    /// failure once the turn already streamed visible output -- retrying
+    /// could duplicate already-surfaced output or side effects.
+    #[test]
+    fn drive_json_events_does_not_retry_a_transient_error_after_partial_output() {
+        let (mut child, events_dir) = spawn_child_emitting_json_lines(
+            "gated",
+            &[
+                serde_json::json!({
+                    "type":"message_update",
+                    "assistantMessageEvent":{"type":"text_delta","delta":"Looking into it..."}
+                }),
+                serde_json::json!({
+                    "type":"message_end",
+                    "message":{
+                        "role":"assistant",
+                        "content":[],
+                        "stopReason":"error",
+                        "errorMessage":"socket hang up"
+                    }
+                }),
+            ],
+        );
+        let (workspace, workspace_dir) = temp_workspace("gated");
+
+        let err = drive_json_events(
+            &mut child,
+            &workspace,
+            default_thrash_thresholds(),
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+            0,
+        )
+        .expect_err("a transient error after partial output must not be retried");
+        assert!(err.0.contains("socket hang up"), "{}", err.0);
+
+        std::fs::remove_dir_all(&events_dir).ok();
+        std::fs::remove_dir_all(&workspace_dir).ok();
     }
 
     /// RAL-326: pi's own `Usage` splits prompt-cache tokens out of `input`

@@ -161,6 +161,15 @@ pub struct RunOptions<'a> {
     /// separate settings from memory -- those backends isolate whenever
     /// either this or [`Self::allow_personal_settings`] is `false`.
     pub allow_personal_memory: bool,
+    /// RAL-497: zero-based count of how many times this cell/proof has
+    /// already been retried after a provider-classified transient failure.
+    /// `0` for a fresh dispatch, forwarded from `CellSpec::retry_attempt`.
+    /// Only the pi backend reads this today, to compute its own exponential
+    /// backoff for provider errors with no explicit provider-supplied delay
+    /// (see `pi_backend`'s retry classification); other backends ignore it,
+    /// same "hand-rolled backends accept and ignore it" precedent as
+    /// `assigned_agent_session_id`.
+    pub retry_attempt: u32,
 }
 
 /// RAL-292: the sole turn content sent by [`ModelBackend::nudge`]'s default

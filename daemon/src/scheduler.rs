@@ -2087,6 +2087,7 @@ fn run_cell_with_rate_limit_retries<'a>(
         }
         permit = sem.acquire_ranked(dispatch_priority);
         spec.resume_agent_session_id = agent_session_id;
+        spec.retry_attempt = spec.retry_attempt.saturating_add(1);
     }
 }
 
@@ -3984,6 +3985,7 @@ fn run_proof_with_rate_limit_retries(
             .lock()
             .clear_proof_delayed(squad_id, task_idx, scope, cell_idx, idx);
         spec.resume_agent_session_id = result.agent_session_id;
+        spec.retry_attempt = retries;
     }
 }
 

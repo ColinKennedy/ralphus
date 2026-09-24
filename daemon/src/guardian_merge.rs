@@ -1892,6 +1892,7 @@ fn synthesize_proof_instructions(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
@@ -2389,6 +2390,7 @@ fn resolve_conflicts_with_agent(
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         };
 
@@ -2808,6 +2810,7 @@ fn run_final_proof(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
@@ -6002,6 +6005,7 @@ fn run_commit_step(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     let result =
@@ -6361,6 +6365,7 @@ pub fn run_feedback(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     // Stash any pre-existing dirty state so we only include the resolver's
@@ -8218,6 +8223,7 @@ fn run_review_auto_build(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
@@ -10609,6 +10615,7 @@ fn generate_final_summary(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
     let result = runner.run(&spec);
@@ -10952,6 +10959,7 @@ fn generate_manual_commands(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
 
@@ -11168,6 +11176,7 @@ pub(crate) fn resolve_check_input(
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
         allow_personal_memory: false,
+        retry_attempt: 0,
         maximum_timeout: None,
     };
 
