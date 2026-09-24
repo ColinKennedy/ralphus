@@ -2326,18 +2326,47 @@ impl Store {
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
             let failed = matches!(status, GuardianStatus::MergeFailed);
             if failed {
+                // RAL-504: a MergeFailed transition caused by
+                // `guardian_merge::run_agent_with_rate_limit_retry` exhausting
+                // its provider-rate-limit retries is recoverable by re-running
+                // the merge, not by manual conflict surgery -- downgrade to
+                // High and point straight at `review reopen` instead of the
+                // generic "inspect and resolve" guidance.
+                let exhausted = detail.is_some_and(crate::mailbox::is_retry_exhaustion_error);
+                let (priority, notify_msg, remediation) = if exhausted {
+                    (
+                        crate::mailbox::MailboxPriority::High,
+                        format!(
+                            "review {id} merge stalled: automated retries have been exhausted \
+                             and stopped: {}",
+                            detail.unwrap_or_default()
+                        ),
+                        crate::mailbox::Remediation::SuggestedCommand {
+                            command: format!("ralphus review reopen {id}"),
+                            purpose: "retry the merge now that the provider rate limit has had \
+                                      time to clear"
+                                .to_string(),
+                        },
+                    )
+                } else {
+                    (
+                        crate::mailbox::MailboxPriority::Urgent,
+                        msg.clone(),
+                        crate::mailbox::Remediation::ManualInterventionRequired {
+                            guidance: format!(
+                                "inspect the merge failure (`ralphus review worktrees {id}`) and \
+                                 resolve the underlying conflict or error before retrying \
+                                 (`ralphus review reopen {id}`)"
+                            ),
+                        },
+                    )
+                };
                 let _ = self.notify_watchers_with_remediation(
                     crate::monitor::NotifiableEventKind::ReviewFailed,
                     &format!("guardian:{id}"),
-                    crate::mailbox::MailboxPriority::Urgent,
-                    &msg,
-                    &crate::mailbox::Remediation::ManualInterventionRequired {
-                        guidance: format!(
-                            "inspect the merge failure (`ralphus review worktrees {id}`) and \
-                             resolve the underlying conflict or error before retrying \
-                             (`ralphus review reopen {id}`)"
-                        ),
-                    },
+                    priority,
+                    &notify_msg,
+                    &remediation,
                     None,
                     None,
                     None,
@@ -8108,6 +8137,82 @@ mod tests {
             .unwrap();
         store.reset_guardian_to_collecting(&id).unwrap();
         assert_eq!(store.get_guardian(&id).unwrap().status, "collecting");
+    }
+
+    /// RAL-504: a `MergeFailed` transition whose detail matches
+    /// [`crate::mailbox::is_retry_exhaustion_error`] (the wording
+    /// `guardian_merge::run_agent_with_rate_limit_retry` uses once its
+    /// provider-rate-limit retries are genuinely exhausted) must enqueue a
+    /// single High-priority mailbox message pointing at `review reopen`,
+    /// not the generic Urgent/manual-inspection wording an ordinary merge
+    /// failure gets.
+    #[test]
+    fn merge_failed_with_exhausted_retries_enqueues_one_high_priority_mailbox_message() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        store
+            .set_guardian_status(
+                &id,
+                GuardianStatus::MergeFailed,
+                Some(
+                    "provider rate-limit retries exhausted after 3 attempt(s) (see \
+                     [review].provider_timeout_max_retries in .ralphus.toml)",
+                ),
+            )
+            .unwrap();
+
+        let client_id = store.register_mailbox_client().unwrap();
+        let messages = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one message for the terminal exhaustion transition, not one per retry"
+        );
+        assert_eq!(messages[0].priority, "high");
+        assert!(messages[0].message.contains("stalled"));
+        assert!(
+            messages[0]
+                .message
+                .contains("automated retries have been exhausted and stopped")
+        );
+        assert!(
+            messages[0]
+                .message
+                .contains(&format!("ralphus review reopen {id}"))
+        );
+    }
+
+    /// Contrast with the exhaustion case above: an ordinary merge failure
+    /// (a real conflict, not a retry giving up) must keep the pre-RAL-504
+    /// Urgent/manual-intervention wording.
+    #[test]
+    fn merge_failed_with_ordinary_conflict_stays_urgent_and_manual() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        store
+            .set_guardian_status(
+                &id,
+                GuardianStatus::MergeFailed,
+                Some("merge conflict in foo.rs"),
+            )
+            .unwrap();
+
+        let client_id = store.register_mailbox_client().unwrap();
+        let messages = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].priority, "urgent");
+        assert!(messages[0].message.contains("Manual intervention required"));
+        assert!(
+            messages[0]
+                .message
+                .contains(&format!("ralphus review worktrees {id}"))
+        );
     }
 
     /// Guards the fix above from over-widening: a terminal `merged` review
