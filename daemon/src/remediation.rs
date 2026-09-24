@@ -15,7 +15,7 @@
 
 use crate::cancel::CancelToken;
 use crate::runner::{Runner, RunnerResult, RunnerSpec};
-use crate::store::Store;
+use crate::store_lock::StoreHandle;
 
 /// Fixed, code-authored system prompt for every remediation pass. Mirrors
 /// `guardian_merge.rs`'s `CONFLICT_RESOLVER_SYSTEM_PROMPT` precedent: a
@@ -70,9 +70,17 @@ pub struct RepairAgent<'a> {
 /// execution. Each repair pass itself runs under a distinct
 /// `"{cell_id}-remediate-{n}"` cell id, so it never collides with the
 /// command's own session and stays individually inspectable on the board.
+///
+/// Takes the [`StoreHandle`] rather than a borrowed `&Store`, and locks it
+/// only around the individual store writes below. A caller cannot hold the
+/// store lock across this function: it drives `Runner::run_cancellable`, whose
+/// tmux path takes the same lock itself (`SubprocessRunner::emit_tmux_note`),
+/// and the store mutex is not reentrant -- holding it here deadlocked the
+/// whole daemon for as long as the command ran, which is forever once the
+/// runner is the thing waiting on the lock.
 #[must_use]
 pub fn run_command_with_remediation(
-    store: &Store,
+    store: &StoreHandle,
     runner: &dyn Runner,
     cancel: &CancelToken,
     command_spec: &RunnerSpec,
@@ -87,19 +95,22 @@ pub fn run_command_with_remediation(
     while !result.is_done() && attempt < total_attempts && !cancel.is_cancelled() {
         let message =
             format!("command attempt {attempt}/{total_attempts} failed, starting repair pass");
-        crate::cartographer::Note::new("remediation")
-            .level(crate::logging::LogLevel::WARNING)
-            .squad(&command_spec.squad_id)
-            .cell(&command_spec.cell_id)
-            .task(&command_spec.task)
-            .emit(
-                store,
-                &message,
-                serde_json::json!({
-                    "attempt": attempt,
-                    "total_attempts": total_attempts,
-                }),
-            );
+        {
+            let guard = store.lock();
+            crate::cartographer::Note::new("remediation")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(&command_spec.squad_id)
+                .cell(&command_spec.cell_id)
+                .task(&command_spec.task)
+                .emit(
+                    &guard,
+                    &message,
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "total_attempts": total_attempts,
+                    }),
+                );
+        }
         run_repair_pass(store, runner, cancel, command_spec, attempt, repair_agent);
         if cancel.is_cancelled() {
             break;
@@ -134,8 +145,12 @@ pub(crate) fn resolve_total_attempts(mode: &str, remediation_attempts: Option<u3
 /// to run (backend error, timeout, ...) is logged and the caller simply
 /// retries the command anyway, since the only thing that actually decides
 /// pass/fail is the next command execution.
+///
+/// Takes the [`StoreHandle`] for the same reason
+/// [`run_command_with_remediation`] does: it runs the repair agent through
+/// `Runner::run_cancellable`, so the store lock must not be held across it.
 pub(crate) fn run_repair_pass(
-    store: &Store,
+    store: &StoreHandle,
     runner: &dyn Runner,
     cancel: &CancelToken,
     command_spec: &RunnerSpec,
@@ -195,13 +210,14 @@ pub(crate) fn run_repair_pass(
     if !result.is_done() {
         let error_detail = result.error.as_deref().unwrap_or("no detail");
         let message = format!("repair pass {attempt} did not complete cleanly");
+        let guard = store.lock();
         crate::cartographer::Note::new("remediation")
             .level(crate::logging::LogLevel::WARNING)
             .squad(&command_spec.squad_id)
             .cell(&command_spec.cell_id)
             .task(&command_spec.task)
             .emit(
-                store,
+                &guard,
                 &message,
                 serde_json::json!({
                     "attempt": attempt,
@@ -321,9 +337,90 @@ mod tests {
         }
     }
 
+    /// Takes the store lock while it "runs", the way the real tmux runner
+    /// does (`SubprocessRunner::emit_tmux_note`). Acquires it on a helper
+    /// thread with a timeout rather than inline, so a regression reports a
+    /// failed assertion instead of hanging the whole test suite.
+    struct StoreLockingRunner {
+        store: crate::store_lock::StoreHandle,
+        could_lock: Mutex<Vec<bool>>,
+    }
+
+    impl Runner for StoreLockingRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            let store = std::sync::Arc::clone(&self.store);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _guard = store.lock();
+                let _ = tx.send(());
+            });
+            let acquired = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            self.could_lock.lock().unwrap().push(acquired);
+            RunnerResult::failure("scripted failure")
+        }
+    }
+
+    /// The store lock must not be held across `Runner::run_cancellable`.
+    ///
+    /// The real tmux runner takes the store lock itself while running a
+    /// command, and the store mutex is not reentrant -- so a caller holding
+    /// it here deadlocks that thread permanently. Because every subsystem
+    /// shares the one store lock, that froze the entire daemon: HTTP
+    /// handlers, scheduler, guardian workers and all.
+    #[test]
+    fn the_store_lock_is_never_held_while_the_runner_runs() {
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
+        let runner = std::sync::Arc::new(StoreLockingRunner {
+            store: std::sync::Arc::clone(&store),
+            could_lock: Mutex::new(Vec::new()),
+        });
+
+        // Drive the call from a helper thread. A regression here does not
+        // merely fail an assertion -- the store lock is not reentrant, so
+        // holding it across the runner self-deadlocks the calling thread and
+        // would otherwise hang the whole suite instead of reporting.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let call_store = std::sync::Arc::clone(&store);
+        let call_runner = std::sync::Arc::clone(&runner);
+        std::thread::spawn(move || {
+            let spec = command_spec("squad-1", "cell-1", "exit 1");
+            let _ = run_command_with_remediation(
+                &call_store,
+                call_runner.as_ref(),
+                &CancelToken::never(),
+                &spec,
+                ralphus_core::schema::COMMAND_MODE_REMEDIATING,
+                Some(2),
+                &repair_agent(),
+            );
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(),
+            "run_command_with_remediation never returned -- the store lock is held \
+             across a call that takes it again, which self-deadlocks the daemon"
+        );
+
+        let attempts = runner.could_lock.lock().unwrap().clone();
+        assert!(
+            !attempts.is_empty(),
+            "the runner must have been invoked at least once"
+        );
+        assert!(
+            attempts.iter().all(|acquired| *acquired),
+            "the runner could not take the store lock while running ({attempts:?}) -- \
+             something up the call stack is holding it across run_cancellable, which \
+             deadlocks the daemon"
+        );
+    }
+
     #[test]
     fn succeeds_on_first_attempt_no_repair_invoked() {
-        let store = crate::store::Store::open_in_memory().unwrap();
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
         let runner = ScriptedRunner::new(vec![done()]);
         let spec = command_spec("squad-1", "cell-1", "exit 0");
         let result = run_command_with_remediation(
@@ -345,7 +442,9 @@ mod tests {
 
     #[test]
     fn raw_mode_never_remediates_even_after_failure() {
-        let store = crate::store::Store::open_in_memory().unwrap();
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
         let runner = ScriptedRunner::new(vec![failed(), failed(), failed()]);
         let spec = command_spec("squad-1", "cell-1", "exit 1");
         let result = run_command_with_remediation(
@@ -368,7 +467,9 @@ mod tests {
     #[test]
     fn remediates_and_retries_until_success() {
         // attempt 1 (command) fails -> repair pass runs -> attempt 2 (command) succeeds.
-        let store = crate::store::Store::open_in_memory().unwrap();
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
         let runner = ScriptedRunner::new(vec![failed(), done(), done()]);
         let spec = command_spec("squad-1", "cell-1", "cargo build");
         let result = run_command_with_remediation(
@@ -406,7 +507,9 @@ mod tests {
 
     #[test]
     fn exhausts_attempts_and_fails() {
-        let store = crate::store::Store::open_in_memory().unwrap();
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
         let runner = ScriptedRunner::new(vec![failed(), failed(), failed()]);
         let spec = command_spec("squad-1", "cell-1", "cargo build");
         let result = run_command_with_remediation(
@@ -431,7 +534,9 @@ mod tests {
 
     #[test]
     fn repair_prompt_points_at_the_captured_file_instead_of_inlining_it() {
-        let store = crate::store::Store::open_in_memory().unwrap();
+        let store: crate::store_lock::StoreHandle = std::sync::Arc::new(
+            crate::store_lock::StoreMutex::new(crate::store::Store::open_in_memory().unwrap()),
+        );
         let _guard = TestRootGuard::new("remediation-repair-prompt");
         let spec = command_spec("squad-2", "cell-2", "cargo test");
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
