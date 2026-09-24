@@ -1000,10 +1000,18 @@ pub fn dispatch_pr_auto_fix(
     let retry_base_ms = i64::try_from(cfg.auto_fix_retry_base_seconds())
         .unwrap_or(i64::MAX / 1_000)
         .saturating_mul(1_000);
-    match store
-        .lock()
-        .claim_pr_auto_fix_attempt(&pr.id, cfg.auto_fix_max_attempts(), retry_base_ms)
-    {
+    // RAL-<pending>: the lock from `store.lock()` used to stay alive for the
+    // whole match statement below (a temporary in a match scrutinee lives
+    // until the match completes, arms included) -- since the `Deferred` arm
+    // calls `log_ci_watch`, which itself needs `store.lock()`, that held the
+    // lock across a second acquisition on the same thread and deadlocked
+    // outright against `parking_lot::Mutex`'s non-reentrant lock. Binding the
+    // claim result first drops the guard immediately, before any arm runs.
+    let claim =
+        store
+            .lock()
+            .claim_pr_auto_fix_attempt(&pr.id, cfg.auto_fix_max_attempts(), retry_base_ms);
+    match claim {
         Ok(AutoFixClaim::Claimed { .. }) => {}
         Ok(AutoFixClaim::Deferred { next_attempt_at_ms }) => {
             log_ci_watch(
