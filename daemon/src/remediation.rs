@@ -86,6 +86,7 @@ pub struct RepairAgent<'a> {
 /// runs, just without the clean-slate guarantee, logged once at snapshot
 /// time by [`resolve_vcs_for_remediation`].
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn run_command_with_remediation(
     store: &Store,
     runner: &dyn Runner,
@@ -806,6 +807,7 @@ mod tests {
             );
         }
 
+        let store = crate::store::Store::open_in_memory().unwrap();
         let runner = RepairEditingRunner {
             tracked_file: tracked_file.clone(),
             observed_before_edit: Mutex::new(Vec::new()),
@@ -814,6 +816,7 @@ mod tests {
         spec.cwd = dir.to_string_lossy().into_owned();
 
         let result = run_command_with_remediation(
+            &store,
             &runner,
             &CancelToken::never(),
             &spec,
