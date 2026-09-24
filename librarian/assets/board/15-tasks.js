@@ -1322,6 +1322,10 @@
       let sel = { kind: null, taskIdx: 0, cellIdx: 0, proofIdx: -1 };
       let editing = false;
       let filters = defaultTaskFilters();
+      // RAL-486 follow-up: once true, filters.agents is a user/URL-chosen
+      // selection and is no longer auto-synced to newly-discovered agents
+      // (see renderSquadAgentFilter; mirrors taskTabAgentDefaulted).
+      let squadAgentDefaulted = false;
       let reviewFilters = defaultReviewFilters();
       // Once true, reviewFilters.resolver is a user/URL-chosen selection and is no longer
       // auto-synced to newly-discovered resolvers (see renderReviewResolverFilters).
