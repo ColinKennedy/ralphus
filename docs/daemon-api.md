@@ -2348,7 +2348,7 @@ board can flag them rather than silently losing the history. Ralphus only
 {
   "project": "widget",
   "user": "alice",
-  "fork_url": "git@github.com:alice/widget.git",
+  "fork_url": "https://github.com/alice/widget.git",
   "remote_name": "fork-alice",
   "fork_owner": "alice",
   "created_at_ms": 1234567890000,
@@ -2368,6 +2368,17 @@ trailing `{user}` segment target the project-wide default row; a trailing
 segment (including a URL-encoded empty one) targets that specific user's row.
 `PATCH` is field-selective — only present fields change — and `404`s if no
 row exists yet for that `(project, user)`.
+
+**`fork_url` must be an `https://` URL** (RAL-500) — SSH (`git@host:path`,
+`ssh://...`) and `git://` shapes are rejected on both `POST` and `PATCH` with
+`400 invalid_value`, even though `parse_remote_url` (used elsewhere, e.g. fork
+health checks reading an already-registered row) still understands their
+shape. When the target project's own forge host is determinable (from its
+registered `clone_url`, or its local checkout's git remote), `fork_url`'s host
+must also match it exactly; a mismatch is rejected with a distinct
+`400 host_mismatch` rather than `invalid_value`, so callers/UI can tell the
+two failure modes apart. When the project's forge host can't be determined at
+all, only the HTTPS requirement is enforced.
 
 `GET /api/health/project-forks` (advisory, evaluated daemon-side for the same
 reason `GET /api/health/agent-profiles` is — this needs the daemon process's

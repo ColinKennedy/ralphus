@@ -345,6 +345,42 @@ impl Store {
     }
 }
 
+/// Best-effort resolution of the forge host a project's own remote points
+/// at (RAL-500), used to reject a fork registration whose URL targets a
+/// different forge host than the project it's being registered against.
+/// Prefers the project's explicitly registered `clone_url` (RAL-355) over
+/// reading the local git remote, since a project can be registered without
+/// ever having been cloned onto this daemon host. Falls back to the local
+/// git remote picked by [`crate::forge::default_remote_name`] (the same
+/// branch-independent fallback project provisioning itself uses, since a
+/// fork-registration call has no review `base_branch` to resolve a remote
+/// name from). Returns `None` when neither source is set/parseable --
+/// callers should treat "no determinable host" as "skip the host-match
+/// check" rather than a rejection, since plenty of registered projects have
+/// no clone URL and no local checkout on this machine.
+#[must_use]
+pub(crate) fn resolve_project_forge_host(project: &crate::store::ProjectView) -> Option<String> {
+    if let Some(clone_url) = project
+        .clone_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((host, _)) = crate::forge::parse_remote_url(clone_url) {
+            return Some(host);
+        }
+    }
+    let root = std::path::Path::new(&project.path);
+    let forge_cfg = crate::config::resolve_forge(root);
+    let remote_name = crate::forge::default_remote_name(&forge_cfg);
+    let url = crate::guardian_merge::git(
+        root,
+        &["config", "--get", &format!("remote.{remote_name}.url")],
+    )
+    .ok()?;
+    crate::forge::parse_remote_url(url.trim()).map(|(host, _)| host)
+}
+
 /// Idempotently add or update a local git remote pointing at `fork_url`
 /// under `remote_name`, in the working tree rooted at `root`. Safe to call
 /// before every fork-mode push -- a no-op when the remote already points at

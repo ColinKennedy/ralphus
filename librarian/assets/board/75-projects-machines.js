@@ -1427,6 +1427,39 @@ Work submitted against it will fail — fix the machine or deregister the provid
         renderPrefs();
       }
       /**
+       * Client-side mirror of the daemon's fork-URL format check (RAL-500,
+       * `validate_fork_url` in `daemon/src/server.rs`): fork clone URLs must
+       * use HTTPS. Deliberately does not replicate the backend's host-match
+       * check, which needs server-side project state -- an HTTPS URL that
+       * still fails to save surfaces that mismatch via the existing
+       * save-error banner instead.
+       * @param {string} url
+       * @returns {string} Empty string when the URL passes (or is blank --
+       *   emptiness is enforced separately at save time), else an inline
+       *   error message.
+       */
+      function forkUrlValidationError(url) {
+        const trimmed = url.trim();
+        if (!trimmed || trimmed.startsWith("https://")) return "";
+        return "Fork clone URLs must use HTTPS (e.g. https://github.com/owner/repo.git).";
+      }
+      /**
+       * Shared `oninput` handler for every fork-URL text field (Preferences
+       * and the Projects-tab fork modal, RAL-500): updates the given draft
+       * object and the paired inline `.verr` element directly, without a
+       * full re-render, so per-keystroke feedback never disturbs the input's
+       * focus or caret position.
+       * @param {HTMLInputElement} input
+       * @param {{fork_url: string}} draft
+       * @param {string} errElementId
+       * @returns {void}
+       */
+      function onForkUrlInput(input, draft, errElementId) {
+        draft.fork_url = input.value;
+        const errEl = document.getElementById(errElementId);
+        if (errEl) errEl.textContent = forkUrlValidationError(input.value);
+      }
+      /**
        * Loads the exact per-project fork mappings for the user whose
        * Preferences page is open. Legacy project-wide fallback rows never
        * apply to this personal UI.
@@ -1492,7 +1525,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         const rows = preferenceForks.slice().sort((a, b) => a.project.localeCompare(b.project)).map((f) => `<tr><td>${esc(f.project)}</td><td class="mono">${esc(f.fork_url)}</td><td class="mono">${esc(f.remote_name)}</td><td><button class="btn" data-click="removePreferenceFork" data-project="${esc(f.project)}" data-tip="Remove this user's fork mapping for ${esc(f.project)}. This cannot be undone.">Remove</button></td></tr>`).join("");
         const d = preferenceForkDraft;
         const choices = projects.map((p) => `<option value="${esc(p.name)}" ${d.project === p.name ? "selected" : ""}>${esc(p.name)}</option>`).join("");
-        byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><input type="text" value="${esc(d.fork_url)}" oninput="preferenceForkDraft.fork_url=this.value" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project."/><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
+        byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:flex-start"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><div><input type="text" value="${esc(d.fork_url)}" oninput="onForkUrlInput(this, preferenceForkDraft, 'pref-fork-url-err')" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project. Must use HTTPS -- SSH and other transports are not accepted."/><div class="verr" id="pref-fork-url-err">${esc(forkUrlValidationError(d.fork_url))}</div></div><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
       }
       /**
        * Sensible default host to prefill when the forge-token kind dropdown
@@ -2555,7 +2588,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           const d = projectForksEditDraft;
           return `<tr class="proj-edit-row">
               <td>${userCell}</td>
-              <td><input type="text" value="${esc(d.fork_url || "")}" oninput="projectForksEditDraft.fork_url=this.value" data-tip="The fork's own clone URL (any form git accepts)." /></td>
+              <td><input type="text" value="${esc(d.fork_url || "")}" oninput="onForkUrlInput(this, projectForksEditDraft, 'edit-fork-url-err')" data-tip="The fork's own clone URL. Must use HTTPS -- SSH and other transports are not accepted." /><div class="verr" id="edit-fork-url-err">${esc(forkUrlValidationError(d.fork_url || ""))}</div></td>
               <td><input type="text" value="${esc(d.remote_name || "")}" oninput="projectForksEditDraft.remote_name=this.value" data-tip="Local git remote name ralphus creates/updates automatically before the first fork-mode push." /></td>
               <td><input type="text" value="${esc(d.fork_owner || "")}" oninput="projectForksEditDraft.fork_owner=this.value" data-tip="GitHub owner/org login the fork lives under (needed to build the cross-repository PR's \"owner:branch\" head). Leave blank for GitLab, which addresses cross-project MRs by numeric project id instead." /></td>
               <td>
@@ -2609,9 +2642,9 @@ Work submitted against it will fail — fix the machine or deregister the provid
               <th data-tip="GitHub owner/org login the fork lives under. Blank for GitLab.">Owner</th>
               <th></th>
             </tr></thead><tbody>${rowsHtml}</tbody></table>
-            <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px">
+            <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:12px;align-items:flex-start">
               <input type="text" placeholder="user (blank = default)" value="${esc(d.user || "")}" oninput="projectForksAddDraft.user=this.value" style="width:140px" data-tip="Leave blank to register/replace the project-wide default row." />
-              <input type="text" placeholder="fork clone URL" value="${esc(d.fork_url || "")}" oninput="projectForksAddDraft.fork_url=this.value" style="width:220px" data-tip="Required. The fork's own clone URL (any form git accepts)." />
+              <div><input type="text" placeholder="fork clone URL" value="${esc(d.fork_url || "")}" oninput="onForkUrlInput(this, projectForksAddDraft, 'add-fork-url-err')" style="width:220px" data-tip="Required. The fork's own clone URL. Must use HTTPS -- SSH and other transports are not accepted." /><div class="verr" id="add-fork-url-err">${esc(forkUrlValidationError(d.fork_url || ""))}</div></div>
               <input type="text" placeholder="remote name (optional)" value="${esc(d.remote_name || "")}" oninput="projectForksAddDraft.remote_name=this.value" style="width:150px" data-tip="Defaults to \"fork\" for the default row, else \"fork-<user>\"." />
               <input type="text" placeholder="owner (optional)" value="${esc(d.fork_owner || "")}" oninput="projectForksAddDraft.fork_owner=this.value" style="width:120px" data-tip="GitHub owner/org login. Auto-derived from the URL when it looks like a GitHub host; leave blank for GitLab." />
               <button class="btn primary" onclick="addProjectFork()" data-tip="Register this fork. Replaces any existing row for the same user (or the default row, if user is blank).">Add / Replace</button>
