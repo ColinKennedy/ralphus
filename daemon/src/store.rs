@@ -9303,6 +9303,33 @@ impl Store {
         )
     }
 
+    /// Resolve `(squad_id, cell_sid)` into a `cell:...`
+    /// [`crate::entity_uri::EntityUri`] string without needing the owning
+    /// task's name -- used by callers (e.g. `cpu_stall.rs`) that only track
+    /// a squad id and a cell/session id, not a task name. `None` when no
+    /// cell in that squad has a matching `sid` (e.g. `cell_sid` names a
+    /// proof step's synthetic id instead of a real cell).
+    #[must_use]
+    pub fn cell_entity_uri_by_sid(&self, squad_id: &str, cell_sid: &str) -> Option<String> {
+        let (task_idx, cell_idx): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT task_idx, idx FROM cells WHERE squad_id=?1 AND sid=?2",
+                params![squad_id, cell_sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()??;
+        Some(
+            crate::entity_uri::EntityUri::Cell {
+                squad_id: squad_id.to_string(),
+                task_idx,
+                cell_idx,
+            }
+            .to_string(),
+        )
+    }
+
     /// Resolve `(squad_id, task_name)` into a `task:...`
     /// [`crate::entity_uri::EntityUri`] string, so RAL-320 watches can match
     /// against it. `None` when the pair doesn't match a row.

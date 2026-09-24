@@ -3396,13 +3396,18 @@ fn settle_pr_merge_states(
         let message = format!(
             "Linked pull request {pr_ref} merged on the forge while review '{}' ({id}) had a \
              merge/feedback pass in flight. It has been dropped from the review -- check whether \
-             any in-flight work still applies, and resubmit a fresh PR if needed.",
+             any in-flight work still applies.",
             current_guardian.name,
         );
         let entity_uri = format!("guardian:{id}");
-        let _ = guard.enqueue_mailbox_message_ex(
+        let _ = guard.enqueue_error_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &message,
+            &crate::mailbox::Remediation::SuggestedCommand {
+                command: format!("ralphus review pr submit {id}"),
+                purpose: "resubmit a fresh PR for the review if the in-flight work still applies"
+                    .to_string(),
+            },
             None,
             None,
             None,
