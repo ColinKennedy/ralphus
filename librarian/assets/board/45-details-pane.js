@@ -303,29 +303,38 @@
           <div class="kv-row"><span class="k">time running</span><span class="v"${runningAttrs} data-tip="${runningTip}">${fmtDuration(elapsed)}</span></div>`;
       }
       /**
-       * Renders the squad-level details pane.
-       * @param {SquadView} r
-       * @returns {string}
+       * RAL-352: a task's computed total agent-turn count -- its own
+       * task-scope proof steps, every cell, and every cell-scope proof step,
+       * summed on demand. Constituents without a `turns` attribute
+       * (command-mode cells/proofs) are skipped, so a task whose *only* rows
+       * are command-mode reports no applicable total (null).
+       * @param {TaskView} t
+       * @returns {number|null}
        */
+      function taskTurns(t) {
+        let total = 0;
+        let any = false;
+        const take = (/** @type {number|null|undefined} */ n) => { if (n !== undefined && n !== null) { total += n; any = true; } };
+        for (const p of t.proof || []) take(p.turns);
+        for (const c of t.cells || []) {
+          take(c.turns);
+          for (const p of c.proof || []) take(p.turns);
+        }
+        return any ? total : null;
+      }
       /**
-       * RAL-352: the squad's computed total agent-turn count -- every cell,
-       * every cell-scope proof step, and every task-scope proof step, summed
-       * on demand. Constituents without a `turns` attribute (command-mode
-       * cells/proofs) are skipped, so a squad whose *only* rows are
-       * command-mode reports no applicable total (null).
+       * RAL-352: the squad's computed total agent-turn count -- the same sum
+       * as {@link taskTurns}, taken across every task. Null when no task in
+       * the squad has an applicable total.
        * @param {SquadView} r
        * @returns {number|null}
        */
       function squadTurns(r) {
         let total = 0;
         let any = false;
-        const take = (/** @type {number|null|undefined} */ n) => { if (n !== undefined && n !== null) { total += n; any = true; } };
         for (const t of r.tasks || []) {
-          for (const p of t.proof || []) take(p.turns);
-          for (const c of t.cells || []) {
-            take(c.turns);
-            for (const p of c.proof || []) take(p.turns);
-          }
+          const n = taskTurns(t);
+          if (n !== null) { total += n; any = true; }
         }
         return any ? total : null;
       }
@@ -773,11 +782,13 @@
               `<span class="k">${esc(v.state)}</span>` +
               `<button class="btn" data-click="pick" data-kind="proof" data-ti="${ti}" data-si="-1" data-vi="${vi}" data-tip="Jump to this proof step's detail pane — view its kind, state, and output.">Go</button></div>`).join("")
           : `<h3 class="section">proof steps</h3><div class="kv-row"><span class="v">None</span></div>`;
+        const totalTurns = taskTurns(t);
         return `<div class="dhead"><span class="k">⯀ task</span></div>
           <div class="kv-row"><span class="k">name</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">project</span><span class="v">${esc(t.project)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(t.state)}${outOfDateBadge(t.env_out_of_date)}${["pending","queued"].includes(t.state) ? "" : squadLogsBtn(r.id)}${t.error ? failLogBtn(t.error) : ""}</span></div>
           ${timingRows(t.started_at_ms, t.finished_at_ms)}
+          <div class="kv-row" data-tip="${TASK_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           ${cells}
           ${proof}
           ${taskEnvOverridesSection(r, ti, t)}
