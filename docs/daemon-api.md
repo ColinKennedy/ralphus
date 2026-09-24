@@ -1834,6 +1834,20 @@ also declarable at submit time in `[[review]]` as the same names, except
 `[[review]] upstream`: the guardian's base branch is minted from that declared
 or inferred upstream when the review is created.
 
+`base_shift_maximum_rebuilds` (RAL-507, optional positive integer, default 3)
+caps how many times the automatic base-branch-update rebuild may retry one
+unresolved base shift -- a rebuild that keeps failing on the same new base (a
+persistent conflict, failed proof, provider outage, or worktree problem) --
+before the maintenance sweep stops dispatching rebuilds for that campaign and
+the notification mailbox receives one durable message explaining that
+automatic rebasing stopped because the retry budget was exhausted. The budget
+lives on the review as durable per-campaign state keyed by the upstream base
+SHA the failed rebuild attempted: a successful rebuild closes the campaign,
+pressing Merge / rebase resets it, and a shift to a *different* target SHA
+starts a fresh campaign. It can also be set as a `[review]
+base_shift_maximum_rebuilds` project default in `.ralphus.toml`; a value of 0
+is rejected as "must be at least 1".
+
 `separate_pr_branch` (RAL-378, optional boolean) controls whether this
 review's pull request gets a remote branch of its own. `false` -- the default
 -- means the review branch *is* the PR branch: every branch registered since

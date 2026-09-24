@@ -3683,6 +3683,328 @@ fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ─── RAL-507: the base-shift rebuild retry budget ───
+
+/// A runner whose agent dispatch always fails, so every automatic base-shift
+/// rebuild deterministically ends `merge_failed` -- the persistent-conflict /
+/// provider-outage shape the RAL-507 retry budget exists to bound.
+struct FailingAgentRunner;
+impl Runner for FailingAgentRunner {
+    fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+        RunnerResult::failure("provider outage (test)")
+    }
+
+    fn preflight_agent(
+        &self,
+        _agent: &str,
+        _executable: Option<&str>,
+        _machine: Option<&str>,
+    ) -> Result<(), String> {
+        Err("provider outage (test)".to_string())
+    }
+}
+
+/// A one-branch review whose feature branch edits `shared.txt`, so advancing
+/// `main`'s `shared.txt` makes every rebuild against the new base conflict --
+/// and fail, deterministically, with [`FailingAgentRunner`].
+fn conflicting_base_shift_repo() -> (PathBuf, Arc<StoreMutex>, String) {
+    let root = temp_repo();
+    init_repo(&root);
+    write(&root, "shared.txt", "original\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "shared.txt", "feature\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feature"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    (root, store, id)
+}
+
+fn advance_main(root: &Path, file: &str, content: &str, message: &str) -> String {
+    write(root, file, content);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", message]);
+    git(root, &["rev-parse", "main"]).trim().to_string()
+}
+
+fn exhaustion_notices(store: &Arc<StoreMutex>) -> Vec<ralphus_daemon::mailbox::MailboxMessageView> {
+    let guard = store.lock();
+    let client = guard.register_mailbox_client().unwrap();
+    guard
+        .mailbox_messages_for_client(&client, false, None)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.category.as_deref() == Some("review"))
+        .collect()
+}
+
+// A persistent base-shift failure (conflict the resolver agent cannot fix,
+// provider outage, ...) must not consume merge capacity and agent spend
+// forever: after the configured number of failed unattended rebuilds against
+// the SAME target base, the maintenance sweep stops dispatching and the
+// mailbox receives exactly one durable exhaustion notice.
+#[test]
+fn base_shift_rebuild_budget_caps_repeated_failures_and_notifies_once() {
+    let (root, store, id) = conflicting_base_shift_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    store
+        .lock()
+        .set_guardian_base_shift_maximum_rebuilds(&id, Some(2))
+        .unwrap();
+
+    let target = advance_main(&root, "shared.txt", "moved on\n", "conflicting advance");
+    let sem = Semaphore::new(4);
+
+    // Attempts 1 and 2 dispatch and fail; each consumes one unit of budget.
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_failed",
+        "the failed rebuild left the review awaiting human action"
+    );
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(g.base_shift_rebuild_attempts, 2);
+    // Campaign identity is the UPSTREAM base SHA the failed rebuilds
+    // attempted -- never a rebase-generated review SHA, which churns on every
+    // unrelated rebase and would otherwise mint a fresh budget each pass.
+    assert_eq!(
+        g.base_shift_rebuild_targets,
+        Some(std::collections::BTreeMap::from([(
+            root.to_str().unwrap().to_string(),
+            target.clone()
+        )]))
+    );
+
+    // Budget exhausted: no more dispatching, one durable mailbox notice.
+    assert!(
+        !rebuild_on_base_shift(
+            &store,
+            &FailingAgentRunner,
+            &id,
+            &sem,
+            &CancelToken::never()
+        ),
+        "an exhausted campaign must not dispatch another rebuild"
+    );
+    let notices = exhaustion_notices(&store);
+    assert_eq!(notices.len(), 1, "exactly one exhaustion notice");
+    assert!(
+        notices[0].message.contains(&id),
+        "the notice must identify the review: {}",
+        notices[0].message
+    );
+    assert!(
+        notices[0].message.contains("budget exhausted")
+            && notices[0].message.contains("automatic rebasing stopped"),
+        "the notice must explain why automatic rebasing stopped: {}",
+        notices[0].message
+    );
+    assert_eq!(
+        notices[0].entity_uri.as_deref(),
+        Some(format!("guardian:{id}").as_str())
+    );
+    assert_eq!(notices[0].priority, "high");
+
+    // Repeated maintenance passes stay stopped and never duplicate the
+    // notice -- even across what would be a daemon restart (all campaign
+    // state is durable, nothing in-memory).
+    assert!(!rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    assert_eq!(exhaustion_notices(&store).len(), 1, "no duplicate notice");
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(g.base_shift_rebuild_attempts, 2, "no further budget spent");
+    assert_eq!(g.status, "merge_failed", "still awaiting human action");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// A shift to a DIFFERENT target base SHA is meaningful new upstream work and
+// earns its own budget -- the spent old campaign must not suppress it.
+#[test]
+fn base_shift_rebuild_budget_reopens_for_a_new_target_base_sha() {
+    let (root, store, id) = conflicting_base_shift_repo();
+    run_merge(&store, &NoopRunner, &id);
+    store
+        .lock()
+        .set_guardian_base_shift_maximum_rebuilds(&id, Some(1))
+        .unwrap();
+    let sem = Semaphore::new(4);
+
+    let first_target = advance_main(&root, "shared.txt", "moved on\n", "first advance");
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    assert_eq!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .base_shift_rebuild_attempts,
+        1
+    );
+    assert!(
+        !rebuild_on_base_shift(
+            &store,
+            &FailingAgentRunner,
+            &id,
+            &sem,
+            &CancelToken::never()
+        ),
+        "the first campaign's budget is spent"
+    );
+
+    // Upstream genuinely advances again: a new target SHA, a fresh campaign.
+    let second_target = advance_main(&root, "extra.txt", "more upstream\n", "second advance");
+    assert_ne!(first_target, second_target);
+    assert!(
+        rebuild_on_base_shift(
+            &store,
+            &FailingAgentRunner,
+            &id,
+            &sem,
+            &CancelToken::never()
+        ),
+        "a new target base SHA opens a fresh campaign with a full budget"
+    );
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        g.base_shift_rebuild_attempts, 1,
+        "only the new campaign's attempt"
+    );
+    assert_eq!(
+        g.base_shift_rebuild_targets,
+        Some(std::collections::BTreeMap::from([(
+            root.to_str().unwrap().to_string(),
+            second_target
+        )]))
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// A SUCCESSFUL automatic rebuild closes the campaign outright: a future shift
+// starts from a full budget, not from whatever was left of a spent one.
+#[test]
+fn successful_base_shift_rebuild_closes_the_campaign() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+
+    // Open a campaign and spend part of its budget against a stale target,
+    // as an earlier failed shift would have left it.
+    let stale = std::collections::BTreeMap::from([(
+        root.to_str().unwrap().to_string(),
+        "stalebase000".to_string(),
+    )]);
+    {
+        let g = store.lock();
+        g.start_guardian_base_shift_campaign(&id, &stale).unwrap();
+        g.record_guardian_base_shift_rebuild_failure(&id, &stale)
+            .unwrap();
+        assert!(g.claim_guardian_base_shift_exhausted_notice(&id).unwrap());
+    }
+
+    // The shift to the real new base rebuilds cleanly (NoopRunner: no
+    // conflicts), so the pass succeeds -- and the campaign must close.
+    advance_main(&root, "c.txt", "on base\n", "clean advance");
+    let sem = Semaphore::new(4);
+    assert!(rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(g.status, "in_review", "detail: {:?}", g.detail);
+    assert_eq!(g.base_shift_rebuild_attempts, 0, "campaign closed");
+    assert_eq!(g.base_shift_rebuild_targets, None, "campaign closed");
+    assert_eq!(
+        g.base_shift_exhausted_notified_at_ms, None,
+        "exhaustion marker reset with the campaign"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Pressing Merge / rebase manually resets the review's base-shift
+// automatic-rebuild budget BEFORE the user-requested rebase starts: a
+// human-directed retry earns a fresh automatic budget.
+#[test]
+fn manual_merge_press_resets_the_base_shift_rebuild_budget() {
+    let daemon = Daemon::new(Store::open_in_memory().unwrap(), 4);
+    let store = daemon.store_handle();
+    let gid = {
+        let g = store.lock();
+        // A git_root that does not exist: the requested merge itself fails
+        // fast (no branches -> `NoBranches`), so this test exercises only
+        // the reset that must happen BEFORE that rebase starts.
+        g.create_guardian("r", "main", "/repo-does-not-exist")
+            .unwrap()
+    };
+
+    // An exhausted campaign awaiting human action.
+    {
+        let g = store.lock();
+        g.set_guardian_base_shift_maximum_rebuilds(&gid, Some(1))
+            .unwrap();
+        let targets = std::collections::BTreeMap::from([(
+            "/repo-does-not-exist".to_string(),
+            "deadbeef".to_string(),
+        )]);
+        g.start_guardian_base_shift_campaign(&gid, &targets)
+            .unwrap();
+        g.record_guardian_base_shift_rebuild_failure(&gid, &targets)
+            .unwrap();
+        assert!(g.claim_guardian_base_shift_exhausted_notice(&gid).unwrap());
+    }
+
+    let reply = route(&daemon, "POST", &format!("/api/guardians/{gid}/merge"), "");
+    assert_eq!(reply.status, 400, "no branches: {}", reply.body);
+
+    let g = store.lock().get_guardian(&gid).unwrap();
+    assert_eq!(g.base_shift_rebuild_attempts, 0, "budget reset");
+    assert_eq!(g.base_shift_rebuild_targets, None, "campaign cleared");
+    assert_eq!(
+        g.base_shift_exhausted_notified_at_ms, None,
+        "a fresh campaign may notify again if it too exhausts"
+    );
+}
+
 // RAL-97/98 regression: a "linked" guardian whose branches are contributed by
 // SEPARATE runs (joined by a shared `review` key rather than one multi-file
 // submission) can leave a later branch stuck at `merge_status = "pending"`

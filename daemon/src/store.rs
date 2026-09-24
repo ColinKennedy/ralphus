@@ -784,6 +784,10 @@ impl ProjectReviewSettings {
             // `summary_format` above; only the file-based `.ralphus.toml`
             // layer sets it.
             provider_timeout_max_retries: None,
+            // Same treatment again (RAL-507): the base-shift rebuild cap is
+            // set per `.ralphus.toml [review]` layer or per review; a
+            // board-editable numeric project default has no demand yet.
+            base_shift_maximum_rebuilds: None,
         }
     }
 }
@@ -2975,6 +2979,26 @@ impl Store {
             // `reviews::apply_project_review_defaults`, same as
             // `auto_fix_pr_errors`), then `false`.
             "ALTER TABLE guardians ADD COLUMN discourage_tests_during_auto_pull_request_fixes INTEGER",
+            // RAL-507: this review's own cap on unattended base-shift rebuild
+            // attempts. `None` inherits the `.ralphus.toml [review]
+            // base_shift_maximum_rebuilds` project default, then the built-in
+            // default of 3.
+            "ALTER TABLE guardians ADD COLUMN base_shift_maximum_rebuilds INTEGER",
+            // RAL-507: durable base-shift retry-campaign state. `attempts`
+            // counts failed unattended rebuilds within the current campaign;
+            // `targets` is the JSON map of {project_root: upstream base SHA}
+            // the campaign's rebuilds attempt -- the campaign identity, keyed
+            // by the upstream base SHAs (never the rebase-generated review
+            // SHAs, which churn on every unrelated rebase). `notified_at_ms`
+            // is the one-time marker that the mailbox was told the campaign's
+            // budget is exhausted, mirroring the PR auto-fix exhausted
+            // notice's persisted-flag dedup. All three reset together: on a
+            // successful rebuild (campaign closed), on a manual Merge /
+            // rebase (human-directed fresh budget), and when a base shift to
+            // a *different* target SHA starts a new campaign.
+            "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_targets TEXT",
+            "ALTER TABLE guardians ADD COLUMN base_shift_exhausted_notified_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

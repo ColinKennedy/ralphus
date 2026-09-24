@@ -14879,6 +14879,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
     reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+    reset_base_shift_campaign_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_merge(
         daemon.store_handle(),
@@ -14923,6 +14924,21 @@ fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
                 "ralphus [server] review {id} could not reset PR auto-fix attempts before manual rebase: {e}"
             );
         }
+    }
+}
+
+/// RAL-507: a user's Merge / rebase press gives the review's base-shift
+/// retry campaign a fresh automatic budget -- clear the durable campaign
+/// state (attempt counter, target SHAs, exhaustion-notified marker) before
+/// the requested rebase starts. `cancel_and_merge` reaches the same reset
+/// through `restart_guardian_merge`. Best-effort, same convention as the
+/// auto-fix reset above: the merge itself must not fail on bookkeeping.
+fn reset_base_shift_campaign_for_manual_rebase(daemon: &Daemon, id: &str) {
+    if let Err(e) = daemon.lock().clear_guardian_base_shift_campaign(id) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [server] review {id} could not reset base-shift rebuild budget before manual rebase: {e}"
+        );
     }
 }
 

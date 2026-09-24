@@ -277,6 +277,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "skip_worktrees",
     "auto_pr_feedback",
     "skip_base_updates",
+    "base_shift_maximum_rebuilds",
     "skip_auto_clean",
     "match_pr_branch_name",
     "separate_pr_branch",
@@ -1908,6 +1909,15 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "skip_worktrees", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_pr_feedback", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_base_updates", Ty::Bool, &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "base_shift_maximum_rebuilds",
+            Ty::Int,
+            &rpath,
+            header,
+        );
+        check_positive_number(ctx, table, "base_shift_maximum_rebuilds", &rpath, header);
         check_type(ctx, table, "skip_auto_clean", Ty::Bool, &rpath, header);
         check_type(ctx, table, "match_pr_branch_name", Ty::Bool, &rpath, header);
         check_type(ctx, table, "separate_pr_branch", Ty::Bool, &rpath, header);
@@ -3355,6 +3365,43 @@ prompt = "make it build"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\ndual_root_pr=true\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    // ── [[review]] base_shift_maximum_rebuilds (RAL-507) ──
+
+    #[test]
+    fn review_base_shift_maximum_rebuilds_accepted() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_shift_maximum_rebuilds=5\n";
+        let r = validate_toml(src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_base_shift_maximum_rebuilds_rejects_zero_and_negative() {
+        for value in ["0", "-1"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_shift_maximum_rebuilds={value}\n"
+            );
+            let r = validate_toml(&src);
+            assert!(
+                r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                    && e.message.contains("base_shift_maximum_rebuilds")),
+                "{value}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn review_base_shift_maximum_rebuilds_rejects_wrong_type() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_shift_maximum_rebuilds=\"three\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
+                && e.message.contains("base_shift_maximum_rebuilds")),
+            "{:?}",
+            r.errors
+        );
     }
 
     #[test]

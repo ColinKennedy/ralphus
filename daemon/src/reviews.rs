@@ -375,6 +375,9 @@ struct Membership {
     skip_worktrees: Option<bool>,
     auto_pr_feedback: Option<bool>,
     skip_base_updates: Option<bool>,
+    /// RAL-507: optional base-shift rebuild retry cap declared on the review
+    /// (`[[review]] base_shift_maximum_rebuilds`).
+    base_shift_maximum_rebuilds: Option<u32>,
     skip_auto_clean: Option<bool>,
     match_pr_branch_name: Option<bool>,
     separate_pr_branch: Option<bool>,
@@ -991,6 +994,7 @@ pub fn derive_reviews_with_full_prefetch(
             skip_worktrees: rv.and_then(|r| r.skip_worktrees),
             auto_pr_feedback: rv.and_then(|r| r.auto_pr_feedback),
             skip_base_updates: rv.and_then(|r| r.skip_base_updates),
+            base_shift_maximum_rebuilds: rv.and_then(|r| r.base_shift_maximum_rebuilds),
             skip_auto_clean: rv.and_then(|r| r.skip_auto_clean),
             match_pr_branch_name: rv.and_then(|r| r.match_pr_branch_name),
             separate_pr_branch: rv.and_then(|r| r.separate_pr_branch),
@@ -1366,6 +1370,13 @@ fn apply_resolver(
     if let Some(skip) = members.iter().find_map(|m| m.skip_base_updates) {
         store
             .set_guardian_skip_base_updates(gid, Some(skip))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-507: this review's own base-shift rebuild retry cap, authored via
+    // `[[review]] base_shift_maximum_rebuilds`.
+    if let Some(cap) = members.iter().find_map(|m| m.base_shift_maximum_rebuilds) {
+        store
+            .set_guardian_base_shift_maximum_rebuilds(gid, Some(cap))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     if let Some(skip) = members.iter().find_map(|m| m.skip_auto_clean) {
@@ -2993,6 +3004,7 @@ mod tests {
             skip_worktrees: None,
             auto_pr_feedback: None,
             skip_base_updates: None,
+            base_shift_maximum_rebuilds: None,
             skip_auto_clean: None,
             match_pr_branch_name: None,
             separate_pr_branch: None,
