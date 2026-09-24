@@ -214,6 +214,27 @@ impl GitVcs {
             stderr: stderr_thread.join().unwrap_or_default(),
         })
     }
+
+    /// Like [`Self::exec_raw`], but for the subset of commands that read or
+    /// write blob content to the working tree (`diff`, `reset --hard`,
+    /// `apply`) as part of [`Vcs::snapshot_worktree`]/[`Vcs::restore_worktree`].
+    ///
+    /// Those two calls promise a byte-exact round trip of the working tree,
+    /// but git's own `core.autocrlf`/`core.safecrlf` — set ambiently by the
+    /// user's global config or the CI image, not by this module — quietly
+    /// rewrites line endings on checkout. Left alone, `restore_worktree`'s
+    /// `git reset --hard HEAD` can hand back a file with different bytes
+    /// than what was on disk when `snapshot_worktree` captured it, breaking
+    /// the "restore to exactly the state captured" contract. Forcing both
+    /// off for just these commands makes the round trip deterministic
+    /// regardless of ambient config, without touching `core.autocrlf`
+    /// project-wide for other git operations (rebase, worktree, staging)
+    /// that legitimately want the repo's configured convention.
+    fn exec_content_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        let mut full_args = vec!["-c", "core.autocrlf=false", "-c", "core.safecrlf=false"];
+        full_args.extend_from_slice(args);
+        Self::exec_raw(root, &full_args)
+    }
 }
 
 impl Vcs for GitVcs {
@@ -272,7 +293,7 @@ impl Vcs for GitVcs {
 
         // `diff HEAD` covers both staged and unstaged changes in one shot;
         // `--binary` keeps the patch applicable to non-text files too.
-        let diff = Self::exec_raw(root, &["diff", "HEAD", "--binary"])?;
+        let diff = Self::exec_content_raw(root, &["diff", "HEAD", "--binary"])?;
         if !diff.status.success() {
             return Err(format!(
                 "git diff HEAD failed: {}",
@@ -320,7 +341,7 @@ impl Vcs for GitVcs {
         // failed attempt created) before replaying the snapshot — avoids
         // `git stash`, whose stack is shared across every worktree hanging
         // off this daemon's checkout (see `AGENTS.md`).
-        let reset = Self::exec_raw(root, &["reset", "--hard", "HEAD"])?;
+        let reset = Self::exec_content_raw(root, &["reset", "--hard", "HEAD"])?;
         if !reset.status.success() {
             return Err(format!(
                 "git reset --hard HEAD failed: {}",
@@ -339,7 +360,7 @@ impl Vcs for GitVcs {
         let patch_len = std::fs::metadata(&patch_path).map(|m| m.len()).unwrap_or(0);
         if patch_len > 0 {
             let patch_str = patch_path.to_string_lossy().into_owned();
-            let apply = Self::exec_raw(root, &["apply", "--binary", &patch_str])?;
+            let apply = Self::exec_content_raw(root, &["apply", "--binary", &patch_str])?;
             if !apply.status.success() {
                 return Err(format!(
                     "git apply of snapshot patch failed: {}",
