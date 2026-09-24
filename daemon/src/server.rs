@@ -14969,6 +14969,7 @@ fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
 /// auto-fix reset above: the merge itself must not fail on bookkeeping.
 fn reset_base_shift_campaign_for_manual_rebase(daemon: &Daemon, id: &str) {
     if let Err(e) = daemon.lock().clear_guardian_base_shift_campaign(id) {
+        // ralphus[ignore-rlog-pair]: the Store call itself failed, so there is no working Store to record the structured workflow outcome on; the merge/rebase handler logs the rebase it proceeds to run.
         crate::rlog!(
             WARNING,
             "ralphus [server] review {id} could not reset base-shift rebuild budget before manual rebase: {e}"
