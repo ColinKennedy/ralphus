@@ -12045,10 +12045,31 @@ mod tests {
 
     #[test]
     fn check_pr_merges_marks_merged_when_all_merges_were_already_recorded() {
+        let root_dir = tmp_dir("check-pr-merges-already-merged");
+        g(&root_dir, &["init"]);
+        g(
+            &root_dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        std::fs::write(
+            root_dir.join(".ralphus.toml"),
+            r#"[forge]
+kind = "github"
+api_base = "http://127.0.0.1:1"
+token_env = "RALPHUS_TEST_FORGE_TOKEN"
+"#,
+        )
+        .unwrap();
+
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
-            .create_guardian("demo", "main", "/repo")
+            .create_guardian("demo", "main", root_dir.to_str().unwrap())
             .unwrap();
         store
             .lock()
@@ -12074,16 +12095,9 @@ mod tests {
             .update_pull_request(&pr_id, None, None, None, Some("merged"))
             .unwrap();
 
-        let client = crate::forge::ForgeClient::new(
-            crate::forge::ForgeKind::GitHub,
-            "http://127.0.0.1:1".to_string(),
-            "acme/widget".to_string(),
-            None,
-        );
-        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
-
-        assert!(apply_pr_merge_check(&store, &gid, &prs, &client));
+        check_pr_merges(&store, &gid);
         assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merged");
+        let _ = std::fs::remove_dir_all(root_dir);
     }
 
     #[test]
