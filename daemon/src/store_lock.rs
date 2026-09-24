@@ -82,14 +82,25 @@ impl StoreMutex {
             let mut holder = HOLDER.lock();
             if waited >= SLOW_WAIT_LOG_THRESHOLD {
                 if let Some(prev) = *holder {
+                    let held_ms = now.saturating_sub(prev.acquired_at_ms);
                     crate::rlog!(
                         WARNING,
-                        "ralphus [store_lock] waited {}ms for the store lock; previously acquired at {}:{} ({}ms ago)",
+                        "ralphus [store_lock] waited {}ms for the store lock; previously acquired at {}:{} ({held_ms}ms ago)",
                         waited.as_millis(),
                         prev.file,
                         prev.line,
-                        now.saturating_sub(prev.acquired_at_ms)
                     );
+                    crate::cartographer::Note::new("store_lock")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            &guard,
+                            "slow store lock acquisition",
+                            serde_json::json!({
+                                "waited_ms": waited.as_millis() as u64,
+                                "previous_holder": format!("{}:{}", prev.file, prev.line),
+                                "previous_holder_held_ms": held_ms,
+                            }),
+                        );
                 }
             }
             *holder = Some(HolderInfo {
