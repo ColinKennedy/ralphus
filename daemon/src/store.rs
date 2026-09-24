@@ -2056,6 +2056,87 @@ impl Store {
                 ON task_worktree_claims(project, base_branch);
             CREATE INDEX IF NOT EXISTS idx_wt_claims_squad
                 ON task_worktree_claims(project, base_branch, squad_id);
+            -- RAL-400: a waypoint is a named join point that lets a
+            -- human-authored note retroactively bind already-submitted or
+            -- running work (reviews and squads, in v1) without that join
+            -- being foreseeable at submit time. `prompt` is required and
+            -- human-authored -- there is no silent default -- and is what
+            -- gets delivered to each roster entry's agent. `agent`/`model`
+            -- are the backend a delivery is carried out with; `model` is
+            -- required only for agents `core::schema::agent_requires_model`
+            -- says need one, enforced at the validator/API layer, not here.
+            -- `allow_advisory` defaults off: a roster entry only ever
+            -- downgrades to advisory (non-blocking) delivery when both the
+            -- waypoint author opted in here AND the survey (or a human
+            -- override) decided that entry's impact doesn't warrant a
+            -- block. `closed_at_ms` NULL means still open; see
+            -- `crate::waypoints` for the lifecycle.
+            CREATE TABLE IF NOT EXISTS waypoints (
+                id             TEXT PRIMARY KEY,
+                label          TEXT NOT NULL,
+                prompt         TEXT NOT NULL,
+                agent          TEXT,
+                model          TEXT,
+                allow_advisory INTEGER NOT NULL DEFAULT 0,
+                closed_at_ms   INTEGER,
+                created_at_ms  INTEGER NOT NULL
+            );
+            -- RAL-400: one row per (waypoint, roster entry). `entity_kind`
+            -- is `review` or `squad` (v1's roster scope); `entity_id` is
+            -- that entity's own id. `mode` starts at the survey's verdict
+            -- (`block`/`advisory`) and is human-overridable afterward --
+            -- `survey_verdict`/`survey_rationale` keep the original
+            -- classification around even after an override, so \"why did
+            -- this entry end up advisory\" stays answerable.
+            -- `delivery_status` tracks whether the waypoint's prompt has
+            -- reached this entry yet (`undelivered`/`delivered`/
+            -- `via-restack`/`failed`) -- see `crate::waypoints`.
+            CREATE TABLE IF NOT EXISTS waypoint_roster (
+                waypoint_id      TEXT NOT NULL REFERENCES waypoints(id) ON DELETE CASCADE,
+                entity_kind      TEXT NOT NULL,
+                entity_id        TEXT NOT NULL,
+                mode             TEXT NOT NULL DEFAULT 'block',
+                survey_verdict   TEXT,
+                survey_rationale TEXT,
+                delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
+                created_at_ms    INTEGER NOT NULL,
+                updated_at_ms    INTEGER NOT NULL,
+                PRIMARY KEY (waypoint_id, entity_kind, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoint_roster_waypoint
+                ON waypoint_roster(waypoint_id);
+            -- RAL-400: an append-only, durable account of actual completed
+            -- work relevant to a waypoint -- `commit_id`/`commit_summary`
+            -- are populated when the work is tied to a real Git commit,
+            -- `entity_uri` optionally links back to the squad/task/cell/
+            -- review that produced it. Never updated or deleted once
+            -- written, so a waypoint's history can't be silently rewritten.
+            CREATE TABLE IF NOT EXISTS waypoint_bearings (
+                id             TEXT PRIMARY KEY,
+                waypoint_id    TEXT NOT NULL REFERENCES waypoints(id) ON DELETE CASCADE,
+                commit_id      TEXT,
+                commit_summary TEXT,
+                summary        TEXT NOT NULL,
+                entity_uri     TEXT,
+                created_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoint_bearings_waypoint
+                ON waypoint_bearings(waypoint_id, created_at_ms);
+            -- RAL-400: v2-unused-in-v1 schema for delivering a waypoint's
+            -- prompt to a roster entry that is mid-flight when the waypoint
+            -- closes over it (Phase 5, not implemented this pass) --
+            -- created now so the table exists once that delivery path is
+            -- built, without a later migration. `drained_at_ms` NULL means
+            -- still pending.
+            CREATE TABLE IF NOT EXISTS pending_injections (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                waypoint_id   TEXT NOT NULL REFERENCES waypoints(id) ON DELETE CASCADE,
+                entity_kind   TEXT NOT NULL,
+                entity_id     TEXT NOT NULL,
+                payload       TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                drained_at_ms INTEGER
+            );
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and

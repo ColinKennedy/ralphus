@@ -54,6 +54,12 @@ pub struct TaskFile {
     /// [`parse_cell_review_sentinel`]).
     #[serde(default)]
     pub review: Vec<ReviewDef>,
+    /// Top-level waypoint declarations (RAL-400): named join points that let
+    /// a human-authored note retroactively bind already-submitted or running
+    /// work (reviews and squads), without requiring the join to be
+    /// foreseeable at submit time. See [`WaypointDef`].
+    #[serde(default)]
+    pub waypoint: Vec<WaypointDef>,
 }
 
 /// One task: a unit of work made of one or more agent cells plus proof steps.
@@ -1441,6 +1447,77 @@ pub struct ReviewActionInputDef {
     pub default: String,
 }
 
+/// A top-level waypoint declaration via `[[waypoint]]` (RAL-400).
+///
+/// A waypoint is a named join point that lets a human-authored note
+/// retroactively bind already-submitted or running work -- reviews and
+/// squads, its `roster` -- without the join needing to be foreseeable at
+/// submit time. Unlike [`ReviewDef`], a waypoint has no `project` field:
+/// whatever project(s) it spans are inferred by hopping through its
+/// roster's reviews/squads rather than declared directly.
+///
+/// A waypoint created with an empty `roster` is vacuously terminal (there is
+/// nothing it could ever deliver its `prompt` to) and is rejected at
+/// validation time -- see `validate_waypoint_blocks` in
+/// `ralphus_core::validate`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaypointDef {
+    /// Human-readable label; how this waypoint is referenced from the board
+    /// UI and CLI/MCP commands once created.
+    pub label: String,
+    /// The note itself -- what a roster entry's agent should know once the
+    /// waypoint delivers to it. Always human-authored; there is no silent
+    /// default, since a waypoint with no prompt would carry no actionable
+    /// guidance for whoever receives it.
+    pub prompt: String,
+    /// Backend that surveys candidate roster entries for impact and drafts
+    /// delivered bearings, e.g. `"claude-code"` or `"pi"`. Unset falls back
+    /// to the daemon's default resolver agent, mirroring [`ReviewDef::agent`].
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Model the survey `agent` runs. Required when `agent` is a backend
+    /// with no sane built-in default (see [`agent_requires_model`]); a
+    /// custom `[agent.profiles.*]` name already pins its own model, so
+    /// setting this alongside one is a daemon-level conflict (`core` can't
+    /// see custom profiles, so it defers that half of the check -- mirrors
+    /// [`agent_supports_system_prompt`]'s `RESERVED_AGENT_NAMES`-only scope).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether a roster entry the survey classifies as advisory-only (i.e.
+    /// not on the path of the note's relevance) still receives the
+    /// waypoint's note as a non-blocking bearing, instead of being skipped
+    /// outright. Defaults to `false` -- advisory delivery is opt-in, since
+    /// most waypoints exist to gate blocking work, not to broadcast FYIs.
+    #[serde(default)]
+    pub allow_advisory: bool,
+    /// The reviews and squads this waypoint can bind, at least one
+    /// required. Each entry is either a review sentinel (`<<review:<id>>>`
+    /// or `<<ralphus:new-review/<key>>>`, see [`parse_cell_review_sentinel`])
+    /// or a squad sentinel (`<<squad:<id>>>`, see
+    /// [`parse_waypoint_squad_sentinel`]).
+    #[serde(default)]
+    pub roster: Vec<String>,
+}
+
+/// Sentinel wrapper prefix for a [`WaypointDef::roster`] entry naming an
+/// existing squad by id, e.g. `<<squad:squad-000000000001>>`. Mirrors
+/// [`REVIEW_REF_PREFIX`] -- unlike a review, a squad has no same-submission
+/// placeholder form, since squads aren't declared inline as `[[waypoint]]`
+/// siblings the way `[[review]]` blocks are.
+pub const WAYPOINT_SQUAD_REF_PREFIX: &str = "<<squad:";
+
+/// Parse a [`WaypointDef::roster`] entry as a squad-id sentinel, returning
+/// the unwrapped id. Returns `None` for anything else (including a
+/// well-formed review sentinel -- callers try [`parse_cell_review_sentinel`]
+/// first).
+#[must_use]
+pub fn parse_waypoint_squad_sentinel(entry: &str) -> Option<&str> {
+    let inner = entry
+        .strip_prefix(WAYPOINT_SQUAD_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))?;
+    (!inner.is_empty()).then_some(inner)
+}
+
 /// One proof step. Exactly one of `command` / `brain` / `prompt` must be set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStep {
@@ -1688,6 +1765,26 @@ pub fn agent_supports_system_prompt(agent: &str) -> bool {
 #[must_use]
 pub fn agent_supports_maximum_context(agent: &str) -> bool {
     matches!(agent, "codex" | "codex-cli" | "pi")
+}
+
+/// Whether `agent` has no sane built-in default model, so a caller that
+/// picks this backend must say which model to run explicitly (RAL-400,
+/// [`WaypointDef::model`]).
+///
+/// The Claude Code CLI (`claude-code`/`claude-cli`) and the Codex CLI
+/// (`codex`/`codex-cli`) each require an explicit model selection -- there
+/// is no backend-wide default that's right for every waypoint survey. Pi
+/// (`pi`) and the plain `ollama`/`raw` backends fall back to their own
+/// built-in default model when unset, so `model` stays optional for them.
+///
+/// Mirrors [`agent_supports_maximum_context`]'s shape: only meaningful for
+/// [`RESERVED_AGENT_NAMES`] -- a custom `[agent.profiles.*]` name is outside
+/// this function's scope entirely, since it already pins its own model and
+/// `core` can't see profile definitions to check for that conflict (that
+/// half of the rule is a daemon-level check).
+#[must_use]
+pub fn agent_requires_model(agent: &str) -> bool {
+    matches!(agent, "claude-code" | "claude-cli" | "codex" | "codex-cli")
 }
 
 /// Whether `agent` is a backend with a real delivery mechanism for
@@ -2507,6 +2604,33 @@ mod tests {
         assert_eq!(parse_cell_review_sentinel("<<review:>>"), None);
         assert_eq!(parse_cell_review_sentinel("<<unknown>>"), None);
         assert_eq!(parse_cell_review_sentinel(""), None);
+    }
+
+    #[test]
+    fn waypoint_squad_sentinel_matches_plain_id() {
+        assert_eq!(
+            parse_waypoint_squad_sentinel("<<squad:squad-000000000001>>"),
+            Some("squad-000000000001")
+        );
+    }
+
+    #[test]
+    fn waypoint_squad_sentinel_none_for_bare_or_malformed() {
+        assert_eq!(parse_waypoint_squad_sentinel("squad-000000000001"), None);
+        assert_eq!(parse_waypoint_squad_sentinel("<<squad:>>"), None);
+        assert_eq!(parse_waypoint_squad_sentinel("<<review:backend>>"), None);
+        assert_eq!(parse_waypoint_squad_sentinel(""), None);
+    }
+
+    #[test]
+    fn agent_requires_model_claude_and_codex_only() {
+        assert!(agent_requires_model("claude-code"));
+        assert!(agent_requires_model("claude-cli"));
+        assert!(agent_requires_model("codex"));
+        assert!(agent_requires_model("codex-cli"));
+        assert!(!agent_requires_model("pi"));
+        assert!(!agent_requires_model("ollama"));
+        assert!(!agent_requires_model("raw"));
     }
 
     #[test]

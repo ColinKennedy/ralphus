@@ -156,7 +156,12 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     };
 
     for key in table.keys() {
-        if key != "default" && key != "task" && key != "review" && key != "submitter" {
+        if key != "default"
+            && key != "task"
+            && key != "review"
+            && key != "submitter"
+            && key != "waypoint"
+        {
             let line = ctx.idx.find_toplevel_key(ctx.raw, key);
             ctx.error(
                 key,
@@ -171,6 +176,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     validate_submitter(table.get("submitter"), &mut ctx);
     validate_tasks(table.get("task"), &mut ctx);
     validate_review_blocks(table.get("review"), &mut ctx);
+    validate_waypoint_blocks(table.get("waypoint"), &mut ctx);
 
     report
 }
@@ -301,6 +307,16 @@ pub const AUTO_FIX_PROMPT_PLACEHOLDER: &str = "<<prompt>>";
 pub fn auto_fix_template_has_placeholder(template: &str) -> bool {
     template.contains(AUTO_FIX_PROMPT_PLACEHOLDER)
 }
+
+/// The full set of top-level `[[waypoint]]` keys (RAL-400).
+pub const WAYPOINT_KEYS: &[&str] = &[
+    "label",
+    "prompt",
+    "agent",
+    "model",
+    "allow_advisory",
+    "roster",
+];
 
 const REVIEW_ACTION_KEYS: &[&str] = &["label", "prompt", "command", "cleanup_command", "input"];
 const REVIEW_ACTION_INPUT_KEYS: &[&str] = &["name", "message", "default"];
@@ -1971,6 +1987,111 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
     }
 }
 
+/// Validate `[[waypoint]]` blocks (RAL-400): unknown keys, required
+/// `label`/`prompt`, well-typed `agent`/`model`/`allow_advisory`, a non-empty
+/// `roster` of well-formed sentinels, and the agent-aware `model`
+/// requiredness rule ([`crate::schema::agent_requires_model`]). Cross-squad /
+/// cross-review reference *resolution* (does the referenced review/squad
+/// actually exist) needs the daemon's database and is out of this module's
+/// scope, matching this file's existing `upstream = "<<task:...>>"` split.
+fn validate_waypoint_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(arr) = value.as_array() else {
+        ctx.error(
+            "waypoint",
+            ErrorKind::WrongType,
+            "[[waypoint]] must be an array of tables",
+            None,
+        );
+        return;
+    };
+    for (w, item) in arr.iter().enumerate() {
+        let wpath = format!("waypoint[{w}]");
+        let Some(table) = item.as_table() else {
+            ctx.error(
+                &wpath,
+                ErrorKind::WrongType,
+                "each [[waypoint]] must be a table",
+                None,
+            );
+            continue;
+        };
+        let header = ctx.idx.waypoint_line(w);
+        unknown_keys(ctx, table, WAYPOINT_KEYS, &wpath, header);
+
+        check_type(ctx, table, "label", Ty::Str, &wpath, header);
+        if !table.contains_key("label") {
+            ctx.error(
+                &format!("{wpath}.label"),
+                ErrorKind::MissingRequired,
+                "'label' is required -- it's how this waypoint is referenced from the board \
+                 UI and CLI/MCP commands once created",
+                header,
+            );
+        }
+        check_type(ctx, table, "prompt", Ty::Str, &wpath, header);
+        if !table.contains_key("prompt") {
+            ctx.error(
+                &format!("{wpath}.prompt"),
+                ErrorKind::MissingRequired,
+                "'prompt' is required -- a waypoint with no prompt would carry no actionable \
+                 guidance for whoever receives it",
+                header,
+            );
+        }
+        check_type(ctx, table, "agent", Ty::Str, &wpath, header);
+        check_type(ctx, table, "model", Ty::Str, &wpath, header);
+        check_type(ctx, table, "allow_advisory", Ty::Bool, &wpath, header);
+        check_type(ctx, table, "roster", Ty::StrArray, &wpath, header);
+
+        let roster = table.get("roster").and_then(toml::Value::as_array);
+        if roster.is_none_or(|a| a.is_empty()) {
+            ctx.error(
+                &format!("{wpath}.roster"),
+                ErrorKind::MissingRequired,
+                "'roster' must not be empty -- a waypoint with nothing in its roster has \
+                 nothing it could ever deliver its 'prompt' to",
+                ctx.key_line(header, "roster"),
+            );
+        } else if let Some(entries) = roster.map(|a| a.iter().filter_map(toml::Value::as_str)) {
+            for entry in entries {
+                if crate::schema::parse_cell_review_sentinel(entry).is_none()
+                    && crate::schema::parse_waypoint_squad_sentinel(entry).is_none()
+                {
+                    ctx.error(
+                        &format!("{wpath}.roster"),
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "roster entry \"{entry}\" is not a valid review sentinel \
+                             ('<<review:<id>>>' or '<<ralphus:new-review/<key>>>') or squad \
+                             sentinel ('<<squad:<id>>>')"
+                        ),
+                        ctx.key_line(header, "roster"),
+                    );
+                }
+            }
+        }
+
+        if let Some(agent) = table.get("agent").and_then(toml::Value::as_str) {
+            if crate::schema::RESERVED_AGENT_NAMES.contains(&agent)
+                && crate::schema::agent_requires_model(agent)
+                && !table.contains_key("model")
+            {
+                ctx.error(
+                    &format!("{wpath}.model"),
+                    ErrorKind::MissingRequired,
+                    format!(
+                        "'model' is required when 'agent' is \"{agent}\" -- it has no \
+                         built-in default model. Set 'model', or switch to an agent that \
+                         does (e.g. \"pi\")."
+                    ),
+                    ctx.key_line(header, "model"),
+                );
+            }
+        }
+    }
+}
+
 /// Validate `[[review.auto_build]]` entries (RAL-342): declares this review's build
 /// steps, either verbatim `command` or agent-driven `prompt` (mutually
 /// exclusive with each other, mirroring [`validate_review_action_array`]'s
@@ -2689,6 +2810,7 @@ struct HeaderIndex {
     default_lines: Vec<u32>,
     task_lines: Vec<u32>,
     review_lines: Vec<u32>,
+    waypoint_lines: Vec<u32>,
     /// (task_idx, cell_idx) -> line
     cell_lines: HashMap<(usize, usize), u32>,
 }
@@ -2698,6 +2820,7 @@ impl HeaderIndex {
         let mut default_lines = Vec::new();
         let mut task_lines = Vec::new();
         let mut review_lines = Vec::new();
+        let mut waypoint_lines = Vec::new();
         let mut cell_lines = HashMap::new();
         let mut cur_task: isize = -1;
         let mut cur_cell: isize = -1;
@@ -2718,6 +2841,7 @@ impl HeaderIndex {
                     }
                 }
                 Some("[[review]]") => review_lines.push(ln),
+                Some("[[waypoint]]") => waypoint_lines.push(ln),
                 _ => {}
             }
         }
@@ -2725,6 +2849,7 @@ impl HeaderIndex {
             default_lines,
             task_lines,
             review_lines,
+            waypoint_lines,
             cell_lines,
         }
     }
@@ -2739,6 +2864,10 @@ impl HeaderIndex {
 
     fn review_line(&self, r: usize) -> Option<u32> {
         self.review_lines.get(r).copied()
+    }
+
+    fn waypoint_line(&self, w: usize) -> Option<u32> {
+        self.waypoint_lines.get(w).copied()
     }
 
     fn cell_line(&self, t: usize, s: usize) -> Option<u32> {
@@ -4644,6 +4773,144 @@ project = "ralphus"
     #[test]
     fn toplevel_review_block_is_valid() {
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:be>>\"\n[[review]]\nid=\"be\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    // ── waypoint (RAL-400) ───────────────────────────────────────────────
+
+    #[test]
+    fn toplevel_waypoint_block_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[waypoint]]\nlabel=\"Cutover\"\nprompt=\"Both sides ready\"\nroster=[\"<<squad:squad-000000000001>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn waypoint_with_review_roster_entry_is_valid() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:be>>\"\n\
+                   [[review]]\nid=\"be\"\n\
+                   [[waypoint]]\nlabel=\"Cutover\"\nprompt=\"Both sides ready\"\nroster=[\"<<review:be>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn waypoint_unknown_key_is_rejected() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nroster=[\"<<squad:squad-1>>\"]\nasdf_not_a_real_key=true\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::UnknownKey
+                && e.path.starts_with("waypoint[0]")
+                && e.message.contains("asdf_not_a_real_key")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_missing_label_is_rejected() {
+        let src = "[[waypoint]]\nprompt=\"p\"\nroster=[\"<<squad:squad-1>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("label")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_missing_prompt_is_rejected() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nroster=[\"<<squad:squad-1>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("prompt")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_empty_roster_is_rejected() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nroster=[]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.path == "waypoint[0].roster"),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_missing_roster_is_rejected() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.path == "waypoint[0].roster"),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_malformed_roster_entry_is_rejected() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nroster=[\"not-a-sentinel\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.path == "waypoint[0].roster"
+                && e.message.contains("not-a-sentinel")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_model_required_for_claude_code_agent() {
+        let src = "[[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nagent=\"claude-code\"\nroster=[\"<<squad:squad-1>>\"]\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::MissingRequired && e.path == "waypoint[0].model"),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn waypoint_model_not_required_for_pi_agent() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nagent=\"pi\"\nroster=[\"<<squad:squad-1>>\"]\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn waypoint_model_required_satisfied_when_present() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+                   [[waypoint]]\nlabel=\"C\"\nprompt=\"p\"\nagent=\"codex\"\nmodel=\"gpt-5\"\nroster=[\"<<squad:squad-1>>\"]\n";
         assert!(
             validate_toml(src).is_ok(),
             "{:?}",
