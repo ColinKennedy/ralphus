@@ -95,6 +95,9 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
             "mcp initialize is excluded from the MCP tool surface",
         )),
         Command::InitializeGit { path } => exec_initialize_git(path),
+        Command::InitializeServer { .. } => Err(usage(
+            "initialize server is excluded from the MCP tool surface",
+        )),
         Command::Project(c) => project::execute(c, client),
         Command::Machine(c) => machine::execute(c, client),
         Command::Agent(c) => agent::execute(c, client),
