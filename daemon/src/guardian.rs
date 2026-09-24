@@ -4237,6 +4237,103 @@ impl Store {
     pub fn list_guardians(&self) -> Result<Vec<GuardianView>> {
         Self::list_guardians_conn(&self.conn)
     }
+
+    /// Every guardian's `(id, status)`, with none of [`Self::list_guardians`]'s
+    /// per-branch hydration, env resolution, or `.ralphus.toml` filesystem
+    /// walk -- for hot scheduler-loop status filters
+    /// ([`crate::guardian_merge::review_maintenance`],
+    /// [`crate::pr::poll_forge_reorders`]) that only ever look at status.
+    /// RAL-<pending>: those two calls holding the writer lock through a full
+    /// `list_guardians()` (one per-branch query plus a `.ralphus.toml` walk
+    /// per distinct project root) is what caused the store lock to be held
+    /// for 3+ seconds under load, stalling every other daemon operation
+    /// behind it.
+    pub(crate) fn list_guardian_status_pairs(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, status FROM guardians")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Per-guardian `status`/`base_branch`/`git_root`/`machine`/`projects` --
+    /// exactly what [`crate::guardian_merge::poll_base_branch_freshness_once`]
+    /// needs to decide which upstream base branches to refresh, without
+    /// [`Self::list_guardians`]'s per-branch `BranchView` hydration, env
+    /// resolution, or terminal-mode computation. `projects` is still derived
+    /// from `guardian_branches` (the same source `list_guardians` uses), just
+    /// via one direct aggregate instead of building a full branch view per
+    /// row.
+    pub(crate) fn list_guardian_base_fetch_rows(
+        &self,
+    ) -> Result<Vec<crate::guardian_merge::GuardianBaseFetchInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.status, g.base_branch, g.git_root, g.machine,
+                    (SELECT GROUP_CONCAT(gb.project, char(31)) FROM guardian_branches gb
+                     WHERE gb.guardian_id = g.id AND gb.enabled = 1 AND gb.project IS NOT NULL),
+                    g.id, g.owner, g.dual_root_pr
+             FROM guardians g",
+        )?;
+        // `g.dual_root_pr` is the *raw* per-review override, not the effective
+        // value: it layers over the database-backed project settings, an
+        // explicit `.ralphus.toml [review]` value, the project's
+        // registration-time stamp, and the live global config, exactly as
+        // `hydrate_guardian_conn` resolves `effective_dual_root_pr`. It is
+        // carried out of the query unresolved and layered in below, once the
+        // shared hydration context is available.
+        let rows = stmt
+            .query_map([], |r| {
+                let projects_concat: Option<String> = r.get(4)?;
+                let projects = projects_concat
+                    .map(|s| s.split('\u{1f}').map(str::to_string).collect())
+                    .unwrap_or_default();
+                Ok((
+                    crate::guardian_merge::GuardianBaseFetchInfo {
+                        status: r.get(0)?,
+                        base_branch: r.get(1)?,
+                        projects,
+                        git_root: r.get(2)?,
+                        machine: r.get(3)?,
+                        guardian_id: r.get(5)?,
+                        owner: r.get(6)?,
+                        // Layered in below.
+                        dual_root_pr: false,
+                    },
+                    r.get::<_, Option<bool>>(7)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // One context for the whole call, memoized per distinct `git_root`
+        // (the same batching `list_guardians` does) -- this is the only part
+        // of the full hydration this query still needs. Skipping it would
+        // silently read `dual_root_pr` as `false` for every review inheriting
+        // the flag from its project or the global config rather than setting
+        // it per-review, quietly dropping that review's fork-side upstream
+        // refresh.
+        let ctx = Self::build_hydration_ctx_conn(
+            &self.conn,
+            rows.iter().map(|(i, _)| i.git_root.as_str()),
+        );
+        Ok(rows
+            .into_iter()
+            .map(|(mut info, own_override)| {
+                let (_, explicit_project, db_settings) = ctx
+                    .config_by_git_root
+                    .get(&info.git_root)
+                    .cloned()
+                    .unwrap_or_default();
+                let stamps =
+                    crate::store::Store::match_project_stamps(&info.git_root, &ctx.project_stamps);
+                info.dual_root_pr = own_override
+                    .or(db_settings.dual_root_pr)
+                    .or(explicit_project.dual_root_pr)
+                    .or(stamps.and_then(|s| s.dual_root_pr))
+                    .or(ctx.live_global.dual_root_pr)
+                    .unwrap_or(false);
+                info
+            })
+            .collect())
+    }
     /// [`Self::list_guardians`] against any connection, so the read pool
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
