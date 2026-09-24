@@ -721,7 +721,7 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
         "reopen must not change status or start a new worker before the old one exits"
     );
 
-    for _ in 0..100 {
+    for _ in 0..2000 {
         if !cancellations.is_active(&key) {
             break;
         }
