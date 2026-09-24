@@ -5184,6 +5184,54 @@ fn list_project_forks(daemon: &Daemon, project: &str) -> Reply {
     }
 }
 
+/// Shared fork-URL validation for both `POST` and `PATCH` fork registration
+/// endpoints (RAL-500): HTTPS-only, and the URL's host must match the
+/// project's own forge host. HTTPS is the only transport ralphus fork
+/// registration accepts -- SSH/`git://` shapes that `parse_remote_url` still
+/// understands for other callers (e.g. health checks reading an
+/// already-registered row) are rejected here rather than silently accepted.
+/// A fork on a different forge host than its project is rejected with a
+/// distinct `host_mismatch` code so callers/UI can tell the two failure
+/// modes apart. When the project's own forge host can't be determined (no
+/// `clone_url`, no local checkout, unregistered project), the host-match
+/// check is skipped -- only the HTTPS requirement is unconditional.
+fn validate_fork_url(daemon: &Daemon, project: &str, fork_url: &str) -> Result<(), Reply> {
+    if !fork_url.starts_with("https://") {
+        return Err(error(
+            400,
+            "invalid_value",
+            "'fork_url' must use HTTPS (e.g. https://github.com/owner/repo.git) -- \
+             fork clone URLs must use HTTPS",
+            vec![],
+        ));
+    }
+    let Some((fork_host, _)) = crate::forge::parse_remote_url(fork_url) else {
+        return Err(error(
+            400,
+            "invalid_value",
+            "'fork_url' is not a valid HTTPS clone URL",
+            vec![],
+        ));
+    };
+    if let Ok(Some(proj)) = daemon.lock().get_project(project) {
+        if let Some(project_host) = crate::project_forks::resolve_project_forge_host(&proj) {
+            if !project_host.eq_ignore_ascii_case(&fork_host) {
+                return Err(error(
+                    400,
+                    "host_mismatch",
+                    &format!(
+                        "'fork_url' host {fork_host:?} does not match project {project:?}'s \
+                         forge host {project_host:?} -- a fork must live on the same forge \
+                         host as its project"
+                    ),
+                    vec![],
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `POST /api/projects/{name}/forks` (RAL-338): register or replace a fork
 /// row. `user` defaults to `""` (the project-wide row) when omitted.
 fn create_project_fork(daemon: &Daemon, project: &str, body: &str) -> Reply {
@@ -5198,6 +5246,9 @@ fn create_project_fork(daemon: &Daemon, project: &str, body: &str) -> Reply {
     let fork_url = req.fork_url.trim();
     if fork_url.is_empty() {
         return error(400, "invalid_value", "'fork_url' must not be empty", vec![]);
+    }
+    if let Err(e) = validate_fork_url(daemon, project, fork_url) {
+        return e;
     }
     let user = req.user.trim();
     let remote_name = req
@@ -5242,6 +5293,11 @@ fn patch_project_fork(daemon: &Daemon, project: &str, user: &str, body: &str) ->
     let req: PatchProjectForkBody = serde_json::from_str(body).unwrap_or_default();
     if req.fork_url.as_deref().is_some_and(str::is_empty) {
         return error(400, "invalid_value", "'fork_url' must not be empty", vec![]);
+    }
+    if let Some(fork_url) = req.fork_url.as_deref() {
+        if let Err(e) = validate_fork_url(daemon, project, fork_url) {
+            return e;
+        }
     }
     match daemon.lock().patch_project_fork(
         project,
@@ -16356,10 +16412,10 @@ mod tests {
             &d,
             "POST",
             "/api/projects/proj/forks",
-            &serde_json::json!({"fork_url": "git@x:default/proj.git"}).to_string(),
+            &serde_json::json!({"fork_url": "https://x/default/proj.git"}).to_string(),
         );
         assert_eq!(created.status, 201, "{}", created.body);
-        assert!(created.body.contains("git@x:default/proj.git"));
+        assert!(created.body.contains("https://x/default/proj.git"));
 
         // Create a user-specific row.
         let created_user = route(
@@ -16368,7 +16424,7 @@ mod tests {
             "/api/projects/proj/forks",
             &serde_json::json!({
                 "user": "alice",
-                "fork_url": "git@x:alice/proj.git",
+                "fork_url": "https://x/alice/proj.git",
                 "remote_name": "fork-alice",
                 "fork_owner": "alice",
             })
@@ -16379,23 +16435,23 @@ mod tests {
         // List for the project sees both rows.
         let listed = route(&d, "GET", "/api/projects/proj/forks", "");
         assert_eq!(listed.status, 200, "{}", listed.body);
-        assert!(listed.body.contains("git@x:default/proj.git"));
-        assert!(listed.body.contains("git@x:alice/proj.git"));
+        assert!(listed.body.contains("https://x/default/proj.git"));
+        assert!(listed.body.contains("https://x/alice/proj.git"));
 
         // The unscoped list also sees both.
         let all = route(&d, "GET", "/api/project-forks", "");
         assert_eq!(all.status, 200, "{}", all.body);
-        assert!(all.body.contains("git@x:alice/proj.git"));
+        assert!(all.body.contains("https://x/alice/proj.git"));
 
         // Patch the default row (no trailing user segment).
         let patched_default = route(
             &d,
             "PATCH",
             "/api/projects/proj/forks",
-            &serde_json::json!({"fork_url": "git@x:default2/proj.git"}).to_string(),
+            &serde_json::json!({"fork_url": "https://x/default2/proj.git"}).to_string(),
         );
         assert_eq!(patched_default.status, 200, "{}", patched_default.body);
-        assert!(patched_default.body.contains("git@x:default2/proj.git"));
+        assert!(patched_default.body.contains("https://x/default2/proj.git"));
 
         // Patch alice's row.
         let patched_alice = route(
@@ -16407,14 +16463,14 @@ mod tests {
         assert_eq!(patched_alice.status, 200, "{}", patched_alice.body);
         assert!(patched_alice.body.contains("fork-alice-2"));
         // fork_url is unchanged by the selective patch.
-        assert!(patched_alice.body.contains("git@x:alice/proj.git"));
+        assert!(patched_alice.body.contains("https://x/alice/proj.git"));
 
         // Delete alice's row; the default row survives.
         let deleted = route(&d, "DELETE", "/api/projects/proj/forks/alice", "");
         assert_eq!(deleted.status, 200, "{}", deleted.body);
         let after_delete = route(&d, "GET", "/api/projects/proj/forks", "");
         assert!(!after_delete.body.contains("alice"));
-        assert!(after_delete.body.contains("git@x:default2/proj.git"));
+        assert!(after_delete.body.contains("https://x/default2/proj.git"));
 
         // Delete the default row too.
         let deleted_default = route(&d, "DELETE", "/api/projects/proj/forks", "");
@@ -16431,11 +16487,128 @@ mod tests {
             &d,
             "PATCH",
             "/api/projects/proj/forks/nobody",
-            &serde_json::json!({"fork_url": "x"}).to_string(),
+            &serde_json::json!({"fork_url": "https://x/default/proj.git"}).to_string(),
         );
         assert_eq!(patch.status, 404, "{}", patch.body);
         let delete = route(&d, "DELETE", "/api/projects/proj/forks/nobody", "");
         assert_eq!(delete.status, 404, "{}", delete.body);
+    }
+
+    #[test]
+    fn create_and_patch_project_fork_reject_non_https_urls() {
+        let d = daemon();
+        for non_https in [
+            "git@github.com:acme/proj.git",
+            "ssh://git@x/acme/proj.git",
+            "http://x/acme/proj.git",
+        ] {
+            let created = route(
+                &d,
+                "POST",
+                "/api/projects/proj/forks",
+                &serde_json::json!({"fork_url": non_https}).to_string(),
+            );
+            assert_eq!(created.status, 400, "{}", created.body);
+            assert!(created.body.contains("HTTPS"), "{}", created.body);
+        }
+
+        // Register a valid HTTPS row first so PATCH has something to update.
+        let created = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://x/default/proj.git"}).to_string(),
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+
+        let patched = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "git@x:default/proj.git"}).to_string(),
+        );
+        assert_eq!(patched.status, 400, "{}", patched.body);
+        assert!(patched.body.contains("HTTPS"), "{}", patched.body);
+    }
+
+    #[test]
+    fn create_and_patch_project_fork_reject_a_forge_host_mismatch() {
+        let d = daemon();
+        d.lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                "C:/wherever",
+                "git",
+                Some("https://github.com/acme/proj.git"),
+                None,
+            )
+            .unwrap();
+
+        let created = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://gitlab.com/acme/proj-fork.git"}).to_string(),
+        );
+        assert_eq!(created.status, 400, "{}", created.body);
+        assert!(created.body.contains("host_mismatch"), "{}", created.body);
+
+        // Register a matching-host row first so PATCH has something to update.
+        let matching = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://github.com/acme/proj-fork.git"}).to_string(),
+        );
+        assert_eq!(matching.status, 201, "{}", matching.body);
+
+        let patched = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://gitlab.com/acme/proj-fork.git"}).to_string(),
+        );
+        assert_eq!(patched.status, 400, "{}", patched.body);
+        assert!(patched.body.contains("host_mismatch"), "{}", patched.body);
+    }
+
+    #[test]
+    fn create_and_patch_project_fork_accept_a_matching_https_host() {
+        let d = daemon();
+        d.lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                "C:/wherever",
+                "git",
+                Some("https://github.com/acme/proj.git"),
+                None,
+            )
+            .unwrap();
+
+        let created = route(
+            &d,
+            "POST",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://github.com/acme/proj-fork.git"}).to_string(),
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+
+        let patched = route(
+            &d,
+            "PATCH",
+            "/api/projects/proj/forks",
+            &serde_json::json!({"fork_url": "https://github.com/acme/proj-fork-2.git"}).to_string(),
+        );
+        assert_eq!(patched.status, 200, "{}", patched.body);
+        assert!(
+            patched
+                .body
+                .contains("https://github.com/acme/proj-fork-2.git"),
+            "{}",
+            patched.body
+        );
     }
 
     #[test]
@@ -16445,7 +16618,7 @@ mod tests {
             &d,
             "POST",
             "/api/projects/proj/forks",
-            &serde_json::json!({"fork_url": "git@x:default/proj.git"}).to_string(),
+            &serde_json::json!({"fork_url": "https://x/default/proj.git"}).to_string(),
         );
         assert_eq!(created.status, 201, "{}", created.body);
 
