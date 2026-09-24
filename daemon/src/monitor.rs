@@ -14,7 +14,7 @@
 use rusqlite::params;
 use serde::Serialize;
 
-use crate::mailbox::{self, MailboxPriority};
+use crate::mailbox::{self, MailboxPriority, Remediation};
 use crate::store::{Result, Store};
 
 pub use crate::watches::WatchView;
@@ -88,6 +88,49 @@ impl Store {
         Ok(id)
     }
 
+    /// Emit a tagged Monitor event for a genuine failure (RAL-502) --
+    /// `event` must be [`NotifiableEventKind::SquadFailed`] or
+    /// [`NotifiableEventKind::ReviewFailed`], the only two variants that
+    /// represent an error/failure rather than a status change. `remediation`
+    /// is mandatory: its rendered text is appended to `message` via
+    /// [`crate::mailbox::Store::enqueue_error_mailbox_message`], so every
+    /// failure notification a watcher receives carries actionable guidance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_watchers_with_remediation(
+        &self,
+        event: NotifiableEventKind,
+        entity_uri: &str,
+        priority: MailboxPriority,
+        message: &str,
+        remediation: &Remediation,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+    ) -> Result<String> {
+        debug_assert!(
+            matches!(
+                event,
+                NotifiableEventKind::SquadFailed | NotifiableEventKind::ReviewFailed
+            ),
+            "notify_watchers_with_remediation is for failure events only; use notify_watchers_with_context for status changes"
+        );
+        let id = self.enqueue_error_mailbox_message(
+            priority,
+            message,
+            remediation,
+            squad_id,
+            task,
+            cell_id,
+            Some(entity_uri),
+            None,
+        )?;
+        self.conn.execute(
+            "UPDATE mailbox_messages SET event_kind=?1 WHERE id=?2",
+            params![event.as_str(), id],
+        )?;
+        Ok(id)
+    }
+
     /// Every user watching one whole squad or review, oldest first.
     pub fn watchers_for_entity(&self, entity_uri: &str) -> Result<Vec<WatchView>> {
         let mut stmt = self.conn.prepare(
@@ -113,6 +156,18 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inserts a minimal `squads` row so `mailbox_messages.squad_id`'s
+    /// foreign key is satisfiable.
+    fn insert_squad(store: &Store, id: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO squads(id, state, created_at_ms, updated_at_ms) VALUES(?1, 'running', 0, 0)",
+                params![id],
+            )
+            .unwrap();
+    }
 
     #[test]
     fn create_list_and_delete_a_watch() {
@@ -179,6 +234,41 @@ mod tests {
         assert_eq!(store.list_watches("alex").unwrap().len(), 1);
         assert!(store.delete_watch("alex", "squad:squad-1").unwrap());
         assert_eq!(store.list_watches("colin").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failure_notifications_require_and_render_remediation() {
+        let store = Store::open_in_memory().unwrap();
+        insert_squad(&store, "squad-1");
+        store
+            .create_watch("colin", "squad:squad-1", &[MailboxPriority::Urgent])
+            .unwrap();
+        let id = store
+            .notify_watchers_with_remediation(
+                NotifiableEventKind::SquadFailed,
+                "squad:squad-1",
+                MailboxPriority::Urgent,
+                "squad squad-1 failed to materialize: disk full",
+                &mailbox::Remediation::ManualInterventionRequired {
+                    guidance: "free disk space, then run `ralphus squad retry squad-1`".to_string(),
+                },
+                Some("squad-1"),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let personal = store
+            .personal_mailbox_messages_for_user("colin", false, None)
+            .unwrap();
+        assert_eq!(personal.len(), 1);
+        assert_eq!(personal[0].id, id);
+        assert_eq!(personal[0].event_kind.as_deref(), Some("squad_failed"));
+        assert!(
+            personal[0]
+                .message
+                .contains("Manual intervention required:")
+        );
     }
 
     #[test]

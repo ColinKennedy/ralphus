@@ -1783,11 +1783,16 @@ fn enqueue_cell_failure_mailbox(
     };
     let entity_uri = guard.cell_entity_uri(squad_id, task_name, cell_id);
     let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
-    if let Ok(message_id) = guard.notify_watchers_with_context(
+    let remediation = crate::mailbox::Remediation::SuggestedCommand {
+        command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
+        purpose: "retry the failed cell".to_string(),
+    };
+    if let Ok(message_id) = guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
         crate::mailbox::MailboxPriority::Urgent,
         &text,
+        &remediation,
         Some(squad_id),
         Some(task_name),
         Some(cell_id),
@@ -1846,11 +1851,31 @@ fn enqueue_proof_failure_mailbox(
         guard.task_entity_uri(squad_id, task_name)
     };
     let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
-    if let Ok(message_id) = guard.notify_watchers_with_context(
+    // No `proof_idx` is threaded to this helper (see the doc comment above),
+    // so there's no exact `restart-proof --from <index>` to suggest -- a
+    // whole-cell restart (which reruns its proof steps) is the finest safe
+    // command available for a cell-scope failure, while a task-scope proof
+    // has no single owning cell to restart at all.
+    let remediation = if let (Some(cid), "cell") = (cell_id, scope) {
+        crate::mailbox::Remediation::SuggestedCommand {
+            command: format!("ralphus cell restart {squad_id}/{task_name}/{cid}"),
+            purpose: "retry the cell and its proof steps".to_string(),
+        }
+    } else {
+        crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: format!(
+                "inspect task '{task_name}' (squad {squad_id})'s proof output and restart the \
+                 affected cell(s) individually (`ralphus cell restart <selector>`), or restart \
+                 the whole squad (`ralphus squad restart {squad_id}`)"
+            ),
+        }
+    };
+    if let Ok(message_id) = guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
         crate::mailbox::MailboxPriority::Urgent,
         &text,
+        &remediation,
         Some(squad_id),
         Some(task_name),
         cell_id,

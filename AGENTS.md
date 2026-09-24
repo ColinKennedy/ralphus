@@ -78,6 +78,13 @@ alternatives to reach for are in
   resync, reordering, or promotion needs a regression test proving the
   stack stays intact. See
   [`.agent/forge-design-principles.md`](.agent/forge-design-principles.md).
+- **Any mailbox message reporting a failure/blocked state must carry
+  remediation guidance** (RAL-502) — go through
+  `Store::enqueue_error_mailbox_message`/`notify_watchers_with_remediation`
+  in `daemon/src/mailbox.rs`, never the plain remediation-less
+  `enqueue_mailbox_message`/`enqueue_mailbox_message_ex`, which are for
+  purely informational notices only. See
+  [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
 
 ## Architecture
 

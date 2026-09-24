@@ -137,16 +137,25 @@ impl CpuStallTracker {
             }
             let guard = store.lock();
             let text = format!(
-                "session '{session_id}' in squad {run_id} (pid {pid}) has shown no CPU progress for over {}s across {} samples despite still running -- possible hang. Not auto-killed; investigate manually.",
+                "session '{session_id}' in squad {run_id} (pid {pid}) has shown no CPU progress for over {}s across {} samples despite still running -- possible hang.",
                 span_ms / 1000,
                 entry.flat_samples,
             );
-            if let Ok(message_id) = guard.enqueue_mailbox_message(
+            let entity_uri = guard.cell_entity_uri_by_sid(&run_id, &session_id);
+            if let Ok(message_id) = guard.enqueue_error_mailbox_message(
                 crate::mailbox::MailboxPriority::High,
                 &text,
+                &crate::mailbox::Remediation::ManualInterventionRequired {
+                    guidance: format!(
+                        "not auto-killed; inspect the live terminal for session '{session_id}' \
+                         and, if it is truly hung, cancel and restart it \
+                         (`ralphus cell restart <selector>`)"
+                    ),
+                },
                 Some(&run_id),
                 None,
                 Some(&session_id),
+                entity_uri.as_deref(),
                 None,
             ) {
                 crate::cartographer::Note::new("cpu_stall")

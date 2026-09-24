@@ -50,7 +50,7 @@ use crate::cancel::CancelToken;
 use crate::forge::{FailedCheck, PrCiState, PrFailure};
 use crate::guardian::{BranchView, GuardianView};
 use crate::logging::LogLevel;
-use crate::mailbox::MailboxPriority;
+use crate::mailbox::{MailboxPriority, Remediation};
 use crate::pr::{AutoFixClaim, PullRequestView};
 use crate::runner::Runner;
 #[cfg(test)]
@@ -424,12 +424,31 @@ fn enqueue_ci_failure_notice(
     }
     text.push_str("\nDo you want to fix these immediately in a subagent?");
 
+    let remediation = if guardian.auto_fix_pr_errors.unwrap_or(false) {
+        Remediation::AutoFix {
+            action: "auto_fix_pr_errors is enabled for this review; a resolver agent will \
+                     attempt to fix this automatically on the next standing poll"
+                .to_string(),
+        }
+    } else {
+        Remediation::SuggestedCommand {
+            command: format!(
+                "ralphus review settings {} --auto-fix-pr-errors",
+                guardian.id
+            ),
+            purpose: "enable automatic CI-fix attempts for future failures, or inspect the \
+                      failing job(s) above and push a fix manually"
+                .to_string(),
+        }
+    };
+
     let entity_uri = format!("guardian:{}", guardian.id);
     let enqueued = {
         let guard = store.lock();
-        guard.enqueue_mailbox_message_ex(
+        guard.enqueue_error_mailbox_message(
             MailboxPriority::High,
             &text,
+            &remediation,
             None,
             None,
             None,
@@ -485,12 +504,23 @@ fn enqueue_auto_fix_exhausted_notice(
     }
     text.push_str("\nTo force another attempt: use \"Action Feedback\" on this PR.");
 
+    let remediation = Remediation::SuggestedCommand {
+        command: format!(
+            "ralphus review feedback {} \"retry the CI fix\"",
+            guardian.id
+        ),
+        purpose: "force another CI-fix attempt now, bypassing the exhausted auto-fix cap \
+                  (the CLI equivalent of the board's \"Action Feedback\")"
+            .to_string(),
+    };
+
     let entity_uri = format!("guardian:{}", guardian.id);
     let enqueued = {
         let guard = store.lock();
-        guard.enqueue_mailbox_message_ex(
+        guard.enqueue_error_mailbox_message(
             MailboxPriority::High,
             &text,
+            &remediation,
             None,
             None,
             None,

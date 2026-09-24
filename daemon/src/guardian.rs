@@ -2325,21 +2325,32 @@ impl Store {
             };
             let _ = self.log_event(None, Some(id), "guardian", None, &msg);
             let failed = matches!(status, GuardianStatus::MergeFailed);
-            let _ = self.notify_watchers(
-                if failed {
-                    crate::monitor::NotifiableEventKind::ReviewFailed
-                } else {
-                    crate::monitor::NotifiableEventKind::ReviewStatusChanged
-                },
-                &format!("guardian:{id}"),
-                if failed {
-                    crate::mailbox::MailboxPriority::Urgent
-                } else {
-                    crate::mailbox::MailboxPriority::Normal
-                },
-                &msg,
-                None,
-            );
+            if failed {
+                let _ = self.notify_watchers_with_remediation(
+                    crate::monitor::NotifiableEventKind::ReviewFailed,
+                    &format!("guardian:{id}"),
+                    crate::mailbox::MailboxPriority::Urgent,
+                    &msg,
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "inspect the merge failure (`ralphus review worktrees {id}`) and \
+                             resolve the underlying conflict or error before retrying \
+                             (`ralphus review reopen {id}`)"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                );
+            } else {
+                let _ = self.notify_watchers(
+                    crate::monitor::NotifiableEventKind::ReviewStatusChanged,
+                    &format!("guardian:{id}"),
+                    crate::mailbox::MailboxPriority::Normal,
+                    &msg,
+                    None,
+                );
+            }
             Ok(())
         }
     }

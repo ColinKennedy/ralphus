@@ -8804,17 +8804,26 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
                 .unwrap_or(false)
             {
                 let message = format!(
-                    "Guardian worktree {} for review {} ({}) is over 30 days old but is still claimed by a non-terminal {} ({}). If this Task or Review is no longer needed, please cancel it.",
+                    "Guardian worktree {} for review {} ({}) is over 30 days old but is still claimed by a non-terminal {} ({}).",
                     record.path, record.guardian_id, record.guardian_name, claim.kind, claim.owner
                 );
                 let entity_uri = format!("guardian:{}", record.guardian_id);
-                let _ = guard.enqueue_mailbox_message(
+                let _ = guard.enqueue_error_mailbox_message(
                     crate::mailbox::MailboxPriority::High,
                     &message,
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "if this {} ({}) is no longer needed, cancel it -- `ralphus squad \
+                             cancel <squad_id>` for a cell/proof claim, or `ralphus review \
+                             cancel {}` for a review claim",
+                            claim.kind, claim.owner, record.guardian_id
+                        ),
+                    },
                     None,
                     None,
                     None,
                     Some(&entity_uri),
+                    None,
                 );
                 crate::cartographer::Note::new("guardian")
                     .guardian(&record.guardian_id)
@@ -13287,7 +13296,7 @@ mod tests {
         );
         let unsafe_message = messages
             .iter()
-            .find(|m| m.message.contains("please cancel it"))
+            .find(|m| m.message.contains("no longer needed, cancel it"))
             .expect("claimed-retention notice for the still-active review");
         assert_eq!(
             unsafe_message.entity_uri.as_deref(),
