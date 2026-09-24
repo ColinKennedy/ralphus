@@ -3051,7 +3051,11 @@ fn maybe_promote_fork_root(
         };
         match stack_result {
             Ok((number, url, stack_draft)) => {
-                if let Err(e) = store.lock().create_pull_request_ex(
+                // Bind the owned `Result` before branching -- a `MutexGuard`
+                // temporary in an `if let` scrutinee lives for the whole `if
+                // let` (it desugars to `match`), and the body below takes
+                // `store.lock()` again.
+                let record_result = store.lock().create_pull_request_ex(
                     id,
                     Some(successor_branch.id.as_str()),
                     stack_route.client.kind().as_str(),
@@ -3065,7 +3069,8 @@ fn maybe_promote_fork_root(
                     successor_pr.stack_id.as_deref(),
                     stack_draft,
                     "stack",
-                ) {
+                );
+                if let Err(e) = record_result {
                     crate::rlog!(
                         WARNING,
                         "ralphus [pr] review {id} promoted successor's stack pr created on the \
@@ -3299,7 +3304,13 @@ fn settle_pr_merge_states(
         }
         let merged = store.lock().approve_guardian(id).is_ok();
         if merged {
-            if let Ok(guardian) = store.lock().get_guardian(id) {
+            // A `MutexGuard` temporary produced in an `if let` scrutinee lives
+            // for the whole `if let` (it desugars to `match`), so binding the
+            // owned `Option` first is required -- otherwise
+            // `retire_dual_root_branch_for_guardian`'s own `store.lock()`
+            // deadlocks against this still-held guard.
+            let guardian = store.lock().get_guardian(id).ok();
+            if let Some(guardian) = guardian {
                 retire_dual_root_branch_for_guardian(
                     store,
                     &guardian,
@@ -5234,7 +5245,15 @@ pub(crate) fn retire_dual_root_branch_for_guardian(
     guardian: &GuardianView,
     reason: &str,
 ) {
-    if let Ok(Some(branch)) = store.lock().guardian_dual_root_stack_branch(&guardian.id) {
+    // See the matching comment in `settle_pr_merge_states`: bind the owned
+    // `Option` before the `if let` so `retire_dual_root_upstream_branch`'s
+    // own `store.lock()` below doesn't deadlock against this one.
+    let branch = store
+        .lock()
+        .guardian_dual_root_stack_branch(&guardian.id)
+        .ok()
+        .flatten();
+    if let Some(branch) = branch {
         retire_dual_root_upstream_branch(
             store,
             &crate::store::DualRootUpstreamSnapshot {
@@ -5860,7 +5879,12 @@ fn submit_stacked_branch_pr(
                 };
                 match stack_result {
                     Ok((number, url, stack_draft)) => {
-                        if let Err(e) = store.lock().create_pull_request_ex(
+                        // Bind the owned `Result` before branching -- a
+                        // `MutexGuard` temporary in an `if let` scrutinee
+                        // lives for the whole `if let` (it desugars to
+                        // `match`), and the body below takes `store.lock()`
+                        // again.
+                        let record_result = store.lock().create_pull_request_ex(
                             id,
                             Some(branch_id),
                             stack_route.client.kind().as_str(),
@@ -5874,7 +5898,8 @@ fn submit_stacked_branch_pr(
                             Some(stack_id),
                             stack_draft,
                             "stack",
-                        ) {
+                        );
+                        if let Err(e) = record_result {
                             crate::rlog!(
                                 WARNING,
                                 "ralphus [pr] review {id} branch {branch_id} created the stack PR on \
@@ -6900,7 +6925,11 @@ pub(crate) fn schedule_auto_submit_branch(
     branch_id: &str,
 ) {
     let requested_at_ms = now_ms();
-    if let Err(e) = store.lock().request_auto_submit_branch(id, requested_at_ms) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // an `if let` scrutinee lives for the whole `if let` (it desugars to
+    // `match`), and both arms below take `store.lock()` again.
+    let request_result = store.lock().request_auto_submit_branch(id, requested_at_ms);
+    if let Err(e) = request_result {
         crate::rlog!(
             WARNING,
             "ralphus [pr] review {id} branch {branch_id} failed to queue auto-submit request: {e}"

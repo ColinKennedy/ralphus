@@ -512,7 +512,12 @@ fn enqueue_auto_fix_exhausted_notice(
                 ),
                 serde_json::json!({"pr_number": pr.pr_number, "outcome": "exhausted_notified"}),
             );
-            if let Err(e) = store.lock().mark_pr_auto_fix_exhausted_notified(&pr.id) {
+            // Bind the owned `Result` before branching -- a `MutexGuard`
+            // temporary in an `if let` scrutinee lives for the whole `if
+            // let` (it desugars to `match`), and `log_ci_watch` below takes
+            // `store.lock()` again.
+            let mark_result = store.lock().mark_pr_auto_fix_exhausted_notified(&pr.id);
+            if let Err(e) = mark_result {
                 log_ci_watch(
                     store,
                     &guardian.id,
