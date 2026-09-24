@@ -1672,6 +1672,7 @@ mod tests {
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         }
     }

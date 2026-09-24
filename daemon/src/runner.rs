@@ -269,6 +269,20 @@ pub struct RunnerSpec {
     /// operator's personal memory (Claude Code's global `CLAUDE.md`/history,
     /// Codex/Pi's equivalent). Defaults to `false` (isolated).
     pub allow_personal_memory: bool,
+    /// RAL-497: zero-based count of how many times this cell/proof has
+    /// already been retried after a provider-classified transient failure,
+    /// forwarded over the stdin wire contract so a backend that needs to
+    /// compute its own exponential backoff (currently only the pi backend,
+    /// for provider errors with no explicit provider-supplied delay) knows
+    /// which attempt it's on. `0` for a fresh dispatch; the scheduler's
+    /// rate-limit retry loops (`run_cell_with_rate_limit_retries`,
+    /// `run_proof_with_rate_limit_retries`) increment it in place before
+    /// resuming the same agent session. Always serialized (no
+    /// `skip_serializing_if`), matching `allow_personal_settings`'s
+    /// precedent -- there's no ambiguous "unset" state, a fresh cell simply
+    /// starts at `0`. Backends that don't need it (everything but pi) accept
+    /// and ignore it, mirroring `resume_agent_session_id`'s precedent.
+    pub retry_attempt: u32,
     /// RAL-308 cumulative `maximum_timeout_seconds` hard-cap accounting.
     /// `None` when neither this row, its owning cell, nor its owning task
     /// declared the field -- the common case, costing nothing extra at poll
@@ -616,6 +630,10 @@ impl RunnerSpec {
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
+            // RAL-497: a freshly dispatched cell always starts its own
+            // attempt counter at 0; the scheduler's rate-limit retry loop
+            // increments it in place before resuming.
+            retry_attempt: 0,
             // RAL-308: a cell's own cap is already the cumulative cap
             // covering itself and its cell-scope proofs -- see
             // `MaximumTimeoutCaps`'s doc comment.
@@ -737,6 +755,7 @@ impl RunnerSpec {
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
+            retry_attempt: 0,
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -816,6 +835,9 @@ impl RunnerSpec {
             // inert here.
             allow_personal_settings: false,
             allow_personal_memory: false,
+            // Same rationale: no `ModelBackend` reached, so there is no
+            // provider error to retry against.
+            retry_attempt: 0,
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -3350,6 +3372,7 @@ mod tests {
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         }
     }
@@ -5286,6 +5309,7 @@ prompt = "make it build"
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
@@ -5424,6 +5448,7 @@ prompt = "make it build"
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);

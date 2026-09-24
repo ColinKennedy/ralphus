@@ -85,6 +85,12 @@ pub struct CellSpec {
     /// personal cross-project memory (e.g. Claude Code's global `CLAUDE.md`).
     /// Defaults to `false` (isolated) when omitted.
     pub allow_personal_memory: bool,
+    /// RAL-497: zero-based count of how many times this cell/proof has
+    /// already been retried after a provider-classified transient failure.
+    /// `0` for a fresh dispatch. Consumed by the pi backend to compute its
+    /// own exponential backoff for provider errors with no explicit
+    /// provider-supplied delay; other backends accept and ignore it.
+    pub retry_attempt: u32,
 }
 
 impl CellSpec {
@@ -126,6 +132,7 @@ impl CellSpec {
         let maximum_tool_output_tokens = opt_uint(obj, "maximum_tool_output_tokens")?;
         let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
         let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
+        let retry_attempt = opt_u32(obj, "retry_attempt")?.unwrap_or(0);
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -160,6 +167,7 @@ impl CellSpec {
             maximum_tool_output_tokens,
             allow_personal_settings,
             allow_personal_memory,
+            retry_attempt,
         })
     }
 }
