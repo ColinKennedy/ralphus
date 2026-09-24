@@ -21,11 +21,35 @@
 //! call site that used to `.expect(...)` a poison result.
 
 use std::cell::Cell;
+use std::panic::Location;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::store::Store;
+
+/// RAL-<pending>: `file:line` and acquisition time of whoever currently
+/// holds (or most recently acquired) the store lock -- guarded by its own
+/// tiny, uncontended `parking_lot::Mutex`, distinct from the `Store`'s own
+/// lock, so reading/writing it can never itself wait on the thing it is
+/// diagnosing. Written on every [`StoreMutex::lock`] acquisition; read only
+/// when a wait is suspiciously long, so a stuck holder gets logged even if
+/// nobody is watching a debugger at the time.
+#[derive(Clone, Copy)]
+struct HolderInfo {
+    file: &'static str,
+    line: u32,
+    acquired_at_ms: i64,
+}
+
+static HOLDER: LazyLock<parking_lot::Mutex<Option<HolderInfo>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(None));
+
+/// How long a single [`StoreMutex::lock`] wait must be before it's worth
+/// logging who was holding the lock while this call waited -- short waits are
+/// normal contention noise (see the module doc comment), this is only meant
+/// to catch the pathological case.
+const SLOW_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A `Store` behind an eventually-fair, timed mutex. See the module doc
 /// comment.
@@ -40,10 +64,40 @@ impl StoreMutex {
     /// Acquire the store lock, recording how long this call waited into both
     /// the process-lifetime histogram ([`store_lock_wait_snapshot`]) and the
     /// current thread's per-request accumulator ([`take_request_lock_wait_ms`]).
+    ///
+    /// RAL-<pending>: also updates the [`HOLDER`] breadcrumb and, when this
+    /// call had to wait unusually long, logs the *previous* holder's call
+    /// site and how long it had held the lock -- diagnostic aid for tracking
+    /// down a stuck holder without needing to catch a live hang under a
+    /// debugger.
+    #[track_caller]
     pub fn lock(&self) -> StoreGuard<'_> {
         let start = Instant::now();
         let guard = self.0.lock();
-        record_wait(start.elapsed());
+        let waited = start.elapsed();
+        record_wait(waited);
+        let loc = Location::caller();
+        let now = crate::store::now_ms();
+        {
+            let mut holder = HOLDER.lock();
+            if waited >= SLOW_WAIT_LOG_THRESHOLD {
+                if let Some(prev) = *holder {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [store_lock] waited {}ms for the store lock; previously acquired at {}:{} ({}ms ago)",
+                        waited.as_millis(),
+                        prev.file,
+                        prev.line,
+                        now.saturating_sub(prev.acquired_at_ms)
+                    );
+                }
+            }
+            *holder = Some(HolderInfo {
+                file: loc.file(),
+                line: loc.line(),
+                acquired_at_ms: now,
+            });
+        }
         guard
     }
 }

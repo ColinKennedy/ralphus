@@ -4034,11 +4034,11 @@ pub fn poll_forge_reorders(
     let ids: Vec<String> = {
         let guard = store.lock();
         guard
-            .list_guardians()
+            .list_guardian_status_pairs()
             .unwrap_or_default()
             .into_iter()
-            .filter(|g| matches!(g.status.as_str(), "in_review" | "merging"))
-            .map(|g| g.id)
+            .filter(|(_, status)| matches!(status.as_str(), "in_review" | "merging"))
+            .map(|(id, _)| id)
             .collect()
     };
     for id in ids {

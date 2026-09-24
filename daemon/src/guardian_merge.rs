@@ -7215,7 +7215,7 @@ pub fn review_maintenance(
     let candidates: Vec<(String, String)> = {
         let guard = store.lock();
         guard
-            .list_guardians()
+            .list_guardian_status_pairs()
             .unwrap_or_default()
             .into_iter()
             // RAL-300: `merging`/`merge_stopped` are included too (beyond the
@@ -7225,13 +7225,12 @@ pub fn review_maintenance(
             // worktrees right now -- `rebuild_on_base_shift`/
             // `rebase_on_manual_push` already self-gate on `in_review`/
             // `merge_failed` and simply no-op for the other two.
-            .filter(|g| {
+            .filter(|(_, status)| {
                 matches!(
-                    g.status.as_str(),
+                    status.as_str(),
                     "in_review" | "merge_failed" | "merging" | "merge_stopped"
                 )
             })
-            .map(|g| (g.id, g.status))
             .collect()
     };
     // Store lock released. Now apply the per-status cadence: an idle-tier
@@ -9685,21 +9684,7 @@ static DUAL_ROOT_UPSTREAM_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
 pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     let inputs: Vec<GuardianBaseFetchInfo> = {
         let guard = store.lock();
-        guard
-            .list_guardians()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|g| GuardianBaseFetchInfo {
-                status: g.status,
-                base_branch: g.base_branch,
-                projects: g.projects,
-                git_root: g.git_root,
-                machine: g.machine,
-                guardian_id: g.id,
-                owner: g.owner,
-                dual_root_pr: g.effective_dual_root_pr,
-            })
-            .collect()
+        guard.list_guardian_base_fetch_rows().unwrap_or_default()
     };
     for target in collect_base_fetch_targets(&inputs) {
         let key = format!(
