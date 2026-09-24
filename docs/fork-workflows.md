@@ -64,11 +64,15 @@ deployed) or is deleted.
 "Filed on" is the logical destination; the forge API call itself is
 asymmetric between GitLab and GitHub:
 
-- **GitLab** always calls the *fork's* API (`POST
-  /projects/{fork_id}/merge_requests`), adding a numeric `target_project_id`
-  pointing at the parent only for the root MR. A GitLab root's `repo` is
-  therefore the fork's own encoded path, not the parent's — this is why
-  ralphus never uses `repo` alone to decide "is this the root" (see
+- **GitLab** creates the root MR through the *fork's* API (`POST
+  /projects/{fork_id}/merge_requests`) with a numeric `target_project_id`
+  pointing at the parent — but the parent is the project that allocates the
+  MR's `iid`, so a GitLab root's recorded `repo` is the *parent's* encoded
+  path, and every later IID-scoped call (polling, base retargeting,
+  comments, close) addresses the parent. Fork-internal stack MRs are both
+  created through and addressed at the fork's project. Rows recorded before
+  that correction carry the fork's label instead; ralphus never uses `repo`
+  alone to decide "is this the root" for that reason (see
   [Promotion](#promotion)).
 - **GitHub** calls the *parent's* API (`POST /repos/{parent}/pulls`) for the
   root, with `head = "<fork-owner>:<alias>"`, and the fork's API for every
@@ -154,9 +158,11 @@ position to the first branch that's still genuinely open (skipping any that
 also merged in the same batch) and promotes exactly that one.
 
 "Is this PR the root" is decided by comparing its recorded base against the
-guardian's own base branch, not by comparing `repo` — a GitLab root's `repo`
-is the fork's own path (see [Topology](#topology) above), so a `repo`-based
-check would never fire for GitLab at all.
+guardian's own base branch, not by comparing `repo` — which label a GitLab
+root's `repo` carries depends on which ralphus version recorded the row
+(rows recorded before the IID-ownership correction name the fork; newer ones
+name the parent — see [Topology](#topology) above), so `base_ref` is the
+only signal that is correct for both forges and both vintages.
 
 GitHub's native PR-stack registration (`POST /repos/{repo}/stacks`) is
 repository-scoped and can't mix a parent PR number with fork PR numbers, so

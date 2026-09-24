@@ -2554,21 +2554,38 @@ pub(crate) fn resolve_remote_name_excluding(
 /// GitLab-only `target_project_id`, and which repository label the
 /// created/queried PR is filed under (`PullRequestView.repo`). See
 /// `pr.rs`'s fork-aware stack route calculation for how this is built, and
-/// this module's doc comment's Risks-derived asymmetry: GitLab always calls
-/// the fork's client (setting `target_project_id` only for the cross-project
-/// root); GitHub calls the *parent's* client for the cross-repo root and the
-/// fork's client for everything else.
+/// this module's doc comment's Risks-derived asymmetry: GitLab's create call
+/// always goes through the fork's client (setting `target_project_id` only
+/// for the cross-project root, which makes the *parent* allocate the MR's
+/// `iid`), while GitHub's cross-repo root is created through the parent's
+/// own client outright.
 #[derive(Clone)]
 pub struct PrRoute {
+    /// The client that owns the PR/MR's number/IID -- the one every
+    /// follow-up IID-scoped call (merge-state polling, base retargeting,
+    /// comments, close) must go through. Always matches [`Self::repo`].
+    /// GitHub: the parent for the cross-repo root, else the fork. GitLab:
+    /// the fork for fork-internal MRs, the parent for a cross-project root
+    /// (whose `iid` the `target_project_id` parent allocates, RAL-496).
     pub client: ForgeClient,
+    /// The client the *create* call itself goes through when it differs
+    /// from [`Self::client`] -- GitLab's cross-project root only, whose
+    /// `POST .../merge_requests` must hit the fork (the MR's source
+    /// project) with `target_project_id` naming the parent. `None` means
+    /// [`Self::client`] creates it too (GitHub always; GitLab's
+    /// fork-internal MRs).
+    pub create_client: Option<ForgeClient>,
     pub head: String,
     pub base: String,
     pub target_project_id: Option<i64>,
-    /// The repository label the PR/MR is filed under. GitHub: the parent's
-    /// `owner/repo` for the cross-repo root, else the fork's `owner/repo`.
-    /// GitLab: always the fork's encoded path, since a GitLab MR's `iid` is
-    /// scoped to whichever project it was created on, never the
-    /// `target_project_id`.
+    /// The repository label the PR/MR's number/IID is allocated under --
+    /// what `PullRequestView.repo` records, so later IID-scoped operations
+    /// resolve back to the right client via `client_for_repo`. GitHub: the
+    /// parent's `owner/repo` for the cross-repo root, else the fork's
+    /// `owner/repo`. GitLab: the fork's encoded path for fork-internal
+    /// MRs; for a cross-project root, the *parent's* encoded path, because
+    /// `target_project_id` makes the parent allocate the MR's `iid`
+    /// (RAL-496) even though the create call itself POSTs to the fork.
     pub repo: String,
 }
 
@@ -2584,19 +2601,25 @@ impl PrRoute {
         body: &str,
         draft: bool,
     ) -> Result<CreatedPr, String> {
-        self.client.create_pull_request_routed(
-            title,
-            body,
-            &self.head,
-            &self.base,
-            self.target_project_id,
-            draft,
-        )
+        self.create_client
+            .as_ref()
+            .unwrap_or(&self.client)
+            .create_pull_request_routed(
+                title,
+                body,
+                &self.head,
+                &self.base,
+                self.target_project_id,
+                draft,
+            )
     }
 
     /// Toggle this route's PR/MR's draft state (RAL-196), used when a
     /// submission adopts a pre-existing open PR/MR whose draft state differs
-    /// from what was asked for. See
+    /// from what was asked for. Addresses [`Self::client`] -- the project
+    /// whose number/IID namespace the adopted PR/MR lives in -- so a
+    /// GitLab cross-project root adoption PATCHes the parent, not the fork
+    /// the create call would have POSTed to. See
     /// [`ForgeClient::update_pull_request_draft`].
     ///
     /// # Errors
@@ -2607,9 +2630,13 @@ impl PrRoute {
 
     /// Look up whether this route's exact head already has an open PR/MR --
     /// see [`ForgeClient::find_open_pull_request`] for why this is a
-    /// structured query rather than a creation-error-text check. Call this
-    /// before [`Self::create_pull_request`] and adopt what it finds instead
-    /// of creating a duplicate.
+    /// structured query rather than a creation-error-text check. Queries
+    /// [`Self::client`] -- the project whose number/IID namespace a
+    /// pre-existing PR/MR for this head lives under -- so a GitLab
+    /// cross-project root retry finds the parent's MR rather than asking
+    /// the fork about an MR it never hosted. Call this before
+    /// [`Self::create_pull_request`] and adopt what it finds instead of
+    /// creating a duplicate.
     ///
     /// # Errors
     /// Propagates the underlying forge API failure.
