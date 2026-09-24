@@ -4914,7 +4914,11 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
     cancel: &CancelToken,
     set_status: &F,
 ) {
-    let guardian = match store.lock().get_guardian(id) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // a `match` scrutinee lives for the whole `match`, and the arm below takes
+    // `store.lock()` again.
+    let guardian_lookup = store.lock().get_guardian(id);
+    let guardian = match guardian_lookup {
         Ok(g) => g,
         Err(e) => {
             // RAL-<new>: every branch finished rebasing and this is the
@@ -6204,7 +6208,11 @@ pub fn run_feedback(
     // lease is won. `position`/`base` above are left as the pre-wait values
     // deliberately (see their own comments); everything else below must read
     // current state.
-    let guardian = match store.lock().get_guardian(id) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // a `match` scrutinee lives for the whole `match`, and the arm below takes
+    // `store.lock()` again.
+    let guardian_lookup = store.lock().get_guardian(id);
+    let guardian = match guardian_lookup {
         Ok(g) => g,
         Err(_) => {
             let _ = store
@@ -7461,7 +7469,11 @@ pub(crate) fn restack_stack_from(
     detail: &str,
     cancel: &CancelToken,
 ) -> bool {
-    let guardian = match store.lock().get_guardian(id) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // a `match` scrutinee lives for the whole `match`, and the arm below takes
+    // `store.lock()` again.
+    let guardian_lookup = store.lock().get_guardian(id);
+    let guardian = match guardian_lookup {
         Ok(g) => g,
         Err(e) => {
             // RAL-<new>: this is the shared entry point for both a detected

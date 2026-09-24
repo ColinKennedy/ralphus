@@ -4944,7 +4944,11 @@ fn ensure_review_upstream_branch(
     parent_remote_name: &str,
     base_branch_name: &str,
 ) -> std::result::Result<String, String> {
-    let branch = match store.lock().guardian_dual_root_stack_branch(&guardian.id) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // a `match` scrutinee lives for the whole `match`, and the `Ok(None)` arm
+    // below takes `store.lock()` again.
+    let existing_branch = store.lock().guardian_dual_root_stack_branch(&guardian.id);
+    let branch = match existing_branch {
         Ok(Some(existing)) => existing,
         Ok(None) => {
             let allocated = crate::project_forks::allocate_review_upstream_branch(
@@ -6777,7 +6781,11 @@ fn auto_submit_terminal_branches(
 /// submitted; they do not prove that its forge-side base and GitHub-native
 /// stack membership still match the review.
 pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, id: &str) {
-    let guardian = match store.lock().get_guardian(id) {
+    // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
+    // a `match` scrutinee lives for the whole `match`, and the arm below takes
+    // `store.lock()` again.
+    let guardian_lookup = store.lock().get_guardian(id);
+    let guardian = match guardian_lookup {
         Ok(g) => g,
         Err(e) => {
             // RAL-<new>: a branch's terminal transition already logged
