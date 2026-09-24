@@ -1062,20 +1062,43 @@
         applySquadFocus(id);
         renderAll(); syncHash(true);
       }
+      /** Squad states a Retry/Restart can be applied to (RAL-508 bulk included). */
+      const SQUAD_TERMINAL_STATES = ["done", "failed", "cancelled"];
+      /**
+       * Resolves the display label a bulk action's report/confirmation names a squad by.
+       * @param {string} id
+       * @returns {string}
+       */
+      const squadLabelOf = (id) => findSquad(id)?.label || id;
       /**
        * Opens the squad right-click/⋯ context menu with actions valid for its current state.
+       * When the clicked squad is part of an active multi-selection (RAL-508),
+       * every applicable action targets the whole selection: single-item-only
+       * actions (Rename, Watch, Logs) are disabled rather than silently
+       * dropping the rest of the selection, and everything else applies once
+       * per selected squad.
        * @param {MouseEvent} e
        * @param {string} id
        * @returns {void}
        */
+      // RALPHUS-SQUAD-MENU:BEGIN
       function openSquadMenu(e, id) {
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         const r = findSquad(id); if (!r) return;
-        const items = [`<div data-click="renameSquad" data-squad-id="${esc(id)}" data-tip="Rename this squad — changes the display label only.">✎ Rename</div>`];
+        const menuBatchSize = menuActionTargets(id, multiSel).length;
+        /**
+         * @param {string} what
+         * @returns {string}
+         */
+        const singleOnlyTip = (what) => esc(`${what} works on a single squad, so it is disabled while multiple squads are selected.\nClick the squad on its own (plain click, no Ctrl/Shift) to narrow the selection to it, then right-click it again.`);
+        const items = [menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Rename")}">✎ Rename</div>`
+          : `<div data-click="renameSquad" data-squad-id="${esc(id)}" data-tip="Rename this squad — changes the display label only.">✎ Rename</div>`];
         const squadUri = `squad:${id}`;
-        items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
-        const menuBatchSize = (multiSel.has(id) && multiSel.size > 1) ? multiSel.size : 0;
-        if (menuBatchSize) {
+        items.push(menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Watch")}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`
+          : `<div data-click="toggleWatch" data-entity-uri="${esc(squadUri)}" data-tip="${isWatching(squadUri) ? "Stop receiving watcher notifications for this squad." : "Watch this whole squad and choose which mailbox priority tiers should notify you."}">${isWatching(squadUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
+        if (menuBatchSize > 1) {
           items.push(`<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide all ${menuBatchSize} selected squads from your own view — they stay fully intact and keep running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide ${menuBatchSize}</div>`);
           items.push(`<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show all ${menuBatchSize} selected squads again in your own view, if hidden.\nWho/when: use this to undo an earlier hide across a whole selection.\nA personal preference — it never affects what other users see.">👁 Unhide ${menuBatchSize}</div>`);
         } else {
@@ -1083,20 +1106,24 @@
             ? `<div data-click="unhideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Show this squad again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
             : `<div data-click="hideSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Hide this squad from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of squads you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
         }
-        if (r.state === "queued") items.push(`<div data-click="squadMenuActivate" data-squad-id="${esc(id)}" data-tip="Start this queued squad immediately — it was held with hold=true and is waiting to be scheduled.">▶ Run</div>`);
-        if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div data-click="retrySquad" data-squad-id="${esc(id)}" data-tip="Re-run with the same parameters.\nA succeeded squad will prompt for extra confirmation since it may duplicate side effects.">↻ Retry</div>`);
-        if (["done", "failed", "cancelled"].includes(r.state)) items.push(`<div data-click="restartSquad" data-squad-id="${esc(id)}" data-tip="Re-run this squad and mark all downstream squads as dirty so they re-run too.\nThis cannot be undone.">⟳ Restart + downstream</div>`);
-        items.push(`<div class="danger" data-click="cancelSquad" data-squad-id="${esc(id)}" data-tip="Cancel this squad and every squad downstream of it — stops all in-flight task, cell, and proof agents, and permanently locks them out of ever being picked up again (even if already done or failed).\nUse this to stop a stuck or unwanted squad, including one that already finished.\nShows a preview of every squad that will be cancelled before confirming.\nThis cannot be undone.">■ Cancel Squad</div>`);
-        items.push(`<div data-click="openAddDependencyDialogFor" data-squad-id="${esc(id)}" data-tip="Make ${multiSel.has(id) && multiSel.size > 1 ? "every selected squad" : "this squad"} wait for another squad to finish before it can be scheduled.\nSearch for the target squad by ID or name, then confirm.\nThe target squad itself is not modified.">🔗 Add Dependency</div>`);
-        items.push(`<div data-click="openStatusPickerForSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Manually override this squad's status — any valid state can be set regardless of current state.\nA confirmation dialog will appear before applying.\nThis cannot be undone for terminal states (done/failed/cancelled).">⚙ Set Status</div>`);
-        items.push(`<div class="danger" data-click="deleteSquad" data-squad-id="${esc(id)}" data-tip="Delete this squad and all its data permanently.\nThis cannot be undone.">🗑 Delete</div>`);
-        if (!["pending","queued"].includes(r.state)) items.push(`<div data-click="openLogsFromSquadMenu" data-squad-id="${esc(id)}" data-tip="View squad logs — events, task states, cell timings, and proof output.">📄 Logs</div>`);
+        const batchTip = menuBatchSize > 1 ? `\nApplies to all ${menuBatchSize} selected squads; any that aren't eligible for this action are skipped and reported.` : "";
+        if (r.state === "queued") items.push(`<div data-click="squadMenuActivate" data-squad-id="${esc(id)}" data-tip="Start this queued squad immediately — it was held with hold=true and is waiting to be scheduled.${esc(batchTip)}">▶ Run</div>`);
+        if (SQUAD_TERMINAL_STATES.includes(r.state)) items.push(`<div data-click="retrySquad" data-squad-id="${esc(id)}" data-tip="Re-run with the same parameters.\nA succeeded squad will prompt for extra confirmation since it may duplicate side effects.${esc(batchTip)}">↻ Retry</div>`);
+        if (SQUAD_TERMINAL_STATES.includes(r.state)) items.push(`<div data-click="restartSquad" data-squad-id="${esc(id)}" data-tip="Re-run this squad and mark all downstream squads as dirty so they re-run too.\nThis cannot be undone.${esc(batchTip)}">⟳ Restart + downstream</div>`);
+        items.push(`<div class="danger" data-click="cancelSquad" data-squad-id="${esc(id)}" data-tip="Cancel this squad and every squad downstream of it — stops all in-flight task, cell, and proof agents, and permanently locks them out of ever being picked up again (even if already done or failed).\nUse this to stop a stuck or unwanted squad, including one that already finished.\nShows a preview of every squad that will be cancelled before confirming.\nThis cannot be undone.${esc(batchTip)}">■ Cancel Squad</div>`);
+        items.push(`<div data-click="openAddDependencyDialogFor" data-squad-id="${esc(id)}" data-tip="Make ${menuBatchSize > 1 ? "every selected squad" : "this squad"} wait for another squad to finish before it can be scheduled.\nSearch for the target squad by ID or name, then confirm.\nThe target squad itself is not modified.">🔗 Add Dependency</div>`);
+        items.push(`<div data-click="openStatusPickerForSquadMenuItem" data-squad-id="${esc(id)}" data-tip="Manually override this squad's status — any valid state can be set regardless of current state.\nA confirmation dialog will appear before applying.\nThis cannot be undone for terminal states (done/failed/cancelled).${esc(batchTip)}">⚙ Set Status</div>`);
+        items.push(`<div class="danger" data-click="deleteSquad" data-squad-id="${esc(id)}" data-tip="Delete this squad and all its data permanently.\nThis cannot be undone.${esc(batchTip)}">🗑 Delete</div>`);
+        if (!["pending","queued"].includes(r.state)) items.push(menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Logs")}">📄 Logs</div>`
+          : `<div data-click="openLogsFromSquadMenu" data-squad-id="${esc(id)}" data-tip="View squad logs — events, task states, cell timings, and proof output.">📄 Logs</div>`);
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu"; menu.innerHTML = items.join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 170) + "px";
       }
+      // RALPHUS-SQUAD-MENU:END
       /**
        * Closes the squad context menu, if open.
        * @returns {void}
@@ -1105,11 +1132,33 @@
       document.addEventListener("click", closeSquadMenu);
       /**
        * Runs a simple squad-menu POST action (e.g. activate) and refreshes the board.
+       * With an active multi-selection (RAL-508) it applies once per selected
+       * squad, skipping (and reporting) squads the action isn't valid for.
        * @param {string} id
        * @param {string} act
        * @returns {Promise<void>}
        */
-      async function squadMenuAct(id, act) { closeSquadMenu(); await post(`/api/squads/${id}/${act}`); tick(); }
+      async function squadMenuAct(id, act) {
+        closeSquadMenu();
+        const ids = menuActionTargets(id, multiSel);
+        if (ids.length > 1 && act === "activate") { await bulkActivateSquads(ids); return; }
+        await post(`/api/squads/${id}/${act}`); tick();
+      }
+      /**
+       * Activates every selected queued squad (RAL-508), skipping and
+       * reporting squads that aren't queued (only queued squads can be
+       * activated) plus any per-item failure.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-SQUAD-BULK-ACTIVATE:BEGIN
+      async function bulkActivateSquads(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (tid) => findSquad(tid)?.state === "queued");
+        const failed = await bulkActEach(eligible, squadLabelOf, (tid) => post(`/api/squads/${tid}/activate`), "activate failed");
+        reportBulkOutcome("Activated", "squad", eligible.length, skipped, "not queued (only queued squads can be started)", failed);
+        tick();
+      }
+      // RALPHUS-SQUAD-BULK-ACTIVATE:END
       /**
        * Prompts for and applies a new display label for a squad.
        * @param {string} id
@@ -1125,13 +1174,19 @@
       // CCTL-101: retry re-runs with the same params. A succeeded squad gets a
       // higher-friction confirmation (type-to-confirm) to guard against
       // accidental re-runs of successful work; a failed/cancelled one just confirms.
+      // RAL-508: with an active multi-selection the retry applies once per
+      // selected squad via bulkRetrySquads instead.
       /**
        * Re-runs a terminal squad with its existing parameters, with extra confirmation if it already succeeded.
+       * Applies to every selected squad when the clicked one is part of a multi-selection.
        * @param {string} id
        * @returns {Promise<void>}
        */
+      // RALPHUS-SQUAD-RETRY-ROUTE:BEGIN
       async function retrySquad(id) {
         closeSquadMenu();
+        const ids = menuActionTargets(id, multiSel);
+        if (ids.length > 1) { await bulkRetrySquads(ids); return; }
         const r = findSquad(id); if (!r) return;
         if (r.state === "done") {
           const ans = prompt(`This squad SUCCEEDED. Re-running it may duplicate side effects.\nType "retry" to confirm re-running "${r.label || id}".`);
@@ -1142,19 +1197,52 @@
         await post(`/api/squads/${id}/retry`);
         tick();
       }
+      // RALPHUS-SQUAD-RETRY-ROUTE:END
+      /**
+       * Retries every selected terminal squad with its existing parameters
+       * (RAL-508), after one shared confirmation naming them all. Squads that
+       * aren't in a terminal state are skipped and reported; any succeeded
+       * squad in the batch keeps the type-to-confirm friction; per-item
+       * failures are reported without blocking the rest of the batch.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-SQUAD-BULK-RETRY:BEGIN
+      async function bulkRetrySquads(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (tid) => SQUAD_TERMINAL_STATES.includes(findSquad(tid)?.state || ""));
+        if (!eligible.length) return;
+        const names = eligible.map(squadLabelOf);
+        if (eligible.some((tid) => findSquad(tid)?.state === "done")) {
+          const ans = prompt(`Some selected squads SUCCEEDED. Re-running them may duplicate side effects.\nType "retry" to confirm re-running:\n${bulkNameList(names)}`);
+          if ((ans || "").trim().toLowerCase() !== "retry") return;
+        } else if (!confirm(`Retry ${eligible.length} squad(s) with the same parameters?\n\n${bulkNameList(names)}`)) {
+          return;
+        }
+        const failed = await bulkActEach(eligible, squadLabelOf, (tid) => post(`/api/squads/${tid}/retry`), "retry failed");
+        reportBulkOutcome("Retried", "squad", eligible.length, skipped, "not finished (only done/failed/cancelled squads can be retried)", failed);
+        tick();
+      }
+      // RALPHUS-SQUAD-BULK-RETRY:END
       // RAL-19/RAL-104: restart re-runs the squad and dirties every squad that
       // depends on it, so the whole downstream chain re-runs once this one
       // finishes again. Shows a dry-run preview of that impact first.
+      // RAL-508: with an active multi-selection the restart applies once per
+      // selected squad via bulkRestartSquads instead.
       /**
        * Restarts a whole squad (with a downstream-impact preview first).
+       * Applies to every selected squad when the clicked one is part of a multi-selection.
        * @param {string} id
        * @returns {Promise<void>}
        */
+      // RALPHUS-SQUAD-RESTART-ROUTE:BEGIN
       async function restartSquad(id) {
         closeSquadMenu();
+        const ids = menuActionTargets(id, multiSel);
+        if (ids.length > 1) { await bulkRestartSquads(ids); return; }
         const r = findSquad(id); if (!r) return;
         await showRestartPreview(`Restart "${r.label || id}"?`, `/api/squads/${id}/restart/preview`, `/api/squads/${id}/restart`);
       }
+      // RALPHUS-SQUAD-RESTART-ROUTE:END
       // Restart a single cell and everything downstream of it within the squad
       // (upstream cells stay done and are skipped on re-run). Dependent squads
       // are dirtied too. Shows a dry-run preview first (RAL-104).
@@ -1272,6 +1360,80 @@
         });
         tick();
       }
+      // RAL-508: bulk restart over a multi-selection — one shared preview
+      // modal (per-squad impacts fetched from the same preview endpoints the
+      // single restart uses), then one restart per selected squad with
+      // per-item failure reporting.
+      /**
+       * @typedef {object} BulkRestartPreview
+       * @property {string} id
+       * @property {string} label
+       * @property {RestartPreview} impact
+       */
+      /**
+       * Fetches every selected terminal squad's restart preview and shows one
+       * combined confirmation modal. Squads that aren't in a terminal state
+       * are skipped and reported; if any preview fails to compute, nothing is
+       * restarted and the error is shown.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      async function bulkRestartSquads(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (tid) => SQUAD_TERMINAL_STATES.includes(findSquad(tid)?.state || ""));
+        if (!eligible.length) return;
+        if (skipped) notify("error", `Skipped ${skipped} of the selected squad(s): not finished (only done/failed/cancelled squads can be restarted).`);
+        /** @type {BulkRestartPreview[]|null} */
+        let previews = null;
+        try {
+          previews = await Promise.all(eligible.map(async (tid) => {
+            const resp = await post(`/api/squads/${tid}/restart/preview`);
+            if (!resp.ok) throw new Error(await responseError(resp, "restart preview failed"));
+            return { id: tid, label: squadLabelOf(tid), impact: await resp.json() };
+          }));
+        } catch (err) { notify("error", `Failed to compute restart preview: ${(/** @type {Error} */ (err)).message || "network error"}.`); return; }
+        const cellCount = previews.reduce((n, p) => n + (p.impact.cells || []).length, 0);
+        const taskCount = previews.reduce((n, p) => n + (p.impact.tasks || []).length, 0);
+        const dirtiedIds = new Map();
+        for (const p of previews) for (const dr of (p.impact.dirtied_squads || [])) if (!dirtiedIds.has(dr.id)) dirtiedIds.set(dr.id, dr.label || dr.id);
+        const rows = previews.map((p) =>
+          `<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
+            <span style="flex:1">${esc(p.label)}</span>
+            <span style="color:var(--muted)">${(p.impact.cells || []).length} cell(s) across ${(p.impact.tasks || []).length} task(s)${(p.impact.dirtied_squads || []).length ? `, ${(p.impact.dirtied_squads || []).length} dependent squad(s) dirtied` : ""}</span>
+          </div>`).join("");
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
+            <h2>Restart ${previews.length} squad${previews.length === 1 ? "" : "s"} + downstream?</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This will reset ${cellCount} cell${cellCount === 1 ? "" : "s"} across ${taskCount} task${taskCount === 1 ? "" : "s"} to Pending${dirtiedIds.size ? `, and dirty ${dirtiedIds.size} dependent squad${dirtiedIds.size === 1 ? "" : "s"} so ${dirtiedIds.size === 1 ? "it re-runs" : "they re-run"} too` : ""}.</p>
+            <div data-tip="Per-squad impact, computed the same way each restart applies it.\nScroll to see the full list." style="max-height:280px;overflow:auto;border-top:1px solid var(--border)">${rows}</div>
+            ${restartNoteFieldsHtml()}
+            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">This cannot be undone.</p>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Cancel — do not restart anything.">Cancel</button>
+              <button class="btn primary" data-click="confirmBulkRestart" data-squad-ids="${esc(previews.map((p) => p.id).join(","))}" data-tip="Restart every squad listed above, one request each.\nPer-squad failures are reported without blocking the rest.\nThis cannot be undone.">⟳ Restart ${previews.length} squad${previews.length === 1 ? "" : "s"}</button>
+            </div>
+          </div></div>`;
+      }
+      /**
+       * Confirms and executes a previously-previewed bulk restart, forwarding
+       * any optional restart note (RAL-174) typed into the modal's textarea,
+       * restarting each squad in turn and reporting per-item failures.
+       * @param {string} squadIds
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-BULK-RESTART-CONFIRM:BEGIN
+      async function confirmBulkRestart(squadIds) {
+        const ids = (squadIds || "").split(",").filter(Boolean);
+        if (!ids.length) return;
+        const noteEl = /** @type {HTMLTextAreaElement|null} */ (document.getElementById("restart-note-input"));
+        const applyAllEl = /** @type {HTMLInputElement|null} */ (document.getElementById("restart-note-apply-all"));
+        const note = (noteEl?.value || "").trim();
+        const body = note ? { note, apply_to_all: !!applyAllEl?.checked } : undefined;
+        closeModal();
+        const failed = await bulkActEach(ids, squadLabelOf, (tid) => post(`/api/squads/${tid}/restart`, body), "restart failed");
+        reportBulkOutcome("Restarted", "squad", ids.length, 0, "", failed);
+        tick();
+      }
+      // RALPHUS-BULK-RESTART-CONFIRM:END
       // RAL-116: cancel this squad and every squad transitively dependent on it.
       // Always available regardless of current state — even a terminal
       // (done/failed/already-cancelled) squad can be cancelled, so it is
@@ -1279,16 +1441,23 @@
       // dry-run preview of the full cascade first, mirroring restart's
       // preview (RAL-104): the preview and the real cancel share one
       // server-side computation, so they can never drift apart.
+      // RAL-508: with an active multi-selection the cancel applies once per
+      // selected squad via showBulkCancelPreview instead.
       /**
        * Cancels a squad and its downstream dependents (with a preview first).
+       * Applies to every selected squad when the clicked one is part of a multi-selection.
        * @param {string} id
        * @returns {Promise<void>}
        */
+      // RALPHUS-SQUAD-CANCEL-ROUTE:BEGIN
       async function cancelSquad(id) {
         closeSquadMenu();
+        const ids = menuActionTargets(id, multiSel);
+        if (ids.length > 1) { await showBulkCancelPreview(ids); return; }
         const r = findSquad(id); if (!r) return;
         await showCancelPreview(`Cancel "${r.label || id}"?`, `/api/squads/${id}/cancel/preview`, `/api/squads/${id}/cancel`);
       }
+      // RALPHUS-SQUAD-CANCEL-ROUTE:END
       /**
        * @typedef {object} CancelPreview
        * @property {{id: string, label: string|null}[]} [squads]
@@ -1336,6 +1505,65 @@
         await post(cancelUrl, undefined, { success: "Squad cancelled.", errorLabel: "cancel squad" });
         tick();
       }
+      // RAL-508: bulk cancel over a multi-selection — one shared preview modal
+      // (each selected squad's cascade fetched from the same preview endpoint
+      // the single cancel uses, deduped into one list), then one cancel per
+      // selected squad with per-item failure reporting. Also backs the detail
+      // pane's bulk-bar Cancel button, so both entry points confirm through
+      // the same cascade preview.
+      /**
+       * Fetches every selected squad's cancel-cascade preview and shows one
+       * combined confirmation modal listing every squad that will be stopped.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-BULK-CANCEL-PREVIEW:BEGIN
+      async function showBulkCancelPreview(ids) {
+        if (!ids.length) return;
+        /** @type {CancelPreview[]|null} */
+        let previews = null;
+        try {
+          previews = await Promise.all(ids.map(async (tid) => {
+            const resp = await post(`/api/squads/${tid}/cancel/preview`);
+            if (!resp.ok) throw new Error(await responseError(resp, "cancel preview failed"));
+            return await resp.json();
+          }));
+        } catch (err) { notify("error", `Failed to compute cancel preview: ${(/** @type {Error} */ (err)).message || "network error"}.`); return; }
+        const affected = new Map();
+        for (const p of /** @type {CancelPreview[]} */ (previews)) for (const s of (p.squads || [])) if (!affected.has(s.id)) affected.set(s.id, s.label || s.id);
+        const rows = [...affected.entries()].map(([sid, label]) =>
+          `<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px">
+            <span style="flex:1">${esc(label)}</span>
+          </div>`).join("");
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
+            <h2>Cancel ${ids.length} squad${ids.length === 1 ? "" : "s"} (plus everything downstream)?</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This will cancel ${affected.size} squad${affected.size === 1 ? "" : "s"} (the selected squads plus every squad downstream of them) — stopping every in-flight task, cell, and proof agent and permanently locking each one out of ever being picked up again.</p>
+            <div data-tip="Every squad these cancellations will stop, computed the same way the cancels themselves apply them.\nScroll to see the full list." style="max-height:280px;overflow:auto;border-top:1px solid var(--border)">${rows}</div>
+            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">This cannot be undone.</p>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Close without cancelling anything.">Cancel</button>
+              <button class="btn danger" data-click="confirmBulkCancelSquads" data-squad-ids="${esc(ids.join(","))}" data-tip="Cancel every selected squad, one request each.\nPer-squad failures are reported without blocking the rest.\nThis cannot be undone.">■ Cancel ${ids.length} squad${ids.length === 1 ? "" : "s"}</button>
+            </div>
+          </div></div>`;
+      }
+      // RALPHUS-BULK-CANCEL-PREVIEW:END
+      /**
+       * Confirms and executes a previously-previewed bulk cancel, cancelling
+       * each selected squad in turn and reporting per-item failures.
+       * @param {string} squadIds
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-BULK-CANCEL-CONFIRM:BEGIN
+      async function confirmBulkCancelSquads(squadIds) {
+        const ids = (squadIds || "").split(",").filter(Boolean);
+        if (!ids.length) return;
+        closeModal();
+        const failed = await bulkActEach(ids, squadLabelOf, (tid) => post(`/api/squads/${tid}/cancel`), "cancel failed");
+        reportBulkOutcome("Cancelled", "squad", ids.length, 0, "", failed);
+        tick();
+      }
+      // RALPHUS-BULK-CANCEL-CONFIRM:END
       // Attach an interactive terminal to a task cell's live tmux cell
       // (RAL-102 — replaces the old `claude --resume` spawn). Fails gracefully
       // via the alert below when the underlying tmux cell isn't currently
