@@ -9158,6 +9158,16 @@ fn unprefix_thinking_line(line: &str) -> &str {
 /// failure (no binary available at all) is the only case reported as a real
 /// error, since that reflects a daemon configuration problem rather than
 /// "this squad finished".
+///
+/// Deliberately skips a separate `has_session` probe before calling
+/// `capture_pane` — each is its own `tmux`/psmux client subprocess spawn
+/// (`Tmux::run`), and on Windows that cost is real and highly variable
+/// (process creation, AV/EDR scanning a fresh `.exe` launch), so this board
+/// poll (every 2s per open Live View box, RAL-167/`pollOpenPeeks`) was
+/// paying it twice for no behavioral difference: `capture_pane`'s own `Err`
+/// path already falls back to the exact same `inactive_pane_reply` a missing
+/// session would have. Halves the subprocess spawns on this hot path with no
+/// change in observable behavior.
 fn capture_pane_reply(
     daemon: &Daemon,
     squad_id: &str,
@@ -9173,9 +9183,6 @@ fn capture_pane_reply(
         Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
     };
     let name = crate::tmux::session_name(squad_id, task, cell_id);
-    if !tmux.has_session(&name) {
-        return inactive_pane_reply(&name);
-    }
     match tmux.capture_pane(&name, lines) {
         Ok(content) => json(
             200,
