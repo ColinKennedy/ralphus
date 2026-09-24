@@ -2815,6 +2815,15 @@ fn maybe_promote_fork_root(
                          parent pr just merged: {e}",
                         old_stack_pr.id
                     );
+                    crate::cartographer::Note::new("pr")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("guardian")
+                        .guardian(id)
+                        .emit(
+                            &store.lock(),
+                            "could not close stack pr whose branch's parent pr just merged",
+                            serde_json::json!({"pr_id": old_stack_pr.id, "error": e.to_string()}),
+                        );
                 }
                 if let Err(e) = routing.fork_client.post_pr_comment(number, &pointer) {
                     crate::rlog!(
@@ -2823,6 +2832,15 @@ fn maybe_promote_fork_root(
                          pr={}: {e}",
                         old_stack_pr.id
                     );
+                    crate::cartographer::Note::new("pr")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("guardian")
+                        .guardian(id)
+                        .emit(
+                            &store.lock(),
+                            "could not post the pointer comment on stack pr",
+                            serde_json::json!({"pr_id": old_stack_pr.id, "error": e.to_string()}),
+                        );
                 }
             }
             let _ = store.lock().update_pull_request_ex(
