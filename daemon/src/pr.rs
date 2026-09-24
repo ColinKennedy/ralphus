@@ -5250,9 +5250,12 @@ pub(crate) fn retire_dual_root_branch_for_guardian(
 
 /// Retire the transient fork-side upstream branch of every review in a
 /// terminal state (`merged`/`cancelled`/`deployed`) that still records one
-/// (RAL-<new>). Runs on the scheduler's periodic sweep so every terminal
-/// transition path is covered uniformly, plus once at daemon startup for
-/// leftovers from before a restart.
+/// (RAL-<new>). This is only the backstop for whatever
+/// [`retire_dual_root_branch_for_guardian`] misses -- every terminal
+/// transition already retires its own branch immediately -- so it rides the
+/// scheduler's existing worktree-retirement sweep
+/// (`scheduler::WORKTREE_RETIREMENT_INTERVAL`) rather than a timer of its
+/// own, plus once at daemon startup for leftovers from before a restart.
 pub fn sweep_terminal_dual_root_upstream_branches(store: &crate::store_lock::StoreHandle) {
     let snapshots = match store.lock().dual_root_upstream_snapshots(true) {
         Ok(snapshots) => snapshots,
