@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::cancel::Cancellations;
 use crate::config::ArkConfig;
-use crate::mailbox::MailboxPriority;
+use crate::mailbox::{MailboxPriority, Remediation};
 use crate::scheduler::Semaphore;
 use crate::store::{SquadState, Store, now_ms};
 
@@ -317,9 +317,22 @@ fn notify_old_reviews(
     let mut count = 0;
     for (id, name, status, _) in rows {
         if store.claim_ark_notification("review", &id)? {
-            store.enqueue_mailbox_message(MailboxPriority::High,
-                &format!("Ark found old review {id} ({name}) in {status}; inspect it before any worktree cleanup."),
-                None, None, None, Some(&format!("guardian:{id}")))?;
+            store.enqueue_error_mailbox_message(
+                MailboxPriority::High,
+                &format!("Ark found old review {id} ({name}) in {status}."),
+                &Remediation::ManualInterventionRequired {
+                    guidance: format!(
+                        "inspect its worktree state (`ralphus review worktrees {id}`) before \
+                         any worktree cleanup runs; if the review is no longer needed, cancel \
+                         it (`ralphus review cancel {id}`)"
+                    ),
+                },
+                None,
+                None,
+                None,
+                Some(&format!("guardian:{id}")),
+                None,
+            )?;
             count += 1;
         }
     }

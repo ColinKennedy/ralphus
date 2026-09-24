@@ -6082,11 +6082,15 @@ fn run_submit_followup(
         // so a watcher learns about it without having to notice the squad
         // never left `materializing`.
         let event_uri = format!("squad:{squad_id}");
-        if let Ok(message_id) = guard.notify_watchers_with_context(
+        if let Ok(message_id) = guard.notify_watchers_with_remediation(
             crate::monitor::NotifiableEventKind::SquadFailed,
             &event_uri,
             crate::mailbox::MailboxPriority::Urgent,
             &format!("squad {squad_id} failed to materialize: {}", e.message),
+            &crate::mailbox::Remediation::SuggestedCommand {
+                command: format!("ralphus squad retry {squad_id}"),
+                purpose: "reset the squad to pending and retry materialization".to_string(),
+            },
             Some(&squad_id),
             None,
             None,
