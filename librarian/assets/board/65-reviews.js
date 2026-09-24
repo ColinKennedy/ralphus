@@ -219,39 +219,72 @@
         </div>`;
       }
       // CCTL-100: right-click a review for Rename / Delete (mirrors the squad menu).
+      // RAL-508: when the clicked review is part of an active multi-selection,
+      // every applicable action targets the whole selection: single-item-only
+      // actions (Edit Details, Watch) are disabled rather than silently
+      // dropping the rest of the selection, and everything else applies once
+      // per selected review.
       /**
        * Opens the review right-click context menu.
        * @param {MouseEvent} e
        * @param {string} id
        * @returns {void}
        */
+      // RALPHUS-REVIEW-MENU:BEGIN
       function openReviewMenu(e, id) {
         e.preventDefault(); e.stopPropagation(); closeSquadMenu();
         const g = guardians.find((x) => x.id === id); if (!g) return;
         const menu = document.createElement("div");
         menu.className = "ctx-menu"; menu.id = "squad-menu";
+        const menuBatchSize = menuActionTargets(id, guardianMultiSel).length;
+        /**
+         * @param {string} what
+         * @returns {string}
+         */
+        const singleOnlyTip = (what) => esc(`${what} works on a single review, so it is disabled while multiple reviews are selected.\nClick the review on its own (plain click, no Ctrl/Shift) to narrow the selection to it, then right-click it again.`);
+        const batchTip = menuBatchSize > 1 ? `\nApplies to all ${menuBatchSize} selected reviews; any that aren't eligible for this action are skipped and reported.` : "";
         const canCancel = G_CANCELLABLE.includes(g.status);
-        const items = [`<div data-click="openEditReviewDetailsFromMenu" data-guardian-id="${esc(id)}" data-tip="Edit this review's name and other settings.">✎ Edit Details</div>`];
+        const items = [menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Edit Details")}">✎ Edit Details</div>`
+          : `<div data-click="openEditReviewDetailsFromMenu" data-guardian-id="${esc(id)}" data-tip="Edit this review's name and other settings.">✎ Edit Details</div>`];
         const reviewUri = `guardian:${id}`;
-        items.push(`<div data-click="toggleWatch" data-entity-uri="${esc(reviewUri)}" data-tip="${isWatching(reviewUri) ? "Stop receiving watcher notifications for this review." : "Watch this whole review and choose which mailbox priority tiers should notify you."}">${isWatching(reviewUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
-        items.push(hiddenGuardianIds.has(id)
-          ? `<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show this review again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
-          : `<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide this review from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
-        if (canCancel) items.push(`<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.">⊘ Cancel review</div>`);
-        if (g.status === "cancelled") items.push(`<div data-click="reopenReview" data-guardian-id="${esc(id)}" data-tip="Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.\nAny branch still waiting on its task keeps the review in collecting until it finishes.">↺ Reopen review</div>`);
-        items.push(`<div class="danger" data-click="deleteReview" data-guardian-id="${esc(id)}" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.">🗑 Delete</div>`);
+        items.push(menuBatchSize > 1
+          ? `<div class="ctx-disabled" data-tip="${singleOnlyTip("Watch")}">${isWatching(reviewUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`
+          : `<div data-click="toggleWatch" data-entity-uri="${esc(reviewUri)}" data-tip="${isWatching(reviewUri) ? "Stop receiving watcher notifications for this review." : "Watch this whole review and choose which mailbox priority tiers should notify you."}">${isWatching(reviewUri) ? "◉ Unwatch" : "◎ Watch…"}</div>`);
+        if (menuBatchSize > 1) {
+          items.push(`<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide all ${menuBatchSize} selected reviews from your own view — they stay fully intact and keep running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide ${menuBatchSize}</div>`);
+          items.push(`<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show all ${menuBatchSize} selected reviews again in your own view, if hidden.\nWho/when: use this to undo an earlier hide across a whole selection.\nA personal preference — it never affects what other users see.">👁 Unhide ${menuBatchSize}</div>`);
+        } else {
+          items.push(hiddenGuardianIds.has(id)
+            ? `<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show this review again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
+            : `<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide this review from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
+        }
+        if (canCancel) items.push(`<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.${esc(batchTip)}">⊘ Cancel review</div>`);
+        if (g.status === "cancelled") items.push(`<div data-click="reopenReview" data-guardian-id="${esc(id)}" data-tip="Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.\nAny branch still waiting on its task keeps the review in collecting until it finishes.${esc(batchTip)}">↺ Reopen review</div>`);
+        items.push(`<div class="danger" data-click="deleteReview" data-guardian-id="${esc(id)}" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.${esc(batchTip)}">🗑 Delete</div>`);
         menu.innerHTML = items.join("");
         document.body.appendChild(menu);
         menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + "px";
         menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
       }
+      // RALPHUS-REVIEW-MENU:END
       /**
-       * Deletes a review and its worktrees after confirmation.
+       * Resolves the display label a bulk action's report/confirmation names a review by.
+       * @param {string} id
+       * @returns {string}
+       */
+      const reviewLabelOf = (id) => guardians.find((x) => x.id === id)?.name || id;
+      /**
+       * Deletes a review and its worktrees after confirmation. Applies to
+       * every selected review when the clicked one is part of a
+       * multi-selection (RAL-508) via bulkDeleteReviews instead.
        * @param {string} id
        * @returns {Promise<void>}
        */
       async function deleteReview(id) {
         closeSquadMenu();
+        const ids = menuActionTargets(id, guardianMultiSel);
+        if (ids.length > 1) { await bulkDeleteReviews(ids); return; }
         const g = guardians.find((x) => x.id === id);
         if (!confirm(`Delete review "${g ? g.name : id}"? This removes its review worktrees and cannot be undone.`)) return;
         await del(`/api/guardians/${id}`, { success: `Review "${g ? g.name : id}" deleted.`, errorLabel: "delete review" });
@@ -259,6 +292,28 @@
         guardianMultiSel.delete(id);
         tick();
       }
+      /**
+       * Deletes every selected review after one shared confirmation naming
+       * them all (RAL-508). Reports any review the daemon refused to delete
+       * via notify() -- one review failing does not block the rest of the
+       * batch; deleted reviews leave the selection either way.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-REVIEW-BULK-DELETE:BEGIN
+      async function bulkDeleteReviews(ids) {
+        if (!ids.length) return;
+        if (!confirm(`Delete ${ids.length} review(s)? This removes their review worktrees and cannot be undone.\n\n${bulkNameList(ids.map(reviewLabelOf))}`)) return;
+        const failed = await bulkActEach(ids, reviewLabelOf, (gid) => del(`/api/guardians/${gid}`), "delete review failed");
+        if (failed.length) notify("error", failed.join("; "));
+        else notify("success", `Deleted ${ids.length} review(s).`);
+        for (const gid of ids) {
+          if (selectedGuardian === gid) selectedGuardian = null;
+          guardianMultiSel.delete(gid);
+        }
+        tick();
+      }
+      // RALPHUS-REVIEW-BULK-DELETE:END
       /**
        * Hides or unhides a review from the current user's own view (RAL-331) --
        * a personal preference that never changes the review itself or what any
@@ -282,6 +337,19 @@
         renderReviews();
       }
       /**
+       * Hides or unhides from the review context menu (RAL-508) -- applies to
+       * every multi-selected review when the clicked review is part of an
+       * active multi-selection (size > 1), otherwise just the clicked review.
+       * @param {string} id
+       * @param {boolean} hide
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-REVIEW-HIDE:BEGIN
+      function setReviewHiddenFromMenu(id, hide) {
+        if (guardianMultiSel.has(id) && guardianMultiSel.size > 1) return (hide ? bulkHideReviews() : bulkUnhideReviews());
+        return setReviewHidden(id, hide);
+      }
+      /**
        * Hides every multi-selected review from the current user's own view
        * (RAL-331). Reports any review the daemon refused to hide via notify().
        * @returns {Promise<void>}
@@ -296,6 +364,7 @@
         }
         renderReviews();
         if (failed.length) notify("error", failed.join("; "));
+        else notify("success", `${guardianMultiSel.size} review(s) hidden.`);
       }
       /**
        * Re-enables every multi-selected review in the current user's own view
@@ -312,7 +381,9 @@
         }
         renderReviews();
         if (failed.length) notify("error", failed.join("; "));
+        else notify("success", `${guardianMultiSel.size} review(s) unhidden.`);
       }
+      // RALPHUS-REVIEW-HIDE:END
       /**
        * Opens the review detail pane's title-bar ⋯ context menu.
        * @param {MouseEvent} e
@@ -337,27 +408,53 @@
         menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
       }
       /**
-       * Cancels a review's in-progress merge after confirmation.
+       * Cancels a review's in-progress merge after confirmation. Applies to
+       * every selected review when the clicked one is part of a
+       * multi-selection (RAL-508) via bulkCancelReviews instead.
        * @param {string} id
        * @returns {Promise<void>}
        */
       async function cancelReview(id) {
         closeSquadMenu();
+        const ids = menuActionTargets(id, guardianMultiSel);
+        if (ids.length > 1) { await bulkCancelReviews(ids); return; }
         const g = guardians.find((x) => x.id === id);
         if (!confirm(`Cancel review "${g ? g.name : id}"? The current merge will be discarded. This cannot be undone.`)) return;
         await guardianAction(`/api/guardians/${id}/cancel`);
         tick();
       }
       /**
+       * Cancels every selected cancellable review after one shared
+       * confirmation naming them all (RAL-508). Reviews whose status can't be
+       * cancelled are skipped and reported; per-item failures are reported
+       * without blocking the rest of the batch.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-REVIEW-BULK-CANCEL:BEGIN
+      async function bulkCancelReviews(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (gid) => G_CANCELLABLE.includes(guardians.find((x) => x.id === gid)?.status || ""));
+        if (!eligible.length) return;
+        if (!confirm(`Cancel ${eligible.length} review(s)? The current merge of each will be discarded. This cannot be undone.\n\n${bulkNameList(eligible.map(reviewLabelOf))}`)) return;
+        const failed = await bulkActEach(eligible, reviewLabelOf, (gid) => post(`/api/guardians/${gid}/cancel`), "cancel review failed");
+        reportBulkOutcome("Cancelled", "review", eligible.length, skipped, "not in a cancellable status", failed);
+        tick();
+      }
+      // RALPHUS-REVIEW-BULK-CANCEL:END
+      /**
        * Reopens a cancelled or merged review, immediately trying a fresh
        * merge pass. Shares its pending/disabled tracking with the
        * "Merge / rebase" button (`pendingMergeActions`) since "Reopen"
        * occupies that same button slot once a review is cancelled or
        * merged (see `REOPEN_ELIGIBLE`).
+       * Applies to every selected review when the clicked one is part of a
+       * multi-selection (RAL-508) via bulkReopenReviews instead.
        * @param {string} id
        * @returns {Promise<void>}
        */
       async function reopenReview(id) {
+        const ids = menuActionTargets(id, guardianMultiSel);
+        if (ids.length > 1) { closeSquadMenu(); await bulkReopenReviews(ids); return; }
         if (pendingMergeActions.has(id)) return;
         closeSquadMenu();
         pendingMergeActions.add(id);
@@ -370,6 +467,24 @@
         }
         tick();
       }
+      /**
+       * Reopens every selected cancelled review after one shared confirmation
+       * naming them all (RAL-508). Reviews that aren't cancelled are skipped
+       * and reported; per-item failures are reported without blocking the
+       * rest of the batch.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-REVIEW-REOPEN:BEGIN
+      async function bulkReopenReviews(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (gid) => guardians.find((x) => x.id === gid)?.status === "cancelled");
+        if (!eligible.length) return;
+        if (!confirm(`Reopen ${eligible.length} cancelled review(s)? Each will immediately try a fresh merge pass, staging in whatever branches are already ready.\n\n${bulkNameList(eligible.map(reviewLabelOf))}`)) return;
+        const failed = await bulkActEach(eligible, reviewLabelOf, (gid) => post(`/api/guardians/${gid}/reopen`), "reopen review failed");
+        reportBulkOutcome("Reopened", "review", eligible.length, skipped, "not cancelled (only cancelled reviews can be reopened)", failed);
+        tick();
+      }
+      // RALPHUS-REVIEW-REOPEN:END
       /**
        * Renders a review's merge-progress bar and done/total summary.
        * @param {GuardianView} g

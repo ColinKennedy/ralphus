@@ -855,3 +855,83 @@
           setTimeout(() => { btn.textContent = "⧉"; btn.classList.remove("copied"); }, 1200);
         } catch (_) { btn.textContent = "✗"; setTimeout(() => { btn.textContent = "⧉"; }, 1200); }
       }
+
+      // ---- RAL-508: bulk context-menu actions ----
+      // RALPHUS-MENU-BULK:BEGIN
+      /**
+       * Resolves the ids a sidebar context-menu action applies to (RAL-508):
+       * every id in `sel` when `id` is part of an active multi-selection
+       * (size > 1), otherwise just `id` itself — the item under the cursor
+       * never narrows an active selection down to itself alone.
+       * @param {string} id
+       * @param {Set<string>} sel
+       * @returns {string[]}
+       */
+      const menuActionTargets = (id, sel) => (sel.has(id) && sel.size > 1) ? [...sel] : [id];
+      /**
+       * Splits a bulk action's target ids into the ones satisfying `eligible`
+       * and the rest, so a mixed-eligibility selection can be applied to its
+       * eligible members and the skipped remainder *reported* (RAL-508)
+       * instead of silently dropped.
+       * @param {string[]} ids
+       * @param {(id: string) => boolean} eligible
+       * @returns {{eligible: string[], skipped: number}}
+       */
+      const bulkEligibleSplit = (ids, eligible) => {
+        const ok = ids.filter(eligible);
+        return { eligible: ok, skipped: ids.length - ok.length };
+      };
+      /**
+       * Applies `act` to each id in turn, collecting one "label: reason"
+       * entry per failed item — one item failing never blocks the rest of
+       * the batch (RAL-508). The caller owns success/skip reporting; this
+       * only gathers the per-item failure strings.
+       * @param {string[]} ids
+       * @param {(id: string) => string} labelOf
+       * @param {(id: string) => Promise<Response>} act
+       * @param {string} failLabel
+       * @returns {Promise<string[]>}
+       */
+      async function bulkActEach(ids, labelOf, act, failLabel) {
+        /** @type {string[]} */
+        const failed = [];
+        for (const id of ids) {
+          const label = labelOf(id);
+          try {
+            const resp = await act(id);
+            if (!resp.ok) failed.push(`${label}: ${await responseError(resp, failLabel)}`);
+          } catch (_) { failed.push(`${label}: network error`); }
+        }
+        return failed;
+      }
+      /**
+       * Reports one bulk action's outcome (RAL-508): skipped (ineligible)
+       * items and per-item failures as errors, and a success summary only
+       * when every selected item was applied exactly once.
+       * @param {string} verbPast
+       * @param {string} noun
+       * @param {number} applied
+       * @param {number} skipped
+       * @param {string} skipReason
+       * @param {string[]} failed
+       * @returns {void}
+       */
+      function reportBulkOutcome(verbPast, noun, applied, skipped, skipReason, failed) {
+        if (skipped > 0) notify("error", `Skipped ${skipped} of the selected ${noun}(s): ${skipReason}.`);
+        if (failed.length) notify("error", failed.join("; "));
+        else if (applied > 0 && skipped === 0) notify("success", `${verbPast} ${applied} ${noun}(s).`);
+      }
+      /**
+       * Renders a newline-separated name list for a bulk confirmation
+       * dialog, capping very long selections so the native confirm box
+       * stays readable.
+       * @param {string[]} names
+       * @param {number} [cap]
+       * @returns {string}
+       */
+      const bulkNameList = (names, cap = 20) => {
+        const shown = names.slice(0, cap);
+        const rest = names.length - shown.length;
+        return shown.join("\n") + (rest > 0 ? `\n... and ${rest} more` : "");
+      };
+      // RALPHUS-MENU-BULK:END

@@ -383,6 +383,8 @@
       .ctx-menu div { padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
       .ctx-menu div:hover { background: var(--panel-2); }
       .ctx-menu div.danger { color: var(--danger); }
+      .ctx-menu div.ctx-disabled { color: var(--muted); cursor: default; }
+      .ctx-menu div.ctx-disabled:hover { background: transparent; }
       .ctx-menu .ctx-sep { height: 1px; background: var(--border); margin: 4px 2px; padding: 0; cursor: default; }
       .ctx-menu .ctx-check { display: flex; align-items: center; gap: 6px; }
       .ctx-menu .ctx-check.on { color: var(--accent); }
