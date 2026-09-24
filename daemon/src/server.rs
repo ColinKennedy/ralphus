@@ -2744,6 +2744,9 @@ struct EffectiveReviewDefaults {
     skip_auto_clean: bool,
     skip_worktrees: bool,
     skip_base_updates: bool,
+    /// RAL-507: the resolved base-shift rebuild cap (per-review override >
+    /// database default > `.ralphus.toml`/global > the built-in 3).
+    base_shift_maximum_rebuilds: u32,
     match_pr_branch_name: bool,
     separate_pr_branch: bool,
     dual_root_pr: bool,
@@ -2767,6 +2770,7 @@ impl EffectiveReviewDefaults {
             skip_auto_clean: cfg.verify_skip_auto_clean(),
             skip_worktrees: cfg.skip_worktrees(),
             skip_base_updates: cfg.skip_base_updates(),
+            base_shift_maximum_rebuilds: cfg.base_shift_maximum_rebuilds(),
             match_pr_branch_name: cfg.match_pr_branch_name(),
             separate_pr_branch: cfg.separate_pr_branch(),
             dual_root_pr: cfg.dual_root_pr(),
@@ -2871,6 +2875,14 @@ struct ProjectReviewSettingsBody {
     /// suites -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-507: the project's default cap on unattended base-shift rebuild
+    /// attempts per retry campaign. Zero is itself invalid (the cap must be
+    /// at least 1), so clearing uses an explicit flag -- same convention as
+    /// `default_maximum_budget_usd`.
+    #[serde(default)]
+    base_shift_maximum_rebuilds: Option<u32>,
+    #[serde(default)]
+    clear_base_shift_maximum_rebuilds: bool,
     /// RAL-476: fallback owning user for reviews whose squad has no
     /// `submitter` of its own -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
@@ -2905,6 +2917,23 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
                 vec![],
             );
         }
+    }
+    if req.clear_base_shift_maximum_rebuilds && req.base_shift_maximum_rebuilds.is_some() {
+        return error(
+            400,
+            "invalid_value",
+            "'clear_base_shift_maximum_rebuilds' cannot be combined with \
+             'base_shift_maximum_rebuilds'",
+            vec![],
+        );
+    }
+    if req.base_shift_maximum_rebuilds == Some(0) {
+        return error(
+            400,
+            "invalid_value",
+            "'base_shift_maximum_rebuilds' must be at least 1",
+            vec![],
+        );
     }
     if let Some(scope) = req.default_proof_scope.as_deref().filter(|s| !s.is_empty()) {
         if !ralphus_core::schema::PROOF_SCOPE_VALUES.contains(&scope) {
@@ -3002,6 +3031,11 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.skip_base_updates {
         settings.skip_base_updates = Some(v);
+    }
+    if req.clear_base_shift_maximum_rebuilds {
+        settings.base_shift_maximum_rebuilds = None;
+    } else if let Some(v) = req.base_shift_maximum_rebuilds {
+        settings.base_shift_maximum_rebuilds = Some(v);
     }
     if let Some(v) = req.match_pr_branch_name {
         settings.match_pr_branch_name = Some(v);
@@ -17775,6 +17809,82 @@ mod tests {
             "POST",
             "/api/projects/proj/review-settings",
             r#"{"default_maximum_budget_usd":5.0,"clear_maximum_budget_usd":true}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_persists_and_clears_base_shift_cap() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-base-shift-cap");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"base_shift_maximum_rebuilds":5}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["base_shift_maximum_rebuilds"], 5);
+        assert_eq!(body["effective"]["base_shift_maximum_rebuilds"], 5);
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"clear_base_shift_maximum_rebuilds":true}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(body["settings"]["base_shift_maximum_rebuilds"].is_null());
+        assert_eq!(
+            body["effective"]["base_shift_maximum_rebuilds"], 3,
+            "clearing the override must fall back to the built-in default"
+        );
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_a_zero_base_shift_cap() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-zero-base-shift-cap");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"base_shift_maximum_rebuilds":0}"#,
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("must be at least 1"), "{}", r.body);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_rejects_base_shift_clear_and_value_together() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-base-shift-clear-and-value");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"base_shift_maximum_rebuilds":5,"clear_base_shift_maximum_rebuilds":true}"#,
         );
         assert_eq!(r.status, 400, "{}", r.body);
     }

@@ -38,6 +38,7 @@ MAPPING = {
     "auto_submit_pr_stack": "auto_submit_pr_stack",
     "skip_worktrees": "skip_worktrees",
     "skip_base_updates": "skip_base_updates",
+    "base_shift_maximum_rebuilds": "base_shift_maximum_rebuilds",
     "match_pr_branch_name": "match_pr_branch_name",
     "separate_pr_branch": "separate_pr_branch",
     "dual_root_pr": "dual_root_pr",

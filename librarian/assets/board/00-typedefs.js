@@ -658,6 +658,7 @@
        * @property {boolean|null|undefined} verify_skip_auto_clean
        * @property {boolean|null|undefined} skip_worktrees
        * @property {boolean|null|undefined} skip_base_updates
+       * @property {number|null|undefined} base_shift_maximum_rebuilds
        * @property {boolean|null|undefined} match_pr_branch_name
        * @property {boolean|null|undefined} separate_pr_branch
        * @property {boolean|null|undefined} dual_root_pr
@@ -680,6 +681,7 @@
        * @property {boolean} skip_auto_clean
        * @property {boolean} skip_worktrees
        * @property {boolean} skip_base_updates
+       * @property {number} base_shift_maximum_rebuilds
        * @property {boolean} match_pr_branch_name
        * @property {boolean} separate_pr_branch
        * @property {boolean} dual_root_pr

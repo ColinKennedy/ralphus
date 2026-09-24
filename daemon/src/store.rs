@@ -731,6 +731,11 @@ pub struct ProjectReviewSettings {
     /// suites.
     #[serde(default)]
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-507: the project's default cap on unattended base-shift rebuild
+    /// attempts per retry campaign, for a future review whose `[[review]]`
+    /// block (and whose own per-review override) leaves the cap unset.
+    #[serde(default)]
+    pub base_shift_maximum_rebuilds: Option<u32>,
     /// RAL-476: fallback owning user for a review whose squad has no
     /// `submitter` of its own (e.g. an auto-review triggered with no
     /// explicit submission) -- see `Store::create_guardian_keyed`'s owner
@@ -784,10 +789,7 @@ impl ProjectReviewSettings {
             // `summary_format` above; only the file-based `.ralphus.toml`
             // layer sets it.
             provider_timeout_max_retries: None,
-            // Same treatment again (RAL-507): the base-shift rebuild cap is
-            // set per `.ralphus.toml [review]` layer or per review; a
-            // board-editable numeric project default has no demand yet.
-            base_shift_maximum_rebuilds: None,
+            base_shift_maximum_rebuilds: self.base_shift_maximum_rebuilds,
         }
     }
 }
@@ -15211,6 +15213,7 @@ command = "e"
             auto_fix_pr_errors: Some(true),
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
             discourage_tests_during_auto_pull_request_fixes: Some(true),
+            base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),
         };
@@ -15297,6 +15300,35 @@ command = "e"
         assert_eq!(
             cfg.default_resolver_agent(),
             "ollama",
+            "the database-backed override must win over the file-based project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_review_config_database_base_shift_cap_wins_over_file_config() {
+        let root = temp_review_settings_dir();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nbase_shift_maximum_rebuilds = 7\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        store.register_project("proj", "", &path, "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    base_shift_maximum_rebuilds: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cfg = store.resolve_review_config(&root);
+        assert_eq!(
+            cfg.base_shift_maximum_rebuilds(),
+            2,
             "the database-backed override must win over the file-based project default"
         );
         let _ = std::fs::remove_dir_all(&root);

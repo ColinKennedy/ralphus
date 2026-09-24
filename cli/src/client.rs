@@ -451,6 +451,14 @@ impl DaemonClient {
         if patch.clear_maximum_budget_usd {
             body["clear_maximum_budget_usd"] = json!(true);
         }
+        set_if_some(
+            &mut body,
+            "base_shift_maximum_rebuilds",
+            patch.base_shift_maximum_rebuilds,
+        );
+        if patch.clear_base_shift_maximum_rebuilds {
+            body["clear_base_shift_maximum_rebuilds"] = json!(true);
+        }
         set_if_some(&mut body, "default_proof_scope", patch.default_proof_scope);
         set_if_some(
             &mut body,
@@ -1952,6 +1960,13 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// mutually exclusive with `default_maximum_budget_usd` (a numeric field
     /// has no empty-string sentinel to clear it with).
     pub clear_maximum_budget_usd: bool,
+    /// RAL-507: the project's default cap on unattended base-shift rebuild
+    /// attempts per retry campaign.
+    pub base_shift_maximum_rebuilds: Option<u32>,
+    /// Explicitly reset `base_shift_maximum_rebuilds` to inherit -- mutually
+    /// exclusive with `base_shift_maximum_rebuilds` (0 is itself invalid, so
+    /// it cannot serve as the clear sentinel).
+    pub clear_base_shift_maximum_rebuilds: bool,
     pub default_proof_scope: Option<&'a str>,
     pub verify_skip_auto_clean: Option<bool>,
     pub skip_worktrees: Option<bool>,

@@ -69,6 +69,8 @@ pub enum ProjectReviewSettingsCommand {
         machine: Option<String>,
         maximum_budget_usd: Option<f64>,
         clear_maximum_budget_usd: bool,
+        base_shift_maximum_rebuilds: Option<u32>,
+        clear_base_shift_maximum_rebuilds: bool,
         proof_scope: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_worktrees: Option<bool>,
@@ -296,6 +298,9 @@ fn parse_review_settings_set(
     let machine = scanner.take_value("--machine")?;
     let maximum_budget_usd_raw = scanner.take_value("--maximum-budget-usd")?;
     let clear_maximum_budget_usd = scanner.take_bool("--clear-maximum-budget-usd");
+    let base_shift_maximum_rebuilds_raw = scanner.take_value("--base-shift-maximum-rebuilds")?;
+    let clear_base_shift_maximum_rebuilds =
+        scanner.take_bool("--clear-base-shift-maximum-rebuilds");
     let proof_scope = scanner.take_value("--proof-scope")?;
     let skip_auto_clean = crate::commands::review::take_tri_bool(scanner, "--skip-auto-clean");
     let skip_worktrees = crate::commands::review::take_tri_bool(scanner, "--skip-worktrees");
@@ -320,10 +325,26 @@ fn parse_review_settings_set(
                 .to_string(),
         ));
     }
+    if clear_base_shift_maximum_rebuilds && base_shift_maximum_rebuilds_raw.is_some() {
+        return Err(UsageError(
+            "review-settings set: --clear-base-shift-maximum-rebuilds cannot be combined with \
+             --base-shift-maximum-rebuilds"
+                .to_string(),
+        ));
+    }
     let maximum_budget_usd = match maximum_budget_usd_raw {
         Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
             UsageError(format!(
                 "review-settings set: --maximum-budget-usd must be a number, got {raw:?}"
+            ))
+        })?),
+        None => None,
+    };
+    let base_shift_maximum_rebuilds = match base_shift_maximum_rebuilds_raw {
+        Some(raw) => Some(raw.parse::<u32>().map_err(|_| {
+            UsageError(format!(
+                "review-settings set: --base-shift-maximum-rebuilds must be a positive \
+                 integer, got {raw:?}"
             ))
         })?),
         None => None,
@@ -340,6 +361,8 @@ fn parse_review_settings_set(
         machine,
         maximum_budget_usd,
         clear_maximum_budget_usd,
+        base_shift_maximum_rebuilds,
+        clear_base_shift_maximum_rebuilds,
         proof_scope,
         skip_auto_clean,
         skip_worktrees,
@@ -479,6 +502,8 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             machine,
             maximum_budget_usd,
             clear_maximum_budget_usd,
+            base_shift_maximum_rebuilds,
+            clear_base_shift_maximum_rebuilds,
             proof_scope,
             skip_auto_clean,
             skip_worktrees,
@@ -498,6 +523,8 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 default_machine: machine.as_deref(),
                 default_maximum_budget_usd: maximum_budget_usd,
                 clear_maximum_budget_usd,
+                base_shift_maximum_rebuilds,
+                clear_base_shift_maximum_rebuilds,
                 default_proof_scope: proof_scope.as_deref(),
                 verify_skip_auto_clean: skip_auto_clean,
                 skip_worktrees,
@@ -569,6 +596,16 @@ fn render_review_settings(payload: &Value) {
     row_bool("skip auto-clean:", "verify_skip_auto_clean");
     row_bool("skip worktrees:", "skip_worktrees");
     row_bool("skip base updates:", "skip_base_updates");
+    println!(
+        "  {:<26} {:<24} (effective: {})",
+        "base-shift rebuild cap:",
+        settings["base_shift_maximum_rebuilds"]
+            .as_u64()
+            .map_or("(inherited)".to_string(), |v| v.to_string()),
+        effective["base_shift_maximum_rebuilds"]
+            .as_u64()
+            .map_or("3".to_string(), |v| v.to_string())
+    );
     row_bool("match pr branch name:", "match_pr_branch_name");
     row_bool("separate pr branch:", "separate_pr_branch");
     row_bool("dual root pr:", "dual_root_pr");
@@ -1250,6 +1287,56 @@ mod tests {
                 "proj",
                 "--maximum-budget-usd",
                 "lots",
+            ])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_review_settings_set_base_shift_maximum_rebuilds() {
+        match parse(&v(&[
+            "review-settings",
+            "set",
+            "proj",
+            "--base-shift-maximum-rebuilds",
+            "5",
+        ])) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Set {
+                base_shift_maximum_rebuilds,
+                clear_base_shift_maximum_rebuilds,
+                ..
+            }) => {
+                assert_eq!(base_shift_maximum_rebuilds, Some(5));
+                assert!(!clear_base_shift_maximum_rebuilds);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_settings_set_rejects_a_non_numeric_base_shift_cap() {
+        assert!(matches!(
+            parse(&v(&[
+                "review-settings",
+                "set",
+                "proj",
+                "--base-shift-maximum-rebuilds",
+                "lots",
+            ])),
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn review_settings_set_rejects_base_shift_clear_and_value_together() {
+        assert!(matches!(
+            parse(&v(&[
+                "review-settings",
+                "set",
+                "proj",
+                "--base-shift-maximum-rebuilds",
+                "5",
+                "--clear-base-shift-maximum-rebuilds",
             ])),
             ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_))
         ));

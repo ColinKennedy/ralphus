@@ -5001,15 +5001,15 @@ impl Store {
             .unwrap_or(false);
 
         // RAL-507: effective base-shift rebuild retry cap, layered per-review
-        // override > explicit `.ralphus.toml [review]` value > the live
-        // global config > the built-in default of 3. Unlike the boolean
-        // settings above there is no creation-time stamp or database-backed
-        // project default for this numeric option (see
-        // `ProjectReviewSettings::into_review_config`), so the chain is
+        // override > database-backed project default > explicit
+        // `.ralphus.toml [review]` value > the live global config > the
+        // built-in default of 3. Unlike the boolean settings above there is
+        // no creation-time stamp for this numeric option, so the chain is
         // shorter by design.
         let effective_base_shift_maximum_rebuilds = row
             .base_shift_maximum_rebuilds
             .and_then(|v| u32::try_from(v).ok())
+            .or(db_settings.base_shift_maximum_rebuilds)
             .or(explicit_project.base_shift_maximum_rebuilds)
             .or(live_global.base_shift_maximum_rebuilds)
             .unwrap_or(crate::config::DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS);
