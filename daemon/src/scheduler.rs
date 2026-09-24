@@ -86,15 +86,16 @@ pub const TRIAGE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 /// 30-day age threshold's granularity -- a worktree that became stale
 /// yesterday can't have crossed the threshold since the last pass -- and
 /// bounds accumulation to a day's worth of already-stale worktrees.
+///
+/// Also drives `pr::sweep_terminal_dual_root_upstream_branches` (RAL-<new>):
+/// that sweep is only the backstop for a terminal review's transient
+/// fork-side upstream branch -- every state transition that can move a
+/// review to terminal already retires its own branch immediately via
+/// `pr::retire_dual_root_branch_for_guardian` -- so it has no latency need of
+/// its own. Riding this sweep's cadence means there is one retirement pass to
+/// reason about, not a second timer that exists solely to catch what the
+/// first one already covers structurally.
 pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// How often to retire the transient fork-side upstream branch of every
-/// review in a terminal state that still records one (RAL-<new>,
-/// `pr::sweep_terminal_dual_root_upstream_branches`). A terminal review's
-/// dual-root stack branch is dead weight on the fork from the moment the
-/// review completes, so a few minutes -- not the worktree retirement sweep's
-/// daily cadence -- is the right latency for deleting it.
-pub const DUAL_ROOT_UPSTREAM_RETIREMENT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// How often to refresh the local ref for every maintained review's base
 /// branch (see `crate::guardian_merge::poll_base_branch_freshness_once`).
@@ -469,8 +470,12 @@ pub fn run_loop(
     // already past the 30-day threshold are touched, so running the daily
     // retirement pass once at startup (then every
     // [`WORKTREE_RETIREMENT_INTERVAL`]) retires backlog promptly instead of
-    // waiting a day for the first interval to elapse.
+    // waiting a day for the first interval to elapse. RAL-<new>: the
+    // dual-root upstream-branch sweep rides along for the same reason -- a
+    // branch left behind by a review that went terminal while the daemon was
+    // down is retired promptly instead of waiting a full interval.
     crate::guardian_merge::retire_stale_worktrees(&store);
+    crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
     let mut last_worktree_retirement = std::time::Instant::now();
     // Same daily cadence as the retirement sweep just above, but deliberately
     // NOT also run once here at startup the way that sweep is: startup is
@@ -490,12 +495,6 @@ pub fn run_loop(
     // refresh -- same rationale as the ark call just above.
     crate::guardian_merge::poll_base_branch_freshness_once(&store);
     let mut last_base_branch_freshness_poll = std::time::Instant::now();
-    // RAL-<new>: same startup reasoning as the retirement sweep just above --
-    // a dual-root stack branch left behind by a review that went terminal
-    // while the daemon was down is retired promptly instead of waiting a full
-    // interval.
-    crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
-    let mut last_dual_root_retirement = std::time::Instant::now();
     // RAL-389: self-heal a request lost to a crash between a branch's
     // terminal-status write and its durable queue write.
     crate::pr::recover_pending_auto_submits_on_startup(&store);
@@ -550,11 +549,8 @@ pub fn run_loop(
         }
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
-            last_worktree_retirement = std::time::Instant::now();
-        }
-        if last_dual_root_retirement.elapsed() >= DUAL_ROOT_UPSTREAM_RETIREMENT_INTERVAL {
             crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
-            last_dual_root_retirement = std::time::Instant::now();
+            last_worktree_retirement = std::time::Instant::now();
         }
         if last_git_maintenance.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::run_periodic_git_maintenance(&store);
