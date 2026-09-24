@@ -226,6 +226,7 @@
       CLICK_HANDLERS.saveProjectForkEdit = (e, ds) => saveProjectForkEdit(ds.user || "");
       CLICK_HANDLERS.removeProjectFork = (e, ds) => removeProjectFork(ds.user || "");
       CLICK_HANDLERS.removePreferenceFork = (e, ds) => removePreferenceFork(ds.project || "");
+      CLICK_HANDLERS.removePreferenceForgeToken = (e, ds) => removePreferenceForgeToken(ds.host || "");
       CLICK_HANDLERS.previewProjectTriageThreshold = (e, ds) => previewProjectTriageThreshold(e, ds.triageType || "");
       CLICK_HANDLERS.confirmProjectTriageThreshold = (e, ds) => confirmProjectTriageThreshold(ds.triageType || "");
       CLICK_HANDLERS.cancelProjectTriageThresholdPreview = (e, ds) => cancelProjectTriageThresholdPreview(ds.triageType || "");

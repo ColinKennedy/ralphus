@@ -1386,7 +1386,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
        */
       async function pollPrefs() {
         try {
-          await Promise.all([pollWatches(), pollPreferenceForks(), pollProjects()]);
+          await Promise.all([pollWatches(), pollPreferenceForks(), pollProjects(), pollForgeKinds(), pollPreferenceForgeTokens()]);
           await pollMailboxHistory();
           const [hiddenResp, tasksResp, guardiansResp] = await Promise.all([
             fetch("/api/hidden", { headers: prefsUserHeaders() }),
@@ -1495,6 +1495,149 @@ Work submitted against it will fail — fix the machine or deregister the provid
         byId("preference-forks").innerHTML = `${preferenceForksError ? `<div class="verr">${esc(preferenceForksError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Project</th><th>Fork URL</th><th>Remote</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="4" class="empty">No personal fork mappings. Projects without one use origin.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px"><select onchange="preferenceForkDraft.project=this.value" data-tip="Registered project this fork applies to. Choosing a mapped project replaces its URL."><option value="">Choose project…</option>${choices}</select><input type="text" value="${esc(d.fork_url)}" oninput="preferenceForkDraft.fork_url=this.value" placeholder="fork clone URL" data-tip="The clone URL for this user's fork of the selected project."/><input type="text" value="${esc(d.remote_name)}" oninput="preferenceForkDraft.remote_name=this.value" placeholder="remote name (optional)" data-tip="Optional local git remote name. Ralphus derives one when blank."/><button class="btn primary" onclick="addPreferenceFork()" data-tip="Save this user's fork mapping for the selected project, replacing an existing mapping for that project.">Add / replace</button></div>`;
       }
       /**
+       * Sensible default host to prefill when the forge-token kind dropdown
+       * changes (RAL-490). The daemon has no per-kind default-host helper --
+       * `ForgeKind::default_api_base` always takes a caller-supplied host --
+       * so this mapping is deliberately duplicated here; the host field
+       * stays editable for a self-hosted GitHub Enterprise/GitLab instance.
+       * @param {string} kind
+       * @returns {string}
+       */
+      function defaultForgeHost(kind) {
+        return kind === "gitlab" ? "gitlab.com" : "github.com";
+      }
+      /**
+       * Loads every forge kind the daemon supports (`GET /api/forge/kinds`,
+       * RAL-490), so the Preferences tab's forge dropdown is sourced from the
+       * daemon rather than a hard-coded frontend list.
+       * @returns {Promise<void>}
+       */
+      async function pollForgeKinds() {
+        try {
+          const r = await fetch("/api/forge/kinds");
+          if (!r.ok) return;
+          const d = await r.json();
+          forgeKinds = d.kinds || [];
+          if (forgeKinds.length && !forgeKinds.includes(preferenceForgeTokenDraft.kind)) {
+            preferenceForgeTokenDraft = { ...preferenceForgeTokenDraft, kind: forgeKinds[0], host: defaultForgeHost(forgeKinds[0]) };
+          }
+        } catch (_) { /* keep whatever kinds were already loaded */ }
+      }
+      /**
+       * Loads the forge-token host rows (never token values) configured for
+       * the user whose Preferences page is open (RAL-490).
+       * @returns {Promise<void>}
+       */
+      async function pollPreferenceForgeTokens() {
+        const user = prefsUserName();
+        if (!user) { preferenceForgeTokens = []; return; }
+        try {
+          const r = await fetch(`/api/users/${encodeURIComponent(user)}/forge-tokens`, { headers: prefsUserHeaders() });
+          if (!r.ok) { preferenceForgeTokensError = await responseError(r, "could not load forge tokens"); return; }
+          const d = await r.json();
+          preferenceForgeTokens = d.tokens || [];
+          preferenceForgeTokensError = "";
+        } catch (_) { preferenceForgeTokensError = "daemon unreachable"; }
+      }
+      /**
+       * Saves this Preferences page's forge-token draft, then live-verifies
+       * it against the selected forge (RAL-490) -- two separate daemon calls
+       * run back-to-back: `POST .../forge-tokens` persists it,
+       * `POST .../forge-tokens/verify` pings the forge with it. A network or
+       * timeout failure during verification ("unreachable") is kept distinct
+       * from a confirmed-bad token ("invalid") since the token may still be
+       * valid -- the daemon just couldn't reach the forge to check.
+       * @returns {Promise<void>}
+       */
+      async function applyPreferenceForgeToken() {
+        const user = prefsUserName();
+        const draft = preferenceForgeTokenDraft;
+        const host = draft.host.trim();
+        const token = draft.token.trim();
+        if (!user || !host || !token) {
+          preferenceForgeTokensError = "Choose a forge, enter a host, and paste a token.";
+          renderPrefs();
+          return;
+        }
+        preferenceForgeTokenVerify = "saving";
+        preferenceForgeTokensError = "";
+        renderPrefs();
+        try {
+          const saveResp = await fetch(`/api/users/${encodeURIComponent(user)}/forge-tokens`, {
+            method: "POST", headers: { ...prefsUserHeaders(), "Content-Type": "application/json" }, body: JSON.stringify({ host, token }),
+          });
+          if (!saveResp.ok) {
+            preferenceForgeTokensError = await responseError(saveResp, "save failed");
+            preferenceForgeTokenVerify = "idle";
+            renderPrefs();
+            return;
+          }
+          const verifyResp = await fetch(`/api/users/${encodeURIComponent(user)}/forge-tokens/verify`, {
+            method: "POST", headers: { ...prefsUserHeaders(), "Content-Type": "application/json" }, body: JSON.stringify({ kind: draft.kind, host, token }),
+          });
+          if (verifyResp.ok) {
+            const d = await verifyResp.json();
+            preferenceForgeTokenVerify = d.outcome === "valid" || d.outcome === "invalid" || d.outcome === "unreachable" ? d.outcome : "idle";
+          } else {
+            preferenceForgeTokenVerify = "idle";
+            preferenceForgeTokensError = await responseError(verifyResp, "could not verify token");
+          }
+          preferenceForgeTokenDraft = { ...preferenceForgeTokenDraft, token: "" };
+          await pollPreferenceForgeTokens();
+        } catch (_) {
+          preferenceForgeTokensError = "daemon unreachable";
+          preferenceForgeTokenVerify = "idle";
+        }
+        renderPrefs();
+      }
+      /**
+       * Removes one forge-token host row for the user whose Preferences page
+       * is open (RAL-490).
+       * @param {string} host
+       * @returns {Promise<void>}
+       */
+      async function removePreferenceForgeToken(host) {
+        const user = prefsUserName();
+        if (!user || !host || !confirm(`Remove the forge token configured for "${host}"? This cannot be undone.`)) return;
+        try {
+          const r = await fetch(`/api/users/${encodeURIComponent(user)}/forge-tokens/${encodeURIComponent(host)}`, { method: "DELETE", headers: prefsUserHeaders() });
+          preferenceForgeTokensError = r.ok ? "" : await responseError(r, "remove failed");
+          if (r.ok) await pollPreferenceForgeTokens();
+        } catch (_) { preferenceForgeTokensError = "daemon unreachable"; }
+        renderPrefs();
+      }
+      /**
+       * Badge markup for the last "Apply" click's live verify outcome, shown
+       * next to the forge-token form (RAL-490). Distinguishes a confirmed-bad
+       * token ("invalid", red) from a network/timeout failure that couldn't
+       * check it at all ("unreachable", neutral) -- the ticket's explicit
+       * requirement that these read as two different situations.
+       * @returns {string}
+       */
+      function forgeTokenVerifyBadge() {
+        switch (preferenceForgeTokenVerify) {
+          case "saving": return `<span style="color:var(--pending)" data-tip="Saving the token, then pinging the forge with it. Why: confirms Apply actually took effect before you move on.\nWho/when: shown right after clicking Apply.\nCaveats: none -- this is a transient state.">⏳ Verifying…</span>`;
+          case "valid": return `<span style="color:var(--done)" data-tip="The forge accepted this token for an authenticated request. Why: proves the token works before you rely on it for PR/MR submission.\nWho/when: shown right after Apply.\nCaveats: a token can still be revoked later; re-Apply to re-check.">✓ Valid</span>`;
+          case "invalid": return `<span style="color:var(--failed)" data-tip="The forge reached out and rejected this token (401/403). Why: tells you the token itself is wrong, expired, or lacks scope -- distinct from a network problem.\nWho/when: shown right after Apply.\nCaveats: the token is still saved; fix it and Apply again to overwrite it.">✗ Invalid token</span>`;
+          case "unreachable": return `<span style="color:var(--pending)" data-tip="Could not reach the forge to check this token (network/timeout/DNS) -- not the same as an invalid token; the token may well be correct. Why: avoids telling you a working token is bad just because the daemon couldn't dial out.\nWho/when: shown right after Apply.\nCaveats: retry Apply once the forge/host is reachable to get a real answer.">⚠ Couldn't verify (forge unreachable)</span>`;
+          default: return "";
+        }
+      }
+      /**
+       * Renders the Preferences tab's forge personal-access-token section
+       * (RAL-490): existing host rows (never token values) plus the
+       * add/apply form.
+       * @returns {void}
+       */
+      function renderPreferenceForgeTokens() {
+        const rows = preferenceForgeTokens.slice().sort((a, b) => a.host.localeCompare(b.host))
+          .map((t) => `<tr><td class="mono">${esc(t.host)}</td><td>${new Date(t.updated_at_ms).toLocaleString()}</td><td><button class="btn" data-click="removePreferenceForgeToken" data-host="${esc(t.host)}" data-tip="Remove the forge token configured for ${esc(t.host)}. This cannot be undone.">Remove</button></td></tr>`)
+          .join("");
+        const d = preferenceForgeTokenDraft;
+        const kindChoices = (forgeKinds.length ? forgeKinds : [d.kind]).map((k) => `<option value="${esc(k)}" ${d.kind === k ? "selected" : ""}>${esc(k)}</option>`).join("");
+        byId("preference-forge-tokens").innerHTML = `${preferenceForgeTokensError ? `<div class="verr">${esc(preferenceForgeTokensError)}</div>` : ""}<table class="proj-table"><thead><tr><th>Host</th><th>Last updated</th><th></th></tr></thead><tbody>${rows || `<tr><td colspan="3" class="empty">No forge tokens configured yet.</td></tr>`}</tbody></table><div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center"><select onchange="preferenceForgeTokenDraft.kind=this.value; preferenceForgeTokenDraft.host=defaultForgeHost(this.value); preferenceForgeTokenVerify='idle'; renderPrefs()" data-tip="Which forge this token is for -- populated from the daemon's supported adapters (GET /api/forge/kinds), never a fixed list.">${kindChoices}</select><input type="text" value="${esc(d.host)}" oninput="preferenceForgeTokenDraft.host=this.value; preferenceForgeTokenVerify='idle'" placeholder="host, e.g. github.com" data-tip="The forge host this token authenticates against. Defaults to github.com/gitlab.com; change it for a self-hosted GitHub Enterprise or GitLab instance."/><input type="password" value="${esc(d.token)}" oninput="preferenceForgeTokenDraft.token=this.value; preferenceForgeTokenVerify='idle'" placeholder="personal access token" autocomplete="off" data-tip="The token's characters are masked as you type, the same as a password field. Why: this token grants PR/MR access on your behalf.\nWho/when: paste a freshly generated forge PAT here.\nCaveats: it is stored server-side and never redisplayed -- re-paste it here if you ever need to change it."/><button class="btn primary" onclick="applyPreferenceForgeToken()" data-tip="Save this token for the selected host, then immediately make a live authenticated request to the forge to confirm it works.\nWho/when: use after pasting a new or rotated token.\nCaveats: overwrites any existing token already saved for this host.">Apply</button>${forgeTokenVerifyBadge()}</div>`;
+      }
+      /**
        * Updates the Preferences tab's free-text hidden-item filter and re-renders.
        * @param {string} v
        * @returns {void}
@@ -1561,6 +1704,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       function renderPrefs() {
         renderMailboxHistory();
         renderPreferenceForks();
+        renderPreferenceForgeTokens();
         const banner = byId("prefs-visit-banner");
         if (prefsViewingAs) {
           banner.style.display = "";

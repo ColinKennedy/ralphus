@@ -890,6 +890,16 @@
        * @property {string} id - RAL-416 `ralphus_core::health_catalog` entry id.
        */
       /**
+       * One host a user has a forge personal-access-token configured for
+       * (RAL-490). Never carries the token value itself -- `GET
+       * /api/users/{user}/forge-tokens` only ever returns this summary shape.
+       * @typedef {object} UserForgeTokenSummary
+       * @property {string} user
+       * @property {string} host
+       * @property {number} created_at_ms
+       * @property {number} updated_at_ms
+       */
+      /**
        * @typedef {object} TargetHealthReport
        * @property {string} target
        * @property {string} machine
