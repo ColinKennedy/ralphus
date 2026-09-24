@@ -149,3 +149,56 @@ existing full-trace behavior already covers the common case; treat this
 paragraph as the place to start only once a real GitLab incident of this
 shape is confirmed, the same way the GitHub fix above followed a confirmed
 incident rather than a hypothetical one.
+
+## 4. GitLab MR-description template variables (RAL-499)
+
+GitLab's own `.gitlab/merge_request_templates/*.md` files can contain
+[documented template variables](https://docs.gitlab.com/user/project/description_templates/)
+like `%{source_branch}` — GitLab resolves these itself when a human creates
+an MR through its web UI, but a template fetched via the raw-file API
+(`ForgeClient::fetch_pr_template`, used by `pr.rs` to seed a generated
+description) is the literal, unexpanded file content. Left alone, an MR
+created through ralphus's API call would ship a description with the raw
+`%{source_branch}` token still in it instead of a branch name.
+
+**The fix is a narrow, single-call substitution at the create/update
+boundary, not a round-trip through GitLab.** `ForgeClient::
+create_pull_request_inner`'s GitLab branch runs the outgoing description
+through `expand_gitlab_description_variables` (`daemon/src/forge.rs`) right
+before it's placed in the create-MR JSON payload — no extra HTTP call, no
+"create blank, read back GitLab's own expansion, then update" round trip.
+This was a deliberate departure from a two-call design that was considered
+and rejected: GitLab's docs don't clearly state whether its server-side
+expansion even applies to a description supplied explicitly via the REST
+API (as opposed to only its own auto-applied default template through the
+web UI), and unconditionally adding a second request would slow down every
+GitLab MR creation and break the single-`server.recv()` shape of the
+existing GitLab creation test suite for no proven benefit. A single,
+testable substitution ralphus fully controls is preferable to a flow whose
+correctness depends on unconfirmed GitLab server behavior.
+
+**Only two variables are substituted: `%{source_branch}` and
+`%{target_branch}`.** Those are the only ones ralphus has an authoritative,
+unambiguous value for at create/update time — the branch names are
+parameters of the call itself. GitLab's documented description-template set
+also includes `%{all_commits}`, `%{closes_issue}`, `%{co_authored_by}`,
+`%{first_commit}`, `%{first_multiline_commit}`, and
+`%{first_multiline_commit_description}` — these are deliberately left as
+literal, unexpanded text. Reimplementing them would mean re-deriving
+GitLab's own commit-log/issue-linking semantics (which commit counts as
+"first," how `Closes #N` issue references are detected, co-author trailer
+parsing) outside GitLab's control, with no way to keep that logic in sync as
+GitLab's own behavior evolves — exactly the "partial custom substitution can
+silently diverge" risk this feature exists to avoid. Any other unrecognized
+`%{...}` token (including ones a user writes into a manually-supplied
+description that happens to collide with GitLab's syntax) is left untouched
+for the same reason: ralphus does not attempt to distinguish "this looks
+like a GitLab template variable" from "this is unrelated user Markdown that
+happens to contain `%{...}`."
+
+This substitution runs for every GitLab MR description ralphus sends —
+generated (`pr.rs`'s `synthesize_pr_text`/`fallback_pr_description`) and
+explicit user-supplied descriptions alike — since both flow through the same
+`create_pull_request_inner` call. GitHub PR templates are unaffected;
+GitHub has no equivalent `%{...}` template-variable syntax, and this is
+GitLab-only scope by design (RAL-499's out-of-scope note).

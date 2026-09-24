@@ -312,6 +312,28 @@ fn pr_object_draft(obj: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// RAL-499: expand the GitLab MR-description template variables ralphus can
+/// resolve with values already on hand at create/update time, leaving every
+/// other `%{...}` token untouched.
+///
+/// Only `%{source_branch}` and `%{target_branch}` are substituted. GitLab's
+/// documented description-template variables also include `%{all_commits}`,
+/// `%{closes_issue}`, `%{co_authored_by}`, `%{first_commit}`,
+/// `%{first_multiline_commit}`, and `%{first_multiline_commit_description}`
+/// (see `.agent/forge-design-principles.md` for why those are deliberately
+/// left as literal text rather than reimplemented here). Unknown/user-authored
+/// `%{...}` text is never touched, so arbitrary Markdown containing a literal
+/// `%{` is not corrupted.
+fn expand_gitlab_description_variables(
+    description: &str,
+    source_branch: &str,
+    target_branch: &str,
+) -> String {
+    description
+        .replace("%{source_branch}", source_branch)
+        .replace("%{target_branch}", target_branch)
+}
+
 /// A created pull/merge request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPr {
@@ -586,7 +608,7 @@ impl ForgeClient {
                     } else {
                         title.to_string()
                     },
-                    "description": body,
+                    "description": expand_gitlab_description_variables(body, head, base),
                 });
                 if let Some(id) = target_project_id {
                     payload["target_project_id"] = serde_json::json!(id);
@@ -3458,6 +3480,48 @@ mod tests {
             .create_pull_request("Draft: t", "b", "alias", "main", true)
             .unwrap();
         assert!(created.draft);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_pull_request_gitlab_expands_source_and_target_branch_template_variables() {
+        // RAL-499: GitLab's own default MR-description templates can contain
+        // `%{source_branch}`/`%{target_branch}` -- ralphus must resolve those
+        // to the real branch names before the create request goes out, while
+        // leaving an unsupported/unknown template token (`%{closes_issue}`)
+        // untouched rather than guessing at it.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["description"],
+                serde_json::json!("Merging alias into main. Closes: %{closes_issue}")
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid": 4, "web_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "alice%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+        client
+            .create_pull_request(
+                "t",
+                "Merging %{source_branch} into %{target_branch}. Closes: %{closes_issue}",
+                "alias",
+                "main",
+                false,
+            )
+            .unwrap();
         handle.join().unwrap();
     }
 
