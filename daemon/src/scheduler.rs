@@ -645,6 +645,10 @@ pub fn tick(
         let cancellations = cancellations.clone();
         let summary_queue = Arc::clone(summary_queue);
         std::thread::spawn(move || {
+            let _guard = crate::guardian_merge::CancellationCleanup {
+                cancellations: cancellations.clone(),
+                key: squad_id.clone(),
+            };
             execute_squad_inner(
                 &store,
                 runner.as_ref(),
@@ -654,7 +658,6 @@ pub fn tick(
                 &summary_queue,
                 &cancellations,
             );
-            cancellations.remove(&squad_id);
         });
     }
 }
@@ -3648,13 +3651,16 @@ fn start_reviews(
                     Arc::clone(&store),
                 ));
                 let token = cancellations.register(&format!("guardian:{gid}"));
+                let _guard = crate::guardian_merge::CancellationCleanup {
+                    cancellations: cancellations.clone(),
+                    key: format!("guardian:{gid}"),
+                };
                 // RAL-265: use the incremental staged merge so a guardian can
                 // begin rebasing as soon as its first branch's cell is done,
                 // resuming from already-built `Done` tips as later branches
                 // finish, and only finalizing to `InReview` once every branch is
                 // rebased.
                 crate::guardian_merge::run_merge_staged(&store, runner.as_ref(), &gid, &token);
-                cancellations.remove(&format!("guardian:{gid}"));
             }
         });
     }

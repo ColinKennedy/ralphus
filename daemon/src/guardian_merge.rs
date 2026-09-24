@@ -42,6 +42,19 @@ use crate::store::Store;
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
 
+/// RAII guard to ensure cancellation cleanup happens even if the guarded code
+/// panics or returns early.
+pub(crate) struct CancellationCleanup {
+    pub(crate) cancellations: Cancellations,
+    pub(crate) key: String,
+}
+
+impl Drop for CancellationCleanup {
+    fn drop(&mut self) {
+        self.cancellations.remove(&self.key);
+    }
+}
+
 /// The `RunnerSpec.task` value used for every conflict-resolver invocation
 /// (RAL-102). `server.rs`'s guardian-branch terminal/pane endpoints must pass
 /// this exact string into `crate::tmux::session_name` to recompute the tmux
@@ -3897,10 +3910,13 @@ pub(crate) fn kickoff_merge(
     let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
         let _permit = sem.acquire();
+        let _guard = CancellationCleanup {
+            cancellations: cancellations.clone(),
+            key: format!("guardian:{sid}"),
+        };
         if !token.is_cancelled() {
             run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
         }
-        cancellations.remove(&format!("guardian:{sid}"));
     });
     Ok(StartMergeOutcome::Merging)
 }
@@ -4061,10 +4077,13 @@ pub fn reopen_guardian_merge(
     let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
         let _permit = sem.acquire();
+        let _guard = CancellationCleanup {
+            cancellations: cancellations.clone(),
+            key: format!("guardian:{sid}"),
+        };
         if !token.is_cancelled() {
             run_merge_staged(&store, runner.as_ref(), &sid, &token);
         }
-        cancellations.remove(&format!("guardian:{sid}"));
     });
     reply(202, "{\"status\":\"merging\"}")
 }
@@ -7297,8 +7316,11 @@ pub fn review_maintenance(
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
             // -settings change made while this reopen is rebuilding can stop it.
             let token = cancellations.register(&format!("guardian:{id}"));
+            let _guard = CancellationCleanup {
+                cancellations: cancellations.clone(),
+                key: format!("guardian:{id}"),
+            };
             reopen_straggler(&store, &runner, &id, &sem, &token);
-            cancellations.remove(&format!("guardian:{id}"));
         });
     }
 
@@ -7362,6 +7384,10 @@ pub fn review_maintenance(
             // that didn't run) the manual-push restack below -- either may
             // trigger a merge for this guardian id.
             let token = cancellations.register(&format!("guardian:{id}"));
+            let _guard = CancellationCleanup {
+                cancellations: cancellations.clone(),
+                key: format!("guardian:{id}"),
+            };
             // RAL-300: ask "have the linked PRs merged?" before deciding to
             // rebase at all. When this approves the review outright (every
             // linked PR merged, review was idle in `in_review`) or drops a
@@ -7391,7 +7417,6 @@ pub fn review_maintenance(
                         "automatic PR commit sync failed",
                         serde_json::json!({"error": e}),
                     );
-                cancellations.remove(&format!("guardian:{id}"));
                 return;
             }
             // Hold off while a stack is visibly mid-merge on the forge.
@@ -7430,7 +7455,6 @@ pub fn review_maintenance(
                         ),
                         serde_json::json!({"deferred": "stack_partially_merged"}),
                     );
-                cancellations.remove(&format!("guardian:{id}"));
                 return;
             }
             // A base-shift rebuild (full re-derive) subsumes any manual push via
@@ -7454,7 +7478,6 @@ pub fn review_maintenance(
             // same sweep that already reconciles every settled review.
             crate::pr::verify_and_repair_stack_ancestry(&store, runner.as_ref(), &id);
             repair_missing_final_summary(&store, &id);
-            cancellations.remove(&format!("guardian:{id}"));
         });
     }
 }
