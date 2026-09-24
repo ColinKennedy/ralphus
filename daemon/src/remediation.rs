@@ -106,6 +106,7 @@ pub fn run_command_with_remediation(
     let mut attempt = 1u32;
     let mut last_repair_result: Option<RunnerResult> = None;
     while !result.is_done() && attempt < total_attempts && !cancel.is_cancelled() {
+        // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} command attempt {attempt}/{total_attempts} \
@@ -172,11 +173,13 @@ pub(crate) fn resolve_vcs_for_remediation(
     match crate::vcs::for_project_root(&guard, Path::new(cwd)) {
         Ok(vcs) => Some(vcs),
         Err(e) => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [remediation] could not resolve a vcs adapter for {cwd}, remediation \
-                 retries will run without a clean-slate worktree snapshot: {e}"
-            );
+            crate::cartographer::Note::new("remediation")
+                .level(crate::logging::LogLevel::WARNING)
+                .emit(
+                    &guard,
+                    format!("could not resolve a vcs adapter for {cwd}, remediation retries will run without a clean-slate worktree snapshot: {e}"),
+                    serde_json::json!({}),
+                );
             None
         }
     }
@@ -196,6 +199,7 @@ pub(crate) fn snapshot_worktree_before_retries(
     match vcs.snapshot_worktree(Path::new(&command_spec.cwd), &dir) {
         Ok(()) => Some(dir),
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: low-level VCS helper has no Store; best-effort graceful degradation
             crate::rlog!(
                 WARNING,
                 "ralphus [remediation] squad={} task={} cell={} could not snapshot the worktree \
@@ -225,6 +229,7 @@ pub(crate) fn restore_worktree_before_repair(
     attempt: u32,
 ) {
     if let Err(e) = vcs.restore_worktree(Path::new(&command_spec.cwd), snapshot_dir) {
+        // ralphus[ignore-rlog-pair]: low-level VCS helper has no Store; best-effort graceful degradation
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} could not restore the worktree \
@@ -393,6 +398,7 @@ pub(crate) fn run_repair_pass(
 
     let result = runner.run_cancellable(&spec, cancel);
     if !result.is_done() {
+        // ralphus[ignore-rlog-pair]: low-level retry-loop helper with no Store; scheduler records structured cell state
         crate::rlog!(
             WARNING,
             "ralphus [remediation] squad={} task={} cell={} repair pass {attempt} did not \
@@ -464,6 +470,7 @@ mod tests {
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
             allow_personal_memory: false,
+            retry_attempt: 0,
             maximum_timeout: None,
         }
     }
