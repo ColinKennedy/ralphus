@@ -499,6 +499,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 project-level .ralphus.toml [review]
                 auto_fix_prompt_template default, then a built-in
                 default template.
+ discourage_tests_during_auto_pull_request_fixes
+        bool    Guide the auto-fix dispatch above to avoid writing or
+                running tests while fixing a failing PR/MR CI status.
+                Unset inherits the project-level .ralphus.toml
+                [review] discourage_tests_during_auto_pull_request_fixes
+                default, then false.
 
  [[review.auto_build]]  (zero or more per [[review]])
  Declare the build steps that run at merge/finalize time (RAL-342).
@@ -558,7 +564,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  RAL-408: the same project-level defaults (plus skip_worktrees,
  skip_base_updates, match_pr_branch_name, separate_pr_branch,
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
- auto_fix_prompt_template, and skip_auto_clean) can also be set from
+ auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
+ and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
  Settings), instead of hand-editing .ralphus.toml. A database

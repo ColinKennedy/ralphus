@@ -1466,6 +1466,198 @@ fn auto_fix_dispatch_posts_an_attributed_feedback_message() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-505: when this review's own `discourage_tests_during_auto_pull_request_fixes`
+/// override is set, the resolver's feedback prompt must carry the
+/// discourage-tests guidance text -- for both the unattended auto-fix path
+/// and the manual (person-initiated) fix path, since both funnel through
+/// `ci_watch::run_pr_fix`.
+#[test]
+fn auto_fix_dispatch_appends_discourage_tests_guidance_when_review_override_set() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(&root, "base.txt", "base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(12),
+            Some("https://github.com/acme/w/pull/12"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_discourage_tests_during_auto_pull_request_fixes(&id, Some(true))
+        .unwrap();
+
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'build' failed".to_string(),
+        job_url: None,
+        log_text: None,
+        checks: vec![],
+    };
+    let runner = AutoFixRunner::new();
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
+
+    let messages = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
+    assert_eq!(messages.len(), 1, "expected exactly one feedback message");
+    assert!(
+        messages[0]
+            .text
+            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+        "feedback prompt must carry the discourage-tests guidance when the \
+         review's own override is set: {:?}",
+        messages[0].text
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+/// RAL-505: a review with no override of its own must fall back to the
+/// project-level `.ralphus.toml [review] discourage_tests_during_auto_pull_request_fixes`
+/// default -- mirrors `auto_fix_pr_errors`'s own project-default fallback,
+/// just exercised directly against `resolve_review_config` rather than
+/// through `apply_project_review_defaults`, since this guidance is appended
+/// at dispatch time, not stamped onto the guardian row.
+#[test]
+fn auto_fix_dispatch_appends_discourage_tests_guidance_from_project_default_when_review_unset() {
+    let root = temp_repo();
+    init_repo(&root);
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    write(
+        &root,
+        ".ralphus.toml",
+        "[review]\ndiscourage_tests_during_auto_pull_request_fixes = true\n",
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    git(&root, &["checkout", "-b", "feature/a"]);
+    write(&root, "a.txt", "from a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "add a"]);
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("r", "main", root.to_str().unwrap())
+            .unwrap();
+        g.add_guardian_branch(&id, "feature/a").unwrap();
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &id,
+            Some(&bid0),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(13),
+            Some("https://github.com/acme/w/pull/13"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+    // Deliberately left unset -- the guardian row itself carries no override,
+    // so the effective value must come entirely from the project's
+    // `.ralphus.toml [review]` default resolved fresh at dispatch time.
+
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    assert!(
+        guardian
+            .discourage_tests_during_auto_pull_request_fixes
+            .is_none(),
+        "precondition: this review must carry no override of its own"
+    );
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'build' failed".to_string(),
+        job_url: None,
+        log_text: None,
+        checks: vec![],
+    };
+    let runner = AutoFixRunner::new();
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
+
+    let messages = store.lock().guardian_branch_messages(&id, &bid0).unwrap();
+    assert_eq!(messages.len(), 1, "expected exactly one feedback message");
+    assert!(
+        messages[0]
+            .text
+            .contains(ralphus_daemon::config::DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE),
+        "feedback prompt must carry the discourage-tests guidance from the \
+         project-level default when the review itself is unset: {:?}",
+        messages[0].text
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 /// RAL-395: when the forge supplies a raw CI failure log, `dispatch_pr_auto_fix`
 /// writes it into the failing branch's own worktree (not just a summary in
 /// the prompt) -- and still folds its fix into the stack exactly as the

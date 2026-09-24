@@ -648,6 +648,15 @@ pub struct GuardianView {
     /// layering as [`Self::auto_fix_pr_errors`]), else resolves to
     /// `crate::config::DEFAULT_AUTO_FIX_PROMPT_TEMPLATE` at dispatch time.
     pub auto_fix_prompt_template: Option<String>,
+    /// RAL-505: this review's own override of whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites. `None` means unset -- filled in at creation time from the
+    /// project's `.ralphus.toml [review]
+    /// discourage_tests_during_auto_pull_request_fixes` default (same
+    /// layering as [`Self::auto_fix_pr_errors`]), else resolves to `false`
+    /// at dispatch time.
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
     /// future non-git review kinds (see CCTL-112). Existing/derived reviews are
@@ -2844,6 +2853,29 @@ impl Store {
         }
     }
 
+    /// Set this review's own override of whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites (RAL-505). `None` inherits the project/global default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_discourage_tests_during_auto_pull_request_fixes(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET discourage_tests_during_auto_pull_request_fixes=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set this review's own override of the auto-fix prompt template
     /// (RAL-395). `None` inherits the project/global default. Callers must
     /// validate the `<<prompt>>` placeholder is present before calling this
@@ -4222,7 +4254,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4338,7 +4370,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4458,6 +4490,9 @@ impl Store {
             post_merge_finished_at_ms: r.get(59)?,
             owner: r.get(60)?,
             dual_root_pr: r.get::<_, Option<i64>>(61)?.map(|v| v != 0),
+            discourage_tests_during_auto_pull_request_fixes: r
+                .get::<_, Option<i64>>(62)?
+                .map(|v| v != 0),
         })
     }
 
@@ -4881,6 +4916,8 @@ impl Store {
             machine: row.machine,
             auto_fix_pr_errors: row.auto_fix_pr_errors,
             auto_fix_prompt_template: row.auto_fix_prompt_template,
+            discourage_tests_during_auto_pull_request_fixes: row
+                .discourage_tests_during_auto_pull_request_fixes,
             effective_proof_scope,
             effective_proof_skip_auto_clean,
             skip_base_updates: row.skip_base_updates,
@@ -5335,6 +5372,11 @@ struct GuardianRow {
     /// RAL-395: this review's own override of the auto-fix prompt template.
     /// `None` inherits the project/global default.
     auto_fix_prompt_template: Option<String>,
+    /// RAL-505: per-review override for whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites. `None` inherits the project/global default.
+    discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 #[cfg(test)]

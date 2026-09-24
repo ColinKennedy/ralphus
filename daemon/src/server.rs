@@ -2753,6 +2753,7 @@ struct EffectiveReviewDefaults {
     auto_fix_pr_errors: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_fix_prompt_template: Option<String>,
+    discourage_tests_during_auto_pull_request_fixes: bool,
 }
 
 impl EffectiveReviewDefaults {
@@ -2773,6 +2774,8 @@ impl EffectiveReviewDefaults {
             auto_submit_pr_stack: cfg.auto_submit_pr_stack(),
             auto_fix_pr_errors: cfg.auto_fix_pr_errors(),
             auto_fix_prompt_template: cfg.auto_fix_prompt_template().map(str::to_string),
+            discourage_tests_during_auto_pull_request_fixes: cfg
+                .discourage_tests_during_auto_pull_request_fixes(),
         }
     }
 }
@@ -2862,6 +2865,12 @@ struct ProjectReviewSettingsBody {
     auto_fix_pr_errors: Option<bool>,
     #[serde(default)]
     auto_fix_prompt_template: Option<String>,
+    /// RAL-505: project-level default for whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites -- see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     /// RAL-476: fallback owning user for reviews whose squad has no
     /// `submitter` of its own -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
@@ -3014,6 +3023,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_fix_prompt_template {
         settings.auto_fix_prompt_template = clear_if_empty(v);
+    }
+    if let Some(v) = req.discourage_tests_during_auto_pull_request_fixes {
+        settings.discourage_tests_during_auto_pull_request_fixes = Some(v);
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -12532,6 +12544,13 @@ struct GuardianSettingsBody {
     /// `proof_scope` above).
     #[serde(default)]
     auto_fix_prompt_template: Option<String>,
+    /// RAL-505: this review's own override for whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites. `None` (or the field being absent) means "inherit the
+    /// project/global default".
+    #[serde(default)]
+    discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -12574,6 +12593,10 @@ struct GuardianDetailsBody {
     /// RAL-395: see [`GuardianSettingsBody::auto_fix_prompt_template`].
     #[serde(default)]
     auto_fix_prompt_template: Option<String>,
+    /// RAL-505: see
+    /// [`GuardianSettingsBody::discourage_tests_during_auto_pull_request_fixes`].
+    #[serde(default)]
+    discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -12953,6 +12976,13 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.discourage_tests_during_auto_pull_request_fixes {
+        if let Err(e) =
+            store.set_guardian_discourage_tests_during_auto_pull_request_fixes(id, Some(enabled))
+        {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -13243,6 +13273,13 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             Some(template)
         };
         if let Err(e) = store.set_guardian_auto_fix_prompt_template(id, template) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.discourage_tests_during_auto_pull_request_fixes {
+        if let Err(e) =
+            store.set_guardian_discourage_tests_during_auto_pull_request_fixes(id, Some(enabled))
+        {
             return store_error(&e);
         }
     }
@@ -17523,6 +17560,11 @@ mod tests {
         assert!(body["settings"]["default_resolver_agent"].is_null());
         assert_eq!(body["effective"]["resolver_agent"], "ollama");
         assert_eq!(body["effective"]["proof_scope"], "each_branch");
+        assert!(body["settings"]["discourage_tests_during_auto_pull_request_fixes"].is_null());
+        assert_eq!(
+            body["effective"]["discourage_tests_during_auto_pull_request_fixes"],
+            false
+        );
     }
 
     #[test]
@@ -17569,6 +17611,47 @@ mod tests {
         );
         assert!(body["effective"]["skip_worktrees"].as_bool().unwrap());
         assert_eq!(body["effective"]["maximum_budget_usd"], 5.0);
+    }
+
+    #[test]
+    fn project_review_settings_route_set_discourage_tests_persists_and_wins_over_file_config() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-set-discourage-tests");
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            "[review]\ndiscourage_tests_during_auto_pull_request_fixes = true\n",
+        )
+        .unwrap();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            body["effective"]["discourage_tests_during_auto_pull_request_fixes"], true,
+            "the file-based project default should apply when no database override is set"
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"discourage_tests_during_auto_pull_request_fixes":false}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(
+            body["settings"]["discourage_tests_during_auto_pull_request_fixes"],
+            false
+        );
+        assert_eq!(
+            body["effective"]["discourage_tests_during_auto_pull_request_fixes"], false,
+            "the database override must win over the file-based project default"
+        );
     }
 
     #[test]

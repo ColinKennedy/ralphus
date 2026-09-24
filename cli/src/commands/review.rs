@@ -119,6 +119,10 @@ pub enum ReviewCommand {
         auto_fix_pr_errors: Option<bool>,
         /// RAL-395: the prompt template used for the auto-fix dispatch above.
         auto_fix_prompt_template: Option<String>,
+        /// RAL-505: this review's own override for whether its auto-fix
+        /// dispatch is guided to avoid writing/running tests while fixing a
+        /// failing PR's CI status.
+        discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -404,6 +408,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 .take_value("--auto-fix-prompt-template")
                 .ok()
                 .flatten();
+            let discourage_tests_during_auto_pull_request_fixes =
+                take_tri_bool(&mut scanner, "--discourage-tests-during-auto-pr-fixes");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -421,6 +427,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 dual_root_pr,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template,
+                discourage_tests_during_auto_pull_request_fixes,
             })
         }
         Some("env") => {
@@ -1321,6 +1328,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             dual_root_pr,
             auto_fix_pr_errors,
             auto_fix_prompt_template,
+            discourage_tests_during_auto_pull_request_fixes,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1339,6 +1347,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 dual_root_pr,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
+                discourage_tests_during_auto_pull_request_fixes,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));

@@ -65,6 +65,8 @@
        * @property {boolean} originalAutoFixPrErrors
        * @property {string} autoFixPromptTemplate
        * @property {string} originalAutoFixPromptTemplate
+       * @property {boolean} discourageTests
+       * @property {boolean} originalDiscourageTests
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
@@ -83,6 +85,7 @@
       const REVIEW_EDIT_INPUT_STYLE = "background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:2px 5px;font-size:12px";
       const REVIEW_EDIT_TEXTAREA_STYLE = "width:100%;box-sizing:border-box;resize:vertical;font-family:inherit;font-size:12px;padding:6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px";
       const AUTO_FIX_PROMPT_TEMPLATE_TIP = "Prompt handed to the resolver agent when 'auto-fix PR errors' fires, with the literal <<prompt>> placeholder replaced by the failing branch's own Cell prompts. Must contain <<prompt>> or Save is rejected. Leave blank to inherit the project default. Applies on Save.";
+      const DISCOURAGE_TESTS_TIP = "When on, the resolver agent dispatched to fix this review's pull request -- whether from 'auto-fix PR errors' or a manual PR-fix request -- is told to prefer automatic formatters, linters, and static-analysis tools and to avoid running a broad or expensive test suite. Comprehensive validation still happens separately, through the pull request's own checks. Applies on Save.";
 
       /**
        * Builds an env-override scope's draft rows from its currently-saved
@@ -129,6 +132,7 @@
         const dualRootPr = !!g.effective_dual_root_pr;
         const autoFixPrErrors = !!g.auto_fix_pr_errors;
         const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
+        const discourageTests = !!g.discourage_tests_during_auto_pull_request_fixes;
         return {
           gid: g.id,
           name: g.name,
@@ -150,6 +154,7 @@
           dualRootPr, originalDualRootPr: dualRootPr,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
+          discourageTests, originalDiscourageTests: discourageTests,
           squash,
           originalSquashOn: squashOn.slice(),
           projects,
@@ -311,6 +316,12 @@
        * @returns {void}
        */
       function onEditAutoFixPromptTemplate(value) { if (reviewEditDraft) reviewEditDraft.autoFixPromptTemplate = value; }
+      /**
+       * Stages the discourage-tests-during-auto-PR-fix flag.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditDiscourageTests(checked) { if (reviewEditDraft) reviewEditDraft.discourageTests = checked; }
       /**
        * Stages one git project's squash toggle.
        * @param {string} project
@@ -515,21 +526,26 @@
             <input type="checkbox" ${dualRootPr ? "checked" : ""} onchange="${onDualRootPrChange}(this.checked)">dual root PR</label>`;
       }
       /**
-       * RAL-408: auto-fix-PR-errors checkbox + prompt-template textarea,
-       * shared as above.
+       * RAL-408: auto-fix-PR-errors checkbox + prompt-template textarea, plus
+       * the RAL-505 discourage-tests-during-auto-PR-fix checkbox, shared as
+       * above.
        * @param {boolean} autoFixPrErrors
        * @param {string} autoFixPromptTemplate
+       * @param {boolean} discourageTests
        * @param {string} onErrorsChange
        * @param {string} onTemplateChange
+       * @param {string} onDiscourageTestsChange
        * @returns {string}
        */
-      function renderAutoFixFieldsHtml(autoFixPrErrors, autoFixPromptTemplate, onErrorsChange, onTemplateChange) {
+      function renderAutoFixFieldsHtml(autoFixPrErrors, autoFixPromptTemplate, discourageTests, onErrorsChange, onTemplateChange, onDiscourageTestsChange) {
         return `<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Automatically dispatch the resolver agent to fix this review's PR when its CI checks go red. Applies on Save.">
             <input type="checkbox" ${autoFixPrErrors ? "checked" : ""} onchange="${onErrorsChange}(this.checked)">auto-fix PR errors</label>
           <div style="margin-top:8px">
             <label for="auto-fix-prompt-template-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">auto-fix prompt template</label>
             <textarea id="auto-fix-prompt-template-input" rows="4" style="${REVIEW_EDIT_TEXTAREA_STYLE}" placeholder="inherits project default" oninput="${onTemplateChange}(this.value)" data-tip="${AUTO_FIX_PROMPT_TEMPLATE_TIP}">${esc(autoFixPromptTemplate)}</textarea>
-          </div>`;
+          </div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:8px" data-tip="${DISCOURAGE_TESTS_TIP}">
+            <input type="checkbox" ${discourageTests ? "checked" : ""} onchange="${onDiscourageTestsChange}(this.checked)">discourage tests during auto PR fixes</label>`;
       }
 
       /**
@@ -570,7 +586,7 @@
             <h3 class="section">squash</h3>${squashSection}
             <h3 class="section">pull requests</h3>
             ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack", "onEditDualRootPr")}
-            ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate")}
+            ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate", "onEditDiscourageTests")}
             <h3 class="section">environment overrides</h3>
             ${buildEnvSection}
             ${manualChecksEnvSection}
@@ -645,6 +661,7 @@
         if (draft.dualRootPr !== draft.originalDualRootPr) body.dual_root_pr = draft.dualRootPr;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
+        if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {
           body.squash_projects = squashOn;
@@ -693,4 +710,4 @@
         }
       }
 
-      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate];
+      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests];

@@ -80,6 +80,7 @@ pub enum ProjectReviewSettingsCommand {
         auto_submit_pr_stack: Option<bool>,
         auto_fix_pr_errors: Option<bool>,
         auto_fix_prompt_template: Option<String>,
+        discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     },
     UsageError(String),
 }
@@ -310,6 +311,8 @@ fn parse_review_settings_set(
     let auto_fix_pr_errors =
         crate::commands::review::take_tri_bool(scanner, "--auto-fix-pr-errors");
     let auto_fix_prompt_template = scanner.take_value("--auto-fix-prompt-template")?;
+    let discourage_tests_during_auto_pull_request_fixes =
+        crate::commands::review::take_tri_bool(scanner, "--discourage-tests-during-auto-pr-fixes");
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
             "review-settings set: --clear-maximum-budget-usd cannot be combined with \
@@ -348,6 +351,7 @@ fn parse_review_settings_set(
         auto_submit_pr_stack,
         auto_fix_pr_errors,
         auto_fix_prompt_template,
+        discourage_tests_during_auto_pull_request_fixes,
     })
 }
 
@@ -486,6 +490,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             auto_submit_pr_stack,
             auto_fix_pr_errors,
             auto_fix_prompt_template,
+            discourage_tests_during_auto_pull_request_fixes,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -504,6 +509,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 auto_submit_pr_stack,
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
+                discourage_tests_during_auto_pull_request_fixes,
             };
             match client.set_project_review_settings(&name, &patch) {
                 Ok(payload) => {
@@ -570,6 +576,10 @@ fn render_review_settings(payload: &Value) {
     row_bool("auto submit pr stack:", "auto_submit_pr_stack");
     row_bool("auto fix pr errors:", "auto_fix_pr_errors");
     row_str("auto fix prompt template:", "auto_fix_prompt_template");
+    row_bool(
+        "discourage tests during auto pr fixes:",
+        "discourage_tests_during_auto_pull_request_fixes",
+    );
 }
 
 #[must_use]

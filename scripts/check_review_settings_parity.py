@@ -32,6 +32,7 @@ MAPPING = {
     "dual_root_pr": "dual_root_pr",
     "auto_fix_pr_errors": "auto_fix_pr_errors",
     "auto_fix_prompt_template": "auto_fix_prompt_template",
+    "discourage_tests_during_auto_pull_request_fixes": "discourage_tests_during_auto_pull_request_fixes",
 }
 EXEMPT = {
     "base_branch": (
