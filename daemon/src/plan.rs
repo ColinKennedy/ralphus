@@ -242,6 +242,8 @@ mod tests {
             share_session: false,
             maximum_timeout_sec: None,
             task_maximum_timeout_sec: None,
+            mode: None,
+            remediation_attempts: None,
         }
     }
 

@@ -193,9 +193,12 @@ impl NodeState {
 
 /// One row from [`Store::proof_specs`]:
 /// `(idx, id, kind, spec, model, timeout_sec, budget_tokens,
-/// maximum_tool_output_tokens, maximum_timeout_sec)`. The last field is this
-/// step's own RAL-308 hard-cap value; see
-/// `ralphus_core::schema::ProofStep::maximum_timeout_seconds`.
+/// maximum_tool_output_tokens, maximum_timeout_sec, mode, remediation_attempts)`.
+/// The `maximum_timeout_sec` field is this step's own RAL-308 hard-cap value;
+/// see `ralphus_core::schema::ProofStep::maximum_timeout_seconds`. `mode`/
+/// `remediation_attempts` are RAL-487/RAL-488's resolved command-remediation
+/// contract -- see `ralphus_core::schema::resolve_proof_command_mode`;
+/// meaningless (and `None`) for a non-`command` kind.
 pub type ProofSpecRow = (
     i64,
     Option<String>,
@@ -205,6 +208,8 @@ pub type ProofSpecRow = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
+    Option<String>,
     Option<i64>,
 );
 
@@ -2932,6 +2937,19 @@ impl Store {
             // branch has been retired -- terminal review state or review
             // deletion.
             "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
+            // RAL-487/RAL-488: the resolved command-remediation contract for a
+            // `command`-kind cell/proof step -- see
+            // `ralphus_core::schema::CellDef::mode`/`ProofStep::mode`. Stored
+            // already-resolved ("remediating"/"raw", never NULL for a row
+            // inserted after this migration) by `resolve_cell_command_mode`/
+            // `resolve_proof_command_mode` at submit time, mirroring
+            // `share_session`'s precedent -- NULL only for a pre-existing row,
+            // which the scheduler treats the same as `raw` (today's
+            // behavior, unchanged for old data).
+            "ALTER TABLE cells ADD COLUMN mode TEXT",
+            "ALTER TABLE cells ADD COLUMN remediation_attempts INTEGER",
+            "ALTER TABLE proofs ADD COLUMN mode TEXT",
+            "ALTER TABLE proofs ADD COLUMN remediation_attempts INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3373,9 +3391,21 @@ impl Store {
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
                     effective_cell_system_prompt(cell.system_prompt.as_deref(), &cell.subprojects)
                 });
+                // RAL-487/RAL-488: resolved once here, same as
+                // `share_session` above -- meaningless (and left `None`) for
+                // a prompt cell, since `mode`/`remediation_attempts` only
+                // govern a `command` cell's failure behavior.
+                let (cell_mode, cell_remediation_attempts) = if cell.command.is_some() {
+                    (
+                        Some(ralphus_core::schema::resolve_cell_command_mode(cell).to_string()),
+                        cell.remediation_attempts.map(i64::from),
+                    )
+                } else {
+                    (None, None)
+                };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -3414,6 +3444,8 @@ impl Store {
                         ralphus_core::schema::resolve_cell_machine(task, cell),
                         share_session,
                         cell_maximum_timeout_sec,
+                        cell_mode,
+                        cell_remediation_attempts,
                     ],
                 )?;
 
@@ -6083,9 +6115,21 @@ fn insert_proof(
     } else {
         None
     };
+    // RAL-487/RAL-488: resolved once here, same as `share_session`'s
+    // precedent -- meaningless (and left `None`) for a non-`command` kind,
+    // since `mode`/`remediation_attempts` only govern a `command` step's
+    // failure behavior.
+    let (mode, remediation_attempts) = if kind == "command" {
+        (
+            Some(ralphus_core::schema::resolve_proof_command_mode(v).to_string()),
+            v.remediation_attempts.map(i64::from),
+        )
+    } else {
+        (None, None)
+    };
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, env_overrides, mode, remediation_attempts)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -6107,6 +6151,8 @@ fn insert_proof(
             // column `POST .../proof/{vi}/env` writes to, so a declared value
             // and one set later are indistinguishable from here on.
             to_json_map(&v.environment),
+            mode,
+            remediation_attempts,
         ],
     )?;
     Ok(())
@@ -6194,6 +6240,16 @@ pub struct CellRow {
     /// task-wide cap. See
     /// `ralphus_core::schema::TaskDef::maximum_timeout_seconds`.
     pub task_maximum_timeout_sec: Option<i64>,
+    /// RAL-487: resolved command mode -- `Some("remediating")` or
+    /// `Some("raw")` for any cell inserted after this column existed, `None`
+    /// only for a pre-existing row (treated as `raw`, today's unchanged
+    /// behavior). Meaningless when `command` is unset. See
+    /// `ralphus_core::schema::resolve_cell_command_mode`.
+    pub mode: Option<String>,
+    /// RAL-487: remediation attempt budget, required (by `core::validate`)
+    /// whenever `mode` resolves to `"remediating"`. `None` for a raw command
+    /// or a prompt cell.
+    pub remediation_attempts: Option<i64>,
 }
 
 /// Editable cell definition fields (from the details pane).
@@ -6402,7 +6458,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn cells_of_conn(conn: &Connection, squad_id: &str) -> Result<Vec<CellRow>> {
         let mut stmt = conn.prepare(
-            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec
+            "SELECT s.task_idx, s.idx, t.name, s.sid, s.cwd, s.subprojects, s.prompt, s.command, s.agent, s.model, s.system_prompt, s.system_prompt_position, s.depends_on, s.timeout_sec, s.budget_tokens, s.upstream, s.maximum_budget_usd, s.machine, s.maximum_context, s.auto_compact_threshold, s.maximum_tool_output_tokens, s.share_session, s.maximum_timeout_sec, t.maximum_timeout_sec, s.mode, s.remediation_attempts
              FROM cells s JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
              WHERE s.squad_id = ? ORDER BY s.task_idx, s.idx",
         )?;
@@ -6436,6 +6492,8 @@ impl Store {
                     share_session: r.get(21)?,
                     maximum_timeout_sec: r.get(22)?,
                     task_maximum_timeout_sec: r.get(23)?,
+                    mode: r.get(24)?,
+                    remediation_attempts: r.get(25)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6665,7 +6723,7 @@ impl Store {
         cell_idx: i64,
     ) -> Result<Vec<ProofSpecRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT idx, vid, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens, maximum_timeout_sec FROM proofs
+            "SELECT idx, vid, kind, spec, model, timeout_sec, budget_tokens, maximum_tool_output_tokens, maximum_timeout_sec, mode, remediation_attempts FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -6680,6 +6738,8 @@ impl Store {
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<i64>>(7)?,
                     r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -45,6 +45,7 @@ pub mod procreg;
 pub mod project_forks;
 pub mod proof;
 pub mod redact;
+pub mod remediation;
 pub mod remote_failure;
 pub mod remote_runner;
 pub mod resources;

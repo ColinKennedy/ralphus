@@ -224,6 +224,23 @@ pub struct CellDef {
     /// Deterministic shell command. Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
+    /// Only meaningful when `command` is set: whether a failed attempt is
+    /// handed to an agent to repair (a "remediating command") or simply
+    /// fails outright with no agent involvement (a "raw command"). One of
+    /// [`COMMAND_MODE_VALUES`]; unset behaves as
+    /// [`COMMAND_MODE_REMEDIATING`], the recommended default --
+    /// [`COMMAND_MODE_RAW`] is a discouraged opt-out. See
+    /// [`Self::remediation_attempts`] for the accompanying retry budget.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Remediation attempt budget for a `command` cell running in
+    /// [`COMMAND_MODE_REMEDIATING`] (whether set explicitly via `mode` or
+    /// left at that default) -- required in that case, rejected when
+    /// `command` is unset or `mode = "raw"`. Must be at least `1`; `3` is
+    /// the recommended starting value. Shares this cell's own
+    /// `budget_tokens`/`timeout_minutes` rather than a separate budget.
+    #[serde(default)]
+    pub remediation_attempts: Option<u32>,
     /// Cells that must complete before this one starts. Within-task cell
     /// ID (`"cell-a"`) or cross-task `"<task-name>/<cell-id>"`.
     #[serde(default)]
@@ -933,6 +950,41 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
     PROOF_SCOPE_NOTHING,
 ];
 
+/// Valid values for `[[task.cell]] mode` / `[[task.proof]]` (and
+/// `[[task.cell.proof]]`) `mode`: how a `command` cell/proof step behaves on
+/// failure. See [`CellDef::mode`]/[`ProofStep::mode`].
+///
+/// The recommended, default value -- a failed attempt's output is persisted
+/// to an attempt-scoped file (reusing `daemon/src/terminal_log.rs`'s
+/// `attempt_path`/`write_attempt` conventions) and handed to an agent to
+/// repair, then the command is retried, up to
+/// [`CellDef::remediation_attempts`]/[`ProofStep::remediation_attempts`]
+/// times ("remediating command").
+pub const COMMAND_MODE_REMEDIATING: &str = "remediating";
+/// Discouraged opt-out: today's raw, no-agent shell invocation -- a failed
+/// attempt fails the cell/proof step outright, with no retry and no
+/// `remediation_attempts` field permitted ("raw command").
+pub const COMMAND_MODE_RAW: &str = "raw";
+
+/// Every accepted `mode` literal, in the order shown to a user.
+pub const COMMAND_MODE_VALUES: &[&str] = &[COMMAND_MODE_REMEDIATING, COMMAND_MODE_RAW];
+
+/// The effective command mode for a cell: its own [`CellDef::mode`], or
+/// [`COMMAND_MODE_REMEDIATING`] when unset -- there is no task-level `mode`
+/// to inherit from (unlike `agent`/`model`/`share_session`), since a task has
+/// no `command` field of its own.
+#[must_use]
+pub fn resolve_cell_command_mode(cell: &CellDef) -> &str {
+    cell.mode.as_deref().unwrap_or(COMMAND_MODE_REMEDIATING)
+}
+
+/// The effective command mode for a proof step. See
+/// [`resolve_cell_command_mode`].
+#[must_use]
+pub fn resolve_proof_command_mode(step: &ProofStep) -> &str {
+    step.mode.as_deref().unwrap_or(COMMAND_MODE_REMEDIATING)
+}
+
 /// If `id` is a new-review placeholder (`ralphus:new-review/<key>`), return its
 /// `<key>` trimmed of surrounding whitespace. Returns `None` for a plain id or a
 /// non-matching scheme, or when the key is empty.
@@ -1398,6 +1450,23 @@ pub struct ProofStep {
     /// Shell command; exit code is the verdict.
     #[serde(default)]
     pub command: Option<String>,
+    /// Only meaningful when `command` is set: whether a failed attempt is
+    /// handed to an agent to repair (a "remediating command") or simply
+    /// fails outright with no agent involvement (a "raw command"). One of
+    /// [`COMMAND_MODE_VALUES`]; unset behaves as
+    /// [`COMMAND_MODE_REMEDIATING`], the recommended default --
+    /// [`COMMAND_MODE_RAW`] is a discouraged opt-out. See
+    /// [`Self::remediation_attempts`] for the accompanying retry budget.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Remediation attempt budget for a `command` proof step running in
+    /// [`COMMAND_MODE_REMEDIATING`] (whether set explicitly via `mode` or
+    /// left at that default) -- required in that case, rejected when
+    /// `command` is unset or `mode = "raw"`. Must be at least `1`; `3` is
+    /// the recommended starting value. Shares this step's own
+    /// `budget_tokens`/`timeout_minutes` rather than a separate budget.
+    #[serde(default)]
+    pub remediation_attempts: Option<u32>,
     /// Prompt routed to the local brain (deferred in ralphus MVP).
     #[serde(default)]
     pub brain: Option<String>,
@@ -1803,6 +1872,8 @@ mod tests {
             subprojects: vec![],
             prompt: Some("hi".into()),
             command: None,
+            mode: None,
+            remediation_attempts: None,
             depends_on: vec![],
             agent: agent.map(|a| AgentSpec::Single(a.to_string())),
             model: model.map(str::to_string),

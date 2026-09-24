@@ -194,9 +194,53 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         contain {handoff:<task-or-cell>} -- replaced
                                         at run time with the summaries of this cell's
                                         completed dependencies.
- command                 string  ONE-OF Deterministic shell command (no AI). Exit 0 = ok.
-                                        Mutually exclusive with `prompt`. NOTE: command
-                                        cells ignore `agent` and `model` entirely.
+ command                 string  ONE-OF A command RUNNABLE IN A TERMINAL (no natural-
+                                        language agent instructions) -- e.g.
+                                        "cargo build --release", not "build the
+                                        project". Mutually exclusive with `prompt`. See
+                                        `mode` below for what happens on failure.
+ mode                    string         Only meaningful alongside `command`. One of
+                                        "remediating" (DEFAULT -- also what an unset
+                                        `mode` means) or "raw" (DISCOURAGED opt-out).
+                                        "remediating": on a failed attempt, the
+                                        command's output is persisted to an
+                                        attempt-scoped file (reusing
+                                        `daemon/src/terminal_log.rs`'s
+                                        `attempt_path`/`write_attempt`
+                                        conventions) and handed to an agent
+                                        (using this cell's `agent`/`model`)
+                                        alongside a fixed, repair-only system
+                                        prompt whose only job is to repair the
+                                        underlying issue -- it may NOT run tests,
+                                        formatters, linters, commits, pushes, or any
+                                        other verification command; only the
+                                        orchestrator re-runs the configured `command`
+                                        itself. The cell keeps retrying
+                                        remediate-then-rerun up to `remediation_attempts`
+                                        times; it succeeds the first time the command
+                                        exits 0, and fails once attempts are exhausted
+                                        with no success. Requires
+                                        `remediation_attempts` to be set.
+                                        "raw": today's plain behavior -- the command
+                                        runs once, exit 0 = pass, any nonzero exit
+                                        fails the cell outright with no agent
+                                        involvement and no retry. Rejects
+                                        `remediation_attempts` if set.
+                                        Example:
+                                          command = "cargo build --release"
+                                          mode = "raw"
+ remediation_attempts    integer        Retry budget for a `command` cell running in
+                                        "remediating" mode (whether set explicitly via
+                                        `mode` or left at that default) -- REQUIRED in
+                                        that case, rejected otherwise (i.e. when
+                                        `command` is unset or `mode = "raw"`). Must be
+                                        >= 1; 3 is a reasonable starting value. Shares
+                                        this cell's own `budget_tokens`/
+                                        `timeout_minutes` -- there is no separate
+                                        remediation-specific budget field.
+                                        Example:
+                                          command = "cargo build --release"
+                                          remediation_attempts = 3   # mode defaults to "remediating"
  role                    string         Optional role label
  agent                   string         Override the task agent for this cell
  model                   string         Override the task model for this cell
@@ -559,7 +603,51 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 
  Key                Type           Notes
  id                 string         Stable id for restart_on references
- command            string  ONE-OF Shell command; exit 0 = PASS. (Works today.)
+ command            string  ONE-OF A check RUNNABLE IN A TERMINAL (no natural-
+                                   language agent instructions) -- e.g.
+                                   "cargo build --release", not "make sure it
+                                   builds". Exit 0 = PASS. See `mode` below for
+                                   what happens on a nonzero exit.
+ mode               string         Only meaningful alongside `command`. One of
+                                   "remediating" (DEFAULT -- also what an unset
+                                   `mode` means) or "raw" (DISCOURAGED opt-out).
+                                   "remediating": on a FAIL, the command's
+                                   output is persisted to an attempt-scoped
+                                   file (reusing `daemon/src/terminal_log.rs`'s
+                                   `attempt_path`/`write_attempt` conventions)
+                                   and handed to an agent (using the owning
+                                   cell's resolved `agent`/`model`) alongside a
+                                   fixed, repair-only system prompt whose only
+                                   job is to repair the underlying issue -- it
+                                   may NOT run tests, formatters, linters,
+                                   commits, pushes, or any other verification
+                                   command; only the orchestrator re-runs the
+                                   configured `command` itself. The proof step keeps
+                                   retrying remediate-then-rerun up to
+                                   `remediation_attempts` times; it PASSes the
+                                   first time the command exits 0, and FAILs
+                                   once attempts are exhausted with no
+                                   success. Requires `remediation_attempts` to
+                                   be set.
+                                   "raw": today's plain behavior -- the
+                                   command runs once, exit 0 = PASS, any
+                                   nonzero exit is an immediate FAIL with no
+                                   agent involvement and no retry. Rejects
+                                   `remediation_attempts` if set.
+ remediation_attempts
+                    integer        Retry budget for a `command` proof step
+                                   running in "remediating" mode (whether set
+                                   explicitly via `mode` or left at that
+                                   default) -- REQUIRED in that case, rejected
+                                   otherwise (i.e. when `command` is unset or
+                                   `mode = "raw"`). Must be >= 1; 3 is a
+                                   reasonable starting value. Shares this
+                                   proof step's own `budget_tokens`/
+                                   `timeout_minutes` -- there is no separate
+                                   remediation-specific budget field.
+                                   Example:
+                                     command = "cargo test"
+                                     remediation_attempts = 3   # mode defaults to "remediating"
  brain              string  ONE-OF Local-LLM check (planned; not yet run in MVP).
  prompt             string  ONE-OF AI proof prompt -- the check to run. (Works
                                    today.) NOT a backend name: unlike the
@@ -608,7 +696,10 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 
  NOTE: today the runner executes `command` and `prompt` proof steps; `brain`
  (local-LLM) and `approval` (human) proof steps are still accepted by the schema
- but deferred, and stay pending.
+ but deferred, and stay pending. A `mode = "remediating"` command's repair-agent
+ retry loop is fully wired: a failed attempt's captured output is handed to
+ the owning cell's resolved agent/model as a file path (never inlined), and
+ the command is retried up to `remediation_attempts` times.
 
 ---------------------------------------------------------------
  Project registry + placeholder cwd
@@ -849,7 +940,8 @@ project = "my-project"
   cwd     = "<<ralphus:new-worktree/check?upstream=beta>>"
   agent   = "{<...put your recommended agent here>}"
   model   = "qwen3:8b"
-  command = "cargo test"          # command ignores agent/model anyway
+  command = "cargo test"          # a remediating command: `agent`/`model` above
+  remediation_attempts = 3        # are who repairs a failed attempt
 
 -- 3. Two tasks, a handoff, and a per-project review ----------
 
@@ -864,7 +956,8 @@ project = "my-project"
   review = "<<review:backend>>"   # opt this worktree branch into the review
 
     [[task.cell.proof]]
-    command = "test -f data.json"
+    command              = "test -f data.json"
+    remediation_attempts = 3
 
 [[task]]
 name       = "report"
@@ -878,7 +971,8 @@ depends_on = ["setup"]            # waits for all of setup's cells + proof steps
   review   = "<<review:backend>>"
 
     [[task.cell.proof]]
-    command = "test -f report.md"
+    command              = "test -f report.md"
+    remediation_attempts = 3
 
 # Top-level review declaration (upstream is normally inferred from the
 # worktree's git upstream tracking branch; declared explicitly here).

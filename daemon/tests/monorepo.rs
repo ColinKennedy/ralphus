@@ -167,7 +167,7 @@ fn subprojects_system_prompt_injected_through_full_pipeline() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nsubprojects=[\"packages/alpha\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -215,8 +215,8 @@ fn two_subprojects_cells_get_independent_addenda() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nsubprojects=[\"packages/alpha\"]\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nsubprojects=[\"packages/beta\"]\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo alpha\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\n\
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo beta\"\nremediation_attempts=3\nsubprojects=[\"packages/beta\"]\n"
     );
     assert!(
         ralphus_core::validate::validate_toml(&toml).is_ok(),
@@ -262,7 +262,7 @@ fn no_subprojects_no_injection() {
 
     let toml = format!(
         "[[task]]\nname=\"t\"\n\
-         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\n"
+         [[task.cell]]\ncwd=\"{repo}\"\ncommand=\"echo ok\"\nremediation_attempts=3\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
@@ -379,9 +379,9 @@ fn full_monorepo_flow_with_subproject_cells() {
     //    of the same monorepo, both scoped to `packages/alpha`.
     let toml = format!(
         "[[task]]\nname=\"a\"\n\
-         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
+         [[task.cell]]\ncwd=\"{cwd_a}\"\ncommand=\"echo a-done\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
          [[task]]\nname=\"b\"\ndepends_on=[\"a\"]\n\
-         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
+         [[task.cell]]\ncwd=\"{cwd_b}\"\ncommand=\"echo b-done\"\nremediation_attempts=3\nsubprojects=[\"packages/alpha\"]\nreview=\"<<review:rev>>\"\n\
          [[review]]\nid=\"rev\"\n"
     );
     assert!(
