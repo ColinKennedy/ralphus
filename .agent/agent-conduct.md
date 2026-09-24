@@ -179,6 +179,44 @@ Prefer naming the exact entity affected (an `EntityUri`, a selector, an id)
 in the guidance text over a generic pointer, so the recipient doesn't have to
 go hunting for which squad/review/cell the message is about.
 
+## Every retry loop must notify on exhaustion, once (RAL-504)
+
+Any mechanism in this codebase that retries an operation a bounded number of
+times before giving up (a provider/harness rate-limit retry, a session
+reattach loop, a PR auto-fix campaign, or any future one) must send a user
+notification when it finally gives up — never silently. A retry that is
+still in progress is recoverable and must stay non-terminal (no notification
+for each failed attempt, and no notification while a later attempt could
+still succeed); the moment the loop's own cap is hit and it will not retry
+again, fire exactly one notification for that terminal transition.
+
+That notification must, at minimum:
+
+- name the specific operation that stalled (the cell, proof step, review, or
+  PR affected — not just "something failed");
+- say plainly that automated retries have stopped, so the recipient does not
+  wait for a retry that isn't coming; and
+- give a specific next action — the precise command to retry (e.g.
+  `ralphus cell restart-proof <squad/task/cell> --from <index>` when the
+  exact failing proof index is known, `ralphus review reopen <id>`, `ralphus
+  cell restart ...`), or say plainly that manual investigation is required
+  when no safe command exists.
+
+Send it through the existing mandatory-remediation mailbox path from the
+rule above (`Store::enqueue_error_mailbox_message` /
+`Store::notify_watchers_with_remediation`) — do not invent a second,
+parallel notification mechanism for a new retry loop. Prefer enriching an
+*existing* terminal failure notification for that operation (branching on
+whether the failure is retry-exhaustion) over adding a distinct new message,
+so a recipient watching one entity still gets exactly one failure
+notification per real failure. Use `crate::mailbox::is_retry_exhaustion_error`
+as the reference for how an existing exhaustion message is distinguished
+from an ordinary failure by its wording, and add any new retry loop's own
+terminal message text to that classifier (and its test) so it is recognized
+too. Once retries are genuinely exhausted, `MailboxPriority::High` is
+enough — reserve `Urgent` for failures that are not a routine, expected
+"the retry budget ran out".
+
 ## Report what you could not verify
 
 If part of the suite could not run (see the dev-daemon exe lock in

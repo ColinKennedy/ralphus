@@ -118,6 +118,28 @@ impl Remediation {
     }
 }
 
+/// True when `error` is one of this codebase's retry loops' own terminal
+/// exhaustion messages -- the RAL-435 provider/harness rate-limit-retry loops
+/// (the cell-level thrash detector in `scheduler.rs::rate_limit_thrash_message`,
+/// the proof-level retry loop in `scheduler.rs::run_proof_with_rate_limit_retries`,
+/// and the guardian-merge retry loop in
+/// `guardian_merge.rs::run_agent_with_rate_limit_retry`), plus the runner's
+/// tmux-session reattach loop (`runner.rs::Runner::run_via_tmux`, reason
+/// `"reattach attempts exhausted"` once `MAX_REATTACH_ATTEMPTS` is hit). All
+/// of these produce a message containing one of the substrings below, so
+/// this is detected by string match rather than a dedicated `RunnerResult`
+/// field or a boolean threaded through every intervening call. A caller that
+/// recognizes this (RAL-504) should downgrade the notification from
+/// `Urgent` to `High` and swap in exhaustion-specific remediation -- a
+/// still-in-progress retry never reaches this text (it stays non-terminal),
+/// so this only ever matches once retries have genuinely stopped.
+#[must_use]
+pub fn is_retry_exhaustion_error(error: &str) -> bool {
+    error.contains("retry thrashing")
+        || error.contains("retries exhausted")
+        || error.contains("reattach attempts exhausted")
+}
+
 /// Every priority tier, most urgent first -- the default a watch/user
 /// preference is given when a caller wants "notify me about everything"
 /// (RAL-320).
@@ -645,6 +667,32 @@ mod tests {
             manual,
             "Manual intervention required: inspect the terminal output and resolve the conflict by hand."
         );
+    }
+
+    #[test]
+    fn retry_exhaustion_classifier_matches_all_known_loops_and_rejects_ordinary_errors() {
+        assert!(is_retry_exhaustion_error(
+            "rate-limit retry thrashing: pi was rate limited 4 times this run, most recently \
+             only 1 turn(s) after the previous retry (thrash threshold: 3+ retries with fewer \
+             than 2 turns between them)"
+        ));
+        assert!(is_retry_exhaustion_error(
+            "provider rate-limit retries exhausted after 3 attempt(s)"
+        ));
+        assert!(is_retry_exhaustion_error(
+            "provider rate-limit retries exhausted after 3 attempt(s) (see \
+             [review].provider_timeout_max_retries in .ralphus.toml)"
+        ));
+        assert!(is_retry_exhaustion_error(
+            "session lost after 3 reattach attempt(s) (reattach attempts exhausted)"
+        ));
+        assert!(!is_retry_exhaustion_error("exit code 1"));
+        assert!(!is_retry_exhaustion_error(
+            "merge conflict in daemon/src/store.rs"
+        ));
+        assert!(!is_retry_exhaustion_error(
+            "session lost after 1 reattach attempt(s) (timeout budget exhausted)"
+        ));
     }
 
     #[test]
