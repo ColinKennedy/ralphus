@@ -11,6 +11,7 @@ import { dirname, join } from "node:path";
 const REGIONS = [
   ["// RALPHUS-TASK-TAB-COLUMNS:BEGIN", "// RALPHUS-TASK-TAB-COLUMNS:END"],
   ["// RALPHUS-TASK-TAB-LOGIC:BEGIN", "// RALPHUS-TASK-TAB-LOGIC:END"],
+  ["// RALPHUS-TT-COLUMN-TIPS:BEGIN", "// RALPHUS-TT-COLUMN-TIPS:END"],
 ];
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -34,6 +35,7 @@ const exported = [
   "TASK_TAB_COLUMNS",
   "TASK_TAB_SORTS",
   "TASK_TAB_DEFAULT_HIDDEN_COLS",
+  "TT_COLUMN_TIPS",
   "taskTabGridTemplate",
   "ttUsageOf",
   "ttCellUsageItems",
