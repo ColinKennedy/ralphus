@@ -34,6 +34,7 @@
        * @param {string} state
        * @returns {Promise<void>}
        */
+      // RALPHUS-SET-STATUS-PICK:BEGIN
       async function doPickStatus(state) {
         closeStatusPicker();
         const items = _statusPickerItems; if (!items || !items.length) return;
@@ -79,6 +80,7 @@
         tick();
         if (tab === "queue") pollQueue();
       }
+      // RALPHUS-SET-STATUS-PICK:END
       // ---- Add Dependency dialog (RAL-105) ----
       // Lets the user wire up a manual cross-squad dependency after submission:
       // the selected source squad(s) will not be scheduled until the chosen
@@ -243,12 +245,14 @@
        * @param {MouseEvent} e
        * @returns {Promise<void>}
        */
+      // RALPHUS-BULK-SET-STATUS:BEGIN
       async function bulkSetStatus(e) {
         e.stopPropagation();
         const items = [...multiSel].map((id) => ({squadId: id, kind: "squad", taskIdx: 0, cellIdx: -1, proofIdx: -1, proofScope: "", label: findSquad(id)?.label || id}));
         if (!items.length) return;
         openStatusPicker(e, items);
       }
+      // RALPHUS-BULK-SET-STATUS:END
       /**
        * Opens the context menu for a proof-step graph node (restart / set status).
        * @param {MouseEvent} e
@@ -373,18 +377,23 @@
         if (tab === "queue") pollQueue();
       }
       /**
-       * Deletes a squad permanently after confirmation.
+       * Deletes a squad permanently after confirmation. Applies to every
+       * selected squad when the clicked one is part of a multi-selection
+       * (RAL-508) via bulkDelete instead.
        * @param {string} id
        * @returns {Promise<void>}
        */
+      // RALPHUS-SQUAD-DELETE-ROUTE:BEGIN
       async function deleteSquad(id) {
         closeSquadMenu();
+        if (menuActionTargets(id, multiSel).length > 1) { await bulkDelete(); return; }
         if (!confirm("Delete this squad? This cannot be undone.")) return;
         const label = findSquad(id)?.label || id;
         await del(`/api/squads/${id}`, { success: `Squad "${label}" deleted.`, errorLabel: "delete squad" });
         if (selectedSquadId === id) selectedSquadId = null;
         multiSel.delete(id); tick();
       }
+      // RALPHUS-SQUAD-DELETE-ROUTE:END
       /**
        * Hides or unhides a squad from the current user's own view (RAL-331) --
        * a personal preference that never changes the squad itself or what any
@@ -415,11 +424,13 @@
        * @param {boolean} hide
        * @returns {Promise<void>}
        */
+      // RALPHUS-SQUAD-HIDE-ROUTE:BEGIN
       async function setSquadHiddenFromMenu(id, hide) {
         closeSquadMenu();
         if (multiSel.has(id) && multiSel.size > 1) await (hide ? bulkHideSquads() : bulkUnhideSquads());
         else await setSquadHidden(id, hide);
       }
+      // RALPHUS-SQUAD-HIDE-ROUTE:END
       /**
        * Hides or unhides every multi-selected squad in a single request
        * (RAL-331) -- one POST to the batch endpoint instead of one round
@@ -481,33 +492,26 @@
         renderAll();
       }
       /**
-       * Cancels every multi-selected squad. Reports any squad the daemon
-       * refused to cancel via notify() -- one squad failing does not block
-       * the rest of the batch.
+       * Cancels every multi-selected squad (RAL-508) after the same shared
+       * cascade-preview confirmation the context menu's bulk cancel uses.
+       * Reports any squad the daemon refused to cancel via notify() -- one
+       * squad failing does not block the rest of the batch.
        * @returns {Promise<void>}
        */
       async function bulkCancel() {
-        const ids = [...multiSel];
-        const failed = [];
-        for (const id of ids) {
-          try {
-            const resp = await post(`/api/squads/${id}/cancel`);
-            if (!resp.ok) failed.push(`${findSquad(id)?.label || id}: ${await responseError(resp, "cancel failed")}`);
-          } catch (_) { failed.push(`${findSquad(id)?.label || id}: network error`); }
-        }
-        if (failed.length) notify("error", failed.join("; "));
-        else if (ids.length) notify("success", `Cancelled ${ids.length} squad(s).`);
-        tick();
+        await showBulkCancelPreview([...multiSel]);
       }
       /**
-       * Deletes every multi-selected squad after confirmation. Reports any
-       * squad the daemon refused to delete via notify() -- one squad
-       * failing does not block the rest of the batch.
+       * Deletes every multi-selected squad after a confirmation naming them
+       * all (RAL-508). Reports any squad the daemon refused to delete via
+       * notify() -- one squad failing does not block the rest of the batch.
        * @returns {Promise<void>}
        */
+      // RALPHUS-BULK-DELETE:BEGIN
       async function bulkDelete() {
-        if (!confirm(`Delete ${multiSel.size} squad(s)? This cannot be undone.`)) return;
         const ids = [...multiSel];
+        if (!ids.length) return;
+        if (!confirm(`Delete ${ids.length} squad(s)? This cannot be undone.\n\n${bulkNameList(ids.map(squadLabelOf))}`)) return;
         const failed = [];
         for (const id of ids) {
           try {
@@ -519,6 +523,7 @@
         else notify("success", `Deleted ${ids.length} squad(s).`);
         multiSel.clear(); selectedSquadId = null; tick();
       }
+      // RALPHUS-BULK-DELETE:END
       /**
        * Renders the multi-select tab strip and bulk-action button row.
        * @returns {string}

@@ -76,11 +76,15 @@
         restartSquad: (e, ds) => restartSquad(ds.squadId || ""),
         cancelSquad: (e, ds) => cancelSquad(ds.squadId || ""),
         openAddDependencyDialogFor: (e, ds) => openAddDependencyDialogFor(e, ds.squadId || ""),
-        openStatusPickerForSquadMenuItem: (e, ds) => { e.stopPropagation(); closeSquadMenu(); openStatusPickerForSquad(e, ds.squadId || ""); },
+        // RALPHUS-SET-STATUS-ROUTE:BEGIN
+        openStatusPickerForSquadMenuItem: (e, ds) => { e.stopPropagation(); closeSquadMenu(); const id = ds.squadId || ""; if (menuActionTargets(id, multiSel).length > 1) bulkSetStatus(e); else openStatusPickerForSquad(e, id); },
+        // RALPHUS-SET-STATUS-ROUTE:END
         deleteSquad: (e, ds) => deleteSquad(ds.squadId || ""),
         openLogsFromSquadMenu: (e, ds) => { closeSquadMenu(); openLogs(ds.squadId || ""); },
         confirmRestart: (e, ds) => confirmRestart(ds.restartUrl || ""),
+        confirmBulkRestart: (e, ds) => confirmBulkRestart(ds.squadIds || ""),
         confirmCancelSquad: (e, ds) => confirmCancelSquad(ds.cancelUrl || ""),
+        confirmBulkCancelSquads: (e, ds) => confirmBulkCancelSquads(ds.squadIds || ""),
         toggleTerminalMenu: (e, ds) => toggleTerminalMenu(ds.key || ""),
         togglePeek: (e, ds) => togglePeek(ds.key || ""),
         togglePeekStopProp: (e, ds) => { togglePeek(ds.key || ""); e.stopPropagation(); },
@@ -169,8 +173,8 @@
       CLICK_HANDLERS.deleteReview = (e, ds) => deleteReview(ds.guardianId || "");
       CLICK_HANDLERS.hideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", true);
       CLICK_HANDLERS.unhideSquadMenuItem = (e, ds) => setSquadHiddenFromMenu(ds.squadId || "", false);
-      CLICK_HANDLERS.hideReviewMenuItem = (e, ds) => setReviewHidden(ds.guardianId || "", true);
-      CLICK_HANDLERS.unhideReviewMenuItem = (e, ds) => setReviewHidden(ds.guardianId || "", false);
+      CLICK_HANDLERS.hideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", true);
+      CLICK_HANDLERS.unhideReviewMenuItem = (e, ds) => setReviewHiddenFromMenu(ds.guardianId || "", false);
       CLICK_HANDLERS.toggleAgentInspect = (e, ds) => toggleAgentInspect(e, ds.tid || "");
       CLICK_HANDLERS.pullPrCommits = (e, ds) => pullPrCommits(ds.prId || "");
       CLICK_HANDLERS.submitPrStack = (e, ds) => submitPrStack(ds.guardianId || "");
