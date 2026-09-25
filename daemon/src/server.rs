@@ -5583,7 +5583,12 @@ fn fetch_fork_credential(daemon: &Daemon, query: &str) -> Reply {
 /// anything (RAL-101). Used by the Projects tab to flag rows whose git
 /// repository has since moved, been deleted, or stopped being a repo.
 fn validate_project(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: as a scrutinee the guard would stay alive for
+    // the whole match body, and `validate_project_location` shells out to
+    // `git rev-parse` -- a subprocess that must not run with the daemon's one
+    // global store lock held.
+    let project = daemon.lock().get_project(name);
+    match project {
         Ok(Some(p)) => match validate_project_location(&p.path, &p.vcs) {
             Ok(()) => json(
                 200,
@@ -5627,7 +5632,11 @@ struct ProjectBranchesResponse {
 }
 
 fn project_branches(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: both `list_base_branches` calls below spawn a
+    // `git for-each-ref`, and this endpoint is polled by the board -- two
+    // subprocesses per poll under the global store lock.
+    let project = daemon.lock().get_project(name);
+    match project {
         Ok(Some(p)) if p.vcs == "git" => {
             let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
             for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
@@ -5665,7 +5674,11 @@ struct ProjectAutofixDefaultBranchResponse {
 /// projects actually use, and a one-click action needs one unambiguous
 /// remote to act on rather than guessing among several.
 fn project_autofix_default_branch(daemon: &Daemon, name: &str) -> Reply {
-    match daemon.lock().get_project(name) {
+    // Bound before the `match`: the `git remote set-head origin --auto` below
+    // contacts the remote, so as a scrutinee this would hold the global store
+    // lock across a network round-trip bounded only by `GIT_TIMEOUT` (60 s).
+    let project = daemon.lock().get_project(name);
+    match project {
         Ok(Some(p)) if p.vcs == "git" => {
             let root = std::path::Path::new(&p.path);
             if let Err(e) =
@@ -12069,19 +12082,29 @@ fn stop_targets_for_status_change(
 /// of the time there's no live agent to capture (the common case is
 /// overriding an already-finished node), and even a tmux resolution failure
 /// shouldn't stop a user from being able to force a status.
-fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody]) {
+/// Takes the [`StoreHandle`] rather than a live guard: the loop below runs
+/// `tmux has-session`, `tmux capture-pane` and `git rev-parse` per target, and
+/// the caller (`set_status`) used to hold the daemon's one global store lock
+/// across all of it. Targets are resolved under a single brief lock, then every
+/// store touch inside the loop takes its own short-lived one, so no subprocess
+/// ever runs with the lock held.
+fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatusBody]) {
     let Ok(tmux) = crate::tmux::Tmux::resolve() else {
         return;
     };
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-    for req in reqs {
-        for target in stop_targets_for_status_change_full(store, squad_id, req) {
-            if seen.insert(target.clone()) {
-                targets.push(target);
+    let targets = {
+        let guard = store.lock();
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for req in reqs {
+            for target in stop_targets_for_status_change_full(&guard, squad_id, req) {
+                if seen.insert(target.clone()) {
+                    targets.push(target);
+                }
             }
         }
-    }
+        targets
+    };
     for target in targets {
         if !tmux.has_session(&target.pane_name) {
             continue;
@@ -12096,11 +12119,15 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                 let uri =
                     crate::ghost::cell_uri(squad_id, target.ghost_task_idx, target.ghost_cell_idx);
                 let cwd = store
+                    .lock()
                     .get_cell_agent_resume(squad_id, target.ghost_task_idx, target.ghost_cell_idx)
                     .map(|(cwd, _, _)| cwd)
                     .unwrap_or_default();
+                // `current_revision` shells out to git, so it sits between the
+                // two locked sections rather than inside either.
                 let revision = crate::ghost::current_revision(&cwd);
-                if store
+                let guard = store.lock();
+                if guard
                     .upsert_ghost(
                         &uri,
                         crate::ghost::KIND_CELL,
@@ -12115,7 +12142,7 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                         .squad(squad_id)
                         .scope("cascade-stop")
                         .emit(
-                            store,
+                            &guard,
                             "captured in-progress agent output before manual status change",
                             serde_json::json!({
                                 "pane": target.pane_name,
@@ -12124,13 +12151,14 @@ fn capture_and_stop_nodes(store: &Store, squad_id: &str, reqs: &[SetStatusBody])
                             }),
                         );
                 }
+                drop(guard);
             }
         }
         let _ = tmux.kill_session(&target.pane_name);
     }
 }
 
-fn capture_and_stop_node(store: &Store, squad_id: &str, req: &SetStatusBody) {
+fn capture_and_stop_node(store: &StoreHandle, squad_id: &str, req: &SetStatusBody) {
     capture_and_stop_nodes(store, squad_id, std::slice::from_ref(req));
 }
 
@@ -12191,7 +12219,7 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<SetStatusBody>(body) else {
         return error(400, "bad_request", "invalid set-status body", vec![]);
     };
-    let store = daemon.lock();
+    let mut store = daemon.lock();
     let accepted_failed_proof = if req.kind == "proof" && req.state == "done" {
         store
             .proof_state(
@@ -12233,14 +12261,25 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // kill happens before the state change itself is applied below. For a
     // cascading RAL-181 stop, stop every impacted pane in that branch; for any
     // other manual status change, keep the old single-node behavior.
+    // The guard is released for the capture pass and re-taken after it. Every
+    // target costs a `tmux has-session`, a `tmux capture-pane` and a
+    // `git rev-parse`, and this used to run with the guard live from the top of
+    // the handler -- one manual cancel of a multi-cell branch stalled every
+    // other request the daemon served for as long as tmux took to answer.
+    // Re-reading state afterwards is correct: the code below looks up whatever
+    // it needs itself, and this handler already drops and re-acquires the lock
+    // further down for `fire_ready_triage_thresholds` for the same reason.
     if matches!(req.kind.as_str(), "task" | "cell" | "proof") {
         if let Some(state) = NodeState::parse(&req.state) {
             if state != NodeState::Pending {
+                drop(store);
+                let store_handle = daemon.store_handle();
                 if let Some(plan) = &stop_plan {
-                    capture_and_stop_nodes(&store, id, &plan.stop_requests());
+                    capture_and_stop_nodes(&store_handle, id, &plan.stop_requests());
                 } else {
-                    capture_and_stop_node(&store, id, &req);
+                    capture_and_stop_node(&store_handle, id, &req);
                 }
+                store = daemon.lock();
             }
         }
     }
@@ -12448,7 +12487,11 @@ struct QueueSetPositionBody {
 
 /// The classified, ordered list of runnable work across all schedulable squads.
 fn queue(daemon: &Daemon) -> Reply {
-    match daemon.lock().queue() {
+    // WS-D.6: read-only, and polled by the board -- served from a pooled
+    // read-only connection instead of the writer lock. The read transaction
+    // inside `with_read_snapshot` is what keeps the multi-statement view
+    // internally consistent; excluding the writer was never what did that.
+    match daemon.with_read_snapshot(Store::queue_conn) {
         Ok(items) => json(200, &QueueResponse { items }),
         Err(e) => store_error(&e),
     }

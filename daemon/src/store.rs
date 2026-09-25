@@ -3931,34 +3931,52 @@ impl Store {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        let satisfied = Self::dependency_satisfying_squads(&self.conn)?;
         let mut ready = Vec::new();
         for (id, deps_json) in pending {
-            let deps = from_json(&deps_json);
-            if self.deps_satisfied(&deps)? {
+            let deps: Vec<String> = from_json(&deps_json);
+            if Self::deps_satisfied_in(&satisfied, &deps) {
                 ready.push(id);
             }
         }
         Ok(ready)
     }
 
-    /// Whether every cross-squad dependency reference points at a Done squad.
-    fn deps_satisfied(&self, deps: &[String]) -> Result<bool> {
-        for dep in deps {
-            let dep_squad = dep.split('/').next().unwrap_or(dep);
-            let state: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT state FROM squads WHERE id=?",
-                    params![dep_squad],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match state.as_deref().and_then(SquadState::parse) {
-                Some(s) if s.satisfies_dependents() => {}
-                _ => return Ok(false),
+    /// Every squad id currently in a state that satisfies its dependents, in
+    /// one query.
+    ///
+    /// WS-D.7: the per-dependency `SELECT` this replaces was nested two loops
+    /// deep -- once per dependency, inside once per squad, inside `queue`
+    /// (polled by the board) and `list_ready` (polled by the scheduler). The
+    /// state of every squad fits comfortably in memory; re-querying it per
+    /// dependency reference did not.
+    ///
+    /// Filtering happens in Rust rather than as a SQL `IN (...)` so
+    /// [`SquadState::satisfies_dependents`] stays the single definition of
+    /// which states count.
+    fn dependency_satisfying_squads(conn: &Connection) -> Result<HashSet<String>> {
+        let mut stmt = conn.prepare("SELECT id, state FROM squads")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let (id, state) = row?;
+            if SquadState::parse(&state).is_some_and(SquadState::satisfies_dependents) {
+                out.insert(id);
             }
         }
-        Ok(true)
+        Ok(out)
+    }
+
+    /// Whether every cross-squad dependency reference points at a squad whose
+    /// state satisfies dependents, given the set from
+    /// [`Self::dependency_satisfying_squads`].
+    ///
+    /// A reference is `squad-id` or `squad-id/task/cell`; only the squad part
+    /// gates today (path-precise gating is a later refinement). An unknown
+    /// squad id is unsatisfied, which is also what a missing row meant before.
+    fn deps_satisfied_in(satisfied: &HashSet<String>, deps: &[String]) -> bool {
+        deps.iter()
+            .all(|dep| satisfied.contains(dep.split('/').next().unwrap_or(dep)))
     }
 
     /// Count of currently running squads.
@@ -6791,8 +6809,13 @@ impl Store {
 
     /// The cross-squad dependency references declared in the squad's `[[default]]`.
     pub fn squad_depends_on(&self, squad_id: &str) -> Result<Vec<String>> {
-        let s: Option<String> = self
-            .conn
+        Self::squad_depends_on_conn(&self.conn, squad_id)
+    }
+
+    /// [`Self::squad_depends_on`]'s query against an explicit connection, so
+    /// the pooled read path can reach it — see [`Self::queue_conn`].
+    pub(crate) fn squad_depends_on_conn(conn: &Connection, squad_id: &str) -> Result<Vec<String>> {
+        let s: Option<String> = conn
             .query_row(
                 "SELECT depends_on FROM squads WHERE id=?",
                 params![squad_id],
@@ -10023,8 +10046,21 @@ impl Store {
     /// `pending`/`running` state. Ordered canonically by
     /// `(queue_rank NULLS LAST, squad created_at, task_idx, cells-before-proofs, idx)`.
     pub fn queue(&self) -> Result<Vec<QueueItem>> {
+        Self::queue_conn(&self.conn)
+    }
+
+    /// [`Self::queue`] against an explicit connection (WS-D.6).
+    ///
+    /// `GET /api/queue` is polled by the board and reads only — it has no
+    /// business waiting on the writer lock behind the scheduler and the
+    /// guardian-merge workers. Routed through
+    /// [`crate::server::Daemon::with_read_snapshot`], whose read transaction
+    /// supplies the atomicity the writer lock used to provide implicitly: this
+    /// view is built from several statements and a torn read across them would
+    /// show a cell as both blocked and ready.
+    pub(crate) fn queue_conn(conn: &Connection) -> Result<Vec<QueueItem>> {
         let squads: Vec<(String, Option<String>, String, i64)> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT id, label, state, created_at_ms FROM squads
                  WHERE state IN ('pending','running','queued') ORDER BY created_at_ms, id",
             )?;
@@ -10039,13 +10075,18 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
+        // Built once for the whole queue view rather than per squad's
+        // per-dependency lookup -- see `dependency_satisfying_squads`.
+        let satisfied = Self::dependency_satisfying_squads(conn)?;
         let mut out: Vec<QueueItem> = Vec::new();
         for (squad_id, squad_label, squad_state, squad_created) in squads {
-            self.queue_items_for_squad(
+            Self::queue_items_for_squad(
+                conn,
                 &squad_id,
                 squad_label.as_deref(),
                 &squad_state,
                 squad_created,
+                &satisfied,
                 &mut out,
             )?;
         }
@@ -10060,20 +10101,22 @@ impl Store {
     }
 
     fn queue_items_for_squad(
-        &self,
+        conn: &Connection,
         squad_id: &str,
         squad_label: Option<&str>,
         squad_state: &str,
         squad_created: i64,
+        satisfied: &HashSet<String>,
         out: &mut Vec<QueueItem>,
     ) -> Result<()> {
-        let cells = self.cells_of(squad_id)?;
-        let tasks = self.tasks_of(squad_id)?;
+        let cells = Self::cells_of_conn(conn, squad_id)?;
+        let tasks = Self::tasks_of_conn(conn, squad_id)?;
         let plan = match crate::plan::plan(&cells, &tasks) {
             Ok(p) => p,
             Err(_) => return Ok(()), // a cyclic squad cannot be queued
         };
-        let squad_deps_ok = self.deps_satisfied(&self.squad_depends_on(squad_id)?)?;
+        let squad_deps_ok =
+            Self::deps_satisfied_in(satisfied, &Self::squad_depends_on_conn(conn, squad_id)?);
 
         // Each task's declared `depends_on` (task names), for the header display.
         let task_deps: HashMap<i64, Vec<String>> = tasks
@@ -10094,7 +10137,7 @@ impl Store {
             rank: Option<f64>,
         }
         let smeta: HashMap<(i64, i64), SMeta> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT task_idx, idx, sid, name, state, queue_rank FROM cells WHERE squad_id=?",
             )?;
             stmt.query_map(params![squad_id], |r| {
@@ -10189,7 +10232,7 @@ impl Store {
 
         // ── proofs (cell-scope and task-scope) ──
         let proof_rows: Vec<ProofQueueRow> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT task_idx, scope, cell_idx, idx, vid, kind, state, queue_rank
                  FROM proofs WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
             )?;

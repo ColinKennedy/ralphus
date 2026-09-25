@@ -36,15 +36,19 @@ const LOAD_MS: u64 = 4_000;
 /// Squads seeded before the load starts, so the board endpoints hydrate a
 /// realistic amount of data rather than an empty board.
 const SQUADS: usize = 10;
-/// Per-endpoint p95 budget in milliseconds. This is the plan's M8 target;
-/// locally the worst endpoint measures ~32 ms, so the number is a ratchet with
-/// room for slower CI hardware, not a description of current behavior.
-const P95_BUDGET_MS: u128 = 200;
-/// M3: store-lock *wait* p95 over the whole contention window. Baseline before
-/// the WS-A fixes was 10,450 ms; locally this now measures ~25 ms.
-const LOCK_WAIT_P95_BUDGET_MS: f64 = 200.0;
-/// M4: store-lock wait max. Baseline was 45,890 ms; locally ~76 ms.
-const LOCK_WAIT_MAX_BUDGET_MS: f64 = 500.0;
+/// Per-endpoint p95 budget in milliseconds. The plan's M8 target is 200 ms;
+/// after WS-D.6 moved `/api/queue` onto the read pool and WS-D.7 removed the
+/// per-dependency query, the worst endpoint measures ~19 ms, so this is
+/// ratcheted below the target with headroom for slower CI hardware.
+const P95_BUDGET_MS: u128 = 100;
+/// M3: store-lock *wait* p95 over the whole contention window. 10,450 ms before
+/// the WS-A fixes, ~25 ms after WS-A through WS-C, ~0.2 ms once the board's
+/// hottest read stopped taking the writer lock at all. The plan's M3 target is
+/// 50 ms, which this now clears by more than two orders of magnitude.
+const LOCK_WAIT_P95_BUDGET_MS: f64 = 50.0;
+/// M4: store-lock wait max. 45,890 ms at baseline; now well under a
+/// millisecond. The plan's target is 500 ms.
+const LOCK_WAIT_MAX_BUDGET_MS: f64 = 100.0;
 
 fn submit_body(tag: usize) -> String {
     serde_json::json!({
@@ -87,11 +91,23 @@ fn spawn_server(db: &Path) -> String {
 /// carries it and the test registers it first.
 const USER: &str = "load";
 
+/// One reusable HTTP client per thread.
+///
+/// Building an agent per request exhausts Windows' ephemeral port range once
+/// the daemon is fast enough to complete thousands of requests inside the
+/// window: every connection lands in `TIME_WAIT` and the next `connect` fails
+/// with `os error 10048`. That is a property of the harness, not of the
+/// daemon -- and reusing the agent is also closer to how the board behaves,
+/// since a browser holds its connections open too.
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build()
+}
+
 /// Minimal HTTP client returning `(status, body)` with a hard timeout so a
 /// stuck handler fails the test instead of hanging it.
-fn request(method: &str, url: &str, body: Option<&str>) -> (u16, String) {
-    let timeout = Duration::from_secs(30);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+fn request(agent: &ureq::Agent, method: &str, url: &str, body: Option<&str>) -> (u16, String) {
     let req = match method {
         "POST" => agent.post(url).set("Content-Type", "application/json"),
         _ => agent.get(url),
@@ -147,7 +163,9 @@ fn board_reads_stay_fast_under_four_writers() {
 
     // Seed: a user to submit as, then enough squads that the board endpoints
     // do real hydration work.
+    let seed_agent = agent();
     let (status, body) = request(
+        &seed_agent,
         "POST",
         &format!("{base}/api/users"),
         Some(&serde_json::json!({ "name": USER }).to_string()),
@@ -155,7 +173,12 @@ fn board_reads_stay_fast_under_four_writers() {
     assert_eq!(status, 200, "user create: {body}");
     let mut squad_ids = Vec::with_capacity(SQUADS);
     for i in 0..SQUADS {
-        let (status, body) = request("POST", &format!("{base}/api/squads"), Some(&submit_body(i)));
+        let (status, body) = request(
+            &seed_agent,
+            "POST",
+            &format!("{base}/api/squads"),
+            Some(&submit_body(i)),
+        );
         assert_eq!(status, 201, "seed submit {i}: {body}");
         let resp: serde_json::Value = serde_json::from_str(&body).expect("submit JSON");
         let id = resp["squad_id"]
@@ -179,6 +202,7 @@ fn board_reads_stay_fast_under_four_writers() {
             let base = base.clone();
             let squad_ids = squad_ids.clone();
             thread::spawn(move || {
+                let agent = agent();
                 let mut writes = 0u64;
                 let mut n = 0u64;
                 while Instant::now() < deadline {
@@ -186,8 +210,12 @@ fn board_reads_stay_fast_under_four_writers() {
                     let body =
                         serde_json::json!({"set": {"RALPHUS_CONTENTION_PING": n.to_string()}})
                             .to_string();
-                    let (status, resp) =
-                        request("POST", &format!("{base}/api/squads/{id}/env"), Some(&body));
+                    let (status, resp) = request(
+                        &agent,
+                        "POST",
+                        &format!("{base}/api/squads/{id}/env"),
+                        Some(&body),
+                    );
                     if status != 200 {
                         panic!("writer {w} env write failed ({status}): {resp}");
                     }
@@ -205,11 +233,12 @@ fn board_reads_stay_fast_under_four_writers() {
         .map(|endpoint| {
             let url = format!("{base}{endpoint}");
             thread::spawn(move || {
+                let agent = agent();
                 let mut samples: Vec<u128> = Vec::new();
                 let mut statuses: Vec<u16> = Vec::new();
                 while Instant::now() < deadline {
                     let started = Instant::now();
-                    let (status, body) = request("GET", &url, None);
+                    let (status, body) = request(&agent, "GET", &url, None);
                     samples.push(started.elapsed().as_millis());
                     statuses.push(status);
                     let _ = body;
@@ -259,7 +288,7 @@ fn board_reads_stay_fast_under_four_writers() {
     }
 
     // The daemon is still healthy after the storm.
-    let (status, body) = request("GET", &format!("{base}/api/daemon"), None);
+    let (status, body) = request(&seed_agent, "GET", &format!("{base}/api/daemon"), None);
     assert_eq!(status, 200);
     let health: serde_json::Value = serde_json::from_str(&body).expect("health JSON");
     assert_eq!(
