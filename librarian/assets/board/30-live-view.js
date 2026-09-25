@@ -505,8 +505,10 @@
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
-      /** Model thinking/reasoning marker, trailing space included; tags one line of reasoning (RAL-434). Matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER. */
-      const RALPHUS_TAPE_THINKING_PREFIX = "RALPHUS_THINKING: ";
+      /** Model thinking/reasoning marker, tagging one line of reasoning (RAL-434); matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER minus their trailing space. The space is deliberately not matched on: tmux trims each captured row's trailing whitespace, so a line of *empty* reasoning arrives as a bare "RALPHUS_THINKING:" that a space-carrying prefix misses -- which rendered the raw marker into the pane. unprefixThinkingLine drops the space when the row kept one. */
+      const RALPHUS_TAPE_THINKING_TAG = "RALPHUS_THINKING:";
+      /** Trailing byte tmux writes on a row it had to wrap at the pane width (`-x 500`, daemon/src/tmux.rs). The overflow continues on the next captured row, which carries no marker of its own -- see tapeLineWrapped. */
+      const TAPE_WRAP_MARKER = "\b";
       /** Private sentinel classifyTapeLine returns for a thinking line that is folded away, so renderTapeLines can collapse a whole run of them into one placeholder. Carries a NUL byte so it can never collide with a real rendered line. */
       const THINKING_FOLDED = "\u0000thinking-folded";
       /** What a folded run of thinking lines renders as, following the ⟨debug⟩ convention formatInlineTapeEvent uses. */
@@ -677,11 +679,36 @@
           if (!showDebug) return null;
           return formatInlineTapeEvent(clean.slice(RALPHUS_TAPE_EVENT_PREFIX.length));
         }
-        if (clean.startsWith(RALPHUS_TAPE_THINKING_PREFIX)) {
+        if (clean.startsWith(RALPHUS_TAPE_THINKING_TAG)) {
           if (!showThinking) return THINKING_FOLDED;
-          return clean.slice(RALPHUS_TAPE_THINKING_PREFIX.length);
+          return unprefixThinkingLine(clean);
         }
         return clean;
+      }
+      /**
+       * Strips the thinking marker -- and the single space after it, when the
+       * row kept one -- off an already-cleaned line.
+       * @param {string} clean
+       * @returns {string}
+       */
+      function unprefixThinkingLine(clean) {
+        const rest = clean.slice(RALPHUS_TAPE_THINKING_TAG.length);
+        return rest.startsWith(" ") ? rest.slice(1) : rest;
+      }
+      /**
+       * Whether `raw` is a row tmux had to wrap, so the next captured row is
+       * its tail rather than a new logical line.
+       *
+       * The pane is created 500 columns wide to cap its resident memory
+       * (daemon/src/tmux.rs), and tmux marks a wrapped row by ending it with a
+       * backspace. This has to read the *raw* row: renderPaneLine consumes the
+       * backspace as a cursor move, so by the time a line reaches
+       * classifyTapeLine the evidence is gone.
+       * @param {string} raw
+       * @returns {boolean}
+       */
+      function tapeLineWrapped(raw) {
+        return raw.replace(/\r$/, "").endsWith(TAPE_WRAP_MARKER);
       }
       /**
        * Run the full pipeline over a tape's complete lines — ANSI-strip,
@@ -700,8 +727,27 @@
       function renderTapeLines(lines, showDebug, showThinking) {
         const out = [];
         let folding = false;
+        // Whether the previous row wrapped, and if so whether the logical line
+        // it belongs to was thinking -- a tail row carries no marker of its
+        // own, so its classification has to be carried across the break.
+        /** @type {boolean} */
+        let inWrap = false;
+        /** @type {boolean} */
+        let wrapIsThinking = false;
         for (const raw of lines) {
-          const rendered = classifyTapeLine(renderPaneLine(raw), showDebug, showThinking);
+          const clean = renderPaneLine(raw).replace(/\r$/, "");
+          /** @type {boolean} */
+          const thinking = inWrap ? wrapIsThinking : clean.startsWith(RALPHUS_TAPE_THINKING_TAG);
+          let rendered;
+          if (!inWrap) {
+            rendered = classifyTapeLine(clean, showDebug, showThinking);
+          } else if (thinking) {
+            rendered = showThinking ? clean : THINKING_FOLDED;
+          } else {
+            rendered = clean;
+          }
+          wrapIsThinking = thinking;
+          inWrap = tapeLineWrapped(raw);
           if (rendered === null) continue;
           if (rendered === THINKING_FOLDED) {
             if (folding) continue;
@@ -728,11 +774,7 @@
       function stripThinkingPrefixes(text) {
         return text
           .split("\n")
-          .map((line) =>
-            line.startsWith(RALPHUS_TAPE_THINKING_PREFIX)
-              ? line.slice(RALPHUS_TAPE_THINKING_PREFIX.length)
-              : line,
-          )
+          .map((line) => (line.startsWith(RALPHUS_TAPE_THINKING_TAG) ? unprefixThinkingLine(line) : line))
           .join("\n");
       }
       // RALPHUS-TAPE-LINES:END

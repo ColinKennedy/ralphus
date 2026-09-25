@@ -223,3 +223,59 @@ test("stripThinkingPrefixes untags a whole block of text, leaving other lines al
   const text = "plain\nRALPHUS_THINKING: reasoning\nRALPHUS_EVENT: {}\nmore";
   assert.equal(stripThinkingPrefixes(text), "plain\nreasoning\nRALPHUS_EVENT: {}\nmore");
 });
+
+// RAL-434 follow-up: two ways a hidden thinking block still leaked its text
+// into the pane, both found in a real capture
+// (ralphus_squad-000000000206_ral-507.../0000.raw: 24 bare markers and 75
+// leaked reasoning fragments in that one cell).
+//
+// 1. tmux trims each captured row's trailing whitespace, so a line of *empty*
+//    reasoning arrives as a bare "RALPHUS_THINKING:" -- which the old
+//    space-carrying prefix missed, rendering the raw marker as agent output.
+// 2. The pane is 500 columns wide (daemon/src/tmux.rs `-x 500`, a deliberate
+//    memory cap), so a longer reasoning line is wrapped across rows and only
+//    the FIRST row carries the marker. The tail rows were classified as agent
+//    output and shown verbatim -- mid-word, which is how this was spotted
+//    ("...com|pare equality) -- robust.").
+// tmux marks a wrapped row by ending it with a backspace; renderPaneLine
+// consumes that as a cursor move, so renderTapeLines reads it off the raw row.
+
+test("a bare thinking marker with no trailing space still folds when Thinking is off", () => {
+  assert.equal(renderTapeLines(["before", "RALPHUS_THINKING:", "after"], false, false), `before\n${THINKING_FOLDED_TEXT}\nafter`);
+});
+
+test("a bare thinking marker with no trailing space renders as an empty line when Thinking is on", () => {
+  assert.equal(classifyTapeLine("RALPHUS_THINKING:", false, true), "");
+});
+
+test("a wrapped thinking line's tail folds into the same block instead of leaking as agent output", () => {
+  const raw = ["RALPHUS_THINKING: reasoning that ran past the pane width\b", "and its unmarked tail", "after"];
+  assert.equal(renderTapeLines(raw, false, false), `${THINKING_FOLDED_TEXT}\nafter`);
+});
+
+test("a wrapped thinking line's tail is shown, unmarked, when Thinking is on", () => {
+  const raw = ["RALPHUS_THINKING: reasoning\b", "and its unmarked tail", "after"];
+  assert.equal(renderTapeLines(raw, false, true), "reasoning\nand its unmarked tail\nafter");
+});
+
+test("a thinking line wrapped across three rows folds as one block", () => {
+  const raw = ["RALPHUS_THINKING: a\b", "b\b", "c", "after"];
+  assert.equal(renderTapeLines(raw, false, false), `${THINKING_FOLDED_TEXT}\nafter`);
+});
+
+test("a wrapped line of ordinary agent output is untouched by the thinking fold", () => {
+  const raw = ["ordinary output\b", "and its tail", "after"];
+  assert.equal(renderTapeLines(raw, false, false), "ordinary output\nand its tail\nafter");
+  assert.equal(renderTapeLines(raw, false, true), "ordinary output\nand its tail\nafter");
+});
+
+test("a wrapped thinking line's tail is not re-parsed as a marker of its own", () => {
+  // The 500-column break can land anywhere, including right before text that
+  // looks like another marker. A tail belongs to the line it continues.
+  const raw = ["RALPHUS_THINKING: weighing\b", "RALPHUS_EVENT: not really an event", "after"];
+  assert.equal(renderTapeLines(raw, false, false), `${THINKING_FOLDED_TEXT}\nafter`);
+});
+
+test("stripThinkingPrefixes also handles the space-less marker", () => {
+  assert.equal(stripThinkingPrefixes("RALPHUS_THINKING:\nRALPHUS_THINKING: x"), "\nx");
+});

@@ -171,7 +171,7 @@
             </div>`
           : "";
         return `<div class="peek-box" data-tip="${headTip}">
-            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}${typeFilterHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
+            <div class="peek-head"><span><span class="peek-dot${ended ? ' ended' : ''}"></span>${headLabel}${startedHtml}${endedHtml}${activityHtml}</span><span style="display:flex;gap:8px;align-items:center">${debugToggleHtml}${typeFilterHtml}${thinkingToggleHtml}<button class="copy-btn" data-tip="${copyTip}" data-click="copyPeekText" data-key="${esc(key)}">⧉</button><button class="btn" style="padding:1px 7px;font-size:11px" data-click="togglePeekStopProp" data-key="${esc(key)}" data-tip="Collapse this live view.">✕ Hide</button></span></div>
             ${tabsHtml}
             ${promptTab ? `<div class="peek-pre-wrap">
               <pre id="peek-prompt-${cssKey}" class="peek-pre" style="height:${peekPaneHeight}px" data-tip="The exact system prompt this step's agent received — ralphus's hidden instructions plus the step's authored system prompt.\nShown on the System Prompt tab; the ⧉ Copy control copies this text.">${esc(peekPromptDisplay(peekSystemPrompt[key]))}</pre>

@@ -9222,8 +9222,14 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
 #[must_use]
 fn unprefix_thinking_line(line: &str) -> &str {
     let trimmed = line.trim_start();
-    match trimmed.strip_prefix(crate::runner::THINKING_MARKER) {
-        Some(rest) => rest,
+    // Matched without the marker's trailing space: tmux trims each captured
+    // row's trailing whitespace, so a line of *empty* reasoning arrives as a
+    // bare `RALPHUS_THINKING:`, which a space-carrying prefix misses -- and
+    // the raw marker then leaks into the pane. The space is dropped below
+    // when the row kept one.
+    let tag = crate::runner::THINKING_MARKER.trim_end();
+    match trimmed.strip_prefix(tag) {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
         None => line,
     }
 }
@@ -24905,6 +24911,24 @@ remediation_attempts = 1
         assert_eq!(
             strip_ralphus_pane_markers(text),
             "before\nweighing the options\nafter"
+        );
+    }
+
+    /// tmux trims each captured row's trailing whitespace, so a line of
+    /// *empty* reasoning reaches this fallback as a bare `RALPHUS_THINKING:`
+    /// with no space after the colon. Matching on the marker's full
+    /// space-carrying form missed exactly those lines and leaked the raw
+    /// marker into the pane (24 of them in one real RAL-507 capture).
+    #[test]
+    fn strip_ralphus_pane_markers_unprefixes_a_thinking_line_with_no_trailing_space() {
+        let text = "before
+RALPHUS_THINKING:
+after";
+        assert_eq!(
+            strip_ralphus_pane_markers(text),
+            "before
+
+after"
         );
     }
 
