@@ -21,19 +21,88 @@
 
 use std::path::Path;
 
+/// The line with any trailing `// comment` removed (string literals are
+/// respected, so a `"http://x"` URL is not truncated). Brace/lock accounting
+/// must run over code only: a `{` inside a comment otherwise unbalances the
+/// count and makes every region after it wrong.
+fn code_of(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'\\' if in_str => {
+                escaped = true;
+                i += 1;
+            }
+            b'"' => in_str = !in_str,
+            b'/' if !in_str && i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                return line[..i].to_string();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line.to_string()
+}
+
+/// 1-based line ranges of every `#[cfg(test)] mod ...` block: the lint is
+/// about the production daemon; test-module code runs single-threaded under
+/// the test harness and is out of scope.
+fn cfg_test_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("#[cfg(test)]") {
+            // Find the `mod ... {` line within the next few lines.
+            let mut j = i + 1;
+            while j < lines.len() && j <= i + 3 && !lines[j].trim_start().starts_with("mod ") {
+                j += 1;
+            }
+            if j < lines.len() && j <= i + 3 {
+                if let Some(end) = brace_end(lines, j) {
+                    ranges.push((i + 1, end + 1));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    ranges
+}
+
+/// Whether a 1-based line number falls inside any of the ranges.
+fn in_ranges(line: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(start, end)| line >= start && line <= end)
+}
+
 /// Source lines whose `match`/`if let`/`while let` scrutinee takes a lock
 /// guard, each paired with the lines inside that same expression which lock
 /// again. Line numbers are 1-based.
 fn reentrant_sites(src: &str) -> Vec<(usize, Vec<usize>)> {
     let lines: Vec<&str> = src.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
     let mut found = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
+        if in_ranges(i + 1, &test_ranges) {
+            continue;
+        }
         // Prose in a comment that merely mentions the pattern -- such as the
         // explanatory notes left at the sites already written correctly -- is
         // not code.
-        if trimmed.starts_with("//") {
+        let code = code_of(line);
+        let trimmed = code.trim_start();
+        if trimmed.is_empty() {
             continue;
         }
         let branches = trimmed.starts_with("match ")
@@ -72,10 +141,7 @@ fn reentrant_sites(src: &str) -> Vec<(usize, Vec<usize>)> {
         let Some(end) = end else { continue };
 
         let inner: Vec<usize> = ((i + 1)..=end)
-            .filter(|&j| {
-                let l = lines[j];
-                !l.trim_start().starts_with("//") && l.contains(".lock()")
-            })
+            .filter(|&j| !in_ranges(j + 1, &test_ranges) && code_of(lines[j]).contains(".lock()"))
             .map(|j| j + 1)
             .collect();
         if !inner.is_empty() {
@@ -159,5 +225,552 @@ fn detector_flags_the_shape_this_test_exists_to_catch() {
     assert!(
         reentrant_sites(prose).is_empty(),
         "detector must ignore explanatory comments"
+    );
+}
+
+// ── WS-B.1: one-call-level reentrancy ────────────────────────────────────
+//
+// The scrutinee detector above only flags a *literal* `.lock()` textually
+// inside the scrutinee body. BUG-1 (the live hang) hid one call away: the
+// match arm called `retire_dual_root_branch_for_guardian(&handle, ..)`, whose
+// own body takes `store.lock()`. So the detector here also flags, inside a
+// scrutinee-held region, any call to a function whose signature takes the
+// store handle (`&StoreHandle`/`&StoreMutex`) -- one call level is enough to
+// have caught it, and staying at one level keeps the false-positive surface
+// readable.
+
+/// Names of every `fn` in the scanned sources whose parameter list mentions
+/// the store handle (`StoreHandle` or `StoreMutex`, in any spelling).
+fn handle_taking_fn_names(sources: &[(String, String)]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for (_, src) in sources {
+        let lines: Vec<&str> = src.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+        for (i, line) in lines.iter().enumerate() {
+            if in_ranges(i + 1, &test_ranges) {
+                continue;
+            }
+            let code = code_of(line);
+            let trimmed = code.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            else {
+                continue;
+            };
+            let Some(name_end) = rest.find('(') else {
+                continue;
+            };
+            let name = rest[..name_end].trim().to_string();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            // Parameter list may span lines; collect from the name's own
+            // opening paren (the `pub(crate)` visibilities' parens come
+            // before the name and must not unbalance the count) until the
+            // parens balance.
+            let mut params: String = rest[name_end..].to_string();
+            let mut balance: i32 =
+                params.matches('(').count() as i32 - params.matches(')').count() as i32;
+            let mut j = i + 1;
+            while balance > 0 && j < lines.len() {
+                let code = code_of(lines[j]);
+                params.push_str(&code);
+                balance += code.matches('(').count() as i32;
+                balance -= code.matches(')').count() as i32;
+                j += 1;
+            }
+            if params.contains("StoreHandle") || params.contains("StoreMutex") {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
+/// Within each scrutinee-held region (same brace walk as [`reentrant_sites`]),
+/// the called functions whose signatures take the store handle -- i.e. calls
+/// that would re-lock a lock the scrutinee already holds.
+fn reentrant_via_callee(
+    src: &str,
+    handle_fns: &std::collections::HashSet<String>,
+) -> Vec<(usize, Vec<usize>)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
+    let mut found = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if in_ranges(i + 1, &test_ranges) {
+            continue;
+        }
+        let code = code_of(line);
+        let trimmed = code.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let branches = trimmed.starts_with("match ")
+            || trimmed.contains(" match ")
+            || trimmed.contains("if let ")
+            || trimmed.contains("while let ");
+        if !branches || !code.contains(".lock()") {
+            continue;
+        }
+        let Some(end) = brace_end(&lines, i) else {
+            continue;
+        };
+        let inner: Vec<usize> = ((i + 1)..=end)
+            .filter(|&j| {
+                let l = code_of(lines[j]);
+                if l.trim().is_empty() || in_ranges(j + 1, &test_ranges) {
+                    return false;
+                }
+                // `name(` / `.name(` / `::name(` where `name` takes the
+                // handle -- a call that would re-lock while the scrutinee
+                // guard is still alive.
+                // The call must also pass a store-ish argument: generic
+                // names like `new` are in the index (every
+                // `impl StoreMutex::new` is), and flagging every
+                // `Path::new(...)` would drown the signal.
+                call_idents(&l)
+                    .iter()
+                    .any(|id| handle_fns.contains(id.as_str()))
+                    && mentions_store_arg(&l)
+            })
+            .map(|j| j + 1)
+            .collect();
+        if !inner.is_empty() {
+            found.push((i + 1, inner));
+        }
+    }
+    found
+}
+
+/// Brace-matched end line (0-based) of the expression starting at `start`:
+/// the first line where brace depth returns to 0 after having gone positive.
+/// String literals are skipped so a `'{'` in a format string cannot end the
+/// walk early.
+fn brace_end(lines: &[&str], start: usize) -> Option<usize> {
+    let (mut depth, mut started) = (0i32, false);
+    for (j, body) in lines.iter().enumerate().skip(start) {
+        let mut in_str = false;
+        let mut escaped = false;
+        for ch in code_of(body).chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' if in_str => escaped = true,
+                '"' => in_str = !in_str,
+                '{' if !in_str => {
+                    depth += 1;
+                    started = true;
+                }
+                '}' if !in_str => {
+                    depth -= 1;
+                    if started && depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Whether the line passes a store-ish value into something: a bare
+/// `store`/`guard`/`handle`/`store_handle`/`daemon` word. Word-ish matching
+/// (split on non-identifier chars) so `semaphore_handle` does not read as
+/// `handle`.
+fn mentions_store_arg(line: &str) -> bool {
+    line.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| {
+            matches!(
+                word,
+                "store" | "store_handle" | "guard" | "handle" | "daemon"
+            )
+        })
+}
+
+/// Identifiers invoked as calls on a line: `foo(`, `.foo(`, `::foo(`.
+fn call_idents(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'_' || c.is_ascii_alphanumeric() {
+            let start = i;
+            while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            // A call iff the identifier is immediately followed by `(`.
+            if i < bytes.len() && bytes[i] == b'(' {
+                let id = &line[start..i];
+                if !matches!(
+                    id,
+                    "if" | "match" | "while" | "for" | "loop" | "fn" | "let" | "else"
+                ) {
+                    out.push(id.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+// ── WS-B.2: no live guard across I/O ──────────────────────────────────
+//
+// A store guard alive while the code performs blocking I/O stalls every other
+// request for the I/O's full duration. This catches the shape static call-
+// graph reasoning misses when the I/O is reached through layers of
+// delegation: bind the guard, and while that binding is live, ban the tokens
+// below. Escapes are possible only through the `allow-lock-io:` marker with
+// a written justification on the offending (or one of the two preceding)
+// lines.
+
+/// Tokens that (heuristically) mean "blocking I/O" when they appear on a line
+/// inside a live-guard region.
+const IO_TOKENS: &[&str] = &[
+    "ureq::",
+    "Command::new",
+    ".output()",
+    ".status()",
+    ".wait()",
+    ".recv()",
+    ".recv_timeout()",
+    "thread::sleep",
+    "run_command",
+];
+
+/// Marker that exempts one line from the guard-across-I/O ban. The rest of
+/// the marker's line is the justification, and it must be non-empty.
+const ALLOW_MARKER: &str = "allow-lock-io:";
+
+/// Lines inside a live store-guard region that perform blocking I/O, as
+/// `(guard_binding_line_1based, guard_name, offending_lines_1based)`.
+fn guard_io_sites(src: &str) -> Vec<(usize, String, Vec<usize>)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
+    let mut found = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if in_ranges(i + 1, &test_ranges) {
+            continue;
+        }
+        // Bindings: `let guard = <...>.lock()` (any receiver), `let store =
+        // daemon.lock();`, etc.
+        let binding_code = code_of(line);
+        let trimmed = binding_code.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("let ") else {
+            continue;
+        };
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let Some(eq) = rest.find('=') else {
+            continue;
+        };
+        let name = rest[..eq].trim().to_string();
+        // The binding must BE the guard: the RHS ends with `.lock()` after the
+        // trailing `;`. A chain like `let x = store.lock().foo()` holds the
+        // guard only as a statement temporary -- not a live binding.
+        let rhs = rest[eq + 1..].trim();
+        let rhs = rhs.strip_suffix(';').unwrap_or(rhs).trim_end();
+        if name.is_empty()
+            || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            || !rhs.ends_with(".lock()")
+        {
+            continue;
+        }
+
+        // The guard is live from this line until `drop(<name>)`, a
+        // reassignment, or the end of the enclosing block (brace depth
+        // returning below the binding line's own depth). All accounting
+        // runs over comment-stripped code (see [`code_of`]).
+        let mut depth = 0i32;
+        for ch in code_of(line).chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let binding_depth = depth;
+        let mut region_end = lines.len() - 1;
+        for (j, body) in lines.iter().enumerate().skip(i + 1) {
+            let code = code_of(body);
+            if code.contains(&format!("drop({name})"))
+                || (code.trim_start().starts_with(&format!("{name} = "))
+                    && code.contains(".lock()"))
+            {
+                region_end = j;
+                break;
+            }
+            if in_ranges(j + 1, &test_ranges) {
+                region_end = j;
+                break;
+            }
+            for ch in code.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth < binding_depth {
+                region_end = j;
+                break;
+            }
+        }
+
+        let offending: Vec<usize> = ((i + 1)..=region_end)
+            .filter(|&j| {
+                if in_ranges(j + 1, &test_ranges) {
+                    return false;
+                }
+                let l = code_of(lines[j]);
+                if l.trim().is_empty() {
+                    return false;
+                }
+                if !IO_TOKENS.iter().any(|tok| l.contains(tok)) {
+                    return false;
+                }
+                // The marker (on the offending line or either preceding
+                // line) exempts it.
+                let allowed = (j.saturating_sub(2)..=j).any(|k| lines[k].contains(ALLOW_MARKER));
+                !allowed
+            })
+            .map(|j| j + 1)
+            .collect();
+        if !offending.is_empty() {
+            found.push((i + 1, name, offending));
+        }
+    }
+    found
+}
+
+/// Lines inside a scrutinee-held guard region (`match daemon.lock()... {`)
+/// that perform blocking I/O, as `(scrutinee_line_1based, offending_lines)`.
+/// The scrutinee temporary lives until the end of the entire `match`/`if
+/// let`, so its arms run with the store lock held -- exactly the region the
+/// reentrancy detectors above walk.
+fn scrutinee_io_sites(src: &str) -> Vec<(usize, Vec<usize>)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
+    let mut found = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if in_ranges(i + 1, &test_ranges) {
+            continue;
+        }
+        let code = code_of(line);
+        let trimmed = code.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let branches = trimmed.starts_with("match ")
+            || trimmed.contains(" match ")
+            || trimmed.contains("if let ")
+            || trimmed.contains("while let ");
+        if !branches || !code.contains(".lock()") {
+            continue;
+        }
+        let Some(end) = brace_end(&lines, i) else {
+            continue;
+        };
+        let offending: Vec<usize> = ((i + 1)..=end)
+            .filter(|&j| {
+                if in_ranges(j + 1, &test_ranges) {
+                    return false;
+                }
+                let l = code_of(lines[j]);
+                if l.trim().is_empty() {
+                    return false;
+                }
+                if !IO_TOKENS.iter().any(|tok| l.contains(tok)) {
+                    return false;
+                }
+                let allowed = (j.saturating_sub(2)..=j).any(|k| lines[k].contains(ALLOW_MARKER));
+                !allowed
+            })
+            .map(|j| j + 1)
+            .collect();
+        if !offending.is_empty() {
+            found.push((i + 1, offending));
+        }
+    }
+    found
+}
+
+fn daemon_sources() -> Vec<(String, String)> {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources: Vec<(String, String)> = std::fs::read_dir(&src_dir)
+        .expect("daemon/src must be readable")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .map(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let src = std::fs::read_to_string(&p).expect("source file must be readable");
+            (name, src)
+        })
+        .collect();
+    sources.sort();
+    assert!(!sources.is_empty(), "found no daemon/src/*.rs to scan");
+    sources
+}
+
+#[test]
+fn no_scrutinee_holds_the_lock_across_a_call_that_relocks() {
+    let sources = daemon_sources();
+    let handle_fns = handle_taking_fn_names(&sources);
+    assert!(
+        handle_fns.contains("retire_dual_root_branch_for_guardian"),
+        "sanity: the name index must find handle-taking functions"
+    );
+
+    let mut offenders = Vec::new();
+    for (name, src) in &sources {
+        for (line, callees) in reentrant_via_callee(src, &handle_fns) {
+            offenders.push(format!(
+                "  daemon/src/{name}:{line} holds a lock guard for the whole \
+                 expression; its arms call store-handle-taking function(s) at \
+                 line(s) {callees:?}"
+            ));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a lock guard held in a `match`/`if let` scrutinee flows into a function \
+         that takes the store handle itself, which re-locks and self-deadlocks \
+         the daemon (bind the scrutinee to a `let` first; see this file's module \
+         docs):\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn no_live_store_guard_spans_blocking_io() {
+    let sources = daemon_sources();
+
+    let mut offenders = Vec::new();
+    for (name, src) in &sources {
+        for (guard_line, guard, lines) in guard_io_sites(src) {
+            offenders.push(format!(
+                "  daemon/src/{name}: guard `{guard}` (bound at line {guard_line}) is \
+                 still live at line(s) {lines:?}, which perform blocking I/O -- \
+                 drop the guard first, or justify with an `allow-lock-io:` \
+                 comment if the I/O is genuinely bounded and unavoidable"
+            ));
+        }
+        for (scrutinee_line, lines) in scrutinee_io_sites(src) {
+            offenders.push(format!(
+                "  daemon/src/{name}: scrutinee guard (bound at line {scrutinee_line}) is \
+                 still live at line(s) {lines:?}, which perform blocking I/O -- \
+                 bind the scrutinee to a `let` and drop it before the I/O, or \
+                 justify with an `allow-lock-io:` comment"
+            ));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a live store guard spans blocking I/O; the daemon's one global store \
+         lock must never be held across a network call, subprocess, or sleep:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn io_detector_flags_the_shapes_this_test_exists_to_catch() {
+    let bad = r#"
+    let guard = store.lock();
+    do_store_work(&guard);
+    let resp = ureq::post("https://api.example.com").call()?;
+    drop(guard);
+"#;
+    assert_eq!(guard_io_sites(bad).len(), 1, "ureq under a live guard");
+
+    let bad_sleep = r#"
+    let guard = store.lock();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+"#;
+    assert_eq!(
+        guard_io_sites(bad_sleep).len(),
+        1,
+        "sleep under a live guard"
+    );
+
+    let allowed = r#"
+    let guard = store.lock();
+    // allow-lock-io: 2s bounded DNS probe, measured at <50ms, cannot hold the lock long
+    let resp = ureq::get("https://api.example.com").timeout(std::time::Duration::from_secs(2)).call()?;
+    drop(guard);
+"#;
+    assert!(
+        guard_io_sites(allowed).is_empty(),
+        "an `allow-lock-io:` marker must exempt the line"
+    );
+
+    let good = r#"
+    let probe = { let guard = store.lock(); guard.config() };
+    let resp = ureq::post("https://api.example.com").call()?;
+"#;
+    assert!(
+        guard_io_sites(good).is_empty(),
+        "a guard dropped before the I/O must pass"
+    );
+
+    let scrutinee = r#"
+    match daemon.lock().get(id) {
+        Ok(p) => {
+            let resp = ureq::post("https://api.example.com").call()?;
+        }
+        Err(_) => {}
+    }
+"#;
+    assert_eq!(
+        scrutinee_io_sites(scrutinee).len(),
+        1,
+        "I/O inside a scrutinee-held match must be flagged"
+    );
+}
+
+#[test]
+fn callee_detector_flags_a_relock_one_call_away() {
+    let sources = vec![(
+        "fake.rs".to_string(),
+        r#"
+    fn helper(store: &crate::store_lock::StoreHandle) { store.lock().work(); }
+
+    fn caller(store: &crate::store_lock::StoreHandle) {
+        match store.lock().get(id) {
+            Ok(v) => { helper(store); }
+            Err(_) => {}
+        }
+    }
+"#
+        .to_string(),
+    )];
+    let handle_fns = handle_taking_fn_names(&sources);
+    assert!(handle_fns.contains("helper"));
+    assert_eq!(
+        reentrant_via_callee(&sources[0].1, &handle_fns).len(),
+        1,
+        "a callee that takes the handle must be flagged one call level away"
     );
 }

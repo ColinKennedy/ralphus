@@ -109,14 +109,107 @@ impl StoreMutex {
                 acquired_at_ms: now,
             });
         }
-        guard
+        StoreGuard::new(guard, loc)
     }
 }
 
-/// A held store lock. `parking_lot::MutexGuard` derefs to `&Store`/`&mut
-/// Store` exactly like `std::sync::MutexGuard` did, just without the
-/// `Result` wrapper `std::sync::Mutex::lock()` returned.
-pub type StoreGuard<'a> = parking_lot::MutexGuard<'a, Store>;
+/// A held store lock, instrumented by the WS-B.3 guard watchdog: on drop,
+/// how long the guard was held is checked against the watchdog threshold --
+/// a hold that long means blocking work ran under the daemon's one global
+/// lock (an I/O call reached through layers of delegation is exactly what a
+/// source-level lint cannot see). Over the threshold this panics in dev/test
+/// builds and logs a WARNING plus a Cartographer row in release.
+/// Derefs to `&Store`/`&mut Store` exactly like the raw `MutexGuard` it wraps.
+pub struct StoreGuard<'a> {
+    inner: parking_lot::MutexGuard<'a, Store>,
+    acquired_at: Instant,
+    site: &'static Location<'static>,
+}
+
+impl<'a> StoreGuard<'a> {
+    fn new(inner: parking_lot::MutexGuard<'a, Store>, site: &'static Location<'static>) -> Self {
+        Self {
+            inner,
+            acquired_at: Instant::now(),
+            site,
+        }
+    }
+}
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for StoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.inner
+    }
+}
+
+/// Guard holds at or above this many milliseconds are watchdog-worthy
+/// (log + Cartographer row, and a panic in dev/test builds).
+const GUARD_HOLD_WARN_MS: u128 = 100;
+
+/// Panic threshold for the guard watchdog, in milliseconds; `0` disables
+/// panicking (release builds log instead). Dev (`debug_assertions`) panics at
+/// the warn threshold so a regression fails loudly and immediately; test
+/// builds tolerate slow machines up to 5 s -- enough to catch a genuinely
+/// stuck hold without flaking on CI load -- and both are overridable via
+/// `RALPHUS_GUARD_HOLD_PANIC_MS` (set it very large to disable panicking).
+fn guard_hold_panic_ms() -> u128 {
+    let default = if cfg!(test) {
+        5_000
+    } else if cfg!(debug_assertions) {
+        GUARD_HOLD_WARN_MS
+    } else {
+        0
+    };
+    std::env::var("RALPHUS_GUARD_HOLD_PANIC_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(default)
+}
+
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        let held_ms = self.acquired_at.elapsed().as_millis();
+        if held_ms < GUARD_HOLD_WARN_MS {
+            return;
+        }
+        let detail = format!(
+            "store guard held for {held_ms}ms (acquired at {}:{})",
+            self.site.file(),
+            self.site.line()
+        );
+        let panic_ms = guard_hold_panic_ms();
+        if panic_ms > 0 && held_ms >= panic_ms {
+            panic!(
+                "{detail} -- the daemon's one global store lock must never be \
+                 held this long; something under the guard is blocking (I/O, a \
+                 subprocess, or a sleep). Drop the guard before the blocking \
+                 work, or justify it with an `allow-lock-io:` comment for the \
+                 source lint in daemon/tests/store_lock_reentrancy.rs"
+            );
+        }
+        crate::rlog!(
+            WARNING,
+            "ralphus [store_lock] {detail} -- blocking work ran under the store lock"
+        );
+        crate::cartographer::Note::new("store_lock")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &self.inner,
+                "long store guard hold",
+                serde_json::json!({
+                    "held_ms": held_ms as u64,
+                    "acquired_at": format!("{}:{}", self.site.file(), self.site.line()),
+                }),
+            );
+    }
+}
 
 /// The daemon's one shared handle to its `Store`, cloned into every
 /// background worker and the HTTP layer alike.
