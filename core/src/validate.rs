@@ -156,7 +156,12 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     };
 
     for key in table.keys() {
-        if key != "default" && key != "task" && key != "review" && key != "submitter" {
+        if key != "default"
+            && key != "task"
+            && key != "review"
+            && key != "waypoint"
+            && key != "submitter"
+        {
             let line = ctx.idx.find_toplevel_key(ctx.raw, key);
             ctx.error(
                 key,
@@ -171,6 +176,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
     validate_submitter(table.get("submitter"), &mut ctx);
     validate_tasks(table.get("task"), &mut ctx);
     validate_review_blocks(table.get("review"), &mut ctx);
+    validate_waypoint_blocks(table, table.get("waypoint"), &mut ctx);
 
     report
 }
@@ -288,6 +294,15 @@ pub const REVIEW_KEYS: &[&str] = &[
     "auto_fix_prompt_template",
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
+];
+/// The full set of top-level `[[waypoint]]` keys (RAL-400).
+pub const WAYPOINT_KEYS: &[&str] = &[
+    "label",
+    "prompt",
+    "agent",
+    "model",
+    "allow_advisory",
+    "roster",
 ];
 /// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
 /// contain -- shared between `[[review]]` submission validation
@@ -1999,6 +2014,180 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
     }
 }
 
+/// Validate top-level `[[waypoint]]` blocks (RAL-400): unknown keys, the
+/// required `prompt`, a non-empty `roster` whose entries are all well-formed
+/// sentinels (see [`crate::schema::parse_roster_entry_sentinel`]), and
+/// agent-aware `model` requiredness (see
+/// [`crate::schema::agent_requires_waypoint_model`]).
+///
+/// A roster entry naming an *existing* review/squad
+/// (`<<review:<id>>>`/`<<squad:<id>>>`) cannot be checked here -- whether
+/// that id exists is only knowable once the daemon's database is in the
+/// loop, the same core/daemon split [`check_review`] already draws for a
+/// cell's own `review` field. A same-file placeholder
+/// (`<<ralphus:new-review/<key>>>`/`<<ralphus:new-squad>>`) is different: it
+/// claims to match something declared in *this same submission*, which
+/// `core` can check offline -- a placeholder with no matching `[[review]]`
+/// id or, for `<<ralphus:new-squad>>`, no `[[task]]` at all, is a definite
+/// submit error rather than something deferred to the daemon.
+fn validate_waypoint_blocks(root: &toml::Table, value: Option<&toml::Value>, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(arr) = value.as_array() else {
+        ctx.error(
+            "waypoint",
+            ErrorKind::WrongType,
+            "[[waypoint]] must be an array of tables",
+            None,
+        );
+        return;
+    };
+
+    let review_ids: HashSet<&str> = root
+        .get("review")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter_map(|t| t.get("id"))
+        .filter_map(toml::Value::as_str)
+        .collect();
+    let has_task_group = root
+        .get("task")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|a| a.iter().any(|t| t.as_table().is_some()));
+
+    for (w, item) in arr.iter().enumerate() {
+        let wpath = format!("waypoint[{w}]");
+        let Some(table) = item.as_table() else {
+            ctx.error(
+                &wpath,
+                ErrorKind::WrongType,
+                "each [[waypoint]] must be a table",
+                None,
+            );
+            continue;
+        };
+        let header = ctx.idx.waypoint_line(w);
+        unknown_keys(ctx, table, WAYPOINT_KEYS, &wpath, header);
+        check_type(ctx, table, "label", Ty::Str, &wpath, header);
+        check_type(ctx, table, "agent", Ty::Str, &wpath, header);
+        check_type(ctx, table, "model", Ty::Str, &wpath, header);
+        check_type(ctx, table, "allow_advisory", Ty::Bool, &wpath, header);
+
+        match table.get("prompt") {
+            None => ctx.error(
+                &wpath,
+                ErrorKind::MissingRequired,
+                "waypoint requires a 'prompt'",
+                header,
+            ),
+            Some(toml::Value::String(s)) if s.trim().is_empty() => ctx.error(
+                &format!("{wpath}.prompt"),
+                ErrorKind::InvalidValue,
+                "'prompt' must not be empty",
+                ctx.key_line(header, "prompt"),
+            ),
+            Some(toml::Value::String(_)) => {}
+            Some(_) => check_type(ctx, table, "prompt", Ty::Str, &wpath, header),
+        }
+
+        if let Some(agent) = table.get("agent").and_then(toml::Value::as_str) {
+            if crate::schema::RESERVED_AGENT_NAMES.contains(&agent) {
+                match crate::schema::agent_requires_waypoint_model(agent) {
+                    Some(true) if !table.contains_key("model") => ctx.error(
+                        &format!("{wpath}.model"),
+                        ErrorKind::MissingRequired,
+                        format!("'model' is required for the '{agent}' agent"),
+                        header,
+                    ),
+                    Some(false) if table.contains_key("model") => ctx.error(
+                        &format!("{wpath}.model"),
+                        ErrorKind::ConflictingKeys,
+                        format!("'model' is not accepted for the '{agent}' agent"),
+                        ctx.key_line(header, "model"),
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        match table.get("roster") {
+            None => ctx.error(
+                &wpath,
+                ErrorKind::MissingRequired,
+                "'roster' is required and must name at least one review/squad",
+                header,
+            ),
+            Some(v) => match v.as_array() {
+                None => check_type(ctx, table, "roster", Ty::StrArray, &wpath, header),
+                Some(items) => {
+                    if items.is_empty() {
+                        ctx.error(
+                            &format!("{wpath}.roster"),
+                            ErrorKind::InvalidValue,
+                            "'roster' must name at least one review/squad",
+                            ctx.key_line(header, "roster"),
+                        );
+                    }
+                    for (i, entry) in items.iter().enumerate() {
+                        let epath = format!("{wpath}.roster[{i}]");
+                        let Some(s) = entry.as_str() else {
+                            ctx.error(
+                                &epath,
+                                ErrorKind::WrongType,
+                                "each 'roster' entry must be a string",
+                                None,
+                            );
+                            continue;
+                        };
+                        let Some(parsed) = crate::schema::parse_roster_entry_sentinel(s) else {
+                            ctx.error(
+                                &epath,
+                                ErrorKind::InvalidValue,
+                                "roster entry must be wrapped in \"<<...>>\" sentinel syntax, \
+                                 e.g. \"<<review:backend>>\", \"<<squad:squad-abc>>\", \
+                                 \"<<ralphus:new-review/<key>>>\", or \"<<ralphus:new-squad>>\"",
+                                None,
+                            );
+                            continue;
+                        };
+                        match parsed {
+                            crate::schema::RosterEntryRef::ExistingReview(id)
+                                if id.starts_with("ralphus:") =>
+                            {
+                                if !review_ids.contains(id.as_str()) {
+                                    ctx.error(
+                                        &epath,
+                                        ErrorKind::InvalidValue,
+                                        format!(
+                                            "roster entry \"{s}\" names a same-file placeholder \
+                                             that does not match any [[review]].id in this \
+                                             submission"
+                                        ),
+                                        None,
+                                    );
+                                }
+                            }
+                            crate::schema::RosterEntryRef::NewSquad if !has_task_group => {
+                                ctx.error(
+                                    &epath,
+                                    ErrorKind::InvalidValue,
+                                    "roster entry \"<<ralphus:new-squad>>\" requires at least \
+                                     one [[task]] in this submission",
+                                    None,
+                                );
+                            }
+                            crate::schema::RosterEntryRef::ExistingReview(_)
+                            | crate::schema::RosterEntryRef::ExistingSquad(_)
+                            | crate::schema::RosterEntryRef::NewSquad => {}
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
 /// Validate `[[review.auto_build]]` entries (RAL-342): declares this review's build
 /// steps, either verbatim `command` or agent-driven `prompt` (mutually
 /// exclusive with each other, mirroring [`validate_review_action_array`]'s
@@ -2717,6 +2906,7 @@ struct HeaderIndex {
     default_lines: Vec<u32>,
     task_lines: Vec<u32>,
     review_lines: Vec<u32>,
+    waypoint_lines: Vec<u32>,
     /// (task_idx, cell_idx) -> line
     cell_lines: HashMap<(usize, usize), u32>,
 }
@@ -2726,6 +2916,7 @@ impl HeaderIndex {
         let mut default_lines = Vec::new();
         let mut task_lines = Vec::new();
         let mut review_lines = Vec::new();
+        let mut waypoint_lines = Vec::new();
         let mut cell_lines = HashMap::new();
         let mut cur_task: isize = -1;
         let mut cur_cell: isize = -1;
@@ -2746,6 +2937,7 @@ impl HeaderIndex {
                     }
                 }
                 Some("[[review]]") => review_lines.push(ln),
+                Some("[[waypoint]]") => waypoint_lines.push(ln),
                 _ => {}
             }
         }
@@ -2753,6 +2945,7 @@ impl HeaderIndex {
             default_lines,
             task_lines,
             review_lines,
+            waypoint_lines,
             cell_lines,
         }
     }
@@ -2767,6 +2960,10 @@ impl HeaderIndex {
 
     fn review_line(&self, r: usize) -> Option<u32> {
         self.review_lines.get(r).copied()
+    }
+
+    fn waypoint_line(&self, w: usize) -> Option<u32> {
+        self.waypoint_lines.get(w).copied()
     }
 
     fn cell_line(&self, t: usize, s: usize) -> Option<u32> {
