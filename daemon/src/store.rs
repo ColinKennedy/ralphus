@@ -3459,6 +3459,9 @@ impl Store {
             // waypoint's consolidated event feed.
             "ALTER TABLE pending_injections ADD COLUMN waypoint_id TEXT",
             "CREATE INDEX IF NOT EXISTS idx_carto_scope_at ON cartographer_events(scope, at_ms)",
+            // RAL-509: persist the transient fork-side upstream branch name for
+            // dual_root_pr targets once allocated.
+            "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
