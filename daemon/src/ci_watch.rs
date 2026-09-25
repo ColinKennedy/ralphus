@@ -737,6 +737,25 @@ pub fn poll_open_pr_ci_status(
                 decision.failure,
                 &client,
             );
+        } else if decision.not_ready {
+            log_ci_watch(
+                store,
+                guardian_id,
+                decision.pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} pr #{} auto-fix deferred: this \
+                     branch has no review worktree yet -- will retry once it's ready",
+                    decision.pr.pr_number.unwrap_or_default()
+                ),
+                serde_json::json!({
+                    "pr_number": decision.pr.pr_number,
+                    "outcome": "deferred_no_worktree",
+                }),
+            );
+            let _ = store
+                .lock()
+                .set_pr_auto_fix_outcome(&decision.pr.id, "deferred_no_worktree");
         } else {
             log_ci_watch(
                 store,
@@ -754,6 +773,9 @@ pub fn poll_open_pr_ci_status(
                     "outcome": "deferred_upstream_failing",
                 }),
             );
+            let _ = store
+                .lock()
+                .set_pr_auto_fix_outcome(&decision.pr.id, "deferred_upstream_failing");
         }
     }
 }
@@ -764,8 +786,15 @@ struct AutoFixDecision<'a> {
     pr: &'a PullRequestView,
     failure: &'a PrFailure,
     /// `true` when no earlier-position branch in the same stack also has a
-    /// currently-failing PR.
+    /// currently-failing PR AND this PR's own branch is ready (see
+    /// [`branch_ready_for_auto_fix`]).
     dispatch: bool,
+    /// RAL-509: `true` when this PR's own branch isn't ready for a fix to be
+    /// applied yet (no review worktree -- e.g. a `collecting` guardian whose
+    /// branch hasn't restacked yet) -- distinct from `!dispatch` on its own,
+    /// which is also `true` for a perfectly ready branch that's merely
+    /// blocked behind a failing upstream sibling.
+    not_ready: bool,
 }
 
 /// This guardian's `[BranchView::position]` for the branch a PR was opened
@@ -783,6 +812,26 @@ fn pr_stack_position(guardian: &GuardianView, pr: &PullRequestView) -> i64 {
         .map_or(i64::MAX, |b| b.position)
 }
 
+/// RAL-509: `true` once the branch a PR's fix would land on actually has a
+/// review worktree to apply that fix in -- i.e. `pr_fix_branch_id` resolves
+/// to an enabled branch that has already restacked. A `collecting` guardian
+/// can have sibling branches still queued behind earlier tasks
+/// (`MergeStatus::Pending`, no worktree yet) even while another branch in the
+/// same stack already has an open, failing PR; dispatching into a branch with
+/// no worktree is exactly the case `run_feedback` itself refuses (it marks
+/// the guardian `MergeFailed` with "no review worktree yet" instead), so this
+/// gate keeps that failure from ever being reached by auto-fix in the first
+/// place.
+fn branch_ready_for_auto_fix(guardian: &GuardianView, pr: &PullRequestView) -> bool {
+    let Some(branch_id) = pr_fix_branch_id(guardian, pr) else {
+        return false;
+    };
+    guardian
+        .branches
+        .iter()
+        .any(|b| b.id == branch_id && b.worktree.is_some())
+}
+
 /// Decide which of this pass's failing PRs are safe to auto-fix right now
 /// (RAL-<new>): a stacked review branch is rebuilt on top of every
 /// earlier-position branch's content on its next restack, so auto-fixing a
@@ -795,14 +844,27 @@ fn pr_stack_position(guardian: &GuardianView, pr: &PullRequestView) -> i64 {
 /// single-attempt-per-failure budget): an exhausted, still-failing upstream
 /// attempt leaves the same broken code in place, so downstream must keep
 /// waiting for a human either way.
+///
+/// RAL-509: a not-ready branch (see [`branch_ready_for_auto_fix`]) is never
+/// dispatched into, but it also never counts as an "upstream failing" blocker
+/// for a later, ready sibling -- a branch with no worktree yet has nothing to
+/// fix and nothing to rebase out from under a downstream branch either, so
+/// treating it as a blocker would stall a perfectly fixable sibling PR for no
+/// reason. Once that branch itself becomes ready and is still failing, it
+/// resumes blocking downstream normally on a later pass.
 fn plan_auto_fix_dispatch<'a>(
     guardian: &GuardianView,
     polled: &'a [(PullRequestView, PrCiState)],
 ) -> Vec<AutoFixDecision<'a>> {
-    let mut ordered: Vec<(i64, &PullRequestView, &PrFailure)> = polled
+    let mut ordered: Vec<(i64, &PullRequestView, &PrFailure, bool)> = polled
         .iter()
         .filter_map(|(pr, state)| match state {
-            PrCiState::Failing(failure) => Some((pr_stack_position(guardian, pr), pr, failure)),
+            PrCiState::Failing(failure) => Some((
+                pr_stack_position(guardian, pr),
+                pr,
+                failure,
+                branch_ready_for_auto_fix(guardian, pr),
+            )),
             _ => None,
         })
         .collect();
@@ -810,13 +872,16 @@ fn plan_auto_fix_dispatch<'a>(
     let mut upstream_failing = false;
     ordered
         .into_iter()
-        .map(|(_, pr, failure)| {
+        .map(|(_, pr, failure, ready)| {
             let decision = AutoFixDecision {
                 pr,
                 failure,
-                dispatch: !upstream_failing,
+                dispatch: ready && !upstream_failing,
+                not_ready: !ready,
             };
-            upstream_failing = true;
+            if ready {
+                upstream_failing = true;
+            }
             decision
         })
         .collect()
@@ -1011,6 +1076,9 @@ pub fn dispatch_pr_auto_fix(
             ),
             serde_json::json!({"pr_number": pr.pr_number, "outcome": "skipped_not_enabled"}),
         );
+        let _ = store
+            .lock()
+            .set_pr_auto_fix_outcome(&pr.id, "skipped_not_enabled");
         return;
     }
     let Some(branch_id) = pr_fix_branch_id(guardian, pr) else {
@@ -1027,6 +1095,9 @@ pub fn dispatch_pr_auto_fix(
             ),
             serde_json::json!({"pr_number": pr.pr_number, "outcome": "skipped_no_branch"}),
         );
+        let _ = store
+            .lock()
+            .set_pr_auto_fix_outcome(&pr.id, "skipped_no_branch");
         return;
     };
     let cfg = store
@@ -1061,6 +1132,9 @@ pub fn dispatch_pr_auto_fix(
                 ),
                 serde_json::json!({"pr_number": pr.pr_number, "outcome": "deferred_backoff", "next_attempt_at_ms": next_attempt_at_ms}),
             );
+            let _ = store
+                .lock()
+                .set_pr_auto_fix_outcome(&pr.id, "deferred_backoff");
             return;
         }
         Ok(AutoFixClaim::Exhausted { attempts }) => {
@@ -1080,6 +1154,7 @@ pub fn dispatch_pr_auto_fix(
                     "attempts": attempts,
                 }),
             );
+            let _ = store.lock().set_pr_auto_fix_outcome(&pr.id, "exhausted");
             if pr.auto_fix_exhausted_notified_at_ms.is_none() {
                 enqueue_auto_fix_exhausted_notice(store, guardian, pr, failure);
             }
@@ -1098,6 +1173,7 @@ pub fn dispatch_pr_auto_fix(
                 ),
                 serde_json::json!({"pr_number": pr.pr_number, "outcome": "claim_failed", "error": error.to_string()}),
             );
+            let _ = store.lock().set_pr_auto_fix_outcome(&pr.id, "claim_failed");
             return;
         }
     }
@@ -1330,6 +1406,9 @@ fn run_pr_fix(
         ),
         serde_json::json!({"pr_number": pr.pr_number, "outcome": "auto_fix_dispatching"}),
     );
+    let _ = store
+        .lock()
+        .set_pr_auto_fix_outcome(&pr.id, "auto_fix_dispatching");
     let outcome = crate::guardian_merge::run_feedback(
         store,
         runner,
@@ -1379,6 +1458,9 @@ fn run_pr_fix(
                 "outcome": "auto_fix_not_attempted",
             }),
         );
+        let _ = store
+            .lock()
+            .set_pr_auto_fix_outcome(&pr.id, "auto_fix_not_attempted");
         return;
     };
     log_ci_watch(
@@ -1407,6 +1489,14 @@ fn run_pr_fix(
             "committed": outcome.committed,
             "pushed": outcome.pushed,
         }),
+    );
+    let _ = store.lock().set_pr_auto_fix_outcome(
+        &pr.id,
+        if passed {
+            "auto_fix_passed"
+        } else {
+            "auto_fix_failed"
+        },
     );
 }
 
@@ -1547,6 +1637,17 @@ mod tests {
         let guardian = guard.get_guardian(&id).unwrap();
         let bid0 = guardian.branches[0].id.clone();
         let bid1 = guardian.branches[1].id.clone();
+        // Both branches have already finished collecting and restacked --
+        // the readiness state `branch_ready_for_auto_fix` (RAL-509) expects
+        // of every branch these shared `plan_auto_fix_dispatch` tests dispatch
+        // into. `not_ready`-specific behavior gets its own fixture below.
+        guard
+            .set_branch_review(&id, &bid0, "guardian/1/a", "/tmp/x/a")
+            .unwrap();
+        guard
+            .set_branch_review(&id, &bid1, "guardian/1/b", "/tmp/x/b")
+            .unwrap();
+        let guardian = guard.get_guardian(&id).unwrap();
         let pr0_id = guard
             .create_pull_request(
                 &id,
@@ -1625,5 +1726,201 @@ mod tests {
             "a failing downstream PR must dispatch once its upstream is no longer failing"
         );
         assert_eq!(decisions[0].pr.id, pr1.id);
+    }
+
+    /// Like [`two_branch_stack_with_open_prs`], but lets each test control
+    /// whether a branch has already restacked into a review worktree --
+    /// RAL-509's `not_ready` cases (a `collecting` guardian's straggler
+    /// branch) need a branch with no worktree at all.
+    fn two_branch_stack_with_open_prs_readiness(
+        store: &crate::store_lock::StoreHandle,
+        ready0: bool,
+        ready1: bool,
+    ) -> (GuardianView, PullRequestView, PullRequestView) {
+        let guard = store.lock();
+        let id = guard.create_guardian("r", "main", "/tmp/x").unwrap();
+        guard.add_guardian_branch(&id, "feature/a").unwrap();
+        guard.add_guardian_branch(&id, "feature/b").unwrap();
+        let guardian = guard.get_guardian(&id).unwrap();
+        let bid0 = guardian.branches[0].id.clone();
+        let bid1 = guardian.branches[1].id.clone();
+        if ready0 {
+            guard
+                .set_branch_review(&id, &bid0, "guardian/1/a", "/tmp/x/a")
+                .unwrap();
+        }
+        if ready1 {
+            guard
+                .set_branch_review(&id, &bid1, "guardian/1/b", "/tmp/x/b")
+                .unwrap();
+        }
+        let guardian = guard.get_guardian(&id).unwrap();
+        let pr0_id = guard
+            .create_pull_request(
+                &id,
+                Some(&bid0),
+                "github",
+                "acme/w",
+                "a-alias",
+                "main",
+                "T",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let pr1_id = guard
+            .create_pull_request(
+                &id,
+                Some(&bid1),
+                "github",
+                "acme/w",
+                "b-alias",
+                "main",
+                "T",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+        let pr0 = guard.get_pull_request(&pr0_id).unwrap();
+        let pr1 = guard.get_pull_request(&pr1_id).unwrap();
+        (guardian, pr0, pr1)
+    }
+
+    #[test]
+    fn plan_auto_fix_dispatch_marks_a_branch_without_a_worktree_as_not_ready() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // Only the upstream branch exists for this test; the downstream PR
+        // is irrelevant to it and is left passing.
+        let (guardian, pr0, pr1) = two_branch_stack_with_open_prs_readiness(&store, false, true);
+        let polled = vec![(pr0.clone(), failing("a")), (pr1, PrCiState::Passing)];
+        let decisions = plan_auto_fix_dispatch(&guardian, &polled);
+        let upstream = decisions.iter().find(|d| d.pr.id == pr0.id).unwrap();
+        assert!(
+            !upstream.dispatch,
+            "a branch with no review worktree yet must never be dispatched into"
+        );
+        assert!(
+            upstream.not_ready,
+            "the decision must say *why* it didn't dispatch: no worktree, not just blocked"
+        );
+    }
+
+    #[test]
+    fn plan_auto_fix_dispatch_lets_a_ready_downstream_pr_run_while_its_not_ready_upstream_waits() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // Upstream branch hasn't restacked into a worktree yet (still
+        // collecting); downstream branch has and is failing CI.
+        let (guardian, pr0, pr1) = two_branch_stack_with_open_prs_readiness(&store, false, true);
+        let polled = vec![(pr0.clone(), failing("a")), (pr1.clone(), failing("b"))];
+        let decisions = plan_auto_fix_dispatch(&guardian, &polled);
+        let upstream = decisions.iter().find(|d| d.pr.id == pr0.id).unwrap();
+        let downstream = decisions.iter().find(|d| d.pr.id == pr1.id).unwrap();
+        assert!(
+            !upstream.dispatch,
+            "the not-ready branch is never dispatched into"
+        );
+        assert!(
+            downstream.dispatch,
+            "a not-ready upstream branch must not block a ready downstream sibling"
+        );
+    }
+
+    #[test]
+    fn plan_auto_fix_dispatch_resumes_blocking_downstream_once_upstream_lands_and_still_fails() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard.create_guardian("r", "main", "/tmp/x").unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.add_guardian_branch(&id, "feature/b").unwrap();
+            let guardian = guard.get_guardian(&id).unwrap();
+            let bid1 = guardian.branches[1].id.clone();
+            // Only the downstream branch has restacked so far -- the upstream
+            // branch is still collecting.
+            guard
+                .set_branch_review(&id, &bid1, "guardian/1/b", "/tmp/x/b")
+                .unwrap();
+            id
+        };
+        let (bid0, pr0, pr1) = {
+            let guard = store.lock();
+            let guardian = guard.get_guardian(&id).unwrap();
+            let bid0 = guardian.branches[0].id.clone();
+            let bid1 = guardian.branches[1].id.clone();
+            let pr0_id = guard
+                .create_pull_request(
+                    &id,
+                    Some(&bid0),
+                    "github",
+                    "acme/w",
+                    "a-alias",
+                    "main",
+                    "T",
+                    "",
+                    Some(1),
+                    None,
+                )
+                .unwrap();
+            let pr1_id = guard
+                .create_pull_request(
+                    &id,
+                    Some(&bid1),
+                    "github",
+                    "acme/w",
+                    "b-alias",
+                    "main",
+                    "T",
+                    "",
+                    Some(2),
+                    None,
+                )
+                .unwrap();
+            (
+                bid0,
+                guard.get_pull_request(&pr0_id).unwrap(),
+                guard.get_pull_request(&pr1_id).unwrap(),
+            )
+        };
+
+        // First tick: upstream branch is still not ready, so the ready
+        // downstream sibling is allowed to run.
+        let guardian = { store.lock().get_guardian(&id).unwrap() };
+        let polled = vec![(pr0.clone(), failing("a")), (pr1.clone(), failing("b"))];
+        let decisions = plan_auto_fix_dispatch(&guardian, &polled);
+        let downstream = decisions.iter().find(|d| d.pr.id == pr1.id).unwrap();
+        assert!(
+            downstream.dispatch,
+            "must dispatch downstream while upstream is still not ready"
+        );
+
+        // The upstream branch "lands" (finishes collecting and restacks)
+        // and its CI is still failing -- it must now resume blocking the
+        // downstream sibling, exactly as if it had been ready all along.
+        {
+            let guard = store.lock();
+            guard
+                .set_branch_review(&id, &bid0, "guardian/1/a", "/tmp/x/a")
+                .unwrap();
+        }
+        let guardian = { store.lock().get_guardian(&id).unwrap() };
+        let decisions = plan_auto_fix_dispatch(&guardian, &polled);
+        let upstream = decisions.iter().find(|d| d.pr.id == pr0.id).unwrap();
+        let downstream = decisions.iter().find(|d| d.pr.id == pr1.id).unwrap();
+        assert!(
+            upstream.dispatch,
+            "the now-ready upstream branch is the one that should run next"
+        );
+        assert!(
+            !downstream.dispatch,
+            "once upstream is ready and still failing, it must resume blocking downstream"
+        );
     }
 }

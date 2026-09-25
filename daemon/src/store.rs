@@ -3001,6 +3001,17 @@ impl Store {
             "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_targets TEXT",
             "ALTER TABLE guardians ADD COLUMN base_shift_exhausted_notified_at_ms INTEGER",
+            // RAL-509: the latest reason `dispatch_pr_auto_fix`/
+            // `plan_auto_fix_dispatch` did or did not run for this PR --
+            // `"skipped_not_enabled"`, `"deferred_upstream_failing"`,
+            // `"deferred_backoff"`, `"deferred_no_worktree"`, `"exhausted"`,
+            // etc, mirroring the `outcome` field already logged to
+            // Cartographer by `ci_watch::log_ci_watch`. Kept as its own
+            // column (not folded into `auto_fix_error`) since it also covers
+            // ordinary, non-error skip/defer outcomes that `auto_fix_error`
+            // was never meant to carry. `None` for a PR never evaluated for
+            // auto-fix yet.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_last_outcome TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }

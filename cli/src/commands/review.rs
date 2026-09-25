@@ -1788,7 +1788,13 @@ fn dispatch_pr(cmd: ReviewPrCommand, opts: &GlobalOpts, client: &DaemonClient) -
                 println!(
                     "{}: {} (#{}, {})",
                     r["id"], r["title"], r["pr_number"], r["state"]
-                )
+                );
+                // RAL-509: the last auto-fix outcome, when set, explains why
+                // (or whether) unattended auto-fix ran for this PR's most
+                // recent failure -- see `Store::set_pr_auto_fix_outcome`.
+                if let Some(outcome) = r["auto_fix_last_outcome"].as_str() {
+                    println!("auto-fix: {outcome}");
+                }
             });
             Ok(())
         }),
@@ -2669,8 +2675,16 @@ fn render_pr_list(rows: &Value) {
         } else {
             format!("branch {}", r["branch_id"])
         };
+        // RAL-509: surface the last auto-fix outcome (e.g.
+        // "deferred_no_worktree", "deferred_backoff", "auto_fix_passed") so a
+        // failing PR that auto-fix deliberately skipped is legible from the
+        // CLI, not just a DEBUG Cartographer row.
+        let auto_fix_label = r["auto_fix_last_outcome"]
+            .as_str()
+            .map(|o| format!("  auto-fix:{o}"))
+            .unwrap_or_default();
         println!(
-            "{}  {pos_label}  #{}  {}  {}",
+            "{}  {pos_label}  #{}  {}  {}{auto_fix_label}",
             r["id"], r["pr_number"], r["state"], r["title"]
         );
     }

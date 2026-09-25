@@ -6849,7 +6849,19 @@ pub fn run_feedback(
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| review_ref_of(id, branch));
+    // RAL-509: a downstream branch that hasn't finished collecting yet (still
+    // `pending`, never marked ready) must not be forced through a build just
+    // because an upstream sibling's feedback/auto-fix landed -- halt the
+    // restack here, exactly like `staged_merge_pass`'s own prefix stop, so
+    // `run_merge_staged` resumes this branch from the just-updated upstream
+    // tip once it actually lands (see
+    // `auto_fix_during_collection_folds_into_stack_once_the_straggler_lands`).
+    let mut halted_on_still_collecting = false;
     for ob in &downstream {
+        if ob.merge_status == MergeStatus::Pending.as_str() {
+            halted_on_still_collecting = true;
+            break;
+        }
         let _ = store
             .lock()
             .set_branch_status(id, &ob.id, MergeStatus::InProgress, None);
@@ -6901,6 +6913,22 @@ pub fn run_feedback(
             return outcome;
         }
         prev_ref = rev;
+    }
+
+    if halted_on_still_collecting {
+        // RAL-509: don't finalize -- a downstream branch is still waiting on
+        // its own task to finish collecting. Re-baseline whatever DID get
+        // restacked above (if anything) so future manual-push detection
+        // compares against the new tips, then drop back to `Collecting`
+        // rather than `InReview`; the still-pending branch's eventual
+        // `run_merge_staged` pass resumes from `prev_ref` (this branch's
+        // updated tip) via `staged_resume_point`.
+        snapshot_review_heads(store, id);
+        set_status(
+            GuardianStatus::Collecting,
+            Some("waiting for a still-collecting downstream branch"),
+        );
+        return outcome;
     }
 
     match finalize_review(store, runner, &root, &wt_base, id, &prev_ref, cancel) {
@@ -7123,6 +7151,14 @@ static MAINTAINING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::n
 /// different operations and must not block each other.
 static REOPENING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Guardian ids with a `collecting`-only CI poll in flight (RAL-509).
+/// Separate from [`MAINTAINING`]: a `collecting` guardian never enters the
+/// full maintenance path below (rebuild/rebase/PR-merge-check), so sharing
+/// that set would just make this poll wait behind unrelated work for no
+/// reason -- and would let a `collecting` guardian that later transitions to
+/// `in_review` mid-poll fail to claim [`MAINTAINING`] on the very next tick.
+static CI_POLLING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Last idle-tier maintenance pass per guardian id — see
 /// `scheduler::REVIEW_IDLE_MAINT_INTERVAL`. Pruned on every pass to the set of
 /// guardians still in a maintained status, so it cannot grow without bound
@@ -7194,6 +7230,39 @@ impl Drop for InFlightClaim {
     }
 }
 
+/// RAL-509: guardians eligible for the full maintenance pass below the
+/// `collecting`-only CI poll in [`review_maintenance`] -- merge-check,
+/// stack sync, ancestry repair, and (via [`rebuild_on_base_shift`]/
+/// [`rebase_on_manual_push`]) the base-shift/manual-push restacks. A
+/// `collecting` guardian's branch set isn't finalized yet, so none of that
+/// pass is safe to run for it; only [`crate::ci_watch::poll_open_pr_ci_status`]
+/// (and the auto-fix it may dispatch) is. Pulled out to a pure function so
+/// this exclusion has its own regression test
+/// (`full_maintenance_candidates_excludes_collecting_and_terminal_statuses`),
+/// separate from the thread-spawning side effects around it -- several of
+/// the functions this pass reaches (`crate::pr::check_pr_merges`,
+/// `crate::pr::sync_open_pr_branches`, `crate::pr::verify_and_repair_stack_ancestry`,
+/// `repair_missing_final_summary`) have no internal `collecting` guard of
+/// their own and rely entirely on this filter to never see one.
+fn full_maintenance_candidates(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    pairs
+        .into_iter()
+        // RAL-300: `merging`/`merge_stopped` are included too (beyond the
+        // base-shift/manual-push targets below) purely so the PR-merge
+        // check just below can catch a PR that merged out-of-band while
+        // this review's own rebase/feedback pass is what's using its
+        // worktrees right now -- `rebuild_on_base_shift`/
+        // `rebase_on_manual_push` already self-gate on `in_review`/
+        // `merge_failed` and simply no-op for the other two.
+        .filter(|(_, status)| {
+            matches!(
+                status.as_str(),
+                "in_review" | "merge_failed" | "merging" | "merge_stopped"
+            )
+        })
+        .collect()
+}
+
 /// Poll every review for a base-branch shift and rebuild any that drifted, each
 /// on its own thread. Called periodically by the scheduler loop so that new
 /// commits landing on a review's base branch are picked up automatically.
@@ -7233,27 +7302,41 @@ pub fn review_maintenance(
         });
     }
 
-    let candidates: Vec<(String, String)> = {
+    let all_status_pairs: Vec<(String, String)> = {
         let guard = store.lock();
-        guard
-            .list_guardian_status_pairs()
-            .unwrap_or_default()
-            .into_iter()
-            // RAL-300: `merging`/`merge_stopped` are included too (beyond the
-            // base-shift/manual-push targets below) purely so the PR-merge
-            // check just below can catch a PR that merged out-of-band while
-            // this review's own rebase/feedback pass is what's using its
-            // worktrees right now -- `rebuild_on_base_shift`/
-            // `rebase_on_manual_push` already self-gate on `in_review`/
-            // `merge_failed` and simply no-op for the other two.
-            .filter(|(_, status)| {
-                matches!(
-                    status.as_str(),
-                    "in_review" | "merge_failed" | "merging" | "merge_stopped"
-                )
-            })
-            .collect()
+        guard.list_guardian_status_pairs().unwrap_or_default()
     };
+    // RAL-509: a `collecting` guardian can already have submitted, rebased
+    // PRs with failing CI for the branches that have finished collecting --
+    // only the CI standing poll (and the auto-fix it may dispatch) is safe to
+    // run this early, never the full maintenance pass below. That pass
+    // rebuilds/rebases the guardian's worktrees and treats a merged PR as
+    // grounds to approve the review outright, both of which assume the
+    // guardian's branch set is finalized -- exactly what `collecting` means
+    // it is not yet. `poll_open_pr_ci_status` itself already tolerates being
+    // called on a non-terminal guardian of any status, and
+    // `ci_watch::plan_auto_fix_dispatch` separately refuses to dispatch into
+    // any branch that isn't ready (no review worktree yet), so a straggler
+    // branch still waiting on its own task cells is never touched here.
+    let collecting_ids: Vec<String> = all_status_pairs
+        .iter()
+        .filter(|(_, status)| status == "collecting")
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in collecting_ids {
+        let Some(claim) = InFlightClaim::acquire(&CI_POLLING, &id) else {
+            continue;
+        };
+        let store = Arc::clone(store);
+        std::thread::spawn(move || {
+            let _claim = claim;
+            let runner =
+                crate::runner::SubprocessRunner::from_env().with_cartographer(Arc::clone(&store));
+            crate::ci_watch::poll_open_pr_ci_status(&store, &runner, &id);
+        });
+    }
+
+    let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
     // Store lock released. Now apply the per-status cadence: an idle-tier
     // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
     let ids = filter_by_idle_cadence(&candidates);
@@ -11621,6 +11704,40 @@ mod tests {
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());
+    }
+
+    #[test]
+    fn full_maintenance_candidates_excludes_collecting_and_terminal_statuses() {
+        // RAL-509: `collecting` must never reach the full maintenance pass
+        // (check_pr_merges, sync_open_pr_branches, verify_and_repair_stack_ancestry,
+        // repair_missing_final_summary, and the base-shift/manual-push
+        // restacks) -- only the standing CI poll above it in
+        // `review_maintenance` is safe for a still-collecting guardian.
+        // Several of those functions have no internal `collecting` guard of
+        // their own, so this filter is their only protection; pin it here.
+        let pairs = vec![
+            ("collecting-1".to_string(), "collecting".to_string()),
+            ("in-review-1".to_string(), "in_review".to_string()),
+            ("merge-failed-1".to_string(), "merge_failed".to_string()),
+            ("merging-1".to_string(), "merging".to_string()),
+            ("merge-stopped-1".to_string(), "merge_stopped".to_string()),
+            ("merged-1".to_string(), "merged".to_string()),
+            ("cancelled-1".to_string(), "cancelled".to_string()),
+            ("deployed-1".to_string(), "deployed".to_string()),
+        ];
+        let ids: Vec<String> = full_maintenance_candidates(pairs)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "in-review-1".to_string(),
+                "merge-failed-1".to_string(),
+                "merging-1".to_string(),
+                "merge-stopped-1".to_string(),
+            ]
+        );
     }
 
     fn root_info(git_root: &str, machine: Option<&str>, status: &str) -> GuardianRootInfo {

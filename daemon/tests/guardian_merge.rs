@@ -23,6 +23,7 @@ use ralphus_daemon::guardian_merge::{
     restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
     stop_guardian_merge, stop_merge_worker_for_cancel,
 };
+use ralphus_daemon::pr::sync_remote_pr_commits;
 use ralphus_daemon::reviews::derive_reviews;
 use ralphus_daemon::runner::{Runner, RunnerResult, RunnerSpec};
 use ralphus_daemon::scheduler::Semaphore;
@@ -1363,6 +1364,108 @@ fn auto_fix_dispatch_folds_into_stack_and_restacks_downstream() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+/// RAL-509: a `collecting` review can already have a straggler branch's PR
+/// open and failing CI while a later branch is still being collected --
+/// `dispatch_pr_auto_fix` must still fold its commit into the linear stack,
+/// and the still-pending branch must pick up the fix once it finally lands.
+#[test]
+fn auto_fix_during_collection_folds_into_stack_once_the_straggler_lands() {
+    let (root, store, id, bids) = staged_feature_repo(&["feature/a", "feature/b"]);
+    // `run_feedback` (the auto-fix resolver path) always pushes the review
+    // branch it just committed to -- without a remote that push fails,
+    // marking the branch `failed` instead of `done` and making the resume
+    // check below (correctly) refuse to reuse its already-fixed tip. Mirrors
+    // `auto_fix_dispatch_folds_into_stack_and_restacks_downstream`'s bare
+    // remote setup.
+    let remote_dir = temp_repo();
+    git(&remote_dir, &["init", "--bare"]);
+    git(
+        &root,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    // Only branch a is ready -- the staged merge builds just its worktree and
+    // returns to `collecting`, exactly like a review still waiting on branch
+    // b's task cells.
+    mark_ready(&store, &id, &bids[0]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(guardian.status, "collecting");
+    assert_eq!(guardian.branches[0].merge_status, "done");
+    assert!(guardian.branches[0].worktree.is_some());
+    assert_eq!(guardian.branches[1].merge_status, "pending");
+
+    let pr_id = store
+        .lock()
+        .create_pull_request(
+            &id,
+            Some(&bids[0]),
+            "github",
+            "acme/w",
+            "feature-a-alias",
+            "main",
+            "T",
+            "",
+            Some(7),
+            Some("https://github.com/acme/w/pull/7"),
+        )
+        .unwrap();
+    store
+        .lock()
+        .set_guardian_auto_fix_pr_errors(&id, Some(true))
+        .unwrap();
+
+    let guardian = store.lock().get_guardian(&id).unwrap();
+    let pr = store.lock().get_pull_request(&pr_id).unwrap();
+    let failure = ralphus_daemon::forge::PrFailure {
+        reason: "check 'build' failed".to_string(),
+        job_url: None,
+        log_text: None,
+        checks: vec![],
+    };
+    let runner = AutoFixRunner::new();
+    let client = test_forge_client();
+    ralphus_daemon::ci_watch::dispatch_pr_auto_fix(
+        &store, &runner, &guardian, &pr, &failure, &client,
+    );
+    assert!(
+        runner.calls.load(Ordering::Relaxed) > 0,
+        "the resolver agent must run against a collecting review's already-ready branch"
+    );
+
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        view.status, "collecting",
+        "an auto-fix on a straggler branch must not itself force the review out of collecting: {:?}",
+        view.detail
+    );
+    let rev_a = view.branches[0].review_branch.clone().unwrap();
+    let files_a = git(&root, &["ls-tree", "-r", "--name-only", &rev_a]);
+    assert!(
+        files_a.contains("fix.txt"),
+        "auto-fix commit must land on branch a: {files_a}"
+    );
+
+    // Branch b now finishes collecting -- the staged merge must resume from
+    // branch a's *fixed* tip, not silently drop the auto-fix commit.
+    mark_ready(&store, &id, &bids[1]);
+    run_merge_staged(&store, &NoopRunner, &id, &CancelToken::never());
+    let final_view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        final_view.status, "in_review",
+        "detail: {:?}",
+        final_view.detail
+    );
+    let rev_b = final_view.branches[1].review_branch.clone().unwrap();
+    let files_b = git(&root, &["ls-tree", "-r", "--name-only", &rev_b]);
+    assert!(
+        files_b.contains("fix.txt") && files_b.contains("a.txt") && files_b.contains("b.txt"),
+        "branch b must restack on top of the straggler's auto-fix commit: {files_b}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 /// RAL-395 addendum: `dispatch_pr_auto_fix` must post its feedback into the
 /// branch's feedback thread attributed to `ci_watch::AUTO_FIX_AUTHOR`, so the
 /// board can tell an automated CI-fix round apart from a human reviewer's own
@@ -2558,6 +2661,122 @@ fn failing_check_gate_fails_the_merge() {
     let view = store.lock().get_guardian(&id).unwrap();
     assert_eq!(view.status, "merge_failed");
     assert!(view.detail.unwrap_or_default().contains("check failed"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-509: `rebuild_on_base_shift`, `rebase_on_manual_push`, and
+// `sync_remote_pr_commits` each self-guard on `guardian.status != "in_review"`
+// (`rebuild_on_base_shift` also accepts `"merge_failed"`), so none of them may
+// do anything for a guardian that is still `collecting` -- exactly the
+// scenario `full_maintenance_candidates` (guardian_merge.rs) is meant to keep
+// out of `review_maintenance`'s full pass in the first place. These three
+// tests call each function directly against a guardian left in its
+// freshly-created `collecting` status (no `run_merge`), proving the guard
+// holds even if a caller ever bypassed the filter.
+#[test]
+fn rebuild_on_base_shift_is_a_noop_while_still_collecting() {
+    let (root, store, id) = single_feature_repo();
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+
+    // Advance the base branch, same as `base_branch_shift_triggers_rebuild`,
+    // so this isn't a no-op merely because there's nothing to rebuild.
+    git(&root, &["checkout", "main"]);
+    write(&root, "c.txt", "on base\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base moves forward"]);
+
+    let sem = Semaphore::new(4);
+    let rebuilt = rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
+    assert!(
+        !rebuilt,
+        "a collecting guardian must never be rebuilt by the base-shift sweep"
+    );
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "collecting");
+    assert!(
+        view.combined_worktree.is_none(),
+        "no combined worktree should have been built"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebase_on_manual_push_is_a_noop_while_still_collecting() {
+    let (root, store, id) = single_feature_repo();
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+
+    let sem = Semaphore::new(4);
+    assert!(
+        !rebase_on_manual_push(&store, &NoopRunner, &id, &sem),
+        "a collecting guardian has no review worktree yet and must never be scanned for a manual push"
+    );
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "collecting");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sync_remote_pr_commits_is_a_noop_while_still_collecting() {
+    let (root, store, id) = single_feature_repo();
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+
+    let pulled = sync_remote_pr_commits(&store, &NoopRunner, &id)
+        .expect("a collecting guardian must not error, just no-op");
+    assert_eq!(
+        pulled, 0,
+        "a collecting guardian has no open PRs to pull remote commits into"
+    );
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "collecting");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-509: `ci_watch::dispatch_pr_fix_manual` (the human-triggered "Action
+// feedback" PR-fix path) deliberately bypasses `auto_fix_pr_errors` and the
+// single-attempt-per-failure cap, and -- unlike `ci_watch::dispatch_pr_auto_fix`
+// -- never consults `ci_watch::branch_ready_for_auto_fix` before dispatching,
+// since it always targets one specific PR/branch a person already picked. Both
+// dispatch paths funnel into this same `run_feedback` core, though, and this
+// core already refuses a branch with no worktree yet on its own (the
+// `branch.worktree` check a few hundred lines above) -- so the manual path's
+// missing readiness pre-check is safe by construction, not by luck: pointed at
+// a still-`collecting` guardian's straggler branch (no `run_merge` yet, same
+// as the three tests above), it must fail closed to `merge_failed` with a
+// legible detail message instead of panicking or silently doing nothing.
+#[test]
+fn run_feedback_refuses_a_branch_with_no_worktree_yet_regardless_of_dispatch_path() {
+    let (root, store, id) = single_feature_repo();
+    let bid0 = store.lock().get_guardian(&id).unwrap().branches[0]
+        .id
+        .clone();
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+
+    let outcome = run_feedback(
+        &store,
+        &NoopRunner,
+        &id,
+        &bid0,
+        "fix the failing check",
+        None,
+        true,
+        &CancelToken::never(),
+    );
+    assert!(
+        !outcome.committed,
+        "no resolver should have run against a branch with no worktree"
+    );
+    assert_eq!(outcome.proof_passed, None);
+
+    let view = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(view.status, "merge_failed");
+    assert!(
+        view.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no review worktree yet"),
+        "expected a legible no-worktree detail, got {:?}",
+        view.detail
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
