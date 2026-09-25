@@ -330,6 +330,12 @@ jobs:
         env:
           RALPHUS_BOARD_TIMING: "1"
         run: cargo nextest run -p ralphus-daemon --test board_cold_load_perf --run-ignored only --test-threads 1
+      # WS-B.4: board reads stay fast while four writers hammer the daemon,
+      # over real HTTP against a real `serve_with`. Also gated here (and not
+      # in the `rust` job) because its budgets are wall-clock -- see the
+      # module doc comment in daemon/tests/board_contention.rs.
+      - name: Rust store contention budget
+        run: cargo nextest run -p ralphus-daemon --test board_contention --run-ignored only --test-threads 1
       - name: Build ralphus-librarian (needed by the browser-side perf test)
         run: cargo build -p ralphus-librarian
       - uses: actions/setup-python@v5
