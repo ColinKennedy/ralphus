@@ -54,6 +54,10 @@ pub struct TaskFile {
     /// [`parse_cell_review_sentinel`]).
     #[serde(default)]
     pub review: Vec<ReviewDef>,
+    /// Top-level waypoint (RAL-400) declarations: named, open/closed join
+    /// points a `roster` of reviews/squads must respect. See [`WaypointDef`].
+    #[serde(default)]
+    pub waypoint: Vec<WaypointDef>,
 }
 
 /// One task: a unit of work made of one or more agent cells plus proof steps.
@@ -1020,6 +1024,57 @@ pub fn parse_cell_review_sentinel(review: &str) -> Option<&str> {
     review_link_key(inner).is_some().then_some(inner)
 }
 
+/// Sentinel prefix for a `[[waypoint]].roster` entry naming an
+/// already-declared squad, `<<squad:<id>>>` (RAL-400). Structurally
+/// identical to [`REVIEW_REF_PREFIX`]'s `<<review:...>>` form -- see
+/// [`parse_roster_entry_sentinel`].
+pub const SQUAD_REF_PREFIX: &str = "<<squad:";
+
+/// Sentinel naming the squad this same submission itself creates,
+/// `<<ralphus:new-squad>>` (RAL-400). Unlike [`REVIEW_LINK_PREFIX`]'s
+/// `ralphus:new-review/<key>`, this carries no `<key>` -- a single
+/// submission file always produces exactly one squad, so there is nothing
+/// to disambiguate between multiple same-file candidates the way several
+/// `[[review]]` blocks require. See
+/// `.agent/waypoints-phase0-decisions.md`'s "Roster-reference sentinel
+/// grammar" section.
+pub const NEW_SQUAD_SENTINEL: &str = "<<ralphus:new-squad>>";
+
+/// A parsed, well-formed `[[waypoint]].roster` entry (RAL-400). Every
+/// roster entry must be wrapped in `<<...>>`, mirroring
+/// [`parse_cell_review_sentinel`]'s rule that a bare/unwrapped id is
+/// invalid -- see `core/src/validate.rs`'s `check_review` precedent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosterEntryRef {
+    /// `<<review:<id>>>` -- an existing `[[review]].id` in the daemon (or,
+    /// same-file, a `[[review]]` block's own id/placeholder in this
+    /// submission).
+    ExistingReview(String),
+    /// `<<squad:<id>>>` -- an existing squad id already known to the
+    /// daemon.
+    ExistingSquad(String),
+    /// `<<ralphus:new-squad>>` -- the squad this same submission creates.
+    NewSquad,
+}
+
+/// Parse a `[[waypoint]].roster` entry (RAL-400). Returns `None` for a
+/// bare/unwrapped or otherwise malformed value -- callers reject those at
+/// validation time exactly as [`parse_cell_review_sentinel`] does for a
+/// cell's `review` field.
+#[must_use]
+pub fn parse_roster_entry_sentinel(entry: &str) -> Option<RosterEntryRef> {
+    if entry == NEW_SQUAD_SENTINEL {
+        return Some(RosterEntryRef::NewSquad);
+    }
+    if let Some(inner) = entry
+        .strip_prefix(SQUAD_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+    {
+        return (!inner.is_empty()).then(|| RosterEntryRef::ExistingSquad(inner.to_string()));
+    }
+    parse_cell_review_sentinel(entry).map(|inner| RosterEntryRef::ExistingReview(inner.to_string()))
+}
+
 /// The reserved `machine` value naming the daemon's own host. Also the
 /// implicit default when `machine` is unset anywhere in the inheritance chain,
 /// so an existing task file that never mentions `machine` keeps running
@@ -1463,6 +1518,46 @@ pub struct ReviewActionInputDef {
     pub default: String,
 }
 
+/// A top-level waypoint declaration via `[[waypoint]]` (RAL-400): a named,
+/// open/closed join point a `roster` of reviews/squads must respect. No
+/// `project` field -- a waypoint's project(s) are inferred by hopping
+/// through its roster entries' own projects, the same "projects are
+/// inferred, not declared" principle used elsewhere in this schema. See
+/// `.agent/waypoints-phase0-decisions.md` for the full design record.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaypointDef {
+    /// GUI label; falls back to a generated id when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The guidance/instruction this waypoint publishes to its roster and
+    /// survey candidates. Required, no silent default.
+    pub prompt: String,
+    /// Backend that runs this waypoint's survey classification pass, e.g.
+    /// `"claude-code"` or `"pi"`. Whether `model` is required, forbidden, or
+    /// unconstrained depends on this value -- see
+    /// [`agent_requires_waypoint_model`].
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Model the survey `agent` runs. Requiredness is agent-aware -- see
+    /// [`agent_requires_waypoint_model`].
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether a roster entry may be left in advisory mode (delivered for
+    /// awareness without blocking) rather than always defaulting to block.
+    /// Defaults off -- the survey's per-entry mode decision still applies,
+    /// this only gates whether it's allowed to land on advisory at all.
+    #[serde(default)]
+    pub allow_advisory: bool,
+    /// The reviews/squads this waypoint tracks as impacted. Each entry must
+    /// be a `<<review:<id>>>` / `<<squad:<id>>>` / `<<ralphus:new-review/<key>>>` /
+    /// `<<ralphus:new-squad>>` sentinel -- see [`parse_roster_entry_sentinel`].
+    /// Must name at least one entry; a waypoint with zero roster entries is
+    /// rejected at creation (vacuous terminality is not a valid starting
+    /// state).
+    #[serde(default)]
+    pub roster: Vec<String>,
+}
+
 /// One proof step. Exactly one of `command` / `brain` / `prompt` must be set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStep {
@@ -1767,6 +1862,30 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
         agent,
         "codex" | "codex-cli" | "pi" | "claude-code" | "claude-cli"
     )
+}
+
+/// Whether `[[waypoint]].model` is required, forbidden, or unconstrained
+/// offline for a given `agent` (RAL-400's "`model` requiredness is
+/// agent-aware" decision, `.agent/waypoints-phase0-decisions.md`).
+///
+/// `Some(true)`: the Claude Code CLI (`claude-code`/`claude-cli`) and the
+/// Codex CLI (`codex`/`codex-cli`) require an explicit model -- `model` must
+/// be set. `Some(false)`: Pi (`pi`) resolves its own default and does not
+/// require one -- `model` must be left unset. `None`: every other agent
+/// (`claude`/`anthropic`/`ollama`/`raw`, and any custom `[agent.profiles.*]`
+/// name outside [`RESERVED_AGENT_NAMES`]) is not classified offline; `core`
+/// leaves the field unconstrained and defers to the daemon, mirroring how
+/// [`agent_supports_system_prompt`] and its siblings classify only
+/// `RESERVED_AGENT_NAMES`-recognized agents and defer custom profiles to
+/// `daemon::agent_profiles::validate_task_file_profiles` (where an agent
+/// profile forbids an explicit `model` entirely).
+#[must_use]
+pub fn agent_requires_waypoint_model(agent: &str) -> Option<bool> {
+    match agent {
+        "claude-code" | "claude-cli" | "codex" | "codex-cli" => Some(true),
+        "pi" => Some(false),
+        _ => None,
+    }
 }
 
 impl ResolvedAgent {
