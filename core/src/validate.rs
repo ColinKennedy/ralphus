@@ -285,6 +285,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "skip_auto_build",
     "auto_fix_pr_errors",
     "auto_fix_prompt_template",
+    "discourage_tests_during_auto_pull_request_fixes",
 ];
 /// RAL-395: the literal placeholder every `auto_fix_prompt_template` must
 /// contain -- shared between `[[review]]` submission validation
@@ -1948,6 +1949,14 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
                 );
             }
         }
+        check_type(
+            ctx,
+            table,
+            "discourage_tests_during_auto_pull_request_fixes",
+            Ty::Bool,
+            &rpath,
+            header,
+        );
         // A `ralphus:`-scheme id must be a well-formed review-link placeholder:
         // `ralphus:new-review/<key>` with a non-empty slug key. Any submission
         // that repeats the same key attaches to one shared guardian.
@@ -3426,6 +3435,32 @@ prompt = "make it build"
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
                 && e.message.contains("auto_fix_prompt_template")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    // ── [[review]] discourage_tests_during_auto_pull_request_fixes (RAL-505) ──
+
+    #[test]
+    fn review_discourage_tests_during_auto_pull_request_fixes_accepted() {
+        for value in ["true", "false"] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\ndiscourage_tests_during_auto_pull_request_fixes={value}\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{value}: {:?}", r.errors);
+        }
+    }
+
+    #[test]
+    fn review_discourage_tests_during_auto_pull_request_fixes_wrong_type_reported() {
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\ndiscourage_tests_during_auto_pull_request_fixes=\"yes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType
+                && e.message
+                    .contains("discourage_tests_during_auto_pull_request_fixes")),
             "{:?}",
             r.errors
         );

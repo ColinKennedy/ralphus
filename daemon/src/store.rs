@@ -725,6 +725,12 @@ pub struct ProjectReviewSettings {
     pub auto_fix_pr_errors: Option<bool>,
     #[serde(default)]
     pub auto_fix_prompt_template: Option<String>,
+    /// RAL-505: project-level default for whether the resolver agent
+    /// dispatched for an automatic PR/MR fix is told to prefer automatic
+    /// formatters/linters/static analysis and avoid broad or expensive test
+    /// suites.
+    #[serde(default)]
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
     /// RAL-476: fallback owning user for a review whose squad has no
     /// `submitter` of its own (e.g. an auto-review triggered with no
     /// explicit submission) -- see `Store::create_guardian_keyed`'s owner
@@ -769,6 +775,8 @@ impl ProjectReviewSettings {
             dual_root_pr: self.dual_root_pr,
             auto_fix_pr_errors: self.auto_fix_pr_errors,
             auto_fix_prompt_template: self.auto_fix_prompt_template,
+            discourage_tests_during_auto_pull_request_fixes: self
+                .discourage_tests_during_auto_pull_request_fixes,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
@@ -2957,6 +2965,16 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN remediation_attempts INTEGER",
             "ALTER TABLE proofs ADD COLUMN mode TEXT",
             "ALTER TABLE proofs ADD COLUMN remediation_attempts INTEGER",
+            // RAL-505: per-review opt-in to tell the resolver agent
+            // dispatched for an automatic PR/MR fix to prefer automatic
+            // formatters/linters/static analysis and avoid broad or
+            // expensive test suites. `NULL` = inherit the project/global
+            // `.ralphus.toml [review]
+            // discourage_tests_during_auto_pull_request_fixes` default
+            // (filled in at creation time by
+            // `reviews::apply_project_review_defaults`, same as
+            // `auto_fix_pr_errors`), then `false`.
+            "ALTER TABLE guardians ADD COLUMN discourage_tests_during_auto_pull_request_fixes INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -15141,6 +15159,7 @@ command = "e"
             auto_submit_pr_stack: Some(true),
             auto_fix_pr_errors: Some(true),
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
+            discourage_tests_during_auto_pull_request_fixes: Some(true),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),
         };

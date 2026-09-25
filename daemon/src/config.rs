@@ -274,6 +274,19 @@ pub struct ReviewConfig {
     /// rate-limit retry loop.
     #[serde(default)]
     pub provider_timeout_max_retries: Option<u32>,
+    /// RAL-505: whether the resolver agent dispatched for an automatic
+    /// pull-request fix is told to prefer automatic formatters/linters/
+    /// static analysis and avoid running broad or expensive test suites.
+    /// `None` means unset, which resolves to `false` (see
+    /// [`Self::discourage_tests_during_auto_pull_request_fixes`]);
+    /// per-project scalars win over the global layer, same as
+    /// `skip_worktrees`. A per-review override (see
+    /// `Guardian::discourage_tests_during_auto_pull_request_fixes` in
+    /// `guardian.rs`) wins over this. Auto-created reviews (Arbiter/Triage)
+    /// have no `[[review]]` block to override it with, so they always use
+    /// this project default.
+    #[serde(default)]
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
@@ -282,6 +295,16 @@ pub struct ReviewConfig {
 /// machine" phrasing (not "locally") is deliberate: the fix may run on a
 /// remote machine.
 pub const DEFAULT_AUTO_FIX_PROMPT_TEMPLATE: &str = "We found 1-or-more errors in this PR {insert URL here}, please fix. Keep in mind that we want this code to continue to work:\n\nPrefer fixing fast checks first: run and fix any linters/formatters on the current machine before reaching for heavier/slower test suites. Only run a heavy test suite once the fast checks are clean; you are trusted to use judgment about which slow tests, if any, are actually necessary to confirm the fix.\n\n<<prompt>>";
+
+/// RAL-505: appended to a PR-fix prompt when
+/// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
+/// effective, in place of the more permissive "use judgment about slow
+/// tests" language `DEFAULT_AUTO_FIX_PROMPT_TEMPLATE` (and any per-review
+/// `auto_fix_prompt_template` override) already carries. This is a pure
+/// addition to the PR-fix prompt only -- it never touches the PR workflow's
+/// own proof/CI validation, and it has no bearing on any other agent work
+/// (e.g. command-remediation prompts).
+pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "\n\nDo not run a broad or expensive test suite to verify this fix -- prefer automatic formatters, linters, and static-analysis tools only. Comprehensive validation happens separately, through the pull request's own checks.";
 
 /// Default ceiling for an unattended PR/MR CI-fix campaign.
 pub const DEFAULT_AUTO_FIX_MAX_ATTEMPTS: u32 = 3;
@@ -437,6 +460,16 @@ impl ReviewConfig {
             .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES)
     }
 
+    /// Whether the resolver agent dispatched for an automatic pull-request
+    /// fix should be told to prefer automatic formatters/linters/static
+    /// analysis and avoid broad or expensive test suites (unset resolves to
+    /// `false`). RAL-505.
+    #[must_use]
+    pub fn discourage_tests_during_auto_pull_request_fixes(&self) -> bool {
+        self.discourage_tests_during_auto_pull_request_fixes
+            .unwrap_or(false)
+    }
+
     /// Validate this config's own scalars, independent of a `[[review]]`
     /// submission's own validation (`ralphus_core::validate`). RAL-395: a
     /// project-level `auto_fix_prompt_template` default must contain the
@@ -501,6 +534,9 @@ impl ReviewConfig {
             provider_timeout_max_retries: over
                 .provider_timeout_max_retries
                 .or(self.provider_timeout_max_retries),
+            discourage_tests_during_auto_pull_request_fixes: over
+                .discourage_tests_during_auto_pull_request_fixes
+                .or(self.discourage_tests_during_auto_pull_request_fixes),
         }
     }
 }
@@ -641,6 +677,12 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_fix_prompt_template",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_fix_prompt_template.is_some()),
+    ),
+    (
+        "discourage_tests_during_auto_pull_request_fixes",
+        ReviewFieldDefault::ProjectDefault(|c| {
+            c.discourage_tests_during_auto_pull_request_fixes.is_some()
+        }),
     ),
 ];
 
@@ -3193,6 +3235,42 @@ mod tests {
                 .merge(ReviewConfig::default())
                 .auto_fix_prompt_template(),
             Some("global: <<prompt>>")
+        );
+    }
+
+    // ── discourage_tests_during_auto_pull_request_fixes (RAL-505) ────────────
+
+    #[test]
+    fn discourage_tests_during_auto_pull_request_fixes_defaults_to_false_when_unset() {
+        assert!(!ReviewConfig::default().discourage_tests_during_auto_pull_request_fixes());
+    }
+
+    #[test]
+    fn discourage_tests_during_auto_pull_request_fixes_reads_from_toml() {
+        let c = from_toml_str("[review]\ndiscourage_tests_during_auto_pull_request_fixes = true\n");
+        assert!(c.discourage_tests_during_auto_pull_request_fixes());
+    }
+
+    #[test]
+    fn merge_discourage_tests_during_auto_pull_request_fixes_project_wins() {
+        let global = ReviewConfig {
+            discourage_tests_during_auto_pull_request_fixes: Some(false),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            discourage_tests_during_auto_pull_request_fixes: Some(true),
+            ..ReviewConfig::default()
+        };
+        assert!(
+            global
+                .clone()
+                .merge(project)
+                .discourage_tests_during_auto_pull_request_fixes()
+        );
+        assert!(
+            !global
+                .merge(ReviewConfig::default())
+                .discourage_tests_during_auto_pull_request_fixes()
         );
     }
 

@@ -1355,6 +1355,20 @@ pub struct ReviewDef {
     /// to read it from.
     #[serde(default)]
     pub auto_fix_prompt_template: Option<String>,
+    /// RAL-505: whether the resolver agent dispatched for an automatic
+    /// pull-request fix (any `run_feedback` call that builds a PR-fix
+    /// prompt, manual or unattended) is told to prefer automatic
+    /// formatters/linters/static analysis and to avoid running broad or
+    /// expensive test suites, leaving comprehensive validation to the PR
+    /// workflow's own proof/CI path. Unset inherits the project-level
+    /// `.ralphus.toml [review] discourage_tests_during_auto_pull_request_fixes`
+    /// default, then `false`. Does not change validation policy for any
+    /// other agent work (e.g. command-remediation prompts, which already
+    /// prohibit tests unconditionally). Auto-created reviews (Arbiter/
+    /// Triage) always use the project default and never set this directly,
+    /// since they have no `[[review]]` block to read it from.
+    #[serde(default)]
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 /// This review's own declared build step (RAL-342): either a static

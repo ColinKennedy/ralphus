@@ -392,6 +392,12 @@ struct Membership {
     /// review (`[[review]] auto_fix_prompt_template`), already validated
     /// (`core::validate`) to contain the literal `<<prompt>>` placeholder.
     auto_fix_prompt_template: Option<String>,
+    /// RAL-505: optional override declared on the review (`[[review]]
+    /// discourage_tests_during_auto_pull_request_fixes`) for whether the
+    /// resolver agent dispatched for an automatic PR/MR fix is told to
+    /// prefer automatic formatters/linters/static analysis and avoid broad
+    /// or expensive test suites.
+    discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -994,6 +1000,8 @@ pub fn derive_reviews_with_full_prefetch(
             auto_fix_prompt_template: rv
                 .and_then(|r| r.auto_fix_prompt_template.clone())
                 .filter(|s| !s.trim().is_empty()),
+            discourage_tests_during_auto_pull_request_fixes: rv
+                .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
         });
     }
 
@@ -1283,6 +1291,17 @@ fn apply_project_review_defaults(
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
     }
+    // RAL-505: same "fill the gap from project config" treatment as
+    // `auto_fix_pr_errors` above.
+    if row
+        .discourage_tests_during_auto_pull_request_fixes
+        .is_none()
+        && cfg.discourage_tests_during_auto_pull_request_fixes()
+    {
+        store
+            .set_guardian_discourage_tests_during_auto_pull_request_fixes(gid, Some(true))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -1380,6 +1399,17 @@ fn apply_resolver(
     {
         store
             .set_guardian_auto_fix_prompt_template(gid, Some(&template))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-505: this review's own discourage-tests-during-auto-PR-fix
+    // override, authored via `[[review]]
+    // discourage_tests_during_auto_pull_request_fixes`.
+    if let Some(enabled) = members
+        .iter()
+        .find_map(|m| m.discourage_tests_during_auto_pull_request_fixes)
+    {
+        store
+            .set_guardian_discourage_tests_during_auto_pull_request_fixes(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -2970,6 +3000,7 @@ mod tests {
             skip_auto_build: false,
             auto_fix_pr_errors: None,
             auto_fix_prompt_template: None,
+            discourage_tests_during_auto_pull_request_fixes: None,
         }
     }
 
@@ -4062,6 +4093,91 @@ print(json.dumps(result))
                 .auto_fix_prompt_template
                 .as_deref(),
             Some("member: <<prompt>>")
+        );
+    }
+
+    // ── RAL-505: per-project / [[review]] discourage_tests_during_auto_pull_request_fixes ──
+
+    #[test]
+    fn apply_project_review_defaults_fills_discourage_tests_from_project_config() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndiscourage_tests_during_auto_pull_request_fixes = true\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.discourage_tests_during_auto_pull_request_fixes,
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_project_review_defaults_does_not_clobber_an_already_set_discourage_tests_value() {
+        let root = temp_repo();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\ndiscourage_tests_during_auto_pull_request_fixes = true\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let gid = store
+            .create_guardian_for_squad("r", "main", &root.to_string_lossy(), None)
+            .unwrap();
+        store
+            .set_guardian_discourage_tests_during_auto_pull_request_fixes(&gid, Some(false))
+            .unwrap();
+
+        apply_project_review_defaults(&store, &gid, &root.to_string_lossy()).unwrap();
+
+        let g = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            g.discourage_tests_during_auto_pull_request_fixes,
+            Some(false),
+            "an already-set value must never be overwritten by the project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_resolver_sets_discourage_tests_from_declaring_member() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = Membership {
+            discourage_tests_during_auto_pull_request_fixes: Some(true),
+            ..membership(None)
+        };
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store
+                .get_guardian(&gid)
+                .unwrap()
+                .discourage_tests_during_auto_pull_request_fixes,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_resolver_leaves_discourage_tests_unset_when_no_member_declares_one() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let m = membership(None);
+        apply_resolver(&store, &gid, &[&m]).unwrap();
+        assert_eq!(
+            store
+                .get_guardian(&gid)
+                .unwrap()
+                .discourage_tests_during_auto_pull_request_fixes,
+            None
         );
     }
 

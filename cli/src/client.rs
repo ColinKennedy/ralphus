@@ -478,6 +478,11 @@ impl DaemonClient {
             "auto_fix_prompt_template",
             patch.auto_fix_prompt_template,
         );
+        set_if_some(
+            &mut body,
+            "discourage_tests_during_auto_pull_request_fixes",
+            patch.discourage_tests_during_auto_pull_request_fixes,
+        );
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
 
@@ -1617,6 +1622,11 @@ impl DaemonClient {
             "auto_fix_prompt_template",
             settings.auto_fix_prompt_template.map(str::to_string),
         );
+        set_if_some(
+            &mut body,
+            "discourage_tests_during_auto_pull_request_fixes",
+            settings.discourage_tests_during_auto_pull_request_fixes,
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1919,6 +1929,9 @@ pub struct GuardianSettings<'a> {
     pub auto_fix_pr_errors: Option<bool>,
     /// RAL-395: the prompt template used for the auto-fix dispatch above.
     pub auto_fix_prompt_template: Option<&'a str>,
+    /// RAL-505: whether this review's auto-fix dispatch is guided to avoid
+    /// writing/running tests while fixing a failing PR's CI status.
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 /// RAL-408: bundled optional fields for
@@ -1950,6 +1963,7 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub auto_submit_pr_stack: Option<bool>,
     pub auto_fix_pr_errors: Option<bool>,
     pub auto_fix_prompt_template: Option<&'a str>,
+    pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
 }
 
 #[cfg(test)]

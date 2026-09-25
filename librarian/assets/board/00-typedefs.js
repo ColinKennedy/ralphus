@@ -353,6 +353,7 @@
        * @property {boolean} [effective_auto_submit_pr_stack] - RAL-317: auto_submit_pr_stack resolved against the project/global default -- what the per-branch auto-submit trigger actually gates on.
        * @property {boolean|null} [auto_fix_pr_errors] - RAL-395: this review's own override for whether the resolver agent is auto-dispatched to fix this review's PR when its CI checks go red, or null to inherit the project/global default. No `effective_` counterpart is exposed yet -- callers read this raw value.
        * @property {string|null} [auto_fix_prompt_template] - RAL-395: this review's own prompt template for that auto-fix dispatch, with `<<prompt>>` replaced by the failing branch's own Cell prompts, or null to inherit the project default. Non-empty values must contain the literal `<<prompt>>` placeholder -- enforced server-side.
+       * @property {boolean|null} [discourage_tests_during_auto_pull_request_fixes] - RAL-505: this review's own override for whether the resolver agent dispatched to fix this review's PR (auto-fix or a manual PR-fix request) is told to prefer automatic formatters/linters/static analysis and avoid a broad or expensive test suite, or null to inherit the project/global default. No `effective_` counterpart is exposed yet -- callers read this raw value.
        * @property {string} [origin] - RAL-318: provenance of this review -- "explicit" (an authored [[review]] block, or any other pre-existing creation path -- the default/normal case) or "arbiter" (created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired).
        */
       /**
@@ -664,6 +665,7 @@
        * @property {boolean|null|undefined} auto_submit_pr_stack
        * @property {boolean|null|undefined} auto_fix_pr_errors
        * @property {string|null|undefined} auto_fix_prompt_template
+       * @property {boolean|null|undefined} discourage_tests_during_auto_pull_request_fixes
        */
       /**
        * RAL-408: the fully resolved effective review-setting defaults (file
@@ -685,6 +687,7 @@
        * @property {boolean} auto_submit_pr_stack
        * @property {boolean} auto_fix_pr_errors
        * @property {string|undefined} auto_fix_prompt_template
+       * @property {boolean} discourage_tests_during_auto_pull_request_fixes
        */
       /**
        * RAL-408: `GET/POST /api/projects/{name}/review-settings`'s response

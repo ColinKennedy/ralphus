@@ -57,6 +57,8 @@
        * @property {boolean} originalAutoFixPrErrors
        * @property {string} autoFixPromptTemplate
        * @property {string} originalAutoFixPromptTemplate
+       * @property {boolean} discourageTests
+       * @property {boolean} originalDiscourageTests
        */
 
       /** @type {ProjectReviewSettingsDraft|null} */
@@ -104,6 +106,7 @@
         const autoSubmitPrStack = boolOr(s.auto_submit_pr_stack, effective.auto_submit_pr_stack);
         const autoFixPrErrors = boolOr(s.auto_fix_pr_errors, effective.auto_fix_pr_errors);
         const autoFixPromptTemplate = str(s.auto_fix_prompt_template);
+        const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -123,6 +126,7 @@
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
+          discourageTests, originalDiscourageTests: discourageTests,
         };
       }
 
@@ -272,6 +276,12 @@
        * @returns {void}
        */
       function onProjectEditAutoFixPromptTemplate(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoFixPromptTemplate = value; }
+      /**
+       * Stages the discourage-tests-during-auto-PR-fix default.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditDiscourageTests(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.discourageTests = checked; }
 
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
       const PROJECT_REVIEW_SETTINGS_MACHINE_TIP = "The machine (scheme:uri, or \"local\") a future review's worktrees and merge run on when nothing more specific sets one. Blank inherits the file-config/global value shown below.";
@@ -287,7 +297,7 @@
         const resolverSection = renderResolverFieldsHtml(draft.cwd, draft.resolverAgent, draft.resolverModel, false, "onProjectEditResolverAgent", "onProjectEditResolverModel");
         const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onProjectEditProofScope", "onProjectEditProofSkipAutoClean", true);
         const prSettingsSection = renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onProjectEditSeparatePrBranch", "onProjectEditMatchPrBranchName", "onProjectEditAutoSubmitPrStack", "onProjectEditDualRootPr");
-        const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate");
+        const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate", "onProjectEditDiscourageTests");
         const err = projectReviewSettingsError ? `<div id="project-review-settings-err" class="verr">${esc(projectReviewSettingsError)}</div>` : `<div id="project-review-settings-err" class="verr"></div>`;
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeProjectReviewSettingsModal()"><div class="modal review-edit-modal">
             <h2>Review Settings — ${esc(draft.project)}</h2>
@@ -347,6 +357,7 @@
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
+        if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
           const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/review-settings`, {
@@ -367,4 +378,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests];
