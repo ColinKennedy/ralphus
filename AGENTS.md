@@ -278,3 +278,4 @@ files (each paired with a `CLAUDE.md` containing `@AGENTS.md`):
 - [`.agent/roadmap.md`](.agent/roadmap.md) — what's built vs. not-yet-built by phase
 - [`.agent/cli-runner-port.md`](.agent/cli-runner-port.md) — Python-to-Rust CLI/runner port detail
 - [`.agent/manual-testing-commands.md`](.agent/manual-testing-commands.md) — copy-paste commands for ad-hoc manual testing
+- [`.agent/waypoints-phase0-decisions.md`](.agent/waypoints-phase0-decisions.md) — RAL-400 cross-squad waypoints: terminology, EntityUri/sentinel grammar, and the actionable-notification matching model
