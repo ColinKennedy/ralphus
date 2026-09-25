@@ -1996,6 +1996,8 @@ fn route_for_user(
             ],
         ) => guardian_manual_checks_terminal_log_attempt(daemon, id, attempt),
         ("POST", ["api", "guardians", id, "merge"]) => guardian_merge(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board multi-select Merge/Rebase context-menu action (RAL-514); the CLI already has per-review `review merge`
+        ("POST", ["api", "guardians", "merge-batch"]) => guardian_merge_batch(daemon, body),
         ("POST", ["api", "guardians", id, "stop"]) => guardian_stop(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
@@ -12643,6 +12645,9 @@ struct GuardianDetailsBody {
     skip_auto_build: Option<bool>,
     #[serde(default)]
     skip_worktrees: Option<bool>,
+    /// RAL-514: see [`GuardianSettingsBody::skip_base_updates`].
+    #[serde(default)]
+    skip_base_updates: Option<bool>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
     #[serde(default)]
@@ -12692,6 +12697,42 @@ struct ReorderBody {
     /// are silently ignored (matching the `order` array semantics).
     #[serde(default)]
     enabled: std::collections::HashMap<String, bool>,
+}
+
+/// `POST /api/guardians/merge-batch` body (RAL-514) -- the board's
+/// multi-select Merge/Rebase context-menu action sends every selected
+/// review id in one request instead of one HTTP round trip per review.
+/// Always attempts every id regardless of that review's
+/// `skip_base_updates` setting: that toggle only gates the *automatic*
+/// background base-shift sweep, not an explicit user-triggered batch
+/// action.
+#[derive(Deserialize)]
+struct GuardianMergeBatchBody {
+    ids: Vec<String>,
+}
+
+/// One review's classification in a [`GuardianMergeBatchResult`] (RAL-514).
+/// Kept distinct from a plain success/failure boolean because a review that
+/// is already merged, already mid-rebase, or has no branches to merge is
+/// not an error for the user to act on -- it just had nothing to do.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GuardianMergeBatchOutcome {
+    Started,
+    NotApplicable,
+    Failed,
+}
+
+#[derive(Serialize)]
+struct GuardianMergeBatchResult {
+    id: String,
+    outcome: GuardianMergeBatchOutcome,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct GuardianMergeBatchResponse {
+    results: Vec<GuardianMergeBatchResult>,
 }
 
 #[derive(Serialize)]
@@ -13302,6 +13343,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
+            return store_error(&e);
+        }
+    }
+    if let Some(skip) = req.skip_base_updates {
+        if let Err(e) = store.set_guardian_skip_base_updates(id, Some(skip)) {
             return store_error(&e);
         }
     }
@@ -14948,6 +14994,80 @@ fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
     )
+}
+
+/// Batch form of [`guardian_merge`] (RAL-514) -- the board's multi-select
+/// Merge/Rebase context-menu action applies to every selected review in one
+/// request. Runs the same per-id reset-then-kickoff sequence as the single
+/// endpoint, but calls [`crate::guardian_merge::kickoff_merge`] directly
+/// instead of going through [`crate::guardian_merge::start_merge`]'s HTTP
+/// status mapping, since a batch result needs a three-way
+/// started/not_applicable/failed classification rather than one HTTP
+/// status per review -- notably, `start_merge` maps both
+/// `AlreadyInProgress` (not a failure) and a preflight sync error (a real
+/// failure) to the same 409, which isn't enough to tell them apart here.
+/// Always keeps going through every id even after an earlier one fails --
+/// the response reports a full per-review summary rather than the batch
+/// stopping at the first failure.
+fn guardian_merge_batch(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<GuardianMergeBatchBody>(body) else {
+        return error(400, "bad_request", "invalid body", vec![]);
+    };
+    if req.ids.is_empty() {
+        return error(400, "bad_request", "ids must not be empty", vec![]);
+    }
+    let runner = guardian_agent_runner(daemon);
+    let results: Vec<GuardianMergeBatchResult> = req
+        .ids
+        .iter()
+        .map(|id| {
+            reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+            reset_base_shift_campaign_for_manual_rebase(daemon, id);
+            let outcome = crate::guardian_merge::kickoff_merge(
+                daemon.store_handle(),
+                Arc::clone(&runner),
+                id,
+                daemon.semaphore_handle(),
+                daemon.cancellations_handle(),
+            );
+            let (outcome, message) = match outcome {
+                Ok(crate::guardian_merge::StartMergeOutcome::Merging) => {
+                    (GuardianMergeBatchOutcome::Started, "merging".to_string())
+                }
+                Ok(crate::guardian_merge::StartMergeOutcome::Deferred) => (
+                    GuardianMergeBatchOutcome::Started,
+                    "deferred until every enabled branch is ready".to_string(),
+                ),
+                Ok(crate::guardian_merge::StartMergeOutcome::AlreadyInProgress) => (
+                    GuardianMergeBatchOutcome::NotApplicable,
+                    "a rebase is already in progress".to_string(),
+                ),
+                Ok(crate::guardian_merge::StartMergeOutcome::AlreadyMerged) => (
+                    GuardianMergeBatchOutcome::NotApplicable,
+                    "this review's work was already merged".to_string(),
+                ),
+                Err(crate::guardian_merge::StartMergeError::NoBranches) => (
+                    GuardianMergeBatchOutcome::NotApplicable,
+                    "review has no branches to merge".to_string(),
+                ),
+                Err(crate::guardian_merge::StartMergeError::NotFound(message)) => {
+                    (GuardianMergeBatchOutcome::Failed, message)
+                }
+                Err(crate::guardian_merge::StartMergeError::Preflight(message)) => {
+                    (GuardianMergeBatchOutcome::Failed, message)
+                }
+                Err(crate::guardian_merge::StartMergeError::Store(message)) => {
+                    (GuardianMergeBatchOutcome::Failed, message)
+                }
+            };
+            GuardianMergeBatchResult {
+                id: id.clone(),
+                outcome,
+                message,
+            }
+        })
+        .collect();
+    json(200, &GuardianMergeBatchResponse { results })
 }
 
 /// An explicit rebase request gives the CI watcher another chance to fix an

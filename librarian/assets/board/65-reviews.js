@@ -259,6 +259,7 @@
             ? `<div data-click="unhideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Show this review again in your own view.\nWho/when: use this to undo an earlier hide.\nA personal preference — it never affects what other users see.">👁 Unhide</div>`
             : `<div data-click="hideReviewMenuItem" data-guardian-id="${esc(id)}" data-tip="Hide this review from your own view — it stays fully intact and keeps running/counting normally.\nWho/when: use this to declutter your list of reviews you don't need to watch right now.\nA personal preference — it never affects what other users see, and can be undone any time via \"show hidden\".">🙈 Hide</div>`);
         }
+        items.push(`<div data-click="mergeReviewFromMenu" data-guardian-id="${esc(id)}" data-tip="Start (or resume) a fresh merge/rebase — rebases each enabled branch onto the base, resolving conflicts with the AI agent, then runs check gates.\nWho/when: use this to force a rebase right now instead of waiting for the automatic one, e.g. right after enabling/disabling branches, or on a review with automatic rebasing turned off.\nRuns regardless of this review's 'Skip automatic rebasing' setting -- that setting only gates the automatic sweep, not this manual trigger.\nReviews not currently eligible (already merging, merged, cancelled, or deployed) are skipped and reported.${esc(batchTip)}">⇄ Merge / rebase</div>`);
         if (canCancel) items.push(`<div class="danger" data-click="cancelReview" data-guardian-id="${esc(id)}" data-tip="Cancel this review — stops the current merge and discards its result.\nThe review can be restarted afterward.\nThis cannot be undone.${esc(batchTip)}">⊘ Cancel review</div>`);
         if (g.status === "cancelled") items.push(`<div data-click="reopenReview" data-guardian-id="${esc(id)}" data-tip="Reopen this cancelled review and immediately stage in whatever branches are already ready, without waiting for the rest.\nUse this when a review was cancelled by mistake, or you want to retry it without recreating it from scratch.\nAny branch still waiting on its task keeps the review in collecting until it finishes.${esc(batchTip)}">↺ Reopen review</div>`);
         items.push(`<div class="danger" data-click="deleteReview" data-guardian-id="${esc(id)}" data-tip="Delete this review and remove all review worktrees permanently.\nThis cannot be undone.${esc(batchTip)}">🗑 Delete</div>`);
@@ -274,6 +275,61 @@
        * @returns {string}
        */
       const reviewLabelOf = (id) => guardians.find((x) => x.id === id)?.name || id;
+      /**
+       * Starts merge/rebase from the review context menu (RAL-514). Applies
+       * to every selected review when the clicked one is part of a
+       * multi-selection via bulkMergeReviews instead; otherwise defers to
+       * the single-review `mergeReview`, which already knows how to read
+       * that review's own current status (e.g. resuming vs. restarting).
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function mergeReviewFromMenu(id) {
+        closeSquadMenu();
+        const ids = menuActionTargets(id, guardianMultiSel);
+        if (ids.length > 1) { await bulkMergeReviews(ids); return; }
+        const g = guardians.find((x) => x.id === id);
+        await mergeReview(id, g ? g.status : "");
+      }
+      /**
+       * Starts merge/rebase for every selected review whose status currently
+       * allows it (RAL-514) -- mirrors the single-review "Merge / rebase"
+       * button's own eligibility (`MERGE_STARTABLE`), so a review that's
+       * e.g. already merging, already merged, cancelled, or deployed is
+       * skipped client-side and reported rather than attempted. Runs
+       * unconditionally regardless of each review's own "skip automatic
+       * rebasing" setting -- that setting only gates the automatic
+       * base-shift sweep, not this explicit manual trigger. Sends every
+       * remaining id in one request to `POST /api/guardians/merge-batch`
+       * rather than looping a per-review call, and reports the server's
+       * three-way started/not_applicable/failed outcome per review -- a
+       * review the daemon finds already merged or already mid-rebase had
+       * nothing to do, which is distinct from a real failure.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      // RALPHUS-REVIEW-BULK-MERGE:BEGIN
+      async function bulkMergeReviews(ids) {
+        const { eligible, skipped } = bulkEligibleSplit(ids, (gid) => MERGE_STARTABLE.includes(guardians.find((x) => x.id === gid)?.status || ""));
+        if (!eligible.length) return;
+        if (!confirm(`Start merge/rebase for ${eligible.length} review(s)? Each rebases onto its base branch, resolving conflicts with the AI agent.\n\n${bulkNameList(eligible.map(reviewLabelOf))}`)) return;
+        let resp;
+        try {
+          resp = await post("/api/guardians/merge-batch", { ids: eligible });
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        if (!resp.ok) { notify("error", await responseError(resp, "merge/rebase failed")); return; }
+        /** @type {GuardianMergeBatchResponse} */
+        const result = await resp.json();
+        const started = result.results.filter((r) => r.outcome === "started");
+        const notApplicable = result.results.filter((r) => r.outcome === "not_applicable");
+        const failed = result.results.filter((r) => r.outcome === "failed");
+        if (skipped > 0) notify("error", `Skipped ${skipped} of the selected review(s): not in a mergeable/rebaseable status.`);
+        if (notApplicable.length) notify("error", `${notApplicable.length} review(s) had nothing to do: ${notApplicable.map((r) => `${reviewLabelOf(r.id)} (${r.message})`).join("; ")}.`);
+        if (failed.length) notify("error", failed.map((r) => `${reviewLabelOf(r.id)}: ${r.message}`).join("; "));
+        else if (started.length > 0 && skipped === 0 && notApplicable.length === 0) notify("success", `Started merge/rebase for ${started.length} review(s).`);
+        tick();
+      }
+      // RALPHUS-REVIEW-BULK-MERGE:END
       /**
        * Deletes a review and its worktrees after confirmation. Applies to
        * every selected review when the clicked one is part of a

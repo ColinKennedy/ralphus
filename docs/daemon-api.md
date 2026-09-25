@@ -145,6 +145,7 @@ where one exists.
 | POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
+| POST | `/api/guardians/merge-batch` | [Start/continue the stacked rebase for many reviews in one request](#post-apiguardiansmerge-batch-ral-514) (RAL-514) |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review guardian |
@@ -1914,7 +1915,7 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_auto_build`, `skip_worktrees`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `proof_skip_auto_clean`, `skip_auto_build`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
 
@@ -1942,6 +1943,38 @@ Returns `200` with `{ "guardian": GuardianView, "base_change"?: { status,
 message, action? } }` — `base_change` (same shape `POST .../base` returns)
 is present only when this request's side effect actually changed the
 merge's in-flight state.
+
+### `POST /api/guardians/merge-batch` (RAL-514)
+Batch form of `POST /api/guardians/{id}/merge` — the board's multi-select
+Reviews context menu sends every selected review id in one request instead
+of one round trip per review:
+```json
+{ "ids": ["guardian-000000000001", "guardian-000000000002"] }
+```
+Runs the same reset-then-kickoff sequence as the single-review endpoint for
+every id, **always** — regardless of that review's own `skip_base_updates`
+setting, since that toggle only gates the automatic background base-shift
+sweep, not this explicit manual trigger. One id failing never stops the
+rest of the batch; the response reports a per-review outcome instead of one
+HTTP status for the whole request:
+```json
+{ "results": [
+  { "id": "guardian-000000000001", "outcome": "started", "message": "merging" },
+  { "id": "guardian-000000000002", "outcome": "not_applicable", "message": "this review's work was already merged" }
+] }
+```
+`outcome` is one of:
+- `started` — a rebase was kicked off (or deferred until every enabled
+  branch is ready).
+- `not_applicable` — nothing to do: already merging, already merged, or no
+  branches to merge. Not an error.
+- `failed` — a real error (not found, preflight sync failure, store error);
+  `message` carries the reason.
+
+`400 bad_request` if `ids` is empty or the body doesn't parse. Unlike the
+`/api/hidden/*/batch` endpoints, an unknown id is still reported per-review
+(`failed`, not a top-level `404`) since the batch as a whole always returns
+`200`.
 
 ### `POST /api/guardians/{id}/branches/reorder`
 Persist a new branch order for a review (RAL-6/RAL-14). Body is the full ordered

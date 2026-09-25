@@ -279,6 +279,28 @@
        * @property {{squad_id: string, task_idx: number, error: string}[]} failed
        */
       /**
+       * One review's classification within a `GuardianMergeBatchResponse`
+       * (RAL-514). Kept three-way rather than a plain success/failure
+       * boolean because a review that's already merged, already mid-rebase,
+       * or has no branches to merge had nothing to do -- that isn't an
+       * error for the user to act on.
+       * @typedef {"started"|"not_applicable"|"failed"} GuardianMergeBatchOutcome
+       */
+      /**
+       * @typedef {object} GuardianMergeBatchResult
+       * @property {string} id
+       * @property {GuardianMergeBatchOutcome} outcome
+       * @property {string} message
+       */
+      /**
+       * Response from `POST /api/guardians/merge-batch` (RAL-514) -- the
+       * board's multi-select Merge/Rebase context-menu action; always
+       * attempts every requested id and reports a per-review outcome rather
+       * than stopping at the first failure.
+       * @typedef {object} GuardianMergeBatchResponse
+       * @property {GuardianMergeBatchResult[]} results
+       */
+      /**
        * @typedef {object} GuardianView
        * @property {string} id
        * @property {string} name
@@ -312,6 +334,8 @@
        * @property {string} [detail]
        * @property {boolean} [skip_auto_build]
        * @property {boolean} [skip_worktrees]
+       * @property {boolean|null} [skip_base_updates] - RAL-250: this review's own override for whether the automatic base-branch auto-update rebuild is skipped, or null to inherit the project/global default.
+       * @property {boolean} [effective_skip_base_updates] - RAL-250: skip_base_updates resolved against the project/global default -- what the automatic base-shift sweep actually gates on.
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
        * @property {number} [conflicts_committed]
