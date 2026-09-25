@@ -76,6 +76,7 @@ doesn't go through tmux/psmux at all.
 | `board_contention.rs` | WS-B.4: board reads vs. four concurrent writers over real HTTP | 1 `#[ignore]`d test; runs in the `perf-tests` CI job. File-backed store — `open_in_memory`'s `cache=shared` raises `SQLITE_LOCKED` under concurrent read/write |
 | `store_write_throughput.rs` | WS-B.5: the writer's sustained commit rate, batched and unbatched | 2 `#[ignore]`d tests; runs in the `perf-tests` CI job |
 | `workload_replay.rs` | WS-B.6: the captured production event mix replayed at its recorded rates | 3 `#[ignore]`d tests; runs in the `perf-tests` CI job. `RALPHUS_REPLAY_SECONDS` lengthens the window (the WS-G.5 soak knob) |
+| `submit_lock_hold.rs` | WS-D.8: the submit path's worst store-lock *hold* (`GET /api/daemon` → `guard_hold.max_ms`) | 1 always-run test. Asserts hold duration, not request latency: a submit may legitimately be slow, but it must not make every other request slow |
 
 **Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash

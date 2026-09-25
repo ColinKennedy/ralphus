@@ -870,6 +870,11 @@ struct DaemonHealth<'a> {
     /// measured separately from handler execution time so lock contention is
     /// visible without conflating it with query cost.
     lock_wait: crate::store_lock::LockWaitSnapshot,
+    /// How long the store lock has been *held*, at worst, and how often a hold
+    /// crossed the watchdog threshold. Distinct from `lock_wait`, which is time
+    /// spent waiting to get it: a long hold is the cause, a long wait is the
+    /// symptom every other thread experiences.
+    guard_hold: crate::store_lock::GuardHoldSnapshot,
     /// WS-G.1/G.4: whether the store lock is currently reachable, and the
     /// history of it not being. `stalled: true` here is the signal that the
     /// daemon is wedged -- the condition that previously went entirely
@@ -2181,6 +2186,7 @@ fn health(daemon: &Daemon) -> Reply {
             db,
             warnings,
             lock_wait: crate::store_lock::store_lock_wait_snapshot(),
+            guard_hold: crate::store_lock::guard_hold_snapshot(),
             watchdog: daemon.watchdog.snapshot(),
             store_lock_holder: crate::store_lock::store_lock_holder()
                 .map(|(site, held_ms)| StoreLockHolder { site, held_ms }),
@@ -6166,14 +6172,27 @@ fn run_submit_followup(
         crate::worktrees::execute_local_worktree_jobs(&jobs)
     };
 
-    let guard = store_handle.lock();
-    if let Err(e) = crate::reviews::derive_reviews_with_full_prefetch(
-        &guard,
+    // WS-D.8: called with the handle, not a held guard. This was the single
+    // worst lock holder in the daemon -- measured at 45.9 seconds, twice, on
+    // this exact line -- because the guard spanned the placeholder resolution
+    // inside, which runs real `git worktree add`/`fetch`/rebase per cell and a
+    // whole provisioning round-trip for a remote one. The two prefetch passes
+    // above were added to shrink that window; anything they miss (a remote
+    // cell, a `<<...>>` upstream sentinel, an unregistered project) still fell
+    // through to live git under the lock. The function now locks internally,
+    // once, for the database half only.
+    //
+    // The failure path below takes its own guard: there is nothing to keep
+    // atomic between the derivation and reporting that it failed.
+    let derived = crate::reviews::derive_reviews_with_full_prefetch(
+        store_handle,
         &squad_id,
         &file,
         &prefetched_upstreams,
         &prefetched_worktrees,
-    ) {
+    );
+    if let Err(e) = derived {
+        let guard = store_handle.lock();
         let _ = guard.set_squad_error(&squad_id, Some(&e.message));
         let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
         crate::rlog!(
@@ -6220,7 +6239,6 @@ fn run_submit_followup(
         }
         return;
     }
-    drop(guard);
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
     // `derive_triage_pools` does to get there -- runs only now that review

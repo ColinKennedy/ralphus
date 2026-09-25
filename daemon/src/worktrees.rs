@@ -38,6 +38,7 @@ use opentelemetry::trace::{SpanKind, Status};
 use crate::guardian_merge::git;
 use crate::otel;
 use crate::store::{CellRow, ProjectView, Store, TaskRow};
+use crate::store_lock::StoreHandle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
@@ -125,7 +126,7 @@ pub(crate) struct PlaceholderContext<'a> {
 trait ProjectStartupAdapter {
     fn resolve_placeholder(
         &self,
-        store: &Store,
+        store: &StoreHandle,
         project: &ProjectView,
         placeholder: &str,
         ctx: PlaceholderContext<'_>,
@@ -410,15 +411,36 @@ const MAX_BRANCH_SUFFIX: usize = 1000;
 /// nothing, which is not what the placeholder asked for. Per-squad allocation
 /// applies only to branches this daemon creates and owns.
 fn resolve_squad_branch(
+    store: &StoreHandle,
+    project: &ProjectView,
+    base_branch: &str,
+    squad_id: &str,
+    on_disk: &HashMap<String, String>,
+) -> Result<String, String> {
+    // The git probe runs with no guard held; the claim decision below takes one.
+    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
+        return Ok(base_branch.to_string());
+    }
+    let guard = store.lock();
+    resolve_squad_branch_claim(&guard, project, base_branch, squad_id, on_disk)
+}
+
+/// [`resolve_squad_branch`]'s claim decision, with the git probe already done.
+///
+/// Takes a live `&Store` rather than the handle **on purpose**: this reads every
+/// existing claim, picks a candidate no claim and no on-disk worktree occupies,
+/// and then records a claim for it. That is a read-check-then-write, and it is
+/// atomic only while one guard is held across the whole thing. Locking per
+/// statement instead would let two concurrent submissions both observe the same
+/// branch as free and both claim it, handing two squads the same worktree --
+/// which is exactly the failure RAL-337 introduced this allocation to prevent.
+fn resolve_squad_branch_claim(
     store: &Store,
     project: &ProjectView,
     base_branch: &str,
     squad_id: &str,
     on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
-    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
-        return Ok(base_branch.to_string());
-    }
     if let Some(existing) = store
         .task_worktree_claim_for_squad(&project.name, base_branch, squad_id)
         .map_err(|e| e.to_string())?
@@ -1335,7 +1357,7 @@ fn synthetic_cell_row(ctx: PlaceholderContext<'_>) -> CellRow {
 impl ProjectStartupAdapter for GitProjectStartupAdapter {
     fn resolve_placeholder(
         &self,
-        store: &Store,
+        store: &StoreHandle,
         project: &ProjectView,
         placeholder: &str,
         ctx: PlaceholderContext<'_>,
@@ -1534,7 +1556,7 @@ fn validate_worktree_placeholders(raw: &str, cell_id: &str) -> Result<(), String
 }
 
 fn resolve_placeholder_text_for_project(
-    store: &Store,
+    store: &StoreHandle,
     project_name: &str,
     raw: &str,
     ctx: PlaceholderContext<'_>,
@@ -1542,6 +1564,7 @@ fn resolve_placeholder_text_for_project(
 ) -> Result<String, String> {
     validate_worktree_placeholders(raw, ctx.cell_id)?;
     let project = store
+        .lock()
         .resolve_project(project_name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| {
@@ -1582,11 +1605,12 @@ fn resolve_placeholder_text_for_project(
 /// `ralphus:new-worktree/...` placeholder with no linked field at all,
 /// resolves exactly as it always has.
 pub(crate) fn materialize_env_overrides(
-    store: &Store,
+    store: &StoreHandle,
     ctx: PlaceholderContext<'_>,
     env: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
     let project_name = store
+        .lock()
         .task_project_at(ctx.squad_id, ctx.task_idx)
         .map_err(|e| e.to_string())?;
     let mut cache = HashMap::new();
@@ -1613,7 +1637,7 @@ pub(crate) fn materialize_env_overrides(
 /// map. See [`materialize_env_overrides`].
 #[allow(clippy::too_many_arguments)]
 fn resolve_env_entry(
-    store: &Store,
+    store: &StoreHandle,
     project_name: Option<&str>,
     env: &BTreeMap<String, String>,
     key: &str,
@@ -1639,6 +1663,7 @@ fn resolve_env_entry(
     let project = match project_name {
         Some(name) => Some(
             store
+                .lock()
                 .resolve_project(name)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| {
@@ -1705,7 +1730,7 @@ fn resolve_env_entry(
 /// [`ralphus_core::schema::parse_linked_field_query`].
 #[allow(clippy::too_many_arguments)]
 fn resolve_linked_field(
-    store: &Store,
+    store: &StoreHandle,
     project_name: Option<&str>,
     env: &BTreeMap<String, String>,
     key: &str,
@@ -1892,7 +1917,7 @@ fn classify_placeholder(cwd: &str) -> Result<Option<&str>, String> {
 /// parameter.
 #[allow(clippy::too_many_arguments)]
 fn provision_remote_with_targets(
-    store: &Store,
+    store: &StoreHandle,
     machine: &str,
     project: &crate::store::ProjectView,
     branch: &str,
@@ -1901,7 +1926,7 @@ fn provision_remote_with_targets(
     squad_id: &str,
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<String, String> {
-    let provider = crate::remote_runner::provider_from_store(store, machine)
+    let provider = crate::remote_runner::provider_from_store(&store.lock(), machine)
         .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
         .ok_or_else(|| {
             // `provision_remote_with_targets` is only called for a non-empty
@@ -1981,7 +2006,7 @@ fn provision_remote_with_targets(
         .squad(squad_id)
         .cell(&cell.cell_id)
         .emit(
-            store,
+            &store.lock(),
             "machine provision",
             serde_json::json!({
                 "machine": machine,
@@ -2015,7 +2040,7 @@ fn provision_remote_with_targets(
 /// the scheduler's own failure path only records squad/task state transitions,
 /// not the reason string itself.
 pub fn resolve_placeholders(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
@@ -2032,24 +2057,31 @@ pub fn resolve_placeholders(
 /// `git_user_name`/`git_user_email`, if either is set, via `git config
 /// --worktree`.
 fn route_worktree_to_submitter_fork(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     project_name: &str,
     worktree: &Path,
 ) -> Result<(), String> {
-    let Some(submitter) = store
-        .get_squad_submitter(squad_id)
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(());
-    };
-    // A fork is personal: no row for this submitter means direct-origin
-    // behavior. Do not silently use the legacy project-wide default row.
-    let Some(fork) = store
-        .get_project_fork(project_name, &submitter)
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(());
+    // Both reads under one guard: the fork row is looked up *by* the submitter,
+    // so reading them from two different snapshots could pair a submitter with
+    // a fork registration that was removed in between.
+    let (submitter, fork) = {
+        let guard = store.lock();
+        let Some(submitter) = guard
+            .get_squad_submitter(squad_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        // A fork is personal: no row for this submitter means direct-origin
+        // behavior. Do not silently use the legacy project-wide default row.
+        let Some(fork) = guard
+            .get_project_fork(project_name, &submitter)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        (submitter, fork)
     };
     crate::project_forks::ensure_fork_remote(worktree, &fork.remote_name, &fork.fork_url).map_err(
         |e| format!("could not configure fork remote for project {project_name:?}: {e}"),
@@ -2061,7 +2093,12 @@ fn route_worktree_to_submitter_fork(
             email: fork.git_user_email.clone(),
         },
     );
-    apply_worktree_credential_helper_best_effort(store, worktree, &submitter, &fork.fork_url);
+    apply_worktree_credential_helper_best_effort(
+        &store.lock(),
+        worktree,
+        &submitter,
+        &fork.fork_url,
+    );
     let branch = git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|e| format!("could not determine fork-routed worktree branch: {e}"))?;
     let branch = branch.trim();
@@ -2097,7 +2134,7 @@ fn route_worktree_to_submitter_fork(
 /// parameter only ever makes the common case faster, never changes what a
 /// given input resolves to.
 pub fn resolve_placeholders_with_prefetch(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
@@ -2131,7 +2168,7 @@ pub fn resolve_placeholders_with_prefetch(
 /// call's lock, exactly as before -- this parameter only ever makes the
 /// common case faster, never changes what a given input resolves to.
 pub fn resolve_placeholders_with_full_prefetch(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
@@ -2349,7 +2386,7 @@ pub(crate) fn plan_local_worktree_jobs(
         }
         let branch_result = {
             let snapshot = on_disk.get(&root).expect("just inserted above");
-            resolve_squad_branch(store, &project, branch, squad_id, snapshot)
+            resolve_squad_branch_claim(store, &project, branch, squad_id, snapshot)
         };
         let Ok(branch) = branch_result else {
             continue;
@@ -2443,7 +2480,7 @@ pub(crate) fn execute_local_worktree_jobs(jobs: &[LocalWorktreeJob]) -> HashMap<
 /// `[machine.targets.*]` entry uses instead.
 #[cfg(test)]
 fn resolve_placeholders_with_targets(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
@@ -2466,7 +2503,7 @@ fn resolve_placeholders_with_targets(
 /// dedup hit within this call) — reported on the span as
 /// `worktrees.materialized`.
 fn resolve_placeholders_inner(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
@@ -2540,6 +2577,7 @@ fn resolve_placeholders_inner(
             continue;
         }
         store
+            .lock()
             .set_cell_cwd(squad_id, cell.task_idx, cell.idx, &resolved)
             .map_err(|e| e.to_string())?;
         route_worktree_to_submitter_fork(store, squad_id, project_name, Path::new(&resolved))?;
@@ -2789,12 +2827,16 @@ mod tests {
     fn submitter_fork_is_the_worktree_branch_upstream() {
         let repo = init_repo("submitter-fork");
         let fork = init_bare_fork(&repo, "alice-fork");
-        let mut store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        store.create_user("alice").unwrap();
+        store.lock().create_user("alice").unwrap();
         store
+            .lock()
             .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(
@@ -2802,6 +2844,7 @@ mod tests {
         )
         .unwrap();
         store
+            .lock()
             .insert_squad_with_id("squad-fork", &file, None, false)
             .unwrap();
         let wt = ensure_worktree(&repo, "feature", "main").unwrap();
@@ -2832,12 +2875,16 @@ mod tests {
     fn submitter_forks_registered_git_identity_is_applied_to_the_worktree() {
         let repo = init_repo("submitter-fork-identity");
         let fork = init_bare_fork(&repo, "alice-fork-identity");
-        let mut store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        store.create_user("alice").unwrap();
+        store.lock().create_user("alice").unwrap();
         store
+            .lock()
             .upsert_project_fork_with_identity(
                 "proj",
                 "alice",
@@ -2853,6 +2900,7 @@ mod tests {
         )
         .unwrap();
         store
+            .lock()
             .insert_squad_with_id("squad-fork-identity", &file, None, false)
             .unwrap();
         let wt = ensure_worktree(&repo, "feature-identity", "main").unwrap();
@@ -2873,12 +2921,16 @@ mod tests {
     fn a_fork_with_no_registered_identity_leaves_the_worktrees_git_config_untouched() {
         let repo = init_repo("submitter-fork-no-identity");
         let fork = init_bare_fork(&repo, "bob-fork-no-identity");
-        let mut store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        store.create_user("bob").unwrap();
+        store.lock().create_user("bob").unwrap();
         store
+            .lock()
             .upsert_project_fork("proj", "bob", &fork.to_string_lossy(), "fork-bob", "")
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(
@@ -2886,6 +2938,7 @@ mod tests {
         )
         .unwrap();
         store
+            .lock()
             .insert_squad_with_id("squad-fork-no-identity", &file, None, false)
             .unwrap();
         let wt = ensure_worktree(&repo, "feature-no-identity", "main").unwrap();
@@ -2902,12 +2955,16 @@ mod tests {
     #[test]
     fn submitter_forks_https_url_wires_up_the_credential_helper() {
         let repo = init_repo("submitter-fork-https-cred-helper");
-        let mut store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        store.create_user("alice").unwrap();
+        store.lock().create_user("alice").unwrap();
         store
+            .lock()
             .set_user_forge_token("alice", "127.0.0.1:1", "glpat-test-secret")
             .unwrap();
         // A URL that fails fast (connection refused, no DNS lookup) rather
@@ -2917,6 +2974,7 @@ mod tests {
         // happens before that push and survives regardless of whether it
         // succeeds.
         store
+            .lock()
             .upsert_project_fork(
                 "proj",
                 "alice",
@@ -2930,6 +2988,7 @@ mod tests {
         )
         .unwrap();
         store
+            .lock()
             .insert_squad_with_id("squad-fork-https", &file, None, false)
             .unwrap();
         let wt = ensure_worktree(&repo, "feature-https", "main").unwrap();
@@ -2966,6 +3025,7 @@ mod tests {
         );
         assert_eq!(
             store
+                .lock()
                 .resolve_worktree_credential(&worktree_id, &grant)
                 .unwrap(),
             Some("glpat-test-secret".to_string())
@@ -2976,15 +3036,20 @@ mod tests {
     fn submitter_forks_non_http_url_does_not_wire_up_the_credential_helper() {
         let repo = init_repo("submitter-fork-non-http-no-cred-helper");
         let fork = init_bare_fork(&repo, "alice-fork-non-http");
-        let mut store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
-        store.create_user("alice").unwrap();
+        store.lock().create_user("alice").unwrap();
         store
+            .lock()
             .set_user_forge_token("alice", "gitlab.com", "glpat-should-be-unused")
             .unwrap();
         store
+            .lock()
             .upsert_project_fork("proj", "alice", &fork.to_string_lossy(), "fork-alice", "")
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(
@@ -2992,6 +3057,7 @@ mod tests {
         )
         .unwrap();
         store
+            .lock()
             .insert_squad_with_id("squad-fork-non-http", &file, None, false)
             .unwrap();
         let wt = ensure_worktree(&repo, "feature-non-http", "main").unwrap();
@@ -3511,7 +3577,9 @@ mod tests {
 
     #[test]
     fn resolve_placeholders_surfaces_an_unsupported_scheme_as_a_squad_failure() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut cells = vec![cell_row(0, 0, "s0", Some("incredibuild:/build/wt"))];
         let err = resolve_placeholders(&store, "squad-1", &mut cells, &[], &Context::new())
             .expect_err("unsupported cwd scheme must fail the squad");
@@ -3558,8 +3626,11 @@ mod tests {
             "remote-provision-p",
             r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
         );
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project_with_clone_url_ex(
                 "proj",
                 "",
@@ -3570,6 +3641,7 @@ mod tests {
             )
             .unwrap();
         store
+            .lock()
             .register_machine_provider(
                 "ib",
                 "",
@@ -3608,11 +3680,15 @@ mod tests {
             "remote-provision-no-url-p",
             r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
         );
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         store
+            .lock()
             .register_machine_provider(
                 "ib",
                 "",
@@ -3648,8 +3724,11 @@ mod tests {
             "remote-provision-no-target-p",
             r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
         );
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project_with_clone_url_ex(
                 "proj",
                 "",
@@ -3660,6 +3739,7 @@ mod tests {
             )
             .unwrap();
         store
+            .lock()
             .register_machine_provider(
                 "ib",
                 "",
@@ -3698,8 +3778,11 @@ mod tests {
             "two-machines-b",
             r#"{"ok":true,"protocol_version":1,"workspace":"/on/b"}"#,
         );
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project_with_clone_url_ex(
                 "proj",
                 "",
@@ -3711,6 +3794,7 @@ mod tests {
             .unwrap();
         for (scheme, script) in [("ma", &a), ("mb", &b)] {
             store
+                .lock()
                 .register_machine_provider(
                     scheme,
                     "",
@@ -3752,8 +3836,11 @@ mod tests {
     fn a_provider_that_returns_no_workspace_path_fails_the_squad() {
         let repo = init_repo("no-workspace");
         let script = fake_provisioner("no-workspace-p", r#"{"ok":true,"protocol_version":1}"#);
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project_with_clone_url_ex(
                 "proj",
                 "",
@@ -3764,6 +3851,7 @@ mod tests {
             )
             .unwrap();
         store
+            .lock()
             .register_machine_provider(
                 "ib",
                 "",
@@ -3791,7 +3879,9 @@ mod tests {
     #[test]
     fn resolve_placeholders_ignores_plain_cwd() {
         let repo = init_repo("plain-cwd");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let plain = repo.to_string_lossy().into_owned();
         let mut cells = vec![cell_row(0, 0, "s0", Some(&plain))];
         resolve_placeholders(&store, "squad-1", &mut cells, &[], &Context::new())
@@ -3801,7 +3891,9 @@ mod tests {
 
     #[test]
     fn resolve_placeholders_fails_for_unregistered_project() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut cells = vec![cell_row(
             0,
             0,
@@ -3821,7 +3913,9 @@ mod tests {
     fn resolve_placeholders_fails_when_task_has_no_project() {
         // Submit-time validation should already rule this out, but the
         // scheduler must still fail cleanly on stale/hand-edited data.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut cells = vec![cell_row(
             0,
             0,
@@ -3842,7 +3936,9 @@ mod tests {
         // Submit-time validation (`ralphus_core::validate`) already requires
         // every placeholder cwd to carry an explicit `?upstream=`; this is the
         // scheduler's own defensive re-check for stale/hand-edited data.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut cells = vec![cell_row(0, 0, "s0", Some("ralphus:new-worktree/feat"))];
         let tasks = vec![task_row(0, Some("proj"))];
         let err = resolve_placeholders(&store, "squad-1", &mut cells, &tasks, &Context::new())
@@ -3859,8 +3955,11 @@ mod tests {
         // low-level git failure `resolve_upstream_default_fails_...` covers
         // on its own.
         let repo = init_repo("cwd-default-no-remote");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -3902,8 +4001,11 @@ mod tests {
         g(&repo, &["commit", "--message", "other branch commit"]);
         g(&repo, &["checkout", "main"]);
 
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -3989,8 +4091,11 @@ mod tests {
             &["commit", "--message", "local unrelated work"],
         );
 
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project_with_clone_url_ex(
                 "proj",
                 "",
@@ -4024,8 +4129,11 @@ mod tests {
     #[test]
     fn resolve_placeholders_materializes_a_registered_placeholder() {
         let repo = init_repo("materialize");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("myproj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -4045,8 +4153,11 @@ mod tests {
     #[test]
     fn resolve_placeholders_expands_a_wrapped_placeholder_inside_cwd_text() {
         let repo = init_repo("wrapped-cwd");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("myproj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -4070,8 +4181,11 @@ mod tests {
     #[test]
     fn resolve_placeholders_preserves_unknown_wrapped_text_in_cwd() {
         let repo = init_repo("unknown-wrapped-cwd");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("myproj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let raw = "prefix/<<not-a-ralphus-placeholder>>/suffix";
@@ -4090,8 +4204,11 @@ mod tests {
         // tasks in one submission both referenced it) must materialize exactly
         // one worktree and resolve both cells to the identical real path.
         let repo = init_repo("dedupe");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("shared", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![
@@ -4133,8 +4250,11 @@ mod tests {
         // other's `git add`/`commit` in the same index (one cell exiting 1,
         // the other 128). Each must now resolve to its own worktree.
         let repo = init_repo("two-task-collide");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("ralphus", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![
@@ -4189,8 +4309,11 @@ mod tests {
         // thinks it's free, and reuses the second branch's already
         // materialized worktree instead of creating its own.
         let repo = init_repo("three-task-collide");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("ralphus", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![
@@ -4254,8 +4377,11 @@ mod tests {
         // real path (as it would be, re-read from the store), so a second call
         // must be a no-op that neither errors nor recreates the worktree.
         let repo = init_repo("restart-safe");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -4281,7 +4407,12 @@ mod tests {
     /// Resolve one `new-worktree` placeholder for `squad_id` and return the
     /// worktree path it materialized. RAL-337's tests all consist of doing
     /// this repeatedly under different squad ids.
-    fn resolve_for_squad(store: &Store, repo: &Path, squad_id: &str, placeholder: &str) -> String {
+    fn resolve_for_squad(
+        store: &StoreHandle,
+        repo: &Path,
+        squad_id: &str,
+        placeholder: &str,
+    ) -> String {
         let _ = repo;
         let mut cells = vec![cell_row(0, 0, "s0", Some(placeholder))];
         let tasks = vec![task_row(0, Some("proj"))];
@@ -4309,8 +4440,11 @@ mod tests {
         // The second must not land in the first's worktree, because the first
         // has already committed finished work onto that branch.
         let repo = init_repo("ral337-second-squad");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/feat-share?upstream=main";
@@ -4349,8 +4483,11 @@ mod tests {
     #[test]
     fn ral337_a_third_squad_continues_the_suffix_sequence() {
         let repo = init_repo("ral337-third-squad");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/feat-seq?upstream=main";
@@ -4375,8 +4512,11 @@ mod tests {
         // returns the same worktree and branch, with its commits intact. This
         // is what `squad restart` / `squad retry` depend on.
         let repo = init_repo("ral337-restart");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/feat-restart?upstream=main";
@@ -4406,8 +4546,11 @@ mod tests {
         // their own branch and their own worktree. Only cells naming the *same*
         // placeholder share one (see the test below).
         let repo = init_repo("ral337-one-task-many-worktrees");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![
@@ -4445,8 +4588,11 @@ mod tests {
         // per-resolution, so two cells naming the SAME placeholder in the same
         // squad must not end up split across `feat-multi` and `feat-multi-2`.
         let repo = init_repo("ral337-one-squad-many-cells");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/feat-multi?upstream=main";
@@ -4468,8 +4614,11 @@ mod tests {
         // rather than inherit it -- otherwise the very first submission after
         // upgrading still reproduces the bug.
         let repo = init_repo("ral337-legacy-worktree");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         // Materialize the way the pre-RAL-337 daemon would have: straight
@@ -4508,8 +4657,11 @@ mod tests {
         // that worktree -- and its dirty, uncommitted state -- instead of a
         // fresh "-2" slot.
         let repo = init_repo("ral337-legacy-worktree-case");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let legacy = ensure_worktree(&repo, "ral-428-admin-system-prompt-tab", "main")
@@ -4550,8 +4702,11 @@ mod tests {
         // that collision up front and fall back to `-2`, not let the raw
         // `git worktree add` inside `execute_worktree_plan` fail.
         let repo = init_repo("ral491-foreign-worktree");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
 
@@ -4597,8 +4752,11 @@ mod tests {
         // With `feat-skip` and `feat-skip-2` both occupied, the next squad
         // must get `-3` -- not silently reuse either.
         let repo = init_repo("ral337-skip-taken");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/feat-skip?upstream=main";
@@ -4618,8 +4776,11 @@ mod tests {
         // nothing. Guards the behavior asserted end-to-end by
         // `worktree_projects::placeholder_cwd_origin_foo_resyncs_across_separate_run_submissions`.
         let (repo, _sha) = init_repo_with_remote_branch("ral337-remote-shared", "origin/foo");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let ph = "ralphus:new-worktree/origin/foo?upstream=origin/foo";
@@ -4657,8 +4818,11 @@ mod tests {
         // the full path from placeholder cwd to materialized worktree.
         let repo = init_repo("resolve-sentinel-current");
         g(&repo, &["checkout", "-b", "base-branch"]);
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![cell_row(
@@ -4703,8 +4867,11 @@ mod tests {
     #[test]
     fn plan_and_execute_local_worktree_jobs_materializes_every_distinct_branch() {
         let repo = init_repo("prefetch-multi-branch");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
         let mut cells = vec![
@@ -4733,7 +4900,8 @@ mod tests {
             task_row(2, Some("proj")),
         ];
 
-        let jobs = plan_local_worktree_jobs(&store, "squad-1", &cells, &tasks, &HashMap::new());
+        let jobs =
+            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
         assert_eq!(jobs.len(), 3, "one job per distinct branch");
         let prefetched = execute_local_worktree_jobs(&jobs);
         assert_eq!(prefetched.len(), 3, "every job must succeed");
@@ -4777,8 +4945,11 @@ mod tests {
     #[test]
     fn plan_local_worktree_jobs_reserves_a_slot_before_it_is_ever_created() {
         let repo = init_repo("prefetch-collision");
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &repo.to_string_lossy(), "git")
             .unwrap();
 
@@ -4789,8 +4960,13 @@ mod tests {
             Some("ralphus:new-worktree/test-pr-submission-a?upstream=main"),
         )];
         let tasks_a = vec![task_row(0, Some("proj"))];
-        let jobs_a =
-            plan_local_worktree_jobs(&store, "squad-1", &cells_a, &tasks_a, &HashMap::new());
+        let jobs_a = plan_local_worktree_jobs(
+            &store.lock(),
+            "squad-1",
+            &cells_a,
+            &tasks_a,
+            &HashMap::new(),
+        );
         assert_eq!(jobs_a.len(), 1);
 
         // Squad 2's planning pass runs (and completes) BEFORE squad 1's
@@ -4803,8 +4979,13 @@ mod tests {
             Some("ralphus:new-worktree/test-pr-submission-b?upstream=main"),
         )];
         let tasks_b = vec![task_row(0, Some("proj"))];
-        let jobs_b =
-            plan_local_worktree_jobs(&store, "squad-2", &cells_b, &tasks_b, &HashMap::new());
+        let jobs_b = plan_local_worktree_jobs(
+            &store.lock(),
+            "squad-2",
+            &cells_b,
+            &tasks_b,
+            &HashMap::new(),
+        );
         assert_eq!(jobs_b.len(), 1);
 
         assert_eq!(
@@ -4855,7 +5036,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_resolves_link_to_cwd() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -4883,7 +5066,9 @@ mod tests {
     fn materialize_env_overrides_resolves_link_to_cwd_with_trailing_literal_text() {
         // Trailing literal text after the closing ">>" -- the same embedding
         // rule a worktree placeholder already uses, not a "?suffix=" query.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -4914,7 +5099,9 @@ mod tests {
     fn materialize_env_overrides_applies_a_text_query_to_the_linked_value() {
         // RAL-460 follow-up: "?text=basename({})" applies the registered
         // "basename" function to the linked cwd's resolved value.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -4943,7 +5130,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_rejects_an_unregistered_text_query_function() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -4973,7 +5162,9 @@ mod tests {
         // resolution must resolve BASE before SUB reads it, regardless of
         // BTreeMap iteration order ("BASE" < "SUB" alphabetically, so also
         // test the reverse-name case below to rule out lucky ordering).
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5015,7 +5206,9 @@ mod tests {
         // "AAA_LINKS_TO_ZZZ" sorts before "ZZZ_BASE" -- name the linking key
         // so it would iterate *before* its dependency alphabetically,
         // proving the resolver doesn't just get lucky with BTreeMap order.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5054,7 +5247,9 @@ mod tests {
         // worktree placeholder -- no project is registered and none is
         // needed, since resolving a link never triggers worktree
         // materialization.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5086,7 +5281,9 @@ mod tests {
         // Regression guard (RAL-100/RAL-447): a plain literal or an embedded
         // worktree placeholder must resolve exactly as it did before linked
         // fields existed.
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5112,7 +5309,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_errors_on_a_two_key_link_cycle() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5144,7 +5343,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_errors_when_cwd_link_has_no_cwd_in_scope() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5170,7 +5371,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_proof_step_resolves_own_id() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5196,7 +5399,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_proof_step_resolves_parent_cell_cwd_and_id() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());
@@ -5232,7 +5437,9 @@ mod tests {
 
     #[test]
     fn materialize_env_overrides_proof_step_own_id_unset_errors() {
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let targets = std::collections::BTreeMap::new();
         let prefetched_upstreams = HashMap::new();
         let on_disk_worktrees = RefCell::new(HashMap::new());

@@ -192,6 +192,14 @@
         if (wait) {
           rows.push(`<span style="color:var(--muted)" data-tip="How long store-lock acquisitions waited, over this daemon's whole lifetime. This is wait time only -- query time is not included -- so a high value here is contention, not slow SQL.">wait p50 ${esc(fmtMs(wait.p50_ms))} · p95 ${esc(fmtMs(wait.p95_ms))} · max ${esc(fmtMs(wait.max_ms))} (${esc(String(wait.samples))} samples)</span>`);
         }
+        const hold = daemon.guard_hold;
+        if (hold) {
+          // The hold is the cause; the wait above is the symptom. Shown with a
+          // warning tint once any hold has crossed the threshold, since that is
+          // the condition that produces the waits.
+          const tint = hold.over_threshold > 0 ? "--warn" : "--muted";
+          rows.push(`<span style="color:${cvar(tint)}" data-tip="The longest the store lock has been held by any one caller, over this daemon's lifetime, and how many holds crossed the ${esc(String(hold.warn_threshold_ms))}ms watchdog threshold. A long hold is what causes the waits above -- something blocking (a subprocess, a network call, a sleep) ran while the lock was held.">held at most ${esc(fmtMs(hold.max_ms))}${hold.over_threshold > 0 ? ` · ${esc(String(hold.over_threshold))} over ${esc(String(hold.warn_threshold_ms))}ms` : ""}</span>`);
+        }
         if (holder) {
           rows.push(`<span style="color:var(--muted)" data-tip="Source location that most recently acquired the store lock, and how long ago. When the lock is unreachable this names what is holding the daemon up.">held by ${esc(holder.site)} (${esc(fmtMs(holder.held_ms))})</span>`);
         }

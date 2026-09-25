@@ -189,16 +189,35 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 const GUARD_HOLD_WARN_MS: u128 = 100;
 
 /// Panic threshold for the guard watchdog, in milliseconds; `0` disables
-/// panicking (release builds log instead). Dev (`debug_assertions`) panics at
-/// the warn threshold so a regression fails loudly and immediately; test
-/// builds tolerate slow machines up to 5 s -- enough to catch a genuinely
-/// stuck hold without flaking on CI load -- and both are overridable via
+/// panicking (release builds log instead). Overridable via
 /// `RALPHUS_GUARD_HOLD_PANIC_MS` (set it very large to disable panicking).
+///
+/// The thresholds are deliberately far above [`GUARD_HOLD_WARN_MS`], which is
+/// where *reporting* starts. Two reasons.
+///
+/// A debug build is several times slower than a release one at the same work,
+/// so a 100 ms hold in a debug build is not evidence of the thing this watchdog
+/// exists to catch. What it is evidence of is a query being slow, which the
+/// warning already reports and which the aggregate gates in
+/// `daemon/tests/board_contention.rs` and `workload_replay.rs` measure properly
+/// (store-lock wait p95 under 50 ms, over a real workload).
+///
+/// And `cfg!(test)` is true only for this crate's own unit tests. An
+/// *integration* test binary links the library compiled normally, so it takes
+/// the non-test branch -- which is how a 100 ms default came to fail
+/// `daemon/tests/guardian_merge.rs` wholesale on a single 133 ms
+/// `get_guardian`, in a debug build, against real git fixtures. Worse, the same
+/// branch applies to `scripts/build-debug.sh`'s daemon: a developer's daemon
+/// would panic on any 101 ms hold.
+///
+/// What is being caught is blocking I/O under the lock -- a subprocess, a
+/// network round-trip, a sleep -- and those are seconds, not milliseconds. The
+/// thresholds below are sized to that, so the panic means what it says.
 fn guard_hold_panic_ms() -> u128 {
     let default = if cfg!(test) {
         5_000
     } else if cfg!(debug_assertions) {
-        GUARD_HOLD_WARN_MS
+        2_000
     } else {
         0
     };
@@ -208,12 +227,50 @@ fn guard_hold_panic_ms() -> u128 {
         .unwrap_or(default)
 }
 
+/// Longest guard hold, in ms, over the process lifetime.
+static GUARD_HOLD_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// Holds that reached [`GUARD_HOLD_WARN_MS`], over the process lifetime.
+static GUARD_HOLD_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Guard-hold statistics, reported by `GET /api/daemon`.
+///
+/// The plan's M5 target is a maximum hold under 100 ms. Before this the only
+/// record of a long hold was a log line and a Cartographer row, which makes the
+/// target something you grep for rather than something a test can assert. These
+/// counters make it a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GuardHoldSnapshot {
+    /// Longest hold observed, in ms.
+    pub max_ms: u64,
+    /// How many holds reached `warn_threshold_ms`.
+    pub over_threshold: u64,
+    /// The threshold the count is against.
+    pub warn_threshold_ms: u64,
+}
+
+/// Snapshot of the process-lifetime guard-hold counters.
+#[must_use]
+pub fn guard_hold_snapshot() -> GuardHoldSnapshot {
+    GuardHoldSnapshot {
+        max_ms: GUARD_HOLD_MAX_MS.load(Ordering::Relaxed),
+        over_threshold: GUARD_HOLD_WARN_COUNT.load(Ordering::Relaxed),
+        warn_threshold_ms: GUARD_HOLD_WARN_MS as u64,
+    }
+}
+
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         let held_ms = self.acquired_at.elapsed().as_millis();
+        // Recorded for every hold, not just the long ones: the maximum is only
+        // meaningful if nothing is excluded from it.
+        GUARD_HOLD_MAX_MS.fetch_max(
+            u64::try_from(held_ms).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         if held_ms < GUARD_HOLD_WARN_MS {
             return;
         }
+        GUARD_HOLD_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
         let detail = format!(
             "store guard held for {held_ms}ms (acquired at {}:{})",
             self.site.file(),

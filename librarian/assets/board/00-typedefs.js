@@ -866,8 +866,17 @@
        * db/warnings, which other call sites use.
        * @typedef {object} DaemonHealthView
        * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).
+       * @property {StoreGuardHoldView} [guard_hold] - how long the lock has been *held* at worst (WS-D.8/M5). Distinct from `lock_wait`: a long hold is the cause, a long wait is what every other thread feels.
        * @property {StoreWatchdogView} [watchdog] - store-lock liveness (WS-G.1/G.2, `daemon/src/watchdog.rs`).
        * @property {{site: string, held_ms: number}|null} [store_lock_holder] - `file:line` that last acquired the store lock, and how long ago. Absent if the lock has never been taken.
+       */
+      /**
+       * Worst store-lock hold over the daemon's lifetime, and how many holds
+       * crossed the watchdog's warn threshold.
+       * @typedef {object} StoreGuardHoldView
+       * @property {number} max_ms
+       * @property {number} over_threshold
+       * @property {number} warn_threshold_ms
        */
       /**
        * Store-lock wait distribution. Wait time only -- query time is not

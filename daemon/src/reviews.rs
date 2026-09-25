@@ -591,7 +591,7 @@ fn remote_cell_derivation(
 /// Returns [`ReviewError`] when a review cell has no cwd, its cwd is not a git
 /// worktree, or the worktree has no upstream tracking branch.
 pub fn derive_reviews(
-    store: &Store,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
 ) -> std::result::Result<Vec<String>, ReviewError> {
@@ -763,7 +763,7 @@ fn review_branch_order(deps: &[Vec<usize>], topo: &[usize]) -> Vec<usize> {
 /// where the fetch used to happen unconditionally, so correctness never
 /// depends on this cache being complete.
 pub fn derive_reviews_with_prefetch(
-    store: &Store,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
     prefetched_upstreams: &HashMap<(String, String), String>,
@@ -779,7 +779,7 @@ pub fn derive_reviews_with_prefetch(
 /// real, slow `git worktree add`/`fetch`/rebase for every cell the caller
 /// already materialized ahead of time, without the store lock held).
 pub fn derive_reviews_with_full_prefetch(
-    store: &Store,
+    store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
     prefetched_upstreams: &HashMap<(String, String), String>,
@@ -802,7 +802,7 @@ pub fn derive_reviews_with_full_prefetch(
     // worktree creation to discover. See its own doc comment for why this only
     // covers link-key reviews and is advisory (the real check below still runs
     // regardless, so an imprecise answer here only costs time, never correctness).
-    require_auto_build_declaration_early(store, file, &tasks, &cells, &cell_info)?;
+    require_auto_build_declaration_early(&store.lock(), file, &tasks, &cells, &cell_info)?;
 
     // A review-opted-in cell's `cwd` may still be an unmaterialized
     // `ralphus:new-worktree/<branch>` placeholder (RAL-100): normally the
@@ -810,6 +810,12 @@ pub fn derive_reviews_with_full_prefetch(
     // this preflight needs a real worktree path *now* to run git against it.
     // Resolving here (persisted via `Store::set_cell_cwd`, same as the
     // scheduler's resolution) means a restarted squad never re-resolves it.
+    //
+    // WS-D.8: no guard is held for this. It is the expensive half of this
+    // function -- real `git worktree add`/`fetch`/rebase per unresolved
+    // placeholder, and a full provisioning round-trip for a remote cell -- and
+    // holding the store lock across it made this the single worst lock holder
+    // in the daemon, measured at 45.9 seconds twice on the submit path.
     crate::worktrees::resolve_placeholders_with_full_prefetch(
         store,
         squad_id,
@@ -872,7 +878,9 @@ pub fn derive_reviews_with_full_prefetch(
         // from its `ralphus:new-worktree/<branch>` cwd, the upstream from the
         // review's own `upstream`, and the project from the owning task.
         let remote = remote_cell_derivation(
-            store,
+            // Store reads only (a machine lookup and the project root), so a
+            // short lock here is right; the git work is further down.
+            &store.lock(),
             &cells[pos],
             cell_info[pos].0.as_deref(),
             tasks_by_idx.get(&cells[pos].task_idx).copied().flatten(),
@@ -911,7 +919,7 @@ pub fn derive_reviews_with_full_prefetch(
                         .copied()
                         .flatten()
                         .and_then(|task| task.project.as_deref())
-                        .and_then(|name| store.resolve_project(name).ok().flatten());
+                        .and_then(|name| store.lock().resolve_project(name).ok().flatten());
                     match registered_project {
                         // Prefer an already-fetched result from
                         // `prefetched_upstreams` (computed by the caller
@@ -947,9 +955,10 @@ pub fn derive_reviews_with_full_prefetch(
             .copied()
             .flatten()
             .and_then(|task| task.project.as_deref())
-            .and_then(|name| store.resolve_project(name).ok().flatten())
+            .and_then(|name| store.lock().resolve_project(name).ok().flatten())
             .map(|registered| registered.name);
         store
+            .lock()
             .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, &branch)
             .map_err(|e| ReviewError::new(e.to_string()))?;
         // Only meaningful for a local worktree: a remote cell's cwd names a
@@ -1045,6 +1054,7 @@ pub fn derive_reviews_with_full_prefetch(
         if let Some((_, branch)) = explicit_roots.iter().find(|(r, _)| *r == root) {
             let crow = &cells[pos];
             store
+                .lock()
                 .set_cell_review_branch(squad_id, crow.task_idx, crow.idx, branch)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
             implicit_cells_by_branch
@@ -1070,6 +1080,28 @@ pub fn derive_reviews_with_full_prefetch(
     // Split memberships into link groups (grouped within THIS submission by the
     // `ralphus:new-review/<key>` placeholder) and project groups (the classic
     // "one review per repo per submit"). BTreeMap keys give a deterministic order.
+    // WS-D.8: the guard is taken *here*, not at the top of the function. The
+    // membership pass above reads the store per cell but also runs git -- a
+    // local `worktree_upstream`, and on a prefetch miss a live
+    // `resolve_registered_remote_upstream`, which fetches from the remote. Those
+    // must not run under the lock, which is the whole point of this workstream;
+    // holding from the top of the function measured 859 ms in a debug build even
+    // after the expensive placeholder resolution had been hoisted out.
+    //
+    // From here down it is database work only -- creating guardians and
+    // attaching their branches -- and one guard covers all of it, because that
+    // sequence must not interleave with another submission doing the same.
+    //
+    // Splitting here does open one transient window that the old
+    // whole-function guard did not have: the pass above already wrote each
+    // cell's `review_branch`, so for the moment between that write and the
+    // guardian existing, a concurrent board read can see a cell carrying a
+    // branch whose guardian is not there yet. `reviews_for_squad`'s
+    // branch-name arm simply matches nothing, so such a cell renders with no
+    // review for one poll and with its review on the next. That is a
+    // self-correcting 150 ms display lag, traded against holding the daemon's
+    // one global lock across a `git fetch`.
+    let store = &store.lock();
     let mut link_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
     let mut proj_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
     for m in &memberships {
@@ -1711,16 +1743,20 @@ pub fn derive_triage_pools(
     // Arbiter round-trip that must never run with the daemon's global store
     // lock held.
     let touched_keys = {
-        let store = store.lock();
         let (mut cells, tasks, _cell_info) = rows_from_file(file);
+        // WS-D.8: resolved with no guard held -- this materializes worktrees
+        // (`git worktree add`, a fetch, possibly a rebase) and now locks per
+        // store touch internally. The guard for the classification/recording
+        // pass below is taken after it returns.
         crate::worktrees::resolve_placeholders(
-            &store,
+            store,
             squad_id,
             &mut cells,
             &tasks,
             &Context::new(),
         )
         .map_err(ReviewError::new)?;
+        let store = store.lock();
         let tasks_by_idx: BTreeMap<i64, Option<&TaskRow>> =
             tasks.iter().map(|t| (t.idx, Some(t))).collect();
 
@@ -3428,8 +3464,11 @@ mod tests {
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "base"]);
 
-        let store = Store::open_in_memory().unwrap();
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store
+            .lock()
             .register_project("proj", "", &root.to_string_lossy(), "git")
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(&link_review_toml("")).unwrap();

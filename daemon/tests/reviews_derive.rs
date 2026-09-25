@@ -219,12 +219,12 @@ fn single_project_makes_one_review() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 1);
-    let g = store.get_guardian(&ids[0]).unwrap();
+    let g = store.lock().get_guardian(&ids[0]).unwrap();
     assert_eq!(g.name, "backend");
     assert_eq!(g.project, None, "a cwd-only task uses the directory route");
     assert_eq!(g.base_branch, "main");
@@ -240,7 +240,7 @@ fn single_project_makes_one_review() {
     assert_eq!(g.separate_pr_branch, Some(true));
     assert_eq!(g.branches.len(), 1);
     assert_eq!(g.branches[0].branch, "feature/a");
-    assert_eq!(store.guardians_for_squad(&run_id).unwrap(), ids);
+    assert_eq!(store.lock().guardians_for_squad(&run_id).unwrap(), ids);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -256,14 +256,15 @@ fn registered_project_task_records_project_identity_on_its_review() {
          [[review]]\nid=\"project-review\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     store
+        .lock()
         .register_project("ralphus", "", &base.join("repo").to_string_lossy(), "git")
         .unwrap();
-    let squad_id = store.insert_squad(&file, None, false).unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
-    let guardian = store.get_guardian(&guardian_id).unwrap();
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
 
     assert_eq!(guardian.project.as_deref(), Some("ralphus"));
     let _ = std::fs::remove_dir_all(&base);
@@ -340,8 +341,9 @@ fn declared_review_upstream_resolves_against_the_registered_projects_remote() {
          [[review]]\nid=\"remote-upstream-review\"\nupstream=\"staging\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     store
+        .lock()
         .register_project_with_clone_url_ex(
             "proj",
             "",
@@ -351,10 +353,10 @@ fn declared_review_upstream_resolves_against_the_registered_projects_remote() {
             None,
         )
         .unwrap();
-    let squad_id = store.insert_squad(&file, None, false).unwrap();
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
 
     let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
-    let guardian = store.get_guardian(&guardian_id).unwrap();
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
 
     assert_eq!(
         guardian.base_branch, "origin/staging",
@@ -389,10 +391,10 @@ fn declared_review_settings_override_project_defaults() {
         "proof_scope=\"each_branch\"\nskip_worktrees=true\nskip_base_updates=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\nskip_auto_build=true",
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let mut store = Store::open_in_memory().unwrap();
-    let squad_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
     let guardian_id = derive_reviews(&store, &squad_id, &file).unwrap().remove(0);
-    let guardian = store.get_guardian(&guardian_id).unwrap();
+    let guardian = store.lock().get_guardian(&guardian_id).unwrap();
 
     assert!(guardian.skip_worktrees);
     assert_eq!(guardian.skip_base_updates, Some(true));
@@ -416,14 +418,14 @@ fn two_projects_make_two_disambiguated_reviews() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 2, "two projects -> two reviews");
     let names: Vec<String> = ids
         .iter()
-        .map(|id| store.get_guardian(id).unwrap().name)
+        .map(|id| store.lock().get_guardian(id).unwrap().name)
         .collect();
     // Disambiguated with numeric suffixes; the two names must differ.
     assert_ne!(names[0], names[1]);
@@ -472,7 +474,7 @@ fn repo_with_two_worktrees(base: &Path, branch_a: &str, branch_b: &str) -> (Stri
 fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
     let base = temp_base("collision");
     let cwd = repo_with_worktree(&base, "feature/shared");
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     let toml_a = session_toml(
         &cwd,
@@ -480,7 +482,7 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
         "name=\"Batch\"\nskip_auto_build=true",
     );
     let file_a: TaskFile = toml::from_str(&toml_a).unwrap();
-    let squad_a = store.insert_squad(&file_a, None, false).unwrap();
+    let squad_a = store.lock().insert_squad(&file_a, None, false).unwrap();
     let ids_a = derive_reviews(&store, &squad_a, &file_a).expect("derive a");
     assert_eq!(ids_a.len(), 1);
     let gid_a = ids_a[0].clone();
@@ -494,21 +496,21 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
         "name=\"Batch\"\nskip_auto_build=true",
     );
     let file_b: TaskFile = toml::from_str(&toml_b).unwrap();
-    let squad_b = store.insert_squad(&file_b, None, false).unwrap();
+    let squad_b = store.lock().insert_squad(&file_b, None, false).unwrap();
     let ids_b = derive_reviews(&store, &squad_b, &file_b).expect("derive b");
     assert_eq!(ids_b.len(), 1);
     let gid_b = ids_b[0].clone();
 
     assert_ne!(gid_a, gid_b, "each submission mints its own guardian");
     assert_eq!(
-        store.get_guardian(&gid_a).unwrap().branches[0].branch,
-        store.get_guardian(&gid_b).unwrap().branches[0].branch,
+        store.lock().get_guardian(&gid_a).unwrap().branches[0].branch,
+        store.lock().get_guardian(&gid_b).unwrap().branches[0].branch,
         "sanity: both guardians recorded the identical branch string"
     );
 
     // The cell-level "in reviews" list (RAL-17, via `get_squad`) must link
     // each squad's cell to only its own guardian.
-    let view_a = store.get_squad(&squad_a).unwrap();
+    let view_a = store.lock().get_squad(&squad_a).unwrap();
     let cell_a = &view_a.tasks[0].cells[0];
     assert_eq!(
         cell_a
@@ -520,7 +522,7 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
         "squad A's cell must link only to guardian A, not guardian B"
     );
 
-    let view_b = store.get_squad(&squad_b).unwrap();
+    let view_b = store.lock().get_squad(&squad_b).unwrap();
     let cell_b = &view_b.tasks[0].cells[0];
     assert_eq!(
         cell_b
@@ -535,12 +537,18 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
     // The scheduler's stack-readiness gating (`collecting_guardians_for_cells`)
     // must draw the same distinction, not just the cosmetic board view.
     assert_eq!(
-        store.collecting_guardians_for_cells(&squad_a).unwrap(),
+        store
+            .lock()
+            .collecting_guardians_for_cells(&squad_a)
+            .unwrap(),
         vec![gid_a],
         "squad A must only be seen as contributing to guardian A"
     );
     assert_eq!(
-        store.collecting_guardians_for_cells(&squad_b).unwrap(),
+        store
+            .lock()
+            .collecting_guardians_for_cells(&squad_b)
+            .unwrap(),
         vec![gid_b],
         "squad B must only be seen as contributing to guardian B"
     );
@@ -556,7 +564,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
     // guardians — the placeholder never links across submissions.
     let base = temp_base("link");
     let (cwd_a, cwd_b) = repo_with_two_worktrees(&base, "feature/a", "feature/b");
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     // Submission 1 (branch a) mints a fresh guardian, tagged with run 1.
     let file1: TaskFile = toml::from_str(&session_toml(
@@ -565,11 +573,11 @@ fn separate_submissions_each_mint_a_fresh_review() {
         "name=\"My Batch\"\nskip_auto_build=true",
     ))
     .unwrap();
-    let run1 = store.insert_squad(&file1, None, false).unwrap();
+    let run1 = store.lock().insert_squad(&file1, None, false).unwrap();
     let ids1 = derive_reviews(&store, &run1, &file1).expect("derive 1");
     assert_eq!(ids1.len(), 1, "first submission mints one guardian");
     let gid1 = ids1[0].clone();
-    assert_eq!(store.get_guardian(&gid1).unwrap().name, "My Batch");
+    assert_eq!(store.lock().get_guardian(&gid1).unwrap().name, "My Batch");
 
     // Submission 2 (branch b) reuses the same <key> string but is a SEPARATE
     // submission, so it mints its OWN new guardian — it does not attach to gid1.
@@ -579,7 +587,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
         "name=\"My Batch\"\nskip_auto_build=true",
     ))
     .unwrap();
-    let run2 = store.insert_squad(&file2, None, false).unwrap();
+    let run2 = store.lock().insert_squad(&file2, None, false).unwrap();
     let ids2 = derive_reviews(&store, &run2, &file2).expect("derive 2");
     assert_eq!(
         ids2.len(),
@@ -589,13 +597,14 @@ fn separate_submissions_each_mint_a_fresh_review() {
     let gid2 = ids2[0].clone();
     assert_ne!(gid1, gid2, "the two submissions must not share a guardian");
     assert_eq!(
-        store.guardians_for_squad(&run2).unwrap(),
+        store.lock().guardians_for_squad(&run2).unwrap(),
         vec![gid2.clone()],
         "the new guardian is tagged with the second run"
     );
 
     // Each guardian carries only its own submission's branch.
     let b1: Vec<String> = store
+        .lock()
         .get_guardian(&gid1)
         .unwrap()
         .branches
@@ -603,6 +612,7 @@ fn separate_submissions_each_mint_a_fresh_review() {
         .map(|b| b.branch.clone())
         .collect();
     let b2: Vec<String> = store
+        .lock()
         .get_guardian(&gid2)
         .unwrap()
         .branches
@@ -693,8 +703,8 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
     let combined = format!("{file1_text}\n\n{file2_text}\n\n{file3_text}");
     let file: TaskFile = toml::from_str(&combined).expect("combined TOML parses");
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(
@@ -705,7 +715,7 @@ fn three_files_combined_into_one_submission_two_keys_make_two_reviews() {
 
     let guardians: Vec<_> = ids
         .iter()
-        .map(|id| store.get_guardian(id).unwrap())
+        .map(|id| store.lock().get_guardian(id).unwrap())
         .collect();
     let shared = guardians
         .iter()
@@ -738,8 +748,8 @@ fn upstream_base_without_upstream_is_rejected() {
     let toml = session_toml(&cwd, "r", "");
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let err = derive_reviews(&store, &run_id, &file).expect_err("no upstream -> error");
     assert!(err.message.contains("upstream"), "msg: {}", err.message);
 
@@ -767,7 +777,7 @@ fn reviews_auto_start_when_the_run_succeeds() {
     let (run_id, gid) = {
         let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
-        let ids = derive_reviews(&g, &run_id, &file).expect("derive");
+        let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         assert_eq!(g.get_guardian(&ids[0]).unwrap().status, "collecting");
         (run_id, ids[0].clone())
     };
@@ -821,10 +831,7 @@ fn start_merge_resolves_conflicts_with_agent() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
-    let gid = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
-    };
+    let gid = { derive_reviews(&store, &run_id, &file).expect("derive")[0].clone() };
     // RAL-255: start_merge now defers a still-collecting guardian's merge
     // while an enabled branch's upstream Cell isn't done yet, so mark both
     // cells done first -- matching the real precondition for the "Merge /
@@ -929,10 +936,7 @@ fn force_push_then_merge_resolves_cleanly() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
-    let gid = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
-    };
+    let gid = { derive_reviews(&store, &run_id, &file).expect("derive")[0].clone() };
 
     // First merge: A and B don't conflict, so OkRunner (no resolution needed).
     run_merge(&store, &OkRunner, &gid);
@@ -1036,10 +1040,7 @@ fn merge_button_forces_a_fresh_rebase_on_an_already_in_review_review() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
-    let gid = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
-    };
+    let gid = { derive_reviews(&store, &run_id, &file).expect("derive")[0].clone() };
 
     // First "Merge / rebase" press: clean stack, reaches in_review with both
     // branches done.
@@ -1117,10 +1118,7 @@ fn no_checks_configured_runs_project_auto_build_default() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
-    let gid = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
-    };
+    let gid = { derive_reviews(&store, &run_id, &file).expect("derive")[0].clone() };
     assert!(
         store.lock().guardian_checks(&gid).unwrap().is_empty(),
         "sanity: this review has no explicit checks configured"
@@ -1174,10 +1172,7 @@ fn checks_configured_does_not_also_run_auto_build() {
     let file: TaskFile = toml::from_str(&toml).unwrap();
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let run_id = store.lock().insert_squad(&file, None, false).unwrap();
-    let gid = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")[0].clone()
-    };
+    let gid = { derive_reviews(&store, &run_id, &file).expect("derive")[0].clone() };
     store
         .lock()
         .set_guardian_checks(&gid, &["exit 0".to_string()])
@@ -1305,7 +1300,7 @@ fn non_overlapping_task_does_not_block_readiness() {
     let (run_id, gid) = {
         let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
-        let ids = derive_reviews(&g, &run_id, &file).expect("derive");
+        let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only task A declared a review");
         (run_id, ids[0].clone())
     };
@@ -1386,7 +1381,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
     let (run_id, gid) = {
         let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
-        let ids = derive_reviews(&g, &run_id, &file).expect("derive");
+        let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only one project so one review");
         (run_id, ids[0].clone())
     };
@@ -1597,10 +1592,7 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
     //    two branches in topological order (a then b). Derived explicitly here
     //    (rather than via submit's auto-start) so we can inject a real ollama
     //    runner for the conflict resolution.
-    let ids = {
-        let g = store.lock();
-        derive_reviews(&g, &run_id, &file).expect("derive")
-    };
+    let ids = { derive_reviews(&store, &run_id, &file).expect("derive") };
     assert_eq!(ids.len(), 1, "one project -> one review");
     let gid = ids[0].clone();
     assert_eq!(store.lock().get_guardian(&gid).unwrap().branches.len(), 2);
@@ -1634,13 +1626,19 @@ fn full_flow_validate_submit_run_and_ollama_resolves_conflict() {
 
 #[test]
 fn no_review_declaration_makes_no_guardians() {
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/tmp\"\nprompt=\"p\"\n";
     let file: TaskFile = toml::from_str(toml).unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     // No git access happens because no session declares a review.
     assert!(derive_reviews(&store, &run_id, &file).unwrap().is_empty());
-    assert!(store.guardians_for_squad(&run_id).unwrap().is_empty());
+    assert!(
+        store
+            .lock()
+            .guardians_for_squad(&run_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ── Multi-project tests (RAL-29) ─────────────────────────────────────────────
@@ -1655,7 +1653,7 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
     let cwd_a = repo_with_worktree(&base_a, "feature/a");
     let cwd_b = repo_with_worktree(&base_b, "feature/b");
 
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     // One submission with two sessions (repo A + repo B) sharing the key mints one
     // multi-project guardian.
@@ -1666,13 +1664,13 @@ fn link_key_across_two_repos_creates_one_multi_project_guardian() {
         "name=\"Cross Review\"\nskip_auto_build=true",
     ))
     .unwrap();
-    let run = store.insert_squad(&file, None, false).unwrap();
+    let run = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run, &file).expect("derive");
     assert_eq!(ids.len(), 1, "one submission mints one guardian");
     let gid = ids[0].clone();
 
     // The guardian has both branches.
-    let g = store.get_guardian(&gid).unwrap();
+    let g = store.lock().get_guardian(&gid).unwrap();
     let branches: Vec<_> = g.branches.iter().map(|b| b.branch.as_str()).collect();
     assert_eq!(branches, vec!["feature/a", "feature/b"]);
 
@@ -1707,7 +1705,7 @@ fn link_key_same_repo_branches_have_no_project_tag() {
     let base = temp_base("mp-link-same");
     let (cwd_a, cwd_b) = repo_with_two_worktrees(&base, "feature/a", "feature/b");
 
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
 
     // One submission, two sessions in the SAME repo, sharing the key.
     let file: TaskFile = toml::from_str(&two_session_toml(
@@ -1717,10 +1715,10 @@ fn link_key_same_repo_branches_have_no_project_tag() {
         "name=\"Same Repo\"\nskip_auto_build=true",
     ))
     .unwrap();
-    let run = store.insert_squad(&file, None, false).unwrap();
+    let run = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run, &file).expect("derive");
 
-    let g = store.get_guardian(&ids[0]).unwrap();
+    let g = store.lock().get_guardian(&ids[0]).unwrap();
     // Branches in the same repo still carry a project tag (it just happens to be
     // the same path for both), so the merge engine partitions them into one group.
     assert_eq!(g.branches.len(), 2);
@@ -1751,13 +1749,13 @@ fn proj_group_branches_carry_no_project_tag() {
          [[review]]\nid=\"rB\"\nskip_auto_build=true\n"
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 2, "two projects -> two guardians");
     for id in &ids {
-        let g = store.get_guardian(id).unwrap();
+        let g = store.lock().get_guardian(id).unwrap();
         // Single-project guardians: each has exactly one project (its git_root).
         assert_eq!(g.projects.len(), 1);
         assert_eq!(g.projects[0], g.git_root);
@@ -1808,7 +1806,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     let gid = {
         let mut g = store.lock();
         let r = g.insert_squad(&file, None, false).unwrap();
-        let ids = derive_reviews(&g, &r, &file).expect("derive");
+        let ids = derive_reviews(&store, &r, &file).expect("derive");
         ids[0].clone()
     };
 
@@ -1878,12 +1876,15 @@ fn multi_project_all_must_pass_one_fails_makes_merge_failed() {
 /// always contains exactly one entry equal to `git_root`.
 #[test]
 fn single_project_guardian_projects_field_has_one_entry() {
-    let store = Store::open_in_memory().unwrap();
-    let id = store.create_guardian("r", "main", "/some/repo").unwrap();
-    store.add_guardian_branch(&id, "feature/a").unwrap();
-    store.add_guardian_branch(&id, "feature/b").unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = store
+        .lock()
+        .create_guardian("r", "main", "/some/repo")
+        .unwrap();
+    store.lock().add_guardian_branch(&id, "feature/a").unwrap();
+    store.lock().add_guardian_branch(&id, "feature/b").unwrap();
 
-    let g = store.get_guardian(&id).unwrap();
+    let g = store.lock().get_guardian(&id).unwrap();
     assert_eq!(g.projects, vec!["/some/repo".to_string()]);
     assert_eq!(g.projects[0], g.git_root);
 }
@@ -1892,14 +1893,18 @@ fn single_project_guardian_projects_field_has_one_entry() {
 /// tag, while `add_guardian_branch` leaves it as None.
 #[test]
 fn branch_project_tag_stored_and_retrieved() {
-    let store = Store::open_in_memory().unwrap();
-    let id = store.create_guardian("r", "main", "/primary").unwrap();
-    store.add_guardian_branch(&id, "feature/a").unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = store
+        .lock()
+        .create_guardian("r", "main", "/primary")
+        .unwrap();
+    store.lock().add_guardian_branch(&id, "feature/a").unwrap();
     store
+        .lock()
         .add_guardian_branch_with_project(&id, "feature/b", Some("/secondary"))
         .unwrap();
 
-    let g = store.get_guardian(&id).unwrap();
+    let g = store.lock().get_guardian(&id).unwrap();
     assert_eq!(g.branches[0].project, None, "no explicit project -> None");
     assert_eq!(
         g.branches[1].project.as_deref(),
@@ -1912,14 +1917,18 @@ fn branch_project_tag_stored_and_retrieved() {
 /// `set_guardian_project_base_commit` updates the JSON map and the legacy column.
 #[test]
 fn per_project_base_commits_stored_and_retrieved() {
-    let store = Store::open_in_memory().unwrap();
-    let id = store.create_guardian("r", "main", "/primary").unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = store
+        .lock()
+        .create_guardian("r", "main", "/primary")
+        .unwrap();
 
     // Record a commit for the primary project (also updates legacy base_commit).
     store
+        .lock()
         .set_guardian_project_base_commit(&id, "/primary", "abc123")
         .unwrap();
-    let g = store.get_guardian(&id).unwrap();
+    let g = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         g.base_commits.get("/primary").map(String::as_str),
         Some("abc123")
@@ -1932,9 +1941,10 @@ fn per_project_base_commits_stored_and_retrieved() {
 
     // Record a commit for a secondary project (only updates the JSON map).
     store
+        .lock()
         .set_guardian_project_base_commit(&id, "/secondary", "def456")
         .unwrap();
-    let g = store.get_guardian(&id).unwrap();
+    let g = store.lock().get_guardian(&id).unwrap();
     assert_eq!(
         g.base_commits.get("/secondary").map(String::as_str),
         Some("def456")
@@ -1974,17 +1984,17 @@ fn nested_cwd_session_implicitly_joins_review_and_reviews_list() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
 
     assert_eq!(ids.len(), 1, "only one project declares a review");
     let gid = ids[0].clone();
-    let g = store.get_guardian(&gid).unwrap();
+    let g = store.lock().get_guardian(&gid).unwrap();
     assert_eq!(g.branches.len(), 1);
     assert_eq!(g.branches[0].branch, "feature/share");
 
-    let view = store.get_squad(&run_id).unwrap();
+    let view = store.lock().get_squad(&run_id).unwrap();
     let a_reviews = view.tasks[0].cells[0].reviews.clone();
     let b_reviews = view.tasks[1].cells[0].reviews.clone();
     let c_reviews = view.tasks[2].cells[0].reviews.clone();
@@ -2023,20 +2033,24 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     );
     let file: TaskFile = toml::from_str(&toml).unwrap();
 
-    let mut store = Store::open_in_memory().unwrap();
-    let run_id = store.insert_squad(&file, None, false).unwrap();
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let run_id = store.lock().insert_squad(&file, None, false).unwrap();
     let ids = derive_reviews(&store, &run_id, &file).expect("derive ok");
     let gid = ids[0].clone();
 
     // Task A (explicit) finishes -- branch must stay `pending`: task B (the
     // implicit worktree sibling) hasn't finished yet.
     store
+        .lock()
         .set_cell_state(&run_id, 0, 0, NodeState::Done)
         .unwrap();
-    let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+    let n = store
+        .lock()
+        .mark_ready_branches_with_done_cells(&gid)
+        .unwrap();
     assert_eq!(n, 0, "must not promote while a sibling is still pending");
     assert_eq!(
-        store.get_guardian(&gid).unwrap().branches[0].merge_status,
+        store.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
         "pending"
     );
 
@@ -2045,14 +2059,24 @@ fn worktree_sharing_gates_branch_ready_until_all_sessions_done() {
     // `run_task_finalizer` clearing task-level proofs -- before the branch
     // may promote.
     store
+        .lock()
         .set_cell_state(&run_id, 1, 0, NodeState::Done)
         .unwrap();
-    store.set_task_state(&run_id, 0, NodeState::Done).unwrap();
-    store.set_task_state(&run_id, 1, NodeState::Done).unwrap();
-    let n = store.mark_ready_branches_with_done_cells(&gid).unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 0, NodeState::Done)
+        .unwrap();
+    store
+        .lock()
+        .set_task_state(&run_id, 1, NodeState::Done)
+        .unwrap();
+    let n = store
+        .lock()
+        .mark_ready_branches_with_done_cells(&gid)
+        .unwrap();
     assert_eq!(n, 1, "promotes exactly the one branch");
     assert_eq!(
-        store.get_guardian(&gid).unwrap().branches[0].merge_status,
+        store.lock().get_guardian(&gid).unwrap().branches[0].merge_status,
         "ready"
     );
 
@@ -2086,7 +2110,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
     let (run_id, gid) = {
         let mut g = store.lock();
         let run_id = g.insert_squad(&file, None, false).unwrap();
-        let ids = derive_reviews(&g, &run_id, &file).expect("derive");
+        let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         (run_id, ids[0].clone())
     };
 

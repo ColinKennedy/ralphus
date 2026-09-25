@@ -344,6 +344,11 @@ jobs:
       # where the mix came from. RALPHUS_REPLAY_SECONDS lengthens the window.
       - name: Rust recorded-workload replay
         run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+      # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
+      # runs in the default suite too -- but repeated here so a regression is
+      # attributed to the perf job rather than looking like an unrelated flake.
+      - name: Rust submit lock-hold budget
+        run: cargo nextest run -p ralphus-daemon --test submit_lock_hold --test-threads 1
       - name: Build ralphus-librarian (needed by the browser-side perf test)
         run: cargo build -p ralphus-librarian
       - uses: actions/setup-python@v5
