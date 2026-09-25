@@ -7459,6 +7459,42 @@ fn reject_unsupported_maximum_tool_output_tokens(agent: &str) -> Option<Reply> {
 /// [`Store::restart_cell_proof`]/[`Store::restart_task_proof`] so only that
 /// proof step (and any later step in its scope) goes back to Pending, rather
 /// than resetting the whole squad or task.
+/// Whether `edit`, applied to `current`, would leave every field it touches
+/// exactly as it already is -- i.e. the caller resubmitted the same values
+/// rather than actually changing anything. An untouched field (`None`) never
+/// counts against a no-op, matching `edit_cell_fields`'s own "leave the
+/// column as-is" semantics for it.
+///
+/// Used by `edit_squad`'s `"cell"` arm to skip the cancel/wait-for-worker-
+/// stop/restart cascade for a request that wouldn't change any runtime
+/// behavior anyway -- that cascade runs under the daemon's single global
+/// store lock and can block on `wait_for_worker_stop` for up to 5s, so a
+/// caller that repeatedly resubmits an unchanged edit (a stuck retry loop, a
+/// double-click, a form re-save with no actual delta) starves every other
+/// squad's board reads and scheduling for as long as it keeps calling, not
+/// just its own. Observed live: a squad's cell being edited on a ~5s cadence
+/// made an unrelated, otherwise-trivial 2-task squad's materialization take
+/// nearly a minute because it could never get the lock.
+fn cell_edit_is_noop(current: &crate::store::CellRow, edit: &crate::store::CellEdit<'_>) -> bool {
+    edit.cwd.is_none_or(|v| v == current.cwd.as_deref())
+        && edit.agent.is_none_or(|v| v == current.agent)
+        && edit.model.is_none_or(|v| v == current.model.as_deref())
+        && edit.prompt.is_none_or(|v| v == current.prompt.as_deref())
+        && edit.command.is_none_or(|v| v == current.command.as_deref())
+        && edit
+            .auto_compact_threshold
+            .is_none_or(|v| v == current.auto_compact_threshold)
+        && edit
+            .maximum_context
+            .is_none_or(|v| v == current.maximum_context)
+        && edit
+            .maximum_tool_output_tokens
+            .is_none_or(|v| v == current.maximum_tool_output_tokens)
+        && edit
+            .system_prompt
+            .is_none_or(|v| v == current.system_prompt.as_deref())
+}
+
 fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<EditBody>(body) else {
         return error(400, "bad_request", "invalid edit body", vec![]);
@@ -7591,32 +7627,47 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 maximum_tool_output_tokens,
                 system_prompt,
             };
+            // Computed before the write below so it reflects the PRE-edit
+            // state -- see `cell_edit_is_noop`'s doc comment for why this
+            // guards the restart cascade rather than the write itself.
+            let is_noop = daemon
+                .lock()
+                .cells_of(id)
+                .ok()
+                .and_then(|cells| {
+                    cells
+                        .into_iter()
+                        .find(|c| c.task_idx == req.task_idx && c.idx == req.cell_idx)
+                })
+                .is_some_and(|current| cell_edit_is_noop(&current, &edit));
             if let Err(e) = daemon
                 .lock()
                 .edit_cell_fields(id, req.task_idx, req.cell_idx, &edit)
             {
                 return store_error(&e);
             }
-            // Same double-dispatch guard the `restart_cell` HTTP handler
-            // uses: stop every worker this is about to reset *before*
-            // resetting it, and never hold the daemon lock across the (up to
-            // 5s) wait -- batched into one shared budget across every
-            // dirtied squad plus this one, not a 5s wait per squad, so a
-            // cell edit that dirties several dependents can't turn into a
-            // multi-x-5s block of the single write-request worker (see
-            // `wait_for_workers_stop`'s doc comment).
-            let mut affected: Vec<String> = daemon
-                .lock()
-                .compute_cell_restart_impact(id, req.task_idx, req.cell_idx)
-                .map(|impact| impact.dirtied_squads.into_iter().map(|d| d.id).collect())
-                .unwrap_or_default();
-            affected.push(id.to_string());
-            for squad_id in &affected {
-                daemon.cancellations.cancel(squad_id);
-            }
-            wait_for_workers_stop(daemon, &affected);
-            if let Err(e) = daemon.lock().restart_cell(id, req.task_idx, req.cell_idx) {
-                return store_error(&e);
+            if !is_noop {
+                // Same double-dispatch guard the `restart_cell` HTTP handler
+                // uses: stop every worker this is about to reset *before*
+                // resetting it, and never hold the daemon lock across the (up
+                // to 5s) wait -- batched into one shared budget across every
+                // dirtied squad plus this one, not a 5s wait per squad, so a
+                // cell edit that dirties several dependents can't turn into a
+                // multi-x-5s block of the single write-request worker (see
+                // `wait_for_workers_stop`'s doc comment).
+                let mut affected: Vec<String> = daemon
+                    .lock()
+                    .compute_cell_restart_impact(id, req.task_idx, req.cell_idx)
+                    .map(|impact| impact.dirtied_squads.into_iter().map(|d| d.id).collect())
+                    .unwrap_or_default();
+                affected.push(id.to_string());
+                for squad_id in &affected {
+                    daemon.cancellations.cancel(squad_id);
+                }
+                wait_for_workers_stop(daemon, &affected);
+                if let Err(e) = daemon.lock().restart_cell(id, req.task_idx, req.cell_idx) {
+                    return store_error(&e);
+                }
             }
         }
         "proof" => {
@@ -19007,6 +19058,39 @@ machine=\"incredibuild:B\"
         assert!(r.body.contains("\"state\":\"pending\""));
         assert!(r.body.contains("\"cwd\":\"/new\""));
         assert!(r.body.contains("\"agent\":\"ollama\""));
+    }
+
+    #[test]
+    fn edit_cell_resubmitting_identical_values_is_a_noop_and_does_not_restart() {
+        // Regression: `edit_squad`'s "cell" arm used to unconditionally
+        // cancel and restart the cell on every call, even when the request
+        // changed nothing -- a caller that repeatedly resubmits the same
+        // edit (a stuck retry loop, a double-click, a form re-save with no
+        // actual delta) would restart an already-finished squad over and
+        // over. See `cell_edit_is_noop`'s doc comment.
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let body = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0,
+            "cwd": "/original", "agent": "ollama", "model": "qwen3:8b", "prompt": "original prompt"
+        })
+        .to_string();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        // Mark the squad done, then resubmit the exact same edit body --
+        // nothing actually changes, so the squad must stay done rather than
+        // bounce back to pending.
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Done)
+            .unwrap();
+        let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            r.body.contains("\"state\":\"done\""),
+            "an edit that changes nothing must not restart the squad: {}",
+            r.body
+        );
     }
 
     #[test]
