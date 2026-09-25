@@ -287,6 +287,21 @@ pub struct ReviewConfig {
     /// this project default.
     #[serde(default)]
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-507: how many times a review's automatic base-branch-update
+    /// rebuild (`rebuild_on_base_shift`) may retry one unresolved base
+    /// shift -- a rebuild that keeps failing on the same target base (a
+    /// persistent conflict, failed proof, provider outage, or worktree
+    /// problem) -- before the maintenance sweep stops dispatching rebuilds
+    /// for that campaign and notifies the mailbox that a human must take
+    /// over. `None` means unset, which resolves to
+    /// [`DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS`] (3); per-project scalars win
+    /// over the global layer, same as `skip_worktrees`. A per-review
+    /// override (see `GuardianView::base_shift_maximum_rebuilds` in
+    /// `guardian.rs`) wins over this. The counter itself is durable
+    /// per-review campaign state, keyed by the upstream base SHA the failed
+    /// rebuild attempted -- never by rebase-generated review SHAs.
+    #[serde(default)]
+    pub base_shift_maximum_rebuilds: Option<u32>,
 }
 
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
@@ -313,6 +328,9 @@ pub const DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS: u64 = 60;
 
 /// [`ReviewConfig::provider_timeout_max_retries`]'s fallback when unset.
 pub const DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES: u32 = 3;
+
+/// [`ReviewConfig::base_shift_maximum_rebuilds`]'s fallback when unset.
+pub const DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS: u32 = 3;
 
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
@@ -470,6 +488,17 @@ impl ReviewConfig {
             .unwrap_or(false)
     }
 
+    /// How many times a review's automatic base-branch-update rebuild may
+    /// retry one unresolved base shift before the maintenance sweep stops
+    /// dispatching rebuilds for that campaign (unset resolves to
+    /// [`DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS`]). See the field's own doc
+    /// comment for the campaign semantics.
+    #[must_use]
+    pub fn base_shift_maximum_rebuilds(&self) -> u32 {
+        self.base_shift_maximum_rebuilds
+            .unwrap_or(DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS)
+    }
+
     /// Validate this config's own scalars, independent of a `[[review]]`
     /// submission's own validation (`ralphus_core::validate`). RAL-395: a
     /// project-level `auto_fix_prompt_template` default must contain the
@@ -490,6 +519,9 @@ impl ReviewConfig {
         }
         if self.auto_fix_retry_base_seconds == Some(0) {
             return Err("[review] auto_fix_retry_base_seconds must be at least 1".to_string());
+        }
+        if self.base_shift_maximum_rebuilds == Some(0) {
+            return Err("[review] base_shift_maximum_rebuilds must be at least 1".to_string());
         }
         Ok(())
     }
@@ -537,6 +569,9 @@ impl ReviewConfig {
             discourage_tests_during_auto_pull_request_fixes: over
                 .discourage_tests_during_auto_pull_request_fixes
                 .or(self.discourage_tests_during_auto_pull_request_fixes),
+            base_shift_maximum_rebuilds: over
+                .base_shift_maximum_rebuilds
+                .or(self.base_shift_maximum_rebuilds),
         }
     }
 }
@@ -627,6 +662,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "skip_base_updates",
         ReviewFieldDefault::ProjectDefault(|c| c.skip_base_updates.is_some()),
+    ),
+    (
+        "base_shift_maximum_rebuilds",
+        ReviewFieldDefault::ProjectDefault(|c| c.base_shift_maximum_rebuilds.is_some()),
     ),
     (
         "skip_auto_clean",
@@ -3200,6 +3239,62 @@ mod tests {
     #[test]
     fn auto_fix_prompt_template_unset_passes_validation() {
         assert!(ReviewConfig::default().validate().is_ok());
+    }
+
+    // ── base_shift_maximum_rebuilds (RAL-507) ────────────────────────────
+
+    #[test]
+    fn base_shift_maximum_rebuilds_defaults_to_three_when_unset() {
+        assert_eq!(
+            ReviewConfig::default().base_shift_maximum_rebuilds(),
+            DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS
+        );
+        assert_eq!(DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS, 3);
+    }
+
+    #[test]
+    fn base_shift_maximum_rebuilds_reads_from_toml_and_layers_project_over_global() {
+        let c = from_toml_str("[review]\nbase_shift_maximum_rebuilds = 7\n");
+        assert_eq!(c.base_shift_maximum_rebuilds(), 7);
+        let global = ReviewConfig {
+            base_shift_maximum_rebuilds: Some(2),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            base_shift_maximum_rebuilds: Some(5),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global.clone().merge(project).base_shift_maximum_rebuilds(),
+            5
+        );
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global
+                .merge(ReviewConfig::default())
+                .base_shift_maximum_rebuilds(),
+            2
+        );
+    }
+
+    #[test]
+    fn base_shift_maximum_rebuilds_rejects_zero() {
+        let c = ReviewConfig {
+            base_shift_maximum_rebuilds: Some(0),
+            ..ReviewConfig::default()
+        };
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("base_shift_maximum_rebuilds"), "{err}");
+        assert!(err.contains("must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn base_shift_maximum_rebuilds_positive_passes_validation() {
+        let c = ReviewConfig {
+            base_shift_maximum_rebuilds: Some(1),
+            ..ReviewConfig::default()
+        };
+        assert!(c.validate().is_ok());
     }
 
     #[test]

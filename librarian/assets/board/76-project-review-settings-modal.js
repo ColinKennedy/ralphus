@@ -43,6 +43,8 @@
        * @property {boolean} originalSkipWorktrees
        * @property {boolean} skipBaseUpdates
        * @property {boolean} originalSkipBaseUpdates
+       * @property {number|null} baseShiftMaximumRebuilds
+       * @property {number|null} originalBaseShiftMaximumRebuilds
        * @property {boolean} matchPrBranchName
        * @property {boolean} originalMatchPrBranchName
        * @property {boolean} separatePrBranch
@@ -99,6 +101,9 @@
         const proofSkipAutoClean = boolOr(s.verify_skip_auto_clean, effective.skip_auto_clean);
         const skipWorktrees = boolOr(s.skip_worktrees, effective.skip_worktrees);
         const skipBaseUpdates = boolOr(s.skip_base_updates, effective.skip_base_updates);
+        const baseShiftMaximumRebuilds = s.base_shift_maximum_rebuilds === null || s.base_shift_maximum_rebuilds === undefined
+          ? null
+          : s.base_shift_maximum_rebuilds;
         const matchPrBranchName = boolOr(s.match_pr_branch_name, effective.match_pr_branch_name);
         const separatePrBranch = boolOr(s.separate_pr_branch, effective.separate_pr_branch);
         const dualRootPr = boolOr(s.dual_root_pr, effective.dual_root_pr);
@@ -119,6 +124,7 @@
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
+          baseShiftMaximumRebuilds, originalBaseShiftMaximumRebuilds: baseShiftMaximumRebuilds,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
           dualRootPr, originalDualRootPr: dualRootPr,
@@ -228,6 +234,17 @@
        */
       function onProjectEditSkipBaseUpdates(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.skipBaseUpdates = checked; }
       /**
+       * Stages a new base-shift rebuild cap; a blank field means "clear to
+       * inherit" (`null`), not zero.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditBaseShiftMaximumRebuilds(value) {
+        if (!projectReviewSettingsDraft) return;
+        const trimmed = value.trim();
+        projectReviewSettingsDraft.baseShiftMaximumRebuilds = trimmed === "" ? null : Number(trimmed);
+      }
+      /**
        * Stages the separate-PR-branch default and re-renders, since it gates
        * whether "match worktree branch name" is enabled.
        * @param {boolean} checked
@@ -283,6 +300,7 @@
        */
       function onProjectEditDiscourageTests(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.discourageTests = checked; }
 
+      const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
       const PROJECT_REVIEW_SETTINGS_MACHINE_TIP = "The machine (scheme:uri, or \"local\") a future review's worktrees and merge run on when nothing more specific sets one. Blank inherits the file-config/global value shown below.";
       const PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP = "The build/test command run at finalize time in place of check gates, for a future review that declares no explicit [[review.auto_build]] steps and no [[review]] skip_auto_build. Blank inherits the file-config value shown below.";
@@ -311,6 +329,7 @@
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onProjectEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip the automatic base-branch auto-update rebuild, for a future review that declares no explicit skip_base_updates of its own.">
               <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onProjectEditSkipBaseUpdates(this.checked)">skip base-branch auto-updates</label>
+            <div class="kv-row"><span class="k">base-shift rebuild cap</span><input type="number" min="1" step="1" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:80px" value="${draft.baseShiftMaximumRebuilds === null ? "" : esc(String(draft.baseShiftMaximumRebuilds))}" placeholder="${draft.effective.base_shift_maximum_rebuilds === undefined ? "3" : esc(String(draft.effective.base_shift_maximum_rebuilds))}" oninput="onProjectEditBaseShiftMaximumRebuilds(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP}"></div>
             <div style="margin-top:8px">
               <label for="project-auto-build-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">auto-build command</label>
               <input id="project-auto-build-input" type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:100%;box-sizing:border-box" value="${esc(draft.autoBuild)}" placeholder="inherits: ${esc(draft.effective.auto_build || "(none)")}" oninput="onProjectEditAutoBuild(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">
@@ -350,6 +369,13 @@
         if (draft.proofSkipAutoClean !== draft.originalProofSkipAutoClean) body.verify_skip_auto_clean = draft.proofSkipAutoClean;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
+        if (draft.baseShiftMaximumRebuilds !== draft.originalBaseShiftMaximumRebuilds) {
+          if (draft.baseShiftMaximumRebuilds === null) {
+            body.clear_base_shift_maximum_rebuilds = true;
+          } else {
+            body.base_shift_maximum_rebuilds = draft.baseShiftMaximumRebuilds;
+          }
+        }
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
         if (draft.dualRootPr !== draft.originalDualRootPr) body.dual_root_pr = draft.dualRootPr;
@@ -378,4 +404,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests];

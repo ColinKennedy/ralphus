@@ -1291,6 +1291,14 @@ pub struct ReviewDef {
     /// Whether this review skips automatic base-branch update rebuilds.
     #[serde(default)]
     pub skip_base_updates: Option<bool>,
+    /// RAL-507: this review's own cap on how many times the automatic
+    /// base-branch-update rebuild may retry one unresolved base shift before
+    /// it stops dispatching rebuilds for that campaign and asks a human via
+    /// the notification mailbox. Unset inherits the project-level
+    /// `.ralphus.toml [review] base_shift_maximum_rebuilds` default, then 3.
+    /// Must be at least 1.
+    #[serde(default)]
+    pub base_shift_maximum_rebuilds: Option<u32>,
     /// Whether each-branch proof runs skip auto-clean branches. This requires
     /// `proof_scope = "each_branch"`.
     #[serde(default)]

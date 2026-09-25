@@ -760,6 +760,30 @@ pub struct GuardianView {
     /// this project's creation-time stamp, and the live global config -- the
     /// value `rebuild_on_base_shift` actually gates on.
     pub effective_skip_base_updates: bool,
+    /// RAL-507: this review's own cap on unattended base-shift rebuild
+    /// attempts. `None` means "inherit the project/global default"
+    /// (resolved into [`Self::effective_base_shift_maximum_rebuilds`] at
+    /// hydration time). Authored via `[[review]]
+    /// base_shift_maximum_rebuilds`, or set later via the store setter.
+    pub base_shift_maximum_rebuilds: Option<u32>,
+    /// RAL-507: [`Self::base_shift_maximum_rebuilds`] resolved against the
+    /// project-level `.ralphus.toml [review]
+    /// base_shift_maximum_rebuilds` default and the live global config --
+    /// the value `rebuild_on_base_shift` gates its retry campaign on.
+    pub effective_base_shift_maximum_rebuilds: u32,
+    /// RAL-507: failed unattended base-shift rebuild attempts consumed by
+    /// the review's current retry campaign. 0 when no campaign is open.
+    pub base_shift_rebuild_attempts: u32,
+    /// RAL-507: the current retry campaign's target base SHAs, keyed by
+    /// project root. These are the *upstream* base-branch SHAs the failed
+    /// rebuild attempted -- the campaign's durable identity -- never the
+    /// rebase-generated review SHAs, which churn on every unrelated
+    /// rebase. `None` when no campaign is open.
+    pub base_shift_rebuild_targets: Option<std::collections::BTreeMap<String, String>>,
+    /// RAL-507: when the notification mailbox was told that this campaign's
+    /// automatic-rebuild budget is exhausted. One message per exhausted
+    /// campaign; reset together with the campaign.
+    pub base_shift_exhausted_notified_at_ms: Option<i64>,
     /// RAL-307: this review's own override for whether a newly submitted
     /// PR's branch defaults to the exact worktree/feature branch name
     /// instead of the convention-derived alias. `None` means "inherit the
@@ -3074,6 +3098,124 @@ impl Store {
         }
     }
 
+    /// Set this review's own cap on unattended base-shift rebuild attempts
+    /// (RAL-507). `None` clears the override back to "inherit the
+    /// project/global default".
+    pub fn set_guardian_base_shift_maximum_rebuilds(
+        &self,
+        id: &str,
+        cap: Option<u32>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_maximum_rebuilds=?, updated_at_ms=? WHERE id=?",
+            params![cap.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-507: open (or re-open) the review's base-shift retry campaign
+    /// against `targets` with a full budget: clears the attempt counter and
+    /// the exhaustion-notified marker, and stores the campaign's target
+    /// base SHAs. Called inside the maintenance sweep's atomic merge-claim
+    /// window, only when the shift's target SHAs differ from the stored
+    /// campaign's (a different target is meaningful new upstream work and
+    /// earns its own budget); a same-target campaign continues untouched.
+    pub fn start_guardian_base_shift_campaign(
+        &self,
+        id: &str,
+        targets: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(targets).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize campaign targets: {e}"))
+        })?;
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_targets=?2, base_shift_rebuild_attempts=0, \
+             base_shift_exhausted_notified_at_ms=NULL, updated_at_ms=?3 WHERE id=?1",
+            params![id, json, crate::store::now_ms()],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-507: record one failed unattended base-shift rebuild for `id`:
+    /// stores the campaign's target base SHAs (idempotent rewrite of the
+    /// value the dispatch already recorded) and bumps the attempt counter.
+    /// Returns the new attempt count, so the caller can fire the one-time
+    /// exhaustion notice exactly when the cap is reached.
+    pub fn record_guardian_base_shift_rebuild_failure(
+        &self,
+        id: &str,
+        targets: &BTreeMap<String, String>,
+    ) -> Result<u32> {
+        let json = serde_json::to_string(targets).map_err(|e| {
+            StoreError::InvalidTransition(format!("serialize campaign targets: {e}"))
+        })?;
+        self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_targets=?2, \
+             base_shift_rebuild_attempts=base_shift_rebuild_attempts+1, updated_at_ms=?3 \
+             WHERE id=?1",
+            params![id, json, crate::store::now_ms()],
+        )?;
+        let attempts: i64 = self.conn.query_row(
+            "SELECT base_shift_rebuild_attempts FROM guardians WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
+    }
+
+    /// RAL-507: close the review's base-shift retry campaign -- clears the
+    /// attempt counter, the target SHAs, and the exhaustion-notified marker
+    /// together. Called after a successful rebuild pass (the campaign's job
+    /// is done) and before a user-directed Merge / rebase (a human-directed
+    /// retry earns a fresh automatic budget).
+    pub fn clear_guardian_base_shift_campaign(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_rebuild_targets=NULL, \
+             base_shift_rebuild_attempts=0, base_shift_exhausted_notified_at_ms=NULL, \
+             updated_at_ms=?2 WHERE id=?1",
+            params![id, crate::store::now_ms()],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// RAL-507: atomically claim the right to enqueue the one-time
+    /// base-shift budget-exhausted mailbox notice for `id`. Returns `true`
+    /// only for the caller that flipped the NULL marker to a timestamp, so
+    /// concurrent maintenance passes and daemon-restart recovery can never
+    /// duplicate the notice; a loser (or a later pass) sees `false`.
+    pub fn claim_guardian_base_shift_exhausted_notice(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_shift_exhausted_notified_at_ms=?2, updated_at_ms=?3 \
+             WHERE id=?1 AND base_shift_exhausted_notified_at_ms IS NULL",
+            params![id, crate::store::now_ms(), crate::store::now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// RAL-507: release an exhaustion-notice claim whose enqueue failed, so
+    /// a later pass retries the notification instead of the marker
+    /// suppressing it forever.
+    pub fn unclaim_guardian_base_shift_exhausted_notice(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET base_shift_exhausted_notified_at_ms=NULL, updated_at_ms=?2 \
+             WHERE id=?1",
+            params![id, crate::store::now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Set this review's own override for whether a newly submitted PR's
     /// branch defaults to the exact worktree/feature branch name instead of
     /// the convention-derived alias (RAL-307). `None` resets it to "inherit
@@ -4294,7 +4436,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4410,7 +4552,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4533,6 +4675,10 @@ impl Store {
             discourage_tests_during_auto_pull_request_fixes: r
                 .get::<_, Option<i64>>(62)?
                 .map(|v| v != 0),
+            base_shift_maximum_rebuilds: r.get::<_, Option<i64>>(63)?,
+            base_shift_rebuild_attempts: r.get::<_, i64>(64)?,
+            base_shift_rebuild_targets: r.get(65)?,
+            base_shift_exhausted_notified_at_ms: r.get(66)?,
         })
     }
 
@@ -4854,6 +5000,28 @@ impl Store {
             .or(live_global.skip_base_updates)
             .unwrap_or(false);
 
+        // RAL-507: effective base-shift rebuild retry cap, layered per-review
+        // override > database-backed project default > explicit
+        // `.ralphus.toml [review]` value > the live global config > the
+        // built-in default of 3. Unlike the boolean settings above there is
+        // no creation-time stamp for this numeric option, so the chain is
+        // shorter by design.
+        let effective_base_shift_maximum_rebuilds = row
+            .base_shift_maximum_rebuilds
+            .and_then(|v| u32::try_from(v).ok())
+            .or(db_settings.base_shift_maximum_rebuilds)
+            .or(explicit_project.base_shift_maximum_rebuilds)
+            .or(live_global.base_shift_maximum_rebuilds)
+            .unwrap_or(crate::config::DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS);
+        // RAL-507: the durable retry-campaign state, parsed from its JSON
+        // column. A malformed/empty value degrades to "no campaign open" --
+        // the campaign is re-derived from the next failed rebuild, never from
+        // derived SHAs.
+        let base_shift_rebuild_targets = row
+            .base_shift_rebuild_targets
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok());
+
         // RAL-307: same layering as `effective_skip_base_updates` above, for
         // whether a newly submitted PR's branch defaults to the exact
         // worktree/feature branch name instead of the convention-derived
@@ -4962,6 +5130,15 @@ impl Store {
             effective_proof_skip_auto_clean,
             skip_base_updates: row.skip_base_updates,
             effective_skip_base_updates,
+            base_shift_maximum_rebuilds: row
+                .base_shift_maximum_rebuilds
+                .and_then(|v| u32::try_from(v).ok()),
+            effective_base_shift_maximum_rebuilds,
+            base_shift_rebuild_attempts: row
+                .base_shift_rebuild_attempts
+                .clamp(0, i64::from(u32::MAX)) as u32,
+            base_shift_rebuild_targets,
+            base_shift_exhausted_notified_at_ms: row.base_shift_exhausted_notified_at_ms,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
             separate_pr_branch: row.separate_pr_branch,
@@ -5251,7 +5428,7 @@ impl Store {
         Ok(GuardianStatus::MergeStopped)
     }
 
-    fn guardian_status_str(&self, id: &str) -> Result<String> {
+    pub(crate) fn guardian_status_str(&self, id: &str) -> Result<String> {
         self.conn
             .query_row(
                 "SELECT status FROM guardians WHERE id=?",
@@ -5417,6 +5594,18 @@ struct GuardianRow {
     /// formatters/linters/static analysis and avoid broad or expensive test
     /// suites. `None` inherits the project/global default.
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-507: per-review cap on unattended base-shift rebuild attempts.
+    /// `None` inherits the project/global default.
+    base_shift_maximum_rebuilds: Option<i64>,
+    /// RAL-507: failed unattended base-shift rebuilds in the current
+    /// campaign.
+    base_shift_rebuild_attempts: i64,
+    /// RAL-507: the current campaign's target base SHAs, JSON map of
+    /// `{project_root: sha}`. `None` when no campaign is open.
+    base_shift_rebuild_targets: Option<String>,
+    /// RAL-507: when the mailbox was told this campaign's budget is
+    /// exhausted (one-time, dedup marker).
+    base_shift_exhausted_notified_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
@@ -6972,6 +7161,145 @@ mod tests {
                 .set_guardian_skip_base_updates("nope", Some(true))
                 .is_err()
         );
+    }
+
+    // ── RAL-507: base-shift rebuild retry cap + durable campaign state ──
+
+    #[test]
+    fn base_shift_rebuild_cap_defaults_to_three_and_overrides_per_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        // Unset everywhere: the built-in default of 3.
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_maximum_rebuilds, None);
+        assert_eq!(g.effective_base_shift_maximum_rebuilds, 3);
+
+        // A per-review override resolves into the effective value...
+        store
+            .set_guardian_base_shift_maximum_rebuilds(&id, Some(7))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_maximum_rebuilds, Some(7));
+        assert_eq!(g.effective_base_shift_maximum_rebuilds, 7);
+
+        // ...and clearing the override falls back to the default again.
+        store
+            .set_guardian_base_shift_maximum_rebuilds(&id, None)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_maximum_rebuilds, None);
+        assert_eq!(g.effective_base_shift_maximum_rebuilds, 3);
+
+        assert!(
+            store
+                .set_guardian_base_shift_maximum_rebuilds("nope", Some(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn base_shift_campaign_lifecycle_start_record_clear_and_notice_dedup() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+
+        // No campaign open on a fresh review.
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_rebuild_attempts, 0);
+        assert_eq!(g.base_shift_rebuild_targets, None);
+        assert_eq!(g.base_shift_exhausted_notified_at_ms, None);
+
+        // Opening a campaign stores its target base SHAs and starts with a
+        // full budget (counter zeroed, exhaustion marker cleared).
+        let targets = BTreeMap::from([
+            ("/repo".to_string(), "aaa111".to_string()),
+            ("/other".to_string(), "bbb222".to_string()),
+        ]);
+        store
+            .start_guardian_base_shift_campaign(&id, &targets)
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_rebuild_targets, Some(targets.clone()));
+        assert_eq!(g.base_shift_rebuild_attempts, 0);
+
+        // Each failed rebuild consumes one attempt; the counter -- not any
+        // rebase-generated SHA -- is the budget.
+        assert_eq!(
+            store
+                .record_guardian_base_shift_rebuild_failure(&id, &targets)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .record_guardian_base_shift_rebuild_failure(&id, &targets)
+                .unwrap(),
+            2
+        );
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_rebuild_attempts, 2);
+        assert_eq!(g.base_shift_rebuild_targets, Some(targets.clone()));
+
+        // The exhaustion notice is claimed exactly once: a concurrent pass
+        // (or a post-restart pass) sees the claimed marker and stays silent.
+        assert!(
+            store
+                .claim_guardian_base_shift_exhausted_notice(&id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_guardian_base_shift_exhausted_notice(&id)
+                .unwrap()
+        );
+
+        // A lost enqueue releases the claim so a later pass can retry it.
+        store
+            .unclaim_guardian_base_shift_exhausted_notice(&id)
+            .unwrap();
+        assert!(
+            store
+                .claim_guardian_base_shift_exhausted_notice(&id)
+                .unwrap()
+        );
+
+        // Closing the campaign (successful pass / manual reset) clears the
+        // counter, the target SHAs, and the exhaustion marker together.
+        store.clear_guardian_base_shift_campaign(&id).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_rebuild_attempts, 0);
+        assert_eq!(g.base_shift_rebuild_targets, None);
+        assert_eq!(g.base_shift_exhausted_notified_at_ms, None);
+
+        assert!(
+            store
+                .start_guardian_base_shift_campaign("nope", &targets)
+                .is_err()
+        );
+        assert!(
+            store
+                .record_guardian_base_shift_rebuild_failure("nope", &targets)
+                .is_err()
+        );
+        assert!(store.clear_guardian_base_shift_campaign("nope").is_err());
+    }
+
+    #[test]
+    fn base_shift_campaign_malformed_targets_degrade_to_no_campaign() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        // A corrupted/foreign JSON blob in the column must read back as "no
+        // campaign open" -- the campaign is re-derived from the next failed
+        // rebuild, never from a half-parsed SHA map.
+        store
+            .conn
+            .execute(
+                "UPDATE guardians SET base_shift_rebuild_targets='not-json' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.base_shift_rebuild_targets, None);
     }
 
     #[test]

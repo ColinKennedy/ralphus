@@ -731,6 +731,11 @@ pub struct ProjectReviewSettings {
     /// suites.
     #[serde(default)]
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-507: the project's default cap on unattended base-shift rebuild
+    /// attempts per retry campaign, for a future review whose `[[review]]`
+    /// block (and whose own per-review override) leaves the cap unset.
+    #[serde(default)]
+    pub base_shift_maximum_rebuilds: Option<u32>,
     /// RAL-476: fallback owning user for a review whose squad has no
     /// `submitter` of its own (e.g. an auto-review triggered with no
     /// explicit submission) -- see `Store::create_guardian_keyed`'s owner
@@ -784,6 +789,7 @@ impl ProjectReviewSettings {
             // `summary_format` above; only the file-based `.ralphus.toml`
             // layer sets it.
             provider_timeout_max_retries: None,
+            base_shift_maximum_rebuilds: self.base_shift_maximum_rebuilds,
         }
     }
 }
@@ -2975,6 +2981,26 @@ impl Store {
             // `reviews::apply_project_review_defaults`, same as
             // `auto_fix_pr_errors`), then `false`.
             "ALTER TABLE guardians ADD COLUMN discourage_tests_during_auto_pull_request_fixes INTEGER",
+            // RAL-507: this review's own cap on unattended base-shift rebuild
+            // attempts. `None` inherits the `.ralphus.toml [review]
+            // base_shift_maximum_rebuilds` project default, then the built-in
+            // default of 3.
+            "ALTER TABLE guardians ADD COLUMN base_shift_maximum_rebuilds INTEGER",
+            // RAL-507: durable base-shift retry-campaign state. `attempts`
+            // counts failed unattended rebuilds within the current campaign;
+            // `targets` is the JSON map of {project_root: upstream base SHA}
+            // the campaign's rebuilds attempt -- the campaign identity, keyed
+            // by the upstream base SHAs (never the rebase-generated review
+            // SHAs, which churn on every unrelated rebase). `notified_at_ms`
+            // is the one-time marker that the mailbox was told the campaign's
+            // budget is exhausted, mirroring the PR auto-fix exhausted
+            // notice's persisted-flag dedup. All three reset together: on a
+            // successful rebuild (campaign closed), on a manual Merge /
+            // rebase (human-directed fresh budget), and when a base shift to
+            // a *different* target SHA starts a new campaign.
+            "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_targets TEXT",
+            "ALTER TABLE guardians ADD COLUMN base_shift_exhausted_notified_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -15187,6 +15213,7 @@ command = "e"
             auto_fix_pr_errors: Some(true),
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
             discourage_tests_during_auto_pull_request_fixes: Some(true),
+            base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),
         };
@@ -15273,6 +15300,35 @@ command = "e"
         assert_eq!(
             cfg.default_resolver_agent(),
             "ollama",
+            "the database-backed override must win over the file-based project default"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_review_config_database_base_shift_cap_wins_over_file_config() {
+        let root = temp_review_settings_dir();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[review]\nbase_shift_maximum_rebuilds = 7\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let path = root.to_string_lossy().into_owned();
+        store.register_project("proj", "", &path, "git").unwrap();
+        store
+            .set_project_review_settings(
+                "proj",
+                &ProjectReviewSettings {
+                    base_shift_maximum_rebuilds: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cfg = store.resolve_review_config(&root);
+        assert_eq!(
+            cfg.base_shift_maximum_rebuilds(),
+            2,
             "the database-backed override must win over the file-based project default"
         );
         let _ = std::fs::remove_dir_all(&root);

@@ -3993,6 +3993,17 @@ pub fn restart_guardian_merge(
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
     let _ = wait_for_merge_worker_stop(&cancellations, &key);
+    // RAL-507: a user-directed rebase gives the review's base-shift retry
+    // campaign a fresh automatic budget -- clear it before the requested
+    // rebase starts, the same boundary the manual Merge / rebase handler
+    // uses. Best-effort: the restart itself must not fail on a campaign
+    // bookkeeping hiccup.
+    if let Err(e) = store.lock().clear_guardian_base_shift_campaign(id) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} could not reset base-shift rebuild budget before manual rebase: {e}"
+        );
+    }
     if let Err(e) = store.lock().reset_guardian_to_collecting(id) {
         return reply(500, &error_body("store_error", &e.to_string()));
     }
@@ -4867,6 +4878,11 @@ fn staged_merge_pass(
             let _ = guard.set_guardian_project_base_commit(id, proj, sha);
         }
         let _ = guard.set_guardian_build_signature(id, &current_sig);
+        // RAL-507: the pass succeeded, so any open base-shift retry campaign
+        // has done its job -- close it (counter, target SHAs, and the
+        // exhaustion-notified marker reset together) so a future shift gets
+        // a full budget instead of resuming a spent one.
+        let _ = guard.clear_guardian_base_shift_campaign(id);
     }
 
     StagedPassOutcome::Ok { built_any }
@@ -7806,6 +7822,12 @@ pub fn rebuild_on_base_shift(
     let mut all_have_baseline = true;
     let mut fully_landed = !guardian.projects.is_empty();
     let mut shift_detail: Vec<String> = Vec::new();
+    // RAL-507: the upstream base SHA each shifted project would be rebuilt
+    // against. This map is the retry campaign's durable identity -- keyed by
+    // the *upstream* base SHAs, never by rebase-generated review SHAs, which
+    // churn on every unrelated rebase.
+    let mut shift_targets: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for proj in &guardian.projects {
         let root = Workspace::for_guardian(store, id, Path::new(proj));
         let current = match resolve_base(&root, &guardian.base_branch) {
@@ -7826,6 +7848,7 @@ pub fn rebuild_on_base_shift(
             Some(prev) if prev == &current => {} // unchanged
             Some(prev) => {
                 any_shifted = true;
+                shift_targets.insert(proj.clone(), current.clone());
                 shift_detail.push(format!(
                     "{proj} ({}): {}..{}",
                     guardian.base_branch,
@@ -7861,6 +7884,19 @@ pub fn rebuild_on_base_shift(
     {
         return true;
     }
+    // RAL-507: bound the unattended retry campaign. When the same target base
+    // SHAs have already consumed the full rebuild budget, stop dispatching:
+    // a persistent conflict, failed proof, provider outage, or worktree
+    // problem must not consume merge capacity and agent spend forever. A
+    // different target SHA (meaningful new upstream work) starts a fresh
+    // campaign with a full budget; a manual Merge / rebase resets the budget
+    // the same way, and a successful rebuild closes the campaign outright.
+    let maximum_rebuilds = guardian.effective_base_shift_maximum_rebuilds;
+    let same_campaign = guardian.base_shift_rebuild_targets.as_ref() == Some(&shift_targets);
+    if same_campaign && guardian.base_shift_rebuild_attempts >= maximum_rebuilds {
+        notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds);
+        return false;
+    }
     // Claim the review under one lock (flip to Merging) so a concurrent
     // maintenance pass cannot also start rebuilding it.
     let detail = format!(
@@ -7874,11 +7910,140 @@ pub fn rebuild_on_base_shift(
                 .is_ok()
     };
     if claimed {
+        // RAL-507: a shift to a *different* target SHA opens a new campaign
+        // with a full budget. A shift to the same target continues the open
+        // campaign's counter untouched. Consuming the budget (recording a
+        // failed attempt) happens only after this dispatch actually ran and
+        // failed -- inside the claim window this branch owns, so a lost race
+        // can never burn budget without dispatching.
+        if !same_campaign {
+            let _ = store
+                .lock()
+                .start_guardian_base_shift_campaign(id, &shift_targets);
+        }
         let _permit = sem.acquire();
         run_merge_staged(store, runner, id, cancel);
+        record_base_shift_rebuild_outcome(store, id, &shift_targets, maximum_rebuilds);
         true
     } else {
         false
+    }
+}
+
+/// RAL-507: after an automatic base-shift rebuild dispatched by
+/// [`rebuild_on_base_shift`] has finished, classify its outcome. A rebuild
+/// that left the review `merge_failed` consumed one attempt of the campaign
+/// whose target SHAs it attempted; when that reaches the configured cap the
+/// one-time mailbox notification fires. Any other outcome needs no recording
+/// here: a successful pass already closed the campaign (see
+/// `staged_merge_pass`'s post-success baseline commit), and a cancelled or
+/// still-`collecting` rebuild consumed nothing.
+fn record_base_shift_rebuild_outcome(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    shift_targets: &std::collections::BTreeMap<String, String>,
+    maximum_rebuilds: u32,
+) {
+    let failed = {
+        let guard = store.lock();
+        guard
+            .guardian_status_str(id)
+            .map(|s| s == "merge_failed")
+            .unwrap_or(false)
+    };
+    if !failed {
+        return;
+    }
+    let attempts = store
+        .lock()
+        .record_guardian_base_shift_rebuild_failure(id, shift_targets)
+        .unwrap_or(0);
+    if attempts >= maximum_rebuilds {
+        let guardian = match store.lock().get_guardian(id) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        notify_base_shift_budget_exhausted(store, &guardian, maximum_rebuilds);
+    }
+}
+
+/// RAL-507: tell a human that this review's unattended base-shift rebuild
+/// campaign is exhausted -- automatic rebasing stopped because its retry
+/// budget was used up, and a person must intervene. Fires at most once per
+/// exhausted campaign: the durable `base_shift_exhausted_notified_at_ms`
+/// marker is claimed atomically before the mailbox enqueue, so concurrent
+/// maintenance passes and daemon-restart recovery cannot duplicate the
+/// message, and a failed enqueue releases the claim so a later pass retries.
+fn notify_base_shift_budget_exhausted(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &crate::guardian::GuardianView,
+    maximum_rebuilds: u32,
+) {
+    let id = &guardian.id;
+    let claimed = store
+        .lock()
+        .claim_guardian_base_shift_exhausted_notice(id)
+        .unwrap_or(false);
+    if !claimed {
+        return;
+    }
+    let attempts = guardian.base_shift_rebuild_attempts;
+    let text = format!(
+        "Base-shift rebuild budget exhausted for review '{name}' ({id})\n\n\
+         The base branch moved, and automatic rebasing stopped after {attempts} failed \
+         rebuild attempt(s) against the same new base (cap: {maximum_rebuilds}). The review is \
+         left as-is awaiting human action.\n\n\
+         To retry: press Merge / rebase (or run `ralphus review merge`) after intervening -- \
+         that resets this budget and starts a fresh automatic campaign.\n",
+        name = guardian.name,
+    );
+    let entity_uri = format!("guardian:{id}");
+    let enqueued = {
+        let guard = store.lock();
+        guard.enqueue_mailbox_message_ex(
+            crate::mailbox::MailboxPriority::High,
+            &text,
+            None,
+            None,
+            None,
+            Some(&entity_uri),
+            Some("review"),
+        )
+    };
+    match enqueued {
+        Ok(_) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} base-shift rebuild budget exhausted: notified mailbox"
+            );
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::WARNING)
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    "base-shift rebuild budget exhausted: notified mailbox",
+                    serde_json::json!({"attempts": attempts, "cap": maximum_rebuilds}),
+                );
+        }
+        Err(e) => {
+            // Release the claim so a later pass retries the notification
+            // instead of the marker suppressing it forever.
+            let _ = store
+                .lock()
+                .unclaim_guardian_base_shift_exhausted_notice(id);
+            crate::rlog!(
+                ERROR,
+                "ralphus [guardian] review {id} could not enqueue base-shift budget-exhausted mailbox notice: {e}"
+            );
+            crate::cartographer::Note::new("guardian")
+                .level(crate::logging::LogLevel::ERROR)
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    "could not enqueue base-shift budget-exhausted mailbox notice",
+                    serde_json::json!({"error": e.to_string()}),
+                );
+        }
     }
 }
 
