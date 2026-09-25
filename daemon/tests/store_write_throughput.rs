@@ -32,13 +32,14 @@ const WRITES: usize = 2_000;
 
 /// Minimum sustained single-threaded write rate, in writes/sec.
 ///
-/// Measured here at 404/sec, which is an fsync per commit and nothing else:
-/// `synchronous` defaults to `FULL`. Raising this floor is WS-C's job --
-/// `synchronous=NORMAL` is what unlocks the plan's 5,000/sec M10 target, and
-/// no amount of work elsewhere in the daemon moves this number while every
-/// commit waits on the disk. The floor sits well under the measurement so a
+/// Measured at 404/sec before WS-C and 2,588/sec after it -- `synchronous`
+/// defaulted to `FULL`, so every commit cost an fsync. The remaining cost is
+/// not the commit: the same rows insert at 12,466/sec into an un-indexed
+/// table, so index maintenance across `cartographer_events`' six indexes is
+/// what stands between this and the plan's 5,000/sec M10 target, and WS-D.2 is
+/// where that gets addressed. The floor sits well under the measurement so a
 /// slower CI disk does not turn a real gate into a flaky one.
-const MIN_WRITES_PER_SEC: f64 = 250.0;
+const MIN_WRITES_PER_SEC: f64 = 1_200.0;
 
 /// Minimum rate when the same writes are wrapped in one explicit transaction.
 ///

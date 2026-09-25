@@ -1158,6 +1158,8 @@ impl Store {
         // surfacing `SQLITE_BUSY`, instead of leaving it at the default of 0
         // (fail immediately on any lock contention).
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        crate::store_pool::apply_shared_pragmas(&conn)?;
+        crate::store_pool::apply_writer_pragmas(&conn)?;
         // Built from the writer connection's own path so pooled reads see
         // the same on-disk (WAL-mode) database -- see `crate::store_pool`.
         let read_pool = crate::store_pool::ReadConnPool::open(
@@ -1198,6 +1200,8 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
+        crate::store_pool::apply_shared_pragmas(&conn)?;
+        crate::store_pool::apply_writer_pragmas(&conn)?;
         let read_pool = crate::store_pool::ReadConnPool::open(&location);
         let store = Self {
             conn,
@@ -10659,6 +10663,81 @@ fn move_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS-C: the writer's performance PRAGMAs are actually set. Each of these
+    /// is per-connection, not stored in the database file, so a connection
+    /// opened without them looks identical on disk and only shows up as
+    /// unexplained latency -- worth asserting rather than trusting.
+    #[test]
+    fn writer_connection_applies_the_performance_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pragma-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+
+        let int_pragma = |name: &str| -> i64 {
+            store
+                .conn
+                .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("read PRAGMA {name}: {e}"))
+        };
+        // 1 == NORMAL. `FULL` (2, the SQLite default) fsyncs every commit and
+        // costs ~6x the write throughput -- see `apply_writer_pragmas`.
+        assert_eq!(int_pragma("synchronous"), 1, "synchronous is not NORMAL");
+        // 2 == MEMORY.
+        assert_eq!(int_pragma("temp_store"), 2, "temp_store is not MEMORY");
+        assert_eq!(
+            int_pragma("cache_size"),
+            -65_536,
+            "cache_size is not the 64 MiB negative-KiB form"
+        );
+        assert!(
+            int_pragma("mmap_size") > 0,
+            "mmap_size is off; reads pay a syscall and a copy per page"
+        );
+        let journal: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("read journal_mode");
+        assert_eq!(
+            journal, "wal",
+            "WAL is what makes synchronous=NORMAL non-corrupting and pooled              reads concurrent"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same PRAGMAs on a pooled reader. A reader left at the 2 MB default
+    /// cache while the writer has 64 MB is a silent asymmetry that only
+    /// surfaces as slow pooled reads.
+    #[test]
+    fn pooled_readers_apply_the_shared_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-pragma-pool-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+        let pool = store.read_pool();
+        let conn = pool.acquire().expect("pooled connection");
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .expect("read cache_size");
+        assert_eq!(cache, -65_536, "pooled reader cache_size was not applied");
+        let temp: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .expect("read temp_store");
+        assert_eq!(temp, 2, "pooled reader temp_store was not applied");
+        drop(conn);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const SAMPLE: &str = r#"
 [[task]]
