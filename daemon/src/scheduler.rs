@@ -1760,14 +1760,22 @@ fn try_upstream_rebase(
     None
 }
 
-/// RAL-241: broadcast an `urgent` mailbox message for a cell that just
-/// failed, so a supervising human/agent doesn't have to go digging through
-/// the board or Cartographer to notice. Called from every place a cell's
-/// state is written as [`NodeState::Failed`] (the upstream-rebase
-/// precondition failure and the ordinary post-execution outcome) — never for
-/// `Cancelled`, which is a deliberate stop, not a failure. Best-effort: a
-/// store error here is swallowed, matching every other Cartographer/mailbox
-/// write in this file.
+/// RAL-241: broadcast a mailbox message for a cell that just failed, so a
+/// supervising human/agent doesn't have to go digging through the board or
+/// Cartographer to notice. Called from every place a cell's state is written
+/// as [`NodeState::Failed`] (the upstream-rebase precondition failure and the
+/// ordinary post-execution outcome) — never for `Cancelled`, which is a
+/// deliberate stop, not a failure. Best-effort: a store error here is
+/// swallowed, matching every other Cartographer/mailbox write in this file.
+///
+/// RAL-504: when `error` matches
+/// [`crate::mailbox::is_retry_exhaustion_error`] — the cell-level RAL-435
+/// thrash loop (`run_cell_with_rate_limit_retries`) gave up — this is a
+/// single terminal transition, not "yet another failed attempt": downgrade
+/// from `Urgent` to `High` (needs a human, but isn't drop-everything urgent)
+/// and say plainly that automated retries stopped, since the still-retrying
+/// case never reaches this function at all (it stays non-terminal and is
+/// never reported as a failure).
 fn enqueue_cell_failure_mailbox(
     guard: &Store,
     squad_id: &str,
@@ -1775,7 +1783,12 @@ fn enqueue_cell_failure_mailbox(
     task_name: &str,
     error: Option<&str>,
 ) {
+    let exhausted = error.is_some_and(crate::mailbox::is_retry_exhaustion_error);
     let text = match error {
+        Some(err) if exhausted => format!(
+            "cell '{cell_id}' in task '{task_name}' (squad {squad_id}) stalled: automated \
+             retries have been exhausted and stopped: {err}"
+        ),
         Some(err) => {
             format!("cell '{cell_id}' in task '{task_name}' (squad {squad_id}) failed: {err}")
         }
@@ -1783,6 +1796,11 @@ fn enqueue_cell_failure_mailbox(
     };
     let entity_uri = guard.cell_entity_uri(squad_id, task_name, cell_id);
     let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
+    let priority = if exhausted {
+        crate::mailbox::MailboxPriority::High
+    } else {
+        crate::mailbox::MailboxPriority::Urgent
+    };
     let remediation = crate::mailbox::Remediation::SuggestedCommand {
         command: format!("ralphus cell restart {squad_id}/{task_name}/{cell_id}"),
         purpose: "retry the failed cell".to_string(),
@@ -1790,7 +1808,7 @@ fn enqueue_cell_failure_mailbox(
     if let Ok(message_id) = guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
-        crate::mailbox::MailboxPriority::Urgent,
+        priority,
         &text,
         &remediation,
         Some(squad_id),
@@ -1806,17 +1824,17 @@ fn enqueue_cell_failure_mailbox(
             .emit(
                 guard,
                 "mailbox message enqueued for cell failure",
-                serde_json::json!({"message_id": message_id, "priority": "urgent"}),
+                serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
             );
     }
 }
 
-/// RAL-241 follow-up: broadcast an `urgent` mailbox message when a proof
-/// step fails *after* its owning cell/task body already succeeded — the one
-/// failure path [`enqueue_cell_failure_mailbox`] doesn't cover, since that
-/// helper only fires from the body's own outcome (recorded and checked
-/// before any proof step has even run). Covers all three proof scopes:
-/// cell-level (`run_cell_worker`), a standalone proof-only restart
+/// RAL-241 follow-up: broadcast a mailbox message when a proof step fails
+/// *after* its owning cell/task body already succeeded — the one failure
+/// path [`enqueue_cell_failure_mailbox`] doesn't cover, since that helper
+/// only fires from the body's own outcome (recorded and checked before any
+/// proof step has even run). Covers all three proof scopes: cell-level
+/// (`run_cell_worker`), a standalone proof-only restart
 /// (`run_proof_only_worker`), and task-level (`run_task_finalizer`).
 /// `scope` ("cell" or "task") drives the message wording; `cell_id` is
 /// carried separately as an entity-linkage hint for the mailbox row and
@@ -1825,55 +1843,86 @@ fn enqueue_cell_failure_mailbox(
 /// one [`note_proof_outcome`] already folds the ground-truth outcome onto),
 /// so board/API filtering by cell id still surfaces the escalation.
 /// Best-effort, matching `enqueue_cell_failure_mailbox`.
+///
+/// RAL-504: `first_failure` is the first failing step's `(idx, error text)`
+/// this proof pass observed (see [`ProofOutcome::first_failure`]) — when its
+/// error text matches [`crate::mailbox::is_retry_exhaustion_error`] (the
+/// proof-level RAL-435 retry loop in `run_proof_with_rate_limit_retries`
+/// gave up), this downgrades to `High` priority, says plainly that automated
+/// retries stopped, and — since the exact failing index is known — points
+/// at the precise `restart-proof --from <idx>` command instead of the
+/// coarser whole-cell/manual guidance the non-exhaustion path still gives.
 fn enqueue_proof_failure_mailbox(
     guard: &Store,
     squad_id: &str,
     scope: &str,
     cell_id: Option<&str>,
     task_name: &str,
+    first_failure: Option<&(i64, String)>,
 ) {
-    let text = if scope == "cell" {
-        format!(
+    let exhausted =
+        first_failure.is_some_and(|(_, err)| crate::mailbox::is_retry_exhaustion_error(err));
+    let text = match (scope, exhausted) {
+        ("cell", true) => format!(
+            "proof for cell '{}' in task '{task_name}' (squad {squad_id}) stalled: automated \
+             retries have been exhausted and stopped",
+            cell_id.unwrap_or("?")
+        ),
+        ("cell", false) => format!(
             "proof for cell '{}' in task '{task_name}' (squad {squad_id}) failed",
             cell_id.unwrap_or("?")
-        )
-    } else {
-        format!("task-level proof for task '{task_name}' (squad {squad_id}) failed")
+        ),
+        (_, true) => format!(
+            "task-level proof for task '{task_name}' (squad {squad_id}) stalled: automated \
+             retries have been exhausted and stopped"
+        ),
+        (_, false) => format!("task-level proof for task '{task_name}' (squad {squad_id}) failed"),
     };
-    // Best-effort: no `proof_idx` is threaded to this helper (a task-scope
-    // proof outcome is an aggregate across steps), so the finest entity we
-    // can address is the owning cell (for a cell-scope proof) or task (for a
-    // task-scope one) — a follow on the specific failing proof step won't
-    // match, but a squad/task/cell follow still will.
+    // Best-effort: when `first_failure` is `None` (a task-scope proof outcome
+    // is an aggregate across steps, so no single index is always available),
+    // the finest entity we can address is the owning cell (for a cell-scope
+    // proof) or task (for a task-scope one) — a follow on the specific
+    // failing proof step won't match, but a squad/task/cell follow still will.
     let entity_uri = if scope == "cell" {
         cell_id.and_then(|cid| guard.cell_entity_uri(squad_id, task_name, cid))
     } else {
         guard.task_entity_uri(squad_id, task_name)
     };
     let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
-    // No `proof_idx` is threaded to this helper (see the doc comment above),
-    // so there's no exact `restart-proof --from <index>` to suggest -- a
-    // whole-cell restart (which reruns its proof steps) is the finest safe
-    // command available for a cell-scope failure, while a task-scope proof
-    // has no single owning cell to restart at all.
-    let remediation = if let (Some(cid), "cell") = (cell_id, scope) {
-        crate::mailbox::Remediation::SuggestedCommand {
+    let priority = if exhausted {
+        crate::mailbox::MailboxPriority::High
+    } else {
+        crate::mailbox::MailboxPriority::Urgent
+    };
+    let remediation = match (first_failure, cell_id) {
+        (Some((idx, _)), Some(cid)) if scope == "cell" => {
+            crate::mailbox::Remediation::SuggestedCommand {
+                command: format!(
+                    "ralphus cell restart-proof {squad_id}/{task_name}/{cid} --from {idx}"
+                ),
+                purpose: "retry the failed proof step".to_string(),
+            }
+        }
+        (Some((idx, _)), _) if scope != "cell" => crate::mailbox::Remediation::SuggestedCommand {
+            command: format!("ralphus task restart-proof {squad_id}/{task_name} --from {idx}"),
+            purpose: "retry the failed proof step".to_string(),
+        },
+        (None, Some(cid)) if scope == "cell" => crate::mailbox::Remediation::SuggestedCommand {
             command: format!("ralphus cell restart {squad_id}/{task_name}/{cid}"),
             purpose: "retry the cell and its proof steps".to_string(),
-        }
-    } else {
-        crate::mailbox::Remediation::ManualInterventionRequired {
+        },
+        _ => crate::mailbox::Remediation::ManualInterventionRequired {
             guidance: format!(
                 "inspect task '{task_name}' (squad {squad_id})'s proof output and restart the \
                  affected cell(s) individually (`ralphus cell restart <selector>`), or restart \
                  the whole squad (`ralphus squad restart {squad_id}`)"
             ),
-        }
+        },
     };
     if let Ok(message_id) = guard.notify_watchers_with_remediation(
         crate::monitor::NotifiableEventKind::SquadFailed,
         &event_uri,
-        crate::mailbox::MailboxPriority::Urgent,
+        priority,
         &text,
         &remediation,
         Some(squad_id),
@@ -1891,7 +1940,7 @@ fn enqueue_proof_failure_mailbox(
         note.emit(
             guard,
             "mailbox message enqueued for proof failure",
-            serde_json::json!({"message_id": message_id, "priority": "urgent"}),
+            serde_json::json!({"message_id": message_id, "priority": priority.as_str()}),
         );
     }
 }
@@ -2886,7 +2935,14 @@ fn run_cell_worker(
     // is also false for a pure cancellation with zero genuine failures.
     if proof_outcome.steps_passed < proof_outcome.steps_run {
         let guard = store.lock();
-        enqueue_proof_failure_mailbox(&guard, squad_id, "cell", Some(&row.cell_id), &row.task_name);
+        enqueue_proof_failure_mailbox(
+            &guard,
+            squad_id,
+            "cell",
+            Some(&row.cell_id),
+            &row.task_name,
+            proof_outcome.first_failure.as_ref(),
+        );
     }
     // Publish the terminal status and the failure flag together, so the
     // dispatcher never sees this cell Done before its proof verdict is
@@ -2994,7 +3050,14 @@ fn run_proof_only_worker(
     // distinction).
     if proof_outcome.steps_passed < proof_outcome.steps_run {
         let guard = store.lock();
-        enqueue_proof_failure_mailbox(&guard, squad_id, "cell", Some(&row.cell_id), &row.task_name);
+        enqueue_proof_failure_mailbox(
+            &guard,
+            squad_id,
+            "cell",
+            Some(&row.cell_id),
+            &row.task_name,
+            proof_outcome.first_failure.as_ref(),
+        );
     }
     let mut prog = progress.lock().expect("progress mutex poisoned");
     prog.status[i] = if proof_outcome.all_ok {
@@ -3289,6 +3352,7 @@ fn run_task_finalizer(
                     "task",
                     task_cell.map(|ts| ts.cell_id.as_str()),
                     &task_name,
+                    proof_outcome.first_failure.as_ref(),
                 );
             }
         }
@@ -3795,6 +3859,14 @@ struct ProofOutcome {
     steps_run: usize,
     /// How many of `steps_run` passed.
     steps_passed: usize,
+    /// RAL-504: the first failing step's `(idx, error text)`, if any — lets
+    /// [`enqueue_proof_failure_mailbox`] both detect retry exhaustion (via
+    /// [`crate::mailbox::is_retry_exhaustion_error`]) and, when it applies,
+    /// point at the precise `restart-proof --from <idx>` command instead of
+    /// coarser cell/task-level guidance. Deliberately only the *first*
+    /// failure, not every one — one exhaustion transition gets one
+    /// notification, not one per failing step.
+    first_failure: Option<(i64, String)>,
 }
 
 /// Build the immutable proof context immediately before a prompt proof starts.
@@ -4050,6 +4122,7 @@ fn run_proofs(
                 all_ok: false,
                 steps_run: 0,
                 steps_passed: 0,
+                first_failure: None,
             };
         }
     };
@@ -4062,6 +4135,7 @@ fn run_proofs(
     let mut all_ok = true;
     let mut steps_run = 0usize;
     let mut steps_passed = 0usize;
+    let mut first_failure: Option<(i64, String)> = None;
     for (
         position,
         (
@@ -4084,6 +4158,7 @@ fn run_proofs(
                 all_ok,
                 steps_run,
                 steps_passed,
+                first_failure,
             };
         }
         // A user may have manually set this step to `ignored` (RAL Queue /
@@ -4475,12 +4550,16 @@ fn run_proofs(
         }
         if !passed {
             all_ok = false;
+            if first_failure.is_none() {
+                first_failure = Some((idx, output.clone()));
+            }
         }
     }
     ProofOutcome {
         all_ok,
         steps_run,
         steps_passed,
+        first_failure,
     }
 }
 
@@ -5264,6 +5343,47 @@ mod tests {
         );
         assert!(squad.tasks[0].cells[0].delayed_until_ms.is_none());
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
+    /// RAL-504: the same thrash episode as
+    /// [`three_rate_limit_retries_within_the_thrash_window_fail_the_cell`]
+    /// must enqueue exactly one High-priority mailbox message (not one per
+    /// retry) carrying exhaustion wording and a concrete restart command.
+    #[test]
+    fn cell_level_rate_limit_thrash_exhaustion_enqueues_one_high_priority_mailbox_message() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = AlwaysRateLimitedRunner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        execute_squad(&store, &runner, &id);
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+
+        let guard = store.lock();
+        let client_id = guard.register_mailbox_client().unwrap();
+        let messages = guard
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one message for the whole terminal thrash transition, not one per retry"
+        );
+        assert_eq!(messages[0].priority, "high");
+        assert!(messages[0].message.contains("stalled"));
+        assert!(
+            messages[0]
+                .message
+                .contains("automated retries have been exhausted and stopped")
+        );
+        assert!(messages[0].message.contains("rate-limit retry thrashing"));
+        assert!(
+            messages[0]
+                .message
+                .contains(&format!("ralphus cell restart {id}/build/"))
+        );
+        assert_eq!(messages[0].squad_id.as_deref(), Some(id.as_str()));
+        assert_eq!(messages[0].task.as_deref(), Some("build"));
     }
 
     /// RAL-435: thrashes exactly like [`AlwaysRateLimitedRunner`] for its
@@ -6762,6 +6882,107 @@ mod tests {
         assert!(messages[0].message.contains("failed"));
         assert_eq!(messages[0].squad_id.as_deref(), Some(id.as_str()));
         assert_eq!(messages[0].task.as_deref(), Some("a"));
+    }
+
+    /// A runner whose cell body always succeeds but whose proof step
+    /// (`spec.proof`) always reports a rate limit, driving
+    /// `run_proof_with_rate_limit_retries` to genuine exhaustion.
+    struct AlwaysRateLimitedProofRunner {
+        proof_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Runner for AlwaysRateLimitedProofRunner {
+        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
+            if spec.proof {
+                self.proof_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                RunnerResult::rate_limited(
+                    0,
+                    "still rate limited".to_string(),
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(0),
+                    0.01,
+                    Some("sess-proof-rl".to_string()),
+                )
+            } else {
+                RunnerResult {
+                    retry_after_secs: None,
+                    status: "done".to_string(),
+                    tokens_in: 1,
+                    tokens_out: 2,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    compaction_input_tokens: 0,
+                    compaction_count: 0,
+                    cost_usd: 0.5,
+                    cost_is_estimated: false,
+                    summary: "ok".to_string(),
+                    error: None,
+                    proofed: None,
+                    agent_session_id: None,
+                    ghost: None,
+                    turns: None,
+                }
+            }
+        }
+    }
+
+    /// RAL-504: a cell-scope prompt proof that never stops being rate
+    /// limited must, once `run_proof_with_rate_limit_retries` gives up, send
+    /// exactly one High-priority exhaustion notification pointing at the
+    /// precise failing proof step via `restart-proof --from <index>` -- not
+    /// the generic `Urgent` wording ordinary proof failures get (contrast
+    /// with `cell_scope_proof_failure_enqueues_urgent_mailbox_message_and_flips_cell_state`).
+    /// The default `provider_timeout_max_retries` of 3 means this exercises
+    /// real (short) sleeps between retries, so this test takes a few
+    /// real seconds.
+    #[test]
+    fn proof_level_rate_limit_exhaustion_enqueues_one_high_priority_mailbox_message() {
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\".\"\nprompt=\"do work\"\n\
+                     [[task.cell.proof]]\nkind=\"prompt\"\nprompt=\"check it\"\n";
+        let (store, id) = store_with(toml);
+        let runner = AlwaysRateLimitedProofRunner {
+            proof_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        execute_squad(&store, &runner, &id);
+        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        assert!(
+            runner.proof_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "expected more than one proof attempt before exhaustion"
+        );
+
+        let guard = store.lock();
+        let client_id = guard.register_mailbox_client().unwrap();
+        let messages = guard
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one message for the whole terminal exhaustion transition, not one per retry"
+        );
+        assert_eq!(messages[0].priority, "high");
+        assert!(messages[0].message.contains("proof for cell"));
+        assert!(messages[0].message.contains("stalled"));
+        assert!(
+            messages[0]
+                .message
+                .contains("automated retries have been exhausted and stopped")
+        );
+        assert!(
+            messages[0]
+                .message
+                .contains(&format!("ralphus cell restart-proof {id}/t/a --from 0"))
+        );
+        assert_eq!(messages[0].squad_id.as_deref(), Some(id.as_str()));
+        assert_eq!(messages[0].task.as_deref(), Some("t"));
+        assert_eq!(messages[0].cell_id.as_deref(), Some("a"));
     }
 
     #[test]
