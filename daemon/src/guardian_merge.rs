@@ -8337,7 +8337,13 @@ fn final_checks(
     // RAL-101: no explicit checks or review auto_build -- fall back to the
     // project's default build/test command, if one is configured, so
     // "in review" still means "testable" rather than "merged and never built".
-    match store.lock().resolve_review_config(root.root()).auto_build {
+    // The config read is bound before the `match`: a scrutinee temporary
+    // would hold the store guard across the whole match body, and the
+    // `Some(cmd)` arm runs the project's build/test command (`cargo build`,
+    // `npm test`, ...) -- an unbounded-duration subprocess that must never
+    // run with the daemon's global store lock held.
+    let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
+    match auto_build_cmd {
         Some(cmd) => {
             if !root
                 .at(combined_str)
@@ -10098,6 +10104,11 @@ fn drive_rebase(
             if cancel.is_cancelled() {
                 return Err("cancelled".to_string());
             }
+            // Release before sleeping: the thread we're waiting for must take
+            // this same store lock to call `release_guardian_worktree_lease`;
+            // holding the guard across the poll both starves every other
+            // subsystem and delays the very release this loop is polling for.
+            drop(guard);
             std::thread::sleep(std::time::Duration::from_millis(25));
             continue;
         }

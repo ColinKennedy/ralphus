@@ -3892,15 +3892,22 @@ fn force_drain_triage_pool(daemon: &Daemon, body: &str) -> Reply {
             vec![],
         );
     };
-    let store = daemon.lock();
-    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    // Scoped so the store guard is released before the drain/create path:
+    // `create_review_from_triage_pool`'s `orderer` callback performs a
+    // blocking Arbiter round-trip that must never run with the daemon's
+    // global store lock held.
+    let project = {
+        let store = daemon.lock();
+        crate::triage::resolve_pool_key_input(&store, &req.project)
+    };
+    let store_handle = daemon.store_handle();
     match crate::reviews::create_review_from_triage_pool(
-        &store,
+        &store_handle,
         &project,
         &req.triage_type,
         |cands| {
             crate::arbiter::order_pooled_candidates(
-                &store,
+                &store_handle,
                 &crate::arbiter::Arbiter::current(),
                 cands,
             )
@@ -4060,15 +4067,33 @@ fn agent_profiles_health(daemon: &Daemon, query: &str) -> Reply {
 /// (see [`crate::project_forks::check_fork_health`]'s doc comment);
 /// submission's own pre-flight remains authoritative.
 fn project_forks_health(daemon: &Daemon) -> Reply {
-    let store = daemon.lock();
-    let forks = match store.list_project_forks() {
-        Ok(forks) => forks,
-        Err(e) => return store_error(&e),
+    // Fork records are collected under the lock, which is then released
+    // before the health probes run: each probe is a `git config` subprocess
+    // plus two forge REST lookups, and this is the daemon's one global store
+    // lock -- holding it across that I/O would stall every other request, on
+    // every endpoint, for as long as the probes take.
+    let forks = {
+        let store = daemon.lock();
+        match store.list_project_forks() {
+            Ok(forks) => forks,
+            Err(e) => return store_error(&e),
+        }
     };
-    let checks: Vec<crate::project_forks::ForkHealthCheck> = forks
-        .iter()
-        .flat_map(|fork| crate::project_forks::check_fork_health(&store, fork))
-        .collect();
+    let store = daemon.store_handle();
+    let mut checks: Vec<crate::project_forks::ForkHealthCheck> = Vec::new();
+    for fork in &forks {
+        let (mut fork_checks, project_path) = {
+            let guard = store.lock();
+            crate::project_forks::fork_health_store_inputs(&guard, fork)
+        };
+        if let Some(project_path) = project_path {
+            fork_checks.extend(crate::project_forks::check_fork_network_health(
+                &project_path,
+                fork,
+            ));
+        }
+        checks.extend(fork_checks);
+    }
     json(200, &serde_json::json!({ "checks": checks }))
 }
 
@@ -12368,8 +12393,10 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
         drop(store);
         let store_handle = daemon.store_handle();
         {
-            let guard = store_handle.lock();
-            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, id) {
+            // No guard held across this: its pool-firing path invokes the
+            // `orderer` callback, whose Arbiter round-trip is a blocking
+            // network call that must never run with the global store lock held.
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&store_handle, id) {
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] failed to re-check thresholds after manual completion in {id}: {}",
@@ -13957,14 +13984,23 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
 /// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
 /// go through the same `ForgeClient::check_pr_ci_status`.
 fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
-    let store = daemon.lock();
-    let pr = match store.get_pull_request(pr_id) {
-        Ok(pr) => pr,
-        Err(e) => return store_error(&e),
-    };
-    let guardian = match store.get_guardian(&pr.guardian_id) {
-        Ok(g) => g,
-        Err(e) => return store_error(&e),
+    // Scoped so the store guard is released before anything below reaches for
+    // the forge -- same reasoning as `pr_comments` above: the guard must not
+    // live across `resolve_remote`'s git/token subprocesses or the
+    // `check_pr_ci_status` forge REST round-trip, and
+    // `forge::ForgeClient`'s own resolution path takes the store lock itself
+    // on some routes, so holding it here can also self-deadlock.
+    let (pr, guardian) = {
+        let store = daemon.lock();
+        let pr = match store.get_pull_request(pr_id) {
+            Ok(pr) => pr,
+            Err(e) => return store_error(&e),
+        };
+        let guardian = match store.get_guardian(&pr.guardian_id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        (pr, guardian)
     };
     let Some(pr_number) = pr.pr_number else {
         return error(409, "no_pr_number", "PR has no recorded number yet", vec![]);
@@ -13983,6 +14019,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
         crate::forge::PrCiState::Failing(f) => f.job_url.clone(),
         _ => None,
     };
+    let store = daemon.lock();
     if let Err(e) = store.set_pr_ci_status(pr_id, state.as_str(), job_url.as_deref()) {
         return store_error(&e);
     }
@@ -14228,7 +14265,12 @@ fn guardian_arrange(daemon: &Daemon, id: &str, body: &str) -> Reply {
 
 fn guardian_approve(daemon: &Daemon, id: &str) -> Reply {
     let snapshot = daemon.lock().get_guardian(id).ok();
-    match daemon.lock().approve_guardian(id) {
+    // Bind before the `match`: the scrutinee temporary would otherwise hold
+    // the store guard across the whole match body, and the success arm's
+    // `retire_dual_root_branch_for_guardian` re-locks the store
+    // (pr.rs) -- a non-reentrant self-park. See `daemon/tests/store_lock_reentrancy.rs`.
+    let approved = daemon.lock().approve_guardian(id);
+    match approved {
         Ok(status) => {
             if let Some(g) = snapshot {
                 crate::pr::retire_dual_root_branch_for_guardian(
@@ -14255,7 +14297,11 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
     // review, and an acknowledgement must not wait behind slow cleanup.
     crate::guardian_merge::stop_merge_worker_for_cancel(&daemon.cancellations, id);
     let snapshot = daemon.lock().get_guardian(id).ok();
-    match daemon.lock().cancel_guardian(id) {
+    // Bind before the `match`: same re-entrant re-lock hazard as
+    // `guardian_approve` above -- the success arm's
+    // `retire_dual_root_branch_for_guardian` takes the store lock itself.
+    let cancelled = daemon.lock().cancel_guardian(id);
+    match cancelled {
         Ok(status) => {
             if let Some(g) = snapshot {
                 crate::pr::retire_dual_root_branch_for_guardian(
@@ -15291,12 +15337,6 @@ pub fn serve<A: ToSocketAddrs>(
     // Arbiter reviews before review recovery starts scheduling work.
     crate::reviews::repair_arbiter_review_project_roots(&store);
     crate::reviews::repair_review_project_identities(&store);
-    // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
-    // keyed by its pre-fix raw worktree path instead of the resolved
-    // project name, and fire any pool that's now correctly counted and
-    // already past its threshold. Naturally idempotent (see the function's
-    // own doc comment), so unconditional on every restart is safe.
-    crate::reviews::repair_triage_pool_keys(&store);
     // Zombie tmux.exe reaping: on the Windows tmux-alternative (psmux) this
     // project targets, `kill-session` frees a cell's *name* but never
     // actually terminates the backing OS process (see
@@ -15386,6 +15426,15 @@ pub fn serve<A: ToSocketAddrs>(
             .with_token(token)
             .with_background_work(BackgroundWork::Threaded),
     );
+    // RAL-318 bug 3: repair any Triage pool/threshold/schedule row still
+    // keyed by its pre-fix raw worktree path instead of the resolved
+    // project name, and fire any pool that's now correctly counted and
+    // already past its threshold. Naturally idempotent (see the function's
+    // own doc comment), so unconditional on every restart is safe. Runs after
+    // the daemon (and its store handle) exists -- its pool-firing path can
+    // invoke the Arbiter -- but before any background worker or the scheduler
+    // thread below starts scheduling work.
+    crate::reviews::repair_triage_pool_keys(&daemon.store_handle());
 
     // The remote Open Agent terminal relay (RAL-355 Phase 10) listens one
     // port above the main API, on the same host it bound to -- so a remote

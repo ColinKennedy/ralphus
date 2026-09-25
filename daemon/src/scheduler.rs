@@ -3417,8 +3417,10 @@ fn run_task_finalizer(
     // the lock.
     if did_write && state == NodeState::Done {
         {
-            let guard = store.lock();
-            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(&guard, squad_id) {
+            // No guard held across this: its pool-firing path invokes the
+            // `orderer` callback, whose Arbiter round-trip is a blocking
+            // network call that must never run with the global store lock held.
+            if let Err(e) = crate::reviews::fire_ready_triage_thresholds(store, squad_id) {
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] failed to re-check thresholds after task {task_idx} in {squad_id} completed: {}",

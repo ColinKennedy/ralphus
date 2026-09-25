@@ -594,6 +594,24 @@ fn check(
 /// tries to submit through it.
 #[must_use]
 pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthCheck> {
+    let (mut out, project_path) = fork_health_store_inputs(store, fork);
+    if let Some(project_path) = project_path {
+        out.extend(check_fork_network_health(&project_path, fork));
+    }
+    out
+}
+
+/// The store-read prologue of [`check_fork_health`]: the orphaned-user and
+/// missing-project conditions (both pure store reads), plus the registered
+/// project's path for the caller to hand to
+/// [`check_fork_network_health`] *without holding the store lock*. A `None`
+/// path means the network probe must be skipped -- a fail-class
+/// `fork-project` check is already in the returned list.
+#[must_use]
+pub fn fork_health_store_inputs(
+    store: &Store,
+    fork: &ForkRecord,
+) -> (Vec<ForkHealthCheck>, Option<std::path::PathBuf>) {
     let mut out = Vec::new();
     if !fork.user.is_empty() && matches!(store.get_user(&fork.user), Ok(None)) {
         out.push(check(
@@ -602,9 +620,7 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
             "fork-user",
             "warn",
             format!(
-                "fork registered for user {:?}, who is no longer registered -- the row \
-                 still applies to that name if resolved (RAL-338: rows deliberately \
-                 survive user deletion), but the board should flag it as orphaned",
+                "fork registered for user {:?}, who is no longer registered -- the row                  still applies to that name if resolved (RAL-338: rows deliberately                  survive user deletion), but the board should flag it as orphaned",
                 fork.user
             ),
         ));
@@ -619,7 +635,7 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
                 "fail",
                 "the project this fork was registered against is no longer registered",
             ));
-            return out;
+            return (out, None);
         }
         Err(e) => {
             out.push(check(
@@ -629,10 +645,21 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
                 "fail",
                 e.to_string(),
             ));
-            return out;
+            return (out, None);
         }
     };
-    let root = std::path::Path::new(&project.path);
+    (out, Some(std::path::PathBuf::from(project.path)))
+}
+
+/// The I/O tail of [`check_fork_health`]: a `git config --get` subprocess
+/// plus the forge-relationship REST probes. Takes no store access, so it can
+/// run with no store guard held.
+pub fn check_fork_network_health(
+    project_path: &std::path::Path,
+    fork: &ForkRecord,
+) -> Vec<ForkHealthCheck> {
+    let mut out = Vec::new();
+    let root = project_path;
     // `git config --get` (not `git remote get-url`) bypasses any
     // `url.<x>.insteadOf` rewrite rule in the caller's git config (e.g.
     // rewriting `https://github.com/` to an SSH form) so this compares
@@ -653,10 +680,9 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
             "fork-remote",
             "warn",
             format!(
-                "local remote {:?} in {:?} points at {:?}, not the registered fork_url {:?} -- \
-                 the next submission through this fork will correct it automatically",
+                "local remote {:?} in {:?} points at {:?}, not the registered fork_url {:?} --                  the next submission through this fork will correct it automatically",
                 fork.remote_name,
-                project.path,
+                project_path.display(),
                 url.trim(),
                 fork.fork_url
             ),
@@ -667,9 +693,8 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
             "fork-remote",
             "warn",
             format!(
-                "no local git remote named {:?} configured in {:?} yet -- it will be created \
-                 automatically the next time this fork is used to submit",
-                fork.remote_name, project.path
+                "no local git remote named {:?} configured in {:?} yet -- it will be created                  automatically the next time this fork is used to submit",
+                fork.remote_name, project_path.display()
             ),
         )),
     }
@@ -700,23 +725,19 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
                 ),
                 crate::forge::ForkRelationship::SameNetworkIndirect => (
                     "warn",
-                    "fork is only indirectly related to the parent (a fork of a fork, or a \
-                     sibling) -- cross-repository behavior is only proven for a direct fork",
+                    "fork is only indirectly related to the parent (a fork of a fork, or a                      sibling) -- cross-repository behavior is only proven for a direct fork",
                 ),
                 crate::forge::ForkRelationship::NoRelationship => (
                     "fail",
-                    "fork does not appear to be forge-related to the parent at all -- \
-                     submission through it will be blocked without --allow-unlinked-fork",
+                    "fork does not appear to be forge-related to the parent at all --                      submission through it will be blocked without --allow-unlinked-fork",
                 ),
                 crate::forge::ForkRelationship::NotVisible => (
                     "warn",
-                    "could not confirm the fork relationship over the forge API (private, \
-                     deleted, or missing token) -- this is not proof of no relationship",
+                    "could not confirm the fork relationship over the forge API (private,                      deleted, or missing token) -- this is not proof of no relationship",
                 ),
                 crate::forge::ForkRelationship::CrossInstance => (
                     "fail",
-                    "the fork and its parent are on different forge instances/kinds -- there \
-                     is no cross-repository PR path between them",
+                    "the fork and its parent are on different forge instances/kinds --                      there is no cross-repository PR path between them",
                 ),
             };
             out.push(check(
