@@ -190,6 +190,7 @@
       CLICK_HANDLERS.saveReorder = (e, ds) => saveReorder(ds.guardianId || "");
       CLICK_HANDLERS.discardReorder = (e, ds) => discardReorder(ds.guardianId || "");
       CLICK_HANDLERS.mergeReview = (e, ds) => mergeReview(ds.guardianId || "", ds.status || "");
+      CLICK_HANDLERS.mergeReviewFromMenu = (e, ds) => mergeReviewFromMenu(ds.guardianId || "");
       CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.syncPrReview = (e, ds) => syncPrReview(ds.guardianId || "");

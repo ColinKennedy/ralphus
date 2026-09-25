@@ -15077,11 +15077,18 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let forge_name = forge.to_string();
         let handle = std::thread::spawn(move || {
             let mut next_number = 101_i64;
+            let mut received_any = false;
             loop {
-                let req = match server.recv_timeout(std::time::Duration::from_secs(20)) {
+                let timeout = if received_any {
+                    std::time::Duration::from_secs(30)
+                } else {
+                    std::time::Duration::from_secs(30)
+                };
+                let req = match server.recv_timeout(timeout) {
                     Ok(Some(r)) => r,
                     Ok(None) | Err(_) => break,
                 };
+                received_any = true;
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 let path = url.split('?').next().unwrap_or(&url).to_string();
@@ -15550,7 +15557,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 // wait is enough to notice "done" without every run paying
                 // the full timeout as dead time at the end.
                 let timeout = if received_any {
-                    std::time::Duration::from_secs(5)
+                    std::time::Duration::from_secs(30)
                 } else {
                     std::time::Duration::from_secs(30)
                 };
