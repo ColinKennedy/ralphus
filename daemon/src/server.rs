@@ -4528,22 +4528,22 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             }
             // Same double-dispatch guard the `restart_cell` HTTP handler
             // uses: stop every worker this is about to reset *before*
-            // resetting it, and never hold the daemon lock across the
-            // (up to 5s) wait.
-            if let Ok(impact) =
-                daemon
-                    .lock()
-                    .compute_cell_restart_impact(id, req.task_idx, req.cell_idx)
-            {
-                for dep in &impact.dirtied_squads {
-                    daemon.cancellations.cancel(&dep.id);
-                }
-                for dep in &impact.dirtied_squads {
-                    wait_for_worker_stop(daemon, &dep.id);
-                }
+            // resetting it, and never hold the daemon lock across the (up to
+            // 5s) wait -- batched into one shared budget across every
+            // dirtied squad plus this one, not a 5s wait per squad, so a
+            // cell edit that dirties several dependents can't turn into a
+            // multi-x-5s block of the single write-request worker (see
+            // `wait_for_workers_stop`'s doc comment).
+            let mut affected: Vec<String> = daemon
+                .lock()
+                .compute_cell_restart_impact(id, req.task_idx, req.cell_idx)
+                .map(|impact| impact.dirtied_squads.into_iter().map(|d| d.id).collect())
+                .unwrap_or_default();
+            affected.push(id.to_string());
+            for squad_id in &affected {
+                daemon.cancellations.cancel(squad_id);
             }
-            daemon.cancellations.cancel(id);
-            wait_for_worker_stop(daemon, id);
+            wait_for_workers_stop(daemon, &affected);
             if let Err(e) = daemon.lock().restart_cell(id, req.task_idx, req.cell_idx) {
                 return store_error(&e);
             }
@@ -4577,8 +4577,8 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(dirtied) => {
                     for dep_id in &dirtied {
                         daemon.cancellations.cancel(dep_id);
-                        wait_for_worker_stop(daemon, dep_id);
                     }
+                    wait_for_workers_stop(daemon, &dirtied);
                 }
                 Err(e) => return store_error(&e),
             }
@@ -5425,6 +5425,35 @@ fn wait_for_worker_stop(daemon: &Daemon, squad_id: &str) {
     }
 }
 
+/// Like [`wait_for_worker_stop`], but for a whole batch of squads that were
+/// just cancelled together (e.g. a cell/task/squad restart's dirtied
+/// dependents, RAL-19) -- one shared 5s budget for the *whole* batch instead
+/// of each squad getting its own back-to-back. Every call site here runs on
+/// the daemon's single write-request worker (see `WRITE_WORKERS`'s doc
+/// comment): looping `wait_for_worker_stop` once per dirtied squad turns
+/// into `dirtied_squads.len() * 5s` of that one thread being blocked, which
+/// queues up every *other* mutating request -- including the cancel a user
+/// would reach for to escape a stuck one -- behind it for the whole
+/// stretch. Since every squad in the batch is already cancelled before this
+/// runs, polling them together is equivalent and bounds the total wait.
+fn wait_for_workers_stop(daemon: &Daemon, squad_ids: &[String]) {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let started = Instant::now();
+    loop {
+        if squad_ids
+            .iter()
+            .all(|id| !daemon.cancellations.is_active(id))
+        {
+            return;
+        }
+        if started.elapsed() >= TIMEOUT {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Restart a whole squad and dirty every squad that depends on it (RAL-19).
 ///
 /// `Store::restart_squad` forces the squad back to `Pending` unconditionally, even
@@ -5439,16 +5468,15 @@ fn restart_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // everything it will dirty — *before* any of them are reset to Pending,
     // so no old worker can still be mid-poll when the fresh claim lands.
     let impact = daemon.lock().compute_squad_restart_impact(id);
-    if let Ok(impact) = &impact {
-        for dep in &impact.dirtied_squads {
-            daemon.cancellations.cancel(&dep.id);
-        }
-        for dep in &impact.dirtied_squads {
-            wait_for_worker_stop(daemon, &dep.id);
-        }
+    let mut affected: Vec<String> = impact
+        .as_ref()
+        .map(|impact| impact.dirtied_squads.iter().map(|d| d.id.clone()).collect())
+        .unwrap_or_default();
+    affected.push(id.to_string());
+    for squad_id in &affected {
+        daemon.cancellations.cancel(squad_id);
     }
-    daemon.cancellations.cancel(id);
-    wait_for_worker_stop(daemon, id);
+    wait_for_workers_stop(daemon, &affected);
     // Bound to a `let` (not matched directly) so the `MutexGuard` `.lock()`
     // returns is dropped at the end of *this* statement -- matching on
     // `daemon.lock().restart_squad(id)` directly would keep that guard alive
@@ -5551,12 +5579,11 @@ fn restart_cell(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Re
         .lock()
         .compute_cell_restart_impact(id, task_idx, cell_idx);
     if let Ok(impact) = &impact {
-        for dep in &impact.dirtied_squads {
-            daemon.cancellations.cancel(&dep.id);
+        let dep_ids: Vec<String> = impact.dirtied_squads.iter().map(|d| d.id.clone()).collect();
+        for squad_id in &dep_ids {
+            daemon.cancellations.cancel(squad_id);
         }
-        for dep in &impact.dirtied_squads {
-            wait_for_worker_stop(daemon, &dep.id);
-        }
+        wait_for_workers_stop(daemon, &dep_ids);
     }
     // Cancel only when something this restart will actually touch (the
     // target cell itself, or one of its own downstream cells within this
@@ -5650,16 +5677,15 @@ fn restart_task(daemon: &Daemon, id: &str, ti: &str, body: &str) -> Reply {
         return error(400, "bad_request", "task index must be an integer", vec![]);
     };
     let impact = daemon.lock().compute_task_restart_impact(id, task_idx);
-    if let Ok(impact) = &impact {
-        for dep in &impact.dirtied_squads {
-            daemon.cancellations.cancel(&dep.id);
-        }
-        for dep in &impact.dirtied_squads {
-            wait_for_worker_stop(daemon, &dep.id);
-        }
+    let mut affected: Vec<String> = impact
+        .as_ref()
+        .map(|impact| impact.dirtied_squads.iter().map(|d| d.id.clone()).collect())
+        .unwrap_or_default();
+    affected.push(id.to_string());
+    for squad_id in &affected {
+        daemon.cancellations.cancel(squad_id);
     }
-    daemon.cancellations.cancel(id);
-    wait_for_worker_stop(daemon, id);
+    wait_for_workers_stop(daemon, &affected);
     // See `restart_squad`'s comment on why this is a `let` and not matched
     // directly -- `apply_restart_note` below takes its own lock, which would
     // deadlock against a guard still held by the match scrutinee.
@@ -5753,8 +5779,8 @@ fn restart_cell_proof(
             // squad this handler targets is fully protected.
             for dep_id in &dirtied {
                 daemon.cancellations.cancel(dep_id);
-                wait_for_worker_stop(daemon, dep_id);
             }
+            wait_for_workers_stop(daemon, &dirtied);
             apply_restart_note(daemon, id, &[(task_idx, cell_idx)], &note_req);
             json(
                 200,
@@ -5803,8 +5829,8 @@ fn restart_task_proof(daemon: &Daemon, id: &str, ti: &str, vi: &str, body: &str)
         Ok(dirtied) => {
             for dep_id in &dirtied {
                 daemon.cancellations.cancel(dep_id);
-                wait_for_worker_stop(daemon, dep_id);
             }
+            wait_for_workers_stop(daemon, &dirtied);
             // The task's own directly-owned cells -- mirrors restart_task
             // above (no separate impact-preview endpoint exists here, so
             // filter cells_of directly instead of an already-computed
