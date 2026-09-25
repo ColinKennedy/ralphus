@@ -1231,6 +1231,27 @@ impl Store {
         &self.event_bus
     }
 
+    /// Run `f` inside one explicit write transaction, committing if it returns
+    /// `Ok` and rolling back otherwise.
+    ///
+    /// Every `Store` method writes through `self.conn`, so anything `f` calls
+    /// joins this transaction rather than committing on its own. That is the
+    /// point: SQLite's per-commit cost is dominated by the journal flush, so a
+    /// batch of N writes under one commit costs roughly one commit rather than
+    /// N (measured in `daemon/tests/store_write_throughput.rs`).
+    ///
+    /// Two constraints on `f`. It must not take the `StoreMutex` — the caller
+    /// already holds it, and re-entering is a permanent self-park (see
+    /// `crate::store_lock`). And it must not block on I/O: an open write
+    /// transaction holds the WAL writer, so every other writer waits on
+    /// whatever `f` is waiting on.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     fn init_schema(&self) -> Result<()> {
         // RAL-281: captured *before* the `CREATE TABLE IF NOT EXISTS` below so
         // the default seed (after the batch) runs exactly once, at first-ever

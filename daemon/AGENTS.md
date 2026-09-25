@@ -73,6 +73,8 @@ doesn't go through tmux/psmux at all.
 | `reviews_derive.rs` | Full review flow end-to-end | 1 live-Ollama test, `#[ignore]`d by default; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
 | `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test, `#[ignore]`d by default |
 | `board_cold_load_perf.rs` | RAL-414: board endpoint cold-load budget vs. realistic fixtures | 4 always-run smoke tests + 4 `#[ignore]`d heavy tests; the heavy tests run every PR in the `perf-tests` CI job (`.github/workflows/ci.yml`), not the `rust` job's default `Test` step |
+| `board_contention.rs` | WS-B.4: board reads vs. four concurrent writers over real HTTP | 1 `#[ignore]`d test; runs in the `perf-tests` CI job. File-backed store — `open_in_memory`'s `cache=shared` raises `SQLITE_LOCKED` under concurrent read/write |
+| `store_write_throughput.rs` | WS-B.5: the writer's sustained commit rate, batched and unbatched | 2 `#[ignore]`d tests; runs in the `perf-tests` CI job |
 
 **Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash
