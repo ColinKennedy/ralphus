@@ -1582,10 +1582,17 @@ impl Store {
                 payload     TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_carto_at ON cartographer_events(at_ms);
-            CREATE INDEX IF NOT EXISTS idx_carto_squad ON cartographer_events(squad_id);
             CREATE INDEX IF NOT EXISTS idx_carto_guardian ON cartographer_events(guardian_id);
-            CREATE INDEX IF NOT EXISTS idx_carto_cell ON cartographer_events(cell_id);
             CREATE INDEX IF NOT EXISTS idx_carto_source ON cartographer_events(source);
+            -- WS-D.2: partial rather than full. `squad_id`/`cell_id`/`task`
+            -- are NULL on ~99% of rows, and Cartographer inserts are the
+            -- daemon's highest-volume write; see the WS-D.2 migration block
+            -- further down `init_schema` for the measurements and for why an
+            -- equality lookup still uses a partial index.
+            CREATE INDEX IF NOT EXISTS idx_carto_squad_partial
+                ON cartographer_events(squad_id) WHERE squad_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_carto_cell_partial
+                ON cartographer_events(cell_id) WHERE cell_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS projects (
                 name          TEXT PRIMARY KEY,
                 description   TEXT NOT NULL DEFAULT '',
@@ -3104,6 +3111,60 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_guardian_branches_branch_id ON guardian_branches(id)",
             [],
         );
+        // WS-D.2: `guardian_branches`' primary key is (`guardian_id`,
+        // `position`), so every lookup *by branch name* -- the branch-name arm
+        // of `reviews_for_squad`, and the same join in the review-derivation
+        // paths -- had no index to seek on and scanned. This is the index that
+        // makes WS-D.1's `UNION` rewrite actually index-driven rather than
+        // merely better-shaped.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardian_branches_branch ON guardian_branches(branch)",
+            [],
+        );
+        // WS-D.2: the board's review lists filter guardians by status
+        // ("collecting", "merged", ...) and order them by creation time. The
+        // `(created_at_ms, id)` pair matches `reviews_for_squad`'s and the
+        // guardian index's `ORDER BY` exactly, so the sort can be satisfied by
+        // walking the index instead of building a temporary b-tree.
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardians_status ON guardians(status)",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_guardians_created ON guardians(created_at_ms, id)",
+            [],
+        );
+        // WS-D.2: three of `cartographer_events`' six indexes cover columns
+        // that are almost always NULL -- measured against the captured
+        // production database: `squad_id` 98.6% NULL, `cell_id` 99.0%,
+        // `task` 98.8%. SQLite indexes NULLs like any other value, so each of
+        // those three b-trees was being maintained on every single insert to
+        // serve roughly one row in a hundred. Cartographer writes are the
+        // daemon's highest-volume write by a wide margin, and index
+        // maintenance is what dominates their cost (2,308/sec against six
+        // indexes versus 12,466/sec with none).
+        //
+        // A partial index skips the NULL rows entirely. Nothing is lost:
+        // every query these serve is an equality match (`WHERE squad_id = ?`),
+        // which cannot match NULL, so SQLite still uses the partial index for
+        // exactly the lookups the full index served.
+        //
+        // Dropped and recreated rather than created `IF NOT EXISTS`: a
+        // database from before this change already has the full index under
+        // the old name, and `IF NOT EXISTS` would leave it in place.
+        for stmt in [
+            "DROP INDEX IF EXISTS idx_carto_squad",
+            "DROP INDEX IF EXISTS idx_carto_cell",
+            "DROP INDEX IF EXISTS idx_carto_task",
+            "CREATE INDEX IF NOT EXISTS idx_carto_squad_partial
+                 ON cartographer_events(squad_id) WHERE squad_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_carto_cell_partial
+                 ON cartographer_events(cell_id) WHERE cell_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_carto_task_partial
+                 ON cartographer_events(task) WHERE task IS NOT NULL",
+        ] {
+            let _ = self.conn.execute(stmt, []);
+        }
         // RAL-110: one-time backfill of the old `skip_checks` column (present on
         // any database created before this change) into both new columns --
         // preserving prior behavior exactly (skip_checks used to gate both the
@@ -4702,20 +4763,34 @@ impl Store {
     /// review list has always included terminal (merged/deployed/cancelled)
     /// reviews too.
     fn reviews_for_squad(conn: &Connection, squad_id: &str) -> Result<Vec<SquadReviewRef>> {
+        // WS-D.1: the two ways a cell reaches a guardian are collected as a
+        // `UNION` of two separately index-driven subqueries, not as an `OR`
+        // inside one join condition.
+        //
+        // An `OR` spanning two different tables leaves SQLite no single index
+        // to drive the join from, so it fell back to pairing every guardian
+        // with every one of the squad's cells and evaluating the `EXISTS`
+        // per pair -- O(cells x guardians), which is why this was the
+        // costliest query on the board and why it got worse as a project
+        // accumulated reviews rather than staying flat.
+        //
+        // Each arm below seeks: the direct arm on `cells`' primary key
+        // (`squad_id`, ...) and then `idx_cells_review_guardian_id`, the
+        // branch-name arm on the same primary key and then
+        // `idx_guardian_branches_branch`. `UNION` also supplies the
+        // de-duplication the outer `DISTINCT` used to do.
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT g.id, g.name, g.status, g.origin FROM guardians g
-             JOIN cells s ON (
-                 s.review_guardian_id = g.id
-                 OR (
-                     s.review_guardian_id IS NULL
-                     AND s.review_branch IS NOT NULL
-                     AND EXISTS (
-                         SELECT 1 FROM guardian_branches gb
-                         WHERE gb.guardian_id = g.id AND gb.branch = s.review_branch
-                     )
-                 )
+            "SELECT g.id, g.name, g.status, g.origin FROM guardians g
+             WHERE g.id IN (
+                 SELECT s.review_guardian_id FROM cells s
+                 WHERE s.squad_id = ?1 AND s.review_guardian_id IS NOT NULL
+                 UNION
+                 SELECT gb.guardian_id FROM cells s
+                 JOIN guardian_branches gb ON gb.branch = s.review_branch
+                 WHERE s.squad_id = ?1
+                   AND s.review_guardian_id IS NULL
+                   AND s.review_branch IS NOT NULL
              )
-             WHERE s.squad_id = ?
              ORDER BY g.created_at_ms, g.id",
         )?;
         let rows = stmt
@@ -10663,6 +10738,138 @@ fn move_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS-D.1/M13: `reviews_for_squad` must reach its guardians by index seek,
+    /// never by scanning the `guardians` table.
+    ///
+    /// The shape this guards against is the one it replaced: an `OR` spanning
+    /// `cells.review_guardian_id` and a `guardian_branches` subquery gave
+    /// SQLite no index to drive the join from, so it scanned every guardian and
+    /// evaluated a correlated subquery per (guardian, cell) pair. That is
+    /// O(cells x guardians), and it degrades as a project accumulates reviews
+    /// rather than staying flat -- the "it has always been getting slower"
+    /// mechanism. A plan assertion catches a regression here that a timing
+    /// assertion on a small test database never would.
+    #[test]
+    fn reviews_for_squad_reaches_guardians_by_index_seek() {
+        let store = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT g.id, g.name, g.status, g.origin FROM guardians g
+                     WHERE g.id IN (
+                         SELECT s.review_guardian_id FROM cells s
+                         WHERE s.squad_id = ?1 AND s.review_guardian_id IS NOT NULL
+                         UNION
+                         SELECT gb.guardian_id FROM cells s
+                         JOIN guardian_branches gb ON gb.branch = s.review_branch
+                         WHERE s.squad_id = ?1
+                           AND s.review_guardian_id IS NULL
+                           AND s.review_branch IS NOT NULL
+                     )
+                     ORDER BY g.created_at_ms, g.id",
+                )
+                .expect("prepare plan query");
+            stmt.query_map(params!["squad-000000000001"], |r| r.get::<_, String>(3))
+                .expect("run plan query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect plan")
+        };
+        let plan_text = plan.join(
+            "
+",
+        );
+
+        assert!(
+            !plan_text.contains("SCAN g"),
+            "the guardians table is being scanned:
+{plan_text}"
+        );
+        assert!(
+            plan_text.contains("SEARCH g USING"),
+            "guardians are not reached by index seek:
+{plan_text}"
+        );
+        // Both arms of the `UNION` must seek too, or the rewrite only moved
+        // the scan somewhere less visible.
+        assert!(
+            plan_text.contains("SEARCH gb USING INDEX idx_guardian_branches_branch"),
+            "the branch-name arm is not using idx_guardian_branches_branch --              without it this query has no index on `guardian_branches.branch`              to seek, since the table's primary key starts with guardian_id:
+{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SCAN s"),
+            "a cells scan is present; the squad_id seek was lost:
+{plan_text}"
+        );
+    }
+
+    /// WS-D.2: the Cartographer indexes on the near-always-NULL columns are
+    /// partial, and an equality lookup still uses them.
+    ///
+    /// The second half is the part worth asserting: a partial index is only a
+    /// free win if the planner still picks it. `WHERE squad_id = ?` cannot
+    /// match NULL, so it is covered by `WHERE squad_id IS NOT NULL` -- but
+    /// that is a property of SQLite's planner, not something the schema
+    /// states, so it is checked rather than assumed.
+    #[test]
+    fn cartographer_null_heavy_indexes_are_partial_and_still_used() {
+        let store = Store::open_in_memory().unwrap();
+
+        let partial_sql: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT sql FROM sqlite_master
+                     WHERE type='index' AND tbl_name='cartographer_events'
+                       AND name LIKE '%_partial'",
+                )
+                .expect("prepare index query");
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .expect("run index query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect index sql")
+        };
+        assert_eq!(
+            partial_sql.len(),
+            3,
+            "expected partial indexes on squad_id, cell_id and task: {partial_sql:?}"
+        );
+        for sql in &partial_sql {
+            assert!(
+                sql.contains("IS NOT NULL"),
+                "index is not actually partial: {sql}"
+            );
+        }
+        // The full-index names must be gone, or an upgraded database keeps
+        // paying for both.
+        for stale in ["idx_carto_squad", "idx_carto_cell", "idx_carto_task"] {
+            let count: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?",
+                    params![stale],
+                    |r| r.get(0),
+                )
+                .expect("count stale index");
+            assert_eq!(count, 0, "the full index {stale} still exists");
+        }
+
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM cartographer_events WHERE squad_id = ?",
+                params!["squad-000000000001"],
+                |r| r.get(3),
+            )
+            .expect("plan the squad_id lookup");
+        assert!(
+            plan.contains("idx_carto_squad_partial"),
+            "an equality lookup on squad_id no longer uses the partial index: {plan}"
+        );
+    }
 
     /// WS-C: the writer's performance PRAGMAs are actually set. Each of these
     /// is per-connection, not stored in the database file, so a connection

@@ -32,14 +32,17 @@ const WRITES: usize = 2_000;
 
 /// Minimum sustained single-threaded write rate, in writes/sec.
 ///
-/// Measured at 404/sec before WS-C and 2,588/sec after it -- `synchronous`
-/// defaulted to `FULL`, so every commit cost an fsync. The remaining cost is
-/// not the commit: the same rows insert at 12,466/sec into an un-indexed
-/// table, so index maintenance across `cartographer_events`' six indexes is
-/// what stands between this and the plan's 5,000/sec M10 target, and WS-D.2 is
-/// where that gets addressed. The floor sits well under the measurement so a
-/// slower CI disk does not turn a real gate into a flaky one.
-const MIN_WRITES_PER_SEC: f64 = 1_200.0;
+/// Measured progression on one fixed row shape: 404/sec before WS-C, 2,588/sec
+/// after it (`synchronous` had defaulted to `FULL`, fsyncing every commit), and
+/// 3,064-3,387/sec after WS-D.2 made the three near-always-NULL Cartographer
+/// indexes partial. Index maintenance is what remains -- the same rows insert
+/// at 12,466/sec into an un-indexed table -- so the plan's 5,000/sec M10 target
+/// is not reachable by configuration alone; it needs either fewer indexes on
+/// the hot table or WS-F.3's batching, which already measures ~20,000/sec.
+///
+/// The floor sits well under the measurement so a slower CI disk does not turn
+/// a real gate into a flaky one.
+const MIN_WRITES_PER_SEC: f64 = 1_500.0;
 
 /// Minimum rate when the same writes are wrapped in one explicit transaction.
 ///
@@ -63,6 +66,8 @@ fn temp_db(tag: &str) -> PathBuf {
     dir.join("tasks.db")
 }
 
+/// A row with every indexed column populated -- the worst case for index
+/// maintenance, and a fixed shape so the number stays comparable run to run.
 fn entry<'a>(message: &'a str, payload: &'a serde_json::Value) -> CartographerEntry<'a> {
     CartographerEntry {
         level: LogLevel::INFO,
@@ -81,6 +86,14 @@ fn entry<'a>(message: &'a str, payload: &'a serde_json::Value) -> CartographerEn
 
 /// Runs `WRITES` `cartographer_log` calls and returns the achieved rate.
 fn measure(store: &Store) -> f64 {
+    measure_with(store, entry)
+}
+
+/// Runs `WRITES` `cartographer_log` calls built by `shape`, returning the rate.
+fn measure_with(
+    store: &Store,
+    shape: for<'a> fn(&'a str, &'a serde_json::Value) -> CartographerEntry<'a>,
+) -> f64 {
     // A payload with some real shape to it: the production rows carry JSON,
     // and `payload.to_string()` is part of the per-write cost.
     let payload = serde_json::json!({"phase": "measure", "detail": "one representative row"});
@@ -88,7 +101,7 @@ fn measure(store: &Store) -> f64 {
     for i in 0..WRITES {
         let message = format!("throughput sample {i}");
         store
-            .cartographer_log(entry(&message, &payload))
+            .cartographer_log(shape(&message, &payload))
             .expect("cartographer write");
     }
     let elapsed = started.elapsed();
