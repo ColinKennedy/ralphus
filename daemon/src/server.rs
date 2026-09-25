@@ -130,6 +130,11 @@ pub struct Daemon {
     /// tests that don't want live background threads) starts with an empty
     /// cache rather than a real sweep thread.
     health_sweep: crate::health_sweep::HealthSweepState,
+    /// WS-G.1/G.2: store-lock liveness, surfaced by `GET /api/daemon`. The
+    /// checking thread is spawned in `serve()` rather than here, matching
+    /// `health_sweep`'s precedent, so a plain `Daemon::new` (unit tests) gets
+    /// the state without a live background thread.
+    watchdog: Arc<crate::watchdog::WatchdogState>,
 }
 
 /// How to run a unit of background follow-up work spawned from a request
@@ -237,6 +242,7 @@ impl Daemon {
             generation_jobs: crate::generation::GenerationJobs::new(),
             background: BackgroundWork::Immediate,
             health_sweep: crate::health_sweep::HealthSweepState::new(),
+            watchdog: crate::watchdog::WatchdogState::new(),
         }
     }
 
@@ -403,6 +409,13 @@ impl Daemon {
     #[must_use]
     pub fn health_sweep_handle(&self) -> crate::health_sweep::HealthSweepState {
         self.health_sweep.clone()
+    }
+
+    /// A cloned handle to the WS-G watchdog state, for the checking thread
+    /// spawned in `serve()` and for the health route to read.
+    #[must_use]
+    pub fn watchdog_handle(&self) -> Arc<crate::watchdog::WatchdogState> {
+        Arc::clone(&self.watchdog)
     }
 
     /// `#[track_caller]` so the lock-wait breadcrumb and the WS-B.3 guard
@@ -857,6 +870,23 @@ struct DaemonHealth<'a> {
     /// measured separately from handler execution time so lock contention is
     /// visible without conflating it with query cost.
     lock_wait: crate::store_lock::LockWaitSnapshot,
+    /// WS-G.1/G.4: whether the store lock is currently reachable, and the
+    /// history of it not being. `stalled: true` here is the signal that the
+    /// daemon is wedged -- the condition that previously went entirely
+    /// unreported. See `crate::watchdog`.
+    watchdog: crate::watchdog::WatchdogSnapshot,
+    /// WS-G.3: `file:line` of whoever last acquired the store lock, and how
+    /// long ago, so a wedged daemon names its own culprit instead of leaving it
+    /// to be inferred after the fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_lock_holder: Option<StoreLockHolder>,
+}
+
+/// See [`DaemonHealth::store_lock_holder`].
+#[derive(Serialize)]
+struct StoreLockHolder {
+    site: String,
+    held_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -2151,6 +2181,9 @@ fn health(daemon: &Daemon) -> Reply {
             db,
             warnings,
             lock_wait: crate::store_lock::store_lock_wait_snapshot(),
+            watchdog: daemon.watchdog.snapshot(),
+            store_lock_holder: crate::store_lock::store_lock_holder()
+                .map(|(site, held_ms)| StoreLockHolder { site, held_ms }),
         },
     )
 }
@@ -15569,6 +15602,10 @@ pub fn serve<A: ToSocketAddrs>(
     // health check -- see `crate::health_sweep`'s module doc comment for
     // why it's scoped to a subset of the catalog.
     crate::health_sweep::spawn_health_sweep(daemon.health_sweep_handle(), daemon.store_handle());
+    // WS-G.1/G.2: nothing watched the daemon itself until now -- see
+    // `crate::watchdog`'s module doc comment for what the unwatched failure
+    // looked like.
+    crate::watchdog::spawn(daemon.store_handle(), daemon.watchdog_handle());
     std::thread::spawn(move || {
         crate::scheduler::run_loop(
             handle,

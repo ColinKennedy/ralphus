@@ -111,6 +111,41 @@ impl StoreMutex {
         }
         StoreGuard::new(guard, loc)
     }
+
+    /// Try to acquire the store lock, giving up after `timeout`.
+    ///
+    /// WS-G.2: this is how the watchdog asks "is the store reachable?" without
+    /// becoming the next thread stuck behind whatever is holding it. A plain
+    /// `lock()` in a liveness checker would itself park forever on exactly the
+    /// deadlock it exists to report.
+    ///
+    /// Deliberately does not record a wait sample: the watchdog polls on a
+    /// timer rather than because it has work to do, so folding its waits into
+    /// the histogram would report contention that no request experienced.
+    #[track_caller]
+    pub fn try_lock_for(&self, timeout: Duration) -> Option<StoreGuard<'_>> {
+        let guard = self.0.try_lock_for(timeout)?;
+        Some(StoreGuard::new(guard, Location::caller()))
+    }
+}
+
+/// Who holds (or last acquired) the store lock, and for how long: a
+/// `("file:line", held_ms)` pair, or `None` if the lock has never been taken.
+///
+/// Read through the [`HOLDER`] breadcrumb's own tiny mutex, never through the
+/// store lock, so this stays answerable precisely when the store lock is not
+/// -- which is the only time anyone asks. This is the single most useful fact
+/// about a wedged daemon, and the reason the captured deadlock took static
+/// analysis to diagnose is that nothing surfaced it at the time.
+#[must_use]
+pub fn store_lock_holder() -> Option<(String, i64)> {
+    let holder = HOLDER.lock();
+    holder.map(|info| {
+        (
+            format!("{}:{}", info.file, info.line),
+            crate::store::now_ms().saturating_sub(info.acquired_at_ms),
+        )
+    })
 }
 
 /// A held store lock, instrumented by the WS-B.3 guard watchdog: on drop,

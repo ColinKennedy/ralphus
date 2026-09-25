@@ -28,6 +28,14 @@
       let healthRefreshing = false;
       /** Board-local error string for the Health tab's own fetch/refresh failures. */
       let healthError = "";
+      /**
+       * WS-G.4: the daemon's own store-lock liveness from `GET /api/daemon` --
+       * the wait histogram, the watchdog's verdict, and who holds the lock.
+       * The daemon has reported the histogram since RAL-393 and nothing ever
+       * displayed it.
+       * @type {DaemonHealthView | null}
+       */
+      let healthDaemon = null;
 
       /**
        * Fetches the catalog, this daemon's cached sweep report, and every
@@ -37,10 +45,11 @@
        */
       async function pollHealth() {
         try {
-          const [catalogRes, reportRes, targetsRes] = await Promise.all([
+          const [catalogRes, reportRes, targetsRes, daemonRes] = await Promise.all([
             fetch("/api/health/catalog"),
             fetch("/api/health/report"),
             fetch("/api/machines/targets/health"),
+            fetch("/api/daemon"),
           ]);
           if (!catalogRes.ok || !reportRes.ok || !targetsRes.ok) {
             healthError = await responseError(
@@ -57,6 +66,7 @@
           healthCatalogById = new Map(healthCatalog.map((e) => [e.id, e]));
           healthLocalReport = reportBody;
           healthRemoteTargets = targetsBody.targets || [];
+          healthDaemon = daemonRes.ok ? await daemonRes.json() : null;
           byId("conn").className = "dot on";
           markUpdated();
           renderHealthPage();
@@ -147,6 +157,75 @@
           </div>`;
       }
       /**
+       * WS-G.4: the store-lock panel.
+       *
+       * Three facts, in the order they matter when the board feels slow. Is the
+       * lock reachable at all (the watchdog); how long requests are waiting for
+       * it (the histogram the daemon has always reported and nothing showed);
+       * and who last took it, which is the one fact that identifies a wedged
+       * daemon's culprit.
+       * @param {DaemonHealthView | null} daemon
+       * @returns {string}
+       */
+      function storeLockPanelHtml(daemon) {
+        if (!daemon) return "";
+        const wait = daemon.lock_wait;
+        const dog = daemon.watchdog;
+        const holder = daemon.store_lock_holder;
+        // `stalled` means the watchdog could not acquire the lock within its
+        // timeout: the daemon is wedged, not merely busy.
+        const state = dog && dog.stalled
+          ? { color: "--failed", label: "unreachable" }
+          : dog && dog.total_stalls > 0
+            ? { color: "--warn", label: "recovered" }
+            : { color: "--done", label: "reachable" };
+        const rows = [];
+        rows.push(`<span data-tip="Whether the liveness watchdog could acquire the daemon's store lock on its last check (every ${esc(String(WATCHDOG_INTERVAL_SECS))}s). 'unreachable' means the daemon is wedged -- every request is queued behind whoever holds the lock."><span class="dot" style="background:${cvar(state.color)}"></span> ${esc(state.label)}</span>`);
+        if (dog) {
+          if (dog.last_ok_age_ms !== null && dog.last_ok_age_ms !== undefined) {
+            rows.push(`<span style="color:var(--muted)" data-tip="How long ago the watchdog last successfully acquired the store lock. A value far above the check interval means checks are failing.">last ok ${esc(fmtAgo(dog.last_ok_age_ms))}</span>`);
+          }
+          if (dog.total_stalls > 0) {
+            rows.push(`<span style="color:var(--warn)" data-tip="Watchdog checks that timed out waiting for the store lock over this daemon's lifetime. Kept after recovery so a resolved incident is still visible.">${esc(String(dog.total_stalls))} stall(s)${dog.consecutive_stalls > 0 ? ` · ${esc(String(dog.consecutive_stalls))} consecutive` : ""}</span>`);
+          }
+        }
+        if (wait) {
+          rows.push(`<span style="color:var(--muted)" data-tip="How long store-lock acquisitions waited, over this daemon's whole lifetime. This is wait time only -- query time is not included -- so a high value here is contention, not slow SQL.">wait p50 ${esc(fmtMs(wait.p50_ms))} · p95 ${esc(fmtMs(wait.p95_ms))} · max ${esc(fmtMs(wait.max_ms))} (${esc(String(wait.samples))} samples)</span>`);
+        }
+        if (holder) {
+          rows.push(`<span style="color:var(--muted)" data-tip="Source location that most recently acquired the store lock, and how long ago. When the lock is unreachable this names what is holding the daemon up.">held by ${esc(holder.site)} (${esc(fmtMs(holder.held_ms))})</span>`);
+        }
+        return `<div class="row" style="gap:12px;flex-wrap:wrap;margin-bottom:8px">
+            <strong data-tip="The daemon serializes every state change behind one store lock. These figures are that lock's health; when the board feels slow, look here first.">Store lock</strong>
+            ${rows.join('<span style="color:var(--muted)">·</span>')}
+          </div>`;
+      }
+      /** Watchdog check cadence, mirroring `watchdog::CHECK_INTERVAL`. */
+      const WATCHDOG_INTERVAL_SECS = 10;
+      /**
+       * A millisecond figure for display: sub-millisecond values read as "<1ms"
+       * rather than a misleading rounded "0ms".
+       * @param {number} ms
+       * @returns {string}
+       */
+      function fmtMs(ms) {
+        if (!Number.isFinite(ms)) return "n/a";
+        if (ms > 0 && ms < 1) return "<1ms";
+        if (ms < 1000) return `${Math.round(ms)}ms`;
+        return `${(ms / 1000).toFixed(1)}s`;
+      }
+      /**
+       * A coarse age for display.
+       * @param {number} ms
+       * @returns {string}
+       */
+      function fmtAgo(ms) {
+        if (!Number.isFinite(ms)) return "n/a";
+        if (ms < 1000) return "just now";
+        if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+        return `${Math.round(ms / 60_000)}m ago`;
+      }
+      /**
        * Renders the Health tab: this daemon's synthetic local row (with its
        * own "Check now" action) followed by one group per configured
        * [machine.targets.*] entry, or an empty state when neither exists.
@@ -161,6 +240,7 @@
             <span style="color:var(--muted)" data-tip="This daemon's own Free-tier checks refresh automatically on an hourly background sweep (configurable via [health].poll_interval_secs). Remote targets below are always checked live -- the tab's own Refresh button re-checks them.">Local sweep is hourly by default</span>
             <button class="btn" ${healthRefreshing ? "disabled" : ""} onclick="refreshHealthNow()" data-tip="Re-run this daemon's own Free-tier checks immediately instead of waiting for the next hourly sweep.">${healthRefreshing ? "Checking…" : "⟳ Check now (local)"}</button>
           </div>`);
+        parts.push(storeLockPanelHtml(healthDaemon));
         const localMachine = healthLocalReport ? healthLocalReport.machine : "daemon (local)";
         parts.push(healthGroupHtml(
           localMachine,

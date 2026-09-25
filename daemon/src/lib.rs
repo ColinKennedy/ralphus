@@ -70,6 +70,7 @@ pub mod triage;
 pub mod user_forge_tokens;
 pub mod users;
 pub mod vcs;
+pub mod watchdog;
 pub mod watches;
 pub mod workspace;
 pub(crate) mod worktree_claims;
