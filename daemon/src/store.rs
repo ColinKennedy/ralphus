@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::runner::{effective_cell_system_prompt, effective_proof_system_prompt};
 
+/// Ceiling, in bytes, that a checkpoint truncates the `-wal` sidecar back
+/// down to (`PRAGMA journal_size_limit`, applied in [`Store::open`]).
+///
+/// Comfortably above the working set a normal checkpoint interval leaves
+/// behind, so steady-state operation never pays for a truncate, while still
+/// bounding what a write-heavy burst can strand on disk. A much smaller
+/// limit would churn the file size on routine load for no benefit.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// Errors the store can produce.
 #[derive(Debug)]
 pub enum StoreError {
@@ -1133,6 +1142,16 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Cap the `-wal` sidecar. SQLite's autocheckpoint keeps spilling the
+        // WAL back into the database, but at the default `journal_size_limit`
+        // of -1 a checkpoint only *resets* the file for reuse -- it never
+        // shrinks it -- so the WAL stays at its all-time high-water mark for
+        // the life of the database. One period of heavy write load (or one
+        // stalled writer holding checkpoints off) is enough to strand
+        // hundreds of megabytes there permanently, which a later restart then
+        // has to read back through. With a limit set, each checkpoint
+        // truncates the WAL down to it instead.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // RAL-393 Stage 3: bound how long any connection (this writer, or a
         // pooled reader opened below) waits on SQLite's busy handler before
@@ -15641,6 +15660,32 @@ command = "e"
 
     fn any_guardian(store: &Store) -> String {
         store.create_guardian("r", "main", "/repo").unwrap()
+    }
+
+    #[test]
+    fn opening_a_file_store_caps_the_wal_size() {
+        // Must be an on-disk store: an in-memory database has no `-wal`
+        // sidecar for `journal_size_limit` to bound, so `open_in_memory` would
+        // prove nothing here.
+        let dir = std::env::temp_dir().join(format!("ralphus-wal-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Store::open(&dir.join("tasks.db")).expect("open store");
+
+        let limit: i64 = store
+            .conn
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .expect("read journal_size_limit");
+
+        assert_eq!(
+            limit, WAL_SIZE_LIMIT_BYTES,
+            "a checkpoint must be able to truncate the WAL back down -- at the \
+             default of -1 it only resets the file for reuse, so the sidecar \
+             keeps its all-time high-water mark forever"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The board read no longer holds the writer lock, so a write *can* now
