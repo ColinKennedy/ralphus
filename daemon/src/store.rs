@@ -3002,6 +3002,9 @@ impl Store {
             // was never meant to carry. `None` for a PR never evaluated for
             // auto-fix yet.
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_last_outcome TEXT",
+            // RAL-509: persist the transient fork-side upstream branch name for
+            // dual_root_pr targets once allocated.
+            "ALTER TABLE guardians ADD COLUMN dual_root_stack_branch TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
