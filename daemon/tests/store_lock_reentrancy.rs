@@ -18,6 +18,28 @@
 //! let looked_up = store.lock().get_guardian(id);   // guard dropped here
 //! let guardian = match looked_up { /* arms may lock again */ };
 //! ```
+//!
+//! # What these lints cannot see
+//!
+//! Both detectors read *syntax*. They flag a live guard sitting next to
+//! `ureq::`, `Command::new`, `.output()`, `thread::sleep` and friends -- they
+//! do not follow a call graph, so a guard held across a plain function call
+//! that does I/O several frames down is invisible to them.
+//!
+//! That is not a hypothetical gap. `server.rs`'s `cancel` handler held its
+//! guard as a `match` scrutinee across a `background().spawn(...)` whose
+//! closure kills tmux sessions. Nothing on those lines looks like I/O: the
+//! spawn reads as "hand this to another thread", and under the deferred
+//! `BackgroundWork` it is. Under `BackgroundWork::Immediate` -- every
+//! `Daemon::new()`-built test daemon -- the closure runs inline, so the tmux
+//! subprocesses ran with the global store lock held.
+//!
+//! What caught it was the WS-B.3 runtime guard watchdog in
+//! `store_lock::StoreGuard`'s `Drop`, which measures the hold itself and does
+//! not care how the blocking work was reached. Treat these source lints as the
+//! cheap first pass and that watchdog as the real backstop; when a hold is
+//! reported at a site these lints call clean, the lints are not wrong, they
+//! are just looking at the wrong layer.
 
 use std::path::Path;
 

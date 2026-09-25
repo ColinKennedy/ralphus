@@ -405,6 +405,15 @@ impl Daemon {
         self.health_sweep.clone()
     }
 
+    /// `#[track_caller]` so the lock-wait breadcrumb and the WS-B.3 guard
+    /// watchdog name the handler that took the lock, not this wrapper.
+    ///
+    /// Without it every acquisition made through `Daemon` reports as this one
+    /// line, which is precisely how the performance baseline ended up
+    /// attributing 540 acquisitions and a 4.2-second wait to
+    /// "the generic StoreHandle::lock wrapper" -- a location that tells nobody
+    /// anything about which handler is holding the daemon up.
+    #[track_caller]
     pub(crate) fn lock(&self) -> StoreGuard<'_> {
         self.store.lock()
     }
@@ -11531,7 +11540,18 @@ struct CancelResponse {
 /// critical path. `BackgroundWork::Immediate` (every `Daemon::new()`-built
 /// test daemon) keeps this synchronous for tests that assert on it.
 fn cancel(daemon: &Daemon, id: &str) -> Reply {
-    match daemon.lock().cancel_squad(id, false) {
+    // Bound before the `match`: as a scrutinee the guard stays alive for the
+    // whole match body, which includes the `background().spawn` below -- and
+    // under `BackgroundWork::Immediate` that closure runs *inline*, shelling
+    // out to tmux per session with the daemon's one global store lock held.
+    // The WS-B.3 guard watchdog catches this at 129 ms on a single-squad
+    // cancel; a cascade spanning several squads is far worse.
+    //
+    // The WS-B.2 source lint cannot see it, because it discards work inside a
+    // `spawn`ed closure as by-definition off-thread. That is true of the
+    // deferred `BackgroundWork`, and false of `Immediate`.
+    let cancelled = daemon.lock().cancel_squad(id, false);
+    match cancelled {
         Ok(impact) => {
             let squad_ids: Vec<String> = impact.squads.into_iter().map(|r| r.id).collect();
             // Trip each worker's cooperative cancel token now -- cheap,
@@ -15682,10 +15702,52 @@ fn cors_header(name: &'static [u8], value: &str) -> tiny_http::Header {
 /// `Access-Control-Allow-Origin` (echoing the exact allowed origin, never a
 /// wildcard, per RAL-220) plus `Vary: Origin` so a shared cache never serves
 /// one origin's CORS-tagged response to another.
+/// WS-D.5: an entity tag for a response body, so the board's poll can be
+/// answered `304 Not Modified` when nothing it asked about changed.
+///
+/// The tag is derived from the body that was *just* computed, not from a
+/// version stamp tracked alongside the data. That makes it unconditionally
+/// correct -- there is no way for it to claim "unchanged" about a body it did
+/// not hash -- at the cost of not saving the query itself. What it does save is
+/// everything after the query: the response bytes, and the client's JSON parse
+/// and re-render, which is what the board actually spends its time on when it
+/// re-hydrates every 150 ms and nothing has changed.
+///
+/// `DefaultHasher` rather than a cryptographic digest: an ETag is not a
+/// security boundary, and no new dependency is worth one here. The length is
+/// folded into the tag alongside the hash, so a false "unchanged" would need a
+/// collision at the same body length.
+fn body_etag(body: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:x}-{:x}\"", body.len(), hasher.finish())
+}
+
+/// Whether an `If-None-Match` value matches `etag`.
+///
+/// A client may send several tags, comma-separated, and a proxy may weaken a
+/// tag by prefixing `W/`. Both are handled rather than assuming the board is
+/// the only caller.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if if_none_match.trim() == "*" {
+        return true;
+    }
+    if_none_match
+        .split(',')
+        .map(|candidate| candidate.trim().trim_start_matches("W/"))
+        .any(|candidate| candidate == etag)
+}
+
 fn cors_response_headers(origin: &str) -> Vec<tiny_http::Header> {
     vec![
         cors_header(b"Access-Control-Allow-Origin", origin),
         cors_header(b"Vary", "Origin"),
+        // WS-D.5: a cross-origin caller cannot read `ETag` unless it is
+        // explicitly exposed, and a caller that cannot read the tag can never
+        // send `If-None-Match` -- the conditional GET would silently never
+        // engage for the board, which is served from a different port.
+        cors_header(b"Access-Control-Expose-Headers", "ETag, Server-Timing"),
     ]
 }
 
@@ -15700,7 +15762,7 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
     ));
     headers.push(cors_header(
         b"Access-Control-Allow-Headers",
-        "Content-Type, traceparent, X-Ralphus-User",
+        "Content-Type, traceparent, X-Ralphus-User, If-None-Match",
     ));
     headers
 }
@@ -15768,6 +15830,9 @@ struct PendingRequest {
     traceparent: Option<String>,
     auth_header: Option<String>,
     user_header: Option<String>,
+    /// WS-D.5: the board's conditional-GET validator, if it sent one — see
+    /// [`body_etag`].
+    if_none_match: Option<String>,
     cors: ralphus_core::cors::CorsDecision,
     /// When the accept loop finished reading this request, so the time it
     /// then spent waiting for a worker is reportable separately from the
@@ -15846,6 +15911,7 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         traceparent,
         auth_header,
         user_header,
+        if_none_match,
         cors,
         accepted_at,
     } = pending;
@@ -15879,13 +15945,27 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     };
     let handler_ms = handler_started.elapsed().as_millis();
     let lock_wait_ms = crate::store_lock::take_request_lock_wait_ms();
-    let status = reply.status;
+    let mut status = reply.status;
     let server_timing = reply.server_timing;
+    // WS-D.5: conditional GET. Only for a successful read -- a mutation's
+    // response is not cacheable, and a non-200 body carries an error the client
+    // must see every time.
+    let etag = (method == "GET" && status == 200).then(|| body_etag(&reply.body));
+    let mut body_out = reply.body;
+    if let (Some(etag), Some(sent)) = (etag.as_deref(), if_none_match.as_deref()) {
+        if etag_matches(sent, etag) {
+            status = 304;
+            body_out = String::new();
+        }
+    }
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
         .expect("valid header");
-    let mut response = tiny_http::Response::from_string(reply.body)
+    let mut response = tiny_http::Response::from_string(body_out)
         .with_status_code(status)
         .with_header(header);
+    if let Some(etag) = &etag {
+        response = response.with_header(cors_header(b"ETag", etag.as_str()));
+    }
     // RAL-414: only present when `RALPHUS_BOARD_TIMING` is enabled and the
     // handler recorded at least one phase (see `crate::perf_timing`) --
     // absent otherwise, so this adds no header on the default hot path.
@@ -16032,6 +16112,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let traceparent = header_value(&request, "traceparent");
         let auth_header = header_value(&request, "Authorization");
         let user_header = header_value(&request, "X-Ralphus-User");
+        let if_none_match = header_value(&request, "If-None-Match");
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -16044,6 +16125,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
             traceparent,
             auth_header,
             user_header,
+            if_none_match,
             cors,
             accepted_at: Instant::now(),
         };
@@ -16163,6 +16245,25 @@ mod tests {
     #![allow(clippy::print_stdout)]
 
     use super::*;
+
+    /// WS-D.5: the ETag helpers, which decide whether a board poll can be
+    /// answered `304 Not Modified`.
+    #[test]
+    fn body_etag_distinguishes_bodies_and_matches_only_itself() {
+        let a = body_etag(r#"{"squads":[]}"#);
+        let b = body_etag(r#"{"squads":[{"id":"squad-000000000001"}]}"#);
+        assert_ne!(a, b, "different bodies produced the same tag");
+        assert_eq!(a, body_etag(r#"{"squads":[]}"#), "the tag is not stable");
+        assert!(a.starts_with('"') && a.ends_with('"'), "not quoted: {a}");
+
+        assert!(etag_matches(&a, &a));
+        assert!(!etag_matches(&b, &a));
+        // A proxy may weaken the tag, and a client may send several at once.
+        assert!(etag_matches(&format!("W/{a}"), &a));
+        assert!(etag_matches(&format!("{b}, {a}"), &a));
+        assert!(etag_matches("*", &a));
+        assert!(!etag_matches("", &a));
+    }
 
     const GOOD: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
 

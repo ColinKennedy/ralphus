@@ -37,19 +37,29 @@
        * @returns {Promise<void>}
        */
       async function pollTasksTab() {
+        // WS-D.5: both reads are conditional. This tab polls continuously and
+        // is also refreshed on every SSE event, so most rounds ask about data
+        // that has not moved; a `304` on both lets the whole re-render be
+        // skipped rather than rebuilding an identical table.
+        let anythingChanged = false;
         try {
-          const [indexRes, prRes] = await Promise.all([
-            fetch("/api/task-index"),
-            fetch("/api/pull-requests/index"),
+          const [index, prIndex] = await Promise.all([
+            conditionalGet("/api/task-index"),
+            conditionalGet("/api/pull-requests/index"),
           ]);
-          if (indexRes.ok) {
-            const d = await indexRes.json();
-            /** @type {any} */ (window)._daemonStatus = d.daemon;
-            squads = d.squads || [];
-            byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
+          if (index.changed) {
+            anythingChanged = true;
+            if (index.data) {
+              /** @type {any} */ (window)._daemonStatus = index.data.daemon;
+              squads = index.data.squads || [];
+              byId("running").textContent = formatConcurrencyStatus(index.data.daemon.running ?? 0, index.data.daemon.max_concurrent ?? 0);
+            }
           }
-          if (prRes.ok) taskTabPrIndex = await prRes.json();
-        } catch (e) { /* transient -- the next poll retries */ }
+          if (prIndex.changed) {
+            anythingChanged = true;
+            if (prIndex.data) taskTabPrIndex = prIndex.data;
+          }
+        } catch (e) { /* transient -- the next poll retries */ anythingChanged = true; }
         markUpdated();
         if (pendingHash && pendingHash.tab === "tasks") {
           const want = pendingHash;
@@ -62,7 +72,11 @@
           ttScrollSelectionIntoView();
           return;
         }
-        renderTasksTab();
+        // A pending selection change still renders above, because that is a
+        // local state change the server knows nothing about. Here there is no
+        // such change: if neither endpoint moved, the table would be rebuilt
+        // byte-for-byte identical.
+        if (anythingChanged) renderTasksTab();
       }
       // RALPHUS-POLL-TASKS-TAB:END
       /**
