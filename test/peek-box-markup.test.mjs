@@ -43,3 +43,17 @@ test("every markup fragment peekBox builds reaches its returned markup", () => {
   const orphans = declared.filter((name) => !src.includes(`\${${name}}`));
   assert.deepEqual(orphans, [], `peekBox builds these markup fragments but never interpolates them, so they render nowhere: ${orphans.join(", ")}`);
 });
+
+// Asked directly: does the toggle survive on a historical record, or is it a
+// live-only control? It is not gated on liveness -- `ended`/`detachedAtMs`
+// only pick the head banner, dot and tooltip -- and it must stay that way:
+// browsing a finished run is exactly when folding reasoning away is most
+// useful, and a control that vanished on completion would read as the
+// RAL-434 bug all over again.
+test("the Show Thinking toggle is not gated on the pane still being live", () => {
+  const src = peekBoxSource();
+  const decl = src.split("\n").find((l) => l.includes("thinkingToggleHtml ="));
+  assert.ok(decl, "peekBox no longer declares thinkingToggleHtml");
+  assert.ok(!/\bended\b/.test(decl), "the Show Thinking toggle became conditional on `ended` -- it must render on a historical record too");
+  assert.ok(!/\bdetached\b/.test(decl), "the Show Thinking toggle became conditional on `detached` -- it must render on a detached cell's record too");
+});
