@@ -160,6 +160,22 @@ distinction (tracked by the `merge_status` string itself), not a visual one,
 so it does not warrant `--ignored` (reserved for the real `ignored` status)
 or any other cautionary hue.
 
+### Branch's linked PR closed without merging — `--cancelled` (RAL-<new>)
+A review branch whose linked PR/MR was observed closed on the forge
+*without* merging (`merge_status == "closed"` — a human's deliberate close,
+made directly on GitHub/GitLab rather than through ralphus) shows its
+pill/badge in `--cancelled` grey. This reuses the exact role
+`PR_STATE_COLORS.closed` already assigns a closed PR's own chip (see "PR
+CI/CD status" above), rather than adding a new hue: both are the same
+concept ("this PR/MR's lifecycle ended without merging"), just shown on two
+different elements (the PR's own chip vs. the branch's merge-status badge).
+Deliberately not `--failed` red — nothing errored, a human made a decision —
+and not `--done` green like [`Merged`](#branch-already-merged-upstream-—-done-ral-480),
+since the outcome here is the opposite one. Like `Merged`, this is a
+behavioral distinction (automation must never create, update, or otherwise
+resubmit a PR for a `closed` branch — only an explicit per-branch resubmit
+may), not a visual one, so no new color role was warranted.
+
 ### PR draft state — no color (RAL-353)
 The Tasks tab's PR filter (`ttRowMatchesPrFilter`) and the " · draft" text
 a `PullRequestView`/`PrIndexRow` whose `draft` is true appends to its badge

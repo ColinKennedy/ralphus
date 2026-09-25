@@ -123,7 +123,7 @@
 
       // ---------- reviews (list + detail, read-only for now) ----------
       /** @type {{[key: string]: string}} */
-      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", merged:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed" };
+      const G_COLORS = { collecting:"--muted", merging:"--running", merge_failed:"--failed", merge_stopped:"--pending", in_review:"--accent", merged:"--done", cancelled:"--cancelled", deployed:"--done", pending:"--pending", ready:"--teal", in_progress:"--running", actioning:"--running", done:"--done", proof_pending:"--running", conflict_resolved:"--queued", failed:"--failed", closed:"--cancelled" };
       // States in which a review may be cancelled — mirrors the backend's
       // cancel_guardian() (daemon/src/guardian.rs). Both the left-hand review
       // list menu and the detail pane's upper-right ⋯ menu use this one set so
@@ -501,8 +501,11 @@
         // RAL-480: a branch already merged upstream is a clean-merge outcome
         // like "done" -- just one whose PR/MR automation stopped early --
         // so it counts in the same green slice rather than falling out of
-        // every bucket and leaving the bar short of `total`.
-        const done = cnt((b) => b.merge_status === "done" || b.merge_status === "merged");
+        // every bucket and leaving the bar short of `total`. RAL-<new>:
+        // `closed` is the same situation -- the branch's own rebase already
+        // succeeded (that's how it got a PR/MR to close in the first place);
+        // only what happened to its PR/MR afterward differs from `merged`.
+        const done = cnt((b) => b.merge_status === "done" || b.merge_status === "merged" || b.merge_status === "closed");
         const resolved = cnt((b) => b.merge_status === "conflict_resolved");
         // RAL-149/<new>: proof_pending and actioning are transient sub-states
         // of "in progress" — conflicts are resolved/committed but the
@@ -602,6 +605,20 @@
         return `<span class="badge done" data-tip="This branch's commits are already integrated upstream.\nWho/when: a partial or serial stack merge landed this branch's PR/MR (or its base already absorbed its commits) before the rest of the review finished.\nRalphus will not create, update, or otherwise touch this branch's PR/MR again -- it stays enabled and keeps rebasing normally with the rest of the stack.">✓ merged</span>`;
       }
       /**
+       * Renders the "PR closed externally" badge for a branch whose linked
+       * PR/MR was observed closed on the forge without merging -- a human's
+       * deliberate rejection, made directly on GitHub/GitLab rather than
+       * through ralphus. Mirrors `mergedBranchBadge()`'s placement and
+       * "ralphus will not touch this again" wording, but in the existing
+       * `--cancelled` PR-lifecycle color (already used for a closed PR's own
+       * chip, `PR_STATE_COLORS.closed`) rather than `--done`, since the
+       * outcome here is a rejection, not a success.
+       * @returns {string}
+       */
+      function closedExternallyBadge() {
+        return `<span class="badge cancelled" data-tip="This branch's linked PR/MR was closed on the forge without merging -- most likely a human closed it directly on GitHub/GitLab.\nWho/when: you expected auto-submit or a 'submit PR stack' click to keep this branch's PR open, but it stays closed instead.\nRalphus will not create, update, or otherwise resubmit a PR for this branch again -- it stays enabled and keeps rebasing normally with the rest of the stack. Submit this one branch again manually (its own 'submit PR' action) to open a fresh PR and clear this badge.">✕ closed</span>`;
+      }
+      /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
        * @param {GuardianBranch} b
        * @returns {string}
@@ -659,6 +676,11 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
         // mix of `merged` and not-yet-merged branches (a partial stack
         // merge) without the review itself leaving `in_review`.
         if (b.merge_status === "merged") return mergedBranchBadge();
+        // RAL-<new>: mirrors the `merged` check just above -- a `closed`
+        // branch is just as terminal for PR/MR automation, but the outcome
+        // is the opposite one, so it gets its own badge/color rather than
+        // reusing `mergedBranchBadge()`'s "success" wording and green.
+        if (b.merge_status === "closed") return closedExternallyBadge();
         return "";
       }
       // RAL-146: per-branch live progress bars (rebase position + conflict

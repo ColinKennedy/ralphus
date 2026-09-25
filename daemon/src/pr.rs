@@ -3219,11 +3219,60 @@ fn apply_pr_merge_state(
                     payload: serde_json::json!({"pr_id": pr.id}),
                     admin_only: false,
                 });
+                drop(guard);
+                mark_branch_pr_closed_externally(store, id, pr);
             }
         }
         Ok(_) => {}
         Err(error) => log_pr_merge_check_failure(store, id, pr, &error),
     }
+}
+
+/// Marks the branch whose "parent"-kind PR was just observed closed on the
+/// forge *without* merging as [`MergeStatus::Closed`] -- shared by
+/// [`apply_pr_merge_state`] (the periodic `check_pr_merges` poll) and
+/// [`refresh_open_prs`] (the live-state check every submission attempt runs
+/// before deciding what still needs a PR) so whichever of the two discovers
+/// the closure first transitions the branch identically. This is what
+/// keeps a human's deliberate close of a PR/MR respected: once a branch is
+/// `Closed`, `auto_submit_terminal_branches`'s `done`/`conflict_resolved`
+/// filter excludes it from every future auto-submit sweep, and the same-call
+/// re-check in [`submit_stack_for_guardian`] excludes it from a whole-stack
+/// resubmission too -- only an explicit per-branch resubmit request bypasses
+/// both and opens a fresh PR.
+///
+/// A no-op for a `"stack"`-kind row (RAL-338's dual-root-PR mode expects its
+/// second PR to close once its branch's own PR merges -- see
+/// [`maybe_promote_fork_root`] -- so that closure is never a human's
+/// cancellation) or a superseded row (RAL-338 closes a fork-internal PR
+/// itself once its branch is promoted to the cross-repository root), and
+/// idempotent for a branch already `Merged` or `Closed`.
+fn mark_branch_pr_closed_externally(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    pr: &PullRequestView,
+) {
+    if pr.pr_kind != "parent" || pr.superseded_by.is_some() {
+        return;
+    }
+    let Some(branch_id) = pr.branch_id.as_deref() else {
+        return;
+    };
+    let Ok(guardian) = store.lock().get_guardian(id) else {
+        return;
+    };
+    let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
+        return;
+    };
+    if matches!(branch.merge_status.as_str(), "merged" | "closed") {
+        return;
+    }
+    let _ = store.lock().set_branch_status(
+        id,
+        branch_id,
+        crate::guardian::MergeStatus::Closed,
+        Some("linked pr closed without merging"),
+    );
 }
 
 fn log_pr_merge_check_failure(
@@ -6008,6 +6057,17 @@ fn submit_stacked_branch_pr(
     let _ = store
         .lock()
         .set_branch_auto_submit_error(id, branch_id, None);
+    // RAL-<new>: a branch a human's forge-side close previously moved to
+    // `MergeStatus::Closed` (see `mark_branch_pr_closed_externally`) just got
+    // a fresh PR/MR through this exact site -- an explicit per-branch
+    // resubmit, the one path that is allowed to touch a `Closed` branch's PR
+    // at all. Revive it back to `Done` so the board stops showing a "closed
+    // externally" badge next to a PR that is, right now, genuinely open.
+    if branch.merge_status.as_str() == MergeStatus::Closed.as_str() {
+        let _ = store
+            .lock()
+            .set_branch_status(id, branch_id, MergeStatus::Done, None);
+    }
     // RAL-<new>: start watching this PR's CI status the moment it exists,
     // rather than leaving it to `ci_watch::poll_open_pr_ci_status`'s coarse,
     // per-guardian-throttled standing poll. A stack submits one PR at a time
@@ -6199,6 +6259,7 @@ fn retain_prs_reachable_via_current_routing<'a>(
 /// before this best-effort fallback ever comes into play.
 fn refresh_open_prs<'a>(
     store: &crate::store_lock::StoreHandle,
+    id: &str,
     client: &crate::forge::ForgeClient,
     open_by_branch: HashMap<&'a str, &'a PullRequestView>,
 ) -> HashMap<&'a str, &'a PullRequestView> {
@@ -6228,6 +6289,18 @@ fn refresh_open_prs<'a>(
                         None,
                         None,
                     );
+                    // RAL-<new>: a PR closed without merging is a human's
+                    // deliberate rejection -- mark the branch `Closed` right
+                    // here, in the same call that is about to decide which
+                    // branches still need a PR, so this exact detection can
+                    // never itself resubmit the branch it just found closed
+                    // (see `mark_branch_pr_closed_externally`'s doc comment).
+                    // `state == "merged"` is a different, already-good
+                    // outcome (`MergeStatus::Merged`, set by
+                    // `settle_pr_merge_states`) and is left alone here.
+                    if state == "closed" {
+                        mark_branch_pr_closed_externally(store, id, pr);
+                    }
                     false
                 }
                 Ok(_) => true,
@@ -6305,7 +6378,27 @@ fn submit_stack_for_guardian(
 ) -> std::result::Result<StackSubmitOutcome, String> {
     let mut open_by_branch = open_prs_by_branch(existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
-    let already_open = refresh_open_prs(store, client, open_by_branch);
+    let already_open = refresh_open_prs(store, id, client, open_by_branch);
+    // RAL-<new>: `ordered_enabled` was assembled by the caller *before* this
+    // call's own `refresh_open_prs` ran -- so a branch whose linked PR
+    // `refresh_open_prs` just this instant discovered closed-without-merging
+    // (transitioning it to `MergeStatus::Closed`, see
+    // `mark_branch_pr_closed_externally`) is still sitting in that list with
+    // its stale pre-call status, and isn't in `already_open` either (its PR
+    // is no longer "open"). Re-reading each branch's current status fresh
+    // here is what actually stops this exact call from creating the branch
+    // a brand-new PR anyway -- the original bug (a human's manual close
+    // being immediately undone by the very poll that observed it).
+    let current_statuses: HashMap<String, String> = store
+        .lock()
+        .get_guardian(id)
+        .map(|g| {
+            g.branches
+                .into_iter()
+                .map(|b| (b.id, b.merge_status))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut created = Vec::new();
     // One branch's PR failing to submit (e.g. GitHub's "no commits between
     // X and Y" once a stacked branch's diff is already in its base) must
@@ -6319,6 +6412,12 @@ fn submit_stack_for_guardian(
 
     for branch in ordered_enabled {
         if already_open.contains_key(branch.id.as_str()) {
+            continue;
+        }
+        if matches!(
+            current_statuses.get(branch.id.as_str()).map(String::as_str),
+            Some("merged") | Some("closed")
+        ) {
             continue;
         }
         let req = PrRequest {
@@ -6405,7 +6504,7 @@ fn reconcile_native_pr_stack(
         .map_err(|e| e.to_string())?;
     let mut open_by_branch = open_prs_by_branch(&existing_prs);
     retain_prs_reachable_via_current_routing(&mut open_by_branch, client, fork_routing);
-    let already_open = refresh_open_prs(store, client, open_by_branch);
+    let already_open = refresh_open_prs(store, id, client, open_by_branch);
 
     // Re-target any PR that already existed for this guardian but whose base
     // no longer matches the current stack order/chain (RAL-190) -- without
@@ -11907,7 +12006,7 @@ mod tests {
             "sanity: recorded as open before the refresh"
         );
 
-        let refreshed = refresh_open_prs(&store, &client, by_branch);
+        let refreshed = refresh_open_prs(&store, &gid, &client, by_branch);
         assert!(
             refreshed.is_empty(),
             "a PR closed on the forge must not count as still open"
@@ -11919,6 +12018,133 @@ mod tests {
             "the local row must be corrected to match forge reality"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn submit_stack_for_guardian_never_resubmits_a_branch_whose_pr_was_closed_externally() {
+        // Regression test: a human closing a PR/MR on the forge (without
+        // merging) must stick. Before this fix, the very same live-state
+        // check that discovers the close (`refresh_open_prs`, run by every
+        // submission call, including the auto-submit-PR-stack sweep) would,
+        // in that same call, treat the branch as "never submitted" and open
+        // a brand-new PR for it -- undoing the human's close immediately.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/w/pulls/99");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "closed", "merged": false}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            // No creation POST must follow -- this is the whole point of the
+            // fix. A second `recv()` here would hang the thread rather than
+            // silently pass, so an unexpected extra request fails the test
+            // loudly via the unjoined handle instead of masking a regression.
+        });
+
+        let root = tmp_dir("closed-externally-root");
+        let remote_dir = tmp_dir("closed-externally-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("branch-a", &base_commit, false).unwrap();
+        git2_checkout(&repo, "branch-a");
+        gwrite(&root, "a.txt", "a\n");
+        git2_commit_all(&repo, &sig, "commit a", &[&base_commit]);
+        git2_checkout(&repo, "main");
+
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "branch-a", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_id, MergeStatus::Done, None)
+            .unwrap();
+        store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(branch_id.as_str()),
+                "github",
+                "acme/w",
+                "branch-a-pr",
+                "main",
+                "Add a",
+                "Adds a.",
+                Some(99),
+                Some("http://x/99"),
+            )
+            .unwrap();
+
+        let client = crate::forge::ForgeClient::new(
+            crate::forge::ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/w".to_string(),
+            Some("tok".to_string()),
+        );
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let existing_prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let mut alias_by_branch = HashMap::new();
+
+        let (created, failed) = submit_stack_for_guardian(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            &existing_prs,
+            "{name}-pr",
+            None,
+            "stack-1",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("a closed-without-merging pr must never fail the batch, only skip it");
+
+        assert!(
+            created.is_empty(),
+            "must not create a fresh pr for the branch whose pr was just closed externally"
+        );
+        assert!(failed.is_empty());
+
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0].clone();
+        assert_eq!(
+            branch.merge_status,
+            MergeStatus::Closed.as_str(),
+            "the branch must be marked closed, not silently left done"
+        );
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]

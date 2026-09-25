@@ -264,6 +264,24 @@ pub enum MergeStatus {
     /// review with a mix of `Merged` and not-yet-merged branches (a partial
     /// stack merge) simply stays `in_review`.
     Merged,
+    /// RAL-<new>: this branch's linked PR/MR was observed closed on the forge
+    /// *without* merging -- a human rejected or withdrew it directly on
+    /// GitHub/GitLab rather than through ralphus. Mirrors [`Self::Merged`]'s
+    /// contract in every way except outcome: the branch stays enabled and
+    /// keeps participating in rebases exactly like any other terminal
+    /// branch, and a review with a mix of `Closed` and still-live branches
+    /// simply stays `in_review` -- but automation (auto-submit-PR-stack and
+    /// the whole-stack "submit" action) must never create, update, or
+    /// otherwise resubmit a PR for a `Closed` branch, or a human's deliberate
+    /// close would be silently undone the next time either one runs. Only an
+    /// explicit per-branch resubmission (`review pr submit --position N`, or
+    /// the board's per-branch submit action) may open a fresh PR for it,
+    /// which moves the branch back to [`Self::Done`]. Under today's code
+    /// this is the only path that ever reaches `Closed` -- it is set solely
+    /// from a live forge state check finding a linked PR closed-without-
+    /// merging, so a review with auto-submit off, or with no PR ever
+    /// submitted, will never show it.
+    Closed,
 }
 
 impl MergeStatus {
@@ -281,6 +299,7 @@ impl MergeStatus {
             Self::ConflictResolved => "conflict_resolved",
             Self::Failed => "failed",
             Self::Merged => "merged",
+            Self::Closed => "closed",
         }
     }
 }

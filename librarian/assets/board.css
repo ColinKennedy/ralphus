@@ -361,6 +361,7 @@
       .badge.empty { color: var(--empty); border-color: var(--empty); }
       .badge.live { color: var(--running); border-color: var(--running); }
       .badge.done { color: var(--done); border-color: var(--done); }
+      .badge.cancelled { color: var(--cancelled); border-color: var(--cancelled); }
       /* RAL-472: a badge carrying a `data-full` payload opens a copyable text popup on click. */
       .badge[data-full] { cursor: pointer; }
       .badge[data-full]:hover { color: var(--accent); border-color: var(--accent); }
