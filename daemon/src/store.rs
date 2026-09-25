@@ -2076,6 +2076,91 @@ impl Store {
                 ON task_worktree_claims(project, base_branch);
             CREATE INDEX IF NOT EXISTS idx_wt_claims_squad
                 ON task_worktree_claims(project, base_branch, squad_id);
+            -- RAL-400: a named, open/closed cross-squad join point. No
+            -- `project`/anchor column -- a waypoint's project(s) are inferred
+            -- by hopping through its roster entries, mirroring
+            -- `core::schema::WaypointDef`'s \"projects are inferred, not
+            -- declared\" doc comment. `state` is `open`/`closed`; a waypoint
+            -- closes once every roster entry reaches a terminal state (see
+            -- `crate::waypoints::all_roster_entries_terminal`).
+            CREATE TABLE IF NOT EXISTS waypoints (
+                id             TEXT PRIMARY KEY,
+                label          TEXT,
+                prompt         TEXT NOT NULL,
+                agent          TEXT,
+                model          TEXT,
+                allow_advisory INTEGER NOT NULL DEFAULT 0,
+                state          TEXT NOT NULL DEFAULT 'open',
+                created_at_ms  INTEGER NOT NULL,
+                updated_at_ms  INTEGER NOT NULL,
+                closed_at_ms   INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoints_state ON waypoints(state);
+            -- RAL-400: one review/squad this waypoint tracks. `kind` is
+            -- `review`/`squad`; `entry_id` is that review's or squad's id.
+            -- `mode` (`block`/`advisory`) and the survey verdict/rationale
+            -- are the Phase 2 survey pass's output -- both left NULL/default
+            -- until then. `delivery_status` tracks whether this entry's
+            -- waypoint guidance has actually reached it yet
+            -- (`undelivered`/`delivered`/`via-restack`/`failed`) --
+            -- `via-restack` distinguishes delivery folded into an unrelated
+            -- rebase from a dedicated injection.
+            CREATE TABLE IF NOT EXISTS waypoint_roster (
+                waypoint_id      TEXT NOT NULL,
+                kind             TEXT NOT NULL,
+                entry_id         TEXT NOT NULL,
+                mode             TEXT NOT NULL DEFAULT 'block',
+                survey_verdict   TEXT,
+                survey_rationale TEXT,
+                delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
+                created_at_ms    INTEGER NOT NULL,
+                updated_at_ms    INTEGER NOT NULL,
+                PRIMARY KEY (waypoint_id, kind, entry_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoint_roster_entry
+                ON waypoint_roster(kind, entry_id);
+            -- RAL-400 v2 (Phase 5) mechanism: a queued guidance payload for a
+            -- specific cell, addressed the same way `cell_subprojects` is
+            -- (squad_id, task_idx, idx). Schema only -- nothing in Phase 1-4
+            -- writes or drains this table yet. `status` is
+            -- `queued`/`delivered`/`cancelled`; `batch_id` groups injections
+            -- meant to land together (cancel-wins, exactly-once drain
+            -- semantics -- see `crate::waypoints`'s unit tests).
+            CREATE TABLE IF NOT EXISTS pending_injections (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_squad   TEXT NOT NULL,
+                target_task    INTEGER NOT NULL,
+                target_idx     INTEGER NOT NULL,
+                payload        TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'queued',
+                batch_id       TEXT,
+                created_at_ms  INTEGER NOT NULL,
+                updated_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_injections_target
+                ON pending_injections(target_squad, target_task, target_idx, status);
+            CREATE INDEX IF NOT EXISTS idx_pending_injections_batch
+                ON pending_injections(batch_id);
+            -- RAL-400: append-only guidance history for a waypoint. `id`
+            -- (an AUTOINCREMENT rowid) is both the primary key and the
+            -- ordering key -- entries are never updated or reordered once
+            -- written. `producer_kind`/`producer_id` name the roster entry
+            -- (review/squad) that authored this bearing; `entity_uri` and
+            -- the commit fields are optional pointers into where the
+            -- guidance actually landed.
+            CREATE TABLE IF NOT EXISTS waypoint_bearings (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                waypoint_id     TEXT NOT NULL,
+                producer_kind   TEXT NOT NULL,
+                producer_id     TEXT NOT NULL,
+                summary         TEXT NOT NULL,
+                entity_uri      TEXT,
+                commit_id       TEXT,
+                commit_summary  TEXT,
+                created_at_ms   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_waypoint_bearings_waypoint
+                ON waypoint_bearings(waypoint_id, id);
             ",
         )?;
         // RAL-318: the built-in `unclassified` Triage type always exists and
