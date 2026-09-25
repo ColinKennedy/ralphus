@@ -42,6 +42,54 @@ use crate::store::Store;
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
 
+/// How often a poll loop waiting on a branch's worktree lease is allowed to
+/// narrate itself.
+///
+/// The lease poll runs every 25 ms, and it used to emit a Cartographer row --
+/// and therefore an SSE broadcast -- on every iteration. In the captured
+/// production database that one message was 44,161 of 54,067 rows, 81.7% of
+/// every write the daemon made in ten hours, against 11 actual lease
+/// acquisitions. 40 rows/sec is also exactly the "peak burst" write rate the
+/// performance baseline recorded, so that peak was this loop, not user load.
+pub(crate) const LEASE_WAIT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Rate-limits a log line emitted from inside a poll loop: the first call is
+/// always admitted, then at most one per `interval`.
+///
+/// Separate from the loop that uses it so the admit/suppress decision is
+/// testable without a real clock or a real rebase -- see the tests at the
+/// bottom of this module.
+pub(crate) struct PollLogThrottle {
+    interval: std::time::Duration,
+    last: Option<std::time::Instant>,
+}
+
+impl PollLogThrottle {
+    pub(crate) fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    /// Whether the caller should log now, recording the decision if so.
+    pub(crate) fn due(&mut self) -> bool {
+        self.due_at(std::time::Instant::now())
+    }
+
+    /// [`Self::due`] with the current instant supplied, so tests can drive it.
+    fn due_at(&mut self, now: std::time::Instant) -> bool {
+        let admit = match self.last {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.interval,
+        };
+        if admit {
+            self.last = Some(now);
+        }
+        admit
+    }
+}
+
 /// The `RunnerSpec.task` value used for every conflict-resolver invocation
 /// (RAL-102). `server.rs`'s guardian-branch terminal/pane endpoints must pass
 /// this exact string into `crate::tmux::session_name` to recompute the tmux
@@ -10089,28 +10137,72 @@ fn drive_rebase(
     // daemon mid-resolver-call -- since a normal feedback pass never releases
     // its lease dirty.
     let mut rescued_orphaned_edits = false;
+    // The lease poll below narrates itself at most this often. It used to emit
+    // one Cartographer row (and therefore one SSE broadcast) per 25 ms
+    // iteration: 44,161 of the 54,067 rows in the captured production database
+    // -- 81.7% of every write the daemon made in ten hours -- were this single
+    // message, against 11 actual lease acquisitions. A 25 ms poll is 40
+    // rows/sec, which is exactly the "peak burst" write rate the performance
+    // baseline recorded; the peak was never user load. Each of those rows also
+    // pushed an SSE event that made every connected board re-hydrate, so the
+    // spam manufactured read load as well as write load.
+    //
+    // The waiting itself is worth reporting -- a rebase blocked on a lease for
+    // minutes is real -- so it still reports, on a throttle, and carries the
+    // elapsed wait in the payload. One row that says "waited 43,000 ms" is
+    // strictly more informative than 1,720 rows that each say "waiting".
+    let lease_wait_started = std::time::Instant::now();
+    let mut lease_wait_log = PollLogThrottle::new(LEASE_WAIT_LOG_INTERVAL);
+    let mut lease_polls: u64 = 0;
     loop {
         let owner = store.lock().guardian_worktree_lease_owner(id, branch_id);
         if let Some(owner) = owner {
+            lease_polls += 1;
+            if lease_wait_log.due() {
+                let guard = store.lock();
+                crate::cartographer::Note::new("guardian")
+                    .guardian(id)
+                    .scope("branch")
+                    .emit(
+                        &guard,
+                        "restack deferred: branch worktree leased",
+                        serde_json::json!({
+                            "branch_id": branch_id,
+                            "owner": owner,
+                            "waited_ms": lease_wait_started.elapsed().as_millis() as u64,
+                            "polls": lease_polls,
+                        }),
+                    );
+                // Release before sleeping: the thread we're waiting for must
+                // take this same store lock to call
+                // `release_guardian_worktree_lease`; holding the guard across
+                // the poll both starves every other subsystem and delays the
+                // very release this loop is polling for.
+                drop(guard);
+            }
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        }
+        // Report the wait's end exactly once, and only if there was one, so a
+        // lease contention episode is bracketed in the log rather than
+        // trailing off.
+        if lease_polls > 0 {
             let guard = store.lock();
             crate::cartographer::Note::new("guardian")
                 .guardian(id)
                 .scope("branch")
                 .emit(
                     &guard,
-                    "restack deferred: branch worktree leased",
-                    serde_json::json!({"branch_id": branch_id, "owner": owner}),
+                    "restack proceeding: branch worktree lease free",
+                    serde_json::json!({
+                        "branch_id": branch_id,
+                        "waited_ms": lease_wait_started.elapsed().as_millis() as u64,
+                        "polls": lease_polls,
+                    }),
                 );
-            if cancel.is_cancelled() {
-                return Err("cancelled".to_string());
-            }
-            // Release before sleeping: the thread we're waiting for must take
-            // this same store lock to call `release_guardian_worktree_lease`;
-            // holding the guard across the poll both starves every other
-            // subsystem and delays the very release this loop is polling for.
-            drop(guard);
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            continue;
         }
         let dirty = wt.git(&["status", "--porcelain"])?;
         if dirty.trim().is_empty() {
@@ -11496,6 +11588,46 @@ mod tests {
     use super::*;
     use crate::runner::RunnerResult;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The worktree-lease poll must not write a row per iteration.
+    ///
+    /// This is a regression test for the largest single source of write traffic
+    /// the daemon had: at 25 ms per poll the un-throttled loop produced 40
+    /// Cartographer rows per second -- 81.7% of every row in the captured
+    /// production database -- each one also broadcasting an SSE event that made
+    /// every connected board re-hydrate.
+    #[test]
+    fn poll_log_throttle_admits_once_then_suppresses_until_the_interval() {
+        let interval = std::time::Duration::from_secs(5);
+        let mut throttle = PollLogThrottle::new(interval);
+        let start = std::time::Instant::now();
+
+        // The first poll always reports: a wait that is starting is news.
+        assert!(throttle.due_at(start), "the first poll must be admitted");
+
+        // Every poll inside the interval is suppressed. At a 25 ms poll and a
+        // 5 s interval that is 199 suppressed polls per admitted one.
+        let mut admitted = 0;
+        for i in 1..200u64 {
+            if throttle.due_at(start + std::time::Duration::from_millis(25 * i)) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 0,
+            "{admitted} polls inside the {interval:?} window were admitted"
+        );
+
+        // Once the interval has passed, exactly one more gets through.
+        assert!(
+            throttle.due_at(start + interval),
+            "a poll at the interval boundary must be admitted"
+        );
+        assert!(
+            !throttle.due_at(start + interval + std::time::Duration::from_millis(25)),
+            "the poll right after an admitted one must be suppressed"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // RAL-480: clean_rebase_status -- shared by `stack_pick` and
