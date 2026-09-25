@@ -75,6 +75,7 @@ pub mod users;
 pub mod vcs;
 pub mod watchdog;
 pub mod watches;
+pub mod waypoints;
 pub mod workspace;
 pub(crate) mod worktree_claims;
 pub(crate) mod worktree_transcript_retirement;
