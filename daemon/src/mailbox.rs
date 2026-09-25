@@ -56,6 +56,68 @@ impl MailboxPriority {
     }
 }
 
+/// Actionable remediation guidance an error/failure mailbox message must
+/// carry (RAL-502) -- so a human or an AI recipient can act on a failure
+/// without inferring next steps from prose alone. Every call site that
+/// reports an error/failure/blocked state goes through
+/// [`Store::enqueue_error_mailbox_message`] (or
+/// [`crate::monitor::Store::notify_watchers_with_remediation`]), which folds
+/// [`Self::render`]'s text onto the end of the message body -- there is no
+/// separate DB column, so every existing mailbox consumer (CLI, MCP
+/// passthrough, the board) sees it for free without a schema change.
+///
+/// Never construct [`Self::AutoFix`] for a corrective action the daemon
+/// merely *could* take -- only for one it already took safely before this
+/// message was enqueued. When in doubt between a command and manual
+/// guidance, prefer [`Self::ManualInterventionRequired`]: presenting an
+/// unsafe or merely-plausible command as a fix is worse than admitting none
+/// exists.
+#[derive(Debug, Clone)]
+pub enum Remediation {
+    /// The daemon already performed a safe corrective action automatically
+    /// before this message was enqueued; no further action is needed unless
+    /// the failure recurs.
+    AutoFix {
+        /// What was already done, e.g. "the cell was requeued for retry".
+        action: String,
+    },
+    /// A concrete, non-destructive CLI command the recipient can run to
+    /// retry, restart, or otherwise resolve the failure. Never a destructive
+    /// or unsafe command (see the type-level doc).
+    SuggestedCommand {
+        /// The exact command to run, e.g. `"ralphus cell restart squad-1/build/compile"`.
+        command: String,
+        /// What running it accomplishes, e.g. "retry the failed cell".
+        purpose: String,
+    },
+    /// No safe automatic or scripted fix exists; describes what a human
+    /// must inspect or decide.
+    ManualInterventionRequired {
+        /// What to inspect or decide, e.g. "review the merge conflict in the
+        /// review's worktree and resolve it before reopening the review".
+        guidance: String,
+    },
+}
+
+impl Remediation {
+    /// Render as a trailing clause appended to the message body -- plain
+    /// text, deliberately consistent across variants (`"<label>: <detail>"`)
+    /// so an AI recipient can reliably split on the label even though the
+    /// message as a whole is free text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::AutoFix { action } => format!("Automatic fix applied: {action}."),
+            Self::SuggestedCommand { command, purpose } => {
+                format!("Suggested next step: run `{command}` to {purpose}.")
+            }
+            Self::ManualInterventionRequired { guidance } => {
+                format!("Manual intervention required: {guidance}.")
+            }
+        }
+    }
+}
+
 /// Every priority tier, most urgent first -- the default a watch/user
 /// preference is given when a caller wants "notify me about everything"
 /// (RAL-320).
@@ -231,6 +293,38 @@ impl Store {
             params![id, priority.as_str(), message, squad_id, task, cell_id, now_ms(), entity_uri, category],
         )?;
         Ok(id)
+    }
+
+    /// Enqueue an error/failure mailbox message (RAL-502). Identical to
+    /// [`Self::enqueue_mailbox_message_ex`] except `remediation` is
+    /// mandatory: its [`Remediation::render`] text is appended to `message`
+    /// before storage, so every error notification carries actionable
+    /// guidance in its body without a schema change. Use this (not
+    /// [`Self::enqueue_mailbox_message`]/[`Self::enqueue_mailbox_message_ex`])
+    /// for any message reporting an error, failure, or blocked state; the
+    /// plain APIs remain for purely informational/status notices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_error_mailbox_message(
+        &self,
+        priority: MailboxPriority,
+        message: &str,
+        remediation: &Remediation,
+        squad_id: Option<&str>,
+        task: Option<&str>,
+        cell_id: Option<&str>,
+        entity_uri: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<String> {
+        let full_message = format!("{message} {}", remediation.render());
+        self.enqueue_mailbox_message_ex(
+            priority,
+            &full_message,
+            squad_id,
+            task,
+            cell_id,
+            entity_uri,
+            category,
+        )
     }
 
     /// List mailbox messages visible to `client_id`, most-recently-enqueued
@@ -520,6 +614,116 @@ mod tests {
                 params![id],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn remediation_renders_each_variant_distinctly() {
+        let auto_fix = Remediation::AutoFix {
+            action: "the cell was requeued for retry".to_string(),
+        }
+        .render();
+        assert_eq!(
+            auto_fix,
+            "Automatic fix applied: the cell was requeued for retry."
+        );
+
+        let suggested = Remediation::SuggestedCommand {
+            command: "ralphus cell restart squad-1/build/compile".to_string(),
+            purpose: "retry the failed cell".to_string(),
+        }
+        .render();
+        assert_eq!(
+            suggested,
+            "Suggested next step: run `ralphus cell restart squad-1/build/compile` to retry the failed cell."
+        );
+
+        let manual = Remediation::ManualInterventionRequired {
+            guidance: "inspect the terminal output and resolve the conflict by hand".to_string(),
+        }
+        .render();
+        assert_eq!(
+            manual,
+            "Manual intervention required: inspect the terminal output and resolve the conflict by hand."
+        );
+    }
+
+    #[test]
+    fn enqueue_error_mailbox_message_appends_remediation_to_the_stored_message() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        insert_squad(&store, "squad-000000000001");
+
+        let msg_id = store
+            .enqueue_error_mailbox_message(
+                MailboxPriority::Urgent,
+                "cell 'build' failed",
+                &Remediation::SuggestedCommand {
+                    command: "ralphus cell restart squad-000000000001/task/build".to_string(),
+                    purpose: "retry the cell".to_string(),
+                },
+                Some("squad-000000000001"),
+                Some("task"),
+                Some("build"),
+                Some("cell:squad-000000000001:0:0"),
+                None,
+            )
+            .unwrap();
+
+        let unread = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, msg_id);
+        assert_eq!(
+            unread[0].message,
+            "cell 'build' failed Suggested next step: run `ralphus cell restart squad-000000000001/task/build` to retry the cell."
+        );
+        assert_eq!(
+            unread[0].entity_uri.as_deref(),
+            Some("cell:squad-000000000001:0:0")
+        );
+    }
+
+    #[test]
+    fn enqueue_error_mailbox_message_covers_auto_fix_and_manual_variants() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+
+        store
+            .enqueue_error_mailbox_message(
+                MailboxPriority::High,
+                "transient network error while polling CI",
+                &Remediation::AutoFix {
+                    action: "the daemon automatically retried the CI status poll".to_string(),
+                },
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .enqueue_error_mailbox_message(
+                MailboxPriority::Urgent,
+                "merge failed with a real conflict",
+                &Remediation::ManualInterventionRequired {
+                    guidance: "resolve the conflict in the review's worktree by hand".to_string(),
+                },
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let all = store
+            .mailbox_messages_for_client(&client_id, false, None)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].message.contains("Automatic fix applied:"));
+        assert!(all[1].message.contains("Manual intervention required:"));
     }
 
     #[test]

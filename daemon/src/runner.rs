@@ -2620,13 +2620,28 @@ impl SubprocessRunner {
             threshold_ms / 1000,
         );
         let entity_uri = guard.cell_entity_uri(&spec.squad_id, &spec.task, &spec.cell_id);
-        if let Ok(message_id) = guard.enqueue_mailbox_message(
+        if let Ok(message_id) = guard.enqueue_error_mailbox_message(
             crate::mailbox::MailboxPriority::High,
             &text,
+            &crate::mailbox::Remediation::ManualInterventionRequired {
+                guidance: format!(
+                    "inspect the live terminal for cell '{}' (`ralphus cell terminal \
+                     {}/{}/{}`); if it is truly hung, cancel and restart it \
+                     (`ralphus cell restart {}/{}/{}`)",
+                    spec.cell_id,
+                    spec.squad_id,
+                    spec.task,
+                    spec.cell_id,
+                    spec.squad_id,
+                    spec.task,
+                    spec.cell_id,
+                ),
+            },
             Some(&spec.squad_id),
             Some(&spec.task),
             Some(&spec.cell_id),
             entity_uri.as_deref(),
+            None,
         ) {
             crate::cartographer::Note::new("runner")
                 .level(crate::logging::LogLevel::WARNING)

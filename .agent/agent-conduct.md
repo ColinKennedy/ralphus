@@ -149,6 +149,36 @@ Ask concretely: name the candidate value shapes (an enum's literal list, a
 numeric bound, "no validation") rather than asking "should this be
 validated?" in the abstract.
 
+## Mailbox errors carry remediation guidance (RAL-502)
+
+Any new mailbox message that reports a failure, a blocked state, or another
+error condition must go through `Store::enqueue_error_mailbox_message` (or
+`Store::notify_watchers_with_remediation` for a Monitor-tagged notification
+tied to a `SquadFailed`/`ReviewFailed` event) in `daemon/src/mailbox.rs` --
+never the plain `enqueue_mailbox_message`/`enqueue_mailbox_message_ex`, which
+have no remediation parameter and are reserved for purely informational
+notices (status changes, heads-ups with no failure to act on).
+
+Both required-remediation calls take a `&Remediation`, whose three variants
+mirror `core/src/health_catalog.rs`'s existing `remediation: &'static str`
+convention for `ralphus check` findings, but as a small enum instead of free
+text so a caller can't hand-wave past picking one:
+
+- `Remediation::AutoFix { action }` -- only when the daemon already performed
+  the safe corrective action before this message was enqueued.
+- `Remediation::SuggestedCommand { command, purpose }` -- a concrete,
+  non-destructive CLI command the recipient can run. Never a destructive or
+  unsafe command dressed up as a suggestion.
+- `Remediation::ManualInterventionRequired { guidance }` -- no safe automatic
+  or scripted fix exists; say what a human must inspect or decide. When in
+  doubt between a command and manual guidance, prefer this variant --
+  presenting an unsafe or merely-plausible command as a fix is worse than
+  admitting none exists.
+
+Prefer naming the exact entity affected (an `EntityUri`, a selector, an id)
+in the guidance text over a generic pointer, so the recipient doesn't have to
+go hunting for which squad/review/cell the message is about.
+
 ## Report what you could not verify
 
 If part of the suite could not run (see the dev-daemon exe lock in
