@@ -3944,13 +3944,83 @@ pub(crate) fn kickoff_merge(
     let sid = id.to_string();
     let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
-        let _permit = sem.acquire();
+        let _permit = acquire_merge_permit(&store, &sem, &sid, "merge");
         if !token.is_cancelled() {
             run_merge_cancellable(&store, runner.as_ref(), &sid, &token);
         }
+        // ralphus[ignore-rlog-pair]: a diagnostic bracket for the "merge executing" row, not a workflow event of its own.
+        crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] review {sid} merge worker exiting"
+        );
         cancellations.remove(&format!("guardian:{sid}"));
     });
     Ok(StartMergeOutcome::Merging)
+}
+
+/// How long a merge worker may wait for a slot on the global concurrency
+/// semaphore before the wait itself is reported.
+///
+/// The wait is unbounded and, until it returns, the worker has written nothing:
+/// no status, no Cartographer row, no branch progress. A merge that is queued
+/// behind other work is therefore indistinguishable from a merge that is wedged,
+/// which is exactly the confusion this threshold exists to end.
+const SLOW_MERGE_PERMIT_WAIT_MS: u128 = 2_000;
+
+/// Acquire a global concurrency permit for a merge worker, reporting the wait
+/// when it is long enough to look like a hang from the board.
+fn acquire_merge_permit<'a>(
+    store: &crate::store_lock::StoreHandle,
+    sem: &'a Semaphore,
+    id: &str,
+    kind: &str,
+) -> crate::scheduler::SemaphorePermit<'a> {
+    acquire_merge_permit_reported_after(store, sem, id, kind, SLOW_MERGE_PERMIT_WAIT_MS)
+}
+
+/// [`acquire_merge_permit`] with an explicit reporting threshold, so a test can
+/// exercise the reporting branch without spending the production threshold in
+/// real time.
+fn acquire_merge_permit_reported_after<'a>(
+    store: &crate::store_lock::StoreHandle,
+    sem: &'a Semaphore,
+    id: &str,
+    kind: &str,
+    report_after_ms: u128,
+) -> crate::scheduler::SemaphorePermit<'a> {
+    let waiting_since = std::time::Instant::now();
+    let in_use_while_waiting = sem.in_use();
+    let permit = sem.acquire();
+    let waited = waiting_since.elapsed();
+    if waited.as_millis() >= report_after_ms {
+        // ralphus[ignore-rlog-pair]: paired with the cartographer_log below.
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} {kind} worker waited {}ms for a concurrency permit ({in_use_while_waiting} in use on arrival)",
+            waited.as_millis()
+        );
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "guardian",
+            message: "merge worker queued for a concurrency permit",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "waited_ms": waited.as_millis(),
+                "kind": kind,
+                "permits_in_use_on_arrival": in_use_while_waiting,
+                "remediation": "every permit was held by other cells, proofs or merges; \
+                                raise [daemon].max_concurrent or let the in-flight work drain",
+            }),
+            admin_only: false,
+        });
+    }
+    permit
 }
 
 /// Bounded wait for a merge worker registered under `guardian:{id}` to
@@ -3960,16 +4030,77 @@ pub(crate) fn kickoff_merge(
 /// takes a `&Daemon`, which this module has no handle to (only the
 /// individual `store`/`cancellations`/`runner`/`sem` handles it needs).
 fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    wait_for_merge_worker_stop_within(
+        cancellations,
+        key,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(50),
+    )
+}
+
+/// [`wait_for_merge_worker_stop`] with an explicit budget, so a test can drive
+/// the give-up branch without spending the production budget in real time.
+fn wait_for_merge_worker_stop_within(
+    cancellations: &Cancellations,
+    key: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> bool {
     let started = std::time::Instant::now();
     while cancellations.is_active(key) {
-        if started.elapsed() >= TIMEOUT {
+        if started.elapsed() >= timeout {
+            // ralphus[ignore-rlog-pair]: no Store here; each caller records the structured outcome against its own guardian id.
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] {key} worker still running after {}ms stop budget -- proceeding without waiting for it",
+                started.elapsed().as_millis()
+            );
             return false;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(poll_interval);
     }
+    // ralphus[ignore-rlog-pair]: as above -- the caller owns the structured row.
+    crate::rlog!(
+        DEBUG,
+        "ralphus [guardian] {key} worker exited in {}ms",
+        started.elapsed().as_millis()
+    );
     true
+}
+
+/// Record that a stop/restart gave up waiting for `id`'s merge worker.
+///
+/// The worker still owns this review's worktrees, its semaphore permit and the
+/// per-repo review-operation guard when this fires, so a merge started straight
+/// afterwards can block on resources the abandoned worker has not released.
+/// That is the state this row exists to make visible -- without it the user sees
+/// only a successful stop followed by a merge that never reports progress.
+fn log_merge_worker_stop_timeout(store: &crate::store_lock::StoreHandle, id: &str, action: &str) {
+    // ralphus[ignore-rlog-pair]: paired with the cartographer_log below.
+    crate::rlog!(
+        WARNING,
+        "ralphus [guardian] review {id} {action} did not wait out the previous merge worker; \
+         it may still hold this review's worktrees and locks"
+    );
+    let guard = store.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::WARNING,
+        source: "guardian",
+        message: "previous merge worker outlived the stop budget",
+        scope: Some("guardian"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload: serde_json::json!({
+            "action": action,
+            "remediation": "the abandoned worker may still hold this review's worktrees, \
+                            semaphore permit and review-operation lock; wait for it to finish \
+                            before merging again, or restart the daemon if it never does",
+        }),
+        admin_only: false,
+    });
 }
 
 /// Terminate every tmux-backed agent session belonging to this review.
@@ -3981,10 +4112,48 @@ fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool 
 /// removing the tmux session name.
 pub(crate) fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
     let prefix = format!("ralphus_guardian-{id}_");
-    let count = crate::tmux::Tmux::resolve()
+    let resolved = crate::tmux::Tmux::resolve();
+    let tmux_error = resolved.as_ref().err().map(ToString::to_string);
+    let count = resolved
         .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
         .unwrap_or(0);
     if count == 0 {
+        // Distinguish "nothing was running" from "tmux could not be resolved,
+        // so nothing could be killed" -- the two look identical otherwise, and
+        // only the second means a live agent was left behind by this stop.
+        if let Some(err) = tmux_error {
+            // ralphus[ignore-rlog-pair]: paired with the cartographer_log below.
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {id} could not resolve tmux ({err}); any active agent session was left running"
+            );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "guardian",
+                message: "could not reach tmux to stop review agent sessions",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "session_prefix": prefix,
+                    "error": err,
+                    "remediation": "tmux/psmux could not be resolved, so agents for this review \
+                                    were not killed; check RALPHUS_TMUX_CMD and kill any \
+                                    leftover session by hand",
+                }),
+                admin_only: false,
+            });
+        } else {
+            // ralphus[ignore-rlog-pair]: a no-op stop is a routine diagnostic, not a workflow event worth a Cartographer row.
+            crate::rlog!(
+                DEBUG,
+                "ralphus [guardian] review {id} had no active agent sessions to stop"
+            );
+        }
         return;
     }
     crate::rlog!(
@@ -4040,7 +4209,9 @@ pub fn restart_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    let _ = wait_for_merge_worker_stop(&cancellations, &key);
+    if !wait_for_merge_worker_stop(&cancellations, &key) {
+        log_merge_worker_stop_timeout(&store, id, "manual rebase");
+    }
     // RAL-507: a user-directed rebase gives the review's base-shift retry
     // campaign a fresh automatic budget -- clear it before the requested
     // rebase starts, the same boundary the manual Merge / rebase handler
@@ -4108,10 +4279,15 @@ pub fn reopen_guardian_merge(
     let sid = id.to_string();
     let token = cancellations.register(&format!("guardian:{sid}"));
     std::thread::spawn(move || {
-        let _permit = sem.acquire();
+        let _permit = acquire_merge_permit(&store, &sem, &sid, "staged merge");
         if !token.is_cancelled() {
             run_merge_staged(&store, runner.as_ref(), &sid, &token);
         }
+        // ralphus[ignore-rlog-pair]: a diagnostic bracket for the "staged merge executing" row, not a workflow event of its own.
+        crate::rlog!(
+            DEBUG,
+            "ralphus [guardian] review {sid} staged merge worker exiting"
+        );
         cancellations.remove(&format!("guardian:{sid}"));
     });
     reply(202, "{\"status\":\"merging\"}")
@@ -4136,7 +4312,9 @@ pub fn stop_guardian_merge(
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
     kill_guardian_agent_sessions(&store, id);
-    let _ = wait_for_merge_worker_stop(&cancellations, &key);
+    if !wait_for_merge_worker_stop(&cancellations, &key) {
+        log_merge_worker_stop_timeout(&store, id, "stop merge");
+    }
     match store.lock().stop_guardian_merge(id) {
         Ok(status) => {
             // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -5164,8 +5342,42 @@ pub fn run_merge_cancellable(
         Ok(g) => g,
         Err(_) => return,
     };
+    // The review-operation guard is the second unbounded wait a fresh merge
+    // worker hits (after the concurrency permit) and, like it, happens before
+    // any status write -- so a merge blocked here reports nothing at all. Time
+    // it, so the stall is attributable rather than invisible.
+    let guard_wait_started = std::time::Instant::now();
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let guard_waited = guard_wait_started.elapsed();
+    if guard_waited.as_millis() >= SLOW_MERGE_PERMIT_WAIT_MS {
+        // ralphus[ignore-rlog-pair]: paired with the cartographer_log below.
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {id} merge waited {}ms for the review-operation guard on {}",
+            guard_waited.as_millis(),
+            guardian.git_root
+        );
+        let guard = store.lock();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::WARNING,
+            source: "guardian",
+            message: "merge queued for the review-operation guard",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "waited_ms": guard_waited.as_millis(),
+                "git_root": guardian.git_root,
+                "remediation": "another review operation or the daily git maintenance repack held \
+                                this repo exclusively; no action needed unless it recurs",
+            }),
+            admin_only: false,
+        });
+    }
     // RAL-193: every call is its own merge/rebase attempt -- bump the
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
@@ -5264,6 +5476,24 @@ pub fn run_merge_cancellable(
     {
         let guard = store.lock();
         let _ = guard.reset_all_enabled_branches_to_pending(id);
+        // The reset itself writes no event, so without this row the board has
+        // nothing to refresh on and keeps rendering the previous attempt's
+        // terminal statuses until its next full reconcile.
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "guardian",
+            message: "branch statuses reset for a fresh merge attempt",
+            scope: Some("guardian"),
+            squad_id: None,
+            guardian_id: Some(id),
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "branches": branches.iter().filter(|b| b.enabled).count(),
+            }),
+            admin_only: false,
+        });
     }
 
     // RAL-43: disabled branches are skipped in the stacking sequence but their
@@ -16470,5 +16700,145 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── stop/merge observability (the pre-status-write blind spots) ─────────
+
+    /// Every Cartographer row for `guardian_id`, newest first.
+    fn guardian_rows(
+        store: &crate::store_lock::StoreHandle,
+        guardian_id: &str,
+    ) -> Vec<crate::cartographer::CartographerRow> {
+        store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                guardian_id: Some(guardian_id.to_string()),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap()
+            .rows
+    }
+
+    fn store_with_guardian() -> (crate::store_lock::StoreHandle, String) {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
+        (store, id)
+    }
+
+    #[test]
+    fn wait_for_merge_worker_stop_succeeds_once_the_worker_deregisters() {
+        let cancellations = Cancellations::new();
+        let key = "guardian:guardian-1";
+        let _token = cancellations.register(key);
+        cancellations.remove(key);
+
+        assert!(
+            wait_for_merge_worker_stop_within(
+                &cancellations,
+                key,
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(5),
+            ),
+            "a deregistered worker must read as stopped"
+        );
+    }
+
+    #[test]
+    fn wait_for_merge_worker_stop_gives_up_on_a_worker_that_never_exits() {
+        let cancellations = Cancellations::new();
+        let key = "guardian:guardian-1";
+        // Held for the whole test: the worker never deregisters, which is
+        // exactly the case that silently fell through to a "stopped" reply.
+        let _token = cancellations.register(key);
+        cancellations.cancel(key);
+
+        assert!(
+            !wait_for_merge_worker_stop_within(
+                &cancellations,
+                key,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(5),
+            ),
+            "a worker still registered past the budget must report failure, not success"
+        );
+    }
+
+    #[test]
+    fn log_merge_worker_stop_timeout_records_a_warning_carrying_remediation() {
+        let (store, id) = store_with_guardian();
+
+        log_merge_worker_stop_timeout(&store, &id, "stop merge");
+
+        let row = guardian_rows(&store, &id)
+            .into_iter()
+            .find(|r| r.message == "previous merge worker outlived the stop budget")
+            .expect("expected a Cartographer row for the abandoned worker");
+        assert_eq!(row.level, "warning", "an abandoned worker is not routine");
+        assert_eq!(row.payload["action"], "stop merge");
+        assert!(
+            row.payload["remediation"]
+                .as_str()
+                .is_some_and(|r| r.contains("worktrees")),
+            "a blocked-state row must say what to do about it: {:?}",
+            row.payload
+        );
+    }
+
+    #[test]
+    fn acquire_merge_permit_reports_a_queue_wait_that_looks_like_a_hang() {
+        let (store, id) = store_with_guardian();
+        let sem = Semaphore::new(1);
+
+        // Threshold 0 reports any wait, so the branch is exercised without
+        // spending the production threshold in real time.
+        {
+            let _permit = acquire_merge_permit_reported_after(&store, &sem, &id, "merge", 0);
+        }
+
+        let row = guardian_rows(&store, &id)
+            .into_iter()
+            .find(|r| r.message == "merge worker queued for a concurrency permit")
+            .expect("expected a Cartographer row for the permit wait");
+        assert_eq!(row.level, "warning");
+        assert_eq!(row.payload["kind"], "merge");
+        assert!(
+            row.payload["remediation"]
+                .as_str()
+                .is_some_and(|r| r.contains("max_concurrent")),
+            "the permit-wait row must name the knob that fixes it: {:?}",
+            row.payload
+        );
+    }
+
+    #[test]
+    fn acquire_merge_permit_stays_quiet_when_a_slot_is_free() {
+        let (store, id) = store_with_guardian();
+        let sem = Semaphore::new(1);
+
+        {
+            let _permit = acquire_merge_permit_reported_after(&store, &sem, &id, "merge", 60_000);
+        }
+
+        assert!(
+            guardian_rows(&store, &id)
+                .iter()
+                .all(|r| r.message != "merge worker queued for a concurrency permit"),
+            "an uncontended acquire must not add noise to the review's timeline"
+        );
+    }
+
+    #[test]
+    fn acquire_merge_permit_still_hands_back_a_usable_permit() {
+        let (store, id) = store_with_guardian();
+        let sem = Semaphore::new(1);
+
+        {
+            let _permit = acquire_merge_permit_reported_after(&store, &sem, &id, "merge", 0);
+            assert_eq!(sem.in_use(), 1, "the permit must actually be held");
+        }
+        assert_eq!(sem.in_use(), 0, "dropping the permit must free the slot");
     }
 }
