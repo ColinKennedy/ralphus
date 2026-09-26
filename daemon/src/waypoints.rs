@@ -731,6 +731,119 @@ impl Store {
         self.close_waypoint(waypoint_id)
     }
 
+    /// The open waypoint (if any) that block-gates a squad (RAL-400 Phase 3,
+    /// scenario 1): a `kind='squad'` roster entry for `squad_id` whose `mode`
+    /// is `block` and whose owning waypoint is still `open`. A roster entry
+    /// with `survey_verdict='not_impacted'` never gates regardless of `mode`
+    /// (the survey found this squad isn't actually affected, so the `mode`
+    /// column's leftover default value is moot -- see
+    /// [`resolve_survey_verdict`]/[`parse_survey_reply`]); a `NULL`
+    /// `survey_verdict` (not yet surveyed, or a manually-added entry) gates,
+    /// matching Phase 0's fail-closed rule and giving Phase 3's "gate the
+    /// squad until classification completes" its effect for free, since
+    /// [`survey_candidate`] already writes the `block`-mode roster row before
+    /// its LLM call resolves. Advisory-mode entries never gate (Phase 0: for
+    /// a squad, advisory means "keep running, just inform").
+    ///
+    /// Consulted by [`Store::list_ready`] and the queue view's `blocked_by`
+    /// construction -- both existing call sites, not a new scheduling path.
+    /// Returns the earliest-created blocking waypoint's id when more than one
+    /// applies.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn squad_block_gating_waypoint(&self, squad_id: &str) -> StoreResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT wr.waypoint_id FROM waypoint_roster wr
+                 JOIN waypoints w ON w.id = wr.waypoint_id
+                 WHERE wr.kind = 'squad' AND wr.entry_id = ? AND wr.mode = 'block'
+                   AND (wr.survey_verdict IS NULL OR wr.survey_verdict = 'impacted')
+                   AND w.state = 'open'
+                 ORDER BY wr.created_at_ms ASC
+                 LIMIT 1",
+                params![squad_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Every cell currently halted because its squad-kind roster entry
+    /// became `mode=block` on an open waypoint (RAL-400 Phase 3, see
+    /// [`Store::mark_cell_waypoint_halted`]) -- `(squad_id, task_idx, idx)`
+    /// triples, oldest halt first. Consumed by [`run_pending_waypoint_resumes`]
+    /// to find cells worth re-checking against
+    /// [`Store::squad_block_gating_waypoint`] once a waypoint closes or
+    /// de-escalates.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoint_halted_cells(&self) -> StoreResult<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT squad_id, task_idx, idx FROM cells
+             WHERE waypoint_halted_at_ms IS NOT NULL
+             ORDER BY waypoint_halted_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// RAL-400 Phase 3: once a squad that carries a `kind='squad'` roster
+    /// entry completes and its review forms (`guardian_id` becomes known),
+    /// retire that entry and add an equivalent `kind='review'` entry in its
+    /// place -- same waypoint, mode, and survey verdict/rationale carried
+    /// over -- so gating/delivery (Phase 4) continues through the review
+    /// instead of the now-stale squad entry. A no-op if `squad_id` has no
+    /// squad-kind roster entry on any waypoint, and idempotent if called more
+    /// than once for the same `(squad_id, guardian_id)` pair (the review-kind
+    /// insert is the same `ON CONFLICT` upsert [`Store::add_roster_entry`]
+    /// uses elsewhere, keyed on `(waypoint_id, kind, entry_id)`).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn transition_squad_roster_entries_to_review(
+        &self,
+        squad_id: &str,
+        guardian_id: &str,
+    ) -> StoreResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT waypoint_id, mode, survey_verdict, survey_rationale
+             FROM waypoint_roster WHERE kind='squad' AND entry_id=?",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let now = now_ms();
+        for (waypoint_id, mode, survey_verdict, survey_rationale) in rows {
+            self.conn.execute(
+                "INSERT INTO waypoint_roster(waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms)
+                 VALUES(?,'review',?,?,?,?,'undelivered',?,?)
+                 ON CONFLICT(waypoint_id, kind, entry_id) DO UPDATE SET
+                     mode=excluded.mode,
+                     survey_verdict=excluded.survey_verdict,
+                     survey_rationale=excluded.survey_rationale,
+                     updated_at_ms=excluded.updated_at_ms",
+                params![waypoint_id, guardian_id, mode, survey_verdict, survey_rationale, now, now],
+            )?;
+            self.conn.execute(
+                "DELETE FROM waypoint_roster WHERE waypoint_id=? AND kind='squad' AND entry_id=?",
+                params![waypoint_id, squad_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Append one bearing to a waypoint's guidance history. Append-only --
     /// there is no corresponding update/delete method.
     ///
@@ -1035,6 +1148,7 @@ pub fn survey_candidate(
     store: &crate::store_lock::StoreHandle,
     waypoint_id: &str,
     candidate: &SurveyCandidate,
+    waypoint_halts: &crate::cancel::WaypointHalts,
 ) -> StoreResult<SurveyVerdict> {
     let guard = store.lock();
     let waypoint = guard.get_waypoint(waypoint_id)?;
@@ -1045,6 +1159,16 @@ pub fn survey_candidate(
         RosterMode::Block,
     )?;
     drop(guard);
+    // RAL-400 Phase 3: the roster entry above just went from "not rostered"
+    // (unblocked) to `mode=block`. A squad-kind candidate may have a cell
+    // actively running right now -- `cancel` is a no-op when nothing is
+    // registered under this squad id, so this is safe to call unconditionally
+    // rather than first checking squad/cell state. Review-kind candidates
+    // never have a runner-registered token (a review has no cell of its own
+    // to halt), so this is scoped to `Squad` only.
+    if candidate.kind == RosterEntryKind::Squad {
+        waypoint_halts.cancel(&candidate.entry_id);
+    }
 
     let fallback = crate::config::global_review_config();
     let agent = waypoint
@@ -1108,7 +1232,10 @@ pub fn survey_candidate(
 /// `crate::pr::poll_forge_reorders` -- so the scheduler loop is never
 /// blocked for the cumulative duration of every open waypoint's every
 /// candidate's LLM call.
-pub fn run_pending_surveys(store: &crate::store_lock::StoreHandle) {
+pub fn run_pending_surveys(
+    store: &crate::store_lock::StoreHandle,
+    waypoint_halts: &crate::cancel::WaypointHalts,
+) {
     let waypoint_ids = {
         let guard = store.lock();
         guard.list_open_waypoint_ids().unwrap_or_default()
@@ -1123,17 +1250,95 @@ pub fn run_pending_surveys(store: &crate::store_lock::StoreHandle) {
         for candidate in candidates {
             let store = std::sync::Arc::clone(store);
             let waypoint_id = waypoint_id.clone();
+            let waypoint_halts = waypoint_halts.clone();
             std::thread::spawn(move || {
-                let _ = survey_candidate(&store, &waypoint_id, &candidate);
+                let _ = survey_candidate(&store, &waypoint_id, &candidate, &waypoint_halts);
             });
+        }
+    }
+}
+
+/// Scheduler-owned periodic sweep (RAL-400 Phase 3): the other half of a
+/// waypoint halt. `run_cell_worker`'s `is_waypoint_halted()` branch stops a
+/// cell the moment its squad-kind roster entry becomes `mode=block`, but
+/// nothing else in that codepath ever hands the cell back -- a waypoint can
+/// close, de-escalate to advisory, or lose its last blocking roster entry at
+/// any later time, with no single call site to hook a "resume now" trigger
+/// onto (unlike the halt itself, which is driven directly by
+/// [`survey_candidate`] flipping a roster entry to `block`). So this sweep
+/// re-checks every currently-halted cell on the same cadence as
+/// [`run_pending_surveys`], purely synchronous store reads/writes (no LLM
+/// call, no thread-spawn needed).
+///
+/// A cell only resumes once [`Store::squad_block_gating_waypoint`] no longer
+/// names a blocking waypoint for its squad, and only if the DB still shows it
+/// `Running` -- guarding against a cell that moved on through some other path
+/// (a manual restart, say) while still carrying a stale
+/// `waypoint_halted_at_ms`. Resuming sets the cell back to `pending`; a live
+/// squad worker notices via the same Detached-revival reconciliation
+/// `resume_detached_cell` relies on (`scheduler::execute_squad_inner`'s
+/// `reclaimed_detached` check), so only a squad whose worker has already
+/// exited (`!cancellations.is_active`) needs its own row nudged back to
+/// `Pending` to be picked up by a fresh `scheduler::tick`.
+pub fn run_pending_waypoint_resumes(
+    store: &crate::store_lock::StoreHandle,
+    cancellations: &crate::cancel::Cancellations,
+) {
+    let halted = {
+        let guard = store.lock();
+        guard.waypoint_halted_cells().unwrap_or_default()
+    };
+    let mut resumed_squads: BTreeSet<String> = BTreeSet::new();
+    for (squad_id, task_idx, idx) in halted {
+        let guard = store.lock();
+        if guard
+            .squad_block_gating_waypoint(&squad_id)
+            .unwrap_or(None)
+            .is_some()
+        {
+            continue;
+        }
+        if !matches!(
+            guard.cell_state(&squad_id, task_idx, idx),
+            Ok(Some(crate::store::NodeState::Running))
+        ) {
+            continue;
+        }
+        // Mirror `server::resume_automation`'s pairing: a session id is only
+        // worth forcing a resume onto if one was actually captured live
+        // before the halt (a cell halted before the agent ever reported a
+        // session id has nothing of its own to continue) -- `run_cell_worker`
+        // falls back to ordinary fresh-dispatch/cross-cell-sharing logic
+        // otherwise, same as any other cell with no session to resume.
+        if matches!(
+            guard.get_cell_agent_resume(&squad_id, task_idx, idx),
+            Ok((_, _, Some(_)))
+        ) {
+            let _ = guard.set_force_resume_own_session(&squad_id, task_idx, idx);
+        }
+        if guard
+            .resume_waypoint_halted_cell(&squad_id, task_idx, idx)
+            .is_ok()
+        {
+            resumed_squads.insert(squad_id);
+        }
+    }
+    for squad_id in resumed_squads {
+        if !cancellations.is_active(&squad_id) {
+            let guard = store.lock();
+            let _ = guard.set_squad_state(&squad_id, crate::store::SquadState::Pending);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::store::SquadState;
+    use crate::cancel::Cancellations;
+    use crate::store::{NodeState, SquadState};
+    use crate::store_lock::StoreMutex;
 
     fn open_waypoint(store: &Store, id: &str) {
         store
@@ -2100,6 +2305,132 @@ mod tests {
                 .waypoint_survey_candidates("waypoint-1")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Marks a cell as if `run_cell_worker`'s `is_waypoint_halted()` branch
+    /// had just run: DB `state='running'` (what `record_cell_result`
+    /// persists for a waypoint-halted `RunnerResult`) plus
+    /// `waypoint_halted_at_ms` set via [`Store::mark_cell_waypoint_halted`].
+    fn halt_cell(store: &Store, squad_id: &str, task_idx: i64, idx: i64) {
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET state='running' WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+            )
+            .unwrap();
+        store
+            .mark_cell_waypoint_halted(squad_id, task_idx, idx)
+            .unwrap();
+    }
+
+    fn handle(store: Store) -> Arc<StoreMutex> {
+        Arc::new(StoreMutex::new(store))
+    }
+
+    #[test]
+    fn resume_sweep_leaves_a_halted_cell_alone_while_the_waypoint_still_blocks() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Running);
+        insert_bare_task(&store, "squad-1", 0, "core");
+        insert_bare_cell(&store, "squad-1", 0, 0, None, None);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        halt_cell(&store, "squad-1", 0, 0);
+
+        let handle = handle(store);
+        let cancellations = Cancellations::new();
+        run_pending_waypoint_resumes(&handle, &cancellations);
+
+        let store = handle.lock();
+        assert_eq!(
+            store.cell_state("squad-1", 0, 0).unwrap(),
+            Some(NodeState::Running),
+            "still blocked -- the halted cell must not be resumed"
+        );
+        assert_eq!(store.squad_state("squad-1").unwrap(), SquadState::Running);
+    }
+
+    #[test]
+    fn resume_sweep_frees_a_halted_cell_and_squad_once_the_waypoint_closes() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Running);
+        insert_bare_task(&store, "squad-1", 0, "core");
+        insert_bare_cell(&store, "squad-1", 0, 0, None, None);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        halt_cell(&store, "squad-1", 0, 0);
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        // No worker registered for "squad-1" -- simulates the worker thread
+        // having already exited (`run_cell_worker` returned once its cell
+        // halted), so the sweep must also nudge the squad's own row back to
+        // `Pending` for a fresh `scheduler::tick` to pick it up.
+        let cancellations = Cancellations::new();
+        run_pending_waypoint_resumes(&handle, &cancellations);
+
+        let store = handle.lock();
+        assert_eq!(
+            store.cell_state("squad-1", 0, 0).unwrap(),
+            Some(NodeState::Pending),
+            "waypoint closed -- the halted cell must resume"
+        );
+        assert_eq!(store.squad_state("squad-1").unwrap(), SquadState::Pending);
+    }
+
+    #[test]
+    fn resume_sweep_leaves_the_squads_own_row_alone_while_its_worker_is_still_alive() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Running);
+        insert_bare_task(&store, "squad-1", 0, "core");
+        insert_bare_cell(&store, "squad-1", 0, 0, None, None);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        halt_cell(&store, "squad-1", 0, 0);
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let cancellations = Cancellations::new();
+        // Still-registered token: the squad's worker thread hasn't exited,
+        // so it will notice the cell's DB state flip via the same
+        // reclaimed-detached reconciliation `resume_detached_cell` relies
+        // on -- the sweep must not also stomp the squad's own row.
+        let _token = cancellations.register("squad-1");
+        run_pending_waypoint_resumes(&handle, &cancellations);
+
+        let store = handle.lock();
+        assert_eq!(
+            store.cell_state("squad-1", 0, 0).unwrap(),
+            Some(NodeState::Pending),
+            "waypoint closed -- the halted cell must still resume"
+        );
+        assert_eq!(
+            store.squad_state("squad-1").unwrap(),
+            SquadState::Running,
+            "worker still alive -- its own row must not be touched"
         );
     }
 }

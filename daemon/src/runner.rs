@@ -1060,6 +1060,38 @@ impl RunnerResult {
         }
     }
 
+    /// RAL-400 Phase 3: a cell halted because its squad just became gated
+    /// behind an open block-mode waypoint roster entry -- neither success nor
+    /// failure, mirroring [`Self::detached`]'s "don't regress the board's
+    /// numbers" reasoning. Deliberately a distinct status string from
+    /// `"detached"` even though both resolve to [`NodeState::Running`] and
+    /// the same in-memory `CellState::Detached` bookkeeping in the
+    /// scheduler: a waypoint halt leaves no interactive session behind to
+    /// resume into, so it must never surface the board's human-takeover
+    /// affordances, and it must auto-resume when the waypoint closes rather
+    /// than waiting on an explicit resume-automation call.
+    #[must_use]
+    pub fn waypoint_halted(usage: LiveUsage, agent_session_id: Option<String>) -> Self {
+        Self {
+            status: "waypoint_halted".to_string(),
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            compaction_input_tokens: 0,
+            compaction_count: 0,
+            cost_usd: usage.cost_usd,
+            cost_is_estimated: true,
+            summary: String::new(),
+            error: None,
+            proofed: None,
+            agent_session_id,
+            turns: Some(usage.turns),
+            ghost: None,
+            retry_after_secs: None,
+        }
+    }
+
     /// RAL-435: a recognized, retryable Pi rate limit with a suggested
     /// delay -- neither success nor failure, mirroring [`Self::detached`]'s
     /// "don't regress the board's numbers" reasoning. `run_cell_worker`
@@ -1128,6 +1160,17 @@ impl RunnerResult {
         self.status == "detached"
     }
 
+    /// RAL-400 Phase 3: a cell halted because its squad became gated behind
+    /// an open block-mode waypoint roster entry -- see
+    /// [`Self::waypoint_halted`]. Distinct from [`Self::is_detached`] so the
+    /// scheduler can record the halt under its own DB column and Cartographer
+    /// scope, and resume it automatically rather than waiting for a human
+    /// resume-automation call.
+    #[must_use]
+    pub fn is_waypoint_halted(&self) -> bool {
+        self.status == "waypoint_halted"
+    }
+
     /// RAL-435: a recognized, retryable Pi rate limit -- see
     /// [`Self::rate_limited`]. `run_cell_worker`'s retry loop checks this on
     /// every attempt and never lets it reach the rest of the normal
@@ -1142,7 +1185,7 @@ impl RunnerResult {
     pub fn node_state(&self) -> NodeState {
         if self.is_done() {
             NodeState::Done
-        } else if self.is_detached() || self.is_rate_limited() {
+        } else if self.is_detached() || self.is_waypoint_halted() || self.is_rate_limited() {
             NodeState::Running
         } else {
             NodeState::Failed
@@ -1230,6 +1273,12 @@ pub struct SubprocessRunner {
     /// mid-task detach (RAL-288 Stage 6) via the same registry, without
     /// touching the rest of that cell's squad.
     detachments: Option<crate::cancel::Detachments>,
+    /// When set, a per-squad waypoint-halt token is registered for the
+    /// lifetime of each tmux-wrapped attempt (RAL-400 Phase 3) so a squad
+    /// that becomes gated behind an open block-mode waypoint can have every
+    /// one of its currently-running cells halted at once, without marking
+    /// them terminally cancelled.
+    waypoint_halts: Option<crate::cancel::WaypointHalts>,
 }
 
 impl SubprocessRunner {
@@ -1244,6 +1293,7 @@ impl SubprocessRunner {
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         }
     }
 
@@ -1280,6 +1330,16 @@ impl SubprocessRunner {
         self.detachments = Some(detachments);
         self
     }
+
+    /// Attach the shared per-squad waypoint-halt registry (RAL-400 Phase 3)
+    /// so a tmux-wrapped cell can be halted the moment its squad becomes
+    /// gated behind an open block-mode waypoint, via an external caller
+    /// holding the same registry.
+    #[must_use]
+    pub fn with_waypoint_halts(mut self, waypoint_halts: crate::cancel::WaypointHalts) -> Self {
+        self.waypoint_halts = Some(waypoint_halts);
+        self
+    }
 }
 
 /// Registers a cell's subprocess PID on construction and unregisters it on
@@ -1311,6 +1371,24 @@ struct DetachGuard<'a> {
 impl Drop for DetachGuard<'_> {
     fn drop(&mut self) {
         self.detachments.remove(self.session_name);
+    }
+}
+
+/// Removes a cell's waypoint-halt-token registration on every return path out
+/// of [`SubprocessRunner::run_via_tmux`] (RAL-400 Phase 3), the same way
+/// [`DetachGuard`] removes a detach-token registration -- keyed by
+/// `squad_id`, not `session_name`, since the registry is shared across every
+/// cell concurrently running in the same squad; `Cancellations::remove`'s
+/// refcounting already handles the case where more than one of that squad's
+/// cells is registered under the same key at once.
+struct WaypointHaltGuard<'a> {
+    waypoint_halts: &'a crate::cancel::WaypointHalts,
+    squad_id: &'a str,
+}
+
+impl Drop for WaypointHaltGuard<'_> {
+    fn drop(&mut self) {
+        self.waypoint_halts.remove(self.squad_id);
     }
 }
 
@@ -1756,6 +1834,22 @@ impl SubprocessRunner {
             session_name: &session_name,
         });
 
+        // RAL-400 Phase 3: also registered for the lifetime of this whole
+        // cell run, but keyed by `squad_id` rather than `session_name` --
+        // every cell concurrently running in the same squad shares this one
+        // token, so a single external `.cancel(squad_id)` halts all of them
+        // at once when that squad becomes gated behind an open block-mode
+        // waypoint. `_waypoint_halt_guard` removes this cell's registration
+        // on every return path, mirroring `_detach_guard`.
+        let waypoint_halt_token = self
+            .waypoint_halts
+            .as_ref()
+            .map(|w| w.register(&spec.squad_id));
+        let _waypoint_halt_guard = self.waypoint_halts.as_ref().map(|w| WaypointHaltGuard {
+            waypoint_halts: w,
+            squad_id: &spec.squad_id,
+        });
+
         loop {
             let attempt_spec: std::borrow::Cow<'_, RunnerSpec> = if attempt == 0 {
                 std::borrow::Cow::Borrowed(spec)
@@ -1791,6 +1885,7 @@ impl SubprocessRunner {
                 &attempt_spec,
                 cancel,
                 detach_token.as_ref(),
+                waypoint_halt_token.as_ref(),
                 &tmux,
                 &session_name,
                 &spec_path,
@@ -1921,6 +2016,7 @@ impl SubprocessRunner {
         attempt_spec: &RunnerSpec,
         cancel: &CancelToken,
         detach: Option<&crate::cancel::DetachToken>,
+        waypoint_halt: Option<&crate::cancel::WaypointHaltToken>,
         tmux: &Tmux,
         session_name: &str,
         spec_path: &std::path::Path,
@@ -2161,6 +2257,19 @@ impl SubprocessRunner {
                     attempt_spec.cell_id
                 );
                 break RunnerResult::detached(current_usage, resumable_agent_session_id.clone());
+            }
+            if waypoint_halt.is_some_and(crate::cancel::WaypointHaltToken::is_cancelled) {
+                let _ = tmux.kill_session(session_name);
+                crate::rlog!(
+                    INFO,
+                    "ralphus [runner] waypoint halted squad={} cell={}",
+                    attempt_spec.squad_id,
+                    attempt_spec.cell_id
+                );
+                break RunnerResult::waypoint_halted(
+                    current_usage,
+                    resumable_agent_session_id.clone(),
+                );
             }
             if timed_out(started.elapsed(), deadline) {
                 let _ = tmux.kill_session(session_name);
@@ -4491,6 +4600,7 @@ prompt = "make it build"
             registry: Some(reg.clone()),
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         #[cfg(not(target_os = "windows"))]
         let runner = SubprocessRunner {
@@ -4499,6 +4609,7 @@ prompt = "make it build"
             registry: Some(reg.clone()),
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let row = CellRow {
             task_idx: 0,
@@ -4779,6 +4890,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -4832,6 +4944,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_command_proof(
@@ -4882,6 +4995,7 @@ prompt = "make it build"
             registry: Some(reg.clone()),
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         // Backstop only — see the identical note on
@@ -4999,6 +5113,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5054,6 +5169,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5115,6 +5231,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5201,6 +5318,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: Some(detachments.clone()),
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec::for_proof(
@@ -5293,6 +5411,7 @@ prompt = "make it build"
             registry: None,
             cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -5432,6 +5551,7 @@ prompt = "make it build"
             registry: None,
             cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
             detachments: None,
+            waypoint_halts: None,
         };
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let spec = RunnerSpec {
@@ -5532,6 +5652,7 @@ prompt = "make it build"
             registry: None,
             cartographer: None,
             detachments: None,
+            waypoint_halts: None,
         };
         runner
             .preflight_runner_executable(None)

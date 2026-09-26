@@ -143,6 +143,25 @@ pub type Detachments = Cancellations;
 /// See [`Detachments`].
 pub type DetachToken = CancelToken;
 
+/// A per-squad "halt immediately" signal (RAL-400 Phase 3) for a squad that
+/// just became gated behind an open block-mode waypoint roster entry.
+/// Structurally identical to [`Cancellations`]/[`CancelToken`] and to
+/// [`Detachments`]/[`DetachToken`] -- register a token when a cell's
+/// subprocess starts, poll it in the same loop, trip it externally -- but a
+/// *separate* registry from both: unlike [`Cancellations`], tripping it must
+/// never mark the cell terminally cancelled, since the waypoint may close and
+/// the exact same work is expected to resume automatically; unlike
+/// [`Detachments`], tripping it is not a human takeover (there is no
+/// interactive session left behind to attach to), so conflating the two
+/// registries risks auto-resuming a genuinely human-detached cell the moment
+/// an unrelated waypoint closes, or vice versa. Keyed per-squad rather than
+/// per-cell, exploiting [`Cancellations::register`]'s shared-token-per-key
+/// behavior so a single `cancel(squad_id)` halts every cell concurrently
+/// running in that squad.
+pub type WaypointHalts = Cancellations;
+/// See [`WaypointHalts`].
+pub type WaypointHaltToken = CancelToken;
+
 #[cfg(test)]
 mod tests {
     use super::*;

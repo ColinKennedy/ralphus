@@ -120,12 +120,15 @@ pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60
 pub const CPU_STALL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often to run the RAL-400 waypoint survey sweep
-/// (`crate::waypoints::run_pending_surveys`). A waypoint is a human-driven,
-/// coarse-grained event (someone declaring mid-flight impact), not something
-/// needing sub-minute reaction, and every candidate's actual LLM call runs on
-/// its own spawned thread rather than the scheduler thread -- so a minute of
-/// added latency before a brand-new waypoint or newly-non-terminal candidate
-/// gets surveyed is an acceptable, cheap-to-check cadence.
+/// (`crate::waypoints::run_pending_surveys`) and its sibling resume sweep
+/// (`crate::waypoints::run_pending_waypoint_resumes`, Phase 3). A waypoint is
+/// a human-driven, coarse-grained event (someone declaring mid-flight
+/// impact, or a waypoint closing), not something needing sub-minute
+/// reaction, and every candidate's actual LLM call runs on its own spawned
+/// thread rather than the scheduler thread -- so a minute of added latency
+/// before a brand-new waypoint or newly-non-terminal candidate gets
+/// surveyed, or a halted cell resumes, is an acceptable, cheap-to-check
+/// cadence.
 pub const WAYPOINT_SURVEY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Resolves `agent` against RAL-473 database-backed profiles/backend-command
@@ -455,8 +458,8 @@ impl Drop for SemaphorePermit<'_> {
 pub fn run_loop(
     store: crate::store_lock::StoreHandle,
     runner: Arc<dyn Runner>,
-    _max_concurrent: i64,
     cancellations: Cancellations,
+    waypoint_halts: crate::cancel::WaypointHalts,
     sem: Arc<Semaphore>,
     summary_queue: Arc<crate::summary_worker::SummaryQueue>,
     procs: crate::procreg::ProcRegistry,
@@ -624,7 +627,8 @@ pub fn run_loop(
             last_cpu_stall_sweep = std::time::Instant::now();
         }
         if last_waypoint_survey.elapsed() >= WAYPOINT_SURVEY_INTERVAL {
-            crate::waypoints::run_pending_surveys(&store);
+            crate::waypoints::run_pending_surveys(&store, &waypoint_halts);
+            crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
             last_waypoint_survey = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -1843,6 +1847,61 @@ fn enqueue_cell_failure_mailbox(
     }
 }
 
+/// RAL-400 Phase 3: broadcast a mailbox message when a squad's in-flight
+/// cell is halted because its squad-kind roster entry just became
+/// `mode=block` on an open waypoint. Mirrors
+/// [`enqueue_cell_failure_mailbox`]'s shape, but this is a blocked state, not
+/// a failure -- the cell resumes automatically once the waypoint closes or
+/// de-escalates (see the periodic resume sweep in `waypoints.rs`), so the
+/// remediation points at the waypoint, not the cell itself.
+fn enqueue_waypoint_halt_mailbox(
+    guard: &Store,
+    squad_id: &str,
+    cell_id: &str,
+    task_name: &str,
+    waypoint_id: &str,
+) {
+    let waypoint_label = guard
+        .get_waypoint(waypoint_id)
+        .ok()
+        .and_then(|w| w.label)
+        .unwrap_or_else(|| waypoint_id.to_string());
+    let text = format!(
+        "cell '{cell_id}' in task '{task_name}' (squad {squad_id}) halted: blocked by waypoint \
+         '{waypoint_label}' ({waypoint_id})"
+    );
+    let entity_uri = guard.cell_entity_uri(squad_id, task_name, cell_id);
+    let event_uri = entity_uri.unwrap_or_else(|| format!("squad:{squad_id}"));
+    let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+        guidance: format!(
+            "review and close (or de-escalate) waypoint {waypoint_id} to let this cell resume \
+             automatically"
+        ),
+    };
+    if let Ok(message_id) = guard.notify_watchers_with_remediation(
+        crate::monitor::NotifiableEventKind::SquadWaypointHalted,
+        &event_uri,
+        crate::mailbox::MailboxPriority::High,
+        &text,
+        &remediation,
+        Some(squad_id),
+        Some(task_name),
+        Some(cell_id),
+    ) {
+        crate::cartographer::Note::new("scheduler")
+            .level(crate::logging::LogLevel::INFO)
+            .squad(squad_id)
+            .cell(cell_id)
+            .task(task_name)
+            .scope("waypoint")
+            .emit(
+                guard,
+                "mailbox message enqueued for waypoint halt",
+                serde_json::json!({"message_id": message_id, "waypoint_id": waypoint_id}),
+            );
+    }
+}
+
 /// RAL-241 follow-up: broadcast a mailbox message when a proof step fails
 /// *after* its owning cell/task body already succeeded — the one failure
 /// path [`enqueue_cell_failure_mailbox`] doesn't cover, since that helper
@@ -2346,6 +2405,10 @@ fn run_cell_worker(
         // resume-automation-triggered one, without either needing to know
         // about the other's bookkeeping.
         let _ = guard.clear_cell_detached(squad_id, row.task_idx, row.idx);
+        // RAL-400 Phase 3: same reasoning, for a stale `waypoint_halted_at_ms`
+        // left behind by a previous attempt that was halted by a since-closed
+        // waypoint.
+        let _ = guard.clear_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
         // RAL-435: same reasoning, for a stale `delayed_until_ms` left behind
         // by a previous attempt that was still waiting out a rate limit when
         // e.g. the daemon restarted.
@@ -2734,6 +2797,69 @@ fn run_cell_worker(
     // about to take over; automation picks back up only via the explicit
     // resume-automation trigger, not by falling through to the normal
     // done/failed path below.
+    // RAL-400 Phase 3: a squad-kind roster entry just became `mode=block` on
+    // an open waypoint while this cell was actively running (the trigger is
+    // `waypoints::survey_candidate` calling `.cancel(squad_id)` on the
+    // `WaypointHalts` registry this runner attempt was polling). Like a
+    // detach, this is neither success nor failure -- record whatever
+    // usage/session-id was captured live, but never run proof steps. Unlike a
+    // detach, no human interactive session takes over: the periodic
+    // resume-sweep in `waypoints.rs` automatically hands the cell back to
+    // `pending` once the blocking waypoint closes or de-escalates.
+    if result.is_waypoint_halted() {
+        crate::rlog!(
+            INFO,
+            "ralphus [scheduler] cell {squad_id}/{} waypoint-halted tokens_in={} tokens_out={}",
+            row.cell_id,
+            result.tokens_in,
+            result.tokens_out,
+        );
+        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
+        let outcome = CellOutcome {
+            state: result.node_state(),
+            usage: (&result).into(),
+            error: None,
+            agent_session_id: result.agent_session_id.clone(),
+        };
+        let guard = store.lock();
+        let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
+        let _ = guard.mark_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
+        let waypoint_id = guard.squad_block_gating_waypoint(squad_id).ok().flatten();
+        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "scheduler",
+            message: "cell halted by waypoint block",
+            scope: Some("waypoint"),
+            squad_id: Some(squad_id),
+            guardian_id: None,
+            cell_id: Some(&row.cell_id),
+            task: Some(&row.task_name),
+            log_path: None,
+            payload: serde_json::json!({
+                "tokens_in": result.tokens_in,
+                "tokens_out": result.tokens_out,
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_read_tokens": result.cache_read_tokens,
+                "compaction_input_tokens": result.compaction_input_tokens,
+                "compaction_count": result.compaction_count,
+                "cost_usd": result.cost_usd,
+                "cost_is_estimated": result.cost_is_estimated,
+                "agent_session_id": result.agent_session_id,
+                "waypoint_id": waypoint_id,
+            }),
+            admin_only: false,
+        });
+        if let Some(waypoint_id) = waypoint_id.as_deref() {
+            enqueue_waypoint_halt_mailbox(
+                &guard,
+                squad_id,
+                &row.cell_id,
+                &row.task_name,
+                waypoint_id,
+            );
+        }
+        return;
+    }
     if result.is_detached() {
         crate::rlog!(
             INFO,
@@ -4954,6 +5080,106 @@ mod tests {
         assert_eq!(squad.tasks[0].state, "running");
         assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
         assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
+    /// RAL-400 Phase 3: reports a waypoint halt, mirroring [`DetachRunner`].
+    struct WaypointHaltRunner;
+
+    impl Runner for WaypointHaltRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            RunnerResult::waypoint_halted(
+                crate::runner::LiveUsage {
+                    tokens_in: 5,
+                    tokens_out: 9,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    cost_usd: 0.5,
+                    turns: 0,
+                },
+                Some("sess-waypoint-halt-1".to_string()),
+            )
+        }
+    }
+
+    /// RAL-400 Phase 3 AC(c): halting an in-flight cell for a waypoint block
+    /// must notify watchers with remediation guidance (RAL-502) and log a
+    /// Cartographer row -- exercised end-to-end via the real
+    /// `is_waypoint_halted()` branch in `run_cell_worker`, not by calling
+    /// `enqueue_waypoint_halt_mailbox` directly.
+    #[test]
+    fn a_waypoint_halted_cell_notifies_watchers_with_remediation_and_logs_a_cartographer_row() {
+        let (store, id) = store_with(ONE_CELL);
+        {
+            let guard = store.lock();
+            guard
+                .create_waypoint(
+                    "waypoint-1",
+                    Some("release freeze"),
+                    "is this squad affected?",
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_roster_entry(
+                    "waypoint-1",
+                    crate::waypoints::RosterEntryKind::Squad,
+                    &id,
+                    crate::waypoints::RosterMode::Block,
+                )
+                .unwrap();
+            guard
+                .create_watch(
+                    "colin",
+                    &format!("squad:{id}"),
+                    &[
+                        crate::mailbox::MailboxPriority::Urgent,
+                        crate::mailbox::MailboxPriority::High,
+                    ],
+                )
+                .unwrap();
+        }
+
+        execute_squad(&store, &WaypointHaltRunner, &id);
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "running");
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
+        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+
+        let personal = guard
+            .personal_mailbox_messages_for_user("colin", false, None)
+            .unwrap();
+        assert_eq!(personal.len(), 1, "expected exactly one notification");
+        assert_eq!(
+            personal[0].event_kind.as_deref(),
+            Some("squad_waypoint_halted")
+        );
+        assert!(
+            personal[0]
+                .message
+                .contains("Manual intervention required:"),
+            "message must carry remediation guidance (RAL-502): {}",
+            personal[0].message
+        );
+        assert!(personal[0].message.contains("waypoint-1"));
+
+        let page = guard
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                scope: Some("waypoint".to_string()),
+                squad_id: Some(id.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            page.rows
+                .iter()
+                .any(|r| r.message == "cell halted by waypoint block"),
+            "expected a Cartographer row recording the waypoint halt"
+        );
     }
 
     const WORK_THEN_FINALIZE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\".\"\ncommand=\"do-work\"\n[[task.cell]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"do-finalize\"\ndepends_on=[\"work\"]\n";
