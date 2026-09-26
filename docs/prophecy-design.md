@@ -466,3 +466,5 @@ but better as a written decision than an unexamined default. Note
 `SECURITY_AUDIT.local.md` does not currently mention it.
 =======
 >>>>>>> a6401a3c3 (feat(daemon): add prophecy transport via RALPHUS_PROPHECY: marker)
+=======
+>>>>>>> 0d0eb14d6 (docs(prophecy): add §5 — Trust boundary, why the marker doesn't need a token)
