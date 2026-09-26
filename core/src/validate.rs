@@ -3119,6 +3119,53 @@ prompt = "make it build"
         assert_eq!(e.line, Some(3));
     }
 
+    // ── RAL-400: waypoint roster ─────────────────────────────────────────────
+
+    #[test]
+    fn waypoint_roster_must_be_non_empty() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+cwd = "/repo"
+prompt = "make it build"
+[[task.cell.proof]]
+command = "cargo build"
+remediation_attempts = 3
+
+[[waypoint]]
+prompt = "gate on review"
+roster = []
+"#;
+        let r = validate_toml(src);
+        r.errors
+            .iter()
+            .find(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("roster"))
+            .expect("an empty roster must be rejected");
+    }
+
+    #[test]
+    fn waypoint_roster_is_required() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+cwd = "/repo"
+prompt = "make it build"
+[[task.cell.proof]]
+command = "cargo build"
+remediation_attempts = 3
+
+[[waypoint]]
+prompt = "gate on review"
+"#;
+        let r = validate_toml(src);
+        r.errors
+            .iter()
+            .find(|e| e.kind == ErrorKind::MissingRequired && e.message.contains("roster"))
+            .expect("an omitted roster must be rejected");
+    }
+
     #[test]
     fn missing_name() {
         let src = "[[task]]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";

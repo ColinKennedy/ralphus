@@ -120,6 +120,16 @@ impl SquadState {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
+    /// Whether this state is terminal *for waypoint auto-close purposes*
+    /// (RAL-400 Phase 6). Stricter than [`Self::is_terminal`]: `failed` is
+    /// excluded because [`Store::restart_squad`] revives a failed squad back
+    /// to `pending`, so a squad that "may rerun" must not count toward
+    /// closing a waypoint it's rostered on.
+    #[must_use]
+    pub fn is_terminal_for_waypoint(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled)
+    }
+
     /// Whether this state satisfies a downstream dependency. `done` and
     /// `ignored` both unblock dependents; every other state does not.
     #[must_use]
@@ -2108,7 +2118,14 @@ impl Store {
             -- waypoint guidance has actually reached it yet
             -- (`undelivered`/`delivered`/`via-restack`/`failed`) --
             -- `via-restack` distinguishes delivery folded into an unrelated
-            -- rebase from a dedicated injection.
+            -- rebase from a dedicated injection. `stand_down_at_ms` (RAL-400
+            -- Phase 6) is separate from `delivery_status`: it tracks whether
+            -- this entry's optional advisory stand-down notice (sent once its
+            -- waypoint closes) has gone out yet -- NULL until
+            -- `crate::waypoints::run_pending_stand_down_notices` sends it.
+            -- `delivery_status` cannot double as this flag, since it is
+            -- already permanently consumed by the entry's first real
+            -- bearing-delivery outcome.
             CREATE TABLE IF NOT EXISTS waypoint_roster (
                 waypoint_id      TEXT NOT NULL,
                 kind             TEXT NOT NULL,
@@ -2117,6 +2134,7 @@ impl Store {
                 survey_verdict   TEXT,
                 survey_rationale TEXT,
                 delivery_status  TEXT NOT NULL DEFAULT 'undelivered',
+                stand_down_at_ms INTEGER,
                 created_at_ms    INTEGER NOT NULL,
                 updated_at_ms    INTEGER NOT NULL,
                 PRIMARY KEY (waypoint_id, kind, entry_id)
@@ -3813,6 +3831,16 @@ impl Store {
                 None,
                 &format!("squad → {}", state.as_str()),
             );
+            if state.is_terminal_for_waypoint() {
+                // RAL-400 Phase 6: a squad reaching `done`/`cancelled` may be
+                // the last non-terminal roster entry on one or more open
+                // waypoints -- best-effort, mirrors the existing
+                // `notify_watchers` side effects in this setter.
+                let _ = self.maybe_auto_close_waypoints_for_roster_entry(
+                    crate::waypoints::RosterEntryKind::Squad,
+                    id,
+                );
+            }
             Ok(())
         }
     }

@@ -2413,6 +2413,17 @@ impl Store {
                     None,
                 );
             }
+            if GuardianStatus::is_terminal_status(status.as_str()) {
+                // RAL-400 Phase 6: a review reaching `merged`/`cancelled`/
+                // `deployed` may be the last non-terminal roster entry on one
+                // or more open waypoints. `is_terminal_status` already
+                // excludes `merge_failed`, since a failed merge may still be
+                // retried and so is not "finished" for this purpose.
+                let _ = self.maybe_auto_close_waypoints_for_roster_entry(
+                    crate::waypoints::RosterEntryKind::Review,
+                    id,
+                );
+            }
             Ok(())
         }
     }
