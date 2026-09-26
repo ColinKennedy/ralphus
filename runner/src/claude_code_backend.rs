@@ -630,9 +630,7 @@ fn drive_stream_json(
     }
 
     if !state.saw_result {
-        return Err(BackendError(format!(
-            "claude-code exited ({status:?}) without a terminal result event"
-        )));
+        return Err(missing_result_error(&state, &format!("{status:?}")));
     }
     if let Some(error) = state.result_error.as_deref() {
         return Err(BackendError(format!("claude-code: {error}")));
@@ -669,6 +667,14 @@ struct ParseState {
     /// rejections can arrive as a zero-token "successful" result whose text is
     /// the only indication that no model invocation happened.
     result_error: Option<String>,
+    /// Set the moment an `assistant` event carries `isApiErrorMessage: true`
+    /// (`model: "<synthetic>"`) -- Claude Code's own client-side detection of
+    /// a dropped connection mid-response, fabricated before any real API
+    /// error body could arrive from the server. Captured here, distinct from
+    /// [`Self::result_error`], because the stream can end (child exits, no
+    /// further stdout) without ever emitting a terminal `result` event to
+    /// carry this detail forward -- see its use in `missing_result_error`.
+    synthetic_api_error: Option<String>,
     /// RAL-352: completed `assistant` events -- one per user/assistant
     /// exchange (each response event is both sides of the exchange).
     /// Compaction/tool-result events never increment it.
@@ -858,6 +864,29 @@ fn process_event(
                     }
                 }
             }
+            // Claude Code fabricates this event client-side the moment its
+            // connection to the API drops mid-response (`model` reads
+            // `"<synthetic>"`; no real error body was ever received) --
+            // classify it here, immediately, rather than waiting on a
+            // terminal `result` event that may never arrive.
+            if event["isApiErrorMessage"].as_bool() == Some(true) {
+                let category = event["error"].as_str().unwrap_or("unknown");
+                let text = event["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("");
+                state.synthetic_api_error = Some(if text.is_empty() {
+                    category.to_string()
+                } else {
+                    format!("{category}: {text}")
+                });
+                crate::cartographer::emit(
+                    "claude-code",
+                    "synthetic API error message",
+                    "warning",
+                    crate::cartographer::EventContext::default(),
+                    serde_json::json!({"category": category, "text": text}),
+                );
+            }
             let usage = &event["message"]["usage"];
             let ti = usage["input_tokens"].as_i64().unwrap_or(0);
             let to = usage["output_tokens"].as_i64().unwrap_or(0);
@@ -960,6 +989,27 @@ fn process_event(
                         text.trim().to_string()
                     }
                 });
+            // The cell's stored `error` field only ever carries the single
+            // flattened string above -- record the rest of this event's own
+            // fields to Cartographer too, so diagnosing a future failure
+            // isn't limited to one sentence with no context on how long the
+            // call ran or how it categorized itself.
+            if state.result_error.is_some() {
+                crate::cartographer::emit(
+                    "claude-code",
+                    "result event reported an error",
+                    "warning",
+                    crate::cartographer::EventContext::default(),
+                    serde_json::json!({
+                        "subtype": event["subtype"].as_str(),
+                        "is_error": event["is_error"].as_bool(),
+                        "duration_ms": event["duration_ms"].as_i64(),
+                        "duration_api_ms": event["duration_api_ms"].as_i64(),
+                        "num_turns": event["num_turns"].as_i64(),
+                        "quota_rejection": quota_rejection,
+                    }),
+                );
+            }
         }
         _ => {}
     }
@@ -967,6 +1017,22 @@ fn process_event(
 
 fn tool_type_code(name: Option<&str>) -> String {
     name.map_or_else(|| "tool.unknown".to_string(), |name| format!("tool.{name}"))
+}
+
+/// Builds the error for a claude-code exit with no terminal `result` event.
+/// Prefers `state.synthetic_api_error` (set the moment an `assistant` event
+/// flagged a client-side connection drop, see [`ParseState::synthetic_api_error`])
+/// over the bare exit status, since that's exactly the case where the
+/// process can die before ever emitting the `result` event that would
+/// otherwise carry this detail.
+fn missing_result_error(state: &ParseState, status_desc: &str) -> BackendError {
+    if let Some(detail) = state.synthetic_api_error.as_deref() {
+        BackendError(format!("claude-code: {detail}"))
+    } else {
+        BackendError(format!(
+            "claude-code exited ({status_desc}) without a terminal result event"
+        ))
+    }
 }
 
 fn wait_for_child(
@@ -1495,6 +1561,128 @@ mod tests {
         assert_eq!(
             state.result_error.as_deref(),
             Some("You've hit your session limit · resets 1:10am (America/Los_Angeles)")
+        );
+    }
+
+    /// Claude Code fabricates this `assistant` event client-side (`model:
+    /// "<synthetic>"`) the moment its connection to the API drops
+    /// mid-response, before any real error body could arrive from the
+    /// server -- captured immediately rather than waiting on a `result`
+    /// event that may never follow.
+    #[test]
+    fn process_event_flags_a_synthetic_api_error_on_an_assistant_event() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"assistant",
+                "error":"server_error",
+                "isApiErrorMessage":true,
+                "message":{
+                    "model":"<synthetic>",
+                    "role":"assistant",
+                    "content":[{
+                        "type":"text",
+                        "text":"API Error: Connection lost mid-response. The response above may be incomplete."
+                    }]
+                }
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(
+            state.synthetic_api_error.as_deref(),
+            Some(
+                "server_error: API Error: Connection lost mid-response. \
+                 The response above may be incomplete."
+            )
+        );
+    }
+
+    #[test]
+    fn process_event_ignores_an_ordinary_assistant_event_for_synthetic_api_error() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"assistant",
+                "message":{
+                    "model":"claude-sonnet-5",
+                    "role":"assistant",
+                    "content":[{"type":"text","text":"hello"}]
+                }
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(state.synthetic_api_error, None);
+    }
+
+    /// A synthetic connection-drop `assistant` event isn't always followed by
+    /// a terminal `result` event -- the child can simply exit right after.
+    /// [`missing_result_error`] must prefer the captured detail over the
+    /// generic "no terminal result event" message in that case.
+    #[test]
+    fn missing_result_error_prefers_the_synthetic_api_error_detail() {
+        let state = ParseState {
+            synthetic_api_error: Some(
+                "server_error: API Error: Connection lost mid-response. \
+                 The response above may be incomplete."
+                    .to_string(),
+            ),
+            ..ParseState::default()
+        };
+        let error = missing_result_error(&state, "exit status: 1");
+        assert_eq!(
+            error.0,
+            "claude-code: server_error: API Error: Connection lost mid-response. \
+             The response above may be incomplete."
+        );
+    }
+
+    #[test]
+    fn missing_result_error_falls_back_to_the_exit_status_when_nothing_was_captured() {
+        let state = ParseState::default();
+        let error = missing_result_error(&state, "exit status: 1");
+        assert_eq!(
+            error.0,
+            "claude-code exited (exit status: 1) without a terminal result event"
+        );
+    }
+
+    /// The flattened `error` string on the cell is the only piece of a
+    /// failing `result` event kept today -- this only asserts the state
+    /// change; the accompanying Cartographer emit (subtype/duration_ms/
+    /// num_turns) is a side effect this test harness has no hook to observe,
+    /// matching how every other `cartographer::emit` call in this file is
+    /// exercised only indirectly.
+    #[test]
+    fn process_event_still_captures_the_flattened_error_alongside_the_raw_result_fields() {
+        let mut state = ParseState::default();
+        let ws = test_workspace();
+        process_event(
+            &serde_json::json!({
+                "type":"result",
+                "subtype":"error_during_execution",
+                "is_error":true,
+                "duration_ms":4200,
+                "duration_api_ms":3900,
+                "num_turns":12,
+                "usage":{},
+                "result":"API Error: Connection lost mid-response. The response above may be incomplete."
+            }),
+            &mut state,
+            &ws,
+            None,
+            DEFAULT_TOOL_ARG_TRUNCATE_CHARS,
+        );
+        assert_eq!(
+            state.result_error.as_deref(),
+            Some("API Error: Connection lost mid-response. The response above may be incomplete.")
         );
     }
 
