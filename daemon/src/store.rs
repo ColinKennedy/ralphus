@@ -731,6 +731,11 @@ pub struct ProjectReviewSettings {
     /// suites.
     #[serde(default)]
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: project-level default for whether a review cancels a PR/MR's
+    /// still-running CI pipelines whenever a newer commit is force-pushed
+    /// onto the same branch. Defaults to `true` (on by default) when unset.
+    #[serde(default)]
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign, for a future review whose `[[review]]`
     /// block (and whose own per-review override) leaves the cap unset.
@@ -782,6 +787,7 @@ impl ProjectReviewSettings {
             auto_fix_prompt_template: self.auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes: self
                 .discourage_tests_during_auto_pull_request_fixes,
+            auto_cancel_outdated_pr_pipelines: self.auto_cancel_outdated_pr_pipelines,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
@@ -3012,6 +3018,12 @@ impl Store {
             // was never meant to carry. `None` for a PR never evaluated for
             // auto-fix yet.
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_last_outcome TEXT",
+            // RAL-510: per-review override for whether this review cancels a
+            // PR/MR's still-running CI pipelines whenever a newer commit is
+            // force-pushed onto the same branch. `None` inherits the
+            // project/global default, which resolves to `true` (on by
+            // default -- unlike most opt-in review settings).
+            "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -15224,6 +15236,7 @@ command = "e"
             auto_fix_pr_errors: Some(true),
             auto_fix_prompt_template: Some("fix it <<prompt>>".to_string()),
             discourage_tests_during_auto_pull_request_fixes: Some(true),
+            auto_cancel_outdated_pr_pipelines: Some(false),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),

@@ -236,6 +236,16 @@ pub struct ReviewConfig {
     /// block to override it with, so they always use this project default.
     #[serde(default)]
     pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-510: whether a review cancels a PR/MR's still-running CI
+    /// pipelines whenever a newer commit is force-pushed onto the same
+    /// branch. `None` means unset, which resolves to `true` (see
+    /// [`Self::auto_cancel_outdated_pr_pipelines`], on by default -- unlike
+    /// most opt-in review settings); per-project scalars win over the
+    /// global layer, same as `skip_worktrees`. A per-review override (see
+    /// `Guardian::auto_cancel_outdated_pr_pipelines` in `guardian.rs`) wins
+    /// over this.
+    #[serde(default)]
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// RAL-395: the prompt template handed to the resolver agent when
     /// `auto_fix_pr_errors` fires, with `<<prompt>>` replaced by the
     /// concatenated prompts of the failing branch's attached Cells. `None`
@@ -446,6 +456,14 @@ impl ReviewConfig {
         self.auto_fix_pr_errors.unwrap_or(false)
     }
 
+    /// Whether a review cancels a PR/MR's still-running CI pipelines
+    /// whenever a newer commit is force-pushed onto the same branch (unset
+    /// resolves to `true` -- on by default). RAL-510.
+    #[must_use]
+    pub fn auto_cancel_outdated_pr_pipelines(&self) -> bool {
+        self.auto_cancel_outdated_pr_pipelines.unwrap_or(true)
+    }
+
     /// The configured default auto-fix prompt template, unset resolves to
     /// `None` -- callers fall back to [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`].
     /// RAL-395.
@@ -556,6 +574,9 @@ impl ReviewConfig {
             separate_pr_branch: over.separate_pr_branch.or(self.separate_pr_branch),
             dual_root_pr: over.dual_root_pr.or(self.dual_root_pr),
             auto_fix_pr_errors: over.auto_fix_pr_errors.or(self.auto_fix_pr_errors),
+            auto_cancel_outdated_pr_pipelines: over
+                .auto_cancel_outdated_pr_pipelines
+                .or(self.auto_cancel_outdated_pr_pipelines),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
@@ -712,6 +733,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_fix_pr_errors",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_fix_pr_errors.is_some()),
+    ),
+    (
+        "auto_cancel_outdated_pr_pipelines",
+        ReviewFieldDefault::ProjectDefault(|c| c.auto_cancel_outdated_pr_pipelines.is_some()),
     ),
     (
         "auto_fix_prompt_template",

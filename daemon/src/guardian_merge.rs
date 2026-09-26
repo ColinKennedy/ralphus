@@ -6538,13 +6538,13 @@ pub fn run_feedback(
             // failing every feedback push (human-submitted or RAL-395
             // auto-fix) until one succeeds by luck.
             let owner = store.lock().get_guardian(id).ok().and_then(|g| g.owner);
+            let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
             let push_remote = crate::pr::resolve_feedback_fork_remote(
                 store,
                 Path::new(&branch_project),
                 owner.as_deref(),
             )
             .or_else(|| {
-                let forge_cfg = crate::config::resolve_forge(Path::new(&branch_project));
                 Some(crate::forge::resolve_remote_name(
                     Path::new(&branch_project),
                     &base,
@@ -6554,7 +6554,29 @@ pub fn run_feedback(
             match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
                 Ok(sha) => {
                     pushed = true;
-                    pushed_sha = Some(sha);
+                    pushed_sha = Some(sha.clone());
+                    // RAL-510: `push_remote` is always `Some` on this path (see
+                    // the comments above), which means `push_feedback_branch`
+                    // took its `explicit_remote` branch and pushed the local
+                    // `review_branch` name verbatim to the remote -- so the
+                    // remote branch this force-push just superseded CI on is
+                    // `review_branch` itself, not some derived alias.
+                    if let Some(remote_name) = push_remote.as_deref() {
+                        if let Ok(client) = crate::forge::resolve_remote_for(
+                            Path::new(&branch_project),
+                            remote_name,
+                            &forge_cfg,
+                        ) {
+                            crate::pr::cancel_superseded_ci_after_push(
+                                store,
+                                id,
+                                guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+                                Some(&client),
+                                &review_branch,
+                                &sha,
+                            );
+                        }
+                    }
                 }
                 Err(e) => push_error = Some(e),
             }
@@ -7863,52 +7885,45 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
     merged
 }
 
-/// If the guardian's base branch has moved in ANY of its projects since the stack
-/// was last built, rebuild it against the new base. Returns whether a rebuild ran.
-///
-/// For multi-project guardians (RAL-29), each project is checked independently;
-/// a shift in any one project triggers a full rebuild. Only reviews `in_review`
-/// or `merge_failed` are eligible. The first base commit seen for a project is
-/// just recorded (no rebuild) so an existing review is not rebuilt merely because
-/// the per-project column was previously unset.
-pub fn rebuild_on_base_shift(
-    store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
-    id: &str,
-    sem: &Semaphore,
-    cancel: &CancelToken,
-) -> bool {
-    let guardian = match store.lock().get_guardian(id) {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    if !matches!(guardian.status.as_str(), "in_review" | "merge_failed") {
-        return false;
-    }
-    // RAL-250: when this review has opted out of base-branch auto-updates, the
-    // maintenance sweep must not rebuild it on a base shift. This gates ONLY
-    // this automatic pass -- a manual `review upstream set` / merge goes
-    // through its own explicit path and is unaffected.
-    if guardian.effective_skip_base_updates {
-        return false;
-    }
+/// RAL-510: how long [`rebuild_on_base_shift`] waits, after first detecting a
+/// base-branch shift, before re-checking and dispatching a rebuild against
+/// whatever the base has settled on. Several reviews hanging off the same
+/// busy upstream would otherwise turn every single commit landing there into
+/// its own full stacked rebuild (each force-pushing every branch and
+/// stranding the previous CI run) -- pausing briefly and re-detecting folds
+/// any commits that land within this window into the one rebuild that
+/// follows, instead of one rebuild per commit.
+const BASE_SHIFT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
-    // Check every project in the guardian for a base-branch shift. Also track
-    // (RAL-300) whether every project's own enabled branches are already an
-    // ancestor of that project's *current* base -- the inverse direction from
-    // a shift: not "the base moved past us" but "the base already contains
-    // us" (e.g. a fast-forward merge that landed the stack's work
-    // outside any tracked PR). `fully_landed` starts true and is cleared by
-    // any project this can't positively confirm for, so an unresolvable
-    // project never silently counts as "safe to skip".
+/// One pass comparing each of a guardian's projects' current upstream base
+/// against its stored baseline. Factored out of [`rebuild_on_base_shift`] so
+/// it can run twice: once to detect a shift, and again after
+/// [`BASE_SHIFT_DEBOUNCE`] to settle on the final target before dispatching.
+struct BaseShiftDetection {
+    /// Whether any project's base moved since the stored baseline.
+    any_shifted: bool,
+    /// Whether every project already has a stored baseline (false right
+    /// after a project is first added, before any shift can be observed).
+    all_have_baseline: bool,
+    /// RAL-300: whether every project's enabled branches are already an
+    /// ancestor of that project's *current* base -- the shift IS this
+    /// review landing, not upstream work to rebase onto.
+    fully_landed: bool,
+    shift_detail: Vec<String>,
+    /// RAL-507: the upstream base SHA each shifted project would be rebuilt
+    /// against, keyed by project -- the retry campaign's durable identity.
+    shift_targets: std::collections::BTreeMap<String, String>,
+}
+
+fn detect_base_shift(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+) -> BaseShiftDetection {
     let mut any_shifted = false;
     let mut all_have_baseline = true;
     let mut fully_landed = !guardian.projects.is_empty();
     let mut shift_detail: Vec<String> = Vec::new();
-    // RAL-507: the upstream base SHA each shifted project would be rebuilt
-    // against. This map is the retry campaign's durable identity -- keyed by
-    // the *upstream* base SHAs, never by rebase-generated review SHAs, which
-    // churn on every unrelated rebase.
     let mut shift_targets: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for proj in &guardian.projects {
@@ -7940,20 +7955,79 @@ pub fn rebuild_on_base_shift(
                 ));
             }
         }
-        if !project_already_in_base(&root, &guardian, proj, &current) {
+        if !project_already_in_base(&root, guardian, proj, &current) {
             fully_landed = false;
         }
     }
+    BaseShiftDetection {
+        any_shifted,
+        all_have_baseline,
+        fully_landed,
+        shift_detail,
+        shift_targets,
+    }
+}
 
+/// If the guardian's base branch has moved in ANY of its projects since the stack
+/// was last built, rebuild it against the new base. Returns whether a rebuild ran.
+///
+/// For multi-project guardians (RAL-29), each project is checked independently;
+/// a shift in any one project triggers a full rebuild. Only reviews `in_review`
+/// or `merge_failed` are eligible. The first base commit seen for a project is
+/// just recorded (no rebuild) so an existing review is not rebuilt merely because
+/// the per-project column was previously unset.
+pub fn rebuild_on_base_shift(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    sem: &Semaphore,
+    cancel: &CancelToken,
+) -> bool {
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if !matches!(guardian.status.as_str(), "in_review" | "merge_failed") {
+        return false;
+    }
+    // RAL-250: when this review has opted out of base-branch auto-updates, the
+    // maintenance sweep must not rebuild it on a base shift. This gates ONLY
+    // this automatic pass -- a manual `review upstream set` / merge goes
+    // through its own explicit path and is unaffected.
+    if guardian.effective_skip_base_updates {
+        return false;
+    }
+
+    let first_pass = detect_base_shift(store, id, &guardian);
     // Also fall back to the legacy single-project base_commit for existing rows
     // that were created before multi-project support was added.
-    if !any_shifted && !all_have_baseline {
+    if !first_pass.any_shifted && !first_pass.all_have_baseline {
         // Some projects got a first-time baseline; don't rebuild.
         return false;
     }
-    if !any_shifted {
+    if !first_pass.any_shifted {
         return false;
     }
+
+    // RAL-510: settle briefly and re-detect so a burst of near-simultaneous
+    // upstream commits folds into this same dispatch instead of each
+    // triggering its own separate rebuild. This runs before the RAL-507
+    // retry-budget check below so no pending shift ever consumes budget
+    // before it has actually settled.
+    std::thread::sleep(BASE_SHIFT_DEBOUNCE);
+    let settled = detect_base_shift(store, id, &guardian);
+    if !settled.any_shifted {
+        // The shift resolved itself during the debounce wait (e.g. the base
+        // branch was reset back to the prior baseline) -- nothing to rebuild.
+        return false;
+    }
+    let BaseShiftDetection {
+        fully_landed,
+        shift_detail,
+        shift_targets,
+        ..
+    } = settled;
+
     // RAL-300: a base shift alone doesn't mean this review has new upstream
     // work to rebase onto -- if the shift itself is every project absorbing
     // this review's own branches (already-ancestor for all of them), then the

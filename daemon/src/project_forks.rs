@@ -476,8 +476,10 @@ pub(crate) fn allocate_review_upstream_branch(
 /// The push is deliberately `--force`, unlike the fork's own base branch
 /// (which ralphus never touches): this ref is disposable and owned entirely
 /// by the review, so overwriting it can never lose anyone else's work.
-/// Returns whether a push was needed -- an already-current branch skips the
-/// push entirely, so periodic refreshes stay cheap.
+/// Returns the pushed tip sha when a push was needed, `None` when the branch
+/// was already current -- an already-current branch skips the push entirely,
+/// so periodic refreshes stay cheap. RAL-510: the caller uses the returned
+/// sha as `cancel_superseded_ci`'s `keep_sha` for this force-push.
 ///
 /// # Errors
 /// Propagates the underlying `git fetch`/`git push` failure.
@@ -487,7 +489,7 @@ pub(crate) fn sync_review_upstream_branch(
     fork_remote_name: &str,
     base_branch_name: &str,
     review_branch: &str,
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<Option<String>, String> {
     crate::guardian_merge::git(root, &["fetch", parent_remote_name, base_branch_name])
         .map_err(|e| format!("could not fetch {parent_remote_name}/{base_branch_name}: {e}"))?;
     let tip = crate::guardian_merge::git(root, &["rev-parse", "FETCH_HEAD"])
@@ -507,7 +509,7 @@ pub(crate) fn sync_review_upstream_branch(
     .and_then(|line| line.split_once('\t'))
     .map(|(sha, _)| sha.trim().to_string());
     if current.as_deref() == Some(tip.as_str()) {
-        return Ok(false);
+        return Ok(None);
     }
     crate::guardian_merge::git(
         root,
@@ -518,7 +520,7 @@ pub(crate) fn sync_review_upstream_branch(
             &format!("{tip}:refs/heads/{review_branch}"),
         ],
     )
-    .map(|_| true)
+    .map(|_| Some(tip))
     .map_err(|e| format!("could not force-push the review upstream branch {review_branch}: {e}"))
 }
 

@@ -69,6 +69,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             auto_fix_pr_errors,
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
+            auto_cancel_outdated_pr_pipelines,
         } => {
             let patch = ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -90,6 +91,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
+                auto_cancel_outdated_pr_pipelines,
             };
             Ok(client.set_project_review_settings(&name, &patch)?)
         }

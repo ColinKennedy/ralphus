@@ -401,6 +401,11 @@ struct Membership {
     /// prefer automatic formatters/linters/static analysis and avoid broad
     /// or expensive test suites.
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: optional override declared on the review (`[[review]]
+    /// auto_cancel_outdated_pr_pipelines`) for whether this review cancels a
+    /// PR/MR's still-running CI pipelines whenever a newer commit is
+    /// force-pushed onto the same branch.
+    auto_cancel_outdated_pr_pipelines: Option<bool>,
 }
 
 /// Build the planner's cell/task rows straight from the task file (same order
@@ -1006,6 +1011,7 @@ pub fn derive_reviews_with_full_prefetch(
                 .filter(|s| !s.trim().is_empty()),
             discourage_tests_during_auto_pull_request_fixes: rv
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
+            auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
         });
     }
 
@@ -1306,6 +1312,16 @@ fn apply_project_review_defaults(
             .set_guardian_discourage_tests_during_auto_pull_request_fixes(gid, Some(true))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
+    // RAL-510: same "fill the gap from project config" treatment as
+    // `auto_fix_pr_errors` above, but inverted -- this setting defaults to
+    // `true`, so only a project config that opts back out (`false`) needs
+    // stamping; leaving the row `None` already resolves to `true` at
+    // dispatch time.
+    if row.auto_cancel_outdated_pr_pipelines.is_none() && !cfg.auto_cancel_outdated_pr_pipelines() {
+        store
+            .set_guardian_auto_cancel_outdated_pr_pipelines(gid, Some(false))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -1421,6 +1437,16 @@ fn apply_resolver(
     {
         store
             .set_guardian_discourage_tests_during_auto_pull_request_fixes(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // RAL-510: this review's own cancel-outdated-PR-pipelines override,
+    // authored via `[[review]] auto_cancel_outdated_pr_pipelines`.
+    if let Some(enabled) = members
+        .iter()
+        .find_map(|m| m.auto_cancel_outdated_pr_pipelines)
+    {
+        store
+            .set_guardian_auto_cancel_outdated_pr_pipelines(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -3013,6 +3039,7 @@ mod tests {
             auto_fix_pr_errors: None,
             auto_fix_prompt_template: None,
             discourage_tests_during_auto_pull_request_fixes: None,
+            auto_cancel_outdated_pr_pipelines: None,
         }
     }
 
