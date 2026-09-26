@@ -22932,6 +22932,7 @@ remediation_attempts = 1
                     agent_session_id: None,
                     turns: None,
                     ghost: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
@@ -23085,6 +23086,7 @@ remediation_attempts = 1
                     agent_session_id: None,
                     turns: None,
                     ghost: None,
+                    prophecies: Vec::new(),
                 }
             }
         }
