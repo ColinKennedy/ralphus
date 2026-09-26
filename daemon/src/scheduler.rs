@@ -120,15 +120,17 @@ pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60
 pub const CPU_STALL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often to run the RAL-400 waypoint survey sweep
-/// (`crate::waypoints::run_pending_surveys`) and its sibling resume sweep
-/// (`crate::waypoints::run_pending_waypoint_resumes`, Phase 3). A waypoint is
+/// (`crate::waypoints::run_pending_surveys`) and its sibling sweeps: the
+/// squad-resume sweep (`crate::waypoints::run_pending_waypoint_resumes`,
+/// Phase 3) and the review-feedback delivery sweep
+/// (`crate::waypoints::run_pending_deliveries`, Phase 4). A waypoint is
 /// a human-driven, coarse-grained event (someone declaring mid-flight
 /// impact, or a waypoint closing), not something needing sub-minute
 /// reaction, and every candidate's actual LLM call runs on its own spawned
 /// thread rather than the scheduler thread -- so a minute of added latency
 /// before a brand-new waypoint or newly-non-terminal candidate gets
-/// surveyed, or a halted cell resumes, is an acceptable, cheap-to-check
-/// cadence.
+/// surveyed, a halted cell resumes, or an impacted review receives its
+/// feedback, is an acceptable, cheap-to-check cadence.
 pub const WAYPOINT_SURVEY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Resolves `agent` against RAL-473 database-backed profiles/backend-command
@@ -629,6 +631,7 @@ pub fn run_loop(
         if last_waypoint_survey.elapsed() >= WAYPOINT_SURVEY_INTERVAL {
             crate::waypoints::run_pending_surveys(&store, &waypoint_halts);
             crate::waypoints::run_pending_waypoint_resumes(&store, &cancellations);
+            crate::waypoints::run_pending_deliveries(&store, &runner);
             last_waypoint_survey = std::time::Instant::now();
         }
         std::thread::sleep(POLL_INTERVAL);
