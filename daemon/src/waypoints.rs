@@ -15,6 +15,22 @@
 //! A separate, not-yet-implemented `pending_injections` mechanism
 //! ([`PendingInjectionView`]) is schema-only -- see
 //! `.agent/waypoints-phase0-decisions.md` for the full design.
+//!
+//! Phase 5 (scenario 3, in-flight delivery + parking) pulls forward only the
+//! hard-halt/ghost-fold half of the design; see
+//! `.agent/waypoints-phase5-decisions.md`. When a squad's in-flight cell is
+//! halted for a blocking waypoint (`daemon/src/scheduler.rs`'s
+//! `is_waypoint_halted()` branch), the halted cell's current bearing list is
+//! rendered via [`render_bearing_block`] and folded into that cell's own
+//! ghost note (`Store::upsert_ghost`), so the existing ghost-context prepend
+//! to a cell's prompt on redispatch (already built for dependency handoffs)
+//! carries it forward once the waypoint closes and the cell resumes -- no
+//! new delivery channel, no new `CellSpec`/`RunnerSpec` field. The static,
+//! unconditional half of the waypoint-injection prompt contract (what a
+//! bearing block means, and that the agent must inspect its own working
+//! state rather than assume) lives instead in `daemon/src/runner.rs`'s
+//! `WAYPOINT_SYSTEM_PROMPT`, mirrored byte-identically in
+//! `runner/src/execute.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1367,6 +1383,52 @@ fn waypoint_feedback_text(waypoint: &WaypointView) -> String {
     }
 }
 
+/// RAL-400 Phase 5: render a waypoint's current bearing list into a compact,
+/// clearly-delimited block for the ghost-fold delivery path (see this
+/// module's doc comment). Returns `None` for an empty list rather than an
+/// empty/near-empty block, so a halted cell with no bearings yet doesn't get
+/// a note that just says nothing.
+///
+/// Preserves the distinction between a completed change (`commit_id`/
+/// `commit_summary` populated -- the bearing is tied to an actual commit)
+/// and a requested/proposed one (those fields `None` -- the bearing is pure
+/// guidance text) by only appending the `(completed: ...)` marker when the
+/// commit fields are present; the raw `summary` text -- wherever "required"
+/// vs. "proposed" wording lives -- is always rendered verbatim, never
+/// stripped or normalized away. Commit summaries and entity links are
+/// included as investigation leads, matching `WAYPOINT_SYSTEM_PROMPT`'s
+/// instruction that they are leads, not a substitute for inspecting the
+/// cell's own working state.
+#[must_use]
+pub fn render_bearing_block(waypoint_id: &str, bearings: &[BearingView]) -> Option<String> {
+    if bearings.is_empty() {
+        return None;
+    }
+    let mut out = format!("--- Waypoint `{waypoint_id}` bearings ---\n");
+    for bearing in bearings {
+        out.push_str(&format!(
+            "- [{} {}] {}",
+            bearing.producer_kind.as_str(),
+            bearing.producer_id,
+            bearing.summary
+        ));
+        if let (Some(commit_id), Some(commit_summary)) = (
+            bearing.commit_id.as_deref(),
+            bearing.commit_summary.as_deref(),
+        ) {
+            out.push_str(&format!(
+                " (completed: commit {commit_id} -- {commit_summary})"
+            ));
+        }
+        if let Some(entity_uri) = bearing.entity_uri.as_deref() {
+            out.push_str(&format!(" [{entity_uri}]"));
+        }
+        out.push('\n');
+    }
+    out.push_str("--- End waypoint bearings ---\n");
+    Some(out)
+}
+
 /// Scheduler-owned periodic sweep (RAL-400 Phase 4): deliver every open
 /// waypoint's guidance to every roster entry judged impacted. A `NULL` or
 /// `"impacted"` `survey_verdict` both count as impacted here (mirroring
@@ -1816,6 +1878,95 @@ mod tests {
         assert_eq!(one[0].summary, "for one");
         assert_eq!(two.len(), 1);
         assert_eq!(two[0].summary, "for two");
+    }
+
+    #[test]
+    fn render_bearing_block_returns_none_for_an_empty_list() {
+        assert_eq!(render_bearing_block("waypoint-1", &[]), None);
+    }
+
+    #[test]
+    fn render_bearing_block_preserves_completed_requested_and_proposed_distinction() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        // Completed: tied to an actual commit.
+        let completed = store
+            .append_waypoint_bearing(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-completed",
+                "renamed the shared helper to `resolve_thing`",
+                Some("squad:squad-completed"),
+                Some("deadbeef"),
+                Some("refactor: rename helper"),
+            )
+            .unwrap();
+        // Requested: pure guidance text, no commit yet.
+        let requested = store
+            .append_waypoint_bearing(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-requested",
+                "please rename your call sites to use the new helper name",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // Proposed/planned: pure guidance text, phrased as not-yet-decided.
+        let proposed = store
+            .append_waypoint_bearing(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-proposed",
+                "considering removing the helper entirely in a future pass",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let bearings = store.list_waypoint_bearings("waypoint-1").unwrap();
+        let block = render_bearing_block("waypoint-1", &bearings).expect("non-empty block");
+
+        assert!(block.starts_with("--- Waypoint `waypoint-1` bearings ---\n"));
+        assert!(block.trim_end().ends_with("--- End waypoint bearings ---"));
+
+        // Completed bearing: commit marker present, entity link present.
+        assert!(
+            block.contains("renamed the shared helper to `resolve_thing`"),
+            "{block}"
+        );
+        assert!(
+            block.contains("(completed: commit deadbeef -- refactor: rename helper)"),
+            "{block}"
+        );
+        assert!(block.contains("[squad:squad-completed]"), "{block}");
+
+        // Requested bearing: raw summary present verbatim, no commit marker.
+        assert!(
+            block.contains("please rename your call sites to use the new helper name"),
+            "{block}"
+        );
+
+        // Proposed bearing: raw summary present verbatim, no commit marker.
+        assert!(
+            block.contains("considering removing the helper entirely in a future pass"),
+            "{block}"
+        );
+
+        // None of the three collapse into an identical rendering -- the
+        // completed marker distinguishes bearing 1 from bearings 2 and 3,
+        // and each bearing's own summary text distinguishes it from the
+        // others (nothing is normalized away).
+        let ids = [completed.id, requested.id, proposed.id];
+        assert_eq!(ids.len(), 3, "sanity: three distinct bearings recorded");
+        let completed_marker_count = block.matches("(completed:").count();
+        assert_eq!(
+            completed_marker_count, 1,
+            "only the completed bearing should carry a commit marker: {block}"
+        );
     }
 
     #[test]

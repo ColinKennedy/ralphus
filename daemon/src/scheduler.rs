@@ -2828,6 +2828,30 @@ fn run_cell_worker(
         let _ = guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome);
         let _ = guard.mark_cell_waypoint_halted(squad_id, row.task_idx, row.idx);
         let waypoint_id = guard.squad_block_gating_waypoint(squad_id).ok().flatten();
+        // RAL-400 Phase 5: fold the waypoint's current bearing list into this
+        // cell's own ghost note (the same handoff channel a self-summarized
+        // `result.ghost` publishes through above), so the periodic
+        // resume-sweep's redispatch of this cell carries the bearing context
+        // forward automatically via the existing ghost-context prepend --
+        // no separate delivery channel for the parked case.
+        if let Some(wp_id) = waypoint_id.as_deref() {
+            if let Ok(bearings) = guard.list_waypoint_bearings(wp_id) {
+                if let Some(bearing_text) = crate::waypoints::render_bearing_block(wp_id, &bearings)
+                {
+                    let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
+                    let revision =
+                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let _ = guard.upsert_ghost(
+                        &uri,
+                        crate::ghost::KIND_CELL,
+                        Some(squad_id),
+                        None,
+                        &bearing_text,
+                        revision.as_deref(),
+                    );
+                }
+            }
+        }
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
             source: "scheduler",
@@ -5182,6 +5206,71 @@ mod tests {
                 .iter()
                 .any(|r| r.message == "cell halted by waypoint block"),
             "expected a Cartographer row recording the waypoint halt"
+        );
+    }
+
+    /// RAL-400 Phase 5: the "parking" half of the resumability question --
+    /// a waypoint-halted cell must fold the waypoint's current bearing list
+    /// into its own ghost note, so the periodic resume-sweep's redispatch
+    /// carries the bearing context forward automatically through the
+    /// existing ghost-context prepend, with no separate delivery channel.
+    #[test]
+    fn a_waypoint_halted_cell_folds_current_bearings_into_its_own_ghost_note() {
+        let (store, id) = store_with(ONE_CELL);
+        {
+            let guard = store.lock();
+            guard
+                .create_waypoint(
+                    "waypoint-1",
+                    Some("release freeze"),
+                    "is this squad affected?",
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_roster_entry(
+                    "waypoint-1",
+                    crate::waypoints::RosterEntryKind::Squad,
+                    &id,
+                    crate::waypoints::RosterMode::Block,
+                )
+                .unwrap();
+            guard
+                .append_waypoint_bearing(
+                    "waypoint-1",
+                    crate::waypoints::RosterEntryKind::Review,
+                    "other-review",
+                    "renamed the shared auth trait",
+                    None,
+                    Some("abc123"),
+                    Some("rename AuthProvider to AuthBackend"),
+                )
+                .unwrap();
+        }
+
+        execute_squad(&store, &WaypointHaltRunner, &id);
+
+        let guard = store.lock();
+        let ghost = guard
+            .get_ghost(&crate::ghost::cell_uri(&id, 0, 0))
+            .unwrap()
+            .expect("waypoint halt must publish a ghost note for this cell");
+        assert!(
+            ghost.content.contains("waypoint-1"),
+            "ghost note must identify which waypoint it came from: {}",
+            ghost.content
+        );
+        assert!(
+            ghost.content.contains("renamed the shared auth trait"),
+            "ghost note must carry the bearing's summary: {}",
+            ghost.content
+        );
+        assert!(
+            ghost.content.contains("abc123"),
+            "ghost note must preserve the completed-change commit reference: {}",
+            ghost.content
         );
     }
 
