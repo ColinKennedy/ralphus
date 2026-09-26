@@ -672,13 +672,13 @@ mod tests {
             "/api/tasks",
             "",
             None,
-            Some("secret-token-value"),
+            Some("test-token-value"),
         );
         handle_thread.join().unwrap();
         assert_eq!(reply.status, 200);
         assert_eq!(
             received.lock().unwrap().clone(),
-            Some("Bearer secret-token-value".to_string())
+            Some("Bearer test-token-value".to_string())
         );
     }
 

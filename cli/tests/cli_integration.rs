@@ -171,13 +171,13 @@ fn requests_carry_the_bearer_token_from_the_env_override() {
     let (code, _) = run_cli_with_env(
         &daemon.url(),
         &["status"],
-        &[("RALPHUS_DAEMON_TOKEN", "s3cr3t-token")],
+        &[("RALPHUS_DAEMON_TOKEN", "test-token-value")],
     );
     assert_eq!(code, 0);
     let headers = seen.lock().unwrap();
     assert_eq!(
         headers.as_slice(),
-        [Some("Bearer s3cr3t-token".to_string())]
+        [Some("Bearer test-token-value".to_string())]
     );
 }
 
