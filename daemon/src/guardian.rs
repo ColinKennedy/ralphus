@@ -676,6 +676,14 @@ pub struct GuardianView {
     /// layering as [`Self::auto_fix_pr_errors`]), else resolves to `false`
     /// at dispatch time.
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: whether this review cancels a PR/MR's still-running CI
+    /// pipelines whenever a newer commit is force-pushed onto the same
+    /// branch. `None` means unset -- filled in at creation time from the
+    /// project's `.ralphus.toml [review] auto_cancel_outdated_pr_pipelines`
+    /// default (`reviews::apply_project_review_defaults`, same layering as
+    /// [`Self::auto_fix_pr_errors`]), else resolves to `true` at dispatch
+    /// time (on by default -- unlike most opt-in review settings).
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// The review source type. `git` (the default and only fully-implemented
     /// type) drives the branch-stacking flow; other values are placeholders for
     /// future non-git review kinds (see CCTL-112). Existing/derived reviews are
@@ -2959,6 +2967,29 @@ impl Store {
         }
     }
 
+    /// Set this review's own override for whether it cancels a PR/MR's
+    /// still-running CI pipelines whenever a newer commit is force-pushed
+    /// onto the same branch (RAL-510). `None` inherits the project/global
+    /// default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_auto_cancel_outdated_pr_pipelines(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET auto_cancel_outdated_pr_pipelines=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set this review's own override of the auto-fix prompt template
     /// (RAL-395). `None` inherits the project/global default. Callers must
     /// validate the `<<prompt>>` placeholder is present before calling this
@@ -4455,7 +4486,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines
                  FROM guardians WHERE id=?", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 params![id],
                 Self::map_guardian_row,
@@ -4571,7 +4602,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_auto_build, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines
              FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 14) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -4698,6 +4729,7 @@ impl Store {
             base_shift_rebuild_attempts: r.get::<_, i64>(64)?,
             base_shift_rebuild_targets: r.get(65)?,
             base_shift_exhausted_notified_at_ms: r.get(66)?,
+            auto_cancel_outdated_pr_pipelines: r.get::<_, Option<i64>>(67)?.map(|v| v != 0),
         })
     }
 
@@ -5158,6 +5190,7 @@ impl Store {
                 .clamp(0, i64::from(u32::MAX)) as u32,
             base_shift_rebuild_targets,
             base_shift_exhausted_notified_at_ms: row.base_shift_exhausted_notified_at_ms,
+            auto_cancel_outdated_pr_pipelines: row.auto_cancel_outdated_pr_pipelines,
             match_pr_branch_name: row.match_pr_branch_name,
             effective_match_pr_branch_name,
             separate_pr_branch: row.separate_pr_branch,
@@ -5625,6 +5658,11 @@ struct GuardianRow {
     /// RAL-507: when the mailbox was told this campaign's budget is
     /// exhausted (one-time, dedup marker).
     base_shift_exhausted_notified_at_ms: Option<i64>,
+    /// RAL-510: per-review override for whether this review cancels a
+    /// PR/MR's still-running CI pipelines whenever a newer commit is
+    /// force-pushed onto the same branch. `None` inherits the
+    /// project/global default.
+    auto_cancel_outdated_pr_pipelines: Option<bool>,
 }
 
 #[cfg(test)]

@@ -387,6 +387,15 @@ pub struct CreatedStack {
     pub number: i64,
 }
 
+/// Outcome of a [`ForgeClient::cancel_superseded_ci`] call (RAL-510): the
+/// forge-native run/workflow-run id (GitHub) or pipeline id (GitLab) of
+/// every superseded run this cancelled. Empty when nothing on the branch
+/// needed cancelling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CancelSummary {
+    pub cancelled: Vec<i64>,
+}
+
 /// A resolved connection to one forge repository: enough to create PRs, list
 /// comments, and fetch a PR template. Built by [`resolve_remote`].
 #[derive(Clone)]
@@ -1356,6 +1365,175 @@ impl ForgeClient {
             .map_err(|e| self.describe_evicting(e))?
             .into_string()
             .map_err(|e| format!("forge API read: {e}"))
+    }
+
+    /// Cancel every still-running CI run/pipeline on `branch` that predates
+    /// `keep_sha` (RAL-510). Callers push *first*, then call this -- never
+    /// the other way around -- so a pipeline still running for the commit
+    /// that ends up staying (e.g. because `guard_against_clobber` rejects
+    /// the push) is never killed out from under it; `keep_sha` is what tells
+    /// a still-in-flight run for the branch's new head apart from a run left
+    /// over from the commit the push just superseded, so only the latter is
+    /// ever cancelled.
+    ///
+    /// Best-effort in the sense that a run/pipeline this can't classify
+    /// (missing sha or status) is left alone rather than risking a
+    /// false-positive cancel of the commit the caller wants kept. Logs the
+    /// outbound call (start/done/error) via `rlog!`; callers own the
+    /// structured Cartographer row per cancellation decision, per this
+    /// file's provider-boundary convention (see e.g.
+    /// [`Self::update_pull_request_base`]'s doc).
+    pub fn cancel_superseded_ci(
+        &self,
+        branch: &str,
+        keep_sha: &str,
+    ) -> Result<CancelSummary, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] cancel superseded ci start kind={} repo={} branch={branch} \
+             keep_sha={keep_sha}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.cancel_superseded_ci_inner(branch, keep_sha);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(summary) => crate::rlog!(
+                INFO,
+                "ralphus [forge] cancel superseded ci done kind={} repo={} branch={branch} \
+                 keep_sha={keep_sha} cancelled={}",
+                self.kind.as_str(),
+                self.repo_path,
+                summary.cancelled.len()
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] cancel superseded ci failed kind={} repo={} branch={branch} \
+                 keep_sha={keep_sha}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn cancel_superseded_ci_inner(
+        &self,
+        branch: &str,
+        keep_sha: &str,
+    ) -> Result<CancelSummary, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => self.cancel_superseded_github_runs(branch, keep_sha, token),
+            ForgeKind::GitLab => self.cancel_superseded_gitlab_pipelines(branch, keep_sha, token),
+        }
+    }
+
+    /// GitHub half of [`Self::cancel_superseded_ci`]: lists this branch's
+    /// workflow runs and force-cancels every one still in flight (`queued`,
+    /// `in_progress`, `requested`, or `waiting`) whose head sha isn't
+    /// `keep_sha`. Always force-cancels directly rather than a polite-then-
+    /// escalate two-step -- a superseded run's result is already moot, so
+    /// there is nothing to wait for. A `409` from `force-cancel` means the
+    /// run reached a terminal state on its own between the list call and
+    /// this one -- benign, not an error, since the goal ("this run doesn't
+    /// keep burning CI capacity") already holds.
+    fn cancel_superseded_github_runs(
+        &self,
+        branch: &str,
+        keep_sha: &str,
+        token: &str,
+    ) -> Result<CancelSummary, String> {
+        let url = format!("{}/repos/{}/actions/runs", self.api_base, self.repo_path);
+        let resp = self.get(
+            ureq::get(&url)
+                .query("branch", branch)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        )?;
+        let runs = resp["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut cancelled = Vec::new();
+        for run in &runs {
+            if run["head_sha"].as_str() == Some(keep_sha) {
+                continue;
+            }
+            if !matches!(
+                run["status"].as_str().unwrap_or_default(),
+                "queued" | "in_progress" | "requested" | "waiting"
+            ) {
+                continue;
+            }
+            let Some(run_id) = run["id"].as_i64() else {
+                continue;
+            };
+            let cancel_url = format!(
+                "{}/repos/{}/actions/runs/{run_id}/force-cancel",
+                self.api_base, self.repo_path
+            );
+            match ureq::post(&cancel_url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json")
+                .set("Content-Type", "application/json")
+                .send_string("{}")
+            {
+                Ok(_) => cancelled.push(run_id),
+                Err(ureq::Error::Status(409, _)) => {}
+                Err(e) => return Err(self.describe_evicting(e).into()),
+            }
+        }
+        Ok(CancelSummary { cancelled })
+    }
+
+    /// GitLab half of [`Self::cancel_superseded_ci`]: lists this branch's
+    /// pipelines and cancels every one still active (`created`,
+    /// `waiting_for_resource`, `preparing`, `pending`, or `running`) whose
+    /// sha isn't `keep_sha`. GitLab's cancel endpoint is idempotent --
+    /// cancelling an already-terminal pipeline just returns its current
+    /// state unchanged -- so there is no GitHub-style conflict status to
+    /// swallow here.
+    fn cancel_superseded_gitlab_pipelines(
+        &self,
+        branch: &str,
+        keep_sha: &str,
+        token: &str,
+    ) -> Result<CancelSummary, String> {
+        let url = format!("{}/projects/{}/pipelines", self.api_base, self.repo_path);
+        let resp = self.get(
+            ureq::get(&url)
+                .query("ref", branch)
+                .set("PRIVATE-TOKEN", token),
+        )?;
+        let pipelines = resp.as_array().cloned().unwrap_or_default();
+        let mut cancelled = Vec::new();
+        for pipeline in &pipelines {
+            if pipeline["sha"].as_str() == Some(keep_sha) {
+                continue;
+            }
+            if !matches!(
+                pipeline["status"].as_str().unwrap_or_default(),
+                "created" | "waiting_for_resource" | "preparing" | "pending" | "running"
+            ) {
+                continue;
+            }
+            let Some(pipeline_id) = pipeline["id"].as_i64() else {
+                continue;
+            };
+            let cancel_url = format!(
+                "{}/projects/{}/pipelines/{pipeline_id}/cancel",
+                self.api_base, self.repo_path
+            );
+            self.send(
+                ureq::post(&cancel_url).set("PRIVATE-TOKEN", token),
+                &serde_json::json!({}),
+            )?;
+            cancelled.push(pipeline_id);
+        }
+        Ok(CancelSummary { cancelled })
     }
 
     /// Retarget an already-open PR/MR's base/target branch (RAL-190: keeps a
@@ -3190,6 +3368,228 @@ mod tests {
         );
 
         assert_eq!(client.fetch_pr_template().as_deref(), Some("## Summary\n"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_superseded_ci_github_skips_keep_sha_and_treats_409_as_benign() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/repos/acme/widget/actions/runs");
+            assert!(query.contains("branch=feature"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"workflow_runs":[
+                        {"id":1,"head_sha":"keep","status":"in_progress"},
+                        {"id":2,"head_sha":"old1","status":"in_progress"},
+                        {"id":3,"head_sha":"old2","status":"queued"},
+                        {"id":4,"head_sha":"old3","status":"completed"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/actions/runs/2/force-cancel");
+            req.respond(tiny_http::Response::from_string("").with_status_code(202))
+                .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/actions/runs/3/force-cancel");
+            // Already terminal by the time this call landed -- benign, not
+            // surfaced as an error.
+            req.respond(tiny_http::Response::from_string("").with_status_code(409))
+                .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
+        assert_eq!(summary.cancelled, vec![2]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_superseded_ci_gitlab_skips_keep_sha_and_non_active_pipelines() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/projects/acme%2Fwidget/pipelines");
+            assert!(query.contains("ref=feature"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[
+                        {"id":10,"sha":"keep","status":"running"},
+                        {"id":11,"sha":"old1","status":"running"},
+                        {"id":12,"sha":"old2","status":"success"}
+                    ]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/pipelines/11/cancel");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"id":11,"status":"canceled"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
+        assert_eq!(summary.cancelled, vec![11]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_superseded_github_run_cannot_flip_ci_status_for_the_surviving_head() {
+        // RAL-510 regression: `check_pr_ci_status`'s check-runs call is
+        // scoped to one specific commit sha (`commits/{sha}/check-runs`), so
+        // a superseded run this feature force-cancels on the same branch --
+        // for a different, no-longer-current sha -- is never even fetched
+        // when classifying the surviving head's status. `ci_watch`'s
+        // auto-fix dispatch only fires from this call's `Failing` arm, so
+        // proving the head still comes back `Passing` here also proves
+        // cancellation can't trigger an unwanted `auto_fix_pr_errors` round.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/repos/acme/widget/actions/runs");
+            assert!(query.contains("branch=feature"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"workflow_runs":[
+                        {"id":1,"head_sha":"keep","status":"in_progress"},
+                        {"id":2,"head_sha":"old1","status":"in_progress"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/actions/runs/2/force-cancel");
+            req.respond(tiny_http::Response::from_string("").with_status_code(202))
+                .unwrap();
+
+            // The classification call that follows never asks about run 2 or
+            // its sha at all -- only about "keep", the head that was never
+            // cancelled.
+            let req = server.recv().unwrap();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "keep"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/keep/check-runs");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/keep/status");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            format!("http://{addr}"),
+            "acme/widget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
+        assert_eq!(summary.cancelled, vec![2]);
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_superseded_gitlab_pipeline_cannot_flip_ci_status_for_the_surviving_head() {
+        // RAL-510 regression, GitLab half: the MR endpoint's `pipeline`
+        // field is the *latest* pipeline, and `check_pr_ci_status` already
+        // discards it as stale whenever its `sha` doesn't match the MR's
+        // current head (RAL-462). A pipeline this feature cancels always
+        // belongs to a non-`keep_sha` commit, so it can never be the
+        // pipeline this classification reads for the surviving head.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let (path, query) = req.url().split_once('?').unwrap();
+            assert_eq!(path, "/projects/acme%2Fwidget/pipelines");
+            assert!(query.contains("ref=feature"), "{query}");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[
+                        {"id":10,"sha":"keep","status":"running"},
+                        {"id":11,"sha":"old1","status":"running"}
+                    ]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/pipelines/11/cancel");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"id":11,"status":"canceled"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/7");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "keep",
+                        "pipeline": {"id": 10, "sha": "keep", "status": "success"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            format!("http://{addr}"),
+            "acme%2Fwidget".to_string(),
+            Some("tok".to_string()),
+        );
+
+        let summary = client.cancel_superseded_ci("feature", "keep").unwrap();
+        assert_eq!(summary.cancelled, vec![11]);
+        assert_eq!(client.check_pr_ci_status(7).unwrap(), PrCiState::Passing);
         handle.join().unwrap();
     }
 

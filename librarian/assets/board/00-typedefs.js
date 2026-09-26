@@ -668,6 +668,7 @@
        * @property {boolean|null|undefined} auto_fix_pr_errors
        * @property {string|null|undefined} auto_fix_prompt_template
        * @property {boolean|null|undefined} discourage_tests_during_auto_pull_request_fixes
+       * @property {boolean|null|undefined} auto_cancel_outdated_pr_pipelines
        */
       /**
        * RAL-408: the fully resolved effective review-setting defaults (file
@@ -691,6 +692,7 @@
        * @property {boolean} auto_fix_pr_errors
        * @property {string|undefined} auto_fix_prompt_template
        * @property {boolean} discourage_tests_during_auto_pull_request_fixes
+       * @property {boolean} auto_cancel_outdated_pr_pipelines
        */
       /**
        * RAL-408: `GET/POST /api/projects/{name}/review-settings`'s response

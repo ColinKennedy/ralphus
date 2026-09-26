@@ -123,6 +123,11 @@ pub enum ReviewCommand {
         /// dispatch is guided to avoid writing/running tests while fixing a
         /// failing PR's CI status.
         discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+        /// RAL-510: this review's own override for whether it cancels a
+        /// PR/MR's still-running CI pipelines whenever a newer commit is
+        /// force-pushed onto the same branch. Defaults to `true` (on by
+        /// default) when unset.
+        auto_cancel_outdated_pr_pipelines: Option<bool>,
     },
     BuildEnv(GuardianEnvArgs),
     ManualChecksEnv(GuardianEnvArgs),
@@ -410,6 +415,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 .flatten();
             let discourage_tests_during_auto_pull_request_fixes =
                 take_tri_bool(&mut scanner, "--discourage-tests-during-auto-pr-fixes");
+            let auto_cancel_outdated_pr_pipelines =
+                take_tri_bool(&mut scanner, "--auto-cancel-outdated-pr-pipelines");
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_auto_build,
@@ -428,6 +435,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 auto_fix_pr_errors,
                 auto_fix_prompt_template,
                 discourage_tests_during_auto_pull_request_fixes,
+                auto_cancel_outdated_pr_pipelines,
             })
         }
         Some("env") => {
@@ -1329,6 +1337,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             auto_fix_pr_errors,
             auto_fix_prompt_template,
             discourage_tests_during_auto_pull_request_fixes,
+            auto_cancel_outdated_pr_pipelines,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1348,6 +1357,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 auto_fix_pr_errors,
                 auto_fix_prompt_template: auto_fix_prompt_template.as_deref(),
                 discourage_tests_during_auto_pull_request_fixes,
+                auto_cancel_outdated_pr_pipelines,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -2932,6 +2942,39 @@ mod tests {
                 auto_submit_pr_stack,
                 ..
             } => assert_eq!(auto_submit_pr_stack, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_auto_cancel_outdated_pr_pipelines_tri_state() {
+        match parse(&v(&[
+            "settings",
+            "g1",
+            "--auto-cancel-outdated-pr-pipelines",
+        ])) {
+            ReviewCommand::Settings {
+                auto_cancel_outdated_pr_pipelines,
+                ..
+            } => assert_eq!(auto_cancel_outdated_pr_pipelines, Some(true)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&[
+            "settings",
+            "g1",
+            "--no-auto-cancel-outdated-pr-pipelines",
+        ])) {
+            ReviewCommand::Settings {
+                auto_cancel_outdated_pr_pipelines,
+                ..
+            } => assert_eq!(auto_cancel_outdated_pr_pipelines, Some(false)),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                auto_cancel_outdated_pr_pipelines,
+                ..
+            } => assert_eq!(auto_cancel_outdated_pr_pipelines, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

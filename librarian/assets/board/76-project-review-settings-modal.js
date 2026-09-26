@@ -61,6 +61,8 @@
        * @property {string} originalAutoFixPromptTemplate
        * @property {boolean} discourageTests
        * @property {boolean} originalDiscourageTests
+       * @property {boolean} autoCancelOutdatedPrPipelines
+       * @property {boolean} originalAutoCancelOutdatedPrPipelines
        */
 
       /** @type {ProjectReviewSettingsDraft|null} */
@@ -112,6 +114,7 @@
         const autoFixPrErrors = boolOr(s.auto_fix_pr_errors, effective.auto_fix_pr_errors);
         const autoFixPromptTemplate = str(s.auto_fix_prompt_template);
         const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
+        const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -133,6 +136,7 @@
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
           discourageTests, originalDiscourageTests: discourageTests,
+          autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
         };
       }
 
@@ -299,6 +303,12 @@
        * @returns {void}
        */
       function onProjectEditDiscourageTests(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.discourageTests = checked; }
+      /**
+       * Stages the auto-cancel-outdated-PR-pipelines default.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onProjectEditAutoCancelOutdatedPrPipelines(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoCancelOutdatedPrPipelines = checked; }
 
       const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
@@ -337,6 +347,8 @@
             <h3 class="section">pull requests</h3>
             ${prSettingsSection}
             ${autoFixSection}
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Cancel a PR/MR's still-running CI pipelines whenever a newer commit is force-pushed onto the same branch, for a future review that declares no explicit auto_cancel_outdated_pr_pipelines setting of its own. Reduces CI runner exhaustion when multiple reviews stack on a busy upstream.">
+              <input type="checkbox" ${draft.autoCancelOutdatedPrPipelines ? "checked" : ""} onchange="onProjectEditAutoCancelOutdatedPrPipelines(this.checked)">auto-cancel outdated CI pipelines</label>
             ${err}
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeProjectReviewSettingsModal()">Cancel</button><button class="btn primary" onclick="saveProjectReviewSettings()" data-tip="Apply every change made in this modal in a single request. Only fields you actually touched are sent -- an untouched field keeps inheriting from the file-config/global default.">Save</button></div>
           </div></div>`;
@@ -384,6 +396,7 @@
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
+        if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
           const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/review-settings`, {
@@ -404,4 +417,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests];
+      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines];

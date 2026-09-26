@@ -491,6 +491,11 @@ impl DaemonClient {
             "discourage_tests_during_auto_pull_request_fixes",
             patch.discourage_tests_during_auto_pull_request_fixes,
         );
+        set_if_some(
+            &mut body,
+            "auto_cancel_outdated_pr_pipelines",
+            patch.auto_cancel_outdated_pr_pipelines,
+        );
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
 
@@ -1635,6 +1640,11 @@ impl DaemonClient {
             "discourage_tests_during_auto_pull_request_fixes",
             settings.discourage_tests_during_auto_pull_request_fixes,
         );
+        set_if_some(
+            &mut body,
+            "auto_cancel_outdated_pr_pipelines",
+            settings.auto_cancel_outdated_pr_pipelines,
+        );
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -1940,6 +1950,10 @@ pub struct GuardianSettings<'a> {
     /// RAL-505: whether this review's auto-fix dispatch is guided to avoid
     /// writing/running tests while fixing a failing PR's CI status.
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: whether this review cancels a PR/MR's still-running CI
+    /// pipelines whenever a newer commit is force-pushed onto the same
+    /// branch. Defaults to `true` (on by default) when unset.
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
 }
 
 /// RAL-408: bundled optional fields for
@@ -1979,6 +1993,10 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub auto_fix_pr_errors: Option<bool>,
     pub auto_fix_prompt_template: Option<&'a str>,
     pub discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: the project's default for whether a review cancels a PR/MR's
+    /// still-running CI pipelines whenever a newer commit is force-pushed
+    /// onto the same branch. Defaults to `true` (on by default) when unset.
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
 }
 
 #[cfg(test)]

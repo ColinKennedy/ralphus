@@ -1,0 +1,5 @@
+[profile.default]
+
+[[profile.default.overrides]]
+filter = "test(rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild)"
+threads-required = "num-cpus"

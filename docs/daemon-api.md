@@ -2538,6 +2538,58 @@ settled stack that collection hasn't produced yet. `ci_watch::start_ci_watch`
 calls `dispatch_pr_auto_fix`, regardless of guardian status; dispatch is
 exclusively the standing poll's job.
 
+### Cancelling superseded CI runs on force-push (RAL-510)
+
+Every branch in a review's stacked rebase gets force-pushed on each rebuild —
+a rebase rewrites every downstream SHA, so there's no way to push only what
+changed. Each force-push starts a brand-new CI run/pipeline on the branch's
+new tip, but the forge doesn't know the *previous* tip's still-queued or
+still-running CI is now pointless — its tree no longer exists on the branch —
+so it keeps burning runner minutes to completion. This is most visible on a
+review sitting on a busy shared upstream, where a burst of upstream commits
+can trigger several rebuilds (and therefore several force-pushes) in quick
+succession.
+
+`[review] auto_cancel_outdated_pr_pipelines` (default `true`; project- and
+per-review-settable, same layered precedence as `auto_fix_pr_errors`) has
+ralphus force-cancel every still-active run/pipeline on a branch immediately
+after each force-push, keeping only the one matching the SHA that was just
+pushed. It fires after every force-push call site the daemon has — the PR
+branch resync, the initial stacked-PR submission, remote-PR-commit sync,
+apply-feedback, and the feedback-branch push — via
+`ForgeClient::cancel_superseded_ci(branch, keep_sha)`, identical for GitHub
+(`POST .../actions/runs/{id}/force-cancel`, tolerating a `409` for a run that
+already finished) and GitLab (`POST .../pipelines/{id}/cancel`). This is a
+runner-cost optimization only: ralphus's `ci_status` classification is
+already scoped to a PR's *current* head SHA, so a cancelled superseded run —
+one that no longer matches that SHA — was never going to affect `ci_status`
+or `auto_fix_pr_errors` dispatch even before this setting existed. Failures
+(including a fork owner lacking `actions:write`/equivalent on a fork they
+don't control) are logged and otherwise ignored — cancellation is
+best-effort and never fails the force-push that already succeeded, and there
+is no separate mailbox notice for it.
+
+The cheaper alternative, where you control the target repository's CI config
+directly, is to let the forge itself cancel superseded runs instead of
+having ralphus do it after the fact:
+- **GitHub Actions**: a `concurrency:` block on the workflow, e.g.
+  `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }`,
+  cancels any run already active for the same ref the moment a new one
+  starts.
+- **GitLab CI**: `workflow: auto_cancel: on_new_commit: interruptible` (or a
+  job-level `interruptible: true` plus the pipeline-level default) cancels an
+  interruptible pipeline as soon as a newer one starts for the same ref.
+
+Prefer the native config lever when you can edit the target repo's CI
+definition — it cancels faster (the forge acts the instant the new run
+starts, instead of waiting for ralphus's post-push cancellation call) and
+needs no ralphus-side setting at all. `auto_cancel_outdated_pr_pipelines`
+exists for the case ralphus can't assume: a repo whose CI config isn't
+ralphus's to edit, or isn't set up with `concurrency`/`auto_cancel` at all.
+The two are complementary, not exclusive — running both is harmless, since
+whichever cancels first just makes the other's cancel call a no-op (GitHub's
+`409`, GitLab's idempotent cancel).
+
 ### `GET /api/pull-requests/forge-cache-index`
 RAL-366: a flat, single-query index of every PR's *cached* forge state — the
 background poller's most recent observation of un-actioned reviewer feedback
