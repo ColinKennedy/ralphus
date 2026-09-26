@@ -6581,9 +6581,10 @@ pub fn run_feedback(
             // `push_feedback_branch` infer it through `@{upstream}`.
             //
             // RAL-<new>: when there's no registered fork, fall back to the
-            // same base-branch-aware resolution the initial PR-stack push
-            // already uses (`forge::resolve_remote_name`) instead of leaving
-            // it to `push_feedback_branch`'s own `@{u}`/`remote.pushDefault`
+            // same clone_url-aware resolution the initial PR-stack push
+            // already uses (`forge::resolve_parent_remote_name`) instead of
+            // leaving it to `push_feedback_branch`'s own
+            // `@{u}`/`remote.pushDefault`
             // inference. That inference only succeeds once *this* function
             // has itself pushed the branch before (its own prior call sets
             // `@{u}` via `--set-upstream`) -- a review branch whose only
@@ -6601,10 +6602,14 @@ pub fn run_feedback(
                 owner.as_deref(),
             )
             .or_else(|| {
-                Some(crate::forge::resolve_remote_name(
+                let clone_url =
+                    crate::pr::project_clone_url_for_root(store, Path::new(&branch_project));
+                Some(crate::forge::resolve_parent_remote_name(
                     Path::new(&branch_project),
                     &base,
                     &forge_cfg,
+                    clone_url.as_deref(),
+                    None,
                 ))
             });
             match push_feedback_branch(&wt, &review_branch, !squash, push_remote.as_deref()) {
@@ -8732,8 +8737,14 @@ fn fetch_branch_for_remote_cell(
         .as_ref()
         .map(|g| g.base_branch.as_str())
         .unwrap_or_default();
-    let remote =
-        crate::forge::resolve_remote_name(root, base_branch, &crate::config::resolve_forge(root));
+    let clone_url = crate::pr::project_clone_url_for_root(store, root);
+    let remote = crate::forge::resolve_parent_remote_name(
+        root,
+        base_branch,
+        &crate::config::resolve_forge(root),
+        clone_url.as_deref(),
+        None,
+    );
     let vcs = {
         let guard = store.lock();
         crate::vcs::for_project_root(&guard, root)?
