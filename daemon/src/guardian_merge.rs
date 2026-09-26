@@ -7983,6 +7983,27 @@ pub fn rebuild_on_base_shift(
     sem: &Semaphore,
     cancel: &CancelToken,
 ) -> bool {
+    rebuild_on_base_shift_with_debounce(store, runner, id, sem, cancel, BASE_SHIFT_DEBOUNCE)
+}
+
+/// [`rebuild_on_base_shift`] with the debounce window as an explicit
+/// parameter instead of the fixed [`BASE_SHIFT_DEBOUNCE`].
+///
+/// Exists only so `rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild`
+/// can race its burst of real `git` subprocesses against a much wider window
+/// than production uses -- widening what every real deployment sees would
+/// make legitimate bursty upstream activity sit in `merging` longer for no
+/// benefit, but the test needs enough absolute slack to absorb `git`
+/// subprocess-spawn jitter on a loaded CI runner, which does not shrink just
+/// because the window does.
+pub fn rebuild_on_base_shift_with_debounce(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    sem: &Semaphore,
+    cancel: &CancelToken,
+    debounce: std::time::Duration,
+) -> bool {
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
@@ -8014,7 +8035,7 @@ pub fn rebuild_on_base_shift(
     // triggering its own separate rebuild. This runs before the RAL-507
     // retry-budget check below so no pending shift ever consumes budget
     // before it has actually settled.
-    std::thread::sleep(BASE_SHIFT_DEBOUNCE);
+    std::thread::sleep(debounce);
     let settled = detect_base_shift(store, id, &guardian);
     if !settled.any_shifted {
         // The shift resolved itself during the debounce wait (e.g. the base
