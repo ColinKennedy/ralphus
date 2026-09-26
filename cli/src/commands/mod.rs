@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod misc;
 pub mod project;
 pub mod proof;
+pub mod prophecy;
 pub mod queue;
 pub mod quick_start;
 pub mod review;
@@ -208,6 +209,7 @@ pub enum Command {
     Show(show::ShowCommand),
     Squad(squad::SquadCommand),
     Mailbox(mailbox::MailboxCommand),
+    Prophecy(prophecy::ProphecyCommand),
     QuickStart(quick_start::QuickStartCommand),
     Triage(triage::TriageCommand),
     User(user::UserCommand),
@@ -302,6 +304,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("show") => Command::Show(show::parse(&scanner.remaining())),
         Some("squad") => Command::Squad(squad::parse(&scanner.remaining())),
         Some("mailbox") => Command::Mailbox(mailbox::parse(&scanner.remaining())),
+        Some("prophecy") => Command::Prophecy(prophecy::parse(&scanner.remaining())),
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
         Some("triage") => Command::Triage(triage::parse(&scanner.remaining())),
         Some("user") => Command::User(user::parse(&scanner.remaining())),
@@ -380,6 +383,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Show(c) => show::dispatch(c, opts),
         Command::Squad(c) => squad::dispatch(c, opts),
         Command::Mailbox(c) => mailbox::dispatch(c, opts),
+        Command::Prophecy(c) => prophecy::dispatch(c, opts),
         Command::QuickStart(c) => quick_start::dispatch(c, opts),
         Command::Triage(c) => triage::dispatch(c, opts),
         Command::User(c) => user::dispatch(c, opts),

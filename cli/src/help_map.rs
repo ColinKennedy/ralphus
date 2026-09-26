@@ -1237,6 +1237,36 @@ agent/model, machine, budget, proof scope, and the project-level equivalents of 
     ),
 ];
 
+const PROPHECY_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[
+            "--ascending",
+            "--entity [str]",
+            "--kind [str]",
+            "--limit [integer]",
+            "--offset [integer]",
+            "--q [str]",
+        ],
+        "List prophecies (design doc §10 Phase 1): a durable, append-only record of what an \
+agent -- or ralphus itself, e.g. a guardian_merge.rs rebase/conflict-resolution decision -- \
+learned mid-work.",
+        false,
+        true, // ("prophecy", "list")
+        &[],
+    ),
+    node(
+        "show",
+        &["id [id]"],
+        &[],
+        "Print one prophecy's full body by row id.",
+        false,
+        true, // ("prophecy", "show")
+        &[],
+    ),
+];
+
 const MAILBOX_CHILDREN: &[HelpNode] = &[
     node(
         "check",
@@ -2032,6 +2062,16 @@ tailing and --wait-until-valid are not yet ported).",
             false,
             false,
             PROJECT_CHILDREN,
+        ),
+        node(
+            "prophecy",
+            &[],
+            &[],
+            "Query the durable, append-only prophecy log (design doc §10 Phase 1): what an \
+agent -- or ralphus itself -- learned mid-work, surfaced in the PR a human reads.",
+            false,
+            false,
+            PROPHECY_CHILDREN,
         ),
         node(
             "queue",

@@ -1869,6 +1869,29 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_ghosts_squad ON ghosts(squad_id);
             CREATE INDEX IF NOT EXISTS idx_ghosts_guardian ON ghosts(guardian_id);
+            -- Prophecies (RAL-<new>): a durable, append-only record of what
+            -- an agent (or ralphus itself, e.g. a rebase/conflict decision
+            -- in `guardian_merge.rs`) learned mid-work, surfaced in the PR a
+            -- human reads. Unlike `ghosts` (one row per owner, merge-on-
+            -- write, ephemeral/cascade-deleted), a prophecy is one row per
+            -- write, keyed by `entity_uri` + `attempt` so the same cell
+            -- retried after a restart doesn't collide with its own prior
+            -- attempt's notes. Deliberately has no `squad_id`/`guardian_id`
+            -- FK and is NOT cascade-deleted by `delete_squad`/
+            -- `delete_guardian` -- the record is meant to survive the squad
+            -- that produced it (see design doc §11.2).
+            CREATE TABLE IF NOT EXISTS prophecies (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_uri      TEXT NOT NULL,
+                attempt         INTEGER NOT NULL,
+                kind            TEXT NOT NULL,
+                body            TEXT NOT NULL,
+                revision        TEXT,
+                created_at_ms   INTEGER NOT NULL,
+                published_at_ms INTEGER,
+                pr_id           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_prophecies_entity_uri ON prophecies(entity_uri);
             -- RAL-241: the escalation mailbox. `mailbox_clients` is who can
             -- drain (registered via `POST /api/mailbox/register`);
             -- `mailbox_messages` is what got enqueued (a failed cell, a
@@ -8895,6 +8918,9 @@ impl Store {
         tx.execute("DELETE FROM cells WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM tasks WHERE squad_id=?", params![squad_id])?;
         tx.execute("DELETE FROM ghosts WHERE squad_id=?", params![squad_id])?;
+        // Prophecies are deliberately NOT deleted here -- see the comment on
+        // the `prophecies` table in `init_schema`; they're meant to outlive
+        // the squad that produced them.
         tx.execute(
             "DELETE FROM hidden_items WHERE squad_id=?",
             params![squad_id],
@@ -8957,6 +8983,11 @@ impl Store {
             tx.execute("DELETE FROM cells", [])?;
             tx.execute("DELETE FROM tasks", [])?;
             tx.execute("DELETE FROM ghosts", [])?;
+            // Prophecies outlive an individual squad deletion (see the
+            // comment on the `prophecies` table in `init_schema`), but an
+            // unfiltered `clear_all` is a full test-database wipe, not a
+            // squad deletion, so it clears them too.
+            tx.execute("DELETE FROM prophecies", [])?;
             tx.execute("DELETE FROM hidden_items", [])?;
             tx.execute("DELETE FROM mailbox_messages", [])?;
             let squads_deleted = tx.execute("DELETE FROM squads", [])?;
