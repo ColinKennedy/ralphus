@@ -464,3 +464,17 @@ RAL-252 (verified login) and RAL-225 (container mode) are the two existing
 threads that would close it. Reasonable to accept for a single-user dev tool —
 but better as a written decision than an unexamined default. Note
 `SECURITY_AUDIT.local.md` does not currently mention it.
+
+---
+
+## 12. Out of scope for v1
+
+- **Auto-fix insights.** Unlikely to produce much, and the mechanism comes free
+  later if that turns out to be wrong.
+- **Confidence scores.** Agents are unreliable at self-assessment, and an
+  unreliable number is worse than none because it gets filtered on.
+- **A dedicated board tab.** The timeline already merges Cartographer rows
+  chronologically; a prophecy appears there the moment it emits a row. Build
+  the tab when the timeline demonstrably is not enough.
+- **Cross-project prophecy search.** Real feature, wrong order — it needs a
+  corpus that only exists after the rest ships.
