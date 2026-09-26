@@ -1,27 +1,31 @@
-//! Cross-squad waypoints (RAL-400) -- schema/store layer (Phase 1).
+//! Cross-squad waypoints (RAL-400) -- schema/store layer (Phase 1) plus the
+//! survey pass (Phase 2).
 //!
 //! A waypoint is a named, open/closed join point that tracks a roster of
 //! reviews/squads and accumulates append-only guidance ("bearings") for
-//! them. This module owns the roster/bearing/injection CRUD and the
-//! terminal-state auto-close computation; the survey pass that populates
-//! `survey_verdict`/`survey_rationale` (Phase 2) and the actual injection
-//! delivery mechanism (Phase 5) are not implemented here -- see
-//! `.agent/waypoints-phase0-decisions.md` for the full design.
+//! them. This module owns the roster/bearing/injection CRUD, the
+//! terminal-state auto-close computation, and (Phase 2) the survey: the LLM
+//! pass that decides, for every open review/non-terminal squad whose
+//! [`Scope`] overlaps a waypoint's, whether it is impacted and at what
+//! [`RosterMode`]. The actual injection delivery mechanism (Phase 5) is not
+//! implemented here -- see `.agent/waypoints-phase0-decisions.md` for the
+//! full design.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
+use crate::chat_client::{self, ChatMessage};
 use crate::guardian::GuardianStatus;
 use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 use crate::triage::SubprojectResolution;
 
 /// A waypoint/review/squad's aggregate monorepo-subproject footprint (the
 /// Phase 0 actionable-notification matching model, see
-/// `.agent/waypoints-phase0-decisions.md`). Not yet consumed by anything --
-/// the survey pass that reads this to decide which candidates to check
-/// (RAL-400 Phase 2) hasn't been built.
+/// `.agent/waypoints-phase0-decisions.md`). Consumed by
+/// [`Store::waypoint_survey_candidates`] to pick the narrowest candidate set
+/// before any survey call is made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
@@ -60,6 +64,18 @@ fn union_scope(a: &Scope, b: &Scope) -> Scope {
     match (a, b) {
         (Scope::RepoWide, _) | (_, Scope::RepoWide) => Scope::RepoWide,
         (Scope::Areas(x), Scope::Areas(y)) => Scope::Areas(x.union(y).cloned().collect()),
+    }
+}
+
+/// Whether two scopes for the *same project* overlap: `RepoWide` on either
+/// side always overlaps (it's the conservative "could be anything" case,
+/// same rationale as [`aggregate_scope`]'s contagion rule); two `Areas` sets
+/// overlap iff they share at least one subproject name.
+#[must_use]
+fn scopes_overlap(a: &Scope, b: &Scope) -> bool {
+    match (a, b) {
+        (Scope::RepoWide, _) | (_, Scope::RepoWide) => true,
+        (Scope::Areas(x), Scope::Areas(y)) => !x.is_disjoint(y),
     }
 }
 
@@ -199,6 +215,41 @@ pub struct PendingInjectionView {
     pub updated_at_ms: i64,
 }
 
+/// One row of `waypoints`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaypointView {
+    pub id: String,
+    pub label: Option<String>,
+    pub prompt: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub allow_advisory: bool,
+    pub state: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub closed_at_ms: Option<i64>,
+}
+
+/// A candidate identified by [`Store::waypoint_survey_candidates`]: an open
+/// review or non-terminal squad not already an explicit roster entry, whose
+/// own [`Scope`] overlaps the waypoint's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurveyCandidate {
+    pub kind: RosterEntryKind,
+    pub entry_id: String,
+}
+
+/// The result of surveying one candidate: whether it was judged impacted,
+/// under what mode, and why. Always populated -- including on a call
+/// failure/timeout/unparseable reply, which fail closed to `impacted = true`,
+/// `mode = Block` (see [`Store::survey_candidate`]'s doc comment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SurveyVerdict {
+    pub impacted: bool,
+    pub mode: RosterMode,
+    pub rationale: String,
+}
+
 impl Store {
     /// Create a new open waypoint. Callers are responsible for generating
     /// `id` (mirrors every other entity id in this store -- see
@@ -222,6 +273,36 @@ impl Store {
             params![id, label, prompt, agent, model, allow_advisory, now, now],
         )?;
         Ok(())
+    }
+
+    /// Fetch one waypoint by id.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] if no such waypoint exists, or
+    /// propagates any other SQLite failure.
+    pub fn get_waypoint(&self, id: &str) -> StoreResult<WaypointView> {
+        self.conn
+            .query_row(
+                "SELECT id, label, prompt, agent, model, allow_advisory, state, created_at_ms, updated_at_ms, closed_at_ms
+                 FROM waypoints WHERE id=?",
+                params![id],
+                |r| {
+                    Ok(WaypointView {
+                        id: r.get(0)?,
+                        label: r.get(1)?,
+                        prompt: r.get(2)?,
+                        agent: r.get(3)?,
+                        model: r.get(4)?,
+                        allow_advisory: r.get(5)?,
+                        state: r.get(6)?,
+                        created_at_ms: r.get(7)?,
+                        updated_at_ms: r.get(8)?,
+                        closed_at_ms: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
     }
 
     /// A squad's aggregate [`Scope`], per project. Groups every cell in the
@@ -354,6 +435,92 @@ impl Store {
         Ok(merged)
     }
 
+    /// The exact candidate set a waypoint's survey should invoke the LLM on
+    /// (RAL-400 Phase 2): every open review / non-terminal squad that is not
+    /// already an explicit roster entry, whose own [`Scope`] overlaps the
+    /// waypoint's aggregate scope for a shared project (see
+    /// [`scopes_overlap`]). Computed entirely from already-stored scope data
+    /// -- no model call happens here -- so this is the "narrowest set"
+    /// selection the survey itself then classifies.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoint_survey_candidates(
+        &self,
+        waypoint_id: &str,
+    ) -> StoreResult<Vec<SurveyCandidate>> {
+        let waypoint_scopes = self.waypoint_scope_by_project(waypoint_id)?;
+        if waypoint_scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let already_on_roster: Vec<(RosterEntryKind, String)> = self
+            .list_roster_entries(waypoint_id)?
+            .into_iter()
+            .map(|e| (e.kind, e.entry_id))
+            .collect();
+        let is_rostered = |kind: RosterEntryKind, id: &str| {
+            already_on_roster.iter().any(|(k, e)| *k == kind && e == id)
+        };
+        let overlaps = |cand_scopes: &BTreeMap<String, Scope>| {
+            cand_scopes.iter().any(|(project, scope)| {
+                waypoint_scopes
+                    .get(project)
+                    .is_some_and(|ws| scopes_overlap(ws, scope))
+            })
+        };
+
+        let mut candidates = Vec::new();
+
+        let mut stmt = self.conn.prepare("SELECT id, state FROM squads")?;
+        let squad_rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (squad_id, state) in squad_rows {
+            let is_terminal = crate::store::SquadState::parse(&state)
+                .is_some_and(crate::store::SquadState::is_terminal);
+            if is_terminal || is_rostered(RosterEntryKind::Squad, &squad_id) {
+                continue;
+            }
+            if overlaps(&self.squad_scope_by_project(&squad_id)?) {
+                candidates.push(SurveyCandidate {
+                    kind: RosterEntryKind::Squad,
+                    entry_id: squad_id,
+                });
+            }
+        }
+
+        for (guardian_id, status) in self.list_guardian_status_pairs()? {
+            if GuardianStatus::is_terminal_status(&status)
+                || is_rostered(RosterEntryKind::Review, &guardian_id)
+            {
+                continue;
+            }
+            if overlaps(&self.review_scope_by_project(&guardian_id)?) {
+                candidates.push(SurveyCandidate {
+                    kind: RosterEntryKind::Review,
+                    entry_id: guardian_id,
+                });
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    /// Every currently-`open` waypoint's id.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn list_open_waypoint_ids(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM waypoints WHERE state='open'")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Whether a waypoint is `open` (`true`) or `closed`/nonexistent
     /// (`false`).
     ///
@@ -471,6 +638,36 @@ impl Store {
         self.conn.execute(
             "UPDATE waypoint_roster SET delivery_status=?, updated_at_ms=? WHERE waypoint_id=? AND kind=? AND entry_id=?",
             params![status.as_str(), now_ms(), waypoint_id, kind.as_str(), entry_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record one candidate's survey outcome (Phase 2): sets `mode` and the
+    /// `survey_verdict`/`survey_rationale` columns. Does not itself add the
+    /// roster entry -- callers add it (or update its `mode` in place, since
+    /// [`Store::add_roster_entry`] is an upsert) before calling this.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_roster_survey_result(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+        verdict: &SurveyVerdict,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE waypoint_roster SET mode=?, survey_verdict=?, survey_rationale=?, updated_at_ms=?
+             WHERE waypoint_id=? AND kind=? AND entry_id=?",
+            params![
+                verdict.mode.as_str(),
+                if verdict.impacted { "impacted" } else { "not_impacted" },
+                verdict.rationale,
+                now_ms(),
+                waypoint_id,
+                kind.as_str(),
+                entry_id
+            ],
         )?;
         Ok(())
     }
@@ -701,6 +898,235 @@ impl Store {
             created_at_ms: r.get(7)?,
             updated_at_ms: r.get(8)?,
         })
+    }
+}
+
+/// Build the survey's system prompt from the waypoint's own guidance prompt.
+/// Mirrors `arbiter::subproject_inference_system_prompt`'s phrasing style:
+/// a short role framing, the guidance verbatim, then a strict reply-format
+/// spec so [`parse_survey_reply`] has a stable shape to key off. The
+/// `allow_advisory` line is only present when the waypoint allows
+/// de-escalation, per RAL-400 Phase 2 ("if yes and `allow_advisory` is set,
+/// a second question deciding advisory de-escalation vs. keep blocking").
+fn survey_system_prompt(waypoint_prompt: &str, allow_advisory: bool) -> String {
+    let mode_line = if allow_advisory {
+        "MODE: block or advisory -- advisory means this work only needs to be \
+         informed of the guidance, not gated on it; block means it should wait \
+         for/act on the guidance before proceeding. Only meaningful when \
+         IMPACTED is yes; reply NONE when IMPACTED is no.\n"
+    } else {
+        ""
+    };
+    format!(
+        "You are surveying one unit of work (a code review or an agent squad) \
+         against the following cross-squad coordination guidance, to decide \
+         whether that unit of work is actually impacted by it:\n\n\
+         {waypoint_prompt}\n\n\
+         Reply with exactly these lines, in this order, and nothing else -- no \
+         extra commentary, no surrounding quotes:\n\
+         IMPACTED: yes or no\n\
+         {mode_line}\
+         RATIONALE: one short sentence explaining the decision"
+    )
+}
+
+/// Parse one survey reply into a [`SurveyVerdict`], at the same robustness
+/// bar as `arbiter::parse_classification_reply`: tolerant of extra
+/// whitespace/blank lines, case-insensitive keywords and values, and
+/// surrounding quote/period punctuation on values; a line that isn't a
+/// recognized `KEY: value` pair is ignored rather than rejecting the whole
+/// reply. Returns `None` when no recognizable `IMPACTED:` line is present at
+/// all -- callers treat that identically to a call failure (fail closed).
+fn parse_survey_reply(reply: &str, allow_advisory: bool) -> Option<SurveyVerdict> {
+    let mut impacted: Option<bool> = None;
+    let mut advisory = false;
+    let mut rationale = String::new();
+    for line in reply.lines() {
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let val = val
+            .trim()
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == '.');
+        match key.trim().to_ascii_uppercase().as_str() {
+            "IMPACTED" => {
+                if val.eq_ignore_ascii_case("yes") {
+                    impacted = Some(true);
+                } else if val.eq_ignore_ascii_case("no") {
+                    impacted = Some(false);
+                }
+            }
+            "MODE" if allow_advisory => advisory = val.eq_ignore_ascii_case("advisory"),
+            "RATIONALE" => rationale = val.to_string(),
+            _ => {}
+        }
+    }
+    let impacted = impacted?;
+    let mode = if impacted && allow_advisory && advisory {
+        RosterMode::Advisory
+    } else {
+        RosterMode::Block
+    };
+    if rationale.is_empty() {
+        rationale = "model gave no rationale".to_string();
+    }
+    Some(SurveyVerdict {
+        impacted,
+        mode,
+        rationale,
+    })
+}
+
+/// Turn a completed survey call's outcome into a [`SurveyVerdict`], applying
+/// the fail-closed rule uniformly whether the call itself failed or it
+/// succeeded but returned an unparseable reply. Split out from
+/// [`survey_candidate`] so the fail-closed and advisory-de-escalation
+/// decision logic is unit-testable without an actual `chat_client` call.
+fn resolve_survey_verdict(
+    call_result: Result<String, String>,
+    allow_advisory: bool,
+) -> SurveyVerdict {
+    match call_result {
+        Ok(reply) => parse_survey_reply(&reply, allow_advisory).unwrap_or_else(|| SurveyVerdict {
+            impacted: true,
+            mode: RosterMode::Block,
+            rationale: format!("unparseable survey reply, failing closed: {reply:?}"),
+        }),
+        Err(e) => SurveyVerdict {
+            impacted: true,
+            mode: RosterMode::Block,
+            rationale: format!("survey call failed, failing closed: {e}"),
+        },
+    }
+}
+
+/// Survey one candidate against a waypoint (RAL-400 Phase 2): resolve the
+/// survey agent/model, invoke the LLM once, and durably record the outcome
+/// -- via [`Store::add_roster_entry`] + [`Store::set_roster_survey_result`]
+/// and a Cartographer row -- on every path, including failure. The roster
+/// entry is written regardless of the `impacted` verdict (not only when
+/// `true`): the row is the single place both the positive and negative
+/// outcome are recorded, it stops a later scheduler tick from re-surveying
+/// the same still-non-terminal candidate every interval, and it is what a
+/// later phase's delivery/gating logic must consult (`survey_verdict`) to
+/// know whether this roster entry actually blocks/advises.
+///
+/// One LLM call per candidate, not batched across a waypoint's whole
+/// candidate set: a batched reply covering N candidates at once would be
+/// cheaper, but it couples every candidate's outcome to one reply -- a
+/// single malformed/truncated batch reply (more likely as candidate count
+/// grows) would force *all* of them to fail closed together, and a
+/// slow/erroring call would stall every candidate in the batch rather than
+/// just the one it concerns. Per-candidate calls trade some cost for that
+/// failure isolation and for a Cartographer row that is attributable to
+/// exactly the call that produced it; RAL-400 Phase 2 leaves this tradeoff
+/// to this module and defaults to per-candidate absent a concrete cost
+/// problem.
+///
+/// Fail-closed: any agent-resolution/call/parse failure resolves to
+/// `impacted = true`, `mode = Block`, with the failure reason as the
+/// rationale -- never silently dropped.
+///
+/// # Errors
+/// Propagates a SQLite failure from reading the waypoint or persisting the
+/// outcome. A survey-call failure itself is not a [`StoreError`] -- it
+/// resolves to the fail-closed verdict described above instead.
+pub fn survey_candidate(
+    store: &crate::store_lock::StoreHandle,
+    waypoint_id: &str,
+    candidate: &SurveyCandidate,
+) -> StoreResult<SurveyVerdict> {
+    let guard = store.lock();
+    let waypoint = guard.get_waypoint(waypoint_id)?;
+    guard.add_roster_entry(
+        waypoint_id,
+        candidate.kind,
+        &candidate.entry_id,
+        RosterMode::Block,
+    )?;
+    drop(guard);
+
+    let fallback = crate::config::global_review_config();
+    let agent = waypoint
+        .agent
+        .clone()
+        .unwrap_or_else(|| fallback.default_resolver_agent().to_string());
+    let model = waypoint
+        .model
+        .clone()
+        .or_else(|| fallback.default_resolver_model().map(str::to_string));
+
+    let system = survey_system_prompt(&waypoint.prompt, waypoint.allow_advisory);
+    let messages = [ChatMessage {
+        role: "user",
+        content: format!(
+            "Unit of work under survey: {} {}",
+            candidate.kind.as_str(),
+            candidate.entry_id
+        ),
+        image: None,
+    }];
+
+    let call_result = chat_client::call_direct(&agent, model.as_deref(), &system, &messages);
+    let verdict = resolve_survey_verdict(call_result, waypoint.allow_advisory);
+
+    let guard = store.lock();
+    guard.set_roster_survey_result(waypoint_id, candidate.kind, &candidate.entry_id, &verdict)?;
+    let note = crate::cartographer::Note::new("waypoints").scope("waypoint");
+    let note = match candidate.kind {
+        RosterEntryKind::Squad => note.squad(&candidate.entry_id),
+        RosterEntryKind::Review => note.guardian(&candidate.entry_id),
+    };
+    note.emit(
+        &guard,
+        format!(
+            "waypoint {waypoint_id} survey of {} {}: impacted={} mode={}",
+            candidate.kind.as_str(),
+            candidate.entry_id,
+            verdict.impacted,
+            verdict.mode.as_str()
+        ),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "candidate_kind": candidate.kind.as_str(),
+            "candidate_id": candidate.entry_id,
+            "impacted": verdict.impacted,
+            "mode": verdict.mode.as_str(),
+            "rationale": verdict.rationale,
+        }),
+    );
+    Ok(verdict)
+}
+
+/// Scheduler-owned periodic sweep (RAL-400 Phase 2): survey every waiting
+/// candidate on every open waypoint. Must only ever be invoked from
+/// `scheduler::run_loop`'s periodic tick -- never synchronously inside the
+/// waypoint-submit HTTP handler, since a single survey call can take seconds
+/// and a waypoint may have many candidates. The candidate lookups are cheap
+/// synchronous store reads done on the calling (scheduler) thread, but each
+/// actual survey call is dispatched onto its own spawned thread -- mirroring
+/// `crate::pr::poll_forge_reorders` -- so the scheduler loop is never
+/// blocked for the cumulative duration of every open waypoint's every
+/// candidate's LLM call.
+pub fn run_pending_surveys(store: &crate::store_lock::StoreHandle) {
+    let waypoint_ids = {
+        let guard = store.lock();
+        guard.list_open_waypoint_ids().unwrap_or_default()
+    };
+    for waypoint_id in waypoint_ids {
+        let candidates = {
+            let guard = store.lock();
+            guard
+                .waypoint_survey_candidates(&waypoint_id)
+                .unwrap_or_default()
+        };
+        for candidate in candidates {
+            let store = std::sync::Arc::clone(store);
+            let waypoint_id = waypoint_id.clone();
+            std::thread::spawn(move || {
+                let _ = survey_candidate(&store, &waypoint_id, &candidate);
+            });
+        }
     }
 }
 
@@ -1288,6 +1714,392 @@ mod tests {
                 "auth".to_string(),
                 "billing".to_string()
             ])))
+        );
+    }
+
+    fn insert_guardian_with_status(store: &Store, id: &str, status: &str) {
+        let now = now_ms();
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?,?)",
+                params![id, "review", "main", "/tmp/repo", status, now, now],
+            )
+            .unwrap();
+    }
+
+    // ── parse_survey_reply ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_survey_reply_matches_case_insensitively_and_trims_punctuation() {
+        let verdict = parse_survey_reply(
+            "  impacted:  YES.  \nrationale: \"touches the auth flow.\"  ",
+            false,
+        )
+        .unwrap();
+        assert!(verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Block);
+        assert_eq!(verdict.rationale, "touches the auth flow");
+    }
+
+    #[test]
+    fn parse_survey_reply_ignores_unrecognized_and_blank_lines() {
+        let verdict = parse_survey_reply(
+            "some preamble the model added\n\nIMPACTED: no\n\nRATIONALE: unrelated area\ntrailing junk",
+            false,
+        )
+        .unwrap();
+        assert!(!verdict.impacted);
+        assert_eq!(verdict.rationale, "unrelated area");
+    }
+
+    #[test]
+    fn parse_survey_reply_returns_none_when_impacted_line_missing() {
+        assert!(parse_survey_reply("RATIONALE: no clear verdict given", false).is_none());
+        assert!(parse_survey_reply("", false).is_none());
+        assert!(parse_survey_reply("IMPACTED: maybe", false).is_none());
+    }
+
+    #[test]
+    fn parse_survey_reply_defaults_rationale_when_model_omits_it() {
+        let verdict = parse_survey_reply("IMPACTED: yes", false).unwrap();
+        assert_eq!(verdict.rationale, "model gave no rationale");
+    }
+
+    #[test]
+    fn parse_survey_reply_advisory_mode_only_applies_when_allowed_and_impacted() {
+        // allow_advisory=true, impacted=yes, MODE: advisory -> Advisory.
+        let verdict =
+            parse_survey_reply("IMPACTED: yes\nMODE: advisory\nRATIONALE: fyi only", true).unwrap();
+        assert_eq!(verdict.mode, RosterMode::Advisory);
+
+        // allow_advisory=true, impacted=yes, MODE: block -> Block.
+        let verdict = parse_survey_reply("IMPACTED: yes\nMODE: block\nRATIONALE: r", true).unwrap();
+        assert_eq!(verdict.mode, RosterMode::Block);
+
+        // allow_advisory=true but impacted=no -> always Block regardless of MODE.
+        let verdict =
+            parse_survey_reply("IMPACTED: no\nMODE: advisory\nRATIONALE: r", true).unwrap();
+        assert_eq!(verdict.mode, RosterMode::Block);
+
+        // allow_advisory=false -> a MODE line is ignored entirely, always Block.
+        let verdict =
+            parse_survey_reply("IMPACTED: yes\nMODE: advisory\nRATIONALE: r", false).unwrap();
+        assert_eq!(verdict.mode, RosterMode::Block);
+    }
+
+    // ── resolve_survey_verdict (fail-closed + advisory de-escalation) ──────
+
+    #[test]
+    fn resolve_survey_verdict_fails_closed_on_call_error() {
+        let verdict = resolve_survey_verdict(Err("connection refused".to_string()), false);
+        assert!(verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Block);
+        assert!(verdict.rationale.contains("connection refused"));
+    }
+
+    #[test]
+    fn resolve_survey_verdict_fails_closed_on_unparseable_reply() {
+        let verdict =
+            resolve_survey_verdict(Ok("the model rambled without a verdict".to_string()), false);
+        assert!(verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Block);
+        assert!(verdict.rationale.contains("unparseable"));
+    }
+
+    #[test]
+    fn resolve_survey_verdict_applies_advisory_deescalation_when_allowed() {
+        let verdict = resolve_survey_verdict(
+            Ok(
+                "IMPACTED: yes\nMODE: advisory\nRATIONALE: just keep this squad informed"
+                    .to_string(),
+            ),
+            true,
+        );
+        assert!(verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Advisory);
+    }
+
+    #[test]
+    fn resolve_survey_verdict_keeps_block_when_advisory_not_allowed() {
+        let verdict = resolve_survey_verdict(
+            Ok("IMPACTED: yes\nMODE: advisory\nRATIONALE: r".to_string()),
+            false,
+        );
+        assert!(verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Block);
+    }
+
+    #[test]
+    fn resolve_survey_verdict_passes_through_a_clean_not_impacted_reply() {
+        let verdict = resolve_survey_verdict(
+            Ok("IMPACTED: no\nRATIONALE: different area entirely".to_string()),
+            true,
+        );
+        assert!(!verdict.impacted);
+        assert_eq!(verdict.mode, RosterMode::Block);
+    }
+
+    // ── waypoint_survey_candidates (matching-model population) ─────────────
+
+    #[test]
+    fn survey_candidates_include_overlapping_area_and_exclude_sibling_area() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        // Seed the waypoint's scope with one roster entry in project "core",
+        // area "auth" -- standing in for whatever adds the initial roster
+        // entry a waypoint is declared against.
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        // Same project, same area -> must be surveyed.
+        insert_bare_squad(&store, "squad-match", SquadState::Pending);
+        insert_bare_task(&store, "squad-match", 0, "core");
+        insert_bare_cell(&store, "squad-match", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-match", 0, 0, "auth", false);
+
+        // Same project, unrelated sibling area -> must never be surveyed.
+        insert_bare_squad(&store, "squad-sibling", SquadState::Pending);
+        insert_bare_task(&store, "squad-sibling", 0, "core");
+        insert_bare_cell(&store, "squad-sibling", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-sibling", 0, 0, "billing", false);
+
+        // Different project entirely, same area name -> must never be
+        // surveyed (a project match is required before area overlap even
+        // applies).
+        insert_bare_squad(&store, "squad-other-project", SquadState::Pending);
+        insert_bare_task(&store, "squad-other-project", 0, "other");
+        insert_bare_cell(&store, "squad-other-project", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-other-project", 0, 0, "auth", false);
+
+        let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "unrelated-area/project candidates must gain zero roster/survey state: {candidates:?}"
+        );
+        assert_eq!(candidates[0].kind, RosterEntryKind::Squad);
+        assert_eq!(candidates[0].entry_id, "squad-match");
+    }
+
+    #[test]
+    fn survey_candidates_cover_two_explicit_named_areas() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        // Seed the waypoint against both "auth" and "billing" via two
+        // separately-scoped roster entries.
+        insert_bare_squad(&store, "squad-seed-auth", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed-auth", 0, "core");
+        insert_bare_cell(&store, "squad-seed-auth", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-seed-auth", 0, 0, "auth", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed-auth",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        insert_bare_squad(&store, "squad-seed-billing", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed-billing", 0, "core");
+        insert_bare_cell(&store, "squad-seed-billing", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-seed-billing", 0, 0, "billing", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed-billing",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        for (id, area) in [("squad-auth", "auth"), ("squad-billing", "billing")] {
+            insert_bare_squad(&store, id, SquadState::Pending);
+            insert_bare_task(&store, id, 0, "core");
+            insert_bare_cell(&store, id, 0, 0, None, None);
+            insert_cell_subproject(&store, id, 0, 0, area, false);
+        }
+        // A third, unrelated area -- must stay excluded even though the
+        // waypoint already spans two areas.
+        insert_bare_squad(&store, "squad-shipping", SquadState::Pending);
+        insert_bare_task(&store, "squad-shipping", 0, "core");
+        insert_bare_cell(&store, "squad-shipping", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-shipping", 0, 0, "shipping", false);
+
+        let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        let mut ids: Vec<&str> = candidates.iter().map(|c| c.entry_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["squad-auth", "squad-billing"]);
+    }
+
+    #[test]
+    fn survey_candidates_fall_back_to_repo_wide_within_scoped_project_only() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        // Seed roster entry whose cell never got a subproject resolution --
+        // this project's scope can't be safely narrowed, so it goes
+        // repo-wide (conservative fallback), per Phase 0.
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .waypoint_scope_by_project("waypoint-1")
+                .unwrap()
+                .get("core"),
+            Some(&Scope::RepoWide)
+        );
+
+        // Same project, a totally unrelated area -- included anyway because
+        // the project's scope is repo-wide.
+        insert_bare_squad(&store, "squad-same-project", SquadState::Pending);
+        insert_bare_task(&store, "squad-same-project", 0, "core");
+        insert_bare_cell(&store, "squad-same-project", 0, 0, None, None);
+        insert_cell_subproject(
+            &store,
+            "squad-same-project",
+            0,
+            0,
+            "wholly-unrelated",
+            false,
+        );
+
+        // A different project (a different repo/root) is not swept in by
+        // another project's repo-wide fallback.
+        insert_bare_squad(&store, "squad-cross-project", SquadState::Pending);
+        insert_bare_task(&store, "squad-cross-project", 0, "other");
+        insert_bare_cell(&store, "squad-cross-project", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-cross-project", 0, 0, "auth", false);
+
+        let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entry_id, "squad-same-project");
+    }
+
+    #[test]
+    fn survey_candidates_exclude_terminal_and_already_rostered_entries() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        // Overlapping scope but already terminal -> excluded.
+        insert_bare_squad(&store, "squad-done", SquadState::Done);
+        insert_bare_task(&store, "squad-done", 0, "core");
+        insert_bare_cell(&store, "squad-done", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-done", 0, 0, "auth", false);
+
+        // Overlapping scope but already an explicit roster entry -> excluded
+        // (it's already been surveyed/tracked, not a fresh candidate).
+        insert_bare_squad(&store, "squad-already-rostered", SquadState::Pending);
+        insert_bare_task(&store, "squad-already-rostered", 0, "core");
+        insert_bare_cell(&store, "squad-already-rostered", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-already-rostered", 0, 0, "auth", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-already-rostered",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        // A terminal review, and a fresh matching review -- reviews follow
+        // the identical exclusion rules as squads.
+        insert_guardian_with_status(&store, "guardian-merged", "merged");
+        insert_bare_squad(&store, "squad-for-merged-review", SquadState::Pending);
+        insert_bare_task(&store, "squad-for-merged-review", 0, "core");
+        insert_bare_cell(
+            &store,
+            "squad-for-merged-review",
+            0,
+            0,
+            Some("guardian-merged"),
+            None,
+        );
+        insert_cell_subproject(&store, "squad-for-merged-review", 0, 0, "auth", false);
+
+        insert_guardian_with_status(&store, "guardian-open", "collecting");
+        insert_bare_squad(&store, "squad-for-open-review", SquadState::Pending);
+        insert_bare_task(&store, "squad-for-open-review", 0, "core");
+        insert_bare_cell(
+            &store,
+            "squad-for-open-review",
+            0,
+            0,
+            Some("guardian-open"),
+            None,
+        );
+        insert_cell_subproject(&store, "squad-for-open-review", 0, 0, "auth", false);
+
+        let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        let squad_ids: Vec<&str> = candidates
+            .iter()
+            .filter(|c| c.kind == RosterEntryKind::Squad)
+            .map(|c| c.entry_id.as_str())
+            .collect();
+        let review_ids: Vec<&str> = candidates
+            .iter()
+            .filter(|c| c.kind == RosterEntryKind::Review)
+            .map(|c| c.entry_id.as_str())
+            .collect();
+        assert_eq!(
+            squad_ids,
+            vec!["squad-for-merged-review", "squad-for-open-review"],
+            "the squads backing both reviews are themselves fresh, non-terminal, un-rostered candidates too"
+        );
+        assert_eq!(review_ids, vec!["guardian-open"]);
+    }
+
+    #[test]
+    fn survey_candidates_empty_until_the_waypoint_has_a_seeded_roster_scope() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+        insert_bare_task(&store, "squad-1", 0, "core");
+        insert_bare_cell(&store, "squad-1", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-1", 0, 0, "auth", false);
+
+        // A waypoint with an empty roster has no aggregate scope to overlap
+        // against, so it must select nothing rather than guess.
+        assert!(
+            store
+                .waypoint_survey_candidates("waypoint-1")
+                .unwrap()
+                .is_empty()
         );
     }
 }
