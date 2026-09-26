@@ -8,7 +8,11 @@
         const squad = findSquad(selectedSquadId);
         if (!squad) { el.innerHTML = `<div class="empty">Select a squad.</div>`; return; }
         if (squad.state === "materializing") {
-          el.innerHTML = `<div class="empty materializing-graph" data-tip="This squad is creating its worktrees and deriving its review plan. Its task graph will appear when materialization finishes.">Materializing squad…</div>`;
+          const phase = squad.materialization_phase;
+          const detail = phase
+            ? `<div class="materializing-phase">${esc(phase.step)}/${esc(phase.total)} ${esc(phase.label)}</div>`
+            : "";
+          el.innerHTML = `<div class="empty materializing-graph" data-tip="This squad is creating its worktrees and deriving its review plan. Its task graph will appear when materialization finishes.\nThe step count is a rough progress hint, not an exact total.">Materializing…${detail}</div>`;
           return;
         }
         /**
