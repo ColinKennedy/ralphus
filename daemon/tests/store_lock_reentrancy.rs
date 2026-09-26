@@ -633,6 +633,66 @@ fn scrutinee_io_sites(src: &str) -> Vec<(usize, Vec<usize>)> {
     found
 }
 
+/// Statements holding **two or more** `.lock()` temporaries at once.
+///
+/// The shape is `f(store.lock().a(), store.lock().b())` -- or, as it really
+/// appeared, an `assert_eq!` comparing two locked reads. Rust drops a temporary
+/// at the end of the enclosing *statement*, not the enclosing argument, so the
+/// first guard is still alive when the second acquires. The store mutex is not
+/// reentrant, so that is a permanent self-park.
+///
+/// This is BUG-1's shape without a `match`, which means neither of the other
+/// two detectors sees it: `reentrant_sites` looks for a scrutinee, and
+/// `reentrant_via_callee` follows a call. It is added because exactly this got
+/// written during the WS-E migration -- mechanically rewriting `store.x()` into
+/// `store.lock().x()` turned a two-operand comparison into a deadlock, and the
+/// compiler is perfectly happy with it.
+///
+/// Returns `(line, lock_count)` per offending statement. Statements are joined
+/// across lines by paren balance, which is what makes a multi-line `assert_eq!`
+/// visible as one statement.
+fn multi_lock_statements(src: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let skip = cfg_test_ranges(&lines);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = i;
+        let mut stmt = code_of(lines[i]);
+        // Join continuation lines while parens are unbalanced, so a multi-line
+        // call or macro counts as the single statement it is. Bounded so a
+        // malformed region cannot run away.
+        let mut joined = 0;
+        while stmt.matches('(').count() > stmt.matches(')').count()
+            && i + 1 < lines.len()
+            && joined < 20
+        {
+            i += 1;
+            joined += 1;
+            stmt.push(' ');
+            stmt.push_str(code_of(lines[i]).trim());
+        }
+        // Only count locks *before* any `{` that opens a block. A closure or
+        // block body starts a new statement scope, so
+        // `foo(|| { store.lock().a(); })` holds nothing across anything -- the
+        // temporary dies at the inner semicolon. Without this the paren-balance
+        // join above swallows whole `thread::spawn(move || { ... })` bodies and
+        // reports every lock inside them as one statement.
+        let countable = stmt
+            .split_once('{')
+            .map_or(stmt.as_str(), |(before, _)| before);
+        let locks = countable.matches(".lock()").count();
+        // `cfg(test)` regions are out of scope for the same reason the other
+        // detectors skip them: a test may deliberately construct a shape to
+        // assert on it (this file's own fixtures do).
+        if locks >= 2 && !in_ranges(start, &skip) {
+            out.push((start + 1, locks));
+        }
+        i += 1;
+    }
+    out
+}
+
 fn daemon_sources() -> Vec<(String, String)> {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sources: Vec<(String, String)> = std::fs::read_dir(&src_dir)
@@ -770,6 +830,102 @@ fn io_detector_flags_the_shapes_this_test_exists_to_catch() {
         1,
         "I/O inside a scrutinee-held match must be flagged"
     );
+}
+
+#[test]
+fn no_statement_holds_two_lock_guards_at_once() {
+    let sources = daemon_sources();
+    let mut offenders = Vec::new();
+    for (name, src) in &sources {
+        for (line, locks) in multi_lock_statements(src) {
+            offenders.push(format!(
+                "  daemon/src/{name}:{line} holds {locks} `.lock()` temporaries in                  one statement"
+            ));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a single statement acquires the store lock more than once. Rust drops a          temporary at the end of the statement, not the argument, so the first          guard is still held when the second acquires -- and the store mutex is          not reentrant, so this self-parks permanently. Bind each read to its own          `let` first:
+{}",
+        offenders.join("
+")
+    );
+}
+
+#[test]
+fn multi_lock_detector_flags_the_shape_this_test_exists_to_catch() {
+    // The shape that actually got written: two locked reads compared in one
+    // macro invocation, spanning several lines.
+    let bad = r#"
+    fn compare(store: &crate::store_lock::StoreHandle) {
+        assert_eq!(
+            store.lock().get_guardian(&a).unwrap().branch,
+            store.lock().get_guardian(&b).unwrap().branch,
+            "same branch"
+        );
+    }
+"#;
+    let hits = multi_lock_statements(bad);
+    assert_eq!(
+        hits.len(),
+        1,
+        "the two-locks-in-one-statement shape was not flagged: {hits:?}"
+    );
+    assert_eq!(hits[0].1, 2, "wrong lock count reported");
+
+    // Two locks in *separate* statements are fine -- each temporary is dropped
+    // at its own semicolon.
+    let good = r#"
+    fn compare(store: &crate::store_lock::StoreHandle) {
+        let a = store.lock().get_guardian(&a).unwrap().branch.clone();
+        let b = store.lock().get_guardian(&b).unwrap().branch.clone();
+        assert_eq!(a, b);
+    }
+"#;
+    assert!(
+        multi_lock_statements(good).is_empty(),
+        "sequential locks in separate statements were wrongly flagged"
+    );
+
+    // Locks in separate closure bodies are fine: each temporary dies at its own
+    // inner statement, even though the outer call's parens stay open across
+    // both. This is the shape that made the first version of this detector
+    // report three false positives in `pr.rs`.
+    let closures = r#"
+    fn routed(store: &crate::store_lock::StoreHandle) {
+        let fork = name.as_deref().and_then(|p| {
+            owner
+                .and_then(|o| store.lock().resolve_fork(p, o).ok().flatten())
+                .or_else(|| store.lock().resolve_fork(p, "").ok().flatten())
+        });
+    }
+"#;
+    assert!(
+        multi_lock_statements(closures).is_empty(),
+        "locks in separate closure bodies were wrongly flagged"
+    );
+
+    // Same for a spawned thread body.
+    let spawned = r#"
+    fn later(store: &crate::store_lock::StoreHandle) {
+        std::thread::spawn(move || {
+            let a = store.lock().one();
+            let b = store.lock().two();
+        });
+    }
+"#;
+    assert!(
+        multi_lock_statements(spawned).is_empty(),
+        "locks inside a spawned closure were wrongly flagged"
+    );
+
+    // A single lock per statement, however chained, is fine.
+    let single = r#"
+    fn one(store: &crate::store_lock::StoreHandle) {
+        let v = store.lock().thing(a, b, c).map(|x| x.y).unwrap_or_default();
+    }
+"#;
+    assert!(multi_lock_statements(single).is_empty());
 }
 
 #[test]

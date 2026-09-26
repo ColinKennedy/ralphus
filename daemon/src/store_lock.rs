@@ -127,6 +127,26 @@ impl StoreMutex {
         let guard = self.0.try_lock_for(timeout)?;
         Some(StoreGuard::new(guard, Location::caller()))
     }
+
+    /// The store's non-database state (WS-E.1), reached **without** acquiring
+    /// the store lock.
+    ///
+    /// `StoreMemory` has its own small locks, so nothing here needs the global
+    /// one -- worktree leases, tmux liveness, stall debounce and the secret-name
+    /// cache are not database state and never were. Several of the callers are
+    /// hot (`note_live_activity` fires on every observed pane growth for every
+    /// running cell, `check_stall_escalation` on every stall poll), and making
+    /// them queue behind the scheduler and the guardian-merge workers was pure
+    /// cost.
+    ///
+    /// Briefly takes `self.0` to clone the `Arc` out, so it is not literally
+    /// lock-free at the instant of the call; the name is about what the
+    /// *returned* handle costs to use. Hold the result rather than calling this
+    /// repeatedly in a loop.
+    #[must_use]
+    pub fn lock_free_memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
+        self.0.lock().memory()
+    }
 }
 
 /// Who holds (or last acquired) the store lock, and for how long: a

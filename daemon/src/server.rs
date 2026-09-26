@@ -4075,9 +4075,12 @@ fn list_triage_candidates(daemon: &Daemon) -> Reply {
 /// returns the wire shape directly.
 fn list_projects(daemon: &Daemon) -> Reply {
     let mut timer = perf_timing::PhaseTimer::start();
-    let store = daemon.lock();
+    // WS-E.2: pooled. The `PHASE_LOCK_WAIT` phase is still recorded so the
+    // timing breakdown keeps the same shape, and it should now read ~0 --
+    // acquiring a pooled connection is not waiting on the writer.
+    let projects = daemon.with_read_snapshot(Store::list_projects_conn);
     timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    match store.list_projects() {
+    match projects {
         Ok(projects) => {
             let mut reply = json(200, &ProjectsResponse { projects });
             timer.phase(perf_timing::PHASE_SERIALIZE);
@@ -4577,7 +4580,8 @@ fn list_hidden(daemon: &Daemon, user_header: Option<&str>) -> Reply {
         Ok(name) => name,
         Err(reply) => return reply,
     };
-    match daemon.lock().list_hidden(&user_name) {
+    // WS-E.2: pooled -- read by the board to apply its hidden-item filters.
+    match daemon.with_read_snapshot(|c| Store::list_hidden_conn(c, &user_name)) {
         Ok(hidden) => json(200, &HiddenResponse { hidden }),
         Err(e) => store_error(&e),
     }
@@ -5006,7 +5010,8 @@ fn list_watches_endpoint(daemon: &Daemon, query: &str, user_header: Option<&str>
         Ok(u) => u,
         Err(r) => return r,
     };
-    match daemon.lock().list_watches(&user) {
+    // WS-E.2: pooled -- the Tasks tab polls this on every refresh.
+    match daemon.with_read_snapshot(|c| Store::list_watches_conn(c, &user)) {
         Ok(watches) => json(200, &WatchesResponse { watches }),
         Err(e) => store_error(&e),
     }
@@ -5634,8 +5639,9 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
     // Bound before the `match`: as a scrutinee the guard would stay alive for
     // the whole match body, and `validate_project_location` shells out to
     // `git rev-parse` -- a subprocess that must not run with the daemon's one
-    // global store lock held.
-    let project = daemon.lock().get_project(name);
+    // global store lock held. WS-E.2: and the lookup itself is pooled, so this
+    // handler never touches the writer lock at all.
+    let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
         Ok(Some(p)) => match validate_project_location(&p.path, &p.vcs) {
             Ok(()) => json(
@@ -5682,8 +5688,8 @@ struct ProjectBranchesResponse {
 fn project_branches(daemon: &Daemon, name: &str) -> Reply {
     // Bound before the `match`: both `list_base_branches` calls below spawn a
     // `git for-each-ref`, and this endpoint is polled by the board -- two
-    // subprocesses per poll under the global store lock.
-    let project = daemon.lock().get_project(name);
+    // subprocesses per poll under the global store lock. WS-E.2: pooled too.
+    let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
         Ok(Some(p)) if p.vcs == "git" => {
             let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
@@ -13834,7 +13840,9 @@ fn pr_get(daemon: &Daemon, pr_id: &str) -> Reply {
 /// including each open PR's last-polled `ci_status`), which needs every
 /// open PR's source task in one request rather than one lookup per row.
 fn pr_index_list(daemon: &Daemon) -> Reply {
-    match daemon.lock().list_pull_requests_index() {
+    // WS-E.2: read-only and polled by the board on every Tasks-tab refresh, so
+    // it runs on a pooled connection rather than the writer lock.
+    match daemon.with_read_snapshot(Store::list_pull_requests_index_conn) {
         Ok(rows) => json(200, &rows),
         Err(e) => store_error(&e),
     }
@@ -16835,7 +16843,25 @@ mod tests {
         let traced = route_with_trace(&d, "GET", "/api/daemon", "", None);
         let plain = route(&d, "GET", "/api/daemon", "");
         assert_eq!(traced.status, plain.status);
-        assert_eq!(traced.body, plain.body);
+
+        // Compared field by field with the inherently time-dependent ones
+        // dropped. `/api/daemon` reports live instrumentation -- how long the
+        // lock has been held, how long ago the watchdog last succeeded -- and
+        // those legitimately differ between two calls a millisecond apart. What
+        // this test is about is that adding a trace context does not change the
+        // *reply*, so it compares everything except the clock.
+        let strip = |body: &str| -> serde_json::Value {
+            let mut v: serde_json::Value =
+                serde_json::from_str(body).expect("health response is JSON");
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("store_lock_holder");
+                obj.remove("watchdog");
+                obj.remove("lock_wait");
+                obj.remove("guard_hold");
+            }
+            v
+        };
+        assert_eq!(strip(&traced.body), strip(&plain.body));
     }
 
     #[test]

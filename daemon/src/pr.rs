@@ -523,7 +523,17 @@ impl Store {
     /// coordinate isn't stored directly on `guardian_branches`. No forge
     /// calls, no per-guardian N+1 -- one SELECT.
     pub fn list_pull_requests_index(&self) -> Result<Vec<PrIndexRow>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_pull_requests_index_conn(&self.conn)
+    }
+
+    /// [`Self::list_pull_requests_index`] against an explicit connection, so
+    /// `GET /api/pull-requests/index` can be served from the read pool (WS-E.2).
+    /// The board fetches this on every Tasks-tab poll, alongside
+    /// `/api/task-index`.
+    pub(crate) fn list_pull_requests_index_conn(
+        conn: &rusqlite::Connection,
+    ) -> Result<Vec<PrIndexRow>> {
+        let mut stmt = conn.prepare(
             "SELECT pr.id, pr.guardian_id, pr.branch_id, gb.branch AS branch_alias,
                     pr.forge, pr.repo, pr.pr_number, pr.pr_url, pr.state,
                     pr.created_at_ms, pr.updated_at_ms,

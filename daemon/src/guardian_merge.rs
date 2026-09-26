@@ -3138,7 +3138,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     // the last lease claims the (coalesced) request itself, so this call
     // returns without spinning.
     {
-        let mut guard = store.lock();
+        let guard = store.lock();
         guard.request_guardian_restack(id, from_position);
         crate::cartographer::Note::new("guardian")
             .guardian(id)
@@ -6824,7 +6824,7 @@ pub fn run_feedback(
     // its own lease) simply leaves the request queued rather than racing
     // this restack against that branch's in-flight edit.
     {
-        let mut guard = store.lock();
+        let guard = store.lock();
         guard.request_guardian_restack(id, position);
         crate::cartographer::Note::new("guardian")
             .guardian(id)
@@ -10979,7 +10979,7 @@ fn generate_final_summary(
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
     if result.is_done() && !result.summary.trim().is_empty() {
         // RAL-88: record which resolved agent/model produced this summary.
-        let mut guard = store.lock();
+        let guard = store.lock();
         let _ =
             guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
         guard.mark_final_summary_generated(id, signature);

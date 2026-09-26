@@ -59,6 +59,7 @@ pub(crate) mod short_paths;
 pub(crate) mod stash;
 pub mod store;
 pub mod store_lock;
+pub mod store_memory;
 pub mod store_pool;
 pub mod summary_worker;
 pub mod terminal_log;

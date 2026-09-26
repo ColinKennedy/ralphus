@@ -119,7 +119,16 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn list_watches(&self, user_name: &str) -> Result<Vec<WatchView>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_watches_conn(&self.conn, user_name)
+    }
+
+    /// [`Self::list_watches`] against an explicit connection (WS-E.2) -- the
+    /// Tasks tab polls `GET /api/watches` on every refresh.
+    pub(crate) fn list_watches_conn(
+        conn: &rusqlite::Connection,
+        user_name: &str,
+    ) -> Result<Vec<WatchView>> {
+        let mut stmt = conn.prepare(
             "SELECT id, user_name, entity_uri, notify_tiers, created_at_ms
              FROM watches WHERE user_name=?1 ORDER BY created_at_ms DESC, id",
         )?;

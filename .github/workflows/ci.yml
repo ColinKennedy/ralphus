@@ -349,6 +349,11 @@ jobs:
       # attributed to the perf job rather than looking like an unrelated flake.
       - name: Rust submit lock-hold budget
         run: cargo nextest run -p ralphus-daemon --test submit_lock_hold --test-threads 1
+      # WS-E.4: how much of the read path is off the writer lock. A source
+      # scan, so it is fast and deterministic -- see the module doc comment in
+      # daemon/tests/read_path_ratchet.rs for why latency cannot see this.
+      - name: Rust read-path ratchet
+        run: cargo nextest run -p ralphus-daemon --test read_path_ratchet
       - name: Build ralphus-librarian (needed by the browser-side perf test)
         run: cargo build -p ralphus-librarian
       - uses: actions/setup-python@v5

@@ -902,83 +902,16 @@ pub struct Store {
     /// In-process SSE broadcast registry (RAL-167), fed by
     /// [`Store::cartographer_log`]. See `crate::events`.
     event_bus: crate::events::EventBus,
-    /// Liveness signal (RAL-170): last time fresh pane output was observed
-    /// for a running tmux-wrapped session, keyed by `crate::tmux::session_name`
-    /// (the same deterministic key used for task cells, proof steps, and
-    /// Guardian resolver/manual-check sessions alike — see
-    /// [`Self::note_live_activity`]'s doc comment for why this is in-memory
-    /// only, not a DB column). Entries are removed once the owning
-    /// `run_via_tmux` call returns, so this stays bounded by the number of
-    /// *currently running* tmux-wrapped sessions, not lifetime history.
-    live_activity: HashMap<String, i64>,
-    /// RAL-208: per-guardian debounce bookkeeping for the LLM-authored final
-    /// change summary, keyed by guardian id. In-memory only, like
-    /// `live_activity` above — losing this across a daemon restart just means
-    /// the next enabled-branch-set change regenerates the summary once more
-    /// than strictly necessary, not a correctness issue. See
-    /// `guardian_merge::queue_final_summary_regen`/`sweep_pending_summaries`.
-    guardian_summary_debounce: HashMap<String, GuardianSummaryDebounce>,
-    /// Exclusive ownership of one review branch's mutable worktree, keyed by
-    /// `(guardian_id, branch_id)` and valued by an owner tag (e.g.
-    /// `feedback:{branch_id}`) — see the `worktree lease` glossary entry.
-    /// `run_feedback` holds one for the duration of its resolver call so a
-    /// concurrent restack can never rebase a branch out from under a
-    /// still-running feedback pass. In-memory only: a daemon restart mid-lease
-    /// simply drops it, which is safe since the worktree itself is re-checked
-    /// for dirt on the next pass through `drive_rebase`.
-    guardian_worktree_leases: HashMap<(String, String), String>,
-    /// A pending restack request per guardian, coalesced to the lowest
-    /// requested `from_position` — a later request for a *later* position
-    /// while an earlier one is still queued would otherwise lose ground
-    /// already claimed. Cleared by [`Store::try_claim_guardian_restack`].
-    guardian_restack_requests: HashMap<String, i64>,
-    /// Guardians with a restack currently claimed (running). A restack may
-    /// only be claimed when no branch of the guardian holds a worktree lease,
-    /// and no new worktree lease may be acquired while the guardian's id is
-    /// in this set — see [`Store::try_claim_guardian_restack`] and
-    /// [`Store::try_acquire_guardian_worktree_lease`].
-    guardian_restack_running: std::collections::HashSet<String>,
-    /// RAL-241: which `crate::tmux::session_name` keys have already had a
-    /// stall escalation enqueued for their *current* stall onset, and when
-    /// that onset's last-known-good activity timestamp was — so a still-
-    /// ongoing stall doesn't re-enqueue a mailbox message on every poll.
-    /// In-memory only, like `live_activity` above: cleared alongside it (see
-    /// `Store::clear_live_activity`) once the owning `run_via_tmux` call has
-    /// a terminal result, so a *new* attempt/cell can be escalated again.
-    stall_escalated: HashMap<String, i64>,
-    /// RAL-281: process-lifetime cache of `secret_env_names`, `None` when
-    /// invalidated by a mutation. See `crate::secret_env_names`'s module doc
-    /// comment for why this exists (the scheduler's per-cell/per-proof-step
-    /// env-merge choke point reads it on every dispatch, so it must not cost
-    /// a DB query per call). Scoped to this `Store` instance (not a global
-    /// static) so it can't leak between the daemon's one real DB and the many
-    /// independent in-memory stores each test opens.
-    pub(crate) secret_env_names_cache:
-        std::sync::RwLock<Option<std::collections::BTreeSet<String>>>,
-    /// RAL-393 Stage 3: a small pool of read-only connections to this same
-    /// database, so read-classified methods can run without waiting on
-    /// [`crate::store_lock::StoreMutex`]. See `crate::store_pool`'s module
-    /// doc comment for why this is a connection pool rather than
-    /// `RwLock<Store>`.
+    /// WS-E.1: every piece of this store's state that is not in SQLite --
+    /// worktree leases, restack bookkeeping, tmux liveness, stall debounce and
+    /// the secret-name cache -- behind its own small locks rather than this
+    /// one. See `crate::store_memory` for why they are grouped the way they
+    /// are, and why having them here was blocking the read-path migration.
+    ///
+    /// An `Arc` so a caller can hold a handle to it without holding the store:
+    /// see [`Store::memory`].
+    memory: std::sync::Arc<crate::store_memory::StoreMemory>,
     read_pool: std::sync::Arc<crate::store_pool::ReadConnPool>,
-}
-
-/// RAL-208: see [`Store::guardian_summary_debounce`].
-#[derive(Debug, Default, Clone)]
-struct GuardianSummaryDebounce {
-    /// The enabled-branch signature the current LLM-authored `change_summary`
-    /// was generated from. `None` until the first final summary is produced.
-    generated_signature: Option<String>,
-    /// A signature awaiting generation, and when it was last (re)requested.
-    /// Each new request overwrites both fields — that's what implements the
-    /// trailing debounce: the "quiet period" clock restarts on every
-    /// enable/disable toggle instead of accumulating separate pending jobs.
-    pending_signature: Option<String>,
-    pending_requested_at_ms: Option<i64>,
-    /// RAL-303: whether this daemon process has already tried to repair a
-    /// guardian left with no LLM-authored summary. See
-    /// [`Self::claim_final_summary_repair`].
-    repair_attempted: bool,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -1052,20 +985,13 @@ impl Store {
     /// while another owner already holds this branch's lease. See the
     /// `worktree lease` glossary entry.
     pub(crate) fn try_acquire_guardian_worktree_lease(
-        &mut self,
+        &self,
         guardian_id: &str,
         branch_id: &str,
         owner: &str,
     ) -> bool {
-        if self.guardian_restack_running.contains(guardian_id) {
-            return false;
-        }
-        let key = (guardian_id.to_string(), branch_id.to_string());
-        if self.guardian_worktree_leases.contains_key(&key) {
-            return false;
-        }
-        self.guardian_worktree_leases.insert(key, owner.to_string());
-        true
+        self.memory
+            .try_acquire_worktree_lease(guardian_id, branch_id, owner)
     }
 
     /// Release `branch_id`'s worktree lease, but only if `owner` is the
@@ -1073,17 +999,13 @@ impl Store {
     /// release a lease it no longer owns. Returns whether it actually
     /// released one.
     pub(crate) fn release_guardian_worktree_lease(
-        &mut self,
+        &self,
         guardian_id: &str,
         branch_id: &str,
         owner: &str,
     ) -> bool {
-        let key = (guardian_id.to_string(), branch_id.to_string());
-        if self.guardian_worktree_leases.get(&key).map(String::as_str) != Some(owner) {
-            return false;
-        }
-        self.guardian_worktree_leases.remove(&key);
-        true
+        self.memory
+            .release_worktree_lease(guardian_id, branch_id, owner)
     }
 
     /// The current lease owner for `branch_id`'s worktree, if any — used by
@@ -1094,20 +1016,15 @@ impl Store {
         guardian_id: &str,
         branch_id: &str,
     ) -> Option<String> {
-        self.guardian_worktree_leases
-            .get(&(guardian_id.to_string(), branch_id.to_string()))
-            .cloned()
+        self.memory.worktree_lease_owner(guardian_id, branch_id)
     }
 
     /// Queue a restack starting at `from_position` for `guardian_id`,
     /// coalescing with any already-queued request by keeping the lower
     /// position — a restack from a later position can never safely replace
     /// one already promised to reach further back into the stack.
-    pub(crate) fn request_guardian_restack(&mut self, guardian_id: &str, from_position: i64) {
-        self.guardian_restack_requests
-            .entry(guardian_id.to_string())
-            .and_modify(|p| *p = (*p).min(from_position))
-            .or_insert(from_position);
+    pub(crate) fn request_guardian_restack(&self, guardian_id: &str, from_position: i64) {
+        self.memory.request_restack(guardian_id, from_position);
     }
 
     /// Claim the queued restack request for `guardian_id`, if one exists and
@@ -1117,25 +1034,14 @@ impl Store {
     /// guardian is marked running until [`Store::finish_guardian_restack`]
     /// is called, and the coalesced position is returned and removed from
     /// the queue.
-    pub(crate) fn try_claim_guardian_restack(&mut self, guardian_id: &str) -> Option<i64> {
-        if self.guardian_restack_running.contains(guardian_id)
-            || self
-                .guardian_worktree_leases
-                .keys()
-                .any(|(gid, _)| gid == guardian_id)
-        {
-            return None;
-        }
-        let position = self.guardian_restack_requests.remove(guardian_id)?;
-        self.guardian_restack_running
-            .insert(guardian_id.to_string());
-        Some(position)
+    pub(crate) fn try_claim_guardian_restack(&self, guardian_id: &str) -> Option<i64> {
+        self.memory.try_claim_restack(guardian_id)
     }
 
     /// Mark `guardian_id`'s claimed restack finished, allowing a new restack
     /// claim or worktree lease acquisition.
-    pub(crate) fn finish_guardian_restack(&mut self, guardian_id: &str) {
-        self.guardian_restack_running.remove(guardian_id);
+    pub(crate) fn finish_guardian_restack(&self, guardian_id: &str) {
+        self.memory.finish_restack(guardian_id);
     }
 
     /// Open (creating if needed) a store at `path`, in WAL mode.
@@ -1168,13 +1074,7 @@ impl Store {
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool,
         };
         store.init_schema()?;
@@ -1206,13 +1106,7 @@ impl Store {
         let store = Self {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool,
         };
         store.init_schema()?;
@@ -1226,6 +1120,15 @@ impl Store {
     #[must_use]
     pub(crate) fn read_pool(&self) -> std::sync::Arc<crate::store_pool::ReadConnPool> {
         std::sync::Arc::clone(&self.read_pool)
+    }
+
+    /// This store's non-database state (WS-E.1). Cloning the `Arc` is cheap and
+    /// takes no lock, so a caller can hold it independently of the store --
+    /// which is the point: worktree leases, tmux liveness and the rest no
+    /// longer require the global `StoreMutex` to reach.
+    #[must_use]
+    pub fn memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
+        std::sync::Arc::clone(&self.memory)
     }
 
     /// The SSE broadcast registry (RAL-167) — subscribe from the `/api/events`
@@ -4547,12 +4450,39 @@ impl Store {
     /// of these reads must wrap them in a read transaction -- see
     /// [`Self::board_snapshot_conn`].
     pub(crate) fn list_squads_conn(conn: &Connection) -> Result<Vec<SquadView>> {
+        Self::list_squads_conn_limited(conn, None)
+    }
+
+    /// [`Self::list_squads_conn`] with an optional cap on how many squads are
+    /// hydrated (WS-D.3).
+    ///
+    /// The cost of this view is `1 + 8S` statements for `S` squads -- each one
+    /// pays `build_squad_view` for its tasks, cells and proofs -- so it grows
+    /// without bound as a project accumulates history, and the board was
+    /// re-fetching all of it. `None` preserves exactly the previous behavior,
+    /// which is what keeps this change internal: capping what the board
+    /// *displays* is a product decision (it currently shows all history
+    /// implicitly), so this adds the capability and leaves that call open.
+    ///
+    /// The cap is applied in SQL, not by truncating afterwards, so the
+    /// per-squad hydration is skipped rather than done and discarded.
+    pub(crate) fn list_squads_conn_limited(
+        conn: &Connection,
+        limit: Option<i64>,
+    ) -> Result<Vec<SquadView>> {
         // Tie-break on id so squads created within the same millisecond still order
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
-        let mut stmt = conn.prepare(
+        let sql = String::from(
             "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads ORDER BY created_at_ms DESC, id DESC",
-        )?;
+        );
+        // A non-positive limit would mean "no rows", which no caller wants and a
+        // typo could easily produce; treat it as unlimited.
+        let sql = match limit.filter(|n| *n > 0) {
+            Some(n) => format!("{sql} LIMIT {n}"),
+            None => sql,
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -5673,7 +5603,12 @@ impl Store {
 
     /// A project by its exact registered name, or `None` when absent.
     pub fn get_project(&self, name: &str) -> Result<Option<ProjectView>> {
-        self.conn
+        Self::get_project_conn(&self.conn, name)
+    }
+
+    /// [`Self::get_project`] against an explicit connection (WS-E.2).
+    pub(crate) fn get_project_conn(conn: &Connection, name: &str) -> Result<Option<ProjectView>> {
+        conn
             .query_row(
                 "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects WHERE name=?",
                 params![name],
@@ -5694,7 +5629,13 @@ impl Store {
 
     /// All registered projects, newest first.
     pub fn list_projects(&self) -> Result<Vec<ProjectView>> {
-        let mut stmt = self.conn.prepare(
+        Self::list_projects_conn(&self.conn)
+    }
+
+    /// [`Self::list_projects`] against an explicit connection, so the Projects
+    /// tab's poll runs on the read pool (WS-E.2).
+    pub(crate) fn list_projects_conn(conn: &Connection) -> Result<Vec<ProjectView>> {
+        let mut stmt = conn.prepare(
             "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
@@ -9620,8 +9561,8 @@ impl Store {
     /// as the owning `run_via_tmux` call returns, so memory stays bounded by
     /// *currently running* cells rather than growing across the daemon's
     /// lifetime.
-    pub fn note_live_activity(&mut self, session_name: &str, at_ms: i64) {
-        self.live_activity.insert(session_name.to_string(), at_ms);
+    pub fn note_live_activity(&self, session_name: &str, at_ms: i64) {
+        self.memory.note_live_activity(session_name, at_ms);
     }
 
     /// The last time [`Self::note_live_activity`] was called for
@@ -9629,7 +9570,7 @@ impl Store {
     /// has never produced pane growth (fresh cell, no output yet) or has
     /// already ended (see [`Self::clear_live_activity`]).
     pub fn live_activity_ms(&self, session_name: &str) -> Option<i64> {
-        self.live_activity.get(session_name).copied()
+        self.memory.live_activity_ms(session_name)
     }
 
     /// Drop the liveness entry for `session_name` once its owning
@@ -9637,8 +9578,8 @@ impl Store {
     /// reattach kill — see the call site's doc comment). Best-effort: a
     /// missing entry (cell never produced output, or was already
     /// cleared) is not an error.
-    pub fn clear_live_activity(&mut self, session_name: &str) {
-        self.live_activity.remove(session_name);
+    pub fn clear_live_activity(&self, session_name: &str) {
+        self.memory.clear_live_activity(session_name);
     }
 
     /// RAL-241: has a stall escalation already been enqueued for
@@ -9650,23 +9591,24 @@ impl Store {
     /// again, without needing an explicit "clear" between the two stalls.
     #[must_use]
     pub fn is_stall_escalated(&self, session_name: &str, last_activity_ms: i64) -> bool {
-        self.stall_escalated.get(session_name) == Some(&last_activity_ms)
+        self.memory
+            .is_stall_escalated(session_name, last_activity_ms)
     }
 
     /// Record that a stall escalation was just enqueued for `session_name`'s
     /// current stall onset (`last_activity_ms`), so
     /// [`Self::is_stall_escalated`] suppresses a repeat enqueue for the same
     /// ongoing stall.
-    pub fn note_stall_escalated(&mut self, session_name: &str, last_activity_ms: i64) {
-        self.stall_escalated
-            .insert(session_name.to_string(), last_activity_ms);
+    pub fn note_stall_escalated(&self, session_name: &str, last_activity_ms: i64) {
+        self.memory
+            .note_stall_escalated(session_name, last_activity_ms);
     }
 
     /// Drop the RAL-241 stall-escalation bookkeeping for `session_name`,
     /// mirroring [`Self::clear_live_activity`] — called from the same site,
     /// once the owning `run_via_tmux` call has a terminal result for good.
-    pub fn clear_stall_escalated(&mut self, session_name: &str) {
-        self.stall_escalated.remove(session_name);
+    pub fn clear_stall_escalated(&self, session_name: &str) {
+        self.memory.clear_stall_escalated(session_name);
     }
 
     /// RAL-208: request that guardian `id`'s LLM-authored final change
@@ -9684,16 +9626,9 @@ impl Store {
     /// git-log preliminary — there the branch set is unchanged but the summary
     /// has never been through the LLM at all, so the caller passes `force` to
     /// get the handoff it would otherwise be denied.
-    pub fn request_final_summary(&mut self, id: &str, signature: &str, now_ms: i64, force: bool) {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        if !force && d.generated_signature.as_deref() == Some(signature) {
-            return;
-        }
-        d.pending_signature = Some(signature.to_string());
-        d.pending_requested_at_ms = Some(now_ms);
+    pub fn request_final_summary(&self, id: &str, signature: &str, now_ms: i64, force: bool) {
+        self.memory
+            .request_final_summary(id, signature, now_ms, force);
     }
 
     /// RAL-208: atomically claim every guardian whose pending
@@ -9703,23 +9638,12 @@ impl Store {
     /// claim. Returns `(guardian_id, signature)` pairs for the caller to
     /// actually generate (a background call, well outside this lock).
     pub fn take_due_final_summary_requests(
-        &mut self,
+        &self,
         now_ms: i64,
         debounce_ms: i64,
     ) -> Vec<(String, String)> {
-        let mut due = Vec::new();
-        for (id, d) in &mut self.guardian_summary_debounce {
-            let Some(requested_at) = d.pending_requested_at_ms else {
-                continue;
-            };
-            if now_ms.saturating_sub(requested_at) >= debounce_ms {
-                if let Some(sig) = d.pending_signature.take() {
-                    due.push((id.clone(), sig));
-                }
-                d.pending_requested_at_ms = None;
-            }
-        }
-        due
+        self.memory
+            .take_due_final_summary_requests(now_ms, debounce_ms)
     }
 
     /// Queue a guardian's PR stack for asynchronous submission, restarting
@@ -9760,12 +9684,8 @@ impl Store {
     /// RAL-208: record that guardian `id`'s change summary now reflects
     /// `signature`, so a later request for the same signature is recognized
     /// as already-satisfied (see [`Self::request_final_summary`]).
-    pub fn mark_final_summary_generated(&mut self, id: &str, signature: &str) {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        d.generated_signature = Some(signature.to_string());
+    pub fn mark_final_summary_generated(&self, id: &str, signature: &str) {
+        self.memory.mark_final_summary_generated(id, signature);
     }
 
     /// RAL-303: claim the one repair attempt this daemon process gets at a
@@ -9779,16 +9699,8 @@ impl Store {
     /// summary it had at restart forever. This lets the review-maintenance
     /// sweep re-request exactly once rather than re-firing the LLM on every
     /// tick when generation is failing for some other reason.
-    pub fn claim_final_summary_repair(&mut self, id: &str) -> bool {
-        let d = self
-            .guardian_summary_debounce
-            .entry(id.to_string())
-            .or_default();
-        if d.repair_attempted || d.generated_signature.is_some() {
-            return false;
-        }
-        d.repair_attempted = true;
-        true
+    pub fn claim_final_summary_repair(&self, id: &str) -> bool {
+        self.memory.claim_final_summary_repair(id)
     }
 
     /// Fetch a task's first (lowest-`idx`) cell's cwd — the cwd a
@@ -10782,6 +10694,57 @@ fn move_block(
 mod tests {
     use super::*;
 
+    /// WS-D.3: `list_squads` can be capped, and the cap keeps newest-first
+    /// order rather than returning an arbitrary slice.
+    ///
+    /// The uncapped call must stay uncapped: the board currently shows all
+    /// history implicitly, so changing that default is a product decision this
+    /// change deliberately does not make.
+    #[test]
+    fn list_squads_honours_an_optional_limit_and_stays_newest_first() {
+        let mut store = Store::open_in_memory().unwrap();
+        let file = parse(SAMPLE);
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(store.insert_squad(&file, None, false).unwrap());
+        }
+
+        let all = Store::list_squads_conn(&store.conn).unwrap();
+        assert_eq!(all.len(), 5, "the default must not be capped");
+        // Newest first: ids are monotonic, so the last inserted leads.
+        assert_eq!(all[0].id, *ids.last().unwrap());
+
+        let capped = Store::list_squads_conn_limited(&store.conn, Some(2)).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(
+            capped.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            all.iter().take(2).map(|s| s.id.clone()).collect::<Vec<_>>(),
+            "the cap must take the newest squads, not an arbitrary two"
+        );
+
+        // A limit at or above the row count is the same as no limit.
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(99))
+                .unwrap()
+                .len(),
+            5
+        );
+        // A nonsensical limit means unlimited, not zero rows -- a `0` reaching
+        // here from a typo should not silently blank the board.
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(0))
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            Store::list_squads_conn_limited(&store.conn, Some(-1))
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
     /// WS-D.1/M13: `reviews_for_squad` must reach its guardians by index seek,
     /// never by scanning the `guardians` table.
     ///
@@ -11170,13 +11133,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11294,13 +11251,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11391,13 +11342,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11440,13 +11385,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             // These legacy-migration tests exercise `store.conn` directly
             // against a private (non-shared-cache) in-memory connection and
             // never touch the read pool, so an unrelated, freshly-named
@@ -11517,13 +11456,7 @@ prompt = "legacy cell, no review_guardian_id"
         let store = Store {
             conn,
             event_bus: crate::events::EventBus::new(),
-            live_activity: HashMap::new(),
-            guardian_summary_debounce: HashMap::new(),
-            guardian_worktree_leases: HashMap::new(),
-            guardian_restack_requests: HashMap::new(),
-            guardian_restack_running: std::collections::HashSet::new(),
-            stall_escalated: HashMap::new(),
-            secret_env_names_cache: std::sync::RwLock::new(None),
+            memory: crate::store_memory::StoreMemory::new(),
             read_pool: crate::store_pool::ReadConnPool::open(&crate::store_pool::memory_location()),
         };
         store
@@ -15904,7 +15837,7 @@ command = "e"
 
     #[test]
     fn claim_final_summary_repair_fires_once_per_guardian() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.claim_final_summary_repair("g1"));
         assert!(!store.claim_final_summary_repair("g1"));
         // Independent per guardian.
@@ -15913,14 +15846,14 @@ command = "e"
 
     #[test]
     fn claim_final_summary_repair_declines_a_guardian_already_summarized() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         assert!(!store.claim_final_summary_repair("g1"));
     }
 
     #[test]
     fn request_final_summary_is_noop_when_signature_already_generated() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         // A rebuild that didn't change the enabled-branch set (a feedback
         // restack, a manual-push rebase, a base-branch shift) requests the
@@ -15939,7 +15872,7 @@ command = "e"
     /// deny it and the review would keep showing raw commit subjects forever.
     #[test]
     fn request_final_summary_forced_queues_even_for_an_already_generated_signature() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         store.request_final_summary("g1", "sig-a", 1_000, true);
         let due = store.take_due_final_summary_requests(1_000 + 60_000, 0);
@@ -15948,7 +15881,7 @@ command = "e"
 
     #[test]
     fn request_final_summary_queues_when_signature_differs_from_generated() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.mark_final_summary_generated("g1", "sig-a");
         store.request_final_summary("g1", "sig-b", 1_000, false);
         let due = store.take_due_final_summary_requests(1_000 + 5_000, 5_000);
@@ -15957,7 +15890,7 @@ command = "e"
 
     #[test]
     fn take_due_final_summary_requests_respects_debounce_window() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 1_000, false);
         // Not due yet -- the quiet period hasn't elapsed.
         assert!(
@@ -15972,7 +15905,7 @@ command = "e"
 
     #[test]
     fn repeated_requests_restart_the_debounce_clock_and_only_the_latest_signature_survives() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         // Simulates rapid enable/disable toggling: each toggle rebuilds and
         // requests a different enabled-branch signature before the previous
         // request's debounce window has elapsed.
@@ -15995,7 +15928,7 @@ command = "e"
 
     #[test]
     fn take_due_final_summary_requests_clears_pending_so_it_is_claimed_once() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         store.request_final_summary("g1", "sig-a", 0, false);
         let first = store.take_due_final_summary_requests(10_000, 5_000);
         assert_eq!(first, vec![("g1".to_string(), "sig-a".to_string())]);
@@ -16161,7 +16094,7 @@ command = "e"
 
     #[test]
     fn guardian_restack_waits_for_all_parallel_branch_leases_and_coalesces() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
         assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
         store.request_guardian_restack("g", 4);
@@ -16180,7 +16113,7 @@ command = "e"
 
     #[test]
     fn guardian_distinct_branch_feedback_leases_are_concurrent() {
-        let mut store = Store::open_in_memory().unwrap();
+        let store = Store::open_in_memory().unwrap();
         assert!(store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a"));
         assert!(store.try_acquire_guardian_worktree_lease("g", "b", "feedback:b"));
         assert!(!store.try_acquire_guardian_worktree_lease("g", "a", "feedback:a2"));

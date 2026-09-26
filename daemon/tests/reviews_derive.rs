@@ -502,9 +502,17 @@ fn repeat_submission_against_the_same_worktree_does_not_conflate_reviews() {
     let gid_b = ids_b[0].clone();
 
     assert_ne!(gid_a, gid_b, "each submission mints its own guardian");
+    // Read each under its own guard, then compare. Two `store.lock()`
+    // temporaries in one expression is a self-park: the first guard is still
+    // alive when the second acquires, and the store mutex is not reentrant.
+    let branch_a = store.lock().get_guardian(&gid_a).unwrap().branches[0]
+        .branch
+        .clone();
+    let branch_b = store.lock().get_guardian(&gid_b).unwrap().branches[0]
+        .branch
+        .clone();
     assert_eq!(
-        store.lock().get_guardian(&gid_a).unwrap().branches[0].branch,
-        store.lock().get_guardian(&gid_b).unwrap().branches[0].branch,
+        branch_a, branch_b,
         "sanity: both guardians recorded the identical branch string"
     );
 
@@ -775,10 +783,14 @@ fn reviews_auto_start_when_the_run_succeeds() {
 
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock();
-        let run_id = g.insert_squad(&file, None, false).unwrap();
+        // Each store touch takes its own short-lived guard: `derive_reviews`
+        // now locks internally, so holding one across it self-parks.
+        let run_id = store.lock().insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&store, &run_id, &file).expect("derive");
-        assert_eq!(g.get_guardian(&ids[0]).unwrap().status, "collecting");
+        assert_eq!(
+            store.lock().get_guardian(&ids[0]).unwrap().status,
+            "collecting"
+        );
         (run_id, ids[0].clone())
     };
 
@@ -1298,8 +1310,7 @@ fn non_overlapping_task_does_not_block_readiness() {
 
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock();
-        let run_id = g.insert_squad(&file, None, false).unwrap();
+        let run_id = store.lock().insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only task A declared a review");
         (run_id, ids[0].clone())
@@ -1379,8 +1390,7 @@ fn undeclared_overlapping_task_blocks_readiness() {
 
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock();
-        let run_id = g.insert_squad(&file, None, false).unwrap();
+        let run_id = store.lock().insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         assert_eq!(ids.len(), 1, "only one project so one review");
         (run_id, ids[0].clone())
@@ -1804,8 +1814,7 @@ fn multi_project_merge_runs_per_project_and_aggregates() {
     ))
     .unwrap();
     let gid = {
-        let mut g = store.lock();
-        let r = g.insert_squad(&file, None, false).unwrap();
+        let r = store.lock().insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&store, &r, &file).expect("derive");
         ids[0].clone()
     };
@@ -2108,8 +2117,7 @@ fn simultaneous_worktree_sibling_completion_transitions_ready_exactly_once() {
 
     let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
     let (run_id, gid) = {
-        let mut g = store.lock();
-        let run_id = g.insert_squad(&file, None, false).unwrap();
+        let run_id = store.lock().insert_squad(&file, None, false).unwrap();
         let ids = derive_reviews(&store, &run_id, &file).expect("derive");
         (run_id, ids[0].clone())
     };
