@@ -310,7 +310,7 @@
        * @returns {void}
        */
       function openNewAgentProfileForm() {
-        agentProfileForm = { editingName: null, name: "", backend: AGENT_PROFILE_BACKENDS[0], executable: "", model: "", env: [] };
+        agentProfileForm = { editingName: null, name: "", backend: AGENT_PROFILE_BACKENDS[0], executable: "", model: "", env: [], thinkingCapable: null };
         agentProfileFormError = "";
         renderAgentProfiles();
       }
@@ -330,6 +330,7 @@
           executable: p.executable || "",
           model: p.model || "",
           env: p.env.map((e) => ({ key: e.key, kind: e.kind, value: e.value })),
+          thinkingCapable: p.thinking_capable,
         };
         agentProfileFormError = "";
         renderAgentProfiles();
@@ -439,6 +440,17 @@
       }
 
       /**
+       * Stages the profile form's thinking-capability override (RAL-516) and re-renders.
+       * @param {string} value - "inherit" | "on" | "off"
+       * @returns {void}
+       */
+      function onAgentProfileThinkingCapableChange(value) {
+        if (!agentProfileForm) return;
+        agentProfileForm.thinkingCapable = value === "on" ? true : value === "off" ? false : null;
+        renderAgentProfiles();
+      }
+
+      /**
        * Renders the staged create/edit profile form, or an empty string when it's closed.
        * @returns {string}
        */
@@ -465,6 +477,16 @@
             <input type="text" class="mono" style="flex:1" placeholder="${row.kind === "link" ? "other env var name" : "value"}" value="${esc(row.value)}" oninput="onAgentProfileEnvValueInput(${i},this.value)" data-tip="${row.kind === "link" ? "The name of another environment variable to resolve this key from." : "The literal value for this key."}" />
             <button class="btn" style="padding:2px 8px;font-size:11px" data-click="removeAgentProfileEnvRow" data-i="${i}" data-tip="Remove this row. Applies on Save Agent.">✕</button>
           </div>`).join("");
+        const backendDefaultThinking = form.backend === "pi";
+        const thinkingCapableValue = form.thinkingCapable === true ? "on" : form.thinkingCapable === false ? "off" : "inherit";
+        const thinkingCapableField = `<div class="row" style="gap:8px;margin-top:8px">
+              <label style="width:110px" data-tip="RAL-516: whether a Live View pane running this profile shows the \"Show Thinking\" checkbox at all.\nInherit uses this backend's own built-in default; Always/Never explicitly overrides it.">Show Thinking</label>
+              <select style="flex:1" onchange="onAgentProfileThinkingCapableChange(this.value)" data-tip="Use when a custom command wraps a backend that actually emits thinking output but isn't recognized by name (or vice versa) -- this only controls whether the checkbox appears, not what it does once shown.">
+                <option value="inherit" ${thinkingCapableValue === "inherit" ? "selected" : ""}>Inherit (${backendDefaultThinking ? "shows checkbox" : "no checkbox"} for "${esc(form.backend)}")</option>
+                <option value="on" ${thinkingCapableValue === "on" ? "selected" : ""}>Always show checkbox</option>
+                <option value="off" ${thinkingCapableValue === "off" ? "selected" : ""}>Never show checkbox</option>
+              </select>
+            </div>`;
         const err = agentProfileFormError ? `<div class="verr" style="margin-top:8px">${esc(agentProfileFormError)}</div>` : "";
         return `<div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
             <div style="margin-bottom:8px" data-tip="${form.editingName ? `Editing "${esc(form.editingName)}".` : "Create a new agent profile."} Nothing is sent to the daemon until Save Agent.">${form.editingName ? `Edit agent: ${esc(form.editingName)}` : "New agent"}</div>
@@ -484,6 +506,7 @@
               <label style="width:110px" data-tip="Default model for this profile, if the backend takes one. Leave blank to use the backend's own default.">Model</label>
               <input type="text" class="mono" style="flex:1" value="${esc(form.model)}" oninput="onAgentProfileModelInput(this.value)" placeholder="(backend default)" data-tip="Optional default model string passed to the backend." />
             </div>
+            ${thinkingCapableField}
             <div style="margin-top:12px">
               <div style="font-size:12px;color:var(--muted);margin-bottom:4px" data-tip="Ordered Set/Link environment table for this profile. Set stores a literal value; Link resolves another variable by name at cell-start time and is never returned resolved by the API.">Environment</div>
               ${envRows || `<div style="color:var(--muted);font-size:12px">No environment rows yet.</div>`}
@@ -518,6 +541,7 @@
           executable: form.backend === AGENT_RAW_BACKEND && form.executable.trim() ? form.executable.trim() : null,
           model: form.model.trim() || null,
           env,
+          thinking_capable: form.thinkingCapable,
         };
         try {
           const r = form.editingName

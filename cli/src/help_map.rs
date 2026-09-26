@@ -758,10 +758,13 @@ const AGENT_PROFILE_CHILDREN: &[HelpNode] = &[
             "--model [name]",
             "--set [key=value...]",
             "--link [key=target...]",
+            "--thinking-capable/--no-thinking-capable",
         ],
         "Administrative (RAL-473): create a new DB-backed agent profile. --set adds a literal \
 env value, --link chains to another key in the same profile's env table (validated for cycles \
-on save).",
+on save). --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane \
+running this profile shows the \"Show Thinking\" checkbox at all; omitted, it inherits the \
+backend's own default.",
         false,
         false,
         &[],
@@ -775,8 +778,12 @@ on save).",
             "--model [name]",
             "--set [key=value...]",
             "--link [key=target...]",
+            "--thinking-capable/--no-thinking-capable",
         ],
-        "Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env.",
+        "Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env. \
+--thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running \
+this profile shows the \"Show Thinking\" checkbox at all; omitted, it inherits the backend's own \
+default.",
         false,
         false,
         &[],

@@ -355,6 +355,10 @@ impl ModelBackend for PiBackend {
     fn supports_maximum_tool_output_tokens(&self) -> bool {
         true
     }
+
+    fn supports_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// RAL-304 (revised): `pi` has no CLI flag or env var for a context-window
