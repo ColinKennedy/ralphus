@@ -53,6 +53,8 @@
        * @property {boolean} originalSkipAutoBuild
        * @property {boolean} skipWorktrees
        * @property {boolean} originalSkipWorktrees
+       * @property {boolean} skipBaseUpdates - RAL-514: this review's own override for whether the automatic base-branch auto-update rebuild is skipped.
+       * @property {boolean} originalSkipBaseUpdates
        * @property {boolean} separatePrBranch
        * @property {boolean} originalSeparatePrBranch
        * @property {boolean} matchPrBranchName
@@ -126,6 +128,7 @@
         const proofSkipAutoClean = !!g.effective_proof_skip_auto_clean;
         const skipAutoBuild = !!g.skip_auto_build;
         const skipWorktrees = !!g.skip_worktrees;
+        const skipBaseUpdates = !!g.effective_skip_base_updates;
         const separatePrBranch = !!g.effective_separate_pr_branch;
         const matchPrBranchName = !!g.effective_match_pr_branch_name;
         const autoSubmitPrStack = !!g.effective_auto_submit_pr_stack;
@@ -148,6 +151,7 @@
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipAutoBuild, originalSkipAutoBuild: skipAutoBuild,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
+          skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
@@ -275,6 +279,12 @@
        * @returns {void}
        */
       function onEditSkipWorktrees(checked) { if (reviewEditDraft) reviewEditDraft.skipWorktrees = checked; }
+      /**
+       * Stages the skip-automatic-base-rebasing flag (RAL-514).
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditSkipBaseUpdates(checked) { if (reviewEditDraft) reviewEditDraft.skipBaseUpdates = checked; }
       /**
        * Stages the separate-PR-branch flag and re-renders, since it gates
        * whether "match worktree branch name" is enabled.
@@ -583,6 +593,8 @@
               <input type="checkbox" ${draft.skipAutoBuild ? "checked" : ""} onchange="onEditSkipAutoBuild(this.checked)">skip auto-build</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Build the entire branch stack in one shared worktree instead of isolated per-branch worktrees. Applies on Save.">
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
+              <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
             <h3 class="section">squash</h3>${squashSection}
             <h3 class="section">pull requests</h3>
             ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack", "onEditDualRootPr")}
@@ -655,6 +667,7 @@
         }
         if (draft.skipAutoBuild !== draft.originalSkipAutoBuild) body.skip_auto_build = draft.skipAutoBuild;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
+        if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
