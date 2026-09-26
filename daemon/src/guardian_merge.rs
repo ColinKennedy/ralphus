@@ -10882,6 +10882,7 @@ fn generate_final_summary(
     ) {
         Ok(r) => r,
         Err(message) => {
+            // ralphus[ignore-rlog-pair]: summary generation is an optional best-effort step; on failure, the review continues without a summary. The caller (repair_missing_final_summary) holds the Store and records any consequential outcome changes.
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {id} summary generation: unresolvable resolver agent: {message}"
