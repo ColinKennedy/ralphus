@@ -2626,6 +2626,7 @@ mod tests {
             "{}-{tag}.git",
             repo.file_name().expect("repo name").to_string_lossy()
         ));
+        let _ = std::fs::remove_dir_all(&fork);
         let status = std::process::Command::new("git")
             .args([
                 "clone",
