@@ -431,3 +431,5 @@ takes no credit for it beyond confirming it is present.
 
 Phases 3–6 are not started. Nothing in this commit implements a system-prompt
 fragment, PR folding, ghost derivation, or a CLI/MCP write path.
+=======
+>>>>>>> 8fdfa7412 (docs(prophecy): add inventory — what ralphus already has)
