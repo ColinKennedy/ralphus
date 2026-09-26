@@ -5376,13 +5376,16 @@ mod tests {
             assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "clean", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
             .unwrap();
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/1234567890abcdef/check-runs"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "failure", "details_url": "https://ci.example/job/1", "output": {"text": "error: build failed\nsee above"}}]}"#,
@@ -5424,13 +5427,16 @@ mod tests {
             assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "clean", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
             .unwrap();
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/check-runs");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/1234567890abcdef/check-runs"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [
@@ -5485,7 +5491,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "unstable", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "unstable", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -5525,7 +5531,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "unknown", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "unknown", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -5617,7 +5623,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "clean", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -5631,7 +5637,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/1234567890abcdef/status"
+            );
             req.respond(
                 tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
             )
@@ -5661,7 +5670,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "clean", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -5675,7 +5684,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/1234567890abcdef/status"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"state": "pending", "total_count": 0, "statuses": []}"#,
@@ -5702,7 +5714,7 @@ mod tests {
             let req = server.recv().unwrap();
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                    r#"{"mergeable_state": "clean", "head": {"sha": "1234567890abcdef"}}"#,
                 )
                 .with_status_code(200),
             )
@@ -5713,7 +5725,10 @@ mod tests {
             )
             .unwrap();
             let req = server.recv().unwrap();
-            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            assert_eq!(
+                req.url(),
+                "/repos/acme/widget/commits/1234567890abcdef/status"
+            );
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"state": "pending", "total_count": 1, "statuses": [{"state": "pending", "context": "legacy-ci"}]}"#,

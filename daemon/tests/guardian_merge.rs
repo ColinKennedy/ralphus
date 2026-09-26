@@ -4273,7 +4273,7 @@ fn manual_merge_press_resets_the_base_shift_rebuild_budget() {
             .unwrap();
         let targets = std::collections::BTreeMap::from([(
             "/repo-does-not-exist".to_string(),
-            "deadbeef".to_string(),
+            "1234567890abcdef".to_string(),
         )]);
         g.start_guardian_base_shift_campaign(&gid, &targets)
             .unwrap();

@@ -264,11 +264,11 @@ mod tests {
 
     #[test]
     fn traceparent_roundtrips_through_context() {
-        let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let header = "00-12345678901234567890123456789012-1234567890123456-01";
         let cx = context_from_traceparent(Some(header));
         assert!(cx.has_active_span());
         let out = traceparent_from_context(&cx).expect("traceparent");
-        assert!(out.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+        assert!(out.starts_with("00-12345678901234567890123456789012-"));
     }
 
     #[test]
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn start_span_child_shares_trace_id_with_parent() {
         let root = context_from_traceparent(Some(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-12345678901234567890123456789012-1234567890123456-01",
         ));
         let child = start_span("test.child", &root, SpanKind::Internal);
         let root_tp = traceparent_from_context(&root).unwrap();

@@ -29,6 +29,13 @@ pub enum NotifiableEventKind {
     ReviewStatusChanged,
     SquadFailed,
     ReviewFailed,
+    /// RAL-400 Phase 3: a squad's in-flight cell was halted because its
+    /// squad-kind roster entry just became `mode=block` on an open waypoint.
+    /// Not a failure in the ordinary sense (the cell will resume
+    /// automatically once the waypoint closes or de-escalates), but RAL-502
+    /// still requires remediation guidance since it is a blocked state --
+    /// see [`Store::notify_watchers_with_remediation`]'s broadened assert.
+    SquadWaypointHalted,
 }
 
 impl NotifiableEventKind {
@@ -41,6 +48,7 @@ impl NotifiableEventKind {
             Self::ReviewStatusChanged => "review_status_changed",
             Self::SquadFailed => "squad_failed",
             Self::ReviewFailed => "review_failed",
+            Self::SquadWaypointHalted => "squad_waypoint_halted",
         }
     }
 }
@@ -88,13 +96,15 @@ impl Store {
         Ok(id)
     }
 
-    /// Emit a tagged Monitor event for a genuine failure (RAL-502) --
-    /// `event` must be [`NotifiableEventKind::SquadFailed`] or
-    /// [`NotifiableEventKind::ReviewFailed`], the only two variants that
-    /// represent an error/failure rather than a status change. `remediation`
-    /// is mandatory: its rendered text is appended to `message` via
-    /// [`crate::mailbox::Store::enqueue_error_mailbox_message`], so every
-    /// failure notification a watcher receives carries actionable guidance.
+    /// Emit a tagged Monitor event for a genuine failure or blocked state
+    /// (RAL-502) -- `event` must be [`NotifiableEventKind::SquadFailed`],
+    /// [`NotifiableEventKind::ReviewFailed`], or
+    /// [`NotifiableEventKind::SquadWaypointHalted`], the variants that
+    /// represent an error/failure/block rather than an ordinary status
+    /// change. `remediation` is mandatory: its rendered text is appended to
+    /// `message` via [`crate::mailbox::Store::enqueue_error_mailbox_message`],
+    /// so every such notification a watcher receives carries actionable
+    /// guidance.
     #[allow(clippy::too_many_arguments)]
     pub fn notify_watchers_with_remediation(
         &self,
@@ -110,9 +120,11 @@ impl Store {
         debug_assert!(
             matches!(
                 event,
-                NotifiableEventKind::SquadFailed | NotifiableEventKind::ReviewFailed
+                NotifiableEventKind::SquadFailed
+                    | NotifiableEventKind::ReviewFailed
+                    | NotifiableEventKind::SquadWaypointHalted
             ),
-            "notify_watchers_with_remediation is for failure events only; use notify_watchers_with_context for status changes"
+            "notify_watchers_with_remediation is for failure/blocked events only; use notify_watchers_with_context for ordinary status changes"
         );
         let id = self.enqueue_error_mailbox_message(
             priority,

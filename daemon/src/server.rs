@@ -47,6 +47,11 @@ pub struct Daemon {
     /// exactly one running cell -- without touching the rest of its squad --
     /// so a real interactive resume session can safely take over.
     detachments: crate::cancel::Detachments,
+    /// Per-squad waypoint-halt tokens (RAL-400 Phase 3), shared with the
+    /// scheduler's `SubprocessRunner` so a squad-kind roster entry
+    /// transitioning to `mode=block` can stop every currently-running cell
+    /// in that squad immediately, without marking them terminally cancelled.
+    waypoint_halts: crate::cancel::WaypointHalts,
     /// Live registry of cell subprocess PIDs, shared with the runner so the
     /// resource-usage endpoint can attribute OS metrics to running tasks (RAL-11).
     procs: ProcRegistry,
@@ -224,6 +229,7 @@ impl Daemon {
             max_concurrent,
             cancellations: Cancellations::new(),
             detachments: crate::cancel::Detachments::new(),
+            waypoint_halts: crate::cancel::WaypointHalts::new(),
             procs: ProcRegistry::new(),
             sem: Arc::new(Semaphore::new(max_concurrent)),
             summary_queue: SummaryQueue::new(),
@@ -375,6 +381,14 @@ impl Daemon {
     #[must_use]
     pub fn detachments_handle(&self) -> crate::cancel::Detachments {
         self.detachments.clone()
+    }
+
+    /// A cloned handle to the per-squad waypoint-halt registry (RAL-400
+    /// Phase 3), for the scheduler's `SubprocessRunner` and the waypoint
+    /// survey sweep that trips it.
+    #[must_use]
+    pub fn waypoint_halts_handle(&self) -> crate::cancel::WaypointHalts {
+        self.waypoint_halts.clone()
     }
 
     /// A cloned handle to the subprocess PID registry (for the cell runner).
@@ -15574,7 +15588,8 @@ pub fn serve<A: ToSocketAddrs>(
         SubprocessRunner::from_env()
             .with_registry(daemon.procs_handle())
             .with_cartographer(daemon.store_handle())
-            .with_detachments(daemon.detachments_handle()),
+            .with_detachments(daemon.detachments_handle())
+            .with_waypoint_halts(daemon.waypoint_halts_handle()),
     );
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider
@@ -15585,6 +15600,7 @@ pub fn serve<A: ToSocketAddrs>(
     ));
     let handle = daemon.store_handle();
     let cancellations = daemon.cancellations_handle();
+    let waypoint_halts = daemon.waypoint_halts_handle();
     let sem = daemon.semaphore_handle();
     let summary_queue = daemon.summary_queue_handle();
     // RAL-121: background workers draining the guardian summary priority
@@ -15612,8 +15628,8 @@ pub fn serve<A: ToSocketAddrs>(
         crate::scheduler::run_loop(
             handle,
             runner,
-            max_concurrent,
             cancellations,
+            waypoint_halts,
             sem,
             summary_queue,
             procs,
@@ -16744,7 +16760,7 @@ mod tests {
     #[test]
     fn route_with_trace_persists_incoming_traceparent_onto_the_new_squad() {
         let d = daemon();
-        let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let incoming = "00-12345678901234567890123456789012-1234567890123456-01";
         let r = route_with_trace(
             &d,
             "POST",

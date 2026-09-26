@@ -1233,6 +1233,13 @@ fn record_review_guardian(
             }
         }
     }
+    // RAL-400 Phase 3: this squad may carry an open squad-kind waypoint
+    // roster entry (scenario-1 gating) -- now that its review has formed,
+    // hand gating/delivery off to the review-kind entry instead, per Phase 0's
+    // "no dual bookkeeping" rule.
+    store
+        .transition_squad_roster_entries_to_review(squad_id, gid)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
     Ok(())
 }
 
@@ -2180,6 +2187,7 @@ fn build_review_from_drained_pool(
         .map_err(|e| ReviewError::new(e.to_string()))?;
     apply_project_review_defaults(store, &gid, &project_root)?;
     let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_squads: HashSet<String> = HashSet::new();
     for cell in &drained {
         if seen.insert(cell.branch.clone()) {
             store
@@ -2189,6 +2197,15 @@ fn build_review_from_drained_pool(
         store
             .set_cell_review_guardian(&cell.squad_id, cell.task_idx, cell.idx, &gid)
             .map_err(|e| ReviewError::new(e.to_string()))?;
+        // RAL-400 Phase 3: same squad-kind-to-review-kind roster hand-off as
+        // `record_review_guardian`, for the Arbiter's triage-pool-drain path
+        // -- a drained pool can span several completed squads, each of which
+        // may carry its own waypoint roster entry.
+        if seen_squads.insert(cell.squad_id.clone()) {
+            store
+                .transition_squad_roster_entries_to_review(&cell.squad_id, &gid)
+                .map_err(|e| ReviewError::new(e.to_string()))?;
+        }
     }
     crate::cartographer::Note::new("arbiter")
         .guardian(&gid)

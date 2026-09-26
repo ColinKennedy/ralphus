@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn valid_traceparent_yields_active_span() {
         let cx = context_from_traceparent(Some(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-12345678901234567890123456789012-1234567890123456-01",
         ));
         assert!(cx.has_active_span());
     }

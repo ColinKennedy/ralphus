@@ -177,6 +177,20 @@ user-facing actions and relations use **watch** / **watcher**.
 | **restart_on** | A proof step's declaration that another step firing should re-run this cell's proof cursor. Grammar: `task/cell/proof?on=pass\|fail\|both`. |
 | **detach** | (RAL-288) Cleanly stopping a still-running cell's live process — without reporting it `Done` or `Failed` — so a real interactive agent session can safely take over the same conversation. The cell stays `Running`, paused, until an explicit **resume automation** call hands it back to unattended execution. |
 
+## Waypoints (RAL-400)
+
+Cross-squad coordination join points. Full design record, including the
+actionable-notification matching model and the EntityUri/sentinel grammar
+decisions, is [`.agent/waypoints-phase0-decisions.md`](../.agent/waypoints-phase0-decisions.md).
+
+| Term | Meaning |
+|---|---|
+| **waypoint** | A named, open/closed join point: a required `prompt`, an `agent`/`model` pair used as the survey classifier, an `allow_advisory` flag (default off), and a **roster**. Was called "milestone" in early design. |
+| **roster** | The list of entities a waypoint tracks as impacted. v1 kinds are **review** and **squad**; cell/task-level roster entries are deferred to v2. Was called "members". |
+| **roster entry** | One item in a roster — a single review or squad reference. Was called "member". |
+| **bearing** | A durable, append-only guidance item a waypoint publishes for an impacted roster entry's agent: an optional git commit id + message summary, a concise change description, and an optional entity link. The waypoint's counterpart to a **ghost**, but ongoing rather than one-time. |
+| **survey** | The LLM classification pass that decides whether a review/squad is actually impacted by a waypoint, and at what mode (advisory vs. block). Was called "pulse" / "classification pass". |
+
 ## Components
 
 | Term | Meaning |

@@ -263,8 +263,8 @@ mod tests {
     fn secret_values_includes_only_link_resolutions() {
         let env = vec![set("A", "plain"), link("B", "SECRET_VAR")];
         let secrets = secret_values(&env, |name| {
-            (name == "SECRET_VAR").then(|| "sk-super-secret".to_string())
+            (name == "SECRET_VAR").then(|| "testvalue123456".to_string())
         });
-        assert_eq!(secrets, vec!["sk-super-secret".to_string()]);
+        assert_eq!(secrets, vec!["testvalue123456".to_string()]);
     }
 }
