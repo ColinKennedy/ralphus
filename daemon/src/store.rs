@@ -473,6 +473,16 @@ pub struct CellView {
     /// the cell resumes (a successful retry) or gives up (thrash).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_until_ms: Option<i64>,
+    /// RAL-400 Phase 3: when this cell was halted because its squad-kind
+    /// roster entry became `mode=block` on an open waypoint (Unix epoch
+    /// milliseconds). `None` while not halted. `state` stays `"running"`
+    /// throughout -- an additive signal, mirroring [`Self::detached_at_ms`],
+    /// distinct from it because a waypoint halt resumes automatically (once
+    /// the waypoint closes or de-escalates) rather than waiting for a human
+    /// resume-automation call. Cleared the moment the cell is next
+    /// dispatched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waypoint_halted_at_ms: Option<i64>,
 }
 
 /// A task as shown in the board.
@@ -3109,6 +3119,11 @@ impl Store {
             // project/global default, which resolves to `true` (on by
             // default -- unlike most opt-in review settings).
             "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
+            // RAL-400 Phase 3: when this cell was halted because its
+            // squad-kind roster entry became `mode=block` on an open
+            // waypoint -- see `CellView::waypoint_halted_at_ms`. NULL means
+            // not halted.
+            "ALTER TABLE cells ADD COLUMN waypoint_halted_at_ms INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3911,10 +3926,13 @@ impl Store {
         Ok(())
     }
 
-    /// Squad ids that are ready to schedule: Pending, and with every cross-squad
-    /// dependency (from the squad's `[[default]]` `depends_on`) already Done.
-    /// A dependency reference `squad-id` or `squad-id/task/cell` is satisfied when
-    /// that whole squad is Done (path-precise gating is a later refinement).
+    /// Squad ids that are ready to schedule: Pending, with every cross-squad
+    /// dependency (from the squad's `[[default]]` `depends_on`) already Done,
+    /// and not currently gated by an open waypoint (RAL-400 Phase 3, scenario
+    /// 1: a `kind='squad'`, `mode='block'` roster entry -- see
+    /// [`Store::squad_block_gating_waypoint`]). A dependency reference
+    /// `squad-id` or `squad-id/task/cell` is satisfied when that whole squad
+    /// is Done (path-precise gating is a later refinement).
     pub fn list_ready(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, depends_on FROM squads WHERE state='pending' ORDER BY created_at_ms ASC",
@@ -3926,7 +3944,7 @@ impl Store {
         let mut ready = Vec::new();
         for (id, deps_json) in pending {
             let deps = from_json(&deps_json);
-            if self.deps_satisfied(&deps)? {
+            if self.deps_satisfied(&deps)? && self.squad_block_gating_waypoint(&id)?.is_none() {
                 ready.push(id);
             }
         }
@@ -4799,7 +4817,7 @@ impl Store {
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, waypoint_halted_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -4859,6 +4877,7 @@ impl Store {
                         compaction_input_tokens: r.get::<_, i64>(32)?,
                         compaction_count: r.get::<_, i64>(33)?,
                         delayed_until_ms: r.get::<_, Option<i64>>(34)?,
+                        waypoint_halted_at_ms: r.get::<_, Option<i64>>(35)?,
                     },
                 ))
             })?
@@ -9207,6 +9226,37 @@ impl Store {
         Ok(())
     }
 
+    /// Records that a cell's in-flight run was just halted because its
+    /// squad-kind roster entry became `mode=block` on an open waypoint
+    /// (RAL-400 Phase 3) -- called from `scheduler::run_cell_worker`'s
+    /// waypoint-halted-outcome branch, right where `record_cell_result`
+    /// persists the (still-`Running`) `NodeState`. See
+    /// [`CellView::waypoint_halted_at_ms`] for what this drives on the board.
+    pub fn mark_cell_waypoint_halted(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET waypoint_halted_at_ms=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![now_ms(), squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Clears a cell's `waypoint_halted_at_ms`, called at the same point
+    /// `run_cell_worker` sets the cell's `NodeState` back to `Running` for a
+    /// fresh dispatch. Unconditional (no-op if it was already clear),
+    /// mirroring [`Store::clear_cell_detached`].
+    pub fn clear_cell_waypoint_halted(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET waypoint_halted_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
     /// Records that a cell is waiting out a Pi rate limit's suggested retry
     /// delay (RAL-435) -- called from `scheduler::run_cell_worker`'s
     /// rate-limited-retry loop, right before it drops its scheduler permit
@@ -9309,6 +9359,45 @@ impl Store {
             "cell",
             Some(&format!("{task_idx}/{idx}")),
             "resumed (resume-automation)",
+        );
+        Ok(())
+    }
+
+    /// Hands a waypoint-halted cell back to headless automation once its
+    /// blocking waypoint has closed or de-escalated (RAL-400 Phase 3),
+    /// resetting *only* that cell's own row to `pending` -- deliberately not
+    /// [`Store::restart_cell`]'s squad/task/downstream-impact machinery, for
+    /// the same reason [`Store::resume_detached_cell`] avoids it: this is a
+    /// still-in-progress conversation resuming, not a restart-from-scratch.
+    /// `waypoint_halted_at_ms` is cleared separately, at actual re-dispatch
+    /// time (see [`Store::clear_cell_waypoint_halted`]).
+    pub fn resume_waypoint_halted_cell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT idx FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        self.conn.execute(
+            "UPDATE cells SET state='pending' WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        let _ = self.log_event(
+            Some(squad_id),
+            None,
+            "cell",
+            Some(&format!("{task_idx}/{idx}")),
+            "resumed (waypoint unblocked)",
         );
         Ok(())
     }
@@ -10052,6 +10141,15 @@ impl Store {
             Err(_) => return Ok(()), // a cyclic squad cannot be queued
         };
         let squad_deps_ok = self.deps_satisfied(&self.squad_depends_on(squad_id)?)?;
+        let blocking_waypoint = self.squad_block_gating_waypoint(squad_id)?;
+        // Resolved once (not per cell/proof row below) since it's the same
+        // label for every queue item this squad produces.
+        let blocking_waypoint_label = blocking_waypoint.as_deref().map(|wp| {
+            self.get_waypoint(wp)
+                .ok()
+                .and_then(|w| w.label)
+                .unwrap_or_else(|| wp.to_string())
+        });
 
         // Each task's declared `depends_on` (task names), for the header display.
         let task_deps: HashMap<i64, Vec<String>> = tasks
@@ -10118,6 +10216,9 @@ impl Store {
             if !squad_deps_ok {
                 blocked_by.push("upstream squad".to_string());
             }
+            if let Some(label) = &blocking_waypoint_label {
+                blocked_by.push(format!("waypoint {label}"));
+            }
             let mut deps_paths: Vec<String> = Vec::new();
             for &d in &plan.deps[pos] {
                 let (dti, dsi) = (cells[d].task_idx, cells[d].idx);
@@ -10139,7 +10240,7 @@ impl Store {
             let readiness = classify(
                 meta.state.as_str(),
                 excluded,
-                blocked_by.is_empty() && squad_deps_ok,
+                blocked_by.is_empty() && squad_deps_ok && blocking_waypoint.is_none(),
             );
             out.push(QueueItem {
                 squad_id: squad_id.to_string(),
@@ -10195,6 +10296,9 @@ impl Store {
             if !squad_deps_ok {
                 blocked_by.push("upstream squad".to_string());
             }
+            if let Some(label) = &blocking_waypoint_label {
+                blocked_by.push(format!("waypoint {label}"));
+            }
             let (name, path, indent, kind_str);
             if scope == "cell" {
                 name = vid.unwrap_or_else(|| kind.clone());
@@ -10249,7 +10353,7 @@ impl Store {
             let readiness = classify(
                 vstate.as_str(),
                 excluded,
-                blocked_by.is_empty() && squad_deps_ok,
+                blocked_by.is_empty() && squad_deps_ok && blocking_waypoint.is_none(),
             );
             let tname = task_names.get(&ti).cloned().unwrap_or_default();
             out.push(QueueItem {
@@ -12186,6 +12290,70 @@ command = "y"
         assert!(dirtied.contains(&b));
         assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
         assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
+    }
+
+    #[test]
+    fn restart_cascade_surfaces_a_waypoint_blocked_downstream_squad_and_leaves_its_gate_intact() {
+        // RAL-400 Phase 3 AC(e): a squad's restart cascade must still correctly
+        // dirty a downstream squad that happens to be waypoint-block-gated, and
+        // must not clear that gate as a side effect -- the restart cascade only
+        // ever touches squads/cells/tasks rows, never `waypoint_roster`.
+        use crate::waypoints::{RosterEntryKind, RosterMode};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let (a, b, c) = dependent_chain(&mut store);
+        for id in [&a, &b, &c] {
+            store.set_squad_state(id, SquadState::Done).unwrap();
+        }
+
+        store
+            .create_waypoint("waypoint-1", Some("label"), "prompt", None, None, false)
+            .unwrap();
+        store
+            .add_roster_entry("waypoint-1", RosterEntryKind::Squad, &b, RosterMode::Block)
+            .unwrap();
+        assert!(
+            !store.list_ready().unwrap().contains(&b),
+            "b starts out waypoint-gated"
+        );
+
+        let preview = store.compute_squad_restart_impact(&a).unwrap();
+        let dirtied_ids: Vec<&str> = preview
+            .dirtied_squads
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert!(
+            dirtied_ids.contains(&b.as_str()) && dirtied_ids.contains(&c.as_str()),
+            "the waypoint-gated squad b is still surfaced as dirtied, same as an ungated one"
+        );
+
+        let dirtied = store.restart_squad(&a).unwrap();
+        assert!(dirtied.contains(&b) && dirtied.contains(&c));
+        assert_eq!(store.squad_state(&a).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&b).unwrap(), SquadState::Pending);
+        assert_eq!(store.squad_state(&c).unwrap(), SquadState::Pending);
+
+        // The restart cascade reset b to Pending, but its waypoint gate must
+        // still hold -- restart never touches waypoint_roster.
+        assert_eq!(
+            store.squad_block_gating_waypoint(&b).unwrap().as_deref(),
+            Some("waypoint-1"),
+            "the restart cascade must not clear b's waypoint gate"
+        );
+
+        // Isolate the waypoint gate from the (also-unsatisfied) upstream-squad
+        // gate: once a is Done again, b is still not ready purely because of
+        // the waypoint.
+        store.set_squad_state(&a, SquadState::Done).unwrap();
+        assert!(
+            !store.list_ready().unwrap().contains(&b),
+            "the waypoint alone still gates b even once its upstream squad dep is satisfied"
+        );
+
+        // Closing the waypoint is the only thing that lifts the gate.
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+        assert!(store.list_ready().unwrap().contains(&b));
     }
 
     #[test]
@@ -14628,6 +14796,167 @@ command = "check-c"
         assert!(NodeState::Ignored.satisfies_dependents());
         assert!(SquadState::Ignored.satisfies_dependents());
         assert!(!SquadState::Ignored.is_terminal(), "ignored is reversible");
+    }
+
+    #[test]
+    fn list_ready_and_queue_gated_by_open_block_waypoint() {
+        use crate::waypoints::{RosterEntryKind, RosterMode};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        assert!(
+            store.list_ready().unwrap().contains(&squad),
+            "no waypoint yet: squad is ready"
+        );
+
+        store
+            .create_waypoint("waypoint-1", Some("label"), "prompt", None, None, false)
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                &squad,
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert!(
+            !store.list_ready().unwrap().contains(&squad),
+            "an open block-mode roster entry gates the squad"
+        );
+        let q = store.queue().unwrap();
+        let item = q.iter().find(|i| i.squad_id == squad).unwrap();
+        assert_eq!(item.readiness, "blocked");
+        assert!(
+            item.blocked_by.contains(&"waypoint label".to_string()),
+            "queue names the blocking waypoint inline, by its label: {:?}",
+            item.blocked_by
+        );
+
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+        assert!(
+            store.list_ready().unwrap().contains(&squad),
+            "closing the waypoint unblocks the squad"
+        );
+        let q = store.queue().unwrap();
+        let item = q.iter().find(|i| i.squad_id == squad).unwrap();
+        assert_eq!(item.readiness, "ready");
+    }
+
+    #[test]
+    fn advisory_squad_roster_entry_never_gates() {
+        use crate::waypoints::{RosterEntryKind, RosterMode};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        store
+            .create_waypoint("waypoint-1", Some("label"), "prompt", None, None, true)
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                &squad,
+                RosterMode::Advisory,
+            )
+            .unwrap();
+
+        assert!(
+            store.list_ready().unwrap().contains(&squad),
+            "advisory mode never gates a squad"
+        );
+        let q = store.queue().unwrap();
+        let item = q.iter().find(|i| i.squad_id == squad).unwrap();
+        assert_eq!(item.readiness, "ready");
+        assert!(
+            !item.blocked_by.iter().any(|b| b.starts_with("waypoint ")),
+            "advisory entries must not appear as a blocked_by reason: {:?}",
+            item.blocked_by
+        );
+    }
+
+    // RAL-400 Phase 3, final integration-test bullet: "a blocked squad's
+    // review (once formed) correctly inherits gating/feedback" -- once the
+    // squad's review forms, the roster entry that used to gate the squad
+    // directly must carry the exact same mode/verdict over to a review-kind
+    // entry for the new guardian, not go stale or drop the gate.
+    #[test]
+    fn squad_roster_entry_transitions_to_review_kind_once_its_review_forms() {
+        use crate::waypoints::{RosterEntryKind, RosterMode};
+
+        let mut store = Store::open_in_memory().unwrap();
+        let squad = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        store
+            .create_waypoint("waypoint-1", Some("label"), "prompt", None, None, false)
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                &squad,
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                &squad,
+                &crate::waypoints::SurveyVerdict {
+                    impacted: true,
+                    mode: RosterMode::Block,
+                    rationale: "touches the same area".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(
+            !store.list_ready().unwrap().contains(&squad),
+            "still gated before its review forms"
+        );
+
+        let gid = store
+            .create_guardian_for_squad("Review", "main", "/repo", Some(&squad))
+            .unwrap();
+        store
+            .transition_squad_roster_entries_to_review(&squad, &gid)
+            .unwrap();
+
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the squad entry is retired, not duplicated"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.kind, RosterEntryKind::Review);
+        assert_eq!(entry.entry_id, gid);
+        assert_eq!(entry.mode, RosterMode::Block);
+        assert_eq!(entry.survey_verdict.as_deref(), Some("impacted"));
+        assert_eq!(
+            entry.survey_rationale.as_deref(),
+            Some("touches the same area")
+        );
+
+        // The squad itself is unblocked now that gating has moved to its review.
+        assert!(
+            store.squad_block_gating_waypoint(&squad).unwrap().is_none(),
+            "squad-kind gate is gone once the entry transitions to review-kind"
+        );
+
+        // Calling it again for the same (squad, guardian) pair is a no-op,
+        // not a duplicate row -- covers a review formed from a triage-pool
+        // drain calling this once per contributing cell.
+        store
+            .transition_squad_roster_entries_to_review(&squad, &gid)
+            .unwrap();
+        assert_eq!(store.list_roster_entries("waypoint-1").unwrap().len(), 1);
     }
 
     #[test]
