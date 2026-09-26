@@ -65,6 +65,34 @@ table — `daemon/src/ghost.rs`, `runner/src/execute.rs:884`,
 hits, and the runner still sets `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/
 `PI_CODING_AGENT_DIR`/`RALPHUS_PI_WORKSPACE_GUARD`) still holds.
 
+## 3. A prophecy is not a bigger ghost
+
+The tempting cheap move is "raise the ghost cap and keep more of them." That
+breaks ghost without delivering a prophecy.
+
+| | Ghost (RAL-136) | Prophecy |
+|---|---|---|
+| Question it answers | What should the next agent know? | Why does this code look like this? |
+| Reader | The next cell's prompt | A human, in the PR |
+| Rows | One per owner, folded on rewrite | Append-only, one per insight |
+| Written | Once, at end of reply | Continuously, mid-work |
+| Across attempts | Merged into one blob | Attempt 1…N stay distinct |
+| Size | Hard 4000-char total cap (`MAX_CONTENT_CHARS`) | Per-entry cap, unbounded count |
+| Reach | Own restarts + one level of dependents | The whole review stack |
+| Lifespan | Cascade-deleted with its squad or guardian | Outlives both; the PR is the terminal home |
+
+Two consequences worth stating:
+
+- **Why not a Cartographer `source`.** Cartographer prunes at 30 days / 50k
+  rows (`[cartographer] retention_days`, `max_rows`). A prophecy must survive
+  until it reaches a PR. So: its own table — *and* still emit a Cartographer
+  row on every write, per the logging policy, so the squad timeline picks it up
+  for free.
+- **A nice unification, later.** Once a prophecy exists, the **ghost can be
+  derived** from the most recent N for that cell. The agent stops having to
+  remember a separate end-of-reply marker, and the two systems stop competing
+  for the same discipline. See phase 5.
+
 ## 11. Open questions
 
 ### 11.1 Is `kind` a closed enum?
