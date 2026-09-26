@@ -1761,16 +1761,20 @@ fn synthesize_pr_text(
          few sentences of markdown explaining what changed and why, focused on \
          developer intent rather than file-level detail.{template_note}"
     );
+    let pr_cwd = guardian
+        .branches
+        .iter()
+        .find(|b| b.position == position)
+        .and_then(|b| b.worktree.clone())
+        .unwrap_or_else(|| guardian.git_root.clone());
+    // RAL-517: resolve before `cwd: pr_cwd` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(std::path::Path::new(&pr_cwd)).retry_after_unknown_default_seconds();
     let spec = RunnerSpec {
         squad_id: "guardian".to_string(),
         task: "pr-description".to_string(),
         cell_id: "pr-writer".to_string(),
-        cwd: guardian
-            .branches
-            .iter()
-            .find(|b| b.position == position)
-            .and_then(|b| b.worktree.clone())
-            .unwrap_or_else(|| guardian.git_root.clone()),
+        cwd: pr_cwd,
         prompt: Some(prompt),
         command: None,
         agent: resolved.backend,
@@ -1800,6 +1804,7 @@ fn synthesize_pr_text(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome

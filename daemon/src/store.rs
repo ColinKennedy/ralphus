@@ -789,6 +789,9 @@ impl ProjectReviewSettings {
             // `summary_format` above; only the file-based `.ralphus.toml`
             // layer sets it.
             provider_timeout_max_retries: None,
+            // Same "left at default" treatment as `provider_timeout_max_retries`
+            // just above -- DB-backed project settings don't cover this one either.
+            retry_after_unknown_default_seconds: None,
             base_shift_maximum_rebuilds: self.base_shift_maximum_rebuilds,
         }
     }

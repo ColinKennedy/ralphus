@@ -91,6 +91,15 @@ pub struct CellSpec {
     /// own exponential backoff for provider errors with no explicit
     /// provider-supplied delay; other backends accept and ignore it.
     pub retry_attempt: u32,
+    /// RAL-517: the daemon's resolved `[review] retry_after_unknown_default_seconds`
+    /// -- the wait, in whole seconds, the pi backend uses when it recognizes
+    /// a provider error as transient/retryable but the message names no
+    /// concrete delay (unlike RAL-435's parsed 429 delay, or RAL-497's
+    /// `broadened_retry_delay_ms` exponential backoff, both of which stay
+    /// separately controllable -- this field is additive, not a
+    /// consolidation of either). Falls back to the daemon's own default (30)
+    /// when a hand-authored spec omits the key entirely.
+    pub retry_after_unknown_default_seconds: u64,
 }
 
 impl CellSpec {
@@ -133,6 +142,13 @@ impl CellSpec {
         let allow_personal_settings = opt_bool(obj, "allow_personal_settings")?.unwrap_or(false);
         let allow_personal_memory = opt_bool(obj, "allow_personal_memory")?.unwrap_or(false);
         let retry_attempt = opt_u32(obj, "retry_attempt")?.unwrap_or(0);
+        // RAL-517: 30 mirrors `daemon::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS`
+        // -- the runner has no dependency on the daemon crate, so the default
+        // is duplicated here rather than shared, same as every other daemon-
+        // resolved default already inlined in this parser (e.g. `agent`'s
+        // "claude" fallback above).
+        let retry_after_unknown_default_seconds =
+            opt_uint(obj, "retry_after_unknown_default_seconds")?.unwrap_or(30);
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -168,6 +184,7 @@ impl CellSpec {
             allow_personal_settings,
             allow_personal_memory,
             retry_attempt,
+            retry_after_unknown_default_seconds,
         })
     }
 }
@@ -597,6 +614,36 @@ mod tests {
         v["allow_personal_settings"] = serde_json::json!("yes");
         let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("allow_personal_settings"));
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_defaults_to_thirty_when_omitted() {
+        let spec = CellSpec::from_json(&base().to_string()).unwrap();
+        assert_eq!(spec.retry_after_unknown_default_seconds, 30);
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_parses_explicit_value() {
+        let mut v = base();
+        v["retry_after_unknown_default_seconds"] = serde_json::json!(45);
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert_eq!(spec.retry_after_unknown_default_seconds, 45);
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_accepts_zero() {
+        let mut v = base();
+        v["retry_after_unknown_default_seconds"] = serde_json::json!(0);
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert_eq!(spec.retry_after_unknown_default_seconds, 0);
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_rejects_wrong_type() {
+        let mut v = base();
+        v["retry_after_unknown_default_seconds"] = serde_json::json!("soon");
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("retry_after_unknown_default_seconds"));
     }
 
     #[test]
