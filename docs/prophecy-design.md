@@ -266,3 +266,54 @@ That is an enormous blast radius for a feature whose value is "keep a note." A
 correlation id stamped on a prophecy and carried across that seam buys the same
 queryability for a fraction of the change. If it later earns promotion to a
 real entity, nothing here blocks that.
+
+---
+
+## 8. Where a prophecy lands
+
+### 8.1 The PR body — deterministic, never LLM-rewritten
+
+`pr.rs::resolve_title_description` already composes a PR body:
+`synthesize_pr_text` asks a model (honoring the repo's own PR template via
+`fetch_pr_template`), with `fallback_pr_description` as the deterministic path.
+
+- A prophecy folds in as a `<details>` block appended **after** the synthesized
+  description.
+- Appended **deterministically**. A summarizer in that position would quietly
+  launder away the specifics that make the note worth keeping. The note the
+  agent wrote is the note the human reads.
+- Mark entries published so a resubmit does not duplicate them.
+
+### 8.2 The commit trailer — a join key, nothing more
+
+Nothing large goes into a commit message. A git trailer is the `Key: Value`
+block at the bottom of a commit message — where `Co-authored-by:` already lives
+— and git parses it natively, so it is queryable:
+
+```
+Ralphus-Cell: cell:squad-000000000012:0:1
+```
+
+1. **On every commit the cell authors** — not the earliest, not the tip. A
+   trailer rides along with its own commit through a rebase, so nothing needs
+   updating when `guardian_merge.rs` restacks, and there is no "which commit"
+   decision available to get wrong. "Earliest commit of the PR" is not a stable
+   identity in a stack.
+2. **It names the author, not the prophecy set.** A commit is authored at time
+   T, but a prophecy for that cell keeps arriving afterward — that is the whole
+   point. A trailer listing prophecy URIs is stale the moment it is written and
+   would need commit amends to stay current. The entity URI is stable and known
+   at commit time; join on it at read time.
+3. **Keep the attempt number out**, so the same cell across attempts 1 and 3
+   yields one trailer rather than two (`--if-exists addIfDifferent` keys on the
+   exact key+value pair).
+4. **The hook already exists.** RAL-445's `daemon/src/git_hooks.rs` installs a
+   `prepare-commit-msg` hook running
+   `git interpret-trailers --in-place --if-exists addIfDifferent --trailer "Co-authored-by: …"`,
+   synced on every squad worktree materialization and at project registration.
+   Hooks are repo-common, so one install covers every worktree; a `MARKER`
+   guard keeps it from clobbering a hand-authored hook; `[commits]
+   add_coauthor` opts a project out. Adding `Ralphus-Cell:` is a second
+   `--trailer` flag — and since the hook inherits the cell's environment, it
+   reads `$RALPHUS_ENTITY_URI` for free once that is exported.
+5. **Two pre-existing RAL-445 gaps block the trailer half** — see §13.
