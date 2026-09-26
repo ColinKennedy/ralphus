@@ -2141,6 +2141,37 @@ pub fn forge_client_for_pr(
         .cloned()
 }
 
+/// The registered project's `clone_url` for `project_name`, if any
+/// (RAL-<new>) -- looked up fresh per call rather than cached anywhere, since
+/// a project's `clone_url` can be edited after a guardian/PR routing
+/// decision was last made. Feeds
+/// [`crate::forge::resolve_parent_remote_name`], which matches/creates the
+/// parent remote by this URL instead of guessing from local branch-tracking
+/// git state.
+pub(crate) fn project_clone_url(
+    store: &crate::store_lock::StoreHandle,
+    project_name: Option<&str>,
+) -> Option<String> {
+    store
+        .lock()
+        .resolve_project(project_name?)
+        .ok()
+        .flatten()
+        .and_then(|p| p.clone_url)
+}
+
+/// Like [`project_clone_url`], but keyed off a git root path (e.g. a
+/// branch's `project` field, or a review's `git_root`) rather than an
+/// already-known registered project name -- for a caller that only has the
+/// path in hand.
+pub(crate) fn project_clone_url_for_root(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+) -> Option<String> {
+    let project_name = store.lock().project_name_for_path(root.to_str()?);
+    project_clone_url(store, project_name.as_deref())
+}
+
 /// `owner` should be the guardian's own resolved `owner` (submitter/
 /// `default_pr_user`/daemon default, per [`crate::guardian::resolve_review_owner`])
 /// -- RAL-338 follow-up: a project's fork row is keyed by whichever real user
@@ -2173,19 +2204,28 @@ fn resolve_pr_repo_routing(
             .and_then(|o| store.lock().resolve_fork(p, o).ok().flatten())
             .or_else(|| store.lock().resolve_fork(p, "").ok().flatten())
     });
+    let clone_url = project_clone_url(store, project_name.as_deref());
     let Some(fork) = fork else {
-        let parent_remote_name = crate::forge::resolve_remote_name(root, base_branch, forge_cfg);
+        let parent_remote_name = crate::forge::resolve_parent_remote_name(
+            root,
+            base_branch,
+            forge_cfg,
+            clone_url.as_deref(),
+            None,
+        );
         return PrRepoRouting {
-            parent_client: crate::forge::resolve_remote(root, base_branch, forge_cfg).ok(),
+            parent_client: crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)
+                .ok(),
             parent_remote_name,
             fork_client: None,
             fork_remote_name: None,
         };
     };
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
         base_branch,
         forge_cfg,
+        clone_url.as_deref(),
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg).ok();
@@ -2254,7 +2294,14 @@ fn resync_pr_bases_inner(
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let remote_name = crate::forge::resolve_remote_name(&root, &guardian.base_branch, &forge_cfg);
+    let clone_url = project_clone_url(store, guardian.project.as_deref());
+    let remote_name = crate::forge::resolve_parent_remote_name(
+        &root,
+        &guardian.base_branch,
+        &forge_cfg,
+        clone_url.as_deref(),
+        None,
+    );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
 
     let prs = store
@@ -2872,10 +2919,12 @@ fn maybe_promote_fork_root(
     // Same computation `submit_pull_requests_inner`/`poll_pr_base_drift` use:
     // the guardian's base branch, unprefixed by whichever *parent* remote it
     // may have named (never the fork's).
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let clone_url = project_clone_url(store, guardian.project.as_deref());
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
         &guardian.base_branch,
         &forge_cfg,
+        clone_url.as_deref(),
         Some(&routing.fork.remote_name),
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
@@ -5016,10 +5065,12 @@ fn resolve_fork_routing(
         return Ok(None);
     };
     prepare_fork_worktree(store, root, &fork, user)?;
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let clone_url = project_clone_url(store, Some(project_name.as_str()));
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
         &guardian.base_branch,
         forge_cfg,
+        clone_url.as_deref(),
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, forge_cfg)?;
@@ -5270,10 +5321,12 @@ pub(crate) fn refresh_dual_root_upstream_branch(
         );
         return;
     }
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let clone_url = project_clone_url(store, Some(project_name.as_str()));
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
         base_branch,
         &forge_cfg,
+        clone_url.as_deref(),
         Some(&fork.remote_name),
     );
     let base_branch_name = strip_remote_prefix(base_branch, &parent_remote_name);
@@ -6935,10 +6988,12 @@ fn auto_submit_terminal_branches(
         run_fork_preflight(store, id, routing, false)?;
     }
     let fork_remote_exclude = fork_routing.as_ref().map(|r| r.fork.remote_name.as_str());
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let clone_url = project_clone_url(store, guardian.project.as_deref());
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
         &guardian.base_branch,
         &forge_cfg,
+        clone_url.as_deref(),
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
@@ -7364,10 +7419,12 @@ fn submit_pull_requests_inner(
     // `base_branch_name` -- always the *parent's* base branch, unprefixed --
     // is correct regardless of fork mode; only the push target differs.
     let fork_remote_exclude = fork_routing.as_ref().map(|r| r.fork.remote_name.as_str());
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let clone_url = project_clone_url(store, guardian.project.as_deref());
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
         &guardian.base_branch,
         &forge_cfg,
+        clone_url.as_deref(),
         fork_remote_exclude,
     );
     let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);

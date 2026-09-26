@@ -596,16 +596,20 @@ fn check(
 /// tries to submit through it.
 #[must_use]
 pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthCheck> {
-    let (mut out, project_path) = fork_health_store_inputs(store, fork);
+    let (mut out, project_path, clone_url) = fork_health_store_inputs(store, fork);
     if let Some(project_path) = project_path {
-        out.extend(check_fork_network_health(&project_path, fork));
+        out.extend(check_fork_network_health(
+            &project_path,
+            fork,
+            clone_url.as_deref(),
+        ));
     }
     out
 }
 
 /// The store-read prologue of [`check_fork_health`]: the orphaned-user and
 /// missing-project conditions (both pure store reads), plus the registered
-/// project's path for the caller to hand to
+/// project's path and `clone_url` for the caller to hand to
 /// [`check_fork_network_health`] *without holding the store lock*. A `None`
 /// path means the network probe must be skipped -- a fail-class
 /// `fork-project` check is already in the returned list.
@@ -613,7 +617,11 @@ pub fn check_fork_health(store: &Store, fork: &ForkRecord) -> Vec<ForkHealthChec
 pub fn fork_health_store_inputs(
     store: &Store,
     fork: &ForkRecord,
-) -> (Vec<ForkHealthCheck>, Option<std::path::PathBuf>) {
+) -> (
+    Vec<ForkHealthCheck>,
+    Option<std::path::PathBuf>,
+    Option<String>,
+) {
     let mut out = Vec::new();
     if !fork.user.is_empty() && matches!(store.get_user(&fork.user), Ok(None)) {
         out.push(check(
@@ -637,7 +645,7 @@ pub fn fork_health_store_inputs(
                 "fail",
                 "the project this fork was registered against is no longer registered",
             ));
-            return (out, None);
+            return (out, None, None);
         }
         Err(e) => {
             out.push(check(
@@ -647,18 +655,24 @@ pub fn fork_health_store_inputs(
                 "fail",
                 e.to_string(),
             ));
-            return (out, None);
+            return (out, None, None);
         }
     };
-    (out, Some(std::path::PathBuf::from(project.path)))
+    let clone_url = project.clone_url.clone();
+    (out, Some(std::path::PathBuf::from(project.path)), clone_url)
 }
 
 /// The I/O tail of [`check_fork_health`]: a `git config --get` subprocess
 /// plus the forge-relationship REST probes. Takes no store access, so it can
-/// run with no store guard held.
+/// run with no store guard held -- `clone_url` is threaded in from the
+/// store-read prologue ([`fork_health_store_inputs`]) rather than looked up
+/// here, for that reason. Passed to
+/// [`crate::forge::resolve_parent_remote_name`] to match/create the *parent*
+/// remote by URL instead of the local branch-tracking heuristic (RAL-<new>).
 pub fn check_fork_network_health(
     project_path: &std::path::Path,
     fork: &ForkRecord,
+    clone_url: Option<&str>,
 ) -> Vec<ForkHealthCheck> {
     let mut out = Vec::new();
     let root = project_path;
@@ -702,10 +716,11 @@ pub fn check_fork_network_health(
     }
 
     let forge_cfg = crate::config::resolve_forge(root);
-    let parent_remote_name = crate::forge::resolve_remote_name_excluding(
+    let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
         "", // no review base-branch context at health-check time
         &forge_cfg,
+        clone_url,
         Some(&fork.remote_name),
     );
     let parent_client = crate::forge::resolve_remote_for(root, &parent_remote_name, &forge_cfg);

@@ -4146,7 +4146,7 @@ fn project_forks_health(daemon: &Daemon) -> Reply {
     let store = daemon.store_handle();
     let mut checks: Vec<crate::project_forks::ForkHealthCheck> = Vec::new();
     for fork in &forks {
-        let (mut fork_checks, project_path) = {
+        let (mut fork_checks, project_path, clone_url) = {
             let guard = store.lock();
             crate::project_forks::fork_health_store_inputs(&guard, fork)
         };
@@ -4154,6 +4154,7 @@ fn project_forks_health(daemon: &Daemon) -> Reply {
             fork_checks.extend(crate::project_forks::check_fork_network_health(
                 &project_path,
                 fork,
+                clone_url.as_deref(),
             ));
         }
         checks.extend(fork_checks);

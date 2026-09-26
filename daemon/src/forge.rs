@@ -2866,6 +2866,117 @@ pub(crate) fn resolve_remote_name_excluding(
         .unwrap_or_else(|| default_remote_name(cfg))
 }
 
+/// All remote names currently configured in `root` (`git remote`, one per
+/// line). Empty on any git failure -- no remotes configured is not an error
+/// worth surfacing here, callers just find no URL match and fall through.
+fn configured_remote_names(root: &Path) -> Vec<String> {
+    crate::guardian_merge::git(root, &["remote"])
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Find, among `root`'s configured remotes (skipping `exclude`), one whose
+/// URL names the same repository as `url` (RAL-<new>) -- compared via
+/// [`parse_remote_url`]'s (host, path) normalization, so an `ssh://`/`git@`/
+/// `https://` form and a trailing `.git` all still match the same underlying
+/// repo. Reads `git config --get remote.<name>.url` rather than `git remote
+/// get-url`, for the same reason [`crate::project_forks::ensure_fork_remote`]
+/// documents: the latter applies any global `url.<x>.insteadOf` rewrite,
+/// which would make an already-correct remote misleadingly look different.
+fn find_remote_matching_url(root: &Path, url: &str, exclude: Option<&str>) -> Option<String> {
+    let target = parse_remote_url(url)?;
+    configured_remote_names(root).into_iter().find(|name| {
+        if Some(name.as_str()) == exclude {
+            return false;
+        }
+        crate::guardian_merge::git(root, &["config", "--get", &format!("remote.{name}.url")])
+            .ok()
+            .and_then(|configured| parse_remote_url(configured.trim()))
+            .as_ref()
+            == Some(&target)
+    })
+}
+
+/// Idempotently add a remote pointing at `url`, preferring `preferred_name`
+/// but falling back to a synthetic `<preferred_name>-project` name if that
+/// one is already configured for a DIFFERENT url (RAL-<new>) -- mirrors
+/// [`crate::project_forks::ensure_fork_remote`]'s match-or-create shape for
+/// the parent/origin case, which (unlike a fork remote) has no natural
+/// per-user distinct name to fall back on.
+fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result<String, String> {
+    match crate::guardian_merge::git(
+        root,
+        &["config", "--get", &format!("remote.{preferred_name}.url")],
+    ) {
+        Ok(existing) if existing.trim() == url => return Ok(preferred_name.to_string()),
+        Ok(_) => {
+            // preferred_name is already taken by something else -- don't
+            // clobber a remote this project didn't create; fall back below.
+        }
+        Err(_) => {
+            return crate::guardian_merge::git(root, &["remote", "add", preferred_name, url])
+                .map(|_| preferred_name.to_string());
+        }
+    }
+    let fallback = format!("{preferred_name}-project");
+    match crate::guardian_merge::git(
+        root,
+        &["config", "--get", &format!("remote.{fallback}.url")],
+    ) {
+        Ok(existing) if existing.trim() == url => Ok(fallback),
+        Ok(_) => Err(format!(
+            "both \"{preferred_name}\" and \"{fallback}\" are already configured as different \
+             remotes; could not add a remote for \"{url}\""
+        )),
+        Err(_) => {
+            crate::guardian_merge::git(root, &["remote", "add", &fallback, url]).map(|_| fallback)
+        }
+    }
+}
+
+/// Resolve the git remote for a review's *parent* (non-fork) side (RAL-<new>):
+/// prefers matching -- or creating -- a remote from the registered project's
+/// own `clone_url` over [`resolve_remote_name_excluding`]'s local
+/// branch-tracking heuristic. That heuristic shells out to `git rev-parse
+/// <branch>@{u}`, which on at least one real git version/config returns
+/// `remotes/<remote>/<branch>` instead of the expected `<remote>/<branch>`
+/// (see [`remote_from_branch_upstream`]'s doc comment) -- matching by URL
+/// sidesteps that class of parsing bug entirely, since it never shells out to
+/// `rev-parse @{upstream}` at all.
+///
+/// `clone_url` absent (an unregistered project, or one registered with no
+/// remote) falls through unchanged to [`resolve_remote_name_excluding`]. Any
+/// failure while creating a new remote also falls through to it, rather than
+/// failing the caller's whole PR/worktree operation over a remote-naming
+/// nicety.
+#[must_use]
+pub(crate) fn resolve_parent_remote_name(
+    root: &Path,
+    base_branch: &str,
+    cfg: &ForgeConfig,
+    clone_url: Option<&str>,
+    exclude: Option<&str>,
+) -> String {
+    if let Some(url) = clone_url.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(name) = find_remote_matching_url(root, url, exclude) {
+            return name;
+        }
+        let preferred = default_remote_name(cfg);
+        if Some(preferred.as_str()) != exclude {
+            if let Ok(name) = ensure_remote_for_url(root, &preferred, url) {
+                return name;
+            }
+        }
+    }
+    resolve_remote_name_excluding(root, base_branch, cfg, exclude)
+}
+
 /// A resolved routing target for one fork-aware PR/MR operation (RAL-338):
 /// which client to call, what `head`/`base` the forge call itself needs, the
 /// GitLab-only `target_project_id`, and which repository label the
@@ -3217,7 +3328,17 @@ fn remote_from_branch_upstream(root: &Path, base_branch: &str) -> Option<String>
         ],
     )
     .ok()?;
-    let (remote, _branch) = upstream.trim().split_once('/')?;
+    let upstream = upstream.trim();
+    // At least one real git version/config returns `remotes/<remote>/<branch>`
+    // here instead of the documented `<remote>/<branch>` for `--abbrev-ref`
+    // on a remote-tracking ref -- confirmed against this repo's own `staging`
+    // branch, whose `@{u}` abbreviates to `remotes/alt/staging`, not
+    // `alt/staging`. Strip that literal leading path segment before
+    // splitting, or the naive split below reads the fixed word "remotes"
+    // itself as the remote name (this is exactly what broke PR submission
+    // for a bare, unprefixed review `upstream`/`base_branch`).
+    let upstream = upstream.strip_prefix("remotes/").unwrap_or(upstream);
+    let (remote, _branch) = upstream.split_once('/')?;
     Some(remote.to_string())
 }
 
@@ -5187,6 +5308,116 @@ mod tests {
         assert_eq!(
             resolve_remote_name_excluding(&root, "fork/main", &cfg, Some("fork")),
             "origin"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── resolve_parent_remote_name (RAL-<new>) ──────────────────────────
+
+    #[test]
+    fn resolve_parent_remote_name_matches_an_existing_remote_by_clone_url() {
+        let root = tmp_dir("parent-remote-clone-url-match");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &["remote", "add", "alt", "git@github.com:acme/widget.git"],
+        );
+        // No branch-tracking config at all for "staging" -- the OLD
+        // heuristic (`resolve_remote_name_excluding`) has nothing to go on
+        // here and would silently fall through to the config-default
+        // "origin", which isn't even a remote configured in this repo. This
+        // is exactly the real-world failure this fix addresses: a review's
+        // `upstream`/`base_branch` given as a bare branch name (no
+        // "<remote>/" prefix) with no local tracking set up for it.
+        let cfg = ForgeConfig::default();
+        let resolved = resolve_parent_remote_name(
+            &root,
+            "staging",
+            &cfg,
+            Some("https://github.com/acme/widget.git"),
+            None,
+        );
+        assert_eq!(
+            resolved, "alt",
+            "must match the existing \"alt\" remote by its clone_url instead of falling \
+             through to the config-default \"origin\""
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_parent_remote_name_creates_a_remote_when_none_matches_the_clone_url() {
+        let root = tmp_dir("parent-remote-clone-url-create");
+        g(&root, &["init", "--initial-branch", "main"]);
+        let cfg = ForgeConfig::default();
+        let resolved = resolve_parent_remote_name(
+            &root,
+            "staging",
+            &cfg,
+            Some("https://github.com/acme/widget.git"),
+            None,
+        );
+        assert_eq!(resolved, "origin");
+        // `git config --get`, not `git remote get-url`: the latter applies
+        // any local/global `url.<x>.insteadOf` rewrite rule, which would
+        // make this assertion fail on a machine with one configured even
+        // though the remote was created correctly (this environment's own
+        // git config rewrites `https://github.com/` to `ssh://git@github.com/`,
+        // which is exactly the case `ensure_remote_for_url`/
+        // `find_remote_matching_url` are written to be immune to).
+        assert_eq!(
+            g(&root, &["config", "--get", "remote.origin.url"]).trim(),
+            "https://github.com/acme/widget.git",
+            "must have created the missing remote rather than only returning a name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_parent_remote_name_excludes_a_url_match_on_the_excluded_remote() {
+        let root = tmp_dir("parent-remote-clone-url-exclude");
+        g(&root, &["init", "--initial-branch", "main"]);
+        // Both the parent and the fork happen to be registered under the
+        // SAME url in this test (unrealistic in practice, but it isolates
+        // exactly one thing: `exclude` must still win over a URL match).
+        g(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        let cfg = ForgeConfig::default();
+        let resolved = resolve_parent_remote_name(
+            &root,
+            "staging",
+            &cfg,
+            Some("https://github.com/acme/widget.git"),
+            Some("fork"),
+        );
+        assert_ne!(
+            resolved, "fork",
+            "the excluded remote must never be returned, even on a URL match"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_parent_remote_name_falls_back_to_the_heuristic_with_no_clone_url() {
+        let root = tmp_dir("parent-remote-no-clone-url");
+        g(&root, &["init", "--initial-branch", "main"]);
+        g(
+            &root,
+            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
+        );
+        let cfg = ForgeConfig::default();
+        // Byte-identical to `resolve_remote_name_excluding` when there is no
+        // registered project/clone_url to match against at all.
+        assert_eq!(
+            resolve_parent_remote_name(&root, "gitlab/main", &cfg, None, None),
+            "gitlab"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
