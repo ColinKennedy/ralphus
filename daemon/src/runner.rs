@@ -283,6 +283,20 @@ pub struct RunnerSpec {
     /// starts at `0`. Backends that don't need it (everything but pi) accept
     /// and ignore it, mirroring `resume_agent_session_id`'s precedent.
     pub retry_attempt: u32,
+    /// RAL-517: the resolved `[review] retry_after_unknown_default_seconds`
+    /// value (`ReviewConfig::retry_after_unknown_default_seconds`, already
+    /// defaulted to 30 and clamped to the 600s ceiling), forwarded over the
+    /// stdin wire contract so a backend that recognizes a transient provider
+    /// error naming no delay of its own (currently only the pi backend) knows
+    /// how long to wait before retrying. Always serialized (no
+    /// `skip_serializing_if`), matching `retry_attempt`'s precedent -- there's
+    /// no ambiguous "unset" state, since it's resolved from config at spec-build
+    /// time. Backends that don't need it (everything but pi) accept and ignore
+    /// it, mirroring `resume_agent_session_id`'s precedent. The runner still
+    /// falls back to its own default if this is somehow absent on the wire
+    /// (an older daemon, a hand-built test spec), so it behaves sanely either
+    /// way.
+    pub retry_after_unknown_default_seconds: u64,
     /// RAL-308 cumulative `maximum_timeout_seconds` hard-cap accounting.
     /// `None` when neither this row, its owning cell, nor its owning task
     /// declared the field -- the common case, costing nothing extra at poll
@@ -539,6 +553,17 @@ fn resolved_thrash_thresholds() -> (u32, u32) {
     (cfg.max_compactions(), cfg.min_turn_gap())
 }
 
+/// RAL-517: the effective `[review] retry_after_unknown_default_seconds`
+/// value for `cwd`, read fresh at spec-construction time -- same "read live
+/// so a config change takes effect on a squad's next cell without a daemon
+/// restart" reasoning as [`resolved_tool_arg_truncate_chars`], but cwd-aware
+/// (like `provider_timeout_max_retries`'s resolution in `scheduler.rs`/
+/// `guardian_merge.rs`) rather than global-only, since `[review]` settings
+/// are per-project.
+fn resolved_retry_after_unknown_default_seconds(cwd: &str) -> u64 {
+    crate::config::resolve(std::path::Path::new(cwd)).retry_after_unknown_default_seconds()
+}
+
 impl RunnerSpec {
     /// Build a spec from a stored cell row.
     ///
@@ -592,9 +617,10 @@ impl RunnerSpec {
             .clone()
             .or_else(|| system_prompt.as_ref().map(|_| "append".to_string()));
         let (thrash_max_compactions, thrash_min_turn_gap) = resolved_thrash_thresholds();
-        let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(
-            row.cwd.as_deref().unwrap_or(""),
-        ));
+        let row_cwd = row.cwd.as_deref().unwrap_or("");
+        let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(row_cwd));
+        let retry_after_unknown_default_seconds =
+            resolved_retry_after_unknown_default_seconds(row_cwd);
         Self {
             squad_id: squad_id.to_string(),
             task: row.task_name.clone(),
@@ -634,6 +660,7 @@ impl RunnerSpec {
             // attempt counter at 0; the scheduler's rate-limit retry loop
             // increments it in place before resuming.
             retry_attempt: 0,
+            retry_after_unknown_default_seconds,
             // RAL-308: a cell's own cap is already the cumulative cap
             // covering itself and its cell-scope proofs -- see
             // `MaximumTimeoutCaps`'s doc comment.
@@ -721,6 +748,7 @@ impl RunnerSpec {
     ) -> Self {
         let (thrash_max_compactions, thrash_min_turn_gap) = resolved_thrash_thresholds();
         let agent_isolation = crate::config::resolve_agent_isolation(std::path::Path::new(cwd));
+        let retry_after_unknown_default_seconds = resolved_retry_after_unknown_default_seconds(cwd);
         Self {
             squad_id: squad_id.to_string(),
             task: task.to_string(),
@@ -756,6 +784,7 @@ impl RunnerSpec {
             allow_personal_settings: agent_isolation.allow_personal_settings(),
             allow_personal_memory: agent_isolation.allow_personal_memory(),
             retry_attempt: 0,
+            retry_after_unknown_default_seconds,
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -838,6 +867,8 @@ impl RunnerSpec {
             // Same rationale: no `ModelBackend` reached, so there is no
             // provider error to retry against.
             retry_attempt: 0,
+            retry_after_unknown_default_seconds:
+                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             // RAL-308: attached via `with_maximum_timeout_caps` by callers
             // that need it (the scheduler); most test-only callers don't.
             maximum_timeout: None,
@@ -3388,6 +3419,8 @@ mod tests {
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds:
+                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
         }
     }
@@ -5325,6 +5358,8 @@ prompt = "make it build"
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds:
+                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
@@ -5464,6 +5499,8 @@ prompt = "make it build"
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds:
+                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
         };
         let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);

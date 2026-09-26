@@ -312,6 +312,39 @@ pub struct ReviewConfig {
     /// rebuild attempted -- never by rebase-generated review SHAs.
     #[serde(default)]
     pub base_shift_maximum_rebuilds: Option<u32>,
+    /// RAL-517: the wait, in seconds, before the runner retries a recognized
+    /// transient provider error (e.g. a bare "please try again" retry
+    /// invitation with no rate-limit/5xx/timeout signal of its own) whose
+    /// message names no delay of its own to parse. `None` means unset, which
+    /// resolves to [`DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS`] (30);
+    /// per-project scalars win over the global layer, same as
+    /// `skip_worktrees`. `0` is accepted and means an immediate retry, not
+    /// "don't retry" -- to disable this specific tier of retrying, remove the
+    /// vocabulary match in `pi_backend.rs` instead, since a config value has
+    /// no way to express "don't classify this error as retryable" without
+    /// also taking away the operator's ability to tune its wait. The
+    /// resolved value still passes through
+    /// `ralphus_core::rate_limit::clamp_retry_after_secs` (the same 600s
+    /// ceiling RAL-435's provider-stated delays get), so an operator can't
+    /// configure an effectively-infinite wait here either.
+    ///
+    /// Deliberately does NOT govern `scheduler.rs`'s `DEFAULT_RATE_LIMIT_RETRY`
+    /// or `guardian_merge.rs`'s `DEFAULT_PROVIDER_RATE_LIMIT_RETRY` fallbacks,
+    /// even though those cover a structurally similar "recognized rate limit,
+    /// no delay reported" shape one layer further out (a `rate_limited`
+    /// `RunnerResult` that somehow arrived over the wire without a
+    /// `retry_after_secs`). Today `RunnerResult::rate_limited(...)` is the
+    /// only producer of that status and it always supplies a delay, so those
+    /// two constants are a defensive fallback for a malformed/future runner
+    /// result, not a live path -- this ticket's actual "provider says retry,
+    /// no delay stated" case is now resolved entirely inside the runner
+    /// (`pi_backend.rs`), which always computes a concrete delay before ever
+    /// returning a `rate_limited` outcome. Consolidating the daemon-side
+    /// fallbacks into this setting would blur that distinction for no
+    /// practical benefit, and is explicitly out of scope (this setting must
+    /// not consolidate/replace existing per-site delay constants).
+    #[serde(default)]
+    pub retry_after_unknown_default_seconds: Option<u64>,
 }
 
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
@@ -341,6 +374,10 @@ pub const DEFAULT_PROVIDER_TIMEOUT_MAX_RETRIES: u32 = 3;
 
 /// [`ReviewConfig::base_shift_maximum_rebuilds`]'s fallback when unset.
 pub const DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS: u32 = 3;
+
+/// [`ReviewConfig::retry_after_unknown_default_seconds`]'s fallback when
+/// unset. RAL-517.
+pub const DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS: u64 = 30;
 
 impl ReviewConfig {
     /// Whether worktrees should be skipped (unset resolves to `false`).
@@ -517,6 +554,18 @@ impl ReviewConfig {
             .unwrap_or(DEFAULT_BASE_SHIFT_MAXIMUM_REBUILDS)
     }
 
+    /// The wait, in seconds, before the runner retries a recognized
+    /// transient provider error that names no delay of its own (unset
+    /// resolves to [`DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS`]), clamped
+    /// to `ralphus_core::rate_limit::MAX_RATE_LIMIT_RETRY_SECS`. RAL-517.
+    #[must_use]
+    pub fn retry_after_unknown_default_seconds(&self) -> u64 {
+        ralphus_core::rate_limit::clamp_retry_after_secs(
+            self.retry_after_unknown_default_seconds
+                .unwrap_or(DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS),
+        )
+    }
+
     /// Validate this config's own scalars, independent of a `[[review]]`
     /// submission's own validation (`ralphus_core::validate`). RAL-395: a
     /// project-level `auto_fix_prompt_template` default must contain the
@@ -541,6 +590,14 @@ impl ReviewConfig {
         if self.base_shift_maximum_rebuilds == Some(0) {
             return Err("[review] base_shift_maximum_rebuilds must be at least 1".to_string());
         }
+        // RAL-517: unlike `auto_fix_retry_base_seconds` above,
+        // `retry_after_unknown_default_seconds` is deliberately allowed to be
+        // `0` -- see the field's own doc comment. `auto_fix_retry_base_seconds`
+        // is the *base* of a doubling backoff, where `0` would degenerate the
+        // whole schedule to always-immediate; this setting is a single flat
+        // wait applied once per retry, where "immediate retry" is a coherent
+        // (if aggressive) choice an operator can make on purpose, still bounded
+        // by `provider_timeout_max_retries`.
         Ok(())
     }
 
@@ -593,6 +650,9 @@ impl ReviewConfig {
             base_shift_maximum_rebuilds: over
                 .base_shift_maximum_rebuilds
                 .or(self.base_shift_maximum_rebuilds),
+            retry_after_unknown_default_seconds: over
+                .retry_after_unknown_default_seconds
+                .or(self.retry_after_unknown_default_seconds),
         }
     }
 }
@@ -4428,6 +4488,59 @@ mod tests {
     fn provider_timeout_max_retries_parses_from_the_review_table() {
         let cfg = from_toml_str("[review]\nprovider_timeout_max_retries = 7\n");
         assert_eq!(cfg.provider_timeout_max_retries(), 7);
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_defaults_to_thirty_when_unset() {
+        assert_eq!(
+            ReviewConfig::default().retry_after_unknown_default_seconds(),
+            DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS
+        );
+        assert_eq!(DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS, 30);
+    }
+
+    #[test]
+    fn merge_retry_after_unknown_default_seconds_project_wins() {
+        let global = ReviewConfig {
+            retry_after_unknown_default_seconds: Some(45),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            retry_after_unknown_default_seconds: Some(5),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(
+            global
+                .clone()
+                .merge(project)
+                .retry_after_unknown_default_seconds(),
+            5
+        );
+        // Project unset falls back to the global value.
+        assert_eq!(
+            global
+                .merge(ReviewConfig::default())
+                .retry_after_unknown_default_seconds(),
+            45
+        );
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_parses_from_the_review_table() {
+        let cfg = from_toml_str("[review]\nretry_after_unknown_default_seconds = 12\n");
+        assert_eq!(cfg.retry_after_unknown_default_seconds(), 12);
+    }
+
+    #[test]
+    fn retry_after_unknown_default_seconds_accepts_an_explicit_zero() {
+        // RAL-517 AC11: `0` means "immediate retry", not "disable retrying" --
+        // unlike `base_shift_maximum_rebuilds`, `validate()` must not reject it.
+        let cfg = ReviewConfig {
+            retry_after_unknown_default_seconds: Some(0),
+            ..ReviewConfig::default()
+        };
+        assert_eq!(cfg.retry_after_unknown_default_seconds(), 0);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
