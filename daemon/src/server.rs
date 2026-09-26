@@ -2060,6 +2060,24 @@ fn route_for_user(
         ("POST", ["api", "pull-requests", pr_id, "pull-from-pr"]) => pr_pull_from_pr(daemon, pr_id),
         // ralphus[ignore-endpoint-cli]: board on-demand CI-status refresh for a PR
         ("POST", ["api", "pull-requests", pr_id, "refresh-ci"]) => pr_refresh_ci(daemon, pr_id),
+
+        // RAL-400 Phase 7: cross-squad waypoints HTTP surface.
+        ("POST", ["api", "waypoints"]) => waypoint_create(daemon, body),
+        ("GET", ["api", "waypoints"]) => waypoint_list(daemon, query),
+        ("GET", ["api", "waypoints", id]) => waypoint_get(daemon, id),
+        ("POST", ["api", "waypoints", id, "roster"]) => waypoint_add_roster_entry(daemon, id, body),
+        ("DELETE", ["api", "waypoints", id, "roster", entry_id]) => {
+            waypoint_remove_roster_entry(daemon, id, entry_id)
+        }
+        ("PATCH", ["api", "waypoints", id, "roster", entry_id]) => {
+            waypoint_patch_roster_entry(daemon, id, entry_id, body)
+        }
+        ("POST", ["api", "waypoints", id, "close"]) => waypoint_close(daemon, id),
+        ("POST", ["api", "waypoints", id, "reopen"]) => waypoint_reopen(daemon, id),
+        ("POST", ["api", "waypoints", id, "bearings"]) => waypoint_append_bearing(daemon, id, body),
+        ("GET", ["api", "waypoints", id, "bearings"]) => waypoint_list_bearings(daemon, id),
+        ("GET", ["api", "waypoints", id, "deliveries"]) => waypoint_deliveries(daemon, id),
+
         _ => error(
             404,
             "not_found",
@@ -13945,6 +13963,601 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     }
     match store.get_pull_request(pr_id) {
         Ok(pr) => json(200, &pr),
+        Err(e) => store_error(&e),
+    }
+}
+
+// RAL-400 Phase 7: cross-squad waypoints HTTP surface. See `crate::waypoints`
+// for the underlying store methods (roster/bearing/scope semantics) and
+// `docs/glossary.md` for the squad/task/cell/proof/waypoint vocabulary.
+
+#[derive(Deserialize)]
+struct CreateWaypointRosterEntryBody {
+    kind: String,
+    entry_id: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateWaypointBody {
+    #[serde(default)]
+    label: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    allow_advisory: bool,
+    /// At least one entry is required -- see `waypoint_create`'s doc comment.
+    roster: Vec<CreateWaypointRosterEntryBody>,
+}
+
+#[derive(Deserialize)]
+struct AddRosterEntryBody {
+    kind: String,
+    entry_id: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PatchRosterEntryBody {
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct AppendBearingBody {
+    producer_kind: String,
+    producer_id: String,
+    summary: String,
+    #[serde(default)]
+    entity_uri: Option<String>,
+    #[serde(default)]
+    commit_id: Option<String>,
+    #[serde(default)]
+    commit_summary: Option<String>,
+}
+
+/// Roster-entry counts by [`crate::waypoints::DeliveryStatus`], for a
+/// waypoint's list/detail views -- lets a caller show "3/5 delivered"
+/// without shipping every roster row to a list poll.
+#[derive(Serialize, Default)]
+struct DeliverySummary {
+    undelivered: usize,
+    delivered: usize,
+    via_restack: usize,
+    failed: usize,
+}
+
+impl DeliverySummary {
+    fn from_roster(roster: &[crate::waypoints::RosterEntryView]) -> Self {
+        let mut summary = Self::default();
+        for entry in roster {
+            match entry.delivery_status {
+                crate::waypoints::DeliveryStatus::Undelivered => summary.undelivered += 1,
+                crate::waypoints::DeliveryStatus::Delivered => summary.delivered += 1,
+                crate::waypoints::DeliveryStatus::ViaRestack => summary.via_restack += 1,
+                crate::waypoints::DeliveryStatus::Failed => summary.failed += 1,
+            }
+        }
+        summary
+    }
+}
+
+/// Lean per-waypoint projection for `GET /api/waypoints`'s list view --
+/// everything a list poll needs without hydrating the full roster or the
+/// (potentially large) prompt. Mirrors `GuardianIndexEntry`'s relationship
+/// to the full `GuardianView`.
+#[derive(Serialize)]
+struct WaypointListEntry {
+    id: String,
+    label: Option<String>,
+    state: String,
+    allow_advisory: bool,
+    projects: Vec<String>,
+    roster_count: usize,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    closed_at_ms: Option<i64>,
+}
+
+/// Full `GET /api/waypoints/{id}` response: settings, roster, and a delivery
+/// summary. `prompt` is redacted the same way every other user-authored
+/// content field is before it leaves the daemon (see
+/// `ralphus_core::redact::redact_secrets`) -- a waypoint's prompt is
+/// free-form content, and secrets pasted into it must not leak back out.
+#[derive(Serialize)]
+struct WaypointDetail {
+    id: String,
+    label: Option<String>,
+    prompt: String,
+    agent: Option<String>,
+    model: Option<String>,
+    allow_advisory: bool,
+    state: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    closed_at_ms: Option<i64>,
+    projects: Vec<String>,
+    roster: Vec<crate::waypoints::RosterEntryView>,
+    delivery_summary: DeliverySummary,
+}
+
+/// A waypoint's tracked projects, sorted. Mirrors
+/// `Store::waypoint_scope_by_project`'s per-entry aggregation, except a
+/// roster entry whose squad/review no longer exists
+/// (`Store::squad_scope_by_project` reports that as `StoreError::NotFound`,
+/// unlike `Store::review_scope_by_project`'s plain-empty-result-set
+/// behavior for a missing review) contributes no scope instead of failing
+/// the whole waypoint view -- a waypoint's roster referencing a
+/// since-deleted/pruned squad must not 404/500 an otherwise-valid waypoint.
+fn waypoint_projects(store: &Store, waypoint_id: &str) -> crate::store::Result<Vec<String>> {
+    let mut projects = BTreeSet::new();
+    for entry in store.list_roster_entries(waypoint_id)? {
+        let scope = match entry.kind {
+            crate::waypoints::RosterEntryKind::Squad => {
+                match store.squad_scope_by_project(&entry.entry_id) {
+                    Ok(scope) => scope,
+                    Err(StoreError::NotFound) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            crate::waypoints::RosterEntryKind::Review => {
+                store.review_scope_by_project(&entry.entry_id)?
+            }
+        };
+        projects.extend(scope.into_keys());
+    }
+    Ok(projects.into_iter().collect())
+}
+
+/// `POST /api/waypoints` -- create a new open waypoint with its initial
+/// roster. At least one roster entry is required: a waypoint's tracked
+/// projects are inferred entirely from its roster (see
+/// `crate::waypoints::Store::waypoint_scope_by_project`), so an empty roster
+/// would mean nobody to coordinate with and no projects to classify against.
+fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<CreateWaypointBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {prompt, roster: [{kind, entry_id, mode?}], label?, agent?, model?, allow_advisory?}",
+            vec![],
+        );
+    };
+    if req.prompt.trim().is_empty() {
+        return error(400, "bad_request", "prompt must not be empty", vec![]);
+    }
+    if req.roster.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "roster must include at least one entry",
+            vec![],
+        );
+    }
+    let mut parsed_roster = Vec::with_capacity(req.roster.len());
+    for entry in &req.roster {
+        let Some(kind) = crate::waypoints::RosterEntryKind::parse(&entry.kind) else {
+            return error(
+                400,
+                "bad_request",
+                &format!(
+                    "roster entry kind must be \"review\" or \"squad\", got {:?}",
+                    entry.kind
+                ),
+                vec![],
+            );
+        };
+        let mode = match entry.mode.as_deref() {
+            None => crate::waypoints::RosterMode::Block,
+            Some(m) => match crate::waypoints::RosterMode::parse(m) {
+                Some(mode) => mode,
+                None => {
+                    return error(
+                        400,
+                        "bad_request",
+                        &format!("roster entry mode must be \"block\" or \"advisory\", got {m:?}"),
+                        vec![],
+                    );
+                }
+            },
+        };
+        if entry.entry_id.trim().is_empty() {
+            return error(
+                400,
+                "bad_request",
+                "roster entry_id must not be empty",
+                vec![],
+            );
+        }
+        parsed_roster.push((kind, entry.entry_id.clone(), mode));
+    }
+    let store = daemon.lock();
+    let id = match store.next_id("waypoint_seq", "waypoint") {
+        Ok(id) => id,
+        Err(e) => return store_error(&e),
+    };
+    if let Err(e) = store.create_waypoint(
+        &id,
+        req.label.as_deref(),
+        &req.prompt,
+        req.agent.as_deref(),
+        req.model.as_deref(),
+        req.allow_advisory,
+    ) {
+        return store_error(&e);
+    }
+    for (kind, entry_id, mode) in parsed_roster {
+        if let Err(e) = store.add_roster_entry(&id, kind, &entry_id, mode) {
+            return store_error(&e);
+        }
+    }
+    json(201, &IdResponse { id })
+}
+
+/// `GET /api/waypoints` -- list waypoints, optionally filtered by `project`
+/// (must appear in the waypoint's inferred project set) and/or `state`
+/// (`open`/`closed`).
+fn waypoint_list(daemon: &Daemon, query: &str) -> Reply {
+    let project_filter = query_filter(query, "project");
+    let state_filter = query_filter(query, "state");
+    if let Some(state) = state_filter.as_deref() {
+        if state != "open" && state != "closed" {
+            return error(
+                400,
+                "bad_request",
+                "state must be \"open\" or \"closed\"",
+                vec![],
+            );
+        }
+    }
+    let store = daemon.lock();
+    let mut ids = Vec::new();
+    if state_filter.as_deref() != Some("closed") {
+        match store.list_open_waypoint_ids() {
+            Ok(open) => ids.extend(open),
+            Err(e) => return store_error(&e),
+        }
+    }
+    if state_filter.as_deref() != Some("open") {
+        match store.list_closed_waypoint_ids() {
+            Ok(closed) => ids.extend(closed),
+            Err(e) => return store_error(&e),
+        }
+    }
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        let view = match store.get_waypoint(&id) {
+            Ok(view) => view,
+            Err(e) => return store_error(&e),
+        };
+        let projects = match waypoint_projects(&store, &id) {
+            Ok(projects) => projects,
+            Err(e) => return store_error(&e),
+        };
+        if let Some(project) = project_filter.as_deref() {
+            if !projects.iter().any(|p| p == project) {
+                continue;
+            }
+        }
+        let roster_count = match store.list_roster_entries(&id) {
+            Ok(roster) => roster.len(),
+            Err(e) => return store_error(&e),
+        };
+        entries.push(WaypointListEntry {
+            id: view.id,
+            label: view.label,
+            state: view.state,
+            allow_advisory: view.allow_advisory,
+            projects,
+            roster_count,
+            created_at_ms: view.created_at_ms,
+            updated_at_ms: view.updated_at_ms,
+            closed_at_ms: view.closed_at_ms,
+        });
+    }
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    json(200, &entries)
+}
+
+/// Assemble the full `WaypointDetail` (settings, roster, tracked projects,
+/// delivery summary) for one waypoint. Shared by every handler that returns
+/// a waypoint's state, so a roster mutation or a lifecycle change reflects
+/// the same shape a caller would get back from `GET /api/waypoints/{id}`.
+fn waypoint_detail(store: &Store, id: &str) -> crate::store::Result<WaypointDetail> {
+    let view = store.get_waypoint(id)?;
+    let roster = store.list_roster_entries(id)?;
+    let projects = waypoint_projects(store, id)?;
+    let delivery_summary = DeliverySummary::from_roster(&roster);
+    Ok(WaypointDetail {
+        id: view.id,
+        label: view.label,
+        prompt: ralphus_core::redact::redact_secrets(&view.prompt).into_owned(),
+        agent: view.agent,
+        model: view.model,
+        allow_advisory: view.allow_advisory,
+        state: view.state,
+        created_at_ms: view.created_at_ms,
+        updated_at_ms: view.updated_at_ms,
+        closed_at_ms: view.closed_at_ms,
+        projects,
+        roster,
+        delivery_summary,
+    })
+}
+
+/// `GET /api/waypoints/{id}` -- settings, roster, tracked projects, and a
+/// delivery summary.
+fn waypoint_get(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/roster` -- add (or update the mode of) one
+/// roster entry after creation.
+fn waypoint_add_roster_entry(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AddRosterEntryBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {kind, entry_id, mode?}",
+            vec![],
+        );
+    };
+    let Some(kind) = crate::waypoints::RosterEntryKind::parse(&req.kind) else {
+        return error(
+            400,
+            "bad_request",
+            &format!("kind must be \"review\" or \"squad\", got {:?}", req.kind),
+            vec![],
+        );
+    };
+    let mode = match req.mode.as_deref() {
+        None => crate::waypoints::RosterMode::Block,
+        Some(m) => match crate::waypoints::RosterMode::parse(m) {
+            Some(mode) => mode,
+            None => {
+                return error(
+                    400,
+                    "bad_request",
+                    &format!("mode must be \"block\" or \"advisory\", got {m:?}"),
+                    vec![],
+                );
+            }
+        },
+    };
+    if req.entry_id.trim().is_empty() {
+        return error(400, "bad_request", "entry_id must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    // Waypoint existence isn't checked separately -- `add_roster_entry`
+    // itself carries no foreign key to `waypoints`, but `get_waypoint` below
+    // (which the caller needs regardless, to see the change take effect)
+    // reports a missing waypoint as 404.
+    if let Err(e) = store.add_roster_entry(id, kind, &req.entry_id, mode) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Find the roster entry addressed by `entry_id` within one waypoint's
+/// roster, regardless of its `kind` -- review ids (`guardian-...`) and squad
+/// ids (`squad-...`) use non-colliding prefixes, so the path alone is enough
+/// to disambiguate without a separate `kind` query parameter.
+fn find_roster_entry(
+    store: &Store,
+    waypoint_id: &str,
+    entry_id: &str,
+) -> crate::store::Result<Option<crate::waypoints::RosterEntryView>> {
+    Ok(store
+        .list_roster_entries(waypoint_id)?
+        .into_iter()
+        .find(|entry| entry.entry_id == entry_id))
+}
+
+/// `DELETE /api/waypoints/{id}/roster/{entry_id}` -- remove one roster
+/// entry.
+fn waypoint_remove_roster_entry(daemon: &Daemon, id: &str, entry_id: &str) -> Reply {
+    let store = daemon.lock();
+    let entry = match find_roster_entry(&store, id, entry_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no roster entry {entry_id:?} on waypoint {id:?}"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    if let Err(e) = store.remove_roster_entry(id, entry.kind, entry_id) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `PATCH /api/waypoints/{id}/roster/{entry_id}` -- a human override of the
+/// survey's block/advisory mode decision for one roster entry. Reuses
+/// `add_roster_entry`'s mode-only upsert, which never touches the entry's
+/// `survey_verdict`/`survey_rationale`.
+fn waypoint_patch_roster_entry(daemon: &Daemon, id: &str, entry_id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<PatchRosterEntryBody>(body) else {
+        return error(400, "bad_request", "body must be {mode}", vec![]);
+    };
+    let Some(mode) = crate::waypoints::RosterMode::parse(&req.mode) else {
+        return error(
+            400,
+            "bad_request",
+            &format!("mode must be \"block\" or \"advisory\", got {:?}", req.mode),
+            vec![],
+        );
+    };
+    let store = daemon.lock();
+    let entry = match find_roster_entry(&store, id, entry_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no roster entry {entry_id:?} on waypoint {id:?}"),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    if let Err(e) = store.add_roster_entry(id, entry.kind, entry_id, mode) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/close` -- manual lifecycle control: close a
+/// waypoint regardless of whether every roster entry has reached a terminal
+/// state yet.
+fn waypoint_close(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    if let Err(e) = store.close_waypoint_manually(id) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/reopen` -- manual lifecycle control: reopen a
+/// closed waypoint.
+fn waypoint_reopen(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    if let Err(e) = store.reopen_waypoint(id) {
+        return store_error(&e);
+    }
+    match waypoint_detail(&store, id) {
+        Ok(detail) => json(200, &detail),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/waypoints/{id}/bearings` -- append a completed-work bearing.
+/// There is deliberately no edit/delete endpoint (v1): the bearing feed is
+/// meant to stay a durable, auditable record. Emits a Cartographer row
+/// scoped to the waypoint, matching every other waypoint lifecycle event
+/// (see `crate::waypoints::Store::close_waypoint_manually`).
+fn waypoint_append_bearing(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<AppendBearingBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {producer_kind, producer_id, summary, entity_uri?, commit_id?, commit_summary?}",
+            vec![],
+        );
+    };
+    let Some(producer_kind) = crate::waypoints::RosterEntryKind::parse(&req.producer_kind) else {
+        return error(
+            400,
+            "bad_request",
+            &format!(
+                "producer_kind must be \"review\" or \"squad\", got {:?}",
+                req.producer_kind
+            ),
+            vec![],
+        );
+    };
+    if req.summary.trim().is_empty() {
+        return error(400, "bad_request", "summary must not be empty", vec![]);
+    }
+    let store = daemon.lock();
+    let bearing = match store.append_waypoint_bearing(
+        id,
+        producer_kind,
+        &req.producer_id,
+        &req.summary,
+        req.entity_uri.as_deref(),
+        req.commit_id.as_deref(),
+        req.commit_summary.as_deref(),
+    ) {
+        Ok(bearing) => bearing,
+        Err(e) => return store_error(&e),
+    };
+    crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .emit(
+            &store,
+            format!(
+                "waypoint {id} received a bearing from {} {}",
+                producer_kind.as_str(),
+                req.producer_id
+            ),
+            serde_json::json!({
+                "waypoint_id": id,
+                "bearing_id": bearing.id,
+                "producer_kind": producer_kind.as_str(),
+                "producer_id": req.producer_id,
+            }),
+        );
+    json(
+        201,
+        &crate::waypoints::BearingView {
+            summary: ralphus_core::redact::redact_secrets(&bearing.summary).into_owned(),
+            commit_summary: bearing
+                .commit_summary
+                .as_deref()
+                .map(|s| ralphus_core::redact::redact_secrets(s).into_owned()),
+            ..bearing
+        },
+    )
+}
+
+/// `GET /api/waypoints/{id}/bearings` -- the ordered bearing feed, for
+/// injection, CLI, and board use.
+fn waypoint_list_bearings(daemon: &Daemon, id: &str) -> Reply {
+    match daemon.lock().list_waypoint_bearings(id) {
+        Ok(bearings) => {
+            let redacted: Vec<crate::waypoints::BearingView> = bearings
+                .into_iter()
+                .map(|b| crate::waypoints::BearingView {
+                    summary: ralphus_core::redact::redact_secrets(&b.summary).into_owned(),
+                    commit_summary: b
+                        .commit_summary
+                        .as_deref()
+                        .map(|s| ralphus_core::redact::redact_secrets(s).into_owned()),
+                    ..b
+                })
+                .collect();
+            json(200, &redacted)
+        }
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/waypoints/{id}/deliveries` -- delivery/event history backed by
+/// a Cartographer query, matching the squad-timeline response shape family
+/// (`squad_timeline` above). This also serves as the waypoint's merged
+/// event log, so there is no separate `.../timeline` endpoint.
+fn waypoint_deliveries(daemon: &Daemon, id: &str) -> Reply {
+    let store = daemon.lock();
+    // A missing waypoint should 404, not silently return an empty history.
+    if let Err(e) = store.get_waypoint(id) {
+        return store_error(&e);
+    }
+    match store.waypoint_deliveries(id) {
+        Ok(entries) => json(200, &entries),
         Err(e) => store_error(&e),
     }
 }
@@ -27942,5 +28555,346 @@ remediation_attempts=1
              (samples: {all_samples:?})",
             all_samples.len(),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // RAL-400 Phase 7: cross-squad waypoints HTTP surface
+    // -----------------------------------------------------------------------
+
+    fn create_waypoint_body(prompt: &str, roster: serde_json::Value) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "prompt": prompt,
+            "roster": roster,
+        }))
+        .unwrap()
+    }
+
+    /// Create a waypoint with a single `review`-kind roster entry with a
+    /// fake id -- `review_scope_by_project` (unlike `squad_scope_by_project`)
+    /// doesn't error on an id that doesn't correspond to a real guardian, so
+    /// this is the cheapest way to get a valid waypoint without also
+    /// submitting a squad.
+    fn create_waypoint_with_fake_review(d: &Daemon) -> String {
+        let body = create_waypoint_body(
+            "coordinate the thing",
+            serde_json::json!([{"kind": "review", "entry_id": "guardian-fake"}]),
+        );
+        let r = route(d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn waypoint_create_requires_nonempty_prompt() {
+        let d = daemon();
+        let body = create_waypoint_body(
+            "  ",
+            serde_json::json!([{"kind": "review", "entry_id": "guardian-fake"}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_create_requires_at_least_one_roster_entry() {
+        let d = daemon();
+        let body = create_waypoint_body("coordinate the thing", serde_json::json!([]));
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_create_rejects_invalid_roster_kind() {
+        let d = daemon();
+        let body = create_waypoint_body(
+            "coordinate the thing",
+            serde_json::json!([{"kind": "bogus", "entry_id": "guardian-fake"}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_create_rejects_invalid_roster_mode() {
+        let d = daemon();
+        let body = create_waypoint_body(
+            "coordinate the thing",
+            serde_json::json!([{"kind": "review", "entry_id": "guardian-fake", "mode": "bogus"}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_create_and_get_round_trips() {
+        let d = daemon();
+        let id = create_waypoint_with_fake_review(&d);
+        assert!(id.starts_with("waypoint-"), "{id}");
+        let r = route(&d, "GET", &format!("/api/waypoints/{id}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["id"], id);
+        assert_eq!(v["state"], "open");
+        assert_eq!(v["prompt"], "coordinate the thing");
+        assert_eq!(v["roster"].as_array().unwrap().len(), 1);
+        assert_eq!(v["roster"][0]["kind"], "review");
+        assert_eq!(v["roster"][0]["entry_id"], "guardian-fake");
+        assert_eq!(v["delivery_summary"]["undelivered"], 1);
+    }
+
+    #[test]
+    fn waypoint_get_missing_is_404() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/waypoints/waypoint-999", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_get_redacts_secrets_in_prompt() {
+        // `redact_secrets` scrubs credential *assignment* forms
+        // (`$env:KEY = value` / `KEY=value`), not bare-looking secret
+        // strings -- match that grammar so the assertion actually exercises
+        // the redaction path.
+        let d = daemon();
+        let body = create_waypoint_body(
+            "before $env:ANTHROPIC_API_KEY = 'sk-ant-supersecretvalue' after",
+            serde_json::json!([{"kind": "review", "entry_id": "guardian-fake"}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let id = v["id"].as_str().unwrap();
+        let r = route(&d, "GET", &format!("/api/waypoints/{id}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(
+            !r.body.contains("sk-ant-supersecretvalue"),
+            "raw secret must not appear in response: {}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn waypoint_list_filters_by_state_and_project() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        let squad_waypoint = {
+            let body = create_waypoint_body(
+                "coordinate on the squad",
+                serde_json::json!([{"kind": "squad", "entry_id": squad_id}]),
+            );
+            let r = route(&d, "POST", "/api/waypoints", &body);
+            assert_eq!(r.status, 201, "{}", r.body);
+            let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            v["id"].as_str().unwrap().to_string()
+        };
+        let review_waypoint = create_waypoint_with_fake_review(&d);
+        route(
+            &d,
+            "POST",
+            &format!("/api/waypoints/{review_waypoint}/close"),
+            "",
+        );
+
+        let r = route(&d, "GET", "/api/waypoints?state=open", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let ids: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&squad_waypoint.as_str()));
+        assert!(!ids.contains(&review_waypoint.as_str()));
+
+        let r = route(&d, "GET", "/api/waypoints?state=closed", "");
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let ids: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&review_waypoint.as_str()));
+        assert!(!ids.contains(&squad_waypoint.as_str()));
+
+        let r = route(&d, "GET", "/api/waypoints?state=bogus", "");
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_list_tolerates_roster_entry_for_deleted_squad() {
+        // A squad-kind roster entry whose squad id doesn't exist must not
+        // 404/500 the whole list -- `Store::squad_scope_by_project` errors
+        // on a missing squad (unlike the review-scope lookup), so the
+        // `waypoint_list`/`waypoint_get` handlers must tolerate that per
+        // entry rather than propagate it.
+        let d = daemon();
+        let body = create_waypoint_body(
+            "coordinate on a squad that's gone",
+            serde_json::json!([{"kind": "squad", "entry_id": "squad-does-not-exist"}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+
+        let r = route(&d, "GET", "/api/waypoints", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let r = route(&d, "GET", &format!("/api/waypoints/{id}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["projects"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn waypoint_roster_add_remove_and_patch() {
+        let d = daemon();
+        let id = create_waypoint_with_fake_review(&d);
+
+        let add_body = serde_json::to_string(&serde_json::json!({
+            "kind": "squad",
+            "entry_id": "squad-fake",
+            "mode": "advisory",
+        }))
+        .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/waypoints/{id}/roster"),
+            &add_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["roster"].as_array().unwrap().len(), 2);
+
+        let patch_body = serde_json::to_string(&serde_json::json!({ "mode": "block" })).unwrap();
+        let r = route(
+            &d,
+            "PATCH",
+            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            &patch_body,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let patched = v["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["entry_id"] == "squad-fake")
+            .unwrap();
+        assert_eq!(patched["mode"], "block");
+
+        let r = route(
+            &d,
+            "PATCH",
+            &format!("/api/waypoints/{id}/roster/squad-missing"),
+            &patch_body,
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+
+        let r = route(
+            &d,
+            "DELETE",
+            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["roster"].as_array().unwrap().len(), 1);
+
+        let r = route(
+            &d,
+            "DELETE",
+            &format!("/api/waypoints/{id}/roster/squad-fake"),
+            "",
+        );
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_close_and_reopen() {
+        let d = daemon();
+        let id = create_waypoint_with_fake_review(&d);
+
+        let r = route(&d, "POST", &format!("/api/waypoints/{id}/close"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "closed");
+
+        let r = route(&d, "POST", &format!("/api/waypoints/{id}/reopen"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "open");
+
+        let r = route(&d, "POST", "/api/waypoints/waypoint-999/close", "");
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_bearings_append_and_list_are_redacted_and_logged() {
+        let d = daemon();
+        let id = create_waypoint_with_fake_review(&d);
+
+        // `redact_secrets` scrubs credential *assignment* forms
+        // (`$env:KEY = value` / `KEY=value`), not bare-looking secret
+        // strings -- match that grammar so the assertion actually exercises
+        // the redaction path.
+        let append_body = serde_json::to_string(&serde_json::json!({
+            "producer_kind": "review",
+            "producer_id": "guardian-fake",
+            "summary": "landed the fix, $env:ANTHROPIC_API_KEY = 'sk-ant-supersecretvalue' inside",
+            "commit_id": "abc123",
+            "commit_summary": "fix: the thing, ANTHROPIC_API_KEY=sk-ant-anothersecretvalue too",
+        }))
+        .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/waypoints/{id}/bearings"),
+            &append_body,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        assert!(!r.body.contains("sk-ant-supersecretvalue"), "{}", r.body);
+        assert!(!r.body.contains("sk-ant-anothersecretvalue"), "{}", r.body);
+
+        let r = route(&d, "GET", &format!("/api/waypoints/{id}/bearings"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert!(!r.body.contains("sk-ant-supersecretvalue"), "{}", r.body);
+        assert!(!r.body.contains("sk-ant-anothersecretvalue"), "{}", r.body);
+
+        let r = route(&d, "GET", &format!("/api/waypoints/{id}/deliveries"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let entries = v.as_array().unwrap();
+        assert!(
+            entries.iter().any(|e| e["payload"]["bearing_id"] == 1),
+            "expected a bearing-append event in the deliveries feed: {v}"
+        );
+    }
+
+    #[test]
+    fn waypoint_bearings_append_rejects_invalid_producer_kind() {
+        let d = daemon();
+        let id = create_waypoint_with_fake_review(&d);
+        let body = serde_json::to_string(&serde_json::json!({
+            "producer_kind": "bogus",
+            "producer_id": "guardian-fake",
+            "summary": "did the thing",
+        }))
+        .unwrap();
+        let r = route(&d, "POST", &format!("/api/waypoints/{id}/bearings"), &body);
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn waypoint_deliveries_missing_waypoint_is_404() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/waypoints/waypoint-999/deliveries", "");
+        assert_eq!(r.status, 404, "{}", r.body);
     }
 }

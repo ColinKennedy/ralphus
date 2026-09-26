@@ -296,6 +296,27 @@ pub struct SurveyVerdict {
     pub rationale: String,
 }
 
+/// Page size for [`Store::waypoint_deliveries`]'s internal pagination loop.
+const WAYPOINT_EVENTS_PAGE_SIZE: i64 = 500;
+/// Conservative cap on how many `source="waypoints"` Cartographer rows
+/// (across every waypoint, not just the one being queried) one
+/// [`Store::waypoint_deliveries`] call scans before giving up -- the
+/// underlying query can only filter by `source`/`scope`, not by a specific
+/// waypoint id, so this bounds the pagination loop's worst case. Mirrors
+/// `crate::timeline::MAX_EVENTS`'s role for squad timelines.
+const WAYPOINT_MAX_SCANNED_EVENTS: i64 = 5000;
+
+/// One entry in a waypoint's delivery/event history (RAL-400 Phase 7,
+/// `GET /api/waypoints/{id}/deliveries`): a Cartographer row this module
+/// itself emitted for the waypoint, oldest first.
+#[derive(Debug, Clone, Serialize)]
+pub struct WaypointEventEntry {
+    pub at_ms: i64,
+    pub level: String,
+    pub message: String,
+    pub payload: serde_json::Value,
+}
+
 impl Store {
     /// Create a new open waypoint. Callers are responsible for generating
     /// `id` (mirrors every other entity id in this store -- see
@@ -1112,6 +1133,63 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// This waypoint's merged delivery/event history (RAL-400 Phase 7): every
+    /// Cartographer row this module has emitted for `waypoint_id`
+    /// (creation, roster changes, manual close/reopen, auto-close, bearing
+    /// appends, ...), oldest first. Backs `GET /api/waypoints/{id}/deliveries`,
+    /// the waypoint analog of [`crate::timeline::build_squad_timeline`].
+    ///
+    /// The underlying Cartographer query can only filter by `source`/`scope`,
+    /// not by a specific waypoint id, so this pages through every
+    /// `source="waypoints"` row and keeps the ones whose `payload.waypoint_id`
+    /// matches -- bounded by `WAYPOINT_MAX_SCANNED_EVENTS` so a store with a
+    /// long waypoint history can't turn this into an unbounded scan.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoint_deliveries(&self, waypoint_id: &str) -> StoreResult<Vec<WaypointEventEntry>> {
+        let mut matched = Vec::new();
+        let mut offset = 0i64;
+        let mut scanned = 0i64;
+        loop {
+            let filter = crate::cartographer::CartographerFilter {
+                source: Some("waypoints".to_string()),
+                scope: Some("waypoint".to_string()),
+                limit: WAYPOINT_EVENTS_PAGE_SIZE,
+                offset,
+                ascending: true,
+                ..crate::cartographer::CartographerFilter::default()
+            };
+            let page = self.cartographer_query(&filter)?;
+            let got = page.rows.len() as i64;
+            let total = page.total;
+            scanned += got;
+            for row in page.rows {
+                if row
+                    .payload
+                    .get("waypoint_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(waypoint_id)
+                {
+                    matched.push(WaypointEventEntry {
+                        at_ms: row.at_ms,
+                        level: row.level,
+                        message: row.message,
+                        payload: row.payload,
+                    });
+                }
+            }
+            offset += WAYPOINT_EVENTS_PAGE_SIZE;
+            if got < WAYPOINT_EVENTS_PAGE_SIZE
+                || offset >= total
+                || scanned >= WAYPOINT_MAX_SCANNED_EVENTS
+            {
+                break;
+            }
+        }
+        Ok(matched)
     }
 
     /// Queue an injection payload for one cell, optionally as part of a
