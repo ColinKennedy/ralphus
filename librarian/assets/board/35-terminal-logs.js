@@ -89,9 +89,16 @@
        *   the header next to "started" once the box is a historical record
        *   (`peekEnded[key]`) — without it, "cell ended" gave no indication of
        *   when.
+       * @param {boolean} [thinkingCapable] - RAL-516: whether the agent this
+       *   pane shows can emit thinking output at all (backend capability
+       *   folded with any per-profile override, computed server-side —
+       *   see `agent_profiles::thinking_capable_for_agent`). Defaults to
+       *   `true` (fail open) when omitted; the "Show Thinking" checkbox is
+       *   hidden entirely when this is `false`, since there is nothing for
+       *   it to fold/unfold.
        * @returns {string}
        */
-      function peekBox(key, startedAtMs, detachedAtMs, endedAtMs) {
+      function peekBox(key, startedAtMs, detachedAtMs, endedAtMs, thinkingCapable) {
         if (!peekOpen[key]) return "";
         // Reuse the last-fetched content (if any) instead of always starting from
         // "Loading…" — the details pane fully re-renders on every pushed event
@@ -148,6 +155,7 @@
         // unfolds the same loaded window -- nothing is refetched, and nothing
         // was discarded at capture time to begin with.
         const showThinking = peekShowsThinking(key);
+        const canThink = thinkingCapable !== false;
         const shown = cached;
         // RAL-428: admins get a two-tab live viewer — the transcript-tape
         // terminal (default; the Show Debug Messages toggle, jump button and
@@ -160,7 +168,7 @@
         const promptTab = currentUserIsAdmin && peekTab[key] === "prompt";
         const debugToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show ralphus's own diagnostic/telemetry events (session lifecycle, token/cost RALPHUS_EVENT markers) inline, right where they occurred in the terminal output.\nOff by default so routine monitoring only shows what the agent did; the default can be changed globally via the ralphus config file's [live_view] table.\nThis only changes what's rendered here -- the daemon's own logs always keep everything.\nA 'live usage' line's token/cost numbers are tagged (est.) -- estimated token and cost, a conservative mid-run guess (it can undercount tokens and overstate cost) used only to trigger the spend-cap kill switch early. The cell's own 'llm done' line right after it carries the real, final numbers and is never tagged."><input type="checkbox" ${showDebug ? "checked" : ""} onchange="toggleShowDebugMessages('${esc(key)}',this.checked)"> Show Debug Messages</label>`;
         const typeFilterHtml = promptTab || !showDebug ? "" : `<input class="peek-type-filter" value="${esc(peekTypeFilterInput[key] || "")}" oninput="setPeekTypeFilter('${esc(key)}',this.value)" placeholder="Filter types (e.g. read glob)" data-tip="Show only bracket-tagged log lines whose type code contains any space-separated term. Matching is case-insensitive and applies after you pause typing; for example, read glob shows tool.Read and tool.Glob. This filter only affects the Show Debug Messages view." aria-label="Filter log types">`;
-        const thinkingToggleHtml = promptTab ? "" : `<label class="peek-debug-toggle" data-tip="Show the model's own thinking/reasoning, expanded inline where it happened. Off folds each thinking block to a single &lt;thinking…&gt; line so routine monitoring shows what the agent did rather than how it talked itself there.\nFolding is purely a display choice and is freely reversible -- the reasoning is always captured in the transcript, so toggling this re-renders the text already loaded without refetching anything.\nThe starting state can be changed globally via the ralphus config file's [live_view] table (hide_thinking).\nOnly agent backends that report thinking as its own distinct stream have anything to fold here; a backend that does not (or a plain command cell) shows nothing either way."><input type="checkbox" ${showThinking ? "checked" : ""} onchange="toggleShowThinking('${esc(key)}',this.checked)"> Show Thinking</label>`;
+        const thinkingToggleHtml = (!canThink || promptTab) ? "" : `<label class="peek-debug-toggle" data-tip="Show the model's own thinking/reasoning, expanded inline where it happened. Off folds each thinking block to a single &lt;thinking…&gt; line so routine monitoring shows what the agent did rather than how it talked itself there.\nFolding is purely a display choice and is freely reversible -- the reasoning is always captured in the transcript, so toggling this re-renders the text already loaded without refetching anything.\nThe starting state can be changed globally via the ralphus config file's [live_view] table (hide_thinking).\nOnly agent backends that report thinking as its own distinct stream have anything to fold here; a backend that does not (or a plain command cell) shows nothing either way."><input type="checkbox" ${showThinking ? "checked" : ""} onchange="toggleShowThinking('${esc(key)}',this.checked)"> Show Thinking</label>`;
         const copyTip = promptTab
           ? "Copy this step's system prompt to clipboard.\nCopies the exact text shown on this tab — the full effective prompt the agent received (ralphus's hidden instructions plus the step's authored system prompt).\nA command cell or an agent step never yet dispatched has no text to copy."
           : "Copy this terminal's current output to clipboard.\nCopies whatever is visible right now — the live view keeps auto-refreshing after.";

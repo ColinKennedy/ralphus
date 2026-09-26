@@ -253,7 +253,10 @@
        * interview: the API never returns a resolved Link value, so there is
        * nothing to stage from the server beyond the raw key/kind/value rows
        * already in `AgentProfileView.env`).
-       * @type {{editingName: string|null, name: string, backend: string, executable: string, model: string, env: AgentEnvEntry[]}|null}
+       * `thinkingCapable` mirrors `AgentProfileView.thinking_capable`'s
+       * tri-state (RAL-516): `null` inherits the backend's own default,
+       * `true`/`false` is an explicit override.
+       * @type {{editingName: string|null, name: string, backend: string, executable: string, model: string, env: AgentEnvEntry[], thinkingCapable: boolean|null}|null}
        */
       let agentProfileForm = null;
       /** Message from the last failed profile save, shown inside the create/edit form. */

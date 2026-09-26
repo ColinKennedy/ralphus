@@ -992,12 +992,19 @@
           return match !== null && terms.some((term) => match[1].toLowerCase().includes(term));
         }).join("\n");
       }
+      // RALPHUS-SHOW-THINKING:BEGIN
       /**
        * Whether Live View pane `key` currently expands the model's
        * thinking/reasoning lines (RAL-434) rather than folding each block to a
        * single `⟨thinking…⟩` placeholder — the per-pane override in
        * `peekShowThinking` if this pane's checkbox has been toggled this
        * session, else the inverse of the config-driven `hideThinkingDefault`.
+       * This is the third and fourth layers of the "Show Thinking" precedence
+       * chain (RAL-516) — the first two, whether the checkbox is rendered at
+       * all, are `thinking_capable_for_agent`
+       * (`daemon/src/agent_profiles.rs`) and `peekBox`'s `canThink`
+       * (`board/35-terminal-logs.js`); see
+       * `test/board-thinking-precedence.test.mjs` for coverage of these two.
        * @param {string} key
        * @returns {boolean}
        */
@@ -1019,6 +1026,7 @@
         if (peekTape[key] === undefined) return;
         renderPeekTape(key);
       }
+      // RALPHUS-SHOW-THINKING:END
       /**
        * Switches which tab a peek box shows — "terminal" (the default,
        * transcript-tape live view, RAL-397 Phase 2G-A) or "prompt" (the

@@ -1779,6 +1779,30 @@ pub fn agent_supports_maximum_tool_output_tokens(agent: &str) -> bool {
     )
 }
 
+/// Whether `agent` is a backend that emits its model's thinking/reasoning as
+/// a distinct, taggable stream the Live View's "Show Thinking" control
+/// (RAL-434) can fold/unfold -- as opposed to one that mixes reasoning into
+/// its regular output (or emits none at all) with nothing for the board to
+/// tell apart (RAL-516).
+///
+/// Only Pi tags a `RALPHUS_THINKING: ` marker line
+/// (`runner::pi_backend::THINKING_MARKER`) today. Claude Code, Codex, the
+/// native/`anthropic`/`ollama` backends, and `raw`/harness cells emit
+/// nothing the board can classify as thinking, so this declares them
+/// incapable by default -- an agent-profile's own `thinking_capable`
+/// override (`daemon::agent_profiles::AgentProfile`) can still mark a custom
+/// profile capable without changing this default, e.g. a profile pointed at
+/// a future harness that does emit a taggable stream.
+///
+/// On the runner side, each supported backend overrides
+/// `ModelBackend::supports_thinking` to match this set -- the two checks are
+/// independent (`core` cannot see `runner`'s trait impls) and must be kept
+/// in sync by hand.
+#[must_use]
+pub fn agent_supports_thinking(agent: &str) -> bool {
+    matches!(agent, "pi")
+}
+
 impl ResolvedAgent {
     /// Winning `agent` spec after task→cell inheritance (cell wins), plus
     /// the merged extra args -- computed before any candidate-list
@@ -2491,6 +2515,23 @@ mod tests {
         assert!(!agent_supports_maximum_tool_output_tokens("anthropic"));
         assert!(!agent_supports_maximum_tool_output_tokens("ollama"));
         assert!(!agent_supports_maximum_tool_output_tokens("raw"));
+    }
+
+    #[test]
+    fn thinking_supported_only_by_pi() {
+        assert!(agent_supports_thinking("pi"));
+        for agent in [
+            "claude",
+            "anthropic",
+            "ollama",
+            "claude-code",
+            "claude-cli",
+            "codex",
+            "codex-cli",
+            "raw",
+        ] {
+            assert!(!agent_supports_thinking(agent), "{agent}");
+        }
     }
 
     #[test]
