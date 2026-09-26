@@ -1,6 +1,6 @@
 //! Cross-squad waypoints (RAL-400) -- schema/store layer (Phase 1) plus the
-//! survey pass (Phase 2), squad gating (Phase 3), and review-feedback
-//! delivery (Phase 4).
+//! survey pass (Phase 2), squad gating (Phase 3), review-feedback delivery
+//! (Phase 4), and lifecycle (Phase 6).
 //!
 //! A waypoint is a named, open/closed join point that tracks a roster of
 //! reviews/squads and accumulates append-only guidance ("bearings") for
@@ -15,6 +15,25 @@
 //! A separate, not-yet-implemented `pending_injections` mechanism
 //! ([`PendingInjectionView`]) is schema-only -- see
 //! `.agent/waypoints-phase0-decisions.md` for the full design.
+//!
+//! Lifecycle (Phase 6): [`Store::maybe_auto_close_waypoint`] closes a
+//! waypoint once every roster entry has reached a terminal state (a squad's
+//! `done`/`cancelled`, per [`crate::store::SquadState::is_terminal_for_waypoint`];
+//! a review's `merged`/`cancelled`/`deployed`, per
+//! [`GuardianStatus::is_terminal_status`] -- both deliberately excluding
+//! `failed`/`merge_failed`, which may still be retried), hooked into
+//! `Store::set_squad_state`/`Store::set_guardian_status` via
+//! [`Store::maybe_auto_close_waypoints_for_roster_entry`] right after either
+//! transition lands. [`Store::close_waypoint_manually`]/
+//! [`Store::reopen_waypoint`] are the store-level primitives for manual
+//! close/reopen (HTTP/CLI surface is a later phase); a manual close takes
+//! effect for gating immediately, since `Store::squad_block_gating_waypoint`
+//! filters on live `state='open'` with no extra plumbing needed. Closing a
+//! waypoint (auto or manual) queues an optional one-time stand-down notice
+//! for each *advisory*-mode roster entry (`Block`-mode entries get none --
+//! gating simply lifting is itself the signal); [`run_pending_stand_down_notices`]
+//! is the scheduler sweep that sends them and marks each entry's
+//! `stand_down_at_ms` so a later waypoint reopen+reclose never re-sends one.
 //!
 //! Phase 5 (scenario 3, in-flight delivery + parking) pulls forward only the
 //! hard-halt/ghost-fold half of the design; see
@@ -203,6 +222,10 @@ pub struct RosterEntryView {
     pub survey_verdict: Option<String>,
     pub survey_rationale: Option<String>,
     pub delivery_status: DeliveryStatus,
+    /// Set once this entry's optional advisory stand-down notice (RAL-400
+    /// Phase 6) has been sent -- `None` while still pending. See
+    /// [`run_pending_stand_down_notices`].
+    pub stand_down_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -544,6 +567,22 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every currently-`closed` waypoint's id (RAL-400 Phase 6) -- feeds
+    /// [`run_pending_stand_down_notices`], the closed-side counterpart to
+    /// [`Store::list_open_waypoint_ids`].
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn list_closed_waypoint_ids(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM waypoints WHERE state='closed'")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Whether a waypoint is `open` (`true`) or `closed`/nonexistent
     /// (`false`).
     ///
@@ -620,7 +659,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn list_roster_entries(&self, waypoint_id: &str) -> StoreResult<Vec<RosterEntryView>> {
         let mut stmt = self.conn.prepare(
-            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, created_at_ms, updated_at_ms
+            "SELECT waypoint_id, kind, entry_id, mode, survey_verdict, survey_rationale, delivery_status, stand_down_at_ms, created_at_ms, updated_at_ms
              FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms, entry_id",
         )?;
         let rows = stmt
@@ -642,8 +681,9 @@ impl Store {
             survey_rationale: r.get(5)?,
             delivery_status: DeliveryStatus::parse(&delivery_s)
                 .unwrap_or(DeliveryStatus::Undelivered),
-            created_at_ms: r.get(7)?,
-            updated_at_ms: r.get(8)?,
+            stand_down_at_ms: r.get(7)?,
+            created_at_ms: r.get(8)?,
+            updated_at_ms: r.get(9)?,
         })
     }
 
@@ -661,6 +701,27 @@ impl Store {
         self.conn.execute(
             "UPDATE waypoint_roster SET delivery_status=?, updated_at_ms=? WHERE waypoint_id=? AND kind=? AND entry_id=?",
             params![status.as_str(), now_ms(), waypoint_id, kind.as_str(), entry_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a roster entry's advisory stand-down notice as sent (RAL-400
+    /// Phase 6, idempotency for [`run_pending_stand_down_notices`]). A no-op
+    /// if already marked -- `stand_down_at_ms` is set once and never
+    /// overwritten, so calling this twice keeps the original timestamp.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn mark_roster_entry_stood_down(
+        &self,
+        waypoint_id: &str,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE waypoint_roster SET stand_down_at_ms=?, updated_at_ms=?
+             WHERE waypoint_id=? AND kind=? AND entry_id=? AND stand_down_at_ms IS NULL",
+            params![now_ms(), now_ms(), waypoint_id, kind.as_str(), entry_id],
         )?;
         Ok(())
     }
@@ -696,9 +757,13 @@ impl Store {
     }
 
     /// Whether every roster entry on a waypoint has reached a terminal state
-    /// (squad terminal states, per [`SquadState::is_terminal`], count the
-    /// same as review terminal states, per
-    /// [`GuardianStatus::is_terminal_status`]). A waypoint with an empty
+    /// (squad terminal states, per [`SquadState::is_terminal_for_waypoint`]
+    /// -- deliberately stricter than the generic [`SquadState::is_terminal`],
+    /// since a `failed` squad can still be restarted back to `pending` via
+    /// [`Store::restart_squad`] and so is not "finished" for this purpose --
+    /// count the same as review terminal states, per
+    /// [`GuardianStatus::is_terminal_status`], which already excludes
+    /// `merge_failed` for the same reason). A waypoint with an empty
     /// roster is never considered terminal -- there is nothing to have
     /// finished yet.
     ///
@@ -712,7 +777,7 @@ impl Store {
         for entry in &entries {
             let terminal = match entry.kind {
                 RosterEntryKind::Squad => match self.squad_state(&entry.entry_id) {
-                    Ok(state) => state.is_terminal(),
+                    Ok(state) => state.is_terminal_for_waypoint(),
                     Err(StoreError::NotFound) => false,
                     Err(e) => return Err(e),
                 },
@@ -738,9 +803,10 @@ impl Store {
         Ok(true)
     }
 
-    /// Close a waypoint if every roster entry has reached a terminal state.
-    /// A no-op (returns `false`) if the waypoint is already closed, has no
-    /// roster entries, or has at least one still-active entry.
+    /// Close a waypoint if every roster entry has reached a terminal state
+    /// (RAL-400 Phase 6). A no-op (returns `false`) if the waypoint is
+    /// already closed, has no roster entries, or has at least one
+    /// still-active entry. Records a Cartographer row on an actual close.
     ///
     /// # Errors
     /// Propagates any SQLite failure.
@@ -751,7 +817,113 @@ impl Store {
         if !self.all_roster_entries_terminal(waypoint_id)? {
             return Ok(false);
         }
-        self.close_waypoint(waypoint_id)
+        let closed = self.close_waypoint(waypoint_id)?;
+        if closed {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .emit(
+                    self,
+                    format!(
+                        "waypoint {waypoint_id} auto-closed: every roster entry reached a terminal state"
+                    ),
+                    serde_json::json!({"waypoint_id": waypoint_id, "reason": "auto"}),
+                );
+        }
+        Ok(closed)
+    }
+
+    /// Every open waypoint that rosters `(kind, entry_id)` -- the reverse
+    /// lookup behind the auto-close hooks in [`Store::set_squad_state`] and
+    /// [`Store::set_guardian_status`], used to find which waypoints might now
+    /// be closeable after one of their roster entries just reached a
+    /// terminal state. Two waypoints may independently roster the same
+    /// review/squad, so this can return more than one id.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn waypoints_referencing_roster_entry(
+        &self,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wr.waypoint_id FROM waypoint_roster wr
+             JOIN waypoints w ON w.id = wr.waypoint_id
+             WHERE wr.kind = ? AND wr.entry_id = ? AND w.state = 'open'",
+        )?;
+        let rows = stmt
+            .query_map(params![kind.as_str(), entry_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Try to auto-close every open waypoint that rosters `(kind, entry_id)`
+    /// (RAL-400 Phase 6) -- called from [`Store::set_squad_state`] and
+    /// [`Store::set_guardian_status`] right after a roster entry's owning
+    /// squad/review transitions into a terminal state.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn maybe_auto_close_waypoints_for_roster_entry(
+        &self,
+        kind: RosterEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<()> {
+        for waypoint_id in self.waypoints_referencing_roster_entry(kind, entry_id)? {
+            self.maybe_auto_close_waypoint(&waypoint_id)?;
+        }
+        Ok(())
+    }
+
+    /// Manually close a waypoint (RAL-400 Phase 6). Unlike
+    /// [`Store::maybe_auto_close_waypoint`], this always closes an open
+    /// waypoint regardless of roster state -- the whole point of a manual
+    /// close is to override auto-close, e.g. to gate-release a squad whose
+    /// review is still pending. Idempotent: closing an already-closed
+    /// waypoint is a no-op. Takes effect for gating immediately, since
+    /// [`Store::squad_block_gating_waypoint`] filters on live `state='open'`.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn close_waypoint_manually(&self, id: &str) -> StoreResult<bool> {
+        let closed = self.close_waypoint(id)?;
+        if closed {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .emit(
+                    self,
+                    format!("waypoint {id} closed manually"),
+                    serde_json::json!({"waypoint_id": id, "reason": "manual"}),
+                );
+        }
+        Ok(closed)
+    }
+
+    /// Reopen a closed waypoint (RAL-400 Phase 6): flips it back to `open`
+    /// and clears `closed_at_ms`. Idempotent: reopening an already-open
+    /// waypoint is a no-op. Deliberately does not reset any roster entry's
+    /// `stand_down_at_ms` -- a later re-close must not re-send a stand-down
+    /// notice that already went out.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn reopen_waypoint(&self, id: &str) -> StoreResult<bool> {
+        let now = now_ms();
+        let n = self.conn.execute(
+            "UPDATE waypoints SET state='open', updated_at_ms=?, closed_at_ms=NULL WHERE id=? AND state != 'open'",
+            params![now, id],
+        )?;
+        let reopened = n > 0;
+        if reopened {
+            crate::cartographer::Note::new("waypoints")
+                .scope("waypoint")
+                .emit(
+                    self,
+                    format!("waypoint {id} reopened"),
+                    serde_json::json!({"waypoint_id": id}),
+                );
+        }
+        Ok(reopened)
     }
 
     /// The open waypoint (if any) that block-gates a squad (RAL-400 Phase 3,
@@ -1587,6 +1759,167 @@ fn mark_done_but_unreviewed_squad(
     );
 }
 
+/// Render a closed waypoint's stand-down notice text (RAL-400 Phase 6),
+/// shared by both the squad (`notify_watchers`) and review (`start_feedback`)
+/// delivery paths.
+fn stand_down_text(waypoint: &WaypointView) -> String {
+    match &waypoint.label {
+        Some(label) => {
+            format!(
+                "Waypoint \"{label}\" has closed -- no further action is needed for its guidance."
+            )
+        }
+        None => {
+            "This waypoint has closed -- no further action is needed for its guidance.".to_string()
+        }
+    }
+}
+
+/// Scheduler-owned periodic sweep (RAL-400 Phase 6): send each closed
+/// waypoint's *advisory*-mode roster entries a one-time stand-down notice
+/// once their waypoint has closed (auto- or manually). `Block`-mode entries
+/// never get one -- once their waypoint closes, gating simply lifts (see
+/// `Store::squad_block_gating_waypoint`'s live `state='open'` filter), which
+/// is itself the signal; a separate notice would be redundant.
+///
+/// Idempotent per entry via `stand_down_at_ms`
+/// ([`Store::mark_roster_entry_stood_down`]) -- reopening a waypoint does not
+/// reset it (see [`Store::reopen_waypoint`]'s doc comment), so a later
+/// re-close never re-sends a notice that already went out.
+///
+/// - `Review`-kind entries reuse the same feedback path as ordinary guidance
+///   delivery (`guardian_merge::start_feedback` via [`stand_down_review`]),
+///   left pending for a later sweep exactly like [`deliver_to_review`] when
+///   there is no ready branch yet or `start_feedback` reports a non-`202`
+///   status.
+/// - `Squad`-kind entries go out via [`Store::notify_watchers`]
+///   ([`stand_down_squad`]) -- a squad has no review worktree to write
+///   feedback into, and unlike delivery there is no live cell to resume, so
+///   a plain informational mailbox message at `squad:{id}` is enough (v1
+///   scope).
+///
+/// Mirrors [`run_pending_deliveries`]'s shape: cheap synchronous store reads
+/// on the calling (scheduler) thread gate what work happens; the
+/// potentially slow part (`start_feedback`'s spawned background thread) is
+/// not owned by this function's call stack at all.
+pub fn run_pending_stand_down_notices(
+    store: &crate::store_lock::StoreHandle,
+    runner: &Arc<dyn Runner>,
+) {
+    let waypoint_ids = {
+        let guard = store.lock();
+        guard.list_closed_waypoint_ids().unwrap_or_default()
+    };
+    for waypoint_id in waypoint_ids {
+        let (waypoint, entries) = {
+            let guard = store.lock();
+            let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
+                continue;
+            };
+            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            (waypoint, entries)
+        };
+        for entry in entries {
+            if entry.mode != RosterMode::Advisory || entry.stand_down_at_ms.is_some() {
+                continue;
+            }
+            match entry.kind {
+                RosterEntryKind::Review => {
+                    stand_down_review(store, runner, &waypoint_id, &waypoint, &entry.entry_id);
+                }
+                RosterEntryKind::Squad => {
+                    stand_down_squad(store, &waypoint_id, &waypoint, &entry.entry_id);
+                }
+            }
+        }
+    }
+}
+
+/// Send one review roster entry's stand-down notice via the existing
+/// feedback path, then mark it sent. Leaves the entry pending (for a later
+/// sweep to retry) if the guardian has no ready branch yet, or if
+/// `start_feedback` reports `404`/`409` -- the same not-ready/gone races
+/// [`deliver_to_review`] already tolerates. Any other reply status is still
+/// marked sent: unlike ordinary guidance delivery, a stand-down notice is
+/// optional and best-effort, so there is no `Failed` outcome to track for
+/// it, and endlessly retrying a guardian that keeps erroring would be worse
+/// than dropping one advisory-only notice.
+fn stand_down_review(
+    store: &crate::store_lock::StoreHandle,
+    runner: &Arc<dyn Runner>,
+    waypoint_id: &str,
+    waypoint: &WaypointView,
+    guardian_id: &str,
+) {
+    let branch_id = {
+        let guard = store.lock();
+        let Ok(guardian) = guard.get_guardian(guardian_id) else {
+            return;
+        };
+        match topmost_ready_branch(&guardian) {
+            Some(branch) => branch.id.clone(),
+            None => return,
+        }
+    };
+    let reply = crate::guardian_merge::start_feedback(
+        Arc::clone(store),
+        Arc::clone(runner),
+        guardian_id,
+        &branch_id,
+        stand_down_text(waypoint),
+        Some(WAYPOINT_FEEDBACK_AUTHOR.to_string()),
+        None,
+    );
+    if matches!(reply.status, 404 | 409) {
+        return;
+    }
+    let guard = store.lock();
+    let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Review, guardian_id);
+    let note = crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .guardian(guardian_id);
+    note.emit(
+        &guard,
+        format!("waypoint {waypoint_id} sent stand-down notice to review {guardian_id}"),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "guardian_id": guardian_id,
+            "branch_id": branch_id,
+            "reply_status": reply.status,
+        }),
+    );
+}
+
+/// Send one squad roster entry's stand-down notice as a plain informational
+/// mailbox message, then mark it sent.
+fn stand_down_squad(
+    store: &crate::store_lock::StoreHandle,
+    waypoint_id: &str,
+    waypoint: &WaypointView,
+    squad_id: &str,
+) {
+    let guard = store.lock();
+    let _ = guard.notify_watchers(
+        crate::monitor::NotifiableEventKind::SquadAttributesChanged,
+        &format!("squad:{squad_id}"),
+        crate::mailbox::MailboxPriority::Normal,
+        &stand_down_text(waypoint),
+        Some(squad_id),
+    );
+    let _ = guard.mark_roster_entry_stood_down(waypoint_id, RosterEntryKind::Squad, squad_id);
+    let note = crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .squad(squad_id);
+    note.emit(
+        &guard,
+        format!("waypoint {waypoint_id} sent stand-down notice to squad {squad_id}"),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "squad_id": squad_id,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1756,7 +2089,16 @@ mod tests {
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
         assert!(store.waypoint_is_open("waypoint-1").unwrap());
 
-        store.set_squad_state(squad_id, SquadState::Done).unwrap();
+        // Direct SQL (not `set_squad_state`) so this exercises
+        // `maybe_auto_close_waypoint` in isolation, independent of the
+        // `set_squad_state` auto-close hook covered separately below.
+        store
+            .conn
+            .execute(
+                "UPDATE squads SET state='done' WHERE id=?",
+                params![squad_id],
+            )
+            .unwrap();
         assert!(store.maybe_auto_close_waypoint("waypoint-1").unwrap());
         assert!(!store.waypoint_is_open("waypoint-1").unwrap());
     }
@@ -1799,6 +2141,252 @@ mod tests {
         open_waypoint(&store, "waypoint-1");
         assert!(!store.maybe_auto_close_waypoint("waypoint-1").unwrap());
         assert!(store.waypoint_is_open("waypoint-1").unwrap());
+    }
+
+    #[test]
+    fn set_squad_state_hook_auto_closes_but_failed_does_not() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        store
+            .set_squad_state("squad-1", SquadState::Failed)
+            .unwrap();
+        assert!(
+            store.waypoint_is_open("waypoint-1").unwrap(),
+            "a failed squad may still be restarted, so it must not auto-close a waypoint it gates"
+        );
+
+        store.set_squad_state("squad-1", SquadState::Done).unwrap();
+        assert!(
+            !store.waypoint_is_open("waypoint-1").unwrap(),
+            "set_squad_state's auto-close hook must fire without an explicit maybe_auto_close_waypoint call"
+        );
+    }
+
+    #[test]
+    fn set_guardian_status_hook_auto_closes_but_merge_failed_does_not() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        store
+            .set_guardian_status("guardian-1", GuardianStatus::MergeFailed, Some("conflict"))
+            .unwrap();
+        assert!(
+            store.waypoint_is_open("waypoint-1").unwrap(),
+            "a merge-failed review may still be retried, so it must not auto-close a waypoint it gates"
+        );
+
+        store
+            .set_guardian_status("guardian-1", GuardianStatus::Merged, None)
+            .unwrap();
+        assert!(
+            !store.waypoint_is_open("waypoint-1").unwrap(),
+            "set_guardian_status's auto-close hook must fire without an explicit maybe_auto_close_waypoint call"
+        );
+    }
+
+    #[test]
+    fn cancelled_counts_as_terminal_for_both_squad_and_review_entries() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+        insert_bare_guardian(&store, "guardian-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        store
+            .set_guardian_status("guardian-1", GuardianStatus::Cancelled, None)
+            .unwrap();
+        assert!(store.waypoint_is_open("waypoint-1").unwrap());
+
+        store
+            .set_squad_state("squad-1", SquadState::Cancelled)
+            .unwrap();
+        assert!(
+            !store.waypoint_is_open("waypoint-1").unwrap(),
+            "a cancelled squad and a cancelled review must both count as terminal"
+        );
+    }
+
+    #[test]
+    fn two_waypoints_sharing_a_roster_entry_close_independently() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        open_waypoint(&store, "waypoint-2");
+        insert_bare_squad(&store, "squad-shared", SquadState::Pending);
+        insert_bare_squad(&store, "squad-only-2", SquadState::Pending);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-shared",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-2",
+                RosterEntryKind::Squad,
+                "squad-shared",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .add_roster_entry(
+                "waypoint-2",
+                RosterEntryKind::Squad,
+                "squad-only-2",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        store
+            .set_squad_state("squad-shared", SquadState::Done)
+            .unwrap();
+        assert!(
+            !store.waypoint_is_open("waypoint-1").unwrap(),
+            "waypoint-1's only roster entry is now terminal, so it should auto-close"
+        );
+        assert!(
+            store.waypoint_is_open("waypoint-2").unwrap(),
+            "waypoint-2 still has a non-terminal squad-only-2 entry, so it must stay open"
+        );
+
+        store
+            .set_squad_state("squad-only-2", SquadState::Done)
+            .unwrap();
+        assert!(
+            !store.waypoint_is_open("waypoint-2").unwrap(),
+            "waypoint-2's last roster entry is now terminal, so it should auto-close too"
+        );
+    }
+
+    #[test]
+    fn manual_close_overrides_non_terminal_roster_and_is_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        assert!(store.close_waypoint_manually("waypoint-1").unwrap());
+        assert!(!store.waypoint_is_open("waypoint-1").unwrap());
+        assert!(
+            !store.close_waypoint_manually("waypoint-1").unwrap(),
+            "closing an already-closed waypoint must be a no-op"
+        );
+    }
+
+    #[test]
+    fn reopen_is_idempotent_and_does_not_reset_stand_down_timestamps() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+
+        assert!(
+            !store.reopen_waypoint("waypoint-1").unwrap(),
+            "reopening an already-open waypoint must be a no-op"
+        );
+
+        store
+            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .unwrap();
+        let stood_down_at = store.list_roster_entries("waypoint-1").unwrap()[0]
+            .stand_down_at_ms
+            .unwrap();
+
+        assert!(store.close_waypoint_manually("waypoint-1").unwrap());
+        assert!(store.reopen_waypoint("waypoint-1").unwrap());
+        assert!(store.waypoint_is_open("waypoint-1").unwrap());
+        assert!(
+            !store.reopen_waypoint("waypoint-1").unwrap(),
+            "reopening an already-open waypoint must be a no-op"
+        );
+
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(
+            entries[0].stand_down_at_ms,
+            Some(stood_down_at),
+            "reopening must never reset a stand-down timestamp that already fired"
+        );
+    }
+
+    #[test]
+    fn mark_roster_entry_stood_down_is_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Pending);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+
+        store
+            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .unwrap();
+        let first = store.list_roster_entries("waypoint-1").unwrap()[0]
+            .stand_down_at_ms
+            .unwrap();
+        store
+            .mark_roster_entry_stood_down("waypoint-1", RosterEntryKind::Squad, "squad-1")
+            .unwrap();
+        let second = store.list_roster_entries("waypoint-1").unwrap()[0]
+            .stand_down_at_ms
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "a second call must keep the original timestamp"
+        );
     }
 
     #[test]
@@ -2967,6 +3555,160 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "a cancelled squad must never surface as a survey candidate: {candidates:?}"
+        );
+    }
+
+    // ── run_pending_stand_down_notices (Phase 6) ─────────────────────────
+
+    #[test]
+    fn stand_down_sweep_notifies_an_advisory_squad_entry_once_closed() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_stand_down_notices(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert!(
+            entries[0].stand_down_at_ms.is_some(),
+            "an advisory squad entry must be marked stood-down once notified"
+        );
+        let broadcast = store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap();
+        assert_eq!(broadcast.len(), 1);
+        assert_eq!(
+            broadcast[0].event_kind.as_deref(),
+            Some("squad_attributes_changed")
+        );
+    }
+
+    #[test]
+    fn stand_down_sweep_sends_feedback_to_an_advisory_review_entry_with_a_ready_branch() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        open_review_branch(&store, "guardian-1", "feature-x");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_stand_down_notices(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert!(
+            entries[0].stand_down_at_ms.is_some(),
+            "a review entry with a ready branch must be marked stood-down once feedback is sent"
+        );
+    }
+
+    #[test]
+    fn stand_down_sweep_leaves_a_review_entry_pending_without_a_ready_branch() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_stand_down_notices(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert!(
+            entries[0].stand_down_at_ms.is_none(),
+            "with no ready branch yet, the notice must be left for a later sweep"
+        );
+    }
+
+    #[test]
+    fn stand_down_sweep_never_notifies_a_block_mode_entry() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_stand_down_notices(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert!(
+            entries[0].stand_down_at_ms.is_none(),
+            "block-mode entries never get a stand-down notice -- gating simply lifting is the signal"
+        );
+        let broadcast = store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap();
+        assert!(broadcast.is_empty());
+    }
+
+    #[test]
+    fn stand_down_sweep_is_idempotent_across_repeated_runs() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Advisory,
+            )
+            .unwrap();
+        assert!(store.close_waypoint("waypoint-1").unwrap());
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_stand_down_notices(&handle, &runner);
+        run_pending_stand_down_notices(&handle, &runner);
+
+        let store = handle.lock();
+        let broadcast = store
+            .mailbox_messages_for_client("client", false, None)
+            .unwrap();
+        assert_eq!(
+            broadcast.len(),
+            1,
+            "an already-stood-down entry must be skipped on a later sweep"
         );
     }
 }
