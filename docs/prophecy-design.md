@@ -317,6 +317,7 @@ Ralphus-Cell: cell:squad-000000000012:0:1
    `--trailer` flag — and since the hook inherits the cell's environment, it
    reads `$RALPHUS_ENTITY_URI` for free once that is exported.
 5. **Two pre-existing RAL-445 gaps block the trailer half** — see §13.
+
 ---
 
 ## 9. Shape of one prophecy
