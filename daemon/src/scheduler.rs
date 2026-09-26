@@ -2890,29 +2890,44 @@ fn run_cell_worker(
     // Cartographer live, as each `RALPHUS_PROPHECY:` line was scanned
     // (`daemon/src/runner.rs::forward_prophecy_line`), but a cell that was
     // killed, timed out, or otherwise never had its stderr scanned to
-    // completion may only have this set.
-    for text in result
-        .prophecies
-        .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-    {
-        let guard = store.lock();
-        // TODO(prophecy-store): persist `text` into the prophecy table once
-        // it lands (a sibling task in this batch owns the table); for now
-        // this only reaches Cartographer, which is pruned at
-        // `[cartographer] retention_days`/`max_rows` and so cannot be this
-        // subsystem's durable home.
-        crate::cartographer::Note::new("prophecy")
-            .squad(squad_id)
-            .cell(&row.cell_id)
-            .task(&row.task_name)
-            .scope("cell")
-            .emit(
-                &guard,
-                "prophecy recorded",
-                serde_json::json!({"len": text.len()}),
+    // completion may only have this set. `Store::record_prophecy` persists
+    // durably (the `prophecies` table, unlike Cartographer, is never pruned)
+    // and emits its own Cartographer note, so this is the single write.
+    if !result.prophecies.is_empty() {
+        let entity_uri = crate::entity_uri::EntityUri::Cell {
+            squad_id: squad_id.to_string(),
+            task_idx: row.task_idx,
+            cell_idx: row.idx,
+        }
+        .to_string();
+        for text in result
+            .prophecies
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+        {
+            let guard = store.lock();
+            let _ = guard.record_prophecy(
+                crate::prophecy::ProphecyEntry {
+                    entity_uri: &entity_uri,
+                    // 1-based: which command-remediation attempt of this
+                    // cell produced `result` (always 1 outside `mode =
+                    // "remediating"`; see `total_attempts` above). Not a
+                    // general cell-restart counter -- `restart_on`/RAL-19
+                    // dispatcher restarts re-enter this function fresh and
+                    // aren't tracked here.
+                    attempt: i64::from(remediation_attempt),
+                    kind: "note",
+                    body: text,
+                    revision: None,
+                },
+                "scheduler",
+                Some(squad_id),
+                None,
+                Some(&row.cell_id),
+                Some(&row.task_name),
             );
+        }
     }
 
     if !result.is_done() {

@@ -337,3 +337,97 @@ stalls.
 | `pr_id` | text? | Which PR it landed in. |
 
 Deliberately **not** in v1: a confidence score (§12).
+
+---
+
+## 10. Build phases
+
+Each phase is independently shippable and useful alone — stop after two and
+something was still gained.
+
+### Phase 1 — store, plus the writers that need no agent
+
+- [x] Append-only table keyed by `entity_uri` + `attempt`
+- [x] Cartographer row emitted on every write (logging policy)
+- [x] Read-side `ralphus prophecy list | show`
+- [x] Populate from the rebase/conflict decisions `guardian_merge.rs` already
+      makes (§4.4)
+- [x] Glossary entry for **prophecy** in `docs/glossary.md`
+
+*Why first:* zero agent involvement, immediate value, and it proves the storage
+model against real traffic before any prompt work exists.
+
+### Phase 2 — transport
+
+- [x] Scan the agent's streaming output for a standalone `RALPHUS_PROPHECY:`
+      line; match exact-form lines only, per the `RALPHUS_TMUX_DONE` precedent
+      (§4.3)
+- [x] Forward it as a runner event; let `forward_runner_event` attribute it
+- [x] Add a `prophecies` field to `RunnerResult` so the at-exit set crosses the
+      provider boundary as a typed contract, mirroring `ghost` (§6.1)
+- [x] `docs/special-syntax.md` entry for the marker
+
+*No credential, no endpoint, no new env. Works remotely unchanged.*
+
+### Phase 3 — teach the agents
+
+- [ ] System-prompt fragment alongside the existing ghost fragment in
+      `runner/src/execute.rs`
+
+*This is where the discipline is won or lost. Ghost is the evidence it works.*
+
+### Phase 4 — fold into the PR
+
+- [ ] Deterministic `<details>` block after the synthesized description (§8.1)
+- [ ] `published_at_ms` / `pr_id` so a resubmit does not duplicate
+- [ ] `Ralphus-Cell:` trailer on the existing RAL-445 hook (§8.2) — **blocked
+      on the two gaps in §13**
+
+### Phase 5 — derive the ghost (optional)
+
+- [ ] Build the ghost from recent prophecies instead of a separate marker, so
+      there is one discipline to teach rather than two (§3)
+
+*Only once the rest is proven.*
+
+### Phase 6 — the CLI write path (only if the marker disappoints)
+
+- [ ] `ralphus prophecy record`; inherit the MCP tool via parity (§4.2)
+- [ ] Export `RALPHUS_ENTITY_URI` / `RALPHUS_ATTEMPT`
+
+*Blocked on the credential question, which is RAL-252 / RAL-225 territory, not
+this subsystem's. Do not start here.*
+
+### Status as of this commit
+
+This task's scope was Phase 1 only. What landed here:
+
+- The `prophecies` table (`daemon/src/prophecy.rs`, `daemon/src/store.rs`),
+  keyed by `entity_uri` + `attempt`, matching the §9 field shape.
+- A Cartographer row on every `Store::record_prophecy` call.
+- `GET /api/prophecies` / `GET /api/prophecies/{id}` plus
+  `ralphus prophecy list` / `ralphus prophecy show` (CLI, and — by MCP parity
+  — the corresponding MCP tools).
+- Three daemon-side call sites in `daemon/src/guardian_merge.rs` that record
+  a prophecy at rebase/conflict-resolution decisions, with no agent
+  cooperation. Caveat: §4.4 and the table above describe the decisions as
+  "conflict resolved, hunk dropped, ours taken" — `guardian_merge.rs` has no
+  literal `--ours`/"ours taken" merge strategy to hook into (confirmed by
+  grep), so the writers fire on the conflict-resolution and give-up paths
+  that actually exist in the code, not on a literal "ours taken" branch.
+- The glossary entry for **prophecy** in `docs/glossary.md`.
+- `kind` is implemented as an open string, not the closed enum §11.1
+  proposes — that question was left unresolved by the design doc and is not
+  this task's call to make; the validation site carries a
+  `// TODO(prophecy-kind-enum):` comment instead of guessing.
+
+Phase 2 (transport) was already landed by the sibling task scoped to §4 —
+present in the working tree at the time of this commit and cited above
+without re-verifying its authorship: the `RALPHUS_PROPHECY:` marker constant
+and standalone-line scanner (`daemon/src/runner.rs`), forwarding through
+`forward_runner_event`, the `RunnerResult.prophecies` backstop field, and a
+`docs/special-syntax.md` entry. This task did not touch any of that code and
+takes no credit for it beyond confirming it is present.
+
+Phases 3–6 are not started. Nothing in this commit implements a system-prompt
+fragment, PR folding, ghost derivation, or a CLI/MCP write path.

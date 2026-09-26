@@ -20,6 +20,7 @@ mod machine;
 mod mailbox;
 mod project;
 mod proof;
+mod prophecy;
 mod queue;
 mod review;
 mod show;
@@ -89,6 +90,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::TutorShow => Ok(json!({"tutor": ralphus_cli::tutor::task_tutor()})),
         Command::Cell(c) => cell::execute(c, client),
         Command::Proof(c) => proof::execute(c, client),
+        Command::Prophecy(c) => prophecy::execute(c, client),
         Command::Review(c) => review::execute(c, client),
         Command::Queue(c) => queue::execute(c, client),
         Command::Mcp(_) => Err(usage(

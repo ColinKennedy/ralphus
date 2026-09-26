@@ -1335,6 +1335,28 @@ fn guard_against_rebase_step_content_loss(
             }),
             admin_only: false,
         });
+        let entity_uri = crate::entity_uri::EntityUri::Guardian {
+            guardian_id: id.to_string(),
+        }
+        .to_string();
+        let _ = guard.record_prophecy(
+            crate::prophecy::ProphecyEntry {
+                entity_uri: &entity_uri,
+                attempt: 1,
+                kind: "conflict-resolution",
+                body: &format!(
+                    "branch {branch}: a proposed resolution would have dropped content in \
+                     {lost:?} (rebase_head={rebase_head:?}) -- rejected, rebase aborted, will \
+                     retry with the agent instead of replaying the same result"
+                ),
+                revision: Some(&rebase_head),
+            },
+            "guardian_merge",
+            None,
+            Some(id),
+            None,
+            None,
+        );
     }
     // Poison the specific bad cache entries so a retry sees a real conflict
     // and goes through the agent instead of replaying the same lossy
@@ -2056,6 +2078,27 @@ fn finish_branch_resolved(
             payload: serde_json::json!({"branch": branch, "committed": committed}),
             admin_only: false,
         });
+        let entity_uri = crate::entity_uri::EntityUri::Guardian {
+            guardian_id: id.to_string(),
+        }
+        .to_string();
+        let _ = guard.record_prophecy(
+            crate::prophecy::ProphecyEntry {
+                entity_uri: &entity_uri,
+                attempt: 1,
+                kind: "conflict-resolution",
+                body: &format!(
+                    "branch {branch}: {found} conflicting commit(s) resolved by the resolver \
+                     agent, {committed} committed"
+                ),
+                revision: None,
+            },
+            "guardian_merge",
+            None,
+            Some(id),
+            None,
+            None,
+        );
     }
     // RAL-168: gated by Proof scope -- a branch that just had real conflicts
     // resolved is never "auto-clean", so only `scope` (not `skip_auto_clean`)
@@ -2163,6 +2206,34 @@ fn give_up_on_stuck_commit(
                 "rebase_commands_total": command_progress.map(|(_, total)| total),
             }),
         });
+        // This is the one decision in the resolver's whole loop that is
+        // truly silent otherwise: the caller's `git rebase --abort` (right
+        // after this returns) makes the worktree look clean/finished, so
+        // without this record there is no trace that a commit's changes
+        // were dropped from the branch rather than genuinely resolved.
+        let entity_uri = crate::entity_uri::EntityUri::Guardian {
+            guardian_id: id.to_string(),
+        }
+        .to_string();
+        let _ = guard.record_prophecy(
+            crate::prophecy::ProphecyEntry {
+                entity_uri: &entity_uri,
+                attempt: i64::from(attempts),
+                kind: "conflict-resolution",
+                body: &format!(
+                    "branch {branch}: gave up resolving a stuck commit after \
+                     {attempts}/{MAX_ATTEMPTS_PER_COMMIT} attempts (rebase_head={rebase_head:?}, \
+                     remaining_files={final_files:?}) -- rebase aborted, this commit's changes \
+                     did not make it onto the branch"
+                ),
+                revision: rebase_head.as_deref(),
+            },
+            "guardian_merge",
+            None,
+            Some(id),
+            None,
+            None,
+        );
     }
     "conflict resolver exhausted its attempt budget on this commit".to_string()
 }

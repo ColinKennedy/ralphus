@@ -1533,6 +1533,8 @@ fn route_for_user(
         ("POST", ["api", "ghosts", "copy"]) => ghost_copy(daemon, body),
         // ralphus[ignore-endpoint-cli]: board ghost link resolution inside the board (RAL-155)
         ("GET", ["api", "ghosts", owner_uri]) => ghost_get(daemon, owner_uri),
+        ("GET", ["api", "prophecies"]) => prophecy_query_route(daemon, query),
+        ("GET", ["api", "prophecies", id]) => prophecy_get_route(daemon, id),
         ("POST", ["api", "mailbox", "register"]) => mailbox_register(daemon),
         // Monitor watches + the per-user mailbox view they filter.
         // These literal "personal"/"watches" segments must stay ahead of the
@@ -7124,6 +7126,49 @@ fn ghost_get(daemon: &Daemon, owner_uri: &str) -> Reply {
     match daemon.lock().get_ghost(owner_uri) {
         Ok(Some(g)) => json(200, &g),
         Ok(None) => error(404, "not_found", "no such ghost", vec![]),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// The prophecy log (design doc §10 Phase 1): a filtered, paginated view over
+/// `crate::prophecy`'s durable, append-only record of what an agent (or
+/// ralphus itself, e.g. a `guardian_merge.rs` conflict-resolution decision)
+/// learned mid-work. Query params: `entity` (a single-string URI, RAL-155,
+/// resolved to the exact `entity_uri` a prophecy was recorded under -- unlike
+/// Cartographer's `entity`, no task/cell index resolution is needed since
+/// prophecies already store the canonical URI string), `kind`, `q` (substring
+/// match on body), `limit` (default 100, max 1000), `offset`, `sort`
+/// (`asc`/`desc`, default `desc`).
+fn prophecy_query_route(daemon: &Daemon, query: &str) -> Reply {
+    let limit = query_param(query, "limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+    let offset = query_param(query, "offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let filter = crate::prophecy::ProphecyFilter {
+        entity_uri: query_filter(query, "entity"),
+        kind: query_filter(query, "kind"),
+        q: query_filter(query, "q"),
+        limit,
+        offset,
+        ascending: query_param(query, "sort") == Some("asc"),
+    };
+    match daemon.lock().prophecy_query(&filter) {
+        Ok(page) => json(200, &page),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// Fetch one prophecy row by id (used when the CLI/board needs the full
+/// `body` of a specific prophecy rather than a filtered listing).
+fn prophecy_get_route(daemon: &Daemon, id: &str) -> Reply {
+    let Ok(row_id) = id.parse::<i64>() else {
+        return error(400, "bad_request", "id must be an integer", vec![]);
+    };
+    match daemon.lock().prophecy_get(row_id) {
+        Ok(Some(row)) => json(200, &row),
+        Ok(None) => error(404, "not_found", "no such prophecy", vec![]),
         Err(e) => store_error(&e),
     }
 }

@@ -926,6 +926,25 @@ impl DaemonClient {
         self.get(&format!("/api/cartographer{qs}"))
     }
 
+    /// `docs/daemon-api.md`'s `GET /api/prophecies` (design doc §10 Phase 1)
+    /// -- all filters optional.
+    pub fn prophecies(&self, filters: ProphecyFilters<'_>) -> Result<Value, DaemonError> {
+        let qs = query_string(&[
+            ("entity", filters.entity.map(str::to_string)),
+            ("kind", filters.kind.map(str::to_string)),
+            ("q", filters.q.map(str::to_string)),
+            ("limit", Some(filters.limit.to_string())),
+            ("offset", Some(filters.offset.to_string())),
+            ("sort", filters.ascending.then(|| "asc".to_string())),
+        ]);
+        self.get(&format!("/api/prophecies{qs}"))
+    }
+
+    /// `docs/daemon-api.md`'s `GET /api/prophecies/{id}`.
+    pub fn prophecy_get(&self, id: i64) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/prophecies/{id}"))
+    }
+
     // ---- mailbox (RAL-241) ---------------------------------------------
 
     /// `POST /api/mailbox/register` -- returns `{"client_id": "..."}`.
@@ -1907,6 +1926,30 @@ impl Default for CartographerFilters<'_> {
             q: None,
             since_ms: None,
             until_ms: None,
+            limit: 100,
+            offset: 0,
+            ascending: false,
+        }
+    }
+}
+
+/// Optional filters for [`DaemonClient::prophecies`].
+#[derive(Debug, Clone)]
+pub struct ProphecyFilters<'a> {
+    pub entity: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub q: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+    pub ascending: bool,
+}
+
+impl Default for ProphecyFilters<'_> {
+    fn default() -> Self {
+        Self {
+            entity: None,
+            kind: None,
+            q: None,
             limit: 100,
             offset: 0,
             ascending: false,
