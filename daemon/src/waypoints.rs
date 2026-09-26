@@ -342,6 +342,83 @@ impl Store {
         Ok(())
     }
 
+    /// Create every `[[waypoint]]` block a submission declared (RAL-400
+    /// Phase 8), resolving each roster entry's sentinel to a real id:
+    /// `<<ralphus:new-squad>>` to this submission's own `squad_id`,
+    /// `<<ralphus:new-review/<key>>>` to the guardian
+    /// `crate::reviews::derive_reviews_with_full_prefetch` created for that
+    /// same-file `[[review]]` block (via
+    /// [`Store::guardian_id_for_review_key`]), and a plain
+    /// `<<review:<id>>>`/`<<squad:<id>>>` literally. Deliberately mirrors
+    /// `POST /api/waypoints`'s own permissiveness: neither path checks that a
+    /// literal roster id names a real row, so a submission naming a typo'd
+    /// id behaves the same as the HTTP API would (a dangling roster entry
+    /// that never delivers, not a rejected submission). Callers must run
+    /// this only after review derivation has already succeeded for the same
+    /// `squad_id`, so every same-file `[[review]]` block's guardian row
+    /// already exists.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure, or [`StoreError::InvalidTransition`]
+    /// if a same-file `<<ralphus:new-review/<key>>>` placeholder doesn't
+    /// match any guardian created for this squad -- `core::validate`
+    /// rejects an unmatched placeholder offline before the daemon ever sees
+    /// it, so this indicates review derivation didn't actually create the
+    /// review it reported success for.
+    pub(crate) fn create_submission_waypoints(
+        &self,
+        squad_id: &str,
+        waypoints: &[ralphus_core::schema::WaypointDef],
+    ) -> StoreResult<()> {
+        for w in waypoints {
+            let id = self.next_id("waypoint_seq", "waypoint")?;
+            self.create_waypoint(
+                &id,
+                w.label.as_deref(),
+                &w.prompt,
+                w.agent.as_deref(),
+                w.model.as_deref(),
+                w.allow_advisory,
+            )?;
+            for entry in &w.roster {
+                // `core::validate`'s `validate_waypoint_blocks` already
+                // rejects an unparseable roster entry offline -- a `None`
+                // here would mean the daemon is running against a task file
+                // that bypassed that check.
+                let Some(parsed) = ralphus_core::schema::parse_roster_entry_sentinel(entry) else {
+                    return Err(StoreError::InvalidTransition(format!(
+                        "waypoint roster entry {entry:?} is not a valid sentinel"
+                    )));
+                };
+                let (kind, entry_id) = match parsed {
+                    ralphus_core::schema::RosterEntryRef::NewSquad => {
+                        (RosterEntryKind::Squad, squad_id.to_string())
+                    }
+                    ralphus_core::schema::RosterEntryRef::ExistingSquad(existing) => {
+                        (RosterEntryKind::Squad, existing)
+                    }
+                    ralphus_core::schema::RosterEntryRef::ExistingReview(raw) => {
+                        match ralphus_core::schema::review_link_key(&raw) {
+                            Some(key) => match self.guardian_id_for_review_key(squad_id, key)? {
+                                Some(guardian_id) => (RosterEntryKind::Review, guardian_id),
+                                None => {
+                                    return Err(StoreError::InvalidTransition(format!(
+                                        "waypoint roster entry references review key \
+                                         {key:?}, but no guardian was created for it in \
+                                         squad {squad_id}"
+                                    )));
+                                }
+                            },
+                            None => (RosterEntryKind::Review, raw),
+                        }
+                    }
+                };
+                self.add_roster_entry(&id, kind, &entry_id, RosterMode::Block)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fetch one waypoint by id.
     ///
     /// # Errors
