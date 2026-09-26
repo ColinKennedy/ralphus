@@ -7893,7 +7893,7 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
 /// stranding the previous CI run) -- pausing briefly and re-detecting folds
 /// any commits that land within this window into the one rebuild that
 /// follows, instead of one rebuild per commit.
-const BASE_SHIFT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+const BASE_SHIFT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// One pass comparing each of a guardian's projects' current upstream base
 /// against its stored baseline. Factored out of [`rebuild_on_base_shift`] so

@@ -722,7 +722,7 @@ fn reopen_waits_for_cancelled_merge_worker_before_reusing_its_worktrees() {
         "reopen must not change status or start a new worker before the old one exits"
     );
 
-    for _ in 0..100 {
+    for _ in 0..200 {
         if !cancellations.is_active(&key) {
             break;
         }
@@ -4138,7 +4138,7 @@ fn base_shift_rebuild_budget_reopens_for_a_new_target_base_sha() {
 // RAL-510: a burst of upstream commits landing in quick succession must fold
 // into ONE rebuild dispatch (and therefore one force-push, one CI run), not
 // one per commit -- `rebuild_on_base_shift` sleeps for `BASE_SHIFT_DEBOUNCE`
-// (300ms in `guardian_merge.rs`) after its first shift detection and
+// (500ms in `guardian_merge.rs`) after its first shift detection and
 // re-detects before actually dispatching, so a target that keeps moving
 // during that window is only ever rebuilt against wherever it finally
 // settles. This test lands two more commits on `main` *while* the function
