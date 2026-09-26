@@ -11952,6 +11952,7 @@ mod tests {
                     kind: crate::agent_profile_env::AgentEnvKind::Set,
                     value: "key-from-profile".to_string(),
                 }],
+                None,
             )
             .expect("upsert profile");
         store
@@ -12031,7 +12032,7 @@ mod tests {
         ));
         store
             .lock()
-            .upsert_agent_profile("pi-plain", "pi", None, None, vec![])
+            .upsert_agent_profile("pi-plain", "pi", None, None, vec![], None)
             .expect("upsert profile");
 
         let resolved =

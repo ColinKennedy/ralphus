@@ -688,6 +688,12 @@ pub struct GuardianView {
     /// (from the top-level `[[review]]` block's `agent`). `None` falls back to the
     /// `RALPHUS_RESOLVER_AGENT` env override, then `ollama`.
     pub resolver_agent: Option<String>,
+    /// RAL-516: whether the *effective* resolver agent (`resolver_agent`, or
+    /// the project's default resolver agent when unset) can emit thinking
+    /// output -- see `agent_profiles::thinking_capable_for_agent`. The
+    /// resolver Live View pane hides its "Show Thinking" checkbox when this
+    /// is `false`.
+    pub resolver_thinking_capable: bool,
     /// Model the resolver agent runs. `None` falls back to `RALPHUS_RESOLVER_MODEL`,
     /// then `qwen3:8b` for the ollama backend.
     pub resolver_model: Option<String>,
@@ -731,6 +737,12 @@ pub struct GuardianView {
     pub summary_model: Option<String>,
     /// RAL-88: the resolved agent/model that produced `manual_commands`.
     pub manual_commands_agent: Option<String>,
+    /// RAL-516: whether the *effective* manual-checks agent
+    /// (`manual_commands_agent`, or the same effective resolver agent as
+    /// [`Self::resolver_thinking_capable`] when unset) can emit thinking
+    /// output. The manual-checks Live View pane hides its "Show Thinking"
+    /// checkbox when this is `false`.
+    pub manual_commands_thinking_capable: bool,
     /// Model behind `manual_commands` (see [`Self::manual_commands_agent`]).
     pub manual_commands_model: Option<String>,
     /// RAL-88 follow-up: agent_session_id from the most recent manual-checks
@@ -4620,10 +4632,16 @@ impl Store {
                     )
                 });
         }
+        let db_profiles = crate::agent_profile_store::list_agent_profiles_conn(conn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
         GuardianHydrationCtx {
             project_stamps: Self::load_all_project_stamps_conn(conn),
             live_global: crate::config::global_review_config(),
             config_by_git_root,
+            db_profiles,
         }
     }
 
@@ -5096,6 +5114,28 @@ impl Store {
         let (cumulative_tokens_in, cumulative_tokens_out, cumulative_cost_usd) =
             Self::guardian_cost_total_conn(conn, &row.id)?;
 
+        // RAL-516: mirrors the frontend's own `resolverOf(g)` fallback
+        // (`librarian/assets/board/25-chrome.js`) so the capability check is
+        // computed against the same agent name the board actually shows/runs.
+        let effective_resolver_agent = row
+            .resolver_agent
+            .clone()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| default_agent.clone());
+        let resolver_thinking_capable = crate::agent_profiles::thinking_capable_for_agent(
+            &effective_resolver_agent,
+            &ctx.db_profiles,
+        );
+        let effective_manual_commands_agent = row
+            .manual_commands_agent
+            .clone()
+            .filter(|a| !a.is_empty())
+            .unwrap_or(effective_resolver_agent);
+        let manual_commands_thinking_capable = crate::agent_profiles::thinking_capable_for_agent(
+            &effective_manual_commands_agent,
+            &ctx.db_profiles,
+        );
+
         Ok(GuardianView {
             id: row.id,
             name: row.name,
@@ -5116,6 +5156,7 @@ impl Store {
             review_type: row.review_type,
             skip_worktrees: row.skip_worktrees,
             resolver_agent: row.resolver_agent,
+            resolver_thinking_capable,
             resolver_model: row.resolver_model,
             created_at_ms: row.created_at_ms,
             checks: crate::store::from_json(&row.checks),
@@ -5132,6 +5173,7 @@ impl Store {
             summary_agent: row.summary_agent,
             summary_model: row.summary_model,
             manual_commands_agent: row.manual_commands_agent,
+            manual_commands_thinking_capable,
             manual_commands_model: row.manual_commands_model,
             manual_commands_agent_session_id: row.manual_commands_agent_session_id,
             squash_projects: crate::store::from_json(
@@ -5489,6 +5531,11 @@ struct GuardianHydrationCtx {
             crate::store::ProjectReviewSettings,
         ),
     >,
+    /// RAL-516: every DB-backed agent profile, fetched once per call rather
+    /// than once per guardian -- feeds `agent_profiles::thinking_capable_for_agent`
+    /// for [`GuardianView::resolver_thinking_capable`]/
+    /// [`GuardianView::manual_commands_thinking_capable`].
+    db_profiles: std::collections::HashMap<String, crate::agent_profile_store::AgentProfileView>,
 }
 
 struct GuardianRow {

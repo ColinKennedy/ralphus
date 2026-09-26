@@ -55,12 +55,14 @@ fn execute_profile(cmd: AgentProfileCommand, client: &DaemonClient) -> ExecResul
             executable,
             model,
             env,
+            thinking_capable,
         } => Ok(client.create_agent_profile(
             &name,
             &backend,
             executable.as_deref(),
             model.as_deref(),
             &env,
+            thinking_capable,
         )?),
         AgentProfileCommand::Update {
             name,
@@ -68,12 +70,14 @@ fn execute_profile(cmd: AgentProfileCommand, client: &DaemonClient) -> ExecResul
             executable,
             model,
             env,
+            thinking_capable,
         } => Ok(client.update_agent_profile(
             &name,
             &backend,
             executable.as_deref(),
             model.as_deref(),
             &env,
+            thinking_capable,
         )?),
         AgentProfileCommand::Delete { name, force } => {
             Ok(client.delete_agent_profile(&name, force)?)

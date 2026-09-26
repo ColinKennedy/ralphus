@@ -863,7 +863,7 @@
             + terminalMenuItem(key, "View Attempt History",
                 "toggleHistoryMenuItem", {},
                 "List every durably-persisted terminal-log attempt for this proof step, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-          return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key)}${historyBox(key)}`;
+          return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, null, null, null, v.thinking_capable)}${historyBox(key)}`;
         })();
         return `<div class="dhead"><span class="k">✓ proof step</span></div>
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(v.id || "—")}</span></div>
@@ -1125,7 +1125,7 @@
               + terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
-            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms, s.finished_at_ms)}${historyBox(key)}`;
+            return `<div class="btn-row" style="position:relative;gap:0">${previewBtn}${terminalMenuHtml(key, items)}</div>${peekBox(key, s.started_at_ms, s.detached_at_ms, s.finished_at_ms, s.thinking_capable)}${historyBox(key)}`;
           })()}`;
       }
       // CCTL-115: render each command line elided in a fixed-height box; a

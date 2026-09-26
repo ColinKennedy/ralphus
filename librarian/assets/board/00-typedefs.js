@@ -13,6 +13,7 @@
        * @property {string|null} [system_prompt]
        * @property {string|null} model
        * @property {string} [agent]
+       * @property {boolean} [thinking_capable] - RAL-516: whether `agent` can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string} [agent_session_id]
        * @property {number} [tokens_in]
        * @property {number} [tokens_out]
@@ -33,6 +34,7 @@
        * @property {string} [name]
        * @property {string} cwd
        * @property {string} agent
+       * @property {boolean} [thinking_capable] - RAL-516: whether `agent` can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string|null} model
        * @property {string} state
        * @property {number} [tokens_in]
@@ -300,11 +302,13 @@
        * @property {string} [manual_commands_agent]
        * @property {string} [manual_commands_model]
        * @property {string} [manual_commands_agent_session_id]
+       * @property {boolean} [manual_commands_thinking_capable] - RAL-516: whether the effective manual-checks agent can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {GuardianCheck[]} [action_hints]
        * @property {Record<string,string>} [input_values]
        * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]
        * @property {string} [resolver_model]
+       * @property {boolean} [resolver_thinking_capable] - RAL-516: whether the effective resolver agent can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string} [summary_agent]
        * @property {string} [summary_model]
        * @property {string} [summary_state]
@@ -808,6 +812,7 @@
        * @property {string|null} executable - only ever set for the "raw" backend; every other backend's command is a global AgentBackendCommandView override.
        * @property {string|null} model
        * @property {AgentEnvEntry[]} env
+       * @property {boolean|null} thinking_capable - RAL-516: this profile's own override of whether its agent can emit thinking output -- `null` inherits the backend's own default (`ralphus_core::schema::agent_supports_thinking`), `true`/`false` is an explicit override.
        * @property {number} created_at_ms
        * @property {number} updated_at_ms
        */

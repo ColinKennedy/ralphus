@@ -3588,6 +3588,10 @@ struct SaveAgentProfileBody {
     model: Option<String>,
     #[serde(default)]
     env: Vec<crate::agent_profile_env::AgentEnvEntry>,
+    /// RAL-516: `None` inherits `ralphus_core::schema::agent_supports_thinking`
+    /// for `backend`; `Some(_)` explicitly overrides it.
+    #[serde(default)]
+    thinking_capable: Option<bool>,
 }
 
 fn agent_profile_save_error(err: crate::agent_profile_store::AgentProfileSaveError) -> Reply {
@@ -3630,6 +3634,7 @@ fn save_agent_profile(daemon: &Daemon, existing_name: Option<&str>, body: &str) 
         req.executable.as_deref(),
         req.model.as_deref(),
         req.env,
+        req.thinking_capable,
     ) {
         Ok(()) => json(200, &serde_json::json!({"name": name})),
         Err(e) => agent_profile_save_error(e),
