@@ -36,6 +36,9 @@ pub enum NotifiableEventKind {
     /// still requires remediation guidance since it is a blocked state --
     /// see [`Store::notify_watchers_with_remediation`]'s broadened assert.
     SquadWaypointHalted,
+    /// RAL-400 Phase 8: a new waypoint just added a review or squad to its
+    /// roster, notifying that roster entry's own watchers.
+    WaypointCreated,
 }
 
 impl NotifiableEventKind {
@@ -49,6 +52,7 @@ impl NotifiableEventKind {
             Self::SquadFailed => "squad_failed",
             Self::ReviewFailed => "review_failed",
             Self::SquadWaypointHalted => "squad_waypoint_halted",
+            Self::WaypointCreated => "waypoint_created",
         }
     }
 }

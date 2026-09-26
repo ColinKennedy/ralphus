@@ -15,6 +15,7 @@
 //! cell:<squad_id>:<task_idx>:<cell_idx>
 //! proof:<squad_id>:<task_idx>:<proof_scope>:<cell_idx>:<proof_idx>
 //! guardian:<guardian_id>
+//! waypoint:<waypoint_id>
 //! ```
 //!
 //! `task_idx`/`cell_idx`/`proof_idx` are the same 0-based indices already
@@ -59,10 +60,14 @@ pub enum EntityUri {
     Guardian {
         guardian_id: String,
     },
+    Waypoint {
+        waypoint_id: String,
+    },
 }
 
 impl EntityUri {
-    /// The owning squad id, for every kind except [`EntityUri::Guardian`].
+    /// The owning squad id, for every kind except [`EntityUri::Guardian`]/
+    /// [`EntityUri::Waypoint`].
     #[must_use]
     pub fn squad_id(&self) -> Option<&str> {
         match self {
@@ -70,7 +75,7 @@ impl EntityUri {
             | Self::Task { squad_id, .. }
             | Self::Cell { squad_id, .. }
             | Self::Proof { squad_id, .. } => Some(squad_id),
-            Self::Guardian { .. } => None,
+            Self::Guardian { .. } | Self::Waypoint { .. } => None,
         }
     }
 
@@ -83,13 +88,24 @@ impl EntityUri {
         }
     }
 
+    /// The waypoint id, for [`EntityUri::Waypoint`] only.
+    #[must_use]
+    pub fn waypoint_id(&self) -> Option<&str> {
+        match self {
+            Self::Waypoint { waypoint_id } => Some(waypoint_id),
+            _ => None,
+        }
+    }
+
     /// Whether watching `self` should also notify about `other` — the
     /// parent-cascades-to-children rule Monitor watches rely on. An entity
     /// always covers itself; a `Squad` covers everything under its
     /// `squad_id`; a `Task` covers the `Cell`s/`Proof`s under its
     /// `(squad_id, task_idx)`; a `Cell` covers only the cell-scoped `Proof`s
-    /// under its `(squad_id, task_idx, cell_idx)`. `Proof` and `Guardian`
-    /// are leaves — they cover only themselves.
+    /// under its `(squad_id, task_idx, cell_idx)`. `Proof`, `Guardian`, and
+    /// `Waypoint` are leaves — they cover only themselves (a waypoint's
+    /// roster entries are separate top-level entities in their own right,
+    /// not children nested under the waypoint).
     #[must_use]
     pub fn covers(&self, other: &Self) -> bool {
         if self == other {
@@ -124,7 +140,7 @@ impl EntityUri {
                 } => proof_scope == "cell" && s2 == squad_id && t2 == task_idx && c2 == cell_idx,
                 _ => false,
             },
-            Self::Proof { .. } | Self::Guardian { .. } => false,
+            Self::Proof { .. } | Self::Guardian { .. } | Self::Waypoint { .. } => false,
         }
     }
 }
@@ -150,6 +166,7 @@ impl fmt::Display for EntityUri {
                 "proof:{squad_id}:{task_idx}:{proof_scope}:{cell_idx}:{proof_idx}"
             ),
             Self::Guardian { guardian_id } => write!(f, "guardian:{guardian_id}"),
+            Self::Waypoint { waypoint_id } => write!(f, "waypoint:{waypoint_id}"),
         }
     }
 }
@@ -209,6 +226,12 @@ pub fn parse(uri: &str) -> Option<EntityUri> {
                 guardian_id: guardian_id.to_string(),
             }
         }
+        "waypoint" => {
+            let waypoint_id = non_empty(parts.next()?)?;
+            EntityUri::Waypoint {
+                waypoint_id: waypoint_id.to_string(),
+            }
+        }
         _ => return None,
     };
     // Strict arity: no trailing segments left over.
@@ -250,6 +273,9 @@ mod tests {
             },
             EntityUri::Guardian {
                 guardian_id: "guardian-1".to_string(),
+            },
+            EntityUri::Waypoint {
+                waypoint_id: "waypoint-1".to_string(),
             },
         ];
         for uri in cases {
@@ -295,6 +321,12 @@ mod tests {
     }
 
     #[test]
+    fn waypoint_id_accessor_only_set_for_waypoint_kind() {
+        assert_eq!(parse("waypoint:w-1").unwrap().waypoint_id(), Some("w-1"));
+        assert_eq!(parse("squad:squad-1").unwrap().waypoint_id(), None);
+    }
+
+    #[test]
     fn rejects_unknown_kind() {
         assert_eq!(parse("bogus:squad-1"), None);
     }
@@ -331,6 +363,7 @@ mod tests {
             "cell:squad-1:0:1",
             "proof:squad-1:0:cell:1:0",
             "guardian:g-1",
+            "waypoint:w-1",
         ];
         for uri in cases {
             let parsed = parse(uri).unwrap();
@@ -372,5 +405,12 @@ mod tests {
         assert!(!proof.covers(&parse("squad:squad-1").unwrap()));
         let guardian = parse("guardian:g-1").unwrap();
         assert!(!guardian.covers(&parse("guardian:g-2").unwrap()));
+    }
+
+    #[test]
+    fn waypoint_is_a_leaf() {
+        let waypoint = parse("waypoint:w-1").unwrap();
+        assert!(!waypoint.covers(&parse("waypoint:w-2").unwrap()));
+        assert!(!waypoint.covers(&parse("squad:squad-1").unwrap()));
     }
 }

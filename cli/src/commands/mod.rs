@@ -31,6 +31,7 @@ pub mod squad;
 pub mod task;
 pub mod triage;
 pub mod user;
+pub mod waypoint;
 
 use serde_json::Value;
 
@@ -232,6 +233,7 @@ pub enum Command {
     QuickStart(quick_start::QuickStartCommand),
     Triage(triage::TriageCommand),
     User(user::UserCommand),
+    Waypoint(waypoint::WaypointCommand),
     Internal(internal::InternalCommand),
     UsageError(String),
 }
@@ -327,6 +329,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
         Some("triage") => Command::Triage(triage::parse(&scanner.remaining())),
         Some("user") => Command::User(user::parse(&scanner.remaining())),
+        Some("waypoint") => Command::Waypoint(waypoint::parse(&scanner.remaining())),
         Some("internal") => Command::Internal(internal::parse(&scanner.remaining())),
         Some(other) => Command::UsageError(format!("unknown command: {other}")),
     }
@@ -406,6 +409,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::QuickStart(c) => quick_start::dispatch(c, opts),
         Command::Triage(c) => triage::dispatch(c, opts),
         Command::User(c) => user::dispatch(c, opts),
+        Command::Waypoint(c) => waypoint::dispatch(c, opts),
         Command::Internal(c) => internal::dispatch(c, opts),
     }
 }

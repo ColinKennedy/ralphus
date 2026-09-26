@@ -1591,6 +1591,25 @@ impl Store {
         Ok(ids)
     }
 
+    /// Resolves a `ralphus:new-review/<key>` roster placeholder (RAL-400) to
+    /// the real guardian id `derive_reviews_with_full_prefetch` created for
+    /// it in this squad's submission, or `None` if no guardian recorded that
+    /// `review_key` for this squad.
+    pub(crate) fn guardian_id_for_review_key(
+        &self,
+        squad_id: &str,
+        review_key: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM guardians WHERE squad_id=? AND review_key=?",
+                params![squad_id, review_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Ids of collecting guardians this squad's cells contribute to.
     ///
     /// Prefers each cell's direct `review_guardian_id` (RAL-314: set at

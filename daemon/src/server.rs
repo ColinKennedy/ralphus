@@ -6646,6 +6646,58 @@ fn run_submit_followup(
         return;
     }
 
+    // RAL-400 Phase 8: create every `[[waypoint]]` this submission declared,
+    // now that review derivation above has run and every same-file
+    // `[[review]]` block's guardian id is known. Failing this fails the
+    // whole squad -- a declared waypoint is a coordination contract the
+    // submitter asked for, so silently dropping it would be worse than
+    // surfacing the error the same way a review-derivation failure does.
+    if !file.waypoint.is_empty() {
+        if let Err(e) = guard.create_submission_waypoints(&squad_id, &file.waypoint) {
+            let message = e.to_string();
+            let _ = guard.set_squad_error(&squad_id, Some(&message));
+            let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
+            crate::rlog!(
+                WARNING,
+                "ralphus [submit] waypoint creation for squad {squad_id} failed: {message}"
+            );
+            crate::cartographer::Note::new("submit")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(&squad_id)
+                .scope("waypoints")
+                .emit(
+                    &guard,
+                    format!("waypoint creation failed: {message}"),
+                    serde_json::json!({ "error": message }),
+                );
+            let event_uri = format!("squad:{squad_id}");
+            if let Ok(message_id) = guard.notify_watchers_with_remediation(
+                crate::monitor::NotifiableEventKind::SquadFailed,
+                &event_uri,
+                crate::mailbox::MailboxPriority::Urgent,
+                &format!("squad {squad_id} failed to materialize: {message}"),
+                &crate::mailbox::Remediation::SuggestedCommand {
+                    command: format!("ralphus squad retry {squad_id}"),
+                    purpose: "reset the squad to pending and retry materialization".to_string(),
+                },
+                Some(&squad_id),
+                None,
+                None,
+            ) {
+                crate::cartographer::Note::new("submit")
+                    .squad(&squad_id)
+                    .scope("mailbox")
+                    .emit(
+                        &guard,
+                        "mailbox message enqueued for waypoint creation failure",
+                        serde_json::json!({ "message_id": message_id, "priority": "urgent" }),
+                    );
+            }
+            return;
+        }
+    }
+    drop(guard);
+
     report_phase("Finishing up");
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
@@ -7405,6 +7457,13 @@ fn apply_entity_filter(
                 .guardian_id
                 .get_or_insert_with(|| guardian_id.to_string());
         }
+        // `CartographerFilter` has no per-waypoint-id column to narrow by --
+        // a waypoint's own event history is queried through its dedicated
+        // `GET /api/waypoints/{id}/deliveries` endpoint
+        // (`crate::waypoints::Store::waypoint_deliveries`) instead, which
+        // scans `source="waypoints"` rows directly rather than going through
+        // this generic filter.
+        EntityUri::Waypoint { .. } => {}
     }
     Ok(())
 }
@@ -14917,12 +14976,68 @@ fn waypoint_create(daemon: &Daemon, body: &str) -> Reply {
     ) {
         return store_error(&e);
     }
-    for (kind, entry_id, mode) in parsed_roster {
-        if let Err(e) = store.add_roster_entry(&id, kind, &entry_id, mode) {
+    for (kind, entry_id, mode) in &parsed_roster {
+        if let Err(e) = store.add_roster_entry(&id, *kind, entry_id, *mode) {
             return store_error(&e);
         }
     }
+    notify_roster_of_new_waypoint(&store, &id, &req.prompt, &parsed_roster);
     json(201, &IdResponse { id })
+}
+
+/// RAL-400 Phase 8: once a waypoint's roster is in place, tell each roster
+/// entry's own watchers it now has a waypoint to account for -- mirrors
+/// [`enqueue_waypoint_halt_mailbox`]'s one-notification-per-entity shape
+/// (scheduler.rs), except this is an ordinary status change, not a
+/// failure/blocked state, so it goes through
+/// `notify_watchers_with_context` at [`MailboxPriority::Normal`] rather than
+/// `notify_watchers_with_remediation`.
+fn notify_roster_of_new_waypoint(
+    store: &Store,
+    waypoint_id: &str,
+    prompt: &str,
+    roster: &[(
+        crate::waypoints::RosterEntryKind,
+        String,
+        crate::waypoints::RosterMode,
+    )],
+) {
+    let impacted = roster
+        .iter()
+        .map(|(kind, entry_id, mode)| format!("{} {entry_id} ({})", kind.as_str(), mode.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (kind, entry_id, _mode) in roster {
+        let entity_uri = match kind {
+            crate::waypoints::RosterEntryKind::Squad => format!("squad:{entry_id}"),
+            crate::waypoints::RosterEntryKind::Review => format!("guardian:{entry_id}"),
+        };
+        let text = format!(
+            "waypoint '{waypoint_id}' added this to its roster: {prompt:?}. roster: [{impacted}]"
+        );
+        if let Ok(message_id) = store.notify_watchers_with_context(
+            crate::monitor::NotifiableEventKind::WaypointCreated,
+            &entity_uri,
+            crate::mailbox::MailboxPriority::Normal,
+            &text,
+            None,
+            None,
+            None,
+        ) {
+            crate::cartographer::Note::new("server")
+                .level(crate::logging::LogLevel::INFO)
+                .scope("waypoint")
+                .emit(
+                    store,
+                    "mailbox message enqueued for new waypoint roster entry",
+                    serde_json::json!({
+                        "message_id": message_id,
+                        "waypoint_id": waypoint_id,
+                        "entity_uri": entity_uri,
+                    }),
+                );
+        }
+    }
 }
 
 /// `GET /api/waypoints` -- list waypoints, optionally filtered by `project`
@@ -30704,6 +30819,45 @@ remediation_attempts=1
         assert_eq!(v["roster"][0]["kind"], "review");
         assert_eq!(v["roster"][0]["entry_id"], "guardian-fake");
         assert_eq!(v["delivery_summary"]["undelivered"], 1);
+    }
+
+    #[test]
+    fn waypoint_create_notifies_watchers_of_each_roster_entry() {
+        let d = daemon();
+        let squad_id = submit_squad(&d);
+        d.lock()
+            .create_watch(
+                "colin",
+                &format!("squad:{squad_id}"),
+                &[crate::mailbox::MailboxPriority::Normal],
+            )
+            .unwrap();
+
+        let body = create_waypoint_body(
+            "coordinate on the squad",
+            serde_json::json!([{"kind": "squad", "entry_id": squad_id}]),
+        );
+        let r = route(&d, "POST", "/api/waypoints", &body);
+        assert_eq!(r.status, 201, "{}", r.body);
+        let waypoint_id = serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let messages = d
+            .lock()
+            .personal_mailbox_messages_for_user("colin", false, None)
+            .unwrap();
+        let msg = messages
+            .iter()
+            .find(|m| m.event_kind.as_deref() == Some("waypoint_created"))
+            .unwrap_or_else(|| panic!("no waypoint_created message among {messages:?}"));
+        assert_eq!(
+            msg.entity_uri.as_deref(),
+            Some(format!("squad:{squad_id}").as_str())
+        );
+        assert!(msg.message.contains(&waypoint_id), "{}", msg.message);
+        assert!(msg.message.contains("squad"), "{}", msg.message);
     }
 
     #[test]
