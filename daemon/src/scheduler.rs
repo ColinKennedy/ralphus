@@ -5345,6 +5345,78 @@ mod tests {
         assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
     }
 
+    /// RAL-517: reports a recognized "retry invited, no delay stated"
+    /// provider error (the pi backend's new unknown-delay tier) carrying the
+    /// verbatim InferenceNet wording from the ticket, on every call.
+    struct AlwaysUnknownDelayRateLimitedRunner {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Runner for AlwaysUnknownDelayRateLimitedRunner {
+        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            RunnerResult::rate_limited(
+                0,
+                "Upstream error from InferenceNet: Inference request failed, please try again. \
+                 You will not be charged for this request. (generation ID = gv2_abc123)"
+                    .to_string(),
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                Some(0),
+                0.01,
+                Some("sess-rl-unknown-delay".to_string()),
+            )
+        }
+    }
+
+    /// RAL-517 AC8: the pi backend's new "retryable but no stated delay"
+    /// classification tier rides the exact same `RunnerResult::rate_limited`/
+    /// `is_rate_limited` path as every other rate-limit shape, so it is bound
+    /// by the same `provider_timeout_max_retries` thrash budget (default 3)
+    /// as [`three_rate_limit_retries_within_the_thrash_window_fail_the_cell`]
+    /// -- it must not retry forever just because this shape of error is new.
+    ///
+    /// Note on "original upstream error text intact": the daemon's exhaustion
+    /// path here is pre-existing RAL-435 machinery, unchanged by this ticket
+    /// (reworking it is explicitly out of scope) -- it replaces `error` with
+    /// a synthesized thrash message exactly as it already does for every
+    /// other rate-limited shape (see the sibling test above), while
+    /// `summary` carries forward the last attempt's summary. This tier's
+    /// `BackendOutcome::summary` is the trailing assistant message, same
+    /// convention the RAL-497 tier already uses one branch above it in
+    /// `pi_backend.rs` -- not a literal copy of the provider's error text --
+    /// so this ticket does not change, and is not held to a stricter
+    /// standard than, that existing fidelity level.
+    #[test]
+    fn three_unknown_delay_retries_within_the_thrash_window_fail_the_cell() {
+        let (store, id) = store_with(ONE_CELL);
+        let runner = AlwaysUnknownDelayRateLimitedRunner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        execute_squad(&store, &runner, &id);
+
+        assert_eq!(
+            runner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must stop retrying after the 3rd unknown-delay retry rather than retrying forever"
+        );
+
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        assert_eq!(squad.tasks[0].cells[0].state, "failed");
+        let error = squad.tasks[0].cells[0].error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("rate-limit retry thrashing"),
+            "expected a thrash-shaped error, got: {error}"
+        );
+        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Failed);
+    }
+
     /// RAL-504: the same thrash episode as
     /// [`three_rate_limit_retries_within_the_thrash_window_fail_the_cell`]
     /// must enqueue exactly one High-priority mailbox message (not one per

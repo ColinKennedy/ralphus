@@ -1848,6 +1848,10 @@ fn synthesize_proof_instructions(
           no push, no abort, no \"do not stage\", no task-failure side-effects\n\
         Output ONLY the instruction paragraph. No headers, labels, or commentary.";
 
+    // RAL-517: resolve before `cwd: git_root` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(std::path::Path::new(&git_root))
+            .retry_after_unknown_default_seconds();
     let mut spec = RunnerSpec {
         // RAL-102: squad_id/cell_id together key the tmux session name
         // (see `crate::tmux::session_name`) — must be unique per guardian so
@@ -1893,6 +1897,7 @@ fn synthesize_proof_instructions(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
     let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
@@ -2340,6 +2345,11 @@ fn resolve_conflicts_with_agent(
         // agent resumes its own conversation instead of starting cold. Count
         // only a completed agent pass below: a runner/backend invocation that
         // cannot produce a result is not an attempt to resolve conflicts.
+        let resolver_cwd = wt.root().to_string_lossy().into_owned();
+        // RAL-517: resolve before `cwd: resolver_cwd` moves the string below.
+        let retry_after_unknown_default_seconds =
+            crate::config::resolve(std::path::Path::new(&resolver_cwd))
+                .retry_after_unknown_default_seconds();
         let mut spec = RunnerSpec {
             // RAL-102: unique per (guardian, branch) so the tmux session this
             // resolves through (see `crate::tmux::session_name`) never
@@ -2352,7 +2362,7 @@ fn resolve_conflicts_with_agent(
             squad_id: format!("guardian-{id}"),
             task: RESOLVER_TASK.to_string(),
             cell_id: format!("resolver-{branch_id}"),
-            cwd: wt.root().to_string_lossy().into_owned(),
+            cwd: resolver_cwd,
             prompt: Some(prompt),
             command: None,
             agent: agent.clone(),
@@ -2391,6 +2401,7 @@ fn resolve_conflicts_with_agent(
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds,
             maximum_timeout: None,
         };
 
@@ -2767,6 +2778,11 @@ fn run_final_proof(
          quality bar, so do not assume what state the code is in; inspect it yourself.{quality_note}"
     );
     let system_prompt = FINAL_PROOF_SYSTEM_PROMPT;
+    let proof_cwd = wt.root().to_string_lossy().into_owned();
+    // RAL-517: resolve before `cwd: proof_cwd` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(std::path::Path::new(&proof_cwd))
+            .retry_after_unknown_default_seconds();
     let mut spec = RunnerSpec {
         // RAL-192: keyed on the branch's stable id (not its mutable stack
         // position -- see `crate::tmux::session_name`'s doc comment) so a
@@ -2777,7 +2793,7 @@ fn run_final_proof(
         squad_id: format!("guardian-{id}"),
         task: RESOLVER_PROOF_TASK.to_string(),
         cell_id: format!("resolver-proof-{branch_id}"),
-        cwd: wt.root().to_string_lossy().into_owned(),
+        cwd: proof_cwd,
         prompt: Some(prompt),
         command: None,
         agent: agent.to_string(),
@@ -2811,6 +2827,7 @@ fn run_final_proof(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
@@ -6022,6 +6039,8 @@ fn run_commit_step(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(wt_str))
+            .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
     };
     let result =
@@ -6382,6 +6401,8 @@ pub fn run_feedback(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds: crate::config::resolve(std::path::Path::new(&wt_str))
+            .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
     };
     // Stash any pre-existing dirty state so we only include the resolver's
@@ -8511,6 +8532,9 @@ fn run_review_auto_build(
             return Some(format!("auto-build agent unresolvable: {message}"));
         }
     };
+    // RAL-517: resolve before `cwd,` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(Path::new(&cwd)).retry_after_unknown_default_seconds();
     let mut spec = RunnerSpec {
         squad_id: format!("guardian-{id}"),
         task: AUTO_BUILD_TASK.to_string(),
@@ -8545,6 +8569,7 @@ fn run_review_auto_build(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
     let result = run_agent_with_rate_limit_retry(&mut spec, runner, cancel, None);
@@ -10895,6 +10920,8 @@ fn generate_final_summary(
              details.\n\n{context}"
         )
     };
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(ws_root.root()).retry_after_unknown_default_seconds();
     let spec = RunnerSpec {
         // RAL-102: unique per guardian — a bare "guardian" squad_id collides
         // with every other guardian's tmux session name (observed in CI as
@@ -10932,6 +10959,7 @@ fn generate_final_summary(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
     let result = runner.run(&spec);
@@ -11241,6 +11269,9 @@ fn generate_manual_commands(
         }
     };
     let (agent, model) = (resolved.backend.clone(), resolved.model.clone());
+    // RAL-517: resolve before `cwd,` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(Path::new(&cwd)).retry_after_unknown_default_seconds();
 
     let mut spec = RunnerSpec {
         // RAL-102/RAL-88 follow-up: unique per guardian (see the comment on
@@ -11276,6 +11307,7 @@ fn generate_manual_commands(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
 
@@ -11458,6 +11490,9 @@ pub(crate) fn resolve_check_input(
             return;
         }
     };
+    // RAL-517: resolve before `cwd,` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(Path::new(&cwd)).retry_after_unknown_default_seconds();
 
     let spec = RunnerSpec {
         // Unique per (guardian, input) so concurrent resolutions for
@@ -11493,6 +11528,7 @@ pub(crate) fn resolve_check_input(
         allow_personal_settings: false,
         allow_personal_memory: false,
         retry_attempt: 0,
+        retry_after_unknown_default_seconds,
         maximum_timeout: None,
     };
 

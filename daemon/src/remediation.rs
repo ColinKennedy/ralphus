@@ -270,6 +270,8 @@ mod tests {
             allow_personal_settings: false,
             allow_personal_memory: false,
             retry_attempt: 0,
+            retry_after_unknown_default_seconds:
+                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
         }
     }
