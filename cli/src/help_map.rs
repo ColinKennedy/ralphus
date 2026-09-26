@@ -1161,6 +1161,150 @@ token value itself.",
     ),
 ];
 
+const WAYPOINT_ROSTER_CHILDREN: &[HelpNode] = &[
+    node(
+        "add",
+        &["waypoint_id [str]", "kind [review|squad]", "entry_id [str]"],
+        &["--mode [block|advisory]"],
+        "Add (or upsert the mode of) one roster entry on a waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["waypoint_id [str]", "entry_id [str]"],
+        &[],
+        "Remove one roster entry from a waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "mode",
+        &[
+            "waypoint_id [str]",
+            "entry_id [str]",
+            "mode [block|advisory]",
+        ],
+        &[],
+        "Override the block/advisory mode of one existing roster entry.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const WAYPOINT_BEARING_CHILDREN: &[HelpNode] = &[node(
+    "add",
+    &[
+        "waypoint_id [str]",
+        "producer_kind [review|squad]",
+        "producer_id [str]",
+    ],
+    &[
+        "--summary [text]",
+        "--entity-uri [uri]",
+        "--commit-id [str]",
+        "--commit-summary [text]",
+    ],
+    "Append a completed-work bearing to a waypoint's durable delivery feed.",
+    false,
+    false,
+    &[],
+)];
+
+const WAYPOINT_CHILDREN: &[HelpNode] = &[
+    node(
+        "create",
+        &[],
+        &[
+            "--prompt [text]",
+            "--label [text]",
+            "--agent [name]",
+            "--model [name]",
+            "--allow-advisory",
+            "--roster [kind:entry_id[:mode]...]",
+        ],
+        "Create a cross-squad waypoint coordinating the given roster of reviews/squads (RAL-400).",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "list",
+        &[],
+        &["--project [name]", "--state [open|closed]"],
+        "List waypoints.",
+        false,
+        true, // ("waypoint", "list")
+        &[],
+    ),
+    node(
+        "get",
+        &["waypoint_id [str]"],
+        &[],
+        "Show one waypoint's settings, roster, tracked projects, and delivery summary.",
+        false,
+        true, // ("waypoint", "get")
+        &[],
+    ),
+    node(
+        "close",
+        &["waypoint_id [str]"],
+        &[],
+        "Manually close an open waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "reopen",
+        &["waypoint_id [str]"],
+        &[],
+        "Reopen a closed waypoint.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "roster",
+        &[],
+        &[],
+        "Add/remove/change the mode of a waypoint's roster entries.",
+        false,
+        false,
+        WAYPOINT_ROSTER_CHILDREN,
+    ),
+    node(
+        "bearing",
+        &[],
+        &[],
+        "Append a completed-work bearing to a waypoint's delivery feed.",
+        false,
+        false,
+        WAYPOINT_BEARING_CHILDREN,
+    ),
+    node(
+        "bearings",
+        &["waypoint_id [str]"],
+        &[],
+        "List a waypoint's bearing feed.",
+        false,
+        true, // ("waypoint", "bearings")
+        &[],
+    ),
+    node(
+        "deliveries",
+        &["waypoint_id [str]"],
+        &[],
+        "Show a waypoint's delivery/event history.",
+        false,
+        true, // ("waypoint", "deliveries")
+        &[],
+    ),
+];
+
 // RAL-338 follow-up: machine-invoked interfaces with no interactive/task-file
 // use -- see `crate::commands::internal::InternalCommand`.
 const INTERNAL_CHILDREN: &[HelpNode] = &[node(
@@ -2192,6 +2336,15 @@ classification categories (RAL-318).",
             false,
             INTERNAL_CHILDREN,
         ),
+        node(
+            "waypoint",
+            &[],
+            &[],
+            "Coordinate cross-squad work: create waypoints, manage rosters, and track bearings/deliveries (RAL-400).",
+            false,
+            false,
+            WAYPOINT_CHILDREN,
+        ),
         // ralphus[ignore-endpoint-cli]: prints the built-in tutorial text bundled in the CLI binary
         node(
             "tutor",
@@ -2385,7 +2538,9 @@ fn display_chip(chip: &str) -> String {
         "selector" | "entity_uri" | "--entity" | "--for" | "cell" | "to_review" => {
             chip.replacen("[str", "[uri", 1)
         }
-        "squad_id" | "pr_id" | "--squad" | "--guardian" => chip.replacen("[str", "[id", 1),
+        "squad_id" | "pr_id" | "--squad" | "--guardian" | "waypoint_id" | "entry_id" => {
+            chip.replacen("[str", "[id", 1)
+        }
         _ => chip.to_string(),
     }
 }

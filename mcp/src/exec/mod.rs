@@ -28,6 +28,7 @@ mod squad;
 mod task;
 mod triage;
 mod user;
+mod waypoint;
 
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::{Command, CommandError, misc};
@@ -109,6 +110,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::QuickStart(_) => Err(usage("quick-start is excluded from the MCP tool surface")),
         Command::Triage(c) => triage::execute(c, client),
         Command::User(c) => user::execute(c, client),
+        Command::Waypoint(c) => waypoint::execute(c, client),
         Command::Internal(_) => Err(usage("internal is excluded from the MCP tool surface")),
         Command::UsageError(m) => Err(usage(m)),
     }

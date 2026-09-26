@@ -38,6 +38,9 @@ pub enum EntityUri {
     Guardian {
         guardian_id: String,
     },
+    Waypoint {
+        waypoint_id: String,
+    },
 }
 
 impl EntityUri {
@@ -48,7 +51,7 @@ impl EntityUri {
             | Self::Task { squad_id, .. }
             | Self::Cell { squad_id, .. }
             | Self::Proof { squad_id, .. } => Some(squad_id),
-            Self::Guardian { .. } => None,
+            Self::Guardian { .. } | Self::Waypoint { .. } => None,
         }
     }
 
@@ -56,6 +59,14 @@ impl EntityUri {
     pub fn guardian_id(&self) -> Option<&str> {
         match self {
             Self::Guardian { guardian_id } => Some(guardian_id),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn waypoint_id(&self) -> Option<&str> {
+        match self {
+            Self::Waypoint { waypoint_id } => Some(waypoint_id),
             _ => None,
         }
     }
@@ -82,6 +93,7 @@ impl fmt::Display for EntityUri {
                 "proof:{squad_id}:{task_idx}:{proof_scope}:{cell_idx}:{proof_idx}"
             ),
             Self::Guardian { guardian_id } => write!(f, "guardian:{guardian_id}"),
+            Self::Waypoint { waypoint_id } => write!(f, "waypoint:{waypoint_id}"),
         }
     }
 }
@@ -123,6 +135,9 @@ pub fn parse(uri: &str) -> Option<EntityUri> {
         }
         "guardian" => EntityUri::Guardian {
             guardian_id: non_empty(parts.next()?)?.to_string(),
+        },
+        "waypoint" => EntityUri::Waypoint {
+            waypoint_id: non_empty(parts.next()?)?.to_string(),
         },
         _ => return None,
     };
@@ -202,6 +217,9 @@ mod tests {
             },
             EntityUri::Guardian {
                 guardian_id: "guardian-1".to_string(),
+            },
+            EntityUri::Waypoint {
+                waypoint_id: "waypoint-1".to_string(),
             },
         ];
         for uri in cases {
