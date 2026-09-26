@@ -330,6 +330,43 @@ jobs:
         env:
           RALPHUS_BOARD_TIMING: "1"
         run: cargo nextest run -p ralphus-daemon --test board_cold_load_perf --run-ignored only --test-threads 1
+      # WS-B.4: board reads stay fast while four writers hammer the daemon,
+      # over real HTTP against a real `serve_with`. Also gated here (and not
+      # in the `rust` job) because its budgets are wall-clock -- see the
+      # module doc comment in daemon/tests/board_contention.rs.
+      #
+      # --retries 2: this drives real HTTP through the daemon's single
+      # accept-loop thread from 8 concurrent client threads with no
+      # backoff, so which connection that one thread services next is a
+      # matter of OS scheduling, not application logic. On a noisy shared
+      # runner that can, by chance, starve one endpoint's reader for the
+      # whole measurement window even though every endpoint here is on the
+      # pooled read path and never waits on the writer lock -- confirmed by
+      # this exact test passing reliably, repeatedly, locally. Mirrors the
+      # rerun mitigation `cli-py/tests/test_board_cold_load_perf.py` already
+      # uses for the same class of shared-runner flake (see the Python
+      # board cold-load perf step below); a genuine regression still fails
+      # every attempt.
+      - name: Rust store contention budget
+        run: cargo nextest run -p ralphus-daemon --test board_contention --run-ignored only --test-threads 1 --retries 2
+      # WS-B.5: the writer's sustained commit rate, batched and unbatched.
+      - name: Rust store write-throughput floor
+        run: cargo nextest run -p ralphus-daemon --test store_write_throughput --run-ignored only --test-threads 1
+      # WS-B.6: the captured production event mix replayed at its recorded
+      # rates -- see daemon/tests/workload_replay.rs's module doc comment for
+      # where the mix came from. RALPHUS_REPLAY_SECONDS lengthens the window.
+      - name: Rust recorded-workload replay
+        run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+      # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
+      # runs in the default suite too -- but repeated here so a regression is
+      # attributed to the perf job rather than looking like an unrelated flake.
+      - name: Rust submit lock-hold budget
+        run: cargo nextest run -p ralphus-daemon --test submit_lock_hold --test-threads 1
+      # WS-E.4: how much of the read path is off the writer lock. A source
+      # scan, so it is fast and deterministic -- see the module doc comment in
+      # daemon/tests/read_path_ratchet.rs for why latency cannot see this.
+      - name: Rust read-path ratchet
+        run: cargo nextest run -p ralphus-daemon --test read_path_ratchet
       - name: Build ralphus-librarian (needed by the browser-side perf test)
         run: cargo build -p ralphus-librarian
       - uses: actions/setup-python@v5

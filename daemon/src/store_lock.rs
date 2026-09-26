@@ -109,14 +109,219 @@ impl StoreMutex {
                 acquired_at_ms: now,
             });
         }
-        guard
+        StoreGuard::new(guard, loc)
+    }
+
+    /// Try to acquire the store lock, giving up after `timeout`.
+    ///
+    /// WS-G.2: this is how the watchdog asks "is the store reachable?" without
+    /// becoming the next thread stuck behind whatever is holding it. A plain
+    /// `lock()` in a liveness checker would itself park forever on exactly the
+    /// deadlock it exists to report.
+    ///
+    /// Deliberately does not record a wait sample: the watchdog polls on a
+    /// timer rather than because it has work to do, so folding its waits into
+    /// the histogram would report contention that no request experienced.
+    #[track_caller]
+    pub fn try_lock_for(&self, timeout: Duration) -> Option<StoreGuard<'_>> {
+        let guard = self.0.try_lock_for(timeout)?;
+        Some(StoreGuard::new(guard, Location::caller()))
+    }
+
+    /// The store's non-database state (WS-E.1), reached **without** acquiring
+    /// the store lock.
+    ///
+    /// `StoreMemory` has its own small locks, so nothing here needs the global
+    /// one -- worktree leases, tmux liveness, stall debounce and the secret-name
+    /// cache are not database state and never were. Several of the callers are
+    /// hot (`note_live_activity` fires on every observed pane growth for every
+    /// running cell, `check_stall_escalation` on every stall poll), and making
+    /// them queue behind the scheduler and the guardian-merge workers was pure
+    /// cost.
+    ///
+    /// Briefly takes `self.0` to clone the `Arc` out, so it is not literally
+    /// lock-free at the instant of the call; the name is about what the
+    /// *returned* handle costs to use. Hold the result rather than calling this
+    /// repeatedly in a loop.
+    #[must_use]
+    pub fn lock_free_memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
+        self.0.lock().memory()
     }
 }
 
-/// A held store lock. `parking_lot::MutexGuard` derefs to `&Store`/`&mut
-/// Store` exactly like `std::sync::MutexGuard` did, just without the
-/// `Result` wrapper `std::sync::Mutex::lock()` returned.
-pub type StoreGuard<'a> = parking_lot::MutexGuard<'a, Store>;
+/// Who holds (or last acquired) the store lock, and for how long: a
+/// `("file:line", held_ms)` pair, or `None` if the lock has never been taken.
+///
+/// Read through the [`HOLDER`] breadcrumb's own tiny mutex, never through the
+/// store lock, so this stays answerable precisely when the store lock is not
+/// -- which is the only time anyone asks. This is the single most useful fact
+/// about a wedged daemon, and the reason the captured deadlock took static
+/// analysis to diagnose is that nothing surfaced it at the time.
+#[must_use]
+pub fn store_lock_holder() -> Option<(String, i64)> {
+    let holder = HOLDER.lock();
+    holder.map(|info| {
+        (
+            format!("{}:{}", info.file, info.line),
+            crate::store::now_ms().saturating_sub(info.acquired_at_ms),
+        )
+    })
+}
+
+/// A held store lock, instrumented by the WS-B.3 guard watchdog: on drop,
+/// how long the guard was held is checked against the watchdog threshold --
+/// a hold that long means blocking work ran under the daemon's one global
+/// lock (an I/O call reached through layers of delegation is exactly what a
+/// source-level lint cannot see). Over the threshold this panics in dev/test
+/// builds and logs a WARNING plus a Cartographer row in release.
+/// Derefs to `&Store`/`&mut Store` exactly like the raw `MutexGuard` it wraps.
+pub struct StoreGuard<'a> {
+    inner: parking_lot::MutexGuard<'a, Store>,
+    acquired_at: Instant,
+    site: &'static Location<'static>,
+}
+
+impl<'a> StoreGuard<'a> {
+    fn new(inner: parking_lot::MutexGuard<'a, Store>, site: &'static Location<'static>) -> Self {
+        Self {
+            inner,
+            acquired_at: Instant::now(),
+            site,
+        }
+    }
+}
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for StoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.inner
+    }
+}
+
+/// Guard holds at or above this many milliseconds are watchdog-worthy
+/// (log + Cartographer row, and a panic in dev/test builds).
+const GUARD_HOLD_WARN_MS: u128 = 100;
+
+/// Panic threshold for the guard watchdog, in milliseconds; `0` disables
+/// panicking (release builds log instead). Overridable via
+/// `RALPHUS_GUARD_HOLD_PANIC_MS` (set it very large to disable panicking).
+///
+/// The thresholds are deliberately far above [`GUARD_HOLD_WARN_MS`], which is
+/// where *reporting* starts. Two reasons.
+///
+/// A debug build is several times slower than a release one at the same work,
+/// so a 100 ms hold in a debug build is not evidence of the thing this watchdog
+/// exists to catch. What it is evidence of is a query being slow, which the
+/// warning already reports and which the aggregate gates in
+/// `daemon/tests/board_contention.rs` and `workload_replay.rs` measure properly
+/// (store-lock wait p95 under 50 ms, over a real workload).
+///
+/// And `cfg!(test)` is true only for this crate's own unit tests. An
+/// *integration* test binary links the library compiled normally, so it takes
+/// the non-test branch -- which is how a 100 ms default came to fail
+/// `daemon/tests/guardian_merge.rs` wholesale on a single 133 ms
+/// `get_guardian`, in a debug build, against real git fixtures. Worse, the same
+/// branch applies to `scripts/build-debug.sh`'s daemon: a developer's daemon
+/// would panic on any 101 ms hold.
+///
+/// What is being caught is blocking I/O under the lock -- a subprocess, a
+/// network round-trip, a sleep -- and those are seconds, not milliseconds. The
+/// thresholds below are sized to that, so the panic means what it says.
+fn guard_hold_panic_ms() -> u128 {
+    let default = if cfg!(test) {
+        5_000
+    } else if cfg!(debug_assertions) {
+        2_000
+    } else {
+        0
+    };
+    std::env::var("RALPHUS_GUARD_HOLD_PANIC_MS")
+        .ok()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(default)
+}
+
+/// Longest guard hold, in ms, over the process lifetime.
+static GUARD_HOLD_MAX_MS: AtomicU64 = AtomicU64::new(0);
+/// Holds that reached [`GUARD_HOLD_WARN_MS`], over the process lifetime.
+static GUARD_HOLD_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Guard-hold statistics, reported by `GET /api/daemon`.
+///
+/// The plan's M5 target is a maximum hold under 100 ms. Before this the only
+/// record of a long hold was a log line and a Cartographer row, which makes the
+/// target something you grep for rather than something a test can assert. These
+/// counters make it a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GuardHoldSnapshot {
+    /// Longest hold observed, in ms.
+    pub max_ms: u64,
+    /// How many holds reached `warn_threshold_ms`.
+    pub over_threshold: u64,
+    /// The threshold the count is against.
+    pub warn_threshold_ms: u64,
+}
+
+/// Snapshot of the process-lifetime guard-hold counters.
+#[must_use]
+pub fn guard_hold_snapshot() -> GuardHoldSnapshot {
+    GuardHoldSnapshot {
+        max_ms: GUARD_HOLD_MAX_MS.load(Ordering::Relaxed),
+        over_threshold: GUARD_HOLD_WARN_COUNT.load(Ordering::Relaxed),
+        warn_threshold_ms: GUARD_HOLD_WARN_MS as u64,
+    }
+}
+
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        let held_ms = self.acquired_at.elapsed().as_millis();
+        // Recorded for every hold, not just the long ones: the maximum is only
+        // meaningful if nothing is excluded from it.
+        GUARD_HOLD_MAX_MS.fetch_max(
+            u64::try_from(held_ms).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if held_ms < GUARD_HOLD_WARN_MS {
+            return;
+        }
+        GUARD_HOLD_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+        let detail = format!(
+            "store guard held for {held_ms}ms (acquired at {}:{})",
+            self.site.file(),
+            self.site.line()
+        );
+        let panic_ms = guard_hold_panic_ms();
+        if panic_ms > 0 && held_ms >= panic_ms {
+            panic!(
+                "{detail} -- the daemon's one global store lock must never be \
+                 held this long; something under the guard is blocking (I/O, a \
+                 subprocess, or a sleep). Drop the guard before the blocking \
+                 work, or justify it with an `allow-lock-io:` comment for the \
+                 source lint in daemon/tests/store_lock_reentrancy.rs"
+            );
+        }
+        crate::rlog!(
+            WARNING,
+            "ralphus [store_lock] {detail} -- blocking work ran under the store lock"
+        );
+        crate::cartographer::Note::new("store_lock")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &self.inner,
+                "long store guard hold",
+                serde_json::json!({
+                    "held_ms": held_ms as u64,
+                    "acquired_at": format!("{}:{}", self.site.file(), self.site.line()),
+                }),
+            );
+    }
+}
 
 /// The daemon's one shared handle to its `Store`, cloned into every
 /// background worker and the HTTP layer alike.

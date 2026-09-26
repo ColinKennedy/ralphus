@@ -2483,8 +2483,12 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let mut guard = store.lock();
-        guard.note_live_activity(session_name, crate::store::now_ms());
+        // WS-E.1: liveness lives in `StoreMemory`, not behind the store lock.
+        // This runs on every observed pane growth for every running cell, so
+        // not taking the global lock here matters.
+        store
+            .lock_free_memory()
+            .note_live_activity(session_name, crate::store::now_ms());
     }
 
     /// Drop the RAL-170 liveness entry for `session_name` once
@@ -2498,9 +2502,10 @@ impl SubprocessRunner {
         let Some(store) = &self.cartographer else {
             return;
         };
-        let mut guard = store.lock();
-        guard.clear_live_activity(session_name);
-        guard.clear_stall_escalated(session_name);
+        // WS-E.1: both are `StoreMemory` state; no store lock needed.
+        let memory = store.lock_free_memory();
+        memory.clear_live_activity(session_name);
+        memory.clear_stall_escalated(session_name);
     }
 
     /// RAL-308: check the hard, cumulative `maximum_timeout_seconds` caps
@@ -2598,20 +2603,26 @@ impl SubprocessRunner {
             return;
         };
         let threshold_ms = threshold.as_millis() as i64;
-        let mut guard = store.lock();
+        // WS-E.1: both checks read `StoreMemory`, so the overwhelmingly common
+        // outcome -- not stalled, or already escalated -- now returns without
+        // touching the store lock at all. This is called on every stall poll for
+        // every running cell.
+        let memory = store.lock_free_memory();
         // `None` (no pane growth observed yet this attempt) falls back to
         // when this attempt started, not epoch 0 -- otherwise a cell that
         // simply hasn't produced its first line of output yet would appear
         // to have been stalled since 1970 and escalate immediately.
-        let last_activity_ms = guard
+        let last_activity_ms = memory
             .live_activity_ms(session_name)
             .unwrap_or(attempt_started_ms);
         if crate::store::now_ms().saturating_sub(last_activity_ms) < threshold_ms {
             return;
         }
-        if guard.is_stall_escalated(session_name, last_activity_ms) {
+        if memory.is_stall_escalated(session_name, last_activity_ms) {
             return;
         }
+        // Actually escalating needs the store: a mailbox row and a note.
+        let guard = store.lock();
         let text = format!(
             "cell '{}' in task '{}' (squad {}) has been stalled for over {}s with no activity",
             spec.cell_id,

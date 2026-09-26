@@ -401,6 +401,7 @@
           if (filters.status.size !== SQUAD_STATES.length) p.set("status", [...filters.status].join(","));
           if (filters.showHidden) p.set("hidden", "1");
           if (filters.projects.size) p.set("project", [...filters.projects].join(","));
+          if (squadAgentDefaulted) p.set("agent", [...filters.agents].join(","));
           const squad = selectedSquadId ? findSquad(selectedSquadId) : null;
           if (squad) {
             url = hashWithSel("#/squads", p.toString(), squadSelectionUri(squad, sel));
@@ -516,6 +517,9 @@
         const pstatus = p.get("status"); if (pstatus !== null) filters.status = new Set(pstatus.split(",").filter(Boolean));
         filters.showHidden = p.get("hidden") === "1";
         const pproject = p.get("project"); if (pproject !== null) filters.projects = new Set(pproject.split(",").filter(Boolean));
+        const pagent = p.get("agent");
+        squadAgentDefaulted = pagent !== null;
+        if (pagent !== null) filters.agents = new Set(pagent.split(",").filter(Boolean));
         // A URI carries its own squad reference (`?id=`, else the SQUAD[...] label);
         // the legacy form kept it in the path. Both land in `squadId`/`uri` and are
         // decoded against the loaded squad in `pollTasks`.
@@ -607,6 +611,95 @@
        * @returns {void}
        */
       function onFilter(v) { filters.q = v.toLowerCase(); renderSquads(); syncHash(); }
+      // RALPHUS-SQUAD-AGENT-FILTER:BEGIN
+      // RAL-486 follow-up: the Squads sidebar's Agent dropdown -- the same
+      // shared multi-select Status dropdown (RAL-475) the Tasks toolbar and
+      // the Reviews sidebar use, over the resolved agent(s) currently in use
+      // across the loaded squads. A squad's agents are the union of its
+      // tasks' own resolved agents (`ttTaskAgents`), read off the task tree
+      // the squad row already carries; unlike `projects`, the daemon does not
+      // precompute a squad-level agent union onto the wire. Auto-synced to
+      // every agent currently in use until the user or URL picks an explicit
+      // selection (`squadAgentDefaulted`), exactly as the Tasks and Reviews
+      // filters behave.
+      /**
+       * The distinct resolved agent values a squad's tasks use, sorted.
+       * @param {SquadView} squad
+       * @returns {string[]}
+       */
+      function squadAgents(squad) {
+        return [...new Set((squad.tasks || []).flatMap((t) => ttTaskAgents(t)))].sort();
+      }
+      /**
+       * The distinct resolved agent values present across every
+       * currently-loaded squad, sorted -- the Agent dropdown's option list.
+       * @returns {string[]}
+       */
+      function squadAgentOptions() {
+        return [...new Set(squads.flatMap((r) => squadAgents(r)))].sort();
+      }
+      /**
+       * Until the user (or the URL) has picked an explicit agent selection,
+       * keeps `filters.agents` synced to every agent currently in use -- so a
+       * newly-seen agent is filtered-in by default instead of silently hidden.
+       * Called from both `renderSquadAgentFilter` and `visibleSquads`, since
+       * the latter can run first (e.g. picking the default selected squad on
+       * initial load), mirroring `syncReviewResolverDefault`.
+       * @returns {void}
+       */
+      function syncSquadAgentDefault() {
+        if (!squadAgentDefaulted) filters.agents = new Set(squadAgentOptions());
+      }
+      /**
+       * Builds the Squads sidebar's Agent dropdown config.
+       * @returns {StatusDropdownConfig}
+       */
+      function squadAgentDropdownConfig() {
+        return {
+          id: "squads-agent",
+          label: "Agent",
+          mode: "multi",
+          itemNoun: "agent",
+          options: squadAgentOptions().map((a) => ({ value: a, label: a })),
+          selected: filters.agents,
+          optionTip: (a) => `Show or hide squads with a task using the ${a} agent.`,
+          onToggle: toggleSquadAgent,
+          onAll: () => allSquadAgent(true),
+          onNone: () => allSquadAgent(false),
+        };
+      }
+      /**
+       * Renders the Squads sidebar's Agent dropdown. Called from
+       * `renderSquads` on every poll, so its options reflect the
+       * currently-loaded squads.
+       * @returns {void}
+       */
+      function renderSquadAgentFilter() {
+        syncSquadAgentDefault();
+        renderStatusDropdown("agent-filter", squadAgentDropdownConfig());
+      }
+      /**
+       * Toggles one agent in/out of the visible-squads filter.
+       * @param {string} a
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function toggleSquadAgent(a, on) {
+        squadAgentDefaulted = true;
+        on ? filters.agents.add(a) : filters.agents.delete(a);
+        renderSquads(); syncHash();
+      }
+      /**
+       * Shows or hides all squads regardless of agent.
+       * @param {boolean} on
+       * @returns {void}
+       */
+      function allSquadAgent(on) {
+        squadAgentDefaulted = true;
+        filters.agents = on ? new Set(squadAgentOptions()) : new Set();
+        renderSquads(); syncHash();
+      }
+      // RALPHUS-SQUAD-AGENT-FILTER:END
       // RALPHUS-PROJECT-FILTER-MENU:BEGIN
       // RAL-345: project filter -- a Set<string> of task-project names,
       // matching `filters.status`'s idiom (a plain Set, checkbox-driven), but
@@ -954,11 +1047,13 @@
         document.querySelectorAll("[data-sort]").forEach((c) => c.classList.toggle("active", /** @type {HTMLElement} */ (c).dataset.sort === filters.sort));
         byId("dir-chip").textContent = filters.dir < 0 ? "↓" : "↑";
       }
+      // RALPHUS-VISIBLE-SQUADS:BEGIN
       /**
        * Computes the sidebar's squad list after status/text filtering and sorting.
        * @returns {SquadView[]}
        */
       function visibleSquads() {
+        syncSquadAgentDefault();
         // RAL-461 follow-up: the one squad just navigated to directly
         // (§reveal) is always shown, bypassing every sidebar filter below --
         // not just the "hidden" one -- so a "go to squad" link can never
@@ -974,12 +1069,22 @@
             // tasks' projects is in the selected set; empty set means no filter.
             // Reads the squad-level `projects` union rather than walking the
             // task tree, so the sidebar needs no per-task data at all.
-            && (!filters.projects.size || (r.projects || []).some((project) => filters.projects.has(project)))));
+            && (!filters.projects.size || (r.projects || []).some((project) => filters.projects.has(project)))
+            // RAL-486 follow-up: a squad matches the agent filter if any of
+            // its tasks' resolved agents is selected. Unlike the project
+            // filter above, an empty set hides everything rather than meaning
+            // "no filter" -- the set is auto-seeded with every agent in use
+            // (`syncSquadAgentDefault`), so empty can only be a deliberate
+            // "None", and a squad with no resolved agent at all never
+            // matches once the filter is active. Same semantics as the Tasks
+            // tab's `ttRowMatchesFilters`.
+            && squadAgents(r).some((a) => filters.agents.has(a))));
         list.sort((a, b) => filters.sort === "name"
           ? filters.dir * (a.label || a.id).localeCompare(b.label || b.id)
           : filters.dir * (a.created_at_ms - b.created_at_ms));
         return list;
       }
+      // RALPHUS-VISIBLE-SQUADS:END
 
       // ---------- sidebar ----------
       /**
@@ -988,8 +1093,8 @@
        */
       function renderSquads() {
         renderProjectFilterChips();
+        renderSquadAgentFilter();
         const el = byId("squads");
-        renderProjectFilterChips();
         const list = visibleSquads();
         if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>`; return; }
         el.innerHTML = list.map((r) => `

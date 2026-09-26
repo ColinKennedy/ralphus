@@ -1,5 +1,14 @@
 //! `ralphus-mcp` binary entry point: parses `--daemon-url`/`--read-only`,
 //! then runs the MCP stdio loop.
+//!
+//! MCP clients (Claude Code, Codex) spawn this binary detached, with only
+//! its stdio pipes connected and no console. On Windows that makes a
+//! console-subsystem exe pop a new, visible console window for the
+//! process's lifetime. The `windows` subsystem below stops that
+//! allocation; the process still reads/writes fine over its inherited
+//! stdio pipes (the same mechanism `pythonw.exe` relies on), and running
+//! it manually from an existing terminal still prints into that terminal.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::{BufReader, stdin, stdout};
 

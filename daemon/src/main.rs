@@ -126,7 +126,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Serve { port, db } => {
+        Command::Serve { port, db, log_path } => {
             if let Err(e) = ralphus_auth::check_license() {
                 eprintln!("Authorization error: {e}");
                 return ExitCode::FAILURE;
@@ -138,8 +138,13 @@ fn main() -> ExitCode {
             // early self-terminates the daemon (kill-on-close).
             let _job_guard = ralphus_daemon::jobobject::confine_process_tree();
             let daemon_cfg = ralphus_daemon::config::load_daemon_config();
+            // `--log-path` (or `[daemon].log_path`) keeps the daemon's logs
+            // on disk: without one, a detached daemon's stderr is discarded
+            // and a hang leaves nothing to diagnose.
+            let cli_log_path: Option<String> =
+                log_path.as_ref().map(|p| p.to_string_lossy().into_owned());
             ralphus_daemon::logging::init(
-                daemon_cfg.log_path.as_deref(),
+                cli_log_path.as_deref().or(daemon_cfg.log_path.as_deref()),
                 daemon_cfg.log_level.as_deref(),
             );
             // A misconfigured agent profile (e.g. a `from_env` var that isn't

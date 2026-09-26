@@ -1268,46 +1268,55 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
         };
         let guard = store.lock();
         let _ = guard.advance_triage_schedule(sched.id, count, last);
+        drop(guard);
         if fired {
+            // No guard held across the sweep: its `orderer` callback performs
+            // a blocking Arbiter round-trip that must never run with the
+            // daemon's global store lock held.
             match crate::reviews::create_review_from_triage_project_sweep(
-                &guard,
+                store,
                 &sched.project,
                 &sched.triage_type,
                 |cands| {
                     crate::arbiter::order_pooled_candidates(
-                        &guard,
+                        store,
                         &crate::arbiter::Arbiter::current(),
                         cands,
                     )
                 },
             ) {
-                Ok(Some(gid)) => crate::cartographer::Note::new("scheduler")
-                    .guardian(&gid)
-                    .scope("guardian")
-                    .emit(
-                        &guard,
-                        format!(
-                            "triage schedule {} ({}, {}) fired -> review {gid}",
-                            sched.id, sched.project, sched.triage_type
-                        ),
-                        serde_json::json!({
-                            "schedule_id": sched.id,
-                            "project": sched.project,
-                            "triage_type": sched.triage_type,
-                            "guardian_id": gid,
-                        }),
-                    ),
+                Ok(Some(gid)) => {
+                    let guard = store.lock();
+                    crate::cartographer::Note::new("scheduler")
+                        .guardian(&gid)
+                        .scope("guardian")
+                        .emit(
+                            &guard,
+                            format!(
+                                "triage schedule {} ({}, {}) fired -> review {gid}",
+                                sched.id, sched.project, sched.triage_type
+                            ),
+                            serde_json::json!({
+                                "schedule_id": sched.id,
+                                "project": sched.project,
+                                "triage_type": sched.triage_type,
+                                "guardian_id": gid,
+                            }),
+                        );
+                }
                 Ok(None) => {}
-                Err(e) => crate::cartographer::Note::new("scheduler")
-                    .level(crate::logging::LogLevel::WARNING)
-                    .emit(
-                        &guard,
-                        format!("triage schedule {} fire failed: {e}", sched.id),
-                        serde_json::json!({"schedule_id": sched.id, "error": e.to_string()}),
-                    ),
+                Err(e) => {
+                    let guard = store.lock();
+                    crate::cartographer::Note::new("scheduler")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .emit(
+                            &guard,
+                            format!("triage schedule {} fire failed: {e}", sched.id),
+                            serde_json::json!({"schedule_id": sched.id, "error": e.to_string()}),
+                        );
+                }
             }
         }
-        drop(guard);
     }
 }
 

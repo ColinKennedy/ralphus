@@ -61,6 +61,28 @@ and signalling the session's pane PIDs directly) and is not implemented.
 working Unix implementation (`process_group(0)` + `killpg`), since that path
 doesn't go through tmux/psmux at all.
 
+## Store state that is not in SQLite (WS-E.1)
+
+`Store` is the only place SQL lives, but it is not the place non-database state
+lives. Worktree leases, restack bookkeeping, tmux liveness, stall-escalation
+debounce and the secret-env-name cache are all in
+[`store_memory.rs`](src/store_memory.rs), behind their own small locks, reached
+via `Store::memory()` or -- without taking the store lock at all --
+`StoreMutex::lock_free_memory()`.
+
+**Do not add a non-SQL collection to `Store`.** Anything on `Store` can only be
+reached through the global `StoreMutex`, so putting a `HashMap` there forces
+every reader of it to queue behind the scheduler and the guardian-merge workers
+for data SQLite never sees. It also blocks the read-path migration: a read
+method cannot move to a pooled connection while it still has to reach a map only
+the writer lock protects.
+
+The locks in `store_memory.rs` are grouped by the invariants that span them, not
+one per field -- read that module's doc comment before adding a field, because
+two of the groupings are load-bearing (the restack/worktree-lease interlock in
+particular, where separate locks would let a restack and a lease both be held
+for one guardian).
+
 ## Testing — Rust integration tests
 
 `cargo nextest run --all-targets` runs everything. Key integration test files in `daemon/tests/`:
@@ -73,6 +95,11 @@ doesn't go through tmux/psmux at all.
 | `reviews_derive.rs` | Full review flow end-to-end | 1 live-Ollama test, `#[ignore]`d by default; `RALPHUS_RESOLVER_MODEL` (default `qwen3:8b`) |
 | `monorepo.rs` | Monorepo pipeline | 3 always-run + 1 live-Ollama test, `#[ignore]`d by default |
 | `board_cold_load_perf.rs` | RAL-414: board endpoint cold-load budget vs. realistic fixtures | 4 always-run smoke tests + 4 `#[ignore]`d heavy tests; the heavy tests run every PR in the `perf-tests` CI job (`.github/workflows/ci.yml`), not the `rust` job's default `Test` step |
+| `board_contention.rs` | WS-B.4: board reads vs. four concurrent writers over real HTTP | 1 `#[ignore]`d test; runs in the `perf-tests` CI job. File-backed store — `open_in_memory`'s `cache=shared` raises `SQLITE_LOCKED` under concurrent read/write |
+| `store_write_throughput.rs` | WS-B.5: the writer's sustained commit rate, batched and unbatched | 2 `#[ignore]`d tests; runs in the `perf-tests` CI job |
+| `workload_replay.rs` | WS-B.6: the captured production event mix replayed at its recorded rates | 3 `#[ignore]`d tests; runs in the `perf-tests` CI job. `RALPHUS_REPLAY_SECONDS` lengthens the window (the WS-G.5 soak knob) |
+| `submit_lock_hold.rs` | WS-D.8: the submit path's worst store-lock *hold* (`GET /api/daemon` → `guard_hold.max_ms`) | 1 always-run test. Asserts hold duration, not request latency: a submit may legitimately be slow, but it must not make every other request slow |
+| `read_path_ratchet.rs` | WS-E.4: how many `GET` handlers are served from the read pool rather than the writer lock | 2 always-run tests. A source scan, because which path a handler takes is not visible to a latency test until it happens to land behind a slow writer. Raise `MIN_POOLED_GET_HANDLERS` as handlers migrate; never lower it |
 
 **Live-Ollama tests are `#[ignore]`d by default** — a plain `cargo nextest run`/`cargo nextest run --all-targets` never runs them, so CI and the normal dev loop never depend on a local model. Run them explicitly with `--ignored`:
 ```bash

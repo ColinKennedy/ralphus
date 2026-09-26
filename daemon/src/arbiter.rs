@@ -532,19 +532,26 @@ pub fn spawn_triage_followup(
         for p in &pending_subprojects {
             resolve_pending_subprojects(&store_handle, &arbiter, &squad_id, p);
         }
-        let guard = store_handle.lock();
-        if let Err(e) = crate::reviews::derive_triage_pools(&guard, &squad_id, &file, |cands| {
-            crate::arbiter::order_pooled_candidates(
-                &guard,
-                &crate::arbiter::Arbiter::current(),
-                cands,
-            )
-        }) {
+        // No guard held across `derive_triage_pools`: its pool-firing path
+        // invokes the `orderer` callback, whose Arbiter round-trip is a
+        // blocking network call that must never run with the daemon's global
+        // store lock held (the callback locks briefly around its own store
+        // accesses instead).
+        if let Err(e) =
+            crate::reviews::derive_triage_pools(&store_handle, &squad_id, &file, |cands| {
+                crate::arbiter::order_pooled_candidates(
+                    &store_handle,
+                    &crate::arbiter::Arbiter::current(),
+                    cands,
+                )
+            })
+        {
             crate::rlog!(
                 WARNING,
                 "ralphus [arbiter] background triage pooling for squad {squad_id} failed: {}",
                 e.message
             );
+            let guard = store_handle.lock();
             crate::cartographer::Note::new("arbiter")
                 .squad(&squad_id)
                 .emit(
@@ -847,7 +854,7 @@ pub fn parse_ordering_reply(reply: &str, expected_ids: &[&str]) -> Option<Vec<St
 /// `classify` path, which deliberately drops the lock around its call).
 #[must_use]
 pub fn order_pooled_candidates(
-    store: &Store,
+    store: &crate::store_lock::StoreHandle,
     arbiter: &Arbiter,
     candidates: &[OrderingCandidate],
 ) -> Option<Vec<String>> {
@@ -857,9 +864,21 @@ pub fn order_pooled_candidates(
     if candidates.len() <= 1 {
         return Some(ids);
     }
-    if over_budget(store, arbiter) {
+    // Same shape as [`classify`] below: take the store lock only for the
+    // short reads/writes around the Arbiter round-trip, never across it.
+    // The ordering request is a blocking HTTPS call to the Arbiter backend
+    // (Anthropic/Ollama) and this is the daemon's one global store lock --
+    // holding it across the call would park every other request, on every
+    // endpoint, for as long as the backend takes to answer (or forever, on
+    // a stalled socket).
+    let over = {
+        let guard = store.lock();
+        over_budget(&guard, arbiter)
+    };
+    if over {
+        let guard = store.lock();
         crate::cartographer::Note::new("arbiter").emit(
-            store,
+            &guard,
             "Arbiter pool ordering skipped: maximum_budget_usd cap already reached; \
              review uses the deterministic pool order",
             serde_json::json!({ "candidates": ids, "reason": "over_budget" }),
@@ -873,6 +892,7 @@ pub fn order_pooled_candidates(
         content: user,
         image: None,
     }];
+    // No store guard is held across this call.
     let (reply, usage) = match chat_client::call_direct_with_usage(
         &arbiter.agent,
         arbiter.model.as_deref(),
@@ -881,8 +901,9 @@ pub fn order_pooled_candidates(
     ) {
         Ok(v) => v,
         Err(e) => {
+            let guard = store.lock();
             crate::cartographer::Note::new("arbiter").emit(
-                store,
+                &guard,
                 format!(
                     "Arbiter pool ordering call failed: {e}; review uses the deterministic pool order"
                 ),
@@ -899,16 +920,18 @@ pub fn order_pooled_candidates(
         arbiter.model.as_deref().unwrap_or_default(),
         usage,
     );
-    let _ = store.record_arbiter_cost(
+    let expected: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+    let parsed = parse_ordering_reply(&reply, &expected);
+    let guard = store.lock();
+    let _ = guard.record_arbiter_cost(
         "pool_ordering",
         usage.tokens_in as i64,
         usage.tokens_out as i64,
         cost,
     );
-    let expected: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
-    let Some(ordered) = parse_ordering_reply(&reply, &expected) else {
+    let Some(ordered) = parsed else {
         crate::cartographer::Note::new("arbiter").emit(
-            store,
+            &guard,
             format!(
                 "Arbiter pool ordering reply {reply:?} is not an exact permutation of the \
                  drained pool; review uses the deterministic pool order"
@@ -922,7 +945,7 @@ pub fn order_pooled_candidates(
         return None;
     };
     crate::cartographer::Note::new("arbiter").emit(
-        store,
+        &guard,
         format!(
             "Arbiter proposed semantic review order [{}]",
             ordered.join(", ")
@@ -1415,7 +1438,7 @@ mod tests {
 
     #[test]
     fn order_pooled_candidates_trivially_orders_a_single_candidate_without_any_call() {
-        let s = store();
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // An unsupported backend proves no call is attempted: had the
         // function tried to reach the Arbiter it would fail and return None.
         let arbiter = Arbiter {
@@ -1432,13 +1455,14 @@ mod tests {
 
     #[test]
     fn order_pooled_candidates_returns_none_when_over_budget() {
-        let s = store();
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "ollama".to_string(),
             model: None,
             maximum_budget_usd: Some(0.0),
         };
-        s.record_arbiter_cost("classification", 1, 1, 0.0001)
+        s.lock()
+            .record_arbiter_cost("classification", 1, 1, 0.0001)
             .unwrap();
         let cands = vec![
             candidate("squad-1/t0:c0", "a"),
@@ -1452,7 +1476,7 @@ mod tests {
 
     #[test]
     fn order_pooled_candidates_returns_none_for_unsupported_backend() {
-        let s = store();
+        let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let arbiter = Arbiter {
             agent: "claude-code".to_string(), // not headlessly callable
             model: None,
