@@ -1637,6 +1637,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                prophecies: Vec::new(),
                 turns: None,
             }
         }

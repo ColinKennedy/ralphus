@@ -277,6 +277,18 @@ fragment). The markers that assembly teaches are parsed from the reply:
   and one level of dependent cells' prompts — that is its whole routing
   scope. The bullet-count and "not a changelog" framing are prompt
   conventions, not parser-enforced shapes; only the marker line is parsed.
+- **`RALPHUS_PROPHECY: <text>`** — a durable, append-only insight the agent
+  records beyond what the diff shows (why a path was taken, what was left
+  behind in a rebase, a hazard noticed but not fixed). Applies to prompt
+  cells. Unlike the three markers above, it is not parsed only from the
+  final reply: the daemon reads a cell's streaming stderr line by line as
+  the cell runs, the same way it already reads `RALPHUS_EVENT:` (see below),
+  so a prophecy is captured the moment it is written rather than only at
+  exit. `RunnerResult.prophecies` additionally carries whatever the cell
+  still had pending at exit, as a backstop for a cell that is killed or
+  times out before its stream is fully drained. Matched as a **standalone
+  line of the exact form** `RALPHUS_PROPHECY: <text>`, never a substring
+  scan, for the same reason `RALPHUS_TMUX_DONE:` below is.
 
 Risk worth knowing before you echo these markers: an agent whose *work*
 happens to print one of these strings (e.g. an agent developing ralphus,
