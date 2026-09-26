@@ -54,7 +54,6 @@ now starts at `daemon/src/runner.rs:2784`, not `:2789`, and the nullable
 `guardians.squad_id` column is now at `daemon/src/store.rs:1413`, not `:1360` —
 both files have grown since this table was first drafted. Every other citation
 in this table still resolves at the line given.)*
-
 ## 3. A prophecy is not a bigger ghost
 
 The tempting cheap move is "raise the ghost cap and keep more of them." That
