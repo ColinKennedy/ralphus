@@ -588,7 +588,13 @@ pub(crate) fn resolve_registered_remote_upstream(
         return Ok(upstream.to_string());
     }
     let cfg = crate::config::resolve_forge(root);
-    let remote = crate::forge::resolve_remote_name(root, upstream, &cfg);
+    let remote = crate::forge::resolve_parent_remote_name(
+        root,
+        upstream,
+        &cfg,
+        project.clone_url.as_deref(),
+        None,
+    );
     if git(root, &["remote", "get-url", &remote]).is_err() {
         return Ok(upstream.to_string());
     }
