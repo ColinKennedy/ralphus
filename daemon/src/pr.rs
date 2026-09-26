@@ -15271,27 +15271,20 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // PR template) -- only the two calls this test actually cares about:
         // branch A's create 422s, branch B's create succeeds.
         let handle = std::thread::spawn(move || {
-            let mut received_any = false;
             loop {
-                // The first `recv` is generous: under a full parallel
-                // `nextest` run this thread can be waiting behind real
-                // git2/filesystem setup work in the main thread while dozens
-                // of other tests contend for CPU, and too short a timeout
-                // here reads as "no more requests coming" and drops the
-                // listening socket before the real first request ever
-                // arrives. Once the client is mid-flow, a much shorter idle
-                // wait is enough to notice "done" without every run paying
-                // the full timeout as dead time at the end.
-                let timeout = if received_any {
-                    std::time::Duration::from_secs(5)
-                } else {
-                    std::time::Duration::from_secs(30)
-                };
+                // Under a full parallel `nextest` run this thread can be waiting
+                // behind real git2/filesystem setup work in the main thread while
+                // dozens of other tests contend for CPU. Even after the first
+                // request, a slow/loaded machine can take >5 seconds between
+                // handling one response and starting the next -- see
+                // submit_stack_for_guardian's per-branch error handling adding
+                // latency. Windows CI particularly sees delays >10s under full
+                // parallelism, so use a generous 30s timeout throughout.
+                let timeout = std::time::Duration::from_secs(30);
                 let mut req = match server.recv_timeout(timeout) {
                     Ok(Some(r)) => r,
                     _ => break,
                 };
-                received_any = true;
                 let method = req.method().clone();
                 let url = req.url().to_string();
                 if method == tiny_http::Method::Get && url.starts_with("/repos/acme/w/pulls?") {
