@@ -138,6 +138,13 @@
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every cell/proof subprocess this squad spawns from now on, until unset. Empty/absent for the vast majority of squads.
        * @property {GenerationUsage} [generation_cost] - RAL-420: this squad's own pre-work generation cost — the retained usage of the agent/model calls the Simple form made before submission (Generate proof steps / manual checks / auto-build steps, plus the suggest-name fallback), attributed to this squad at submit time and folded into its normal totals exactly once. Absent for the vast majority of squads (only Simple-tab submissions that used the Generate buttons or the suggest-name fallback have rows).
+       * @property {SquadMaterializationPhase} [materialization_phase] - In-progress materialization progress, present only while `state === "materializing"`. `total` is a fixed, coarse step count for the named phases the background submit follow-up runs through — not an exact per-squad computation — so it's a rough progress hint, not a guarantee `step` reaches `total`.
+       */
+      /**
+       * @typedef {object} SquadMaterializationPhase
+       * @property {number} step - 1-based index of the phase currently reporting, e.g. `2`.
+       * @property {number} total - Fixed total named-phase count, e.g. `5`.
+       * @property {string} label - Human-readable label for the current phase, e.g. "Creating worktrees".
        */
       /**
        * RAL-420: a squad's aggregate pre-work generation cost — sums over its
