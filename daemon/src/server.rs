@@ -6114,6 +6114,45 @@ fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -
     )
 }
 
+/// Fixed count of [`run_submit_followup`]'s named materialization phases
+/// (RAL-<pending>): fetching upstream refs, creating worktrees,
+/// authenticating remote machines, deriving the review plan, finishing up.
+/// This is a rough progress hint for the board, not a computed per-squad
+/// total -- a squad with no remote cells still "passes through" the
+/// authentication phase almost instantly, and a squad with no `[[review]]`
+/// blocks skips the two review-derivation phases entirely. See
+/// `Store::set_squad_materialization_phase`'s doc comment.
+const MATERIALIZATION_TOTAL_PHASES: i64 = 5;
+
+/// Advance and persist one named phase of a squad's in-progress
+/// materialization (RAL-<pending>), and emit a matching Cartographer note --
+/// see [`MATERIALIZATION_TOTAL_PHASES`]'s doc comment for what "phase" means
+/// here. Failures to persist are swallowed the same way the rest of this
+/// path's best-effort store writes are: a missing progress update must never
+/// abort materialization itself.
+fn report_materialization_phase(
+    store_handle: &StoreHandle,
+    squad_id: &str,
+    step: i64,
+    label: &str,
+) {
+    let guard = store_handle.lock();
+    let _ =
+        guard.set_squad_materialization_phase(squad_id, step, MATERIALIZATION_TOTAL_PHASES, label);
+    crate::cartographer::Note::new("submit")
+        .scope("materialize")
+        .squad(squad_id)
+        .emit(
+            &guard,
+            format!("{step}/{MATERIALIZATION_TOTAL_PHASES} {label}"),
+            serde_json::json!({
+                "step": step,
+                "total": MATERIALIZATION_TOTAL_PHASES,
+                "label": label,
+            }),
+        );
+}
+
 /// The background half of `submit` (RAL-<pending>, see [`BackgroundWork`]'s
 /// doc comment): everything that can be slow (`git fetch`/`git worktree
 /// add`) or depends on review derivation having already run. `squad_id`
@@ -6135,11 +6174,25 @@ fn run_submit_followup(
     has_triage: bool,
     acting_user: Option<String>,
 ) {
+    // RAL-<pending>: a squad's `materialization_phase` is a rough progress
+    // hint, not an exact accounting -- see `MATERIALIZATION_TOTAL_PHASES`'s
+    // doc comment. `phase_step` is a plain `Cell`, not an `AtomicI64`: every
+    // call to `report_phase` below (including the two made from inside
+    // `derive_reviews_with_full_prefetch`, via the `progress` callback) runs
+    // sequentially on this same background thread.
+    let phase_step = std::cell::Cell::new(0i64);
+    let report_phase = |label: &str| {
+        let step = phase_step.get() + 1;
+        phase_step.set(step);
+        report_materialization_phase(store_handle, &squad_id, step, label);
+    };
+
     // Fetch every registered-remote project's bare `?upstream=`/declared
     // review `upstream` BEFORE taking the lock below -- see
     // `crate::worktrees::resolve_placeholders_with_prefetch`'s doc comment
     // for why (a dead remote's `git fetch` must never stall the store lock),
     // and why a miss here still resolves correctly (just not for free).
+    report_phase("Fetching upstream refs");
     let prefetched_upstreams = {
         let guard = store_handle.lock();
         let targets = crate::reviews::collect_remote_upstream_prefetch_targets(&guard, &file);
@@ -6178,6 +6231,7 @@ fn run_submit_followup(
     // serves meanwhile (board reads, other squads' dispatch), since it's
     // the same single global lock. See
     // `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
+    report_phase("Creating worktrees");
     let prefetched_worktrees = {
         let guard = store_handle.lock();
         let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
@@ -6210,6 +6264,7 @@ fn run_submit_followup(
         &file,
         &prefetched_upstreams,
         &prefetched_worktrees,
+        Some(&report_phase as &dyn Fn(&str)),
     );
     if let Err(e) = derived {
         let guard = store_handle.lock();
@@ -6259,6 +6314,8 @@ fn run_submit_followup(
         }
         return;
     }
+
+    report_phase("Finishing up");
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
     // `derive_triage_pools` does to get there -- runs only now that review
