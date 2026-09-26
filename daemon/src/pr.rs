@@ -862,6 +862,9 @@ impl Store {
         let had_attempt = existing
             .as_ref()
             .is_some_and(|pr| pr.auto_fix_attempted_at_ms.is_some());
+        let changed = existing
+            .as_ref()
+            .is_none_or(|pr| pr.ci_status.as_deref() != Some(status));
         let n = self.conn.execute(
             "UPDATE guardian_pull_requests
              SET ci_status=?, ci_failure_job_url=?, updated_at_ms=?,
@@ -887,10 +890,25 @@ impl Store {
                 INFO,
                 "ralphus [pr] pr={id} auto-fix retry window reset: ci status recovered to {status}"
             );
+        }
+        // RAL-518: every caller of this (the RAL-375 one-shot post-push
+        // watch and the RAL-395 standing poll alike) previously wrote a new
+        // `ci_status` straight to the row with no Cartographer row of its
+        // own -- the board's SSE push only fires off a Cartographer write
+        // (`events::EventBus::publish`, fed by `Store::cartographer_log`),
+        // so a status flip landed here was invisible to it. The board would
+        // only catch up on its slower reconciliation poll, or -- for a lone
+        // review with no sibling row to click away to and back, forcing a
+        // re-render off whatever's already in memory -- not at all until
+        // that poll happened to run. Emitting one event here, gated on the
+        // status actually changing (not on every poll landing the same
+        // verdict again), covers every caller from a single write path
+        // instead of requiring each one to remember its own instrumentation.
+        if changed {
             let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "pr",
-                message: "auto-fix retry campaign reset: ci status passed",
+                message: "pr ci status changed",
                 scope: Some("branch"),
                 squad_id: None,
                 guardian_id: existing.as_ref().map(|pr| pr.guardian_id.as_str()),
