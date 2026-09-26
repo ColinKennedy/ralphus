@@ -630,7 +630,7 @@ mod tests {
             }
         });
         let daemon_url = format!("http://127.0.0.1:{port}");
-        let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let incoming = "00-12345678901234567890123456789012-1234567890123456-01";
         let reply = handle_with_trace(&daemon_url, "GET", "/api/tasks", "", Some(incoming));
         handle_thread.join().unwrap();
         assert_eq!(reply.status, 200);

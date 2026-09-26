@@ -16760,7 +16760,7 @@ mod tests {
     #[test]
     fn route_with_trace_persists_incoming_traceparent_onto_the_new_squad() {
         let d = daemon();
-        let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let incoming = "00-12345678901234567890123456789012-1234567890123456-01";
         let r = route_with_trace(
             &d,
             "POST",
