@@ -634,6 +634,29 @@ pub struct SquadView {
     /// owning user). See `server::resolve_submitter`.
     #[serde(default)]
     pub submitter: Option<String>,
+    /// In-progress materialization phase (RAL-<pending>): populated only
+    /// while this squad is `materializing`, so the board can show what the
+    /// background submit follow-up is actually doing right now instead of a
+    /// single static label for the whole window. `None` once the squad
+    /// leaves `materializing` (or before the first phase has reported in) --
+    /// see `Store::set_squad_materialization_phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_phase: Option<SquadMaterializationPhase>,
+}
+
+/// One reported step of a squad's in-progress materialization (RAL-<pending>).
+/// `total` is a fixed count of `run_submit_followup`'s named phases, not a
+/// computed per-squad total -- a squad with no remote cells still "passes
+/// through" the authentication phase almost instantly, so `step`/`total` are
+/// a rough progress hint, not an exact accounting.
+#[derive(Debug, Clone, Serialize)]
+pub struct SquadMaterializationPhase {
+    /// 1-based index of the phase currently reporting, e.g. `2`.
+    pub step: i64,
+    /// Fixed total named-phase count, e.g. `5`.
+    pub total: i64,
+    /// Human-readable label for the current phase, e.g. `"Creating worktrees"`.
+    pub label: String,
 }
 
 /// A node in the cross-squad `[[default]] depends_on` gating graph
@@ -947,6 +970,25 @@ pub(crate) fn to_json_map(v: &BTreeMap<String, String>) -> String {
 /// Parse a string-to-string map from stored JSON, defaulting to empty on error.
 pub(crate) fn from_json_map(s: &str) -> BTreeMap<String, String> {
     serde_json::from_str(s).unwrap_or_default()
+}
+
+/// Assemble a [`SquadMaterializationPhase`] from `squads.materialization_{step,total,phase}`,
+/// the three columns [`Store::set_squad_materialization_phase`] writes and
+/// every `Store::set_squad_state` call clears back to `NULL`. `None` unless
+/// all three are present -- a partially-written row (never expected in
+/// practice, since all three are always set together) is treated the same as
+/// "no phase reported yet" rather than surfacing a half-formed value.
+fn materialization_phase_from_row(
+    step: Option<i64>,
+    total: Option<i64>,
+    label: Option<String>,
+) -> Option<SquadMaterializationPhase> {
+    match (step, total, label) {
+        (Some(step), Some(total), Some(label)) => {
+            Some(SquadMaterializationPhase { step, total, label })
+        }
+        _ => None,
+    }
 }
 
 /// RAL-230: restrict the DB file (and, if already present, its WAL/SHM
@@ -2978,6 +3020,18 @@ impl Store {
             // project/global default, which resolves to `true` (on by
             // default -- unlike most opt-in review settings).
             "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
+            // RAL-<pending>: coarse-grained progress reporting for a squad
+            // sitting in `materializing` (`run_submit_followup`'s named
+            // phases -- fetching upstream refs, creating worktrees,
+            // authenticating remote machines, deriving the review plan,
+            // finishing up). `materialization_total` is a fixed count of
+            // those named phases, not a per-squad computation -- see
+            // `Store::set_squad_materialization_phase`. All three are reset
+            // to `NULL` by every `Store::set_squad_state` call, so they never
+            // linger once a squad leaves `materializing`.
+            "ALTER TABLE squads ADD COLUMN materialization_step INTEGER",
+            "ALTER TABLE squads ADD COLUMN materialization_total INTEGER",
+            "ALTER TABLE squads ADD COLUMN materialization_phase TEXT",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -3706,7 +3760,10 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE squads SET state=?, updated_at_ms=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
-                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END
+                 finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
+                 materialization_step = NULL,
+                 materialization_total = NULL,
+                 materialization_phase = NULL
              WHERE id=?",
             params![
                 state.as_str(),
@@ -4122,6 +4179,30 @@ impl Store {
         Ok(())
     }
 
+    /// Record the current step of a squad's in-progress materialization
+    /// (RAL-<pending>): `run_submit_followup` calls this at each of its named
+    /// phases (fetching upstream refs, creating worktrees, authenticating
+    /// remote machines, deriving the review plan, finishing up) so the board
+    /// can show what a `materializing` squad is actually doing right now,
+    /// instead of one static label for the whole window. `total` is a fixed
+    /// count of those named phases, not a computed per-squad total -- see
+    /// [`SquadMaterializationPhase`]'s doc comment. Cleared back to `None`
+    /// automatically by every [`Store::set_squad_state`] call, so a squad
+    /// that has left `materializing` never carries a stale phase.
+    pub fn set_squad_materialization_phase(
+        &self,
+        squad_id: &str,
+        step: i64,
+        total: i64,
+        label: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE squads SET materialization_step=?, materialization_total=?, materialization_phase=? WHERE id=?",
+            params![step, total, label, squad_id],
+        )?;
+        Ok(())
+    }
+
     /// Solo a task within a squad (RAL-157): while any task in the squad is
     /// soloed, the scheduler's dispatcher only starts cells belonging to a
     /// soloed task — every other task's not-yet-started cells stay
@@ -4397,7 +4478,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads WHERE id=?",
+                "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads WHERE id=?",
                 params![id],
                 |r| {
                     Ok((
@@ -4410,6 +4491,9 @@ impl Store {
                         r.get::<_, String>(6)?,
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
+                        r.get::<_, Option<i64>>(10)?,
+                        r.get::<_, Option<String>>(11)?,
                     ))
                 },
             )
@@ -4426,6 +4510,7 @@ impl Store {
             from_json_map(&row.6),
             row.7,
             row.8,
+            materialization_phase_from_row(row.9, row.10, row.11),
         )
     }
 
@@ -4486,7 +4571,7 @@ impl Store {
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
         let sql = String::from(
-            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter FROM squads ORDER BY created_at_ms DESC, id DESC",
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads ORDER BY created_at_ms DESC, id DESC",
         );
         // A non-positive limit would mean "no rows", which no caller wants and a
         // typo could easily produce; treat it as unlimited.
@@ -4507,12 +4592,28 @@ impl Store {
                     r.get::<_, String>(6)?,
                     r.get::<_, Option<String>>(7)?,
                     r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<String>>(11)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(
-                |(id, label, state, ts, started, finished, env, error, submitter)| {
+                |(
+                    id,
+                    label,
+                    state,
+                    ts,
+                    started,
+                    finished,
+                    env,
+                    error,
+                    submitter,
+                    mat_step,
+                    mat_total,
+                    mat_phase,
+                )| {
                     Self::build_squad_view(
                         conn,
                         id,
@@ -4524,6 +4625,7 @@ impl Store {
                         from_json_map(&env),
                         error,
                         submitter,
+                        materialization_phase_from_row(mat_step, mat_total, mat_phase),
                     )
                 },
             )
@@ -4585,6 +4687,7 @@ impl Store {
         env_overrides: BTreeMap<String, String>,
         error: Option<String>,
         submitter: Option<String>,
+        materialization_phase: Option<SquadMaterializationPhase>,
     ) -> Result<SquadView> {
         let mut tstmt = conn.prepare(
             "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
@@ -4697,6 +4800,7 @@ impl Store {
             env_overrides,
             error,
             submitter,
+            materialization_phase,
         })
     }
 

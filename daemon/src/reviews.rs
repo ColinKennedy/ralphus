@@ -773,7 +773,14 @@ pub fn derive_reviews_with_prefetch(
     file: &TaskFile,
     prefetched_upstreams: &HashMap<(String, String), String>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
-    derive_reviews_with_full_prefetch(store, squad_id, file, prefetched_upstreams, &HashMap::new())
+    derive_reviews_with_full_prefetch(
+        store,
+        squad_id,
+        file,
+        prefetched_upstreams,
+        &HashMap::new(),
+        None,
+    )
 }
 
 /// Like [`derive_reviews_with_prefetch`], but `prefetched_worktrees`
@@ -783,12 +790,21 @@ pub fn derive_reviews_with_prefetch(
 /// function's own [`resolve_placeholders_with_prefetch`] call below skip the
 /// real, slow `git worktree add`/`fetch`/rebase for every cell the caller
 /// already materialized ahead of time, without the store lock held).
+///
+/// `progress`, when given, is called with a short human-readable label right
+/// before each of this function's own named phases starts (RAL-<pending>) --
+/// `server::run_submit_followup` uses it to advance a squad's reported
+/// materialization step so the board can show what's happening instead of a
+/// single static "materializing" label the whole time. `None` (every call
+/// site but the live submit path, including every test) runs exactly as
+/// before, with no reporting overhead.
 pub fn derive_reviews_with_full_prefetch(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
     prefetched_upstreams: &HashMap<(String, String), String>,
     prefetched_worktrees: &HashMap<String, String>,
+    progress: Option<&dyn Fn(&str)>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
     if file.review.is_empty() {
         return Ok(Vec::new());
@@ -821,6 +837,9 @@ pub fn derive_reviews_with_full_prefetch(
     // placeholder, and a full provisioning round-trip for a remote cell -- and
     // holding the store lock across it made this the single worst lock holder
     // in the daemon, measured at 45.9 seconds twice on the submit path.
+    if let Some(progress) = progress {
+        progress("Authenticating remote machines");
+    }
     crate::worktrees::resolve_placeholders_with_full_prefetch(
         store,
         squad_id,
@@ -1107,6 +1126,9 @@ pub fn derive_reviews_with_full_prefetch(
     // review for one poll and with its review on the next. That is a
     // self-correcting 150 ms display lag, traded against holding the daemon's
     // one global lock across a `git fetch`.
+    if let Some(progress) = progress {
+        progress("Deriving review plan");
+    }
     let store = &store.lock();
     let mut link_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
     let mut proj_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();

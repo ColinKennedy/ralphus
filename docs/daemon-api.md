@@ -2980,6 +2980,23 @@ These are distinct from each `CellView`'s resolved `agent`/`model` fields;
 the board uses the raw task values to explain whether a cell's displayed
 resolved value came from the task or was set explicitly on the cell.
 
+A squad also carries a `materialization_phase` field while (and only while)
+`state` is `"materializing"` -- the background submit follow-up's current
+named phase, so the board can show what a squad is actually doing right now
+instead of one static "materializing" label for the whole window:
+
+```json
+{ "step": 2, "total": 5, "label": "Creating worktrees" }
+```
+
+`total` is a fixed count of the submit follow-up's named phases (fetching
+upstream refs, creating worktrees, authenticating remote machines, deriving
+the review plan, finishing up), not a computed per-squad total -- a squad
+with no remote cells still "passes through" the authentication phase almost
+instantly, and a squad with no `[[review]]` blocks skips both
+review-derivation phases entirely, so `step` is not guaranteed to reach
+`total`. Treat it as a rough progress hint, not an exact accounting.
+
 ### `GET /api/task-index`
 
 Compact cross-squad data for the flat Tasks tab. It has the same `daemon` and
