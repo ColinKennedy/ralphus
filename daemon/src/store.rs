@@ -248,6 +248,12 @@ pub struct ProofView {
     pub maximum_tool_output_tokens: Option<i64>,
     /// Resolved agent program (inherited from the owning cell or task defaults).
     pub agent: String,
+    /// RAL-516: whether `agent` can emit thinking output the Live View's
+    /// "Show Thinking" control has anything to fold -- see
+    /// `agent_profiles::thinking_capable_for_agent` for how this is derived.
+    /// The board hides the "Show Thinking" checkbox entirely for a pane
+    /// whose owning step has this `false`.
+    pub thinking_capable: bool,
     /// Resumable CLI-agent cell/thread id captured when the step ran via a
     /// CLI backend with a resume mechanism (claude-code, codex). `None` for
     /// other agents or steps that have not yet run.
@@ -314,6 +320,12 @@ pub struct CellView {
     pub cwd: Option<String>,
     /// Resolved agent program.
     pub agent: String,
+    /// RAL-516: whether `agent` can emit thinking output the Live View's
+    /// "Show Thinking" control has anything to fold -- see
+    /// `agent_profiles::thinking_capable_for_agent` for how this is derived.
+    /// The board hides the "Show Thinking" checkbox entirely for a pane
+    /// whose owning cell has this `false`.
+    pub thinking_capable: bool,
     /// Resolved model, if any.
     pub model: Option<String>,
     /// AI prompt, if a prompt cell.
@@ -1292,13 +1304,14 @@ impl Store {
                 value INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agent_profiles (
-                name          TEXT PRIMARY KEY,
-                backend       TEXT NOT NULL,
-                executable    TEXT,
-                model         TEXT,
-                env_json      TEXT NOT NULL DEFAULT '[]',
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
+                name             TEXT PRIMARY KEY,
+                backend          TEXT NOT NULL,
+                executable       TEXT,
+                model            TEXT,
+                env_json         TEXT NOT NULL DEFAULT '[]',
+                thinking_capable INTEGER,
+                created_at_ms    INTEGER NOT NULL,
+                updated_at_ms    INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agent_backend_commands (
                 backend       TEXT PRIMARY KEY,
@@ -3024,6 +3037,16 @@ impl Store {
             // project/global default, which resolves to `true` (on by
             // default -- unlike most opt-in review settings).
             "ALTER TABLE guardians ADD COLUMN auto_cancel_outdated_pr_pipelines INTEGER",
+            // RAL-516: per-profile override of whether this agent can emit
+            // thinking/reasoning output for the Live View "Show Thinking"
+            // control. NULL = inherit the backend's own declared capability
+            // (`ralphus_core::schema::agent_supports_thinking`); 0/1 = an
+            // explicit override, letting a custom profile pointed at a
+            // harness the daemon can't see be marked capable/incapable
+            // without a daemon-side lookup table. NULL on every pre-RAL-516
+            // row, which is exactly "keep inheriting the backend default"
+            // and preserves current behavior unchanged.
+            "ALTER TABLE agent_profiles ADD COLUMN thinking_capable INTEGER",
         ] {
             let _ = self.conn.execute(stmt, []);
         }
@@ -4567,7 +4590,18 @@ impl Store {
         // into thousands of individual SQL statements, all serialized under
         // the daemon's single store lock, which is what made `GET /api/tasks`
         // slow enough to stall restart/status-flip requests queued behind it.
-        let proofs_by_scope = Self::proofs_by_scope(conn, &id)?;
+        // RAL-516: every DB-backed agent profile, fetched once per view build
+        // (not once per cell/proof row) so `thinking_capable_for_agent` never
+        // costs an extra query on the hot board-polling path -- same
+        // prefetch-map shape as `review_by_branch`/`triage_by_cell` above.
+        let db_profiles: std::collections::HashMap<
+            String,
+            crate::agent_profile_store::AgentProfileView,
+        > = crate::agent_profile_store::list_agent_profiles_conn(conn)?
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+        let proofs_by_scope = Self::proofs_by_scope(conn, &id, &db_profiles)?;
         let triage_by_cell = Self::triage_types_by_cell(conn, &id)?;
         let subprojects_by_cell = Self::subprojects_by_cell(conn, &id)?;
         let mut cells_by_task = Self::cells_by_task(
@@ -4577,6 +4611,7 @@ impl Store {
             &proofs_by_scope,
             &triage_by_cell,
             &subprojects_by_cell,
+            &db_profiles,
         )?;
         let mut tasks = Vec::with_capacity(task_rows.len());
         for (
@@ -4712,6 +4747,7 @@ impl Store {
         proofs_by_scope: &HashMap<(i64, String, i64), Vec<ProofView>>,
         triage_by_cell: &HashMap<(i64, i64), Vec<String>>,
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
+        db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms
@@ -4733,6 +4769,9 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
+                let agent: String = r.get(5)?;
+                let thinking_capable =
+                    crate::agent_profiles::thinking_capable_for_agent(&agent, db_profiles);
                 Ok((
                     task_idx,
                     idx,
@@ -4740,7 +4779,8 @@ impl Store {
                         id: r.get::<_, String>(2)?,
                         name: r.get::<_, Option<String>>(3)?,
                         cwd: r.get::<_, Option<String>>(4)?,
-                        agent: r.get::<_, String>(5)?,
+                        agent,
+                        thinking_capable,
                         model: r.get::<_, Option<String>>(6)?,
                         state: r.get::<_, String>(7)?,
                         tokens_in: r.get::<_, i64>(8)?,
@@ -4915,6 +4955,7 @@ impl Store {
     fn proofs_by_scope(
         conn: &Connection,
         squad_id: &str,
+        db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
             "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
@@ -4922,6 +4963,9 @@ impl Store {
         )?;
         let rows = stmt
             .query_map(params![squad_id], |r| {
+                let agent: String = r.get(12)?;
+                let thinking_capable =
+                    crate::agent_profiles::thinking_capable_for_agent(&agent, db_profiles);
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -4936,7 +4980,8 @@ impl Store {
                         spec: r.get::<_, String>(9)?,
                         system_prompt: r.get::<_, Option<String>>(10)?,
                         model: r.get::<_, Option<String>>(11)?,
-                        agent: r.get::<_, String>(12)?,
+                        agent,
+                        thinking_capable,
                         agent_session_id: r.get::<_, Option<String>>(13)?,
                         tokens_in: r.get::<_, i64>(14)?,
                         tokens_out: r.get::<_, i64>(15)?,
@@ -4967,12 +5012,23 @@ impl Store {
         scope: &str,
         cell_idx: i64,
     ) -> Result<Vec<ProofView>> {
+        // RAL-516: this is a standalone (non-batch) accessor, unlike
+        // `proofs_by_scope`'s per-squad prefetch -- fetch profiles once per
+        // call rather than threading a prefetched map through every caller.
+        let db_profiles: HashMap<String, crate::agent_profile_store::AgentProfileView> =
+            crate::agent_profile_store::list_agent_profiles_conn(&self.conn)?
+                .into_iter()
+                .map(|p| (p.name.clone(), p))
+                .collect();
         let mut stmt = self.conn.prepare(
             "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
             .query_map(params![squad_id, task_idx, scope, cell_idx], |r| {
+                let agent: String = r.get(9)?;
+                let thinking_capable =
+                    crate::agent_profiles::thinking_capable_for_agent(&agent, &db_profiles);
                 Ok(ProofView {
                     id: r.get::<_, Option<String>>(0)?,
                     kind: r.get::<_, String>(1)?,
@@ -4983,7 +5039,8 @@ impl Store {
                     spec: r.get::<_, String>(6)?,
                     system_prompt: r.get::<_, Option<String>>(7)?,
                     model: r.get::<_, Option<String>>(8)?,
-                    agent: r.get::<_, String>(9)?,
+                    agent,
+                    thinking_capable,
                     agent_session_id: r.get::<_, Option<String>>(10)?,
                     tokens_in: r.get::<_, i64>(11)?,
                     tokens_out: r.get::<_, i64>(12)?,

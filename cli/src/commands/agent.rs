@@ -161,6 +161,7 @@ pub enum AgentProfileCommand {
         executable: Option<String>,
         model: Option<String>,
         env: Vec<(String, String, String)>,
+        thinking_capable: Option<bool>,
     },
     Update {
         name: String,
@@ -168,6 +169,7 @@ pub enum AgentProfileCommand {
         executable: Option<String>,
         model: Option<String>,
         env: Vec<(String, String, String)>,
+        thinking_capable: Option<bool>,
     },
     Delete {
         name: String,
@@ -250,6 +252,14 @@ fn parse_profile_save(args: &[String], is_update: bool) -> AgentProfileCommand {
         Ok(v) => env.extend(v),
         Err(e) => return AgentProfileCommand::UsageError(e),
     }
+    // RAL-516: `--thinking-capable`/`--no-thinking-capable`, tri-state like
+    // every other `Option<bool>` profile field here -- omitting it means
+    // "inherit the backend's own default" (`ralphus_core::schema::
+    // agent_supports_thinking`), not "leave whatever was there before":
+    // create/update both fully replace the profile, matching `--backend`'s
+    // own required-every-time semantics.
+    let thinking_capable =
+        crate::commands::review::take_tri_bool(&mut scanner, "--thinking-capable");
     let Some(backend) = backend else {
         return AgentProfileCommand::UsageError(
             "create/update requires --backend <name>".to_string(),
@@ -265,6 +275,7 @@ fn parse_profile_save(args: &[String], is_update: bool) -> AgentProfileCommand {
             executable,
             model,
             env,
+            thinking_capable,
         }
     } else {
         AgentProfileCommand::Create {
@@ -273,6 +284,7 @@ fn parse_profile_save(args: &[String], is_update: bool) -> AgentProfileCommand {
             executable,
             model,
             env,
+            thinking_capable,
         }
     }
 }
@@ -381,12 +393,14 @@ fn dispatch_profile(cmd: AgentProfileCommand, opts: &GlobalOpts) -> i32 {
             executable,
             model,
             env,
+            thinking_capable,
         } => match client.create_agent_profile(
             &name,
             &backend,
             executable.as_deref(),
             model.as_deref(),
             &env,
+            thinking_capable,
         ) {
             Ok(_) => {
                 println!("created agent profile \"{name}\"");
@@ -403,12 +417,14 @@ fn dispatch_profile(cmd: AgentProfileCommand, opts: &GlobalOpts) -> i32 {
             executable,
             model,
             env,
+            thinking_capable,
         } => match client.update_agent_profile(
             &name,
             &backend,
             executable.as_deref(),
             model.as_deref(),
             &env,
+            thinking_capable,
         ) {
             Ok(_) => {
                 println!("updated agent profile \"{name}\"");
@@ -520,7 +536,23 @@ fn render_agent_profile_list(payload: &Value) {
         if let Some(model) = p["model"].as_str() {
             label.push_str(&format!("  model: {model}"));
         }
+        label.push_str(&format!(
+            "  thinking: {}",
+            thinking_capable_label(&p["thinking_capable"])
+        ));
         println!("{label}");
+    }
+}
+
+/// Renders `AgentProfileView.thinking_capable`'s tri-state (RAL-516): JSON
+/// `null` inherits the backend's own default
+/// (`ralphus_core::schema::agent_supports_thinking`), `true`/`false` is an
+/// explicit override.
+fn thinking_capable_label(v: &Value) -> &'static str {
+    match v.as_bool() {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "inherit",
     }
 }
 
@@ -536,6 +568,10 @@ fn render_agent_profile_detail(p: &Value) {
     if let Some(model) = p["model"].as_str() {
         println!("model:      {model}");
     }
+    println!(
+        "thinking:   {}",
+        thinking_capable_label(&p["thinking_capable"])
+    );
     let env = p["env"].as_array().cloned().unwrap_or_default();
     if env.is_empty() {
         return;
@@ -771,6 +807,7 @@ backend = "codex"
                 executable,
                 model,
                 env,
+                thinking_capable,
             }) => {
                 assert_eq!(name, "my-profile");
                 assert_eq!(backend, "claude-code");
@@ -790,6 +827,41 @@ backend = "codex"
                         ),
                     ]
                 );
+                assert_eq!(thinking_capable, None, "no flag given -> inherit");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_profile_create_with_thinking_capable_override() {
+        match parse(&v(&[
+            "profile",
+            "create",
+            "--backend",
+            "raw",
+            "--thinking-capable",
+            "my-profile",
+        ])) {
+            AgentCommand::Profile(AgentProfileCommand::Create {
+                thinking_capable, ..
+            }) => {
+                assert_eq!(thinking_capable, Some(true));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match parse(&v(&[
+            "profile",
+            "create",
+            "--backend",
+            "raw",
+            "--no-thinking-capable",
+            "my-profile",
+        ])) {
+            AgentCommand::Profile(AgentProfileCommand::Create {
+                thinking_capable, ..
+            }) => {
+                assert_eq!(thinking_capable, Some(false));
             }
             other => panic!("unexpected: {other:?}"),
         }
