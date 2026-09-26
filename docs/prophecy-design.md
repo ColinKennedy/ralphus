@@ -241,3 +241,28 @@ crosses the provider boundary today. Remote auth is the provider's own business
 Same shape, smaller: `ghost::current_revision` (`daemon/src/ghost.rs:202`)
 calls the local `git`, so on a remote `cwd` it returns `None` and the revision
 marker silently vanishes. Needs `ws.git()` too.
+
+---
+
+## 7. The through line — a correlation key, not a new entity
+
+The instinct that ralphus has no through line is about half right, and the
+wrong half matters for cost.
+
+**Already there:**
+
+- Addressing — `EntityUri` (§2).
+- Four entity references stamped on every Cartographer row.
+- `build_squad_timeline` (`daemon/src/timeline.rs`) already merges a squad's
+  whole history chronologically with terminal-log excerpts inlined.
+
+**Genuinely absent:** a durable link across the **squad ↔ review ↔ PR** seam
+(`guardians.squad_id` nullable; a review aggregates branches from possibly
+different squads).
+
+**Recommendation.** A new parent object — Memo, Book, whatever — means every
+existing table grows a foreign key and every existing query learns about it.
+That is an enormous blast radius for a feature whose value is "keep a note." A
+correlation id stamped on a prophecy and carried across that seam buys the same
+queryability for a fraction of the change. If it later earns promotion to a
+real entity, nothing here blocks that.
