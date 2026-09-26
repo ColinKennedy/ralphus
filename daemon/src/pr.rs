@@ -12090,13 +12090,13 @@ mod tests {
             None,
             None,
             Some("other-base"),
-            Some(Some("deadbeef")),
+            Some(Some("1234567890abcdef")),
             Some(Some("other-base")),
         )
         .unwrap();
         let pr = s.get_pull_request(&id).unwrap();
         assert_eq!(pr.base_ref, "other-base");
-        assert_eq!(pr.last_pushed_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(pr.last_pushed_sha.as_deref(), Some("1234567890abcdef"));
         assert_eq!(pr.last_pushed_base_ref.as_deref(), Some("other-base"));
     }
 

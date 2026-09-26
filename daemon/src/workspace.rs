@@ -488,7 +488,7 @@ mod tests {
         // actually reaches the machine rather than erroring somewhere earlier.
         let dir = std::env::temp_dir().join(format!("ral185-ws-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let json = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"deadbeef"}"#;
+        let json = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"testoutput"}"#;
         let (script, body) = if cfg!(windows) {
             (
                 dir.join("p.cmd"),
@@ -525,7 +525,7 @@ echo {json}
             .unwrap();
         let ws = Workspace::on("/remote/repo", Some("ib:A")).with_store(store);
         let out = ws.git(&["rev-parse", "HEAD"]).expect("remote git");
-        assert_eq!(out.trim(), "deadbeef");
+        assert_eq!(out.trim(), "testoutput");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

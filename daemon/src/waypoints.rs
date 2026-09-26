@@ -1762,7 +1762,7 @@ mod tests {
                 "guardian-1",
                 "second summary",
                 Some("squad:squad-1"),
-                Some("deadbeef"),
+                Some("1234567890123456"),
                 Some("fix: thing"),
             )
             .unwrap();
@@ -1777,7 +1777,7 @@ mod tests {
         assert_eq!(bearings[1].id, b2.id);
         assert_eq!(bearings[1].summary, "second summary");
         assert_eq!(bearings[1].entity_uri.as_deref(), Some("squad:squad-1"));
-        assert_eq!(bearings[1].commit_id.as_deref(), Some("deadbeef"));
+        assert_eq!(bearings[1].commit_id.as_deref(), Some("1234567890123456"));
         assert_eq!(bearings[1].commit_summary.as_deref(), Some("fix: thing"));
     }
 
