@@ -19,9 +19,10 @@ use ralphus_daemon::guardian::{
 };
 use ralphus_daemon::guardian_merge::{
     poll_base_branch_freshness_once, pull_pr_commits, purge_worktrees, rebase_command_progress,
-    rebase_on_manual_push, rebuild_on_base_shift, reopen_guardian_merge, reopen_straggler,
-    restart_guardian_merge, run_feedback, run_merge, run_merge_staged, start_feedback, start_merge,
-    stop_guardian_merge, stop_merge_worker_for_cancel,
+    rebase_on_manual_push, rebuild_on_base_shift, rebuild_on_base_shift_with_debounce,
+    reopen_guardian_merge, reopen_straggler, restart_guardian_merge, run_feedback, run_merge,
+    run_merge_staged, start_feedback, start_merge, stop_guardian_merge,
+    stop_merge_worker_for_cancel,
 };
 use ralphus_daemon::pr::sync_remote_pr_commits;
 use ralphus_daemon::reviews::derive_reviews;
@@ -4135,48 +4136,59 @@ fn base_shift_rebuild_budget_reopens_for_a_new_target_base_sha() {
 
 // RAL-510: a burst of upstream commits landing in quick succession must fold
 // into ONE rebuild dispatch (and therefore one force-push, one CI run), not
-// one per commit -- `rebuild_on_base_shift` sleeps for `BASE_SHIFT_DEBOUNCE`
-// (500ms in `guardian_merge.rs`) after its first shift detection and
-// re-detects before actually dispatching, so a target that keeps moving
-// during that window is only ever rebuilt against wherever it finally
-// settles. This test lands two more commits on `main` *while* the function
-// is mid-debounce and asserts: exactly one rebuild attempt was spent, and it
-// targeted the LAST commit -- never the first one detected or the one in
-// between. Without the debounce, a naive implementation would instead react
-// to the first shift immediately and need two further maintenance passes to
-// catch up with the other two commits: three rebuilds for three commits.
+// one per commit -- `rebuild_on_base_shift` sleeps for a debounce window
+// after its first shift detection and re-detects before actually
+// dispatching, so a target that keeps moving during that window is only
+// ever rebuilt against wherever it finally settles. This test lands two more
+// commits on `main` *while* the function is mid-debounce and asserts:
+// exactly one rebuild attempt was spent, and it targeted the LAST commit --
+// never the first one detected or the one in between. Without the debounce,
+// a naive implementation would instead react to the first shift immediately
+// and need two further maintenance passes to catch up with the other two
+// commits: three rebuilds for three commits.
 //
-// This test is pinned to exclusive execution in `.config/nextest.toml`
-// (`threads-required = "num-cpus"`): it races two real background threads
-// (each spawning real `git` subprocesses) against the fixed debounce sleep
-// above, and under nextest's default full-CPU parallelism that race can be
-// lost to subprocess-spawn scheduling jitter from dozens of unrelated tests
-// running at the same time -- not a bug in `rebuild_on_base_shift` itself.
+// This races two real background threads (each spawning real `git`
+// subprocesses, including a fresh `git.exe` process per `add`/`commit`/
+// `rev-parse`) against a debounce sleep, so it's pinned to exclusive
+// execution in `.config/nextest.toml` (`threads-required = "num-cpus"`) --
+// but exclusive CPU access doesn't bound how long a `git` subprocess *spawn*
+// itself takes on a loaded or antivirus-scanned Windows CI runner, which can
+// spike well past what production's real 500ms `BASE_SHIFT_DEBOUNCE` budget
+// leaves for a two-commit burst. This test drives
+// `rebuild_on_base_shift_with_debounce` with a ten-second window instead --
+// ample absolute slack for that jitter -- while keeping the burst's own
+// artificial sleeps tiny, so the assertions below (one attempt, targeting
+// the final commit) still prove the same coalescing behavior. Production
+// callers all go through `rebuild_on_base_shift`, whose fixed 500ms window is
+// untouched by this.
 #[test]
 fn rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild() {
     let (root, store, id) = conflicting_base_shift_repo();
     run_merge(&store, &NoopRunner, &id);
     assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
     let sem = Semaphore::new(4);
+    let debounce = Duration::from_secs(10);
 
     let first_target = advance_main(&root, "shared.txt", "moved on 1\n", "first advance");
     let burst_root = root.clone();
     let burst = std::thread::spawn(move || {
-        // Both land comfortably inside the 300ms debounce window the main
-        // thread is asleep in below.
-        std::thread::sleep(Duration::from_millis(40));
+        // Tiny relative to `debounce` -- these only order the burst's two
+        // commits after the first, not race its subprocess spawn time
+        // against the window.
+        std::thread::sleep(Duration::from_millis(10));
         let second = advance_main(&burst_root, "shared.txt", "moved on 2\n", "second advance");
-        std::thread::sleep(Duration::from_millis(80));
+        std::thread::sleep(Duration::from_millis(10));
         let third = advance_main(&burst_root, "shared.txt", "moved on 3\n", "third advance");
         (second, third)
     });
 
-    assert!(rebuild_on_base_shift(
+    assert!(rebuild_on_base_shift_with_debounce(
         &store,
         &FailingAgentRunner,
         &id,
         &sem,
-        &CancelToken::never()
+        &CancelToken::never(),
+        debounce,
     ));
     let (second_target, third_target) = burst.join().unwrap();
     assert_ne!(first_target, second_target);
