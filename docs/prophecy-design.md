@@ -464,3 +464,5 @@ RAL-252 (verified login) and RAL-225 (container mode) are the two existing
 threads that would close it. Reasonable to accept for a single-user dev tool —
 but better as a written decision than an unexamined default. Note
 `SECURITY_AUDIT.local.md` does not currently mention it.
+=======
+>>>>>>> a6401a3c3 (feat(daemon): add prophecy transport via RALPHUS_PROPHECY: marker)
