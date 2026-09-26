@@ -923,6 +923,16 @@ pub struct RunnerResult {
     /// or when the agent had nothing to hand off.
     #[serde(default)]
     pub ghost: Option<String>,
+    /// Prophecies (durable, append-only insight records) the cell reported
+    /// via a `RALPHUS_PROPHECY:` marker in its stderr, in the order they were
+    /// scanned. This is the at-exit backstop mirroring `ghost` above: the
+    /// primary path is the same-shaped `RunnerEvent` forwarded live through
+    /// `forward_runner_event` as each marker line is scanned, but a cell
+    /// that is killed, times out, or otherwise never reaches its own exit
+    /// may still have emitted markers that were captured here. Empty when
+    /// the cell emitted none.
+    #[serde(default)]
+    pub prophecies: Vec<String>,
     /// RAL-435: set only when `status == "rate_limited"` -- the Pi backend's
     /// suggested retry delay, in whole seconds, for a recognized retryable
     /// 429. `run_cell_worker` waits out this delay (releasing its scheduler
@@ -954,6 +964,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: None,
             ghost: None,
+            prophecies: Vec::new(),
             retry_after_secs: None,
         }
     }
@@ -993,6 +1004,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: Some(usage.turns),
             ghost: None,
+            prophecies: Vec::new(),
             retry_after_secs: None,
         }
     }
@@ -1025,6 +1037,7 @@ impl RunnerResult {
             agent_session_id: None,
             turns: Some(usage.turns),
             ghost: None,
+            prophecies: Vec::new(),
             retry_after_secs: None,
         }
     }
@@ -1056,6 +1069,7 @@ impl RunnerResult {
             agent_session_id,
             turns: Some(usage.turns),
             ghost: None,
+            prophecies: Vec::new(),
             retry_after_secs: None,
         }
     }
@@ -1106,6 +1120,7 @@ impl RunnerResult {
             agent_session_id,
             turns,
             ghost: None,
+            prophecies: Vec::new(),
             retry_after_secs: Some(ralphus_core::rate_limit::clamp_retry_after_secs(
                 retry_after_secs,
             )),
@@ -1410,6 +1425,26 @@ pub(crate) fn line_is_done_sentinel(line: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(": "))
 }
 
+/// Prefix a cell writes to its own stderr to record a durable, append-only
+/// insight the diff itself can't show -- a "prophecy". Read line by line as
+/// the cell runs, alongside [`EVENT_MARKER`], rather than only at exit.
+pub(crate) const PROPHECY_MARKER: &str = "RALPHUS_PROPHECY: ";
+
+/// The prophecy text following a standalone `RALPHUS_PROPHECY: <text>`
+/// line, or `None` if `line` is not that marker.
+///
+/// Matched the same anchored, line-start-only way [`EVENT_MARKER`] already
+/// is (and the way [`line_is_done_sentinel`] was fixed to match
+/// `TMUX_DONE_MARKER`) rather than a substring scan: a substring scan
+/// false-positives the moment a cell's own work happens to echo the literal
+/// marker text -- e.g. an agent whose task is about this exact mechanism
+/// `Read`ing or `Grep`ing this file or `docs/special-syntax.md`, both of
+/// which contain the string `RALPHUS_PROPHECY:` in prose.
+pub(crate) fn line_as_prophecy(line: &str) -> Option<&str> {
+    let text = line.trim_end().strip_prefix(PROPHECY_MARKER)?.trim();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Max bytes [`TranscriptTailer::drain`] consumes from the `.raw` transcript in
 /// a single poll. Bounds the transient allocation when a cell floods output
 /// between polls; anything beyond it is drained on subsequent polls (the byte
@@ -1583,6 +1618,14 @@ fn consume_transcript_lines(
             if let Some(usage) = forwarded.live_usage {
                 *current_usage = usage;
             }
+        } else if let Some(text) = line_as_prophecy(line) {
+            forward_prophecy_line(
+                target.cartographer,
+                target.squad_id,
+                target.cell_id,
+                target.task,
+                text,
+            );
         }
     }
     done
@@ -2327,6 +2370,14 @@ impl SubprocessRunner {
                                         if let Some(usage) = fwd.live_usage {
                                             current_usage = usage;
                                         }
+                                    } else if let Some(text) = line_as_prophecy(line) {
+                                        forward_prophecy_line(
+                                            self.cartographer.as_ref(),
+                                            &attempt_spec.squad_id,
+                                            &attempt_spec.cell_id,
+                                            &attempt_spec.task,
+                                            text,
+                                        );
                                     }
                                 }
                                 pane_lines_seen = all_lines.len();
@@ -2784,6 +2835,23 @@ impl SubprocessRunner {
             }
         }
     }
+}
+
+/// Forward one scanned `RALPHUS_PROPHECY:` line as a runner event, reusing
+/// [`forward_runner_event`] for attribution exactly as an `EVENT_MARKER`
+/// line already is -- there is no separate prophecy attribution path. This
+/// gets the prophecy into Cartographer for free (via `forward_runner_event`'s
+/// own logging), which is the mid-work streaming half of the transport,
+/// distinct from the at-exit `RunnerResult::prophecies` backstop.
+fn forward_prophecy_line(
+    cartographer: Option<&crate::store_lock::StoreHandle>,
+    squad_id: &str,
+    cell_id: &str,
+    task: &str,
+    text: &str,
+) {
+    let json = serde_json::json!({ "source": "prophecy", "message": text }).to_string();
+    forward_runner_event(cartographer, squad_id, cell_id, task, &json);
 }
 
 /// Parse and persist one `RALPHUS_EVENT:` JSON payload from the runner
@@ -3785,6 +3853,7 @@ mod tests {
             proofed: Some(true),
             agent_session_id: None,
             ghost: None,
+            prophecies: Vec::new(),
             turns: None,
             retry_after_secs: None,
         };
@@ -5808,5 +5877,71 @@ prompt = "make it build"
             !line_is_done_sentinel("RALPHUS_TMUX_DONEno-colon"),
             "the marker must be followed by the exact ': ' separator"
         );
+    }
+
+    #[test]
+    fn line_as_prophecy_matches_only_a_standalone_line_start_marker() {
+        assert_eq!(
+            line_as_prophecy("RALPHUS_PROPHECY: left the retry loop unbounded"),
+            Some("left the retry loop unbounded")
+        );
+        assert_eq!(
+            line_as_prophecy("   RALPHUS_PROPHECY: indented"),
+            None,
+            "unlike TMUX_DONE_MARKER, leading whitespace is not tolerated -- matches EVENT_MARKER"
+        );
+        assert_eq!(
+            line_as_prophecy("RALPHUS_PROPHECY:    padded"),
+            Some("padded"),
+            "the text itself is trimmed"
+        );
+        assert_eq!(
+            line_as_prophecy("some_file.rs:42:RALPHUS_PROPHECY: ok"),
+            None,
+            "a grep-style file:line prefix must not read as a prophecy"
+        );
+        assert_eq!(
+            line_as_prophecy("mentioning RALPHUS_PROPHECY: in prose"),
+            None,
+            "the marker embedded mid-line is not a prophecy"
+        );
+        assert_eq!(
+            line_as_prophecy("RALPHUS_PROPHECY:no-space"),
+            None,
+            "the marker must be followed by the exact ': ' separator"
+        );
+        assert_eq!(
+            line_as_prophecy("RALPHUS_PROPHECY:    "),
+            None,
+            "a whitespace-only body doesn't even satisfy the ': ' prefix once trailing \
+             whitespace is trimmed"
+        );
+    }
+
+    #[test]
+    fn consume_transcript_lines_forwards_a_prophecy_marker_to_cartographer() {
+        let (store, squad_id) = store_with_one_cell();
+        let mut session_id = None;
+        let mut usage = LiveUsage::default();
+        let target = TranscriptEventTarget {
+            pane_event_fallback: false,
+            cartographer: Some(&store),
+            squad_id: &squad_id,
+            cell_id: "worker",
+            task: "build",
+        };
+        let lines = vec!["RALPHUS_PROPHECY: left the retry loop unbounded".to_string()];
+        consume_transcript_lines(&lines, &target, &mut session_id, &mut usage);
+
+        let page = store
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter::recent(10))
+            .unwrap();
+        let matched = page
+            .rows
+            .iter()
+            .find(|row| row.message == "left the retry loop unbounded")
+            .expect("prophecy line forwarded to cartographer");
+        assert_eq!(matched.source, "prophecy");
     }
 }

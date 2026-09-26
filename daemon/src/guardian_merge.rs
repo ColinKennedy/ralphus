@@ -350,6 +350,7 @@ fn run_agent_with_rate_limit_retry(
                 agent_session_id: attempt.agent_session_id,
                 turns: total_turns,
                 ghost: None,
+                prophecies: Vec::new(),
                 retry_after_secs: None,
             };
         }
@@ -12546,6 +12547,7 @@ mod tests {
             proofed: None,
             agent_session_id: None,
             ghost: None,
+            prophecies: Vec::new(),
             turns: None,
         }
     }
@@ -12724,6 +12726,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -12960,6 +12963,7 @@ mod tests {
                 agent_session_id: None,
                 turns: None,
                 ghost: None,
+                prophecies: Vec::new(),
             }
         }
     }
@@ -15911,6 +15915,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                prophecies: Vec::new(),
                 turns: None,
             }
         }
@@ -16382,6 +16387,7 @@ mod tests {
                 proofed: None,
                 agent_session_id: None,
                 ghost: None,
+                prophecies: Vec::new(),
                 turns: None,
             }
         }
