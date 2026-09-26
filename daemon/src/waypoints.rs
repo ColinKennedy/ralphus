@@ -1,23 +1,30 @@
 //! Cross-squad waypoints (RAL-400) -- schema/store layer (Phase 1) plus the
-//! survey pass (Phase 2).
+//! survey pass (Phase 2), squad gating (Phase 3), and review-feedback
+//! delivery (Phase 4).
 //!
 //! A waypoint is a named, open/closed join point that tracks a roster of
 //! reviews/squads and accumulates append-only guidance ("bearings") for
 //! them. This module owns the roster/bearing/injection CRUD, the
-//! terminal-state auto-close computation, and (Phase 2) the survey: the LLM
-//! pass that decides, for every open review/non-terminal squad whose
-//! [`Scope`] overlaps a waypoint's, whether it is impacted and at what
-//! [`RosterMode`]. The actual injection delivery mechanism (Phase 5) is not
-//! implemented here -- see `.agent/waypoints-phase0-decisions.md` for the
-//! full design.
+//! terminal-state auto-close computation, the survey (the LLM pass that
+//! decides, for every open review/non-terminal squad whose [`Scope`]
+//! overlaps a waypoint's, whether it is impacted and at what [`RosterMode`]),
+//! and delivery: [`run_pending_deliveries`] pushes an impacted review-kind
+//! roster entry's guidance into its review worktree via the existing
+//! `guardian_merge::start_feedback` path, and marks a squad-kind entry
+//! whose squad finished before any review ever formed for it `via-restack`.
+//! A separate, not-yet-implemented `pending_injections` mechanism
+//! ([`PendingInjectionView`]) is schema-only -- see
+//! `.agent/waypoints-phase0-decisions.md` for the full design.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 use crate::chat_client::{self, ChatMessage};
 use crate::guardian::GuardianStatus;
+use crate::runner::Runner;
 use crate::store::{Result as StoreResult, Store, StoreError, now_ms};
 use crate::triage::SubprojectResolution;
 
@@ -1331,6 +1338,193 @@ pub fn run_pending_waypoint_resumes(
     }
 }
 
+/// Author attributed to a waypoint's delivered feedback messages, mirroring
+/// `ci_watch.rs`'s `AUTO_FIX_AUTHOR`/`MANUAL_PR_FIX_AUTHOR` naming precedent
+/// for automation-originated guardian messages.
+pub const WAYPOINT_FEEDBACK_AUTHOR: &str = "Waypoint";
+
+/// The topmost (highest-position) enabled branch with a worktree already
+/// built, if any. This mirrors the readiness bar `guardian_merge::start_feedback`
+/// itself enforces (its synchronous 409 "run the review merge before giving
+/// feedback" path) -- checked here first so a not-yet-built review is simply
+/// skipped for this sweep (left `Undelivered` for a later one to retry)
+/// rather than surfaced as a `Failed` roster entry.
+fn topmost_ready_branch(
+    guardian: &crate::guardian::GuardianView,
+) -> Option<&crate::guardian::BranchView> {
+    guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && b.worktree.is_some())
+        .max_by_key(|b| b.position)
+}
+
+/// Render a waypoint's guidance as one feedback message body.
+fn waypoint_feedback_text(waypoint: &WaypointView) -> String {
+    match &waypoint.label {
+        Some(label) => format!("Waypoint \"{label}\": {}", waypoint.prompt),
+        None => waypoint.prompt.clone(),
+    }
+}
+
+/// Scheduler-owned periodic sweep (RAL-400 Phase 4): deliver every open
+/// waypoint's guidance to every roster entry judged impacted. A `NULL` or
+/// `"impacted"` `survey_verdict` both count as impacted here (mirroring
+/// [`Store::squad_block_gating_waypoint`]'s own fail-closed reading of that
+/// column); only an explicit `"not_impacted"` skips delivery.
+///
+/// - `Review`-kind entries are delivered through the *existing* review
+///   feedback path -- `guardian_merge::start_feedback`, the same function
+///   `POST /api/guardians/{id}/branches/{branch_id}/feedback` calls -- rather
+///   than a new delivery mechanism. That function already does its own
+///   `feedback:<branch_id>` worktree-lease queueing behind an in-flight
+///   rebase; this sweep only decides *when* to call it, never reimplements
+///   that serialization.
+/// - `Squad`-kind entries never get a direct delivery call: a squad has no
+///   review worktree to write feedback into. If such a squad has already
+///   gone terminal (done/failed/cancelled) -- the "done-but-unreviewed" case,
+///   where the squad finished before a review ever formed for it and before
+///   this ticket's gating could apply -- its roster entry is marked
+///   `via-restack` so the UI can say honestly that its guidance will only
+///   reach it later, folded into the restack/rebase that runs once its
+///   eventual review is built (at which point
+///   `Store::transition_squad_roster_entries_to_review` converts the entry
+///   to `Review`-kind and this sweep starts delivering to it directly). A
+///   still-running squad's entry is left untouched -- there is nothing to do
+///   for it yet.
+///
+/// Mirrors [`run_pending_surveys`]'s shape: cheap synchronous store reads on
+/// the calling (scheduler) thread, gating what work happens; the potentially
+/// slow part (`start_feedback`'s spawned background thread) is not owned by
+/// this function's call stack at all, so no thread-spawn is needed here.
+pub fn run_pending_deliveries(store: &crate::store_lock::StoreHandle, runner: &Arc<dyn Runner>) {
+    let waypoint_ids = {
+        let guard = store.lock();
+        guard.list_open_waypoint_ids().unwrap_or_default()
+    };
+    for waypoint_id in waypoint_ids {
+        let (waypoint, entries) = {
+            let guard = store.lock();
+            let Ok(waypoint) = guard.get_waypoint(&waypoint_id) else {
+                continue;
+            };
+            let entries = guard.list_roster_entries(&waypoint_id).unwrap_or_default();
+            (waypoint, entries)
+        };
+        for entry in entries {
+            if entry.delivery_status != DeliveryStatus::Undelivered {
+                continue;
+            }
+            if entry.survey_verdict.as_deref() == Some("not_impacted") {
+                continue;
+            }
+            match entry.kind {
+                RosterEntryKind::Review => {
+                    deliver_to_review(store, runner, &waypoint_id, &waypoint, &entry.entry_id);
+                }
+                RosterEntryKind::Squad => {
+                    mark_done_but_unreviewed_squad(store, &waypoint_id, &entry.entry_id);
+                }
+            }
+        }
+    }
+}
+
+/// Deliver one waypoint's guidance to one review's topmost ready branch via
+/// the existing feedback path, recording the outcome on the roster entry.
+/// Leaves the entry `Undelivered` (for a later sweep to retry) if the
+/// guardian has no ready branch yet, or if `start_feedback` itself reports
+/// `404` (stale roster entry, guardian/branch since gone) or `409` (branch
+/// has no worktree yet -- an ordinary not-built-yet race, not a failure); any
+/// other reply status is recorded as `Failed`.
+fn deliver_to_review(
+    store: &crate::store_lock::StoreHandle,
+    runner: &Arc<dyn Runner>,
+    waypoint_id: &str,
+    waypoint: &WaypointView,
+    guardian_id: &str,
+) {
+    let branch_id = {
+        let guard = store.lock();
+        let Ok(guardian) = guard.get_guardian(guardian_id) else {
+            return;
+        };
+        match topmost_ready_branch(&guardian) {
+            Some(branch) => branch.id.clone(),
+            None => return,
+        }
+    };
+    let reply = crate::guardian_merge::start_feedback(
+        Arc::clone(store),
+        Arc::clone(runner),
+        guardian_id,
+        &branch_id,
+        waypoint_feedback_text(waypoint),
+        Some(WAYPOINT_FEEDBACK_AUTHOR.to_string()),
+        None,
+    );
+    let status = match reply.status {
+        202 => DeliveryStatus::Delivered,
+        404 | 409 => return,
+        _ => DeliveryStatus::Failed,
+    };
+    let guard = store.lock();
+    let _ =
+        guard.set_roster_delivery_status(waypoint_id, RosterEntryKind::Review, guardian_id, status);
+    let note = crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .guardian(guardian_id);
+    note.emit(
+        &guard,
+        format!(
+            "waypoint {waypoint_id} delivered feedback to review {guardian_id}: status={}",
+            status.as_str()
+        ),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "guardian_id": guardian_id,
+            "branch_id": branch_id,
+            "delivery_status": status.as_str(),
+        }),
+    );
+}
+
+/// Mark a squad-kind roster entry `via-restack` once its squad has gone
+/// terminal without a review ever having formed for it (the "done-but-
+/// unreviewed" case). A no-op if the squad is not yet terminal, or is gone
+/// entirely (treated the same as "not yet terminal" -- nothing to mark).
+fn mark_done_but_unreviewed_squad(
+    store: &crate::store_lock::StoreHandle,
+    waypoint_id: &str,
+    squad_id: &str,
+) {
+    let guard = store.lock();
+    let terminal = matches!(guard.squad_state(squad_id), Ok(state) if state.is_terminal());
+    if !terminal {
+        return;
+    }
+    let _ = guard.set_roster_delivery_status(
+        waypoint_id,
+        RosterEntryKind::Squad,
+        squad_id,
+        DeliveryStatus::ViaRestack,
+    );
+    let note = crate::cartographer::Note::new("waypoints")
+        .scope("waypoint")
+        .squad(squad_id);
+    note.emit(
+        &guard,
+        format!(
+            "waypoint {waypoint_id} squad {squad_id} finished before its review formed -- via-restack"
+        ),
+        serde_json::json!({
+            "waypoint_id": waypoint_id,
+            "squad_id": squad_id,
+            "delivery_status": DeliveryStatus::ViaRestack.as_str(),
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2431,6 +2625,197 @@ mod tests {
             store.squad_state("squad-1").unwrap(),
             SquadState::Running,
             "worker still alive -- its own row must not be touched"
+        );
+    }
+
+    // ── run_pending_deliveries (Phase 4) ─────────────────────────────────
+
+    /// Always returns a `"done"` result -- delivery only cares about
+    /// `start_feedback`'s own synchronous `Reply`, not what its spawned
+    /// background thread (which calls `run_feedback` with this runner) goes
+    /// on to do with a fake, non-existent worktree.
+    struct DeliveryTestRunner;
+
+    impl crate::runner::Runner for DeliveryTestRunner {
+        fn run(&self, _spec: &crate::runner::RunnerSpec) -> crate::runner::RunnerResult {
+            crate::runner::RunnerResult {
+                status: "done".to_string(),
+                ..crate::runner::RunnerResult::failure("unused")
+            }
+        }
+    }
+
+    /// Adds an enabled branch with a review branch/worktree already recorded
+    /// -- the readiness bar both [`topmost_ready_branch`] and
+    /// `guardian_merge::start_feedback` itself enforce -- and returns its id.
+    fn open_review_branch(store: &Store, guardian_id: &str, branch: &str) -> String {
+        let position = store.add_guardian_branch(guardian_id, branch).unwrap();
+        let branch_id = store.get_guardian(guardian_id).unwrap().branches
+            [usize::try_from(position).unwrap()]
+        .id
+        .clone();
+        store
+            .set_branch_review(
+                guardian_id,
+                &branch_id,
+                "review-branch",
+                "/tmp/fake-worktree",
+            )
+            .unwrap();
+        branch_id
+    }
+
+    #[test]
+    fn run_pending_deliveries_marks_an_impacted_review_entry_delivered() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        open_review_branch(&store, "guardian-1", "feature-x");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_deliveries(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delivery_status, DeliveryStatus::Delivered);
+    }
+
+    #[test]
+    fn run_pending_deliveries_skips_a_not_impacted_review_entry() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_guardian(&store, "guardian-1");
+        open_review_branch(&store, "guardian-1", "feature-x");
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+        store
+            .set_roster_survey_result(
+                "waypoint-1",
+                RosterEntryKind::Review,
+                "guardian-1",
+                &SurveyVerdict {
+                    impacted: false,
+                    mode: RosterMode::Block,
+                    rationale: "no overlap".to_string(),
+                },
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_deliveries(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(
+            entries[0].delivery_status,
+            DeliveryStatus::Undelivered,
+            "not_impacted must never be delivered to"
+        );
+    }
+
+    #[test]
+    fn run_pending_deliveries_marks_a_done_but_unreviewed_squad_via_restack() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Done);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_deliveries(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(entries[0].delivery_status, DeliveryStatus::ViaRestack);
+    }
+
+    #[test]
+    fn run_pending_deliveries_leaves_a_still_running_squad_entry_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+        insert_bare_squad(&store, "squad-1", SquadState::Running);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-1",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        let handle = handle(store);
+        let runner: Arc<dyn crate::runner::Runner> = Arc::new(DeliveryTestRunner);
+        run_pending_deliveries(&handle, &runner);
+
+        let store = handle.lock();
+        let entries = store.list_roster_entries("waypoint-1").unwrap();
+        assert_eq!(
+            entries[0].delivery_status,
+            DeliveryStatus::Undelivered,
+            "still-running squad has nothing to do yet -- it is reached later, either \
+             directly (once non-terminal) or via-restack (once terminal)"
+        );
+    }
+
+    // ── waypoint_survey_candidates population filter (Phase 4 addition) ──
+
+    #[test]
+    fn survey_candidates_exclude_cancelled_squads_by_construction() {
+        // RAL-400 Phase 4 AC: fully-done/cancelled squads are excluded from
+        // the classification population *by construction* -- this covers the
+        // `Cancelled` terminal variant specifically, alongside the existing
+        // `survey_candidates_exclude_terminal_and_already_rostered_entries`
+        // test's coverage of `Done`.
+        let store = Store::open_in_memory().unwrap();
+        open_waypoint(&store, "waypoint-1");
+
+        insert_bare_squad(&store, "squad-seed", SquadState::Pending);
+        insert_bare_task(&store, "squad-seed", 0, "core");
+        insert_bare_cell(&store, "squad-seed", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-seed", 0, 0, "auth", false);
+        store
+            .add_roster_entry(
+                "waypoint-1",
+                RosterEntryKind::Squad,
+                "squad-seed",
+                RosterMode::Block,
+            )
+            .unwrap();
+
+        // Overlapping scope but cancelled -> excluded.
+        insert_bare_squad(&store, "squad-cancelled", SquadState::Cancelled);
+        insert_bare_task(&store, "squad-cancelled", 0, "core");
+        insert_bare_cell(&store, "squad-cancelled", 0, 0, None, None);
+        insert_cell_subproject(&store, "squad-cancelled", 0, 0, "auth", false);
+
+        let candidates = store.waypoint_survey_candidates("waypoint-1").unwrap();
+        assert!(
+            candidates.is_empty(),
+            "a cancelled squad must never surface as a survey candidate: {candidates:?}"
         );
     }
 }
