@@ -2757,6 +2757,7 @@ struct EffectiveReviewDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_fix_prompt_template: Option<String>,
     discourage_tests_during_auto_pull_request_fixes: bool,
+    auto_cancel_outdated_pr_pipelines: bool,
 }
 
 impl EffectiveReviewDefaults {
@@ -2780,6 +2781,7 @@ impl EffectiveReviewDefaults {
             auto_fix_prompt_template: cfg.auto_fix_prompt_template().map(str::to_string),
             discourage_tests_during_auto_pull_request_fixes: cfg
                 .discourage_tests_during_auto_pull_request_fixes(),
+            auto_cancel_outdated_pr_pipelines: cfg.auto_cancel_outdated_pr_pipelines(),
         }
     }
 }
@@ -2875,6 +2877,12 @@ struct ProjectReviewSettingsBody {
     /// suites -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: project-level default for whether a review cancels a PR/MR's
+    /// still-running CI pipelines whenever a newer commit is force-pushed
+    /// onto the same branch -- see [`crate::store::ProjectReviewSettings`].
+    /// Defaults to `true` when unset.
+    #[serde(default)]
+    auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// RAL-507: the project's default cap on unattended base-shift rebuild
     /// attempts per retry campaign. Zero is itself invalid (the cap must be
     /// at least 1), so clearing uses an explicit flag -- same convention as
@@ -3060,6 +3068,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.discourage_tests_during_auto_pull_request_fixes {
         settings.discourage_tests_during_auto_pull_request_fixes = Some(v);
+    }
+    if let Some(v) = req.auto_cancel_outdated_pr_pipelines {
+        settings.auto_cancel_outdated_pr_pipelines = Some(v);
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -12615,6 +12626,13 @@ struct GuardianSettingsBody {
     /// project/global default".
     #[serde(default)]
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: this review's own override for whether it cancels a PR/MR's
+    /// still-running CI pipelines whenever a newer commit is force-pushed
+    /// onto the same branch. `None` (or the field being absent) means
+    /// "inherit the project/global default", which resolves to `true` (on
+    /// by default -- unlike most of the overrides above).
+    #[serde(default)]
+    auto_cancel_outdated_pr_pipelines: Option<bool>,
 }
 
 /// Body for `POST /api/guardians/{id}/details` -- the board's single
@@ -12661,6 +12679,9 @@ struct GuardianDetailsBody {
     /// [`GuardianSettingsBody::discourage_tests_during_auto_pull_request_fixes`].
     #[serde(default)]
     discourage_tests_during_auto_pull_request_fixes: Option<bool>,
+    /// RAL-510: see [`GuardianSettingsBody::auto_cancel_outdated_pr_pipelines`].
+    #[serde(default)]
+    auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -13047,6 +13068,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.auto_cancel_outdated_pr_pipelines {
+        if let Err(e) = store.set_guardian_auto_cancel_outdated_pr_pipelines(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
     // actually takes effect on this build instead of only the next one.
@@ -13344,6 +13370,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) =
             store.set_guardian_discourage_tests_during_auto_pull_request_fixes(id, Some(enabled))
         {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.auto_cancel_outdated_pr_pipelines {
+        if let Err(e) = store.set_guardian_auto_cancel_outdated_pr_pipelines(id, Some(enabled)) {
             return store_error(&e);
         }
     }

@@ -1524,6 +1524,89 @@ fn push_ref(
     .map(|_| ())
 }
 
+/// Cancel whatever CI this force-push just superseded (RAL-510) -- called
+/// *after* every `push_ref` above has already landed, never before, so a
+/// pipeline still running for the commit that ends up staying (e.g. because
+/// `guard_against_clobber` rejects the push) is never killed out from under
+/// it. Gated on `auto_cancel` (the caller's resolved
+/// `Guardian::auto_cancel_outdated_pr_pipelines`, on by default). Best-
+/// effort: a forge error here is logged and never undoes or fails the push
+/// that already succeeded. `pub(crate)` so `guardian_merge::run_feedback`'s
+/// own force-push (the review branch's feedback push, not a `pr.rs`-owned
+/// PR sync) can reuse the same logging/gating instead of duplicating it.
+pub(crate) fn cancel_superseded_ci_after_push(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    auto_cancel: bool,
+    client: Option<&crate::forge::ForgeClient>,
+    branch_alias: &str,
+    keep_sha: &str,
+) {
+    if !auto_cancel {
+        return;
+    }
+    let Some(client) = client else {
+        return;
+    };
+    match client.cancel_superseded_ci(branch_alias, keep_sha) {
+        Ok(summary) if summary.cancelled.is_empty() => {}
+        Ok(summary) => {
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {guardian_id} cancelled {} superseded ci run(s) on \
+                 branch={branch_alias} keep_sha={keep_sha}",
+                summary.cancelled.len()
+            );
+            let guard = store.lock();
+            let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::INFO,
+                source: "pr",
+                message: "cancelled superseded ci run(s) after force-push",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: Some(guardian_id),
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({
+                    "branch": branch_alias,
+                    "keep_sha": keep_sha,
+                    "cancelled": summary.cancelled,
+                }),
+                admin_only: false,
+            });
+        }
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {guardian_id} cancel-superseded-ci failed \
+                 branch={branch_alias} keep_sha={keep_sha}: {e}"
+            );
+            // A 403 here is the expected shape for a fork-owned PR run living
+            // in the base repo -- the fork owner's token can't manage a run
+            // it doesn't own. That's a genuine, review-visible error (not a
+            // transient/benign one like the 409-already-terminal case
+            // filtered out above), so it gets the same one-shot advisory
+            // toast every other non-fatal forge hiccup already uses --
+            // deliberately not a new notice mechanism, just this existing
+            // one with its own `notice_kind`.
+            if e.contains("forge API 403") {
+                let guard = store.lock();
+                let _ = guard.set_guardian_notice(
+                    guardian_id,
+                    "cancel_superseded_ci_forbidden",
+                    &format!(
+                        "Cancelling a superseded CI run on branch={branch_alias} was \
+                         rejected (403) -- likely a fork-owned PR run in the base repo \
+                         that this review's token can't manage. The stale run will keep \
+                         going, but it can't affect this PR's CI status."
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// Refuse to force-push over commits the remote `alias` branch has that
 /// `local_ref` does not (RAL-190) — e.g. a reviewer pushed a fix directly to
 /// the open PR branch. A remote branch that doesn't exist yet, or one whose
@@ -3593,6 +3676,14 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
             pr.id,
             pr.branch_alias
         );
+        cancel_superseded_ci_after_push(
+            store,
+            id,
+            guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+            routing.client_for(&pr.repo),
+            &pr.branch_alias,
+            &local_sha,
+        );
     }
 }
 
@@ -5018,13 +5109,22 @@ fn ensure_review_upstream_branch(
         }
         Err(e) => return Err(e.to_string()),
     };
-    crate::project_forks::sync_review_upstream_branch(
+    if let Some(sha) = crate::project_forks::sync_review_upstream_branch(
         root,
         parent_remote_name,
         &routing.fork.remote_name,
         base_branch_name,
         &branch,
-    )?;
+    )? {
+        cancel_superseded_ci_after_push(
+            store,
+            &guardian.id,
+            guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+            Some(&routing.fork_client),
+            &branch,
+            &sha,
+        );
+    }
     Ok(branch)
 }
 
@@ -5121,7 +5221,7 @@ pub(crate) fn refresh_dual_root_upstream_branch(
         &base_branch_name,
         &branch,
     ) {
-        Ok(true) => {
+        Ok(Some(sha)) => {
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {guardian_id} force-pushed {parent_remote_name}/{} to fork \
@@ -5148,8 +5248,25 @@ pub(crate) fn refresh_dual_root_upstream_branch(
                     }),
                     admin_only: false,
                 });
+            let auto_cancel = store
+                .lock()
+                .get_guardian(guardian_id)
+                .ok()
+                .is_some_and(|g| g.auto_cancel_outdated_pr_pipelines.unwrap_or(true));
+            if let Ok(fork_client) =
+                crate::forge::resolve_remote_for(&root, &fork.remote_name, &forge_cfg)
+            {
+                cancel_superseded_ci_after_push(
+                    store,
+                    guardian_id,
+                    auto_cancel,
+                    Some(&fork_client),
+                    &branch,
+                    &sha,
+                );
+            }
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(e) => {
             // ralphus[ignore-rlog-pair]: poll-time refresh diagnostic; the next cycle retries
             crate::rlog!(
@@ -5730,6 +5847,16 @@ fn submit_stacked_branch_pr(
     let pushed_sha = git(root, &["rev-parse", &review_ref])
         .map(|s| s.trim().to_string())
         .ok();
+    if let Some(sha) = pushed_sha.as_deref() {
+        cancel_superseded_ci_after_push(
+            store,
+            id,
+            guardian.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+            Some(client),
+            &alias,
+            sha,
+        );
+    }
     let base = stack_base_for(
         ordered_enabled_branches,
         alias_by_branch,
@@ -7786,6 +7913,7 @@ pub fn pull_pr_commits(
 
     push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
     if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
+        let sha = sha.trim();
         let _ = store.lock().update_pull_request_ex(
             pr_id,
             None,
@@ -7793,8 +7921,16 @@ pub fn pull_pr_commits(
             None,
             None,
             None,
-            Some(Some(sha.trim())),
+            Some(Some(sha)),
             None,
+        );
+        cancel_superseded_ci_after_push(
+            store,
+            &pr.guardian_id,
+            updated.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+            routing.client_for(&pr.repo),
+            &pr.branch_alias,
+            sha,
         );
     }
     {
@@ -8243,6 +8379,7 @@ fn action_pr_feedback_inner(
             );
             push_ref(&root, &remote_name, &local_ref, &pr.branch_alias)?;
             if let Ok(sha) = git(&root, &["rev-parse", &local_ref]) {
+                let sha = sha.trim();
                 let _ = store.lock().update_pull_request_ex(
                     pr_id,
                     None,
@@ -8250,8 +8387,16 @@ fn action_pr_feedback_inner(
                     None,
                     None,
                     None,
-                    Some(Some(sha.trim())),
+                    Some(Some(sha)),
                     None,
+                );
+                cancel_superseded_ci_after_push(
+                    store,
+                    &pr.guardian_id,
+                    updated.auto_cancel_outdated_pr_pipelines.unwrap_or(true),
+                    Some(&client),
+                    &pr.branch_alias,
+                    sha,
                 );
             }
         }
@@ -8487,6 +8632,26 @@ mod tests {
 
     fn gwrite(root: &Path, name: &str, content: &str) {
         std::fs::write(root.join(name), content).unwrap();
+    }
+
+    /// Every push site now runs `cancel_superseded_ci_after_push` right after
+    /// the push lands, which lists superseded runs before any PR-check/create
+    /// call this test cares about. Answer "none" so the mock server's
+    /// expected request sequence can move straight on to what the test is
+    /// actually about.
+    fn expect_cancel_check(server: &tiny_http::Server, repo: &str) {
+        let req = server.recv().unwrap();
+        assert_eq!(req.method(), &tiny_http::Method::Get);
+        assert!(
+            req.url()
+                .starts_with(&format!("/repos/{repo}/actions/runs?")),
+            "{}",
+            req.url()
+        );
+        req.respond(
+            tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#).with_status_code(200),
+        )
+        .unwrap();
     }
 
     /// Stage every path in the worktree and commit, in-process via libgit2 --
@@ -8946,7 +9111,7 @@ mod tests {
             "ralphus/review/g-1/upstream",
         )
         .unwrap();
-        assert!(pushed, "the first sync must create the branch");
+        assert!(pushed.is_some(), "the first sync must create the branch");
         let fork_tip = g(
             &fork_bare,
             &["rev-parse", "refs/heads/ralphus/review/g-1/upstream"],
@@ -8976,7 +9141,7 @@ mod tests {
             "ralphus/review/g-1/upstream",
         )
         .unwrap();
-        assert!(pushed);
+        assert!(pushed.is_some());
         let fork_tip_after = g(
             &fork_bare,
             &["rev-parse", "refs/heads/ralphus/review/g-1/upstream"],
@@ -8995,7 +9160,10 @@ mod tests {
             "ralphus/review/g-1/upstream",
         )
         .unwrap();
-        assert!(!pushed, "an already-current branch must not be re-pushed");
+        assert!(
+            pushed.is_none(),
+            "an already-current branch must not be re-pushed"
+        );
 
         let _ = std::fs::remove_dir_all(&root_dir);
         let _ = std::fs::remove_dir_all(&parent_bare);
@@ -9054,7 +9222,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            pushed,
+            pushed.is_some(),
             "a diverged transient branch must be force-overwritten"
         );
         let parent_sha = g(&root_dir, &["rev-parse", "origin/main"])
@@ -13168,6 +13336,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let handle = std::thread::spawn(move || {
             // Root branch: cross-repository PR filed at the parent, head is
             // `<fork_owner>:<alias>`.
+            expect_cancel_check(&server, "alice/widget");
             let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
@@ -13177,11 +13346,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             // silently ignores a bare branch name (see
             // `ForgeClient::same_repo_head`), so even a fork-internal head
             // must carry the fork's own `owner:` prefix.
+            expect_cancel_check(&server, "alice/widget");
             let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
 
             // Branch c: fork-internal PR based on b's own alias.
+            expect_cancel_check(&server, "alice/widget");
             let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
             assert_eq!(payload["head"], serde_json::json!("alice:c-alias"));
             assert_eq!(payload["base"], serde_json::json!("b-alias"));
@@ -13367,6 +13538,18 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            // RAL-510: each branch's push now triggers a "cancel superseded
+            // ci" sweep against the pushing (fork) client's project first.
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url().starts_with("/projects/alice%2Fwidget/pipelines?"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+
             // Root branch: the adoption probe asks the PARENT project (the
             // IID owner), never the fork.
             let req = server.recv().unwrap();
@@ -13395,8 +13578,16 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
 
-            // Branch b: fork-internal -- probe and create both stay on the
-            // fork, and no `target_project_id` is sent.
+            // Branch b: cancel-check first, then probe and create both stay
+            // on the fork, and no `target_project_id` is sent.
+            let req = server.recv().unwrap();
+            assert!(
+                req.url().starts_with("/projects/alice%2Fwidget/pipelines?"),
+                "{}",
+                req.url()
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
             let req = server.recv().unwrap();
             assert_eq!(
                 req.url(),
@@ -13566,6 +13757,20 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let handle = {
             let requests = requests.clone();
             std::thread::spawn(move || {
+                // RAL-510: the push that precedes the adoption probe now
+                // triggers a "cancel superseded ci" sweep against the
+                // pushing (fork) client's project first.
+                let req = server.recv().unwrap();
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(req.method(), &tiny_http::Method::Get);
+                assert!(
+                    req.url().starts_with("/projects/alice%2Fwidget/pipelines?"),
+                    "{}",
+                    req.url()
+                );
+                req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                    .unwrap();
+
                 // The adoption probe hits the PARENT project.
                 let req = server.recv().unwrap();
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -13596,8 +13801,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
                     .unwrap();
 
-                // Exactly these two calls: no duplicate create POST.
-                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+                // Exactly these three calls: no duplicate create POST.
+                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
             })
         };
 
@@ -13930,6 +14135,24 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 .unwrap();
                 payload
             };
+        // RAL-510: the push that precedes each branch's PR checks now
+        // triggers a "cancel superseded ci" sweep against the pushing
+        // client's repo first -- once per push, not once per PR filed off
+        // that push (a dual-root branch files two PRs from one push).
+        let expect_cancel_check = |server: &tiny_http::Server, repo: &str| {
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url()
+                    .starts_with(&format!("/repos/{repo}/actions/runs?")),
+                "{}",
+                req.url()
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#).with_status_code(200),
+            )
+            .unwrap();
+        };
         let root_dir = tmp_dir("dual-root-work");
         g(&root_dir, &["init", "--initial-branch", "release"]);
         gwrite(&root_dir, "base.txt", "base\n");
@@ -13993,13 +14216,15 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let handle = std::thread::spawn(move || {
             // The existing "parent" PR: cross-repository, filed at the
             // parent, unchanged from today's single-PR behavior.
+            expect_cancel_check(&server, "alice/widget");
             let payload = expect_none_then_create(&server, "acme/widget", 1, "http://x/1");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(payload["base"], serde_json::json!("release"));
 
             // The new "stack" PR: same-repo within the fork, into the
             // review's transient fork-side upstream branch -- never the
-            // fork's own real base branch.
+            // fork's own real base branch. Same push as above, so no second
+            // cancel-check in between.
             let payload = expect_none_then_create(&server, "alice/widget", 2, "http://x/2");
             assert_eq!(payload["head"], serde_json::json!("alice:a-alias"));
             assert_eq!(
@@ -14010,6 +14235,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
             // The following branch remains based on the root's alias, not
             // on the transient branch used by the visual root PR.
+            expect_cancel_check(&server, "alice/widget");
             let payload = expect_none_then_create(&server, "alice/widget", 3, "http://x/3");
             assert_eq!(payload["head"], serde_json::json!("alice:b-alias"));
             assert_eq!(payload["base"], serde_json::json!("a-alias"));
@@ -14175,6 +14401,20 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            // RAL-510: the push that precedes this PR check now triggers a
+            // "cancel superseded ci" sweep first.
+            let req = server.recv().unwrap();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert!(
+                req.url().starts_with("/repos/acme/widget/actions/runs?"),
+                "{}",
+                req.url()
+            );
+            req.respond(
+                tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#).with_status_code(200),
+            )
+            .unwrap();
+
             // The single branch's one and only PR: filed at the parent,
             // plain same-repo alias head, parent base branch -- no second
             // "stack" PR of any kind is ever requested.
@@ -14423,15 +14663,25 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             // iterated from a `HashMap`) order, so this dispatches by
             // method+url rather than asserting a strict sequence. Each
             // branch's `submit_stacked_branch_pr` call also now opens with a
-            // "does a PR already exist for this head?" GET (RAL-<new>) --
-            // two more requests than before this fix.
+            // "does a PR already exist for this head?" GET (RAL-<new>) and a
+            // "cancel superseded ci" sweep after the push (RAL-510) -- three
+            // more requests than before this fix.
             let mut next_pr_number = 10_i64;
             let mut stack_payload = serde_json::Value::Null;
-            for _ in 0..8 {
+            for _ in 0..10 {
                 let mut req = server.recv().unwrap();
                 let method = req.method().clone();
                 let url = req.url().to_string();
-                if method == tiny_http::Method::Get && url.starts_with("/repos/acme/widget/pulls?")
+                if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/widget/actions/runs?")
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/widget/pulls?")
                 {
                     req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                         .unwrap();
@@ -14639,6 +14889,21 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                         r#"{"state":"opened"}"#
                     };
                     req.respond(tiny_http::Response::from_string(body).with_status_code(200))
+                        .unwrap();
+                } else if method == tiny_http::Method::Get
+                    && forge_name == "github"
+                    && path.ends_with("/actions/runs")
+                {
+                    // `cancel_superseded_ci_after_push`'s post-push sweep --
+                    // no superseded runs to report.
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get && path.ends_with("/pipelines") {
+                    // GitLab half of the same post-push sweep.
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                         .unwrap();
                 } else if method == tiny_http::Method::Get
                     && forge_name == "github"
@@ -14879,6 +15144,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            expect_cancel_check(&server, "acme/w");
+
             // `submit_stacked_branch_pr` checks "does an open PR already
             // exist for this head?" before creating (RAL-<new>) -- answer no.
             let req = server.recv().unwrap();
@@ -15074,6 +15341,16 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                     req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
                         .unwrap();
                 } else if method == tiny_http::Method::Get
+                    && url.starts_with("/repos/acme/w/actions/runs?")
+                {
+                    // `cancel_superseded_ci_after_push`'s post-push sweep for
+                    // either branch -- nothing to cancel.
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get
                     && url.starts_with("/repos/acme/w/contents/")
                 {
                     // PR-template probe: none of the candidate paths exist.
@@ -15220,6 +15497,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            expect_cancel_check(&server, "acme/w");
+
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(
@@ -15343,6 +15622,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            expect_cancel_check(&server, "acme/w");
+
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(req.url().starts_with("/repos/acme/w/pulls?"));
@@ -15465,6 +15746,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            expect_cancel_check(&server, "acme/w");
+
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             assert!(req.url().starts_with("/repos/acme/w/pulls?"));
@@ -15591,6 +15874,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_string();
         let handle = std::thread::spawn(move || {
+            expect_cancel_check(&server, "acme/w");
+
             let req = server.recv().unwrap();
             assert_eq!(req.method(), &tiny_http::Method::Get);
             req.respond(tiny_http::Response::from_string("[]").with_status_code(200))

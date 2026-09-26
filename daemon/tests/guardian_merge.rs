@@ -4135,6 +4135,76 @@ fn base_shift_rebuild_budget_reopens_for_a_new_target_base_sha() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-510: a burst of upstream commits landing in quick succession must fold
+// into ONE rebuild dispatch (and therefore one force-push, one CI run), not
+// one per commit -- `rebuild_on_base_shift` sleeps for `BASE_SHIFT_DEBOUNCE`
+// (300ms in `guardian_merge.rs`) after its first shift detection and
+// re-detects before actually dispatching, so a target that keeps moving
+// during that window is only ever rebuilt against wherever it finally
+// settles. This test lands two more commits on `main` *while* the function
+// is mid-debounce and asserts: exactly one rebuild attempt was spent, and it
+// targeted the LAST commit -- never the first one detected or the one in
+// between. Without the debounce, a naive implementation would instead react
+// to the first shift immediately and need two further maintenance passes to
+// catch up with the other two commits: three rebuilds for three commits.
+//
+// This test is pinned to exclusive execution in `.config/nextest.toml`
+// (`threads-required = "num-cpus"`): it races two real background threads
+// (each spawning real `git` subprocesses) against the fixed debounce sleep
+// above, and under nextest's default full-CPU parallelism that race can be
+// lost to subprocess-spawn scheduling jitter from dozens of unrelated tests
+// running at the same time -- not a bug in `rebuild_on_base_shift` itself.
+#[test]
+fn rapid_upstream_commits_coalesce_into_a_single_debounced_rebuild() {
+    let (root, store, id) = conflicting_base_shift_repo();
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+    let sem = Semaphore::new(4);
+
+    let first_target = advance_main(&root, "shared.txt", "moved on 1\n", "first advance");
+    let burst_root = root.clone();
+    let burst = std::thread::spawn(move || {
+        // Both land comfortably inside the 300ms debounce window the main
+        // thread is asleep in below.
+        std::thread::sleep(Duration::from_millis(40));
+        let second = advance_main(&burst_root, "shared.txt", "moved on 2\n", "second advance");
+        std::thread::sleep(Duration::from_millis(80));
+        let third = advance_main(&burst_root, "shared.txt", "moved on 3\n", "third advance");
+        (second, third)
+    });
+
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let (second_target, third_target) = burst.join().unwrap();
+    assert_ne!(first_target, second_target);
+    assert_ne!(second_target, third_target);
+
+    let g = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(
+        g.status, "merge_failed",
+        "the settled target still conflicts, so the single dispatch fails deterministically"
+    );
+    assert_eq!(
+        g.base_shift_rebuild_attempts, 1,
+        "the whole burst must consume exactly one attempt, not one per commit"
+    );
+    assert_eq!(
+        g.base_shift_rebuild_targets,
+        Some(std::collections::BTreeMap::from([(
+            root.to_str().unwrap().to_string(),
+            third_target
+        )])),
+        "the single dispatch must target where the burst settled, not the first-detected commit"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // A SUCCESSFUL automatic rebuild closes the campaign outright: a future shift
 // starts from a full budget, not from whatever was left of a spent one.
 #[test]

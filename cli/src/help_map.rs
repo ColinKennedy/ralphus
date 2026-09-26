@@ -613,6 +613,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         "settings",
         &["selector [str]"],
         &[
+            "--auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines",
             "--auto-fix-pr-errors/--no-auto-fix-pr-errors",
             "--auto-fix-prompt-template [str]",
             "--auto-pr-feedback/--no-auto-pr-feedback",
@@ -1090,6 +1091,7 @@ value for each (file config + database).",
         &["name [str]"],
         &[
             "--auto-build [command]",
+            "--auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines",
             "--auto-fix-pr-errors/--no-auto-fix-pr-errors",
             "--auto-fix-prompt-template [str]",
             "--auto-submit-pr-stack/--no-auto-submit-pr-stack",

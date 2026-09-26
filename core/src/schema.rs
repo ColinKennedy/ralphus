@@ -1351,6 +1351,16 @@ pub struct ReviewDef {
     /// `[[review]]` block to read it from.
     #[serde(default)]
     pub auto_fix_pr_errors: Option<bool>,
+    /// RAL-510: whether this review cancels a PR/MR's still-running CI
+    /// pipelines whenever a newer commit is force-pushed onto the same
+    /// branch, instead of letting superseded runs burn CI capacity to
+    /// completion. Unset inherits the project-level `.ralphus.toml [review]
+    /// auto_cancel_outdated_pr_pipelines` default, then `true` (on by
+    /// default). Auto-created reviews (Arbiter/Triage) always use the
+    /// project default and never set this directly, since they have no
+    /// `[[review]]` block to read it from.
+    #[serde(default)]
+    pub auto_cancel_outdated_pr_pipelines: Option<bool>,
     /// RAL-395: this review's own override of the prompt template handed to
     /// the resolver agent when `auto_fix_pr_errors` fires. Must contain the
     /// literal `<<prompt>>` placeholder, which is replaced with the
